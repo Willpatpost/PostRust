@@ -2,7 +2,7 @@
 
 **Purpose:** the maintained, always-current index of what the engine actually
 is — integrated, tested, measured, and pending. The stage records in
-`engine/README.md` and `docs/` are **historical acceptance evidence, retained
+`docs/ENGINE-WORKSPACE-NARRATIVE.md` and `docs/` are **historical acceptance evidence, retained
 as history and never rewritten**; this file is the live layer on top of them.
 A fresh development or review agent should be able to determine the actual
 current status, active authority, source of truth, known limitations, and next
@@ -23,7 +23,7 @@ work from THIS file alone.
 
 | Record | Location |
 |---|---|
-| The stage-by-stage workspace narrative (Stages 0–5, the stage banner) | `engine/README.md` (top) — historical, retained |
+| The stage-by-stage workspace narrative (Stages 0–5, the stage banner) | `docs/ENGINE-WORKSPACE-NARRATIVE.md` — historical, retained |
 | The architecture decision ledger (T-01…, accepted and deferred) | `docs/DECISIONS.md` |
 | Stage 4 physical acceptance (the owner's rig) | `docs/STAGE4-WINDOWS-ACCEPTANCE-RECORD-2026-10-21.md` |
 | Stage 5 Batch 1–5 acceptance records | `docs/STAGE5-B1-WIRE-FORMAT.md` … `STAGE5-B5-LIFECYCLE-RECORD.md` |
@@ -211,8 +211,8 @@ and both frozen traces byte-identical at the candidate.
   A/B geometry equality asserted, no timing thresholds).
 - **Counts describe the current CI configurations** — the specific commands
   in the workflow, not every platform or feature combination. The historical
-  count narratives inside `engine/README.md` describe earlier states and are
-  retained as history.
+  count narratives inside `docs/ENGINE-WORKSPACE-NARRATIVE.md` describe
+  earlier states and are retained as history.
 
 ## 5. Accepted architecture decisions
 

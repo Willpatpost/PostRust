@@ -4,17 +4,23 @@ on:
   push:
     branches: [main, stage5, macos-port]
     paths:
-      - "engine/**"
+      - "crates/**"
+      - "build/**"
+      - ".cargo/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
       - ".github/workflows/engine-ci.yml"
   pull_request:
     paths:
-      - "engine/**"
+      - "crates/**"
+      - "build/**"
+      - ".cargo/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
       - ".github/workflows/engine-ci.yml"
   workflow_dispatch:
-
-defaults:
-  run:
-    working-directory: engine
 
 jobs:
   build-and-test:
@@ -33,19 +39,17 @@ jobs:
       # AFTER the pinned toolchain install because rust-cache derives
       # its cache key from the active rustc/cargo pair. Pinned to the
       # immutable v2.9.3 commit (annotated GPG-signed tag, published
-      # 2026-10-20; node24 runtime). "engine -> target" follows the
-      # action's documented semantics — the target part is relative
-      # to the workspace part — matching this workflow's engine/
-      # working directory. Every other input stays at its default:
-      # ONLY dependency crates are cached (cache-workspace-crates is
+      # 2026-10-20; node24 runtime). The PostRust layout has the
+      # workspace at the repository root, so the default target
+      # directory applies (the Sektor7-era "engine -> target" mapping
+      # was dropped in the extraction). Every other input stays at its
+      # default: ONLY dependency crates are cached (cache-workspace-crates is
       # false, so workspace crates — including the engine-persist
       # rlib the activation-isolation gate below inspects — are
       # rebuilt from source by the current run's Build step, never
       # restored from a cache); caches save from green jobs only.
       - name: Rust build cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          workspaces: "engine -> target"
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy (deny warnings)
