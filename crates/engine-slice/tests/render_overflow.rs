@@ -104,7 +104,12 @@ fn oversized_region_and_overlay_report_exact_truncation() {
     let mut frame = |renderer: &mut Renderer, region: &[SceneVertex], overlay: Option<&str>| {
         let _snapshot = app.frame();
         renderer
-            .render_frame(&IDENTITY_VIEW_PROJ, region, overlay, app.window_size())
+            .render_frame(
+                &IDENTITY_VIEW_PROJ,
+                region,
+                overlay,
+                app.window().size_in_pixels(),
+            )
             .expect("the frame renders");
     };
 
@@ -119,6 +124,11 @@ fn oversized_region_and_overlay_report_exact_truncation() {
         "lazy region buffer unallocated"
     );
     assert_eq!(stats.overlay_truncated_vertices, 0);
+    assert_eq!(
+        stats.overlay_capacity_vertices,
+        stats.overlay_supplied_peak_vertices.next_power_of_two(),
+        "a short overlay allocates only the next growth bucket"
+    );
     println!(
         "[overflow-smoke] stage 1 control: region_truncated=0 region_capacity=0 \
          (lazy buffer unallocated) overlay_truncated=0"

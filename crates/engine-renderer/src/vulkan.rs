@@ -35,9 +35,8 @@
 //! destroy/recreate drains outstanding presents. **Each swapchain image
 //! owns its depth attachment** (finding A), so concurrent in-flight
 //! submissions into different images never share depth state. **The
-//! overlay vertex buffer has one disjoint region per frame slot**
-//! (finding B) — a slot's region is written only after that slot's fence
-//! wait, so no in-flight submission reads a region being rewritten. The
+//! overlay vertex buffer for each slot grows on demand** after that
+//! slot's fence wait. Other slots retain their own allocations. The
 //! command pool allows individual command-buffer resets (finding D), and
 //! the per-slot fence proves a buffer is no longer pending when its
 //! re-record begins. GPU timestamps are written only when the queue family
@@ -48,12 +47,10 @@
 //! present semaphores, acquire semaphores, fences, query pool → swapchain
 //! framebuffers, views, per-image depth views/images/memories, swapchain
 //! (framebuffers **before** the render pass they reference) → pipelines,
-//! layouts, render pass, scene/overlay buffers and memories (overlay
-//! unmapped first) → logical device → debug messenger → surface →
-//! instance. Swapchain **recreation** builds the replacement before
-//! destroying the current state (a failed recreation leaves the renderer
-//! valid) and follows the same order for the objects it owns, after
-//! `device_wait_idle`.
+//! layouts, render pass and scene buffers → context. Frame slots release
+//! their mapped overlay buffers during frame-state teardown. Failed
+//! swapchain replacements release the retired chain and leave a pending
+//! recreation for the next renderable frame.
 
 // Unsafe containment (Stage 2 authorization, item 1): this module-level
 // allow overrides the crate-level `#![deny(unsafe_code)]` in lib.rs —
@@ -756,6 +753,9 @@ fn pick_physical_device(
 /// out-of-date, and suboptimal-present.
 pub(crate) struct SwapchainState {
     pub swapchain: vk::SwapchainKHR,
+    /// Last drawable size requested by the application. A surface can pin
+    /// or clamp its actual extent to a different size.
+    requested_size: (u32, u32),
     /// The raw swapchain images (framebuffer-owner side of the views —
     /// kept for the bounded frame-capture readback, which copies the
     /// presented image; the swapchain itself owns their lifetime).
@@ -832,6 +832,7 @@ impl SwapchainState {
         // no-ops per the Vulkan spec).
         let mut state = SwapchainState {
             swapchain: vk::SwapchainKHR::null(),
+            requested_size: window_size,
             images: Vec::new(),
             views: Vec::new(),
             framebuffers: Vec::new(),
@@ -1096,13 +1097,17 @@ pub(crate) fn surface_extent_unavailable(capabilities: &vk::SurfaceCapabilitiesK
 /// Live availability probe used once per frame before any recreation
 /// trigger: a deferred frame creates nothing, destroys nothing, and
 /// errors on nothing.
-fn surface_available_now(ctx: &VulkanContext) -> Result<bool, RendererError> {
+fn drawable_extent(
+    ctx: &VulkanContext,
+    window_size: (u32, u32),
+) -> Result<Option<vk::Extent2D>, RendererError> {
     let capabilities = unsafe {
         ctx.surface_ext
             .get_physical_device_surface_capabilities(ctx.physical_device, ctx.surface)
     }
     .map_err(|error| RendererError::vk(error, "surface capabilities"))?;
-    Ok(!surface_extent_unavailable(&capabilities))
+    Ok((!surface_extent_unavailable(&capabilities))
+        .then(|| clamp_extent(window_size, &capabilities)))
 }
 
 /// Depth format for the graphics device; chosen **once per renderer** and
@@ -1158,14 +1163,6 @@ pub(crate) struct PipelineState {
     pub scene_ibo: vk::Buffer,
     pub scene_ibo_memory: vk::DeviceMemory,
     pub scene_index_count: u32,
-    pub overlay_vbo: vk::Buffer,
-    pub overlay_vbo_memory: vk::DeviceMemory,
-    /// Per-slot vertex capacity of the overlay buffer (corrective
-    /// finding B).
-    pub overlay_capacity: u32,
-    /// Byte size of one frame slot's overlay region.
-    pub overlay_slot_bytes: vk::DeviceSize,
-    overlay_mapped: *mut core::ffi::c_void,
     pub region_vbo: vk::Buffer,
     pub region_vbo_memory: vk::DeviceMemory,
     /// Per-slot vertex capacity of the dynamic region-scene buffer
@@ -1203,11 +1200,6 @@ impl PipelineState {
             scene_ibo: vk::Buffer::null(),
             scene_ibo_memory: vk::DeviceMemory::null(),
             scene_index_count: 0,
-            overlay_vbo: vk::Buffer::null(),
-            overlay_vbo_memory: vk::DeviceMemory::null(),
-            overlay_capacity: 0,
-            overlay_slot_bytes: 0,
-            overlay_mapped: core::ptr::null_mut(),
             region_vbo: vk::Buffer::null(),
             region_vbo_memory: vk::DeviceMemory::null(),
             region_capacity: 0,
@@ -1255,21 +1247,6 @@ impl PipelineState {
             self.scene_ibo = scene_ibo;
             self.scene_ibo_memory = scene_ibo_memory;
         }
-
-        // Overlay buffer: persistently mapped host-visible with one
-        // disjoint region per frame slot (corrective finding B) — a
-        // slot's region is rewritten only after that slot's fence wait,
-        // so in-flight submissions never read a region being rewritten.
-        // The total vertex budget stays `overlay_capacity_vertices()`.
-        self.overlay_capacity = crate::overlay::overlay_capacity_vertices() / FRAMES_IN_FLIGHT;
-        self.overlay_slot_bytes = self.overlay_capacity as vk::DeviceSize
-            * std::mem::size_of::<OverlayVertex>() as vk::DeviceSize;
-        let overlay_size = self.overlay_slot_bytes * FRAMES_IN_FLIGHT as vk::DeviceSize;
-        let (overlay_vbo, overlay_vbo_memory, overlay_mapped) =
-            create_mapped_buffer(ctx, vk::BufferUsageFlags::VERTEX_BUFFER, overlay_size)?;
-        self.overlay_vbo = overlay_vbo;
-        self.overlay_vbo_memory = overlay_vbo_memory;
-        self.overlay_mapped = overlay_mapped;
 
         // Dynamic region-scene buffer (Stage 4 graphical integration):
         // NOT created here — it is allocated lazily on first use
@@ -1592,12 +1569,6 @@ impl PipelineState {
 
     pub(crate) fn destroy(&mut self, ctx: &VulkanContext) {
         unsafe {
-            if !self.overlay_mapped.is_null() {
-                ctx.device.unmap_memory(self.overlay_vbo_memory);
-                self.overlay_mapped = core::ptr::null_mut();
-            }
-            ctx.device.destroy_buffer(self.overlay_vbo, None);
-            ctx.device.free_memory(self.overlay_vbo_memory, None);
             if !self.region_mapped.is_null() {
                 ctx.device.unmap_memory(self.region_vbo_memory);
                 self.region_mapped = core::ptr::null_mut();
@@ -2145,9 +2116,59 @@ pub(crate) fn take_capture(
     }))
 }
 
+/// A single frame slot owns this mapping. The slot fence must have
+/// signaled before growing or writing it.
+#[derive(Default)]
+struct OverlaySlot {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    mapped: *mut core::ffi::c_void,
+    capacity: u32,
+}
+
+impl OverlaySlot {
+    fn capacity_for(current: u32, required: usize) -> u32 {
+        let limit = crate::overlay::overlay_capacity_vertices() / FRAMES_IN_FLIGHT;
+        let required = required.min(limit as usize) as u32;
+        if required <= current {
+            return current;
+        }
+        required.next_power_of_two().min(limit)
+    }
+
+    fn reserve(&mut self, ctx: &VulkanContext, required: usize) -> Result<(), RendererError> {
+        let capacity = Self::capacity_for(self.capacity, required);
+        if capacity != self.capacity {
+            let bytes = u64::from(capacity) * size_of::<OverlayVertex>() as u64;
+            let (buffer, memory, mapped) =
+                create_mapped_buffer(ctx, vk::BufferUsageFlags::VERTEX_BUFFER, bytes)?;
+            self.destroy(ctx);
+            *self = Self {
+                buffer,
+                memory,
+                mapped,
+                capacity,
+            };
+        }
+        Ok(())
+    }
+
+    fn destroy(&mut self, ctx: &VulkanContext) {
+        if self.capacity > 0 {
+            unsafe {
+                ctx.device.unmap_memory(self.memory);
+                ctx.device.destroy_buffer(self.buffer, None);
+                ctx.device.free_memory(self.memory, None);
+            }
+            *self = Self::default();
+        }
+    }
+}
+
 /// Sync objects, command buffers, and the timestamp pool, per frames-in-
 /// flight slot, plus per-swapchain-image state.
 pub(crate) struct FrameState {
+    overlay_slots: [OverlaySlot; FRAMES_IN_FLIGHT as usize],
     /// Created with `RESET_COMMAND_BUFFER` (corrective finding D): the
     /// per-slot command buffers are re-recorded every frame, and the
     /// per-slot fence proves a buffer is no longer pending when its
@@ -2188,6 +2209,7 @@ impl FrameState {
     ) -> Result<FrameState, RendererError> {
         // Partial-initialization cleanup (corrective finding G).
         let mut state = FrameState {
+            overlay_slots: std::array::from_fn(|_| OverlaySlot::default()),
             command_pool: vk::CommandPool::null(),
             command_buffers: Vec::new(),
             image_available: Vec::new(),
@@ -2312,9 +2334,18 @@ impl FrameState {
             }
             self.image_available.clear();
             self.capture.destroy(ctx);
+            for overlay in &mut self.overlay_slots {
+                overlay.destroy(ctx);
+            }
             ctx.device.destroy_command_pool(self.command_pool, None);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum LayerPriority {
+    First,
+    Second,
 }
 
 /// Copies consecutive triangle batches into one fenced, persistently mapped
@@ -2331,9 +2362,13 @@ unsafe fn upload_layers<T: bytemuck::Pod>(
     capacity: u32,
     first: &[T],
     second: &[T],
+    priority: LayerPriority,
 ) -> (DynamicClamp, u32) {
     let clamp = dynamic_geometry_clamp(first.len().saturating_add(second.len()), capacity);
-    let first_len = first.len().min(clamp.drawn as usize);
+    let first_len = match priority {
+        LayerPriority::First => first.len().min(clamp.drawn as usize),
+        LayerPriority::Second => (clamp.drawn as usize).saturating_sub(second.len()),
+    };
     let second_len = clamp.drawn as usize - first_len;
     unsafe {
         let dest = mapped.cast::<T>().add(slot * capacity as usize);
@@ -2356,8 +2391,8 @@ pub(crate) struct FrameOutcome {
     /// F-03 Step 1: the frame's region-scene and overlay capacity
     /// decisions (supplied / per-slot capacity / drawn / omitted). Both
     /// stay default — all zero — on deferred or minimized frames, which
-    /// record nothing; the overlay capacity is always reported (its
-    /// buffer is allocated at pipeline build) while the region capacity
+    /// record nothing; the overlay capacity is the current slot's
+    /// allocation, while the region capacity
     /// reads 0 until the lazy region buffer allocates. Nonzero omitted
     /// counts are REPORTED upstream, never fatal here.
     pub region: DynamicClamp,
@@ -2403,10 +2438,10 @@ pub(crate) fn render_frame(
     // surface reports a valid extent again (correction of the 1×1
     // fabrication defect, VUID-VkSwapchainCreateInfoKHR-pNext-07781,
     // found on the rig 2026-10-20).
-    if !surface_available_now(ctx)? {
+    let Some(drawable_extent) = drawable_extent(ctx, window_size)? else {
         outcome.deferred = true;
         return Ok(outcome);
-    }
+    };
 
     // Lazy region-scene buffer (Stage 4 final-verification finding):
     // allocated on first use only, outside command recording — the
@@ -2420,23 +2455,10 @@ pub(crate) fn render_frame(
     // A previous present reported suboptimal — recreate before drawing
     // (verification requirement: suboptimal must eventually trigger
     // recreation).
-    if consume_recreate(&mut frames.needs_recreate) {
-        recreate_swapchain(
-            ctx,
-            swapchain,
-            pipes,
-            frames,
-            window_size,
-            present_preference,
-            replace_pipelines,
-            demo_scene,
-        )?;
-        outcome.recreated = true;
-    }
-
-    // Proactive resize handling: the window size moved away from the
-    // swapchain extent.
-    if window_size.0 != swapchain.extent.width || window_size.1 != swapchain.extent.height {
+    if consume_recreate(&mut frames.needs_recreate)
+        || swapchain.requested_size != window_size
+        || swapchain.extent != drawable_extent
+    {
         recreate_swapchain(
             ctx,
             swapchain,
@@ -2479,10 +2501,12 @@ pub(crate) fn render_frame(
             .map_err(|error| RendererError::vk(error, "wait_for_fences (slot fence timed out — a submission never completed; presenting faster than the present mode drains?)"))?;
     }
 
-    // Acquire; OUT_OF_DATE recreates and retries once. If the retry also
-    // fails, the slot fence is re-created in the signaled state — the
-    // wait above consumed its signal but no submission will provide a new
-    // one, and the next frame must not hang on it.
+    // Allocation can fail. Grow only the fenced slot, before acquire, so
+    // a failure leaves the image-available semaphore and fence reusable.
+    frames.overlay_slots[slot].reserve(ctx, hud.len().saturating_add(debug_overlay.len()))?;
+
+    // OUT_OF_DATE retries once. The fence stays signaled until an image
+    // has actually been acquired, including when both attempts defer.
     let mut acquire_result = unsafe {
         ctx.swapchain_ext.acquire_next_image(
             swapchain.swapchain,
@@ -2515,16 +2539,8 @@ pub(crate) fn render_frame(
     let (image_index, suboptimal) = match acquire_result {
         Ok((index, suboptimal)) => (index, suboptimal),
         Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-            unsafe {
-                ctx.device.destroy_fence(frames.in_flight[slot], None);
-                frames.in_flight[slot] = ctx
-                    .device
-                    .create_fence(
-                        &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                        None,
-                    )
-                    .map_err(|error| RendererError::vk(error, "recreate fence"))?;
-            }
+            frames.needs_recreate = true;
+            outcome.deferred = true;
             return Ok(outcome);
         }
         Err(vk::Result::TIMEOUT) => {
@@ -2601,19 +2617,22 @@ pub(crate) fn render_frame(
                 pipes.region_capacity,
                 region_vertices,
                 foreground_vertices,
+                LayerPriority::Second,
             )
         };
         outcome.foreground_drawn = outcome.region.drawn - world_drawn;
     }
-    outcome.overlay.capacity = pipes.overlay_capacity;
+    let overlay = &frames.overlay_slots[slot];
+    outcome.overlay.capacity = overlay.capacity;
     if !hud.is_empty() || !debug_overlay.is_empty() {
         (outcome.overlay, _) = unsafe {
             upload_layers(
-                pipes.overlay_mapped,
-                slot,
-                pipes.overlay_capacity,
+                overlay.mapped,
+                0,
+                overlay.capacity,
                 hud,
                 debug_overlay,
+                LayerPriority::First,
             )
         };
     }
@@ -2735,9 +2754,12 @@ pub(crate) fn render_frame(
                 vk::PipelineBindPoint::GRAPHICS,
                 pipes.overlay_pipeline,
             );
-            let overlay_offset = (slot as vk::DeviceSize) * pipes.overlay_slot_bytes;
-            ctx.device
-                .cmd_bind_vertex_buffers(command, 0, &[pipes.overlay_vbo], &[overlay_offset]);
+            ctx.device.cmd_bind_vertex_buffers(
+                command,
+                0,
+                &[frames.overlay_slots[slot].buffer],
+                &[0],
+            );
             ctx.device.cmd_draw(command, outcome.overlay.drawn, 1, 0, 0);
         }
 
@@ -2954,8 +2976,10 @@ fn read_timestamps(ctx: &VulkanContext, frames: &FrameState, slot: usize) -> Opt
 }
 
 /// Swapchain recreation (corrective findings F + G): idle the device
-/// (draining outstanding presents), then build the replacement BEFORE
-/// destroying the current state so a failure leaves the renderer valid.
+/// (draining outstanding presents), then build replacement resources.
+/// Passing oldSwapchain retires it even when vkCreateSwapchainKHR fails.
+/// A failed replacement releases the retired handle and retries with a
+/// fresh swapchain before the next image acquisition.
 /// When the surface format changed, the replacement pipelines are built
 /// first — framebuffers are always created against the render pass that
 /// will be current after the swap, never a stale one.
@@ -2970,6 +2994,9 @@ fn recreate_swapchain(
     replace_pipelines: bool,
     demo_scene: DemoScenePreference,
 ) -> Result<(), RendererError> {
+    // Keep the request pending across failures, including an error before
+    // the replacement reaches vkCreateSwapchainKHR.
+    frames.needs_recreate = true;
     unsafe { ctx.device.device_wait_idle() }
         .map_err(|error| RendererError::vk(error, "device_wait_idle"))?;
     let depth_format = swapchain.depth_format;
@@ -3018,16 +3045,15 @@ fn recreate_swapchain(
         new_color_space,
         render_pass_for_new,
         depth_format,
-        // The current swapchain still owns the native window while the
-        // replacement is created; passing it as `old_swapchain` retires
-        // it on success (destroyed below) and leaves it valid on failure.
+        // After a failed replacement, this is null and the native window
+        // is free. Otherwise Vulkan requires the current live handle.
         swapchain.swapchain,
     ) {
         Ok(mut new_state) => {
-            // Re-sync the per-image tables before installing the new
-            // state; on failure here the old state is still current.
+            // The old handle is already retired.
             if let Err(error) = frames.resize_images(ctx, new_state.image_count) {
                 new_state.destroy(ctx);
+                swapchain.destroy(ctx);
                 if let Some(mut replacement) = replacement_pipes {
                     replacement.destroy(ctx);
                 }
@@ -3042,11 +3068,13 @@ fn recreate_swapchain(
             if let Some(mut old_pipes) = old_pipes {
                 old_pipes.destroy(ctx);
             }
+            frames.needs_recreate = false;
             Ok(())
         }
         Err(error) => {
-            // The old swapchain and pipelines are still valid (finding
-            // G); only the replacement pipelines need releasing.
+            // The constructor cleaned its partial replacement. Discard
+            // the old chain even if the failure preceded retirement.
+            swapchain.destroy(ctx);
             if let Some(mut replacement) = replacement_pipes {
                 replacement.destroy(ctx);
             }
@@ -3097,14 +3125,47 @@ mod policy_tests {
             (&[], &[3, 4], [3, 4, 0, 0], 0, 0),
         ] {
             storage.fill(0);
-            let (decision, split) =
-                unsafe { super::upload_layers(storage.as_mut_ptr().cast(), 1, 4, first, second) };
+            let (decision, split) = unsafe {
+                super::upload_layers(
+                    storage.as_mut_ptr().cast(),
+                    1,
+                    4,
+                    first,
+                    second,
+                    LayerPriority::First,
+                )
+            };
             assert_eq!(&storage[4..8], &expected);
             assert_eq!(&storage[..4], &[0; 4]);
             assert_eq!(&storage[8..], &[0; 4]);
             assert_eq!(split, first_count);
             assert_eq!(decision.truncated, omitted);
             assert_eq!(decision.supplied, decision.drawn + omitted);
+        }
+        for (foreground, expected, world_count) in [
+            (&[7, 8, 9][..], [1, 7, 8, 9], 1),
+            (&[7, 8, 9, 10, 11][..], [7, 8, 9, 10], 0),
+            (&[][..], [1, 2, 3, 4], 4),
+        ] {
+            let world = [1u32, 2, 3, 4, 5];
+            let (decision, split) = unsafe {
+                super::upload_layers(
+                    storage.as_mut_ptr().cast(),
+                    1,
+                    4,
+                    &world,
+                    foreground,
+                    LayerPriority::Second,
+                )
+            };
+            assert_eq!(&storage[4..8], &expected);
+            assert_eq!(&storage[..4], &[0; 4]);
+            assert_eq!(&storage[8..], &[0; 4]);
+            assert_eq!(split, world_count);
+            assert_eq!(
+                decision.truncated as usize,
+                world.len() + foreground.len() - 4
+            );
         }
     }
 
@@ -3143,23 +3204,14 @@ mod policy_tests {
     }
 
     #[test]
-    fn overlay_slot_regions_are_disjoint() {
-        // Corrective finding B: the per-slot regions of the mapped
-        // overlay buffer (slot s starts at s × slot_bytes) must not
-        // overlap.
-        let slot_bytes = 1000usize;
-        for a in 0..FRAMES_IN_FLIGHT as usize {
-            for b in 0..FRAMES_IN_FLIGHT as usize {
-                if a != b {
-                    let (a_start, a_end) = (a * slot_bytes, (a + 1) * slot_bytes);
-                    let (b_start, b_end) = (b * slot_bytes, (b + 1) * slot_bytes);
-                    assert!(
-                        a_end <= b_start || b_end <= a_start,
-                        "slots {a}/{b} overlap"
-                    );
-                }
-            }
-        }
+    fn overlay_slots_grow_on_demand_to_the_existing_vertex_budget() {
+        let limit = crate::overlay::overlay_capacity_vertices() / FRAMES_IN_FLIGHT;
+        assert_eq!(OverlaySlot::capacity_for(0, 0), 0);
+        assert_eq!(OverlaySlot::capacity_for(0, 37), 64);
+        assert_eq!(OverlaySlot::capacity_for(64, 0), 64);
+        assert_eq!(OverlaySlot::capacity_for(64, 64), 64);
+        assert_eq!(OverlaySlot::capacity_for(64, usize::MAX), limit);
+        assert_eq!(OverlaySlot::capacity_for(limit, usize::MAX), limit);
     }
 
     fn capabilities(current: [u32; 2], min: [u32; 2], max: [u32; 2]) -> vk::SurfaceCapabilitiesKHR {

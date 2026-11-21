@@ -54,6 +54,40 @@ fn parse_fps(value: &str) -> Result<Option<u32>, &'static str> {
     }
 }
 
+const HELP: &str = "PostRust engine demos and benchmarks
+
+Usage: engine-slice [MODE] [OPTIONS]
+       engine-slice --help
+
+Interactive modes
+  --window [--dummy]                 SDL window and input
+  --render [--regions]               Vulkan scene and optional region LOD
+  --player | --playable              Movement and gatehouse demos
+  --combat | --encounter             Combat and courtyard demos
+  --demo-persist <campaign-dir>      Persistent campaign
+  --soak <seconds> [--real]           SDL loop soak
+
+Graphics options
+  --fps <1-1000|uncapped> --present <auto|fifo|mailbox|immediate>
+  --frames <count> --validation <on|off|auto> --no-overlay
+  --hud-scale <0.75-4>                Encounter HUD size multiplier
+  POSTRUST_BINDINGS and POSTRUST_LOOK_SENSITIVITY configure player controls.
+  See docs/PLAYER-INPUT.md for examples.
+
+Headless modes
+  --sim [--ticks <count>] [--presence <stationary|walk|tour>]
+  --demo-persist <campaign-dir> --headless [--ticks <count>]
+  --player-headless | --playable-headless | --combat-headless | --encounter-headless
+  --fingerprint-selftest | --save-selftest
+
+Benchmarks
+  --benchmark-render | --benchmark-encounter | --benchmark-persistence
+  --benchmark-instrumentation | --benchmark-entity-scale | --benchmark-sustained-load
+  --benchmark-perf-sweep <cell> | --sustained-load-full-matrix
+  --sustained-load-capacity-envelope
+
+Run without a mode for the interactive stdin prompt.";
+
 fn main() {
     // C3-F5B: the namespaced integrated-soak flags are valid ONLY
     // within `--demo-persist` — outside it they reject every top-level
@@ -68,11 +102,19 @@ fn main() {
         "--evidence-dir",
         "--stabilization-deadline-secs",
     ];
-    let raw_args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args().collect();
+    if args
+        .iter()
+        .skip(1)
+        .any(|arg| arg == "--help" || arg == "-h")
+    {
+        println!("{HELP}");
+        return;
+    }
     let uses_soak_flags = INTEGRATED_SOAK_FLAGS
         .iter()
-        .any(|flag| raw_args.iter().any(|arg| arg == flag));
-    if uses_soak_flags && !raw_args.iter().any(|arg| arg == "--demo-persist") {
+        .any(|flag| args.iter().any(|arg| arg == flag));
+    if uses_soak_flags && !args.iter().any(|arg| arg == "--demo-persist") {
         eprintln!(
             "error: the integrated-soak flags ({}) require --demo-persist \
              (the integrated persistence demo)",
@@ -179,8 +221,6 @@ fn main() {
         engine_slice::render_benchmark::run();
         return;
     }
-
-    let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|arg| arg == "--sim") {
         // Stage 3 headless simulation (deterministic; no GPU, no window).
@@ -746,6 +786,7 @@ fn main() {
         // wiring; the weapons/population/geometry stages land with
         // their interface contracts).
         let mut options = engine_slice::encounter_demo::EncounterOptions::default();
+        let mut hud_scale = 1.0;
         let mut index = 1;
         while index < args.len() {
             match args[index].as_str() {
@@ -780,6 +821,18 @@ fn main() {
                         index += 1;
                     }
                 }
+                "--hud-scale" => {
+                    let scale = args
+                        .get(index + 1)
+                        .and_then(|value| value.parse::<f32>().ok())
+                        .filter(|value| (0.75..=4.0).contains(value));
+                    let Some(scale) = scale else {
+                        eprintln!("error: --hud-scale requires a number from 0.75 to 4");
+                        std::process::exit(1);
+                    };
+                    hud_scale = scale;
+                    index += 1;
+                }
                 "--no-overlay" => options.overlay = false,
                 "--validation" => {
                     if let Some(value) = args.get(index + 1)
@@ -794,7 +847,9 @@ fn main() {
             }
             index += 1;
         }
-        if let Err(message) = engine_slice::encounter_demo::run_encounter_demo(options) {
+        if let Err(message) =
+            engine_slice::encounter_demo::run_encounter_demo_with_hud_scale(options, hud_scale)
+        {
             eprintln!("error: {message}");
             if message.contains("Vulkan loader") {
                 eprintln!(

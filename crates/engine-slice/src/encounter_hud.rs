@@ -22,6 +22,8 @@ pub(crate) struct CombatHud {
     hurt: Duration,
     switched: Duration,
     last: Option<Readout>,
+    scale_multiplier: Option<f32>,
+    reset_label: Option<String>,
     targets: Vec<(f32, AdversaryState)>,
     text: String,
     pub vertices: Vec<OverlayVertex>,
@@ -41,6 +43,16 @@ struct Readout {
 }
 
 impl CombatHud {
+    pub fn set_scale_multiplier(&mut self, scale: f32) {
+        self.scale_multiplier = Some(scale);
+        self.last = None;
+    }
+
+    pub fn set_reset_label(&mut self, label: String) {
+        self.reset_label = Some(label.to_ascii_uppercase());
+        self.last = None;
+    }
+
     pub fn advance(&mut self, dt: Duration) {
         for timer in [
             &mut self.hit,
@@ -104,7 +116,9 @@ impl CombatHud {
             self.last = None;
             return;
         }
-        let scale = (h / 480.).clamp(0.75, 2.).min(w / 275.);
+        let scale = ((h / 480.).clamp(0.75, 2.) * self.scale_multiplier.unwrap_or(1.0))
+            .min(w / 275.)
+            .min(h / 100.);
         let mut canvas = Canvas {
             vertices: &mut self.vertices,
             extent,
@@ -211,14 +225,33 @@ impl CombatHud {
         }
         let message = match key.phase {
             EncounterPhase::Dormant => Some(("CROSS THE LINE", PAPER)),
-            EncounterPhase::Won { .. } => Some(("VICTORY  [R] RESET", CYAN)),
-            EncounterPhase::Lost { .. } => Some(("DEFEAT  [R] RESET", HIT)),
+            EncounterPhase::Won { .. } => Some(("VICTORY", CYAN)),
+            EncounterPhase::Lost { .. } => Some(("DEFEAT", HIT)),
             EncounterPhase::Active => None,
         };
         if let Some((label, color)) = message {
-            let width = label.len() as f32 * 9. + 12.;
-            canvas.rect(cx - width * 0.5, h * 0.72, width, 18., INK);
-            canvas.text(cx - width * 0.5 + 6., h * 0.72 + 5., label, color);
+            let label = if key.phase.is_terminal() {
+                self.text.clear();
+                let reset = self.reset_label.as_deref().unwrap_or("R");
+                let _ = write!(self.text, "{label}  [{reset}] RESET");
+                self.text.as_str()
+            } else {
+                label
+            };
+            let ideal_width = label.chars().count() as f32 * 9. + 12.;
+            let width = ideal_width.min(w);
+            let fit = width / ideal_width;
+            let x = cx - width * 0.5;
+            let y = h * 0.72;
+            canvas.rect(x, y, width, 18., INK);
+            push_text_px(
+                canvas.vertices,
+                extent,
+                [(x + 6. * fit) * scale, (y + 5.) * scale],
+                scale * fit,
+                label,
+                color,
+            );
         }
         self.last = Some(key);
     }

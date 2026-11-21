@@ -152,7 +152,7 @@ fn the_default_omits_and_the_explicit_opt_in_preserves_the_demo_scene() {
             .render_frame(frame_view_proj, scene, None, window_size)
             .expect("the frame renders");
     };
-    let real_size = app.window_size();
+    let real_size = app.window().size_in_pixels();
     // The resize-test pattern (render_demo's `--simulate-resize`): one
     // frame reports a different size, forcing the swapchain
     // recreation; with `replace_pipelines` that recreation replaces
@@ -164,6 +164,11 @@ fn the_default_omits_and_the_explicit_opt_in_preserves_the_demo_scene() {
     // lazy allocations settle), then the capture.
     render_with(&mut app, &mut renderer, &view_proj, &[], real_size);
     render_with(&mut app, &mut renderer, &view_proj, &[], real_size);
+    assert_eq!(
+        renderer.stats().overlay_capacity_vertices,
+        0,
+        "empty slots allocate no HUD memory"
+    );
     renderer
         .request_frame_capture()
         .expect("the D1 capture request is accepted");
@@ -252,6 +257,13 @@ fn the_default_omits_and_the_explicit_opt_in_preserves_the_demo_scene() {
     // with the LIVE preference, so the omitted renderer must still
     // render exactly the clear color on an empty region.
     render_with(&mut app, &mut renderer, &view_proj, &[], fake_size);
+    let recreated = renderer.stats().swapchain_recreations;
+    render_with(&mut app, &mut renderer, &view_proj, &[], fake_size);
+    assert_eq!(
+        renderer.stats().swapchain_recreations,
+        recreated,
+        "steady requested size with a pinned surface extent"
+    );
     render_with(&mut app, &mut renderer, &view_proj, &[], real_size);
     renderer
         .request_frame_capture()

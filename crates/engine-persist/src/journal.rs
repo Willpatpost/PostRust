@@ -46,7 +46,8 @@
 //! [`JournalError::AmbiguousCommit`] — never a guessed outcome — and
 //! the documented next step is [`T1Journal::reconcile_write`]:
 //! reread the file, verify the frame (§5.5.2 case 9 — present and
-//! valid ⇒ the intent is durable; absent ⇒ not durable, retry-safe).
+//! valid ⇒ re-establish the durability barrier before returning the intent;
+//! absent ⇒ not committed, retry-safe).
 //! The append handle opens with WRITE access so `sync_all` works on
 //! Windows (`FlushFileBuffers` requires it — the B2 lesson). The
 //! capture-phase failure (`AbortedBeforeCommit`) is definitive — no
@@ -114,10 +115,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use engine_core::{Decoder, Encoder, SaveError};
+use sha2::{Digest, Sha256};
 
 use crate::consequence::ConsequenceId;
 use crate::envelope::{ConsequenceEnvelope, DurabilityClass, SourcePosition};
@@ -149,6 +151,42 @@ pub const MAX_JOURNAL_DETAIL_BYTES: u64 = 1 << 16;
 /// once per open/recovery — bounded, never in a hot path; growth
 /// beyond this fails closed rather than allocating unbounded).
 pub const MAX_JOURNAL_FILE_BYTES: u64 = 1 << 32;
+
+fn check_journal_length(length: u64) -> Result<u64, JournalError> {
+    if length > MAX_JOURNAL_FILE_BYTES {
+        return Err(JournalError::Format(SaveError::Limit {
+            section: "journal",
+            kind: "file-length",
+            value: length,
+            max: MAX_JOURNAL_FILE_BYTES,
+        }));
+    }
+    Ok(length)
+}
+
+/// Reads journal bytes for scanning, hashing, or checking the bound header.
+/// The same open handle supplies the metadata and the read. The reader also
+/// enforces the ceiling if a writer grows the file during an unlocked scan.
+pub fn read_journal_bytes(path: &Path) -> Result<Vec<u8>, JournalError> {
+    let read_error = |e| io_err("read journal", path, e);
+    let mut file = File::open(path).map_err(read_error)?;
+    let length = check_journal_length(file.metadata().map_err(read_error)?.len())?;
+    let mut bytes = Vec::new();
+    let capacity =
+        usize::try_from(length).map_err(|_| read_error(io::ErrorKind::OutOfMemory.into()))?;
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| read_error(io::ErrorKind::OutOfMemory.into()))?;
+    (&mut file)
+        .take(MAX_JOURNAL_FILE_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(read_error)?;
+    if bytes.len() as u64 == MAX_JOURNAL_FILE_BYTES && file.read(&mut [0]).map_err(read_error)? != 0
+    {
+        check_journal_length(MAX_JOURNAL_FILE_BYTES + 1)?;
+    }
+    Ok(bytes)
+}
 
 /// The stable transaction identity — the SHA-256 over the stable
 /// identity material (consequential identities, classification,
@@ -221,18 +259,7 @@ impl TransactionInput {
     /// are a conflicting reuse and fail closed.
     pub fn transaction_id(&self) -> Result<TransactionId, SaveError> {
         let ids = sorted_unique_identities(&self.envelopes)?;
-        let mut enc = Encoder::new();
-        enc.write_str(TRANSACTION_ID_DOMAIN);
-        enc.write_u8(TRANSACTION_ID_SCHEMA);
-        enc.write_u8(durability_discriminant(self.classification));
-        enc.write_count(ids.len());
-        for id in ids {
-            enc.write_u32(id.region);
-            enc.write_u64(id.episode);
-            enc.write_u32(id.npc);
-        }
-        enc.write_bytes(&self.plan);
-        Ok(TransactionId(hash_object(&enc.into_bytes())))
+        Ok(derive_transaction_id(&ids, self.classification, &self.plan))
     }
 }
 
@@ -1080,15 +1107,7 @@ pub fn scan_bound_file(
     root_id: &crate::hash::Hash,
 ) -> Result<JournalScan, JournalError> {
     let path = path.as_ref();
-    let bytes = fs::read(path).map_err(|e| io_err("read bound journal", path, e))?;
-    if bytes.len() as u64 > MAX_JOURNAL_FILE_BYTES {
-        return Err(JournalError::Format(SaveError::Limit {
-            section: "journal",
-            kind: "file-length",
-            value: bytes.len() as u64,
-            max: MAX_JOURNAL_FILE_BYTES,
-        }));
-    }
+    let bytes = read_journal_bytes(path)?;
     match read_bound_header(&bytes, founding, root_id)? {
         BoundHeaderState::Fresh => Err(JournalError::Io {
             op: "read bound journal",
@@ -1120,7 +1139,7 @@ pub fn scan_bound_file(
 struct JournalState {
     committed: Vec<CommittedTransaction>,
     cancellations: Vec<RecordedCancellation>,
-    committed_ids: BTreeSet<TransactionId>,
+    committed_index: BTreeMap<TransactionId, usize>,
     canceled_ids: BTreeSet<TransactionId>,
     /// Identities visible in the inert tail's capture frames (the
     /// `Readable` state — data exists and parses; never actionable).
@@ -1144,7 +1163,7 @@ impl JournalState {
         JournalState {
             committed: Vec::new(),
             cancellations: Vec::new(),
-            committed_ids: BTreeSet::new(),
+            committed_index: BTreeMap::new(),
             canceled_ids: BTreeSet::new(),
             inert_ids: BTreeSet::new(),
             observed_tail: TailState::Clean,
@@ -1161,7 +1180,7 @@ impl JournalState {
         JournalState {
             committed: Vec::new(),
             cancellations: Vec::new(),
-            committed_ids: BTreeSet::new(),
+            committed_index: BTreeMap::new(),
             canceled_ids: BTreeSet::new(),
             inert_ids: BTreeSet::new(),
             observed_tail: TailState::Clean,
@@ -1197,6 +1216,26 @@ fn classify_bound(
     classify_from(state, bytes, header_hash, header_len)
 }
 
+fn strict_bound_state(
+    bytes: &[u8],
+    founding: &Hash,
+    root_id: &Hash,
+) -> Result<JournalState, JournalError> {
+    match read_bound_header(bytes, founding, root_id)? {
+        BoundHeaderState::Matching { header_hash } => classify_bound(
+            bytes,
+            header_hash,
+            bound_header_bytes(founding, root_id).len(),
+        ),
+        BoundHeaderState::Fresh => Err(JournalError::CorruptHeader {
+            detail: "the bound journal is empty — no complete header".into(),
+        }),
+        BoundHeaderState::TornCreation { byte_len } => Err(JournalError::CorruptHeader {
+            detail: format!("torn bound header — damaged evidence (prefix of {byte_len} bytes)"),
+        }),
+    }
+}
+
 /// The shared sequential walk (both header shapes): the state's
 /// append_offset carries the header length; the chain anchors at the
 /// header's hash.
@@ -1213,7 +1252,7 @@ fn classify_from(
     // The pending (uncommitted) capture group.
     let mut pending: Vec<ConsequenceEnvelope> = Vec::new();
     let mut pending_ids: Vec<ConsequenceId> = Vec::new();
-    let mut pending_concat: Vec<u8> = Vec::new();
+    let mut pending_digest = Sha256::new();
     let mut last_valid_end = offset as u64;
 
     while offset < bytes.len() {
@@ -1227,8 +1266,7 @@ fn classify_from(
             break;
         }
         let len = u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("8 bytes"));
-        let frame_end = offset as u64 + 8 + len;
-        if frame_end > bytes.len() as u64 {
+        if len > (remaining - 8) as u64 {
             // The frame claims more bytes than remain — torn.
             damage = Some(Damage {
                 offset: offset as u64,
@@ -1236,6 +1274,7 @@ fn classify_from(
             });
             break;
         }
+        let frame_end = (offset + 8) as u64 + len;
         if len == 0 {
             // A zero-length frame is the documented zero-fill
             // artifact (or garbage): damage, walked past.
@@ -1283,7 +1322,7 @@ fn classify_from(
                         state.inert_ids.insert(envelope.id);
                         pending_ids.push(envelope.id);
                         pending.push(envelope);
-                        pending_concat.extend_from_slice(record_bytes);
+                        pending_digest.update(record_bytes);
                     }
                     Err(_) => {
                         // The frame decodes as a record but the
@@ -1332,7 +1371,7 @@ fn classify_from(
                 if record_count != pending.len() as u64 {
                     return fail_closed("count-mismatch");
                 }
-                if digest != hash_object(&pending_concat) {
+                if digest.as_bytes()[..] != pending_digest.finalize_reset()[..] {
                     return fail_closed("digest-mismatch");
                 }
                 if identities != pending_ids {
@@ -1342,7 +1381,7 @@ fn classify_from(
                 if id != derived {
                     return fail_closed("identity-derivation");
                 }
-                if state.committed_ids.contains(&id) {
+                if state.committed_index.contains_key(&id) {
                     return fail_closed("duplicate-transaction-id");
                 }
                 if let Some(site) = damage {
@@ -1354,7 +1393,7 @@ fn classify_from(
                         rule: "damage-within-committed-history",
                     });
                 }
-                state.committed_ids.insert(id);
+                state.committed_index.insert(id, state.committed.len());
                 state.committed.push(CommittedTransaction {
                     id,
                     sequence,
@@ -1368,7 +1407,6 @@ fn classify_from(
                     plan,
                 });
                 pending_ids.clear();
-                pending_concat.clear();
                 state.next_sequence += 1;
                 last_valid_end = frame_end;
                 state.append_offset = frame_end;
@@ -1402,7 +1440,7 @@ fn classify_from(
                         "sequence-gap"
                     });
                 }
-                if !state.committed_ids.contains(&target) {
+                if !state.committed_index.contains_key(&target) {
                     return fail_closed("cancel-unknown-target");
                 }
                 if state.canceled_ids.contains(&target) {
@@ -1511,6 +1549,10 @@ pub struct T1Journal {
     /// The sidecar lock handle, held for the instance's lifetime —
     /// dropping it (or process death) releases the exclusive lock.
     _lock: File,
+    /// Expected identities from the campaign authority, retained across reconciliation.
+    binding: Option<(Hash, Hash)>,
+    /// A commit or cancellation may have reached disk despite an I/O failure.
+    needs_reconciliation: bool,
     state: JournalState,
     /// The sessions's caller-observed acknowledgments — never
     /// persisted, never claimed for a prior session.
@@ -1559,19 +1601,13 @@ impl T1Journal {
         // lacks; every write seeks to the end first (the journal is
         // append-only by design under the single-writer lock).
         let lock = open_lock_file(&path)?;
-        let bytes = fs::read(&path).map_err(|e| io_err("read journal", &path, e))?;
-        if bytes.len() as u64 > MAX_JOURNAL_FILE_BYTES {
-            return Err(JournalError::Format(SaveError::Limit {
-                section: "journal",
-                kind: "file-length",
-                value: bytes.len() as u64,
-                max: MAX_JOURNAL_FILE_BYTES,
-            }));
-        }
+        let bytes = read_journal_bytes(&path)?;
         let mut journal = T1Journal {
             path: path.clone(),
             file,
             _lock: lock,
+            binding: None,
+            needs_reconciliation: false,
             state: JournalState::empty(Hash::ZERO),
             acknowledged: BTreeSet::new(),
             fault,
@@ -1591,7 +1627,9 @@ impl T1Journal {
                 journal
                     .append_bytes(&header)
                     .map_err(|e| io_err("write journal header", &path, e))?;
-                journal.sync()?;
+                journal
+                    .sync()
+                    .map_err(|e| io_err("sync journal", &journal.path, e))?;
                 sync_parent_dir(&path).map_err(|e| io_err("sync journal dir", &path, e))?;
                 journal.state = JournalState::empty(hash_object(&header));
             }
@@ -1659,45 +1697,21 @@ impl T1Journal {
                 detail: "the bound journal is absent — an ordinary open never creates it".into(),
             })?;
         let lock = open_lock_file(&path)?;
-        let bytes = fs::read(&path).map_err(|e| io_err("read journal", &path, e))?;
-        if bytes.len() as u64 > MAX_JOURNAL_FILE_BYTES {
-            return Err(JournalError::Format(SaveError::Limit {
-                section: "journal",
-                kind: "file-length",
-                value: bytes.len() as u64,
-                max: MAX_JOURNAL_FILE_BYTES,
-            }));
-        }
+        let bytes = read_journal_bytes(&path)?;
         let mut journal = T1Journal {
             path: path.clone(),
             file,
             _lock: lock,
+            binding: Some((*founding, *root_id)),
+            needs_reconciliation: false,
             state: JournalState::empty_bound(Hash::ZERO, 0),
             acknowledged: BTreeSet::new(),
             fault: None,
             sync_count: 0,
             platform_tier: platform_tier(),
         };
-        let header = bound_header_bytes(founding, root_id);
-        match read_bound_header(&bytes, founding, root_id)? {
-            BoundHeaderState::Fresh => {
-                return Err(JournalError::CorruptHeader {
-                    detail: "the bound journal is empty — no complete header".into(),
-                });
-            }
-            BoundHeaderState::TornCreation { byte_len } => {
-                return Err(JournalError::CorruptHeader {
-                    detail: format!(
-                        "torn bound header — damaged evidence, never repaired by an \
-                         ordinary open (prefix of {byte_len} bytes)"
-                    ),
-                });
-            }
-            BoundHeaderState::Matching { header_hash } => {
-                journal.state = classify_bound(&bytes, header_hash, header.len())?;
-                journal.resolve_tail()?;
-            }
-        }
+        journal.state = strict_bound_state(&bytes, founding, root_id)?;
+        journal.resolve_tail()?;
         Ok(journal)
     }
 
@@ -1860,19 +1874,13 @@ impl T1Journal {
         created_here: bool,
     ) -> Result<Self, JournalError> {
         let lock = open_lock_file(path)?;
-        let bytes = fs::read(path).map_err(|e| io_err("read journal", path, e))?;
-        if bytes.len() as u64 > MAX_JOURNAL_FILE_BYTES {
-            return Err(JournalError::Format(SaveError::Limit {
-                section: "journal",
-                kind: "file-length",
-                value: bytes.len() as u64,
-                max: MAX_JOURNAL_FILE_BYTES,
-            }));
-        }
+        let bytes = read_journal_bytes(path)?;
         let mut journal = T1Journal {
             path: path.to_path_buf(),
             file,
             _lock: lock,
+            binding: Some((*founding, *root_id)),
+            needs_reconciliation: false,
             state: JournalState::empty_bound(Hash::ZERO, 0),
             acknowledged: BTreeSet::new(),
             fault: None,
@@ -1900,7 +1908,9 @@ impl T1Journal {
                 journal
                     .append_bytes(&header)
                     .map_err(|e| io_err("write bound journal header", path, e))?;
-                journal.sync()?;
+                journal
+                    .sync()
+                    .map_err(|e| io_err("sync journal", &journal.path, e))?;
                 sync_parent_dir(path).map_err(|e| io_err("sync journal dir", path, e))?;
                 journal.state =
                     JournalState::empty_bound(hash_object(&header), header.len() as u64);
@@ -1960,25 +1970,17 @@ impl T1Journal {
     /// An absent file is an empty journal: nothing pending.
     pub fn scan_file(path: impl AsRef<Path>) -> Result<JournalScan, JournalError> {
         let path = path.as_ref();
-        let bytes = match fs::read(path) {
+        let bytes = match read_journal_bytes(path) {
             Ok(bytes) => bytes,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Err(JournalError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
                 return Ok(JournalScan {
                     committed: Vec::new(),
                     cancellations: Vec::new(),
                     tail: TailState::Clean,
                 });
             }
-            Err(e) => return Err(io_err("read journal", path, e)),
+            Err(error) => return Err(error),
         };
-        if bytes.len() as u64 > MAX_JOURNAL_FILE_BYTES {
-            return Err(JournalError::Format(SaveError::Limit {
-                section: "journal",
-                kind: "file-length",
-                value: bytes.len() as u64,
-                max: MAX_JOURNAL_FILE_BYTES,
-            }));
-        }
         match read_header(&bytes)? {
             HeaderState::Fresh => Ok(JournalScan {
                 committed: Vec::new(),
@@ -2030,9 +2032,8 @@ impl T1Journal {
                 max: MAX_JOURNAL_PLAN_BYTES,
             }));
         }
-        let mut envelope_bytes: Vec<Vec<u8>> = Vec::with_capacity(input.envelopes.len());
-        for envelope in &input.envelopes {
-            envelope_bytes.push(envelope.canonical_bytes().map_err(JournalError::Format)?);
+        if self.needs_reconciliation {
+            self.refresh_from_disk()?;
         }
         let identities =
             sorted_unique_identities(&input.envelopes).map_err(JournalError::Format)?;
@@ -2066,7 +2067,7 @@ impl T1Journal {
                 max: MAX_JOURNAL_FRONTIER,
             }));
         }
-        let id = input.transaction_id().map_err(JournalError::Format)?;
+        let id = derive_transaction_id(&identities, input.classification, &input.plan);
         // Idempotent recognition: the journal knows this
         // transaction — the existing committed state returns (a
         // truthful present-moment receipt of an already-durable
@@ -2076,12 +2077,8 @@ impl T1Journal {
         // match the attempt — a different consequential payload under
         // the same identity is a conflicting claim, never an
         // idempotent duplicate.
-        if let Some(existing) = self
-            .state
-            .committed
-            .iter()
-            .find(|transaction| transaction.id == id)
-        {
+        if let Some(&index) = self.state.committed_index.get(&id) {
+            let existing = &self.state.committed[index];
             if envelope_payloads(&existing.envelopes).map_err(JournalError::Format)?
                 != envelope_payloads(&input.envelopes).map_err(JournalError::Format)?
             {
@@ -2091,34 +2088,34 @@ impl T1Journal {
             self.acknowledged.insert(id);
             return Ok(receipt);
         }
-        self.resolve_tail()?;
-        self.fault_pre(JournalFaultPoint::BeforeCaptures)?;
-
-        // Capture frames (no sync — one barrier per transaction, at
-        // the commit record).
+        // Prepare complete frames before the first write, so every accepted
+        // transaction fits the exact envelope and file bounds its reader uses.
+        let mut end = self.state.append_offset;
+        let mut captures = Vec::with_capacity(input.envelopes.len());
         let mut chain_prev = self.state.chain_prev;
-        let mut capture_concat: Vec<u8> = Vec::new();
-        for (index, bytes) in envelope_bytes.iter().enumerate() {
-            let record = encode_capture(chain_prev, bytes);
-            chain_prev = hash_object(&record);
-            capture_concat.extend_from_slice(&record);
-            let framed = frame(&record);
-            self.append_bytes(&framed)
-                .map_err(|e| JournalError::AbortedBeforeCommit { source: e })?;
-            self.state.append_offset += framed.len() as u64;
-            if index == 0 {
-                self.fault_pre(JournalFaultPoint::MidCaptureWrite)?;
+        let mut capture_digest = Sha256::new();
+        for envelope in &input.envelopes {
+            let bytes = envelope.canonical_bytes().map_err(JournalError::Format)?;
+            if bytes.len() as u64 > MAX_JOURNAL_ENVELOPE_BYTES {
+                return Err(JournalError::Format(SaveError::Limit {
+                    section: "journal",
+                    kind: "byte-length",
+                    value: bytes.len() as u64,
+                    max: MAX_JOURNAL_ENVELOPE_BYTES,
+                }));
             }
+            let record = encode_capture(chain_prev, &bytes);
+            chain_prev = hash_object(&record);
+            capture_digest.update(&record);
+            end = check_journal_length(end + 8 + record.len() as u64)?;
+            captures.push(frame(&record));
         }
-        self.fault_pre(JournalFaultPoint::CapturesWritten)?;
-
-        // The commit record.
+        let digest = Hash::from_bytes(&capture_digest.finalize()).expect("SHA-256 is 32 bytes");
         let sequence = self.state.next_sequence;
-        let digest = hash_object(&capture_concat);
         let fields = CommitFields {
             id,
             sequence,
-            record_count: envelope_bytes.len() as u64,
+            record_count: input.envelopes.len() as u64,
             digest,
             identities: &identities,
             position: &input.position,
@@ -2130,23 +2127,38 @@ impl T1Journal {
         let commit_record = encode_commit(chain_prev, &fields);
         let commit_hash = hash_object(&commit_record);
         let framed = frame(&commit_record);
+        end = check_journal_length(end + framed.len() as u64)?;
+        self.resolve_tail()?;
+        self.fault_pre(JournalFaultPoint::BeforeCaptures)?;
+        // Keep the last committed offset until the barrier succeeds. A
+        // capture-phase error leaves a truncatable tail on this handle.
+        self.state.tail_resolved = false;
+        for (index, capture) in captures.into_iter().enumerate() {
+            self.append_bytes(&capture)
+                .map_err(|source| JournalError::AbortedBeforeCommit { source })?;
+            if index == 0 {
+                self.fault_pre(JournalFaultPoint::MidCaptureWrite)?;
+            }
+        }
+        self.fault_pre(JournalFaultPoint::CapturesWritten)?;
+        self.needs_reconciliation = true;
         self.append_bytes(&framed)
             .map_err(|e| JournalError::AmbiguousCommit {
                 id,
                 stage: CommitStage::Write,
                 source: e,
             })?;
-        self.state.append_offset += framed.len() as u64;
-        self.fault_commit(JournalFaultPoint::CommitWritten, id)?;
-
         // The one durability barrier of the completed transaction.
-        self.sync()?;
+        self.sync_commit(id)?;
         self.fault_commit(JournalFaultPoint::AfterSync, id)?;
+        self.state.append_offset = end;
+        self.state.tail_resolved = true;
+        self.needs_reconciliation = false;
 
         let transaction = CommittedTransaction {
             id,
             sequence,
-            record_count: envelope_bytes.len() as u64,
+            record_count: input.envelopes.len() as u64,
             digest,
             envelopes: input.envelopes.clone(),
             position: input.position,
@@ -2155,15 +2167,17 @@ impl T1Journal {
             frontier,
             plan: input.plan.clone(),
         };
+        self.state
+            .committed_index
+            .insert(id, self.state.committed.len());
         self.state.committed.push(transaction);
-        self.state.committed_ids.insert(id);
         self.state.next_sequence += 1;
         self.state.chain_prev = commit_hash;
         self.acknowledged.insert(id);
         Ok(JournalReceipt {
             id,
             sequence,
-            record_count: envelope_bytes.len() as u64,
+            record_count: input.envelopes.len() as u64,
             digest,
             classification: input.classification,
         })
@@ -2187,7 +2201,10 @@ impl T1Journal {
                 max: MAX_JOURNAL_DETAIL_BYTES,
             }));
         }
-        if !self.state.committed_ids.contains(&target) {
+        if self.needs_reconciliation {
+            self.refresh_from_disk()?;
+        }
+        if !self.state.committed_index.contains_key(&target) {
             return Err(JournalError::UnknownTarget { id: target });
         }
         if self.state.canceled_ids.contains(&target) {
@@ -2198,14 +2215,17 @@ impl T1Journal {
         let record = encode_cancellation(self.state.chain_prev, target, sequence, reason, detail);
         let record_hash = hash_object(&record);
         let framed = frame(&record);
+        let end = check_journal_length(self.state.append_offset + framed.len() as u64)?;
+        self.needs_reconciliation = true;
         self.append_bytes(&framed)
             .map_err(|e| JournalError::AmbiguousCommit {
                 id: target,
                 stage: CommitStage::Write,
                 source: e,
             })?;
-        self.state.append_offset += framed.len() as u64;
-        self.sync()?;
+        self.sync_commit(target)?;
+        self.state.append_offset = end;
+        self.needs_reconciliation = false;
         self.state.canceled_ids.insert(target);
         self.state.cancellations.push(RecordedCancellation {
             sequence,
@@ -2229,32 +2249,9 @@ impl T1Journal {
         attempted: &TransactionInput,
     ) -> Result<WriteReconciliation, JournalError> {
         let id = attempted.transaction_id().map_err(JournalError::Format)?;
-        let bytes = fs::read(&self.path).map_err(|e| io_err("read journal", &self.path, e))?;
-        if bytes.len() as u64 > MAX_JOURNAL_FILE_BYTES {
-            return Err(JournalError::Format(SaveError::Limit {
-                section: "journal",
-                kind: "file-length",
-                value: bytes.len() as u64,
-                max: MAX_JOURNAL_FILE_BYTES,
-            }));
-        }
-        match read_header(&bytes)? {
-            HeaderState::Valid { header_hash } => {
-                self.state = classify(&bytes, header_hash)?;
-                self.resolve_tail()?;
-            }
-            // The header cannot regress to torn/fresh while this
-            // instance holds the lock and a commit was attempted.
-            HeaderState::Fresh | HeaderState::TornCreation { .. } => {
-                self.state = JournalState::empty(hash_object(&header_bytes()));
-            }
-        }
-        if let Some(existing) = self
-            .state
-            .committed
-            .iter()
-            .find(|transaction| transaction.id == id)
-        {
+        self.refresh_from_disk()?;
+        if let Some(&index) = self.state.committed_index.get(&id) {
+            let existing = &self.state.committed[index];
             // Identity equality is NOT effect equivalence: the
             // reread transaction satisfies the ATTEMPT only when its
             // consequential payload matches — a different payload
@@ -2294,7 +2291,7 @@ impl T1Journal {
     }
 
     pub fn is_committed(&self, id: TransactionId) -> bool {
-        self.state.committed_ids.contains(&id)
+        self.state.committed_index.contains_key(&id)
     }
 
     pub fn is_canceled(&self, id: TransactionId) -> bool {
@@ -2316,7 +2313,7 @@ impl T1Journal {
     /// `Readable` state of its capture frames is visible per
     /// consequence identity via [`Self::identity_status`].
     pub fn transaction_status(&self, id: TransactionId) -> Option<TransactionDurability> {
-        if self.state.committed_ids.contains(&id) {
+        if self.state.committed_index.contains_key(&id) {
             if self.acknowledged.contains(&id) {
                 Some(TransactionDurability::AcknowledgedT1)
             } else {
@@ -2368,9 +2365,8 @@ impl T1Journal {
         self.platform_tier
     }
 
-    /// The number of fsync barriers performed (creation plus one per
-    /// completed transaction or cancellation — the efficiency
-    /// evidence for the one-fsync-per-transaction rule).
+    /// Successful durability barriers, including creation, ordinary commits
+    /// and cancellations, and any barrier required to resolve an ambiguous write.
     pub fn sync_count(&self) -> u64 {
         self.sync_count
     }
@@ -2391,17 +2387,49 @@ impl T1Journal {
         self.file.write_all(bytes)
     }
 
-    fn sync(&mut self) -> Result<(), JournalError> {
-        self.file
-            .sync_all()
-            .map(|()| {
-                self.sync_count += 1;
+    fn refresh_from_disk(&mut self) -> Result<(), JournalError> {
+        let bytes = read_journal_bytes(&self.path)?;
+        let state = match self.binding {
+            Some((founding, root_id)) => strict_bound_state(&bytes, &founding, &root_id)?,
+            None => match read_header(&bytes)? {
+                HeaderState::Valid { header_hash } => classify(&bytes, header_hash)?,
+                _ => {
+                    return Err(JournalError::CorruptHeader {
+                        detail: "an open journal lost its complete header".into(),
+                    });
+                }
+            },
+        };
+        // A complete frame may be visible in the OS cache after a failed
+        // flush. A fresh successful barrier is required before exposing it.
+        if self.needs_reconciliation {
+            self.sync()
+                .map_err(|e| io_err("sync reconciled journal", &self.path, e))?;
+        }
+        self.state = state;
+        self.resolve_tail()?;
+        self.needs_reconciliation = false;
+        Ok(())
+    }
+
+    fn sync_commit(&mut self, id: TransactionId) -> Result<(), JournalError> {
+        let barrier = match &self.fault {
+            Some(control) => control.check(JournalFaultPoint::CommitWritten),
+            None => Ok(()),
+        };
+        barrier
+            .and_then(|()| self.sync())
+            .map_err(|source| JournalError::AmbiguousCommit {
+                id,
+                stage: CommitStage::Sync,
+                source,
             })
-            .map_err(|e| JournalError::Io {
-                op: "sync journal",
-                path: self.path.display().to_string(),
-                source: e,
-            })
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        self.file.sync_all().map(|()| {
+            self.sync_count += 1;
+        })
     }
 
     /// Truncates an unresolved inert tail to the last valid boundary
@@ -3199,6 +3227,89 @@ mod tests {
         );
         assert!(!journal.acknowledged_this_session(id));
         assert!(journal.is_actionable(id));
+    }
+
+    #[test]
+    fn bound_ambiguous_commit_reestablishes_durability_before_reconciliation() {
+        let dir = TestDir::new("bound-ambiguous");
+        let path = dir.journal();
+        let founding = hash_object(b"founding");
+        let root_id = hash_object(b"journal-root");
+        let mut journal = T1Journal::create_bound_generation(&path, &founding, &root_id).unwrap();
+        journal.fault = Some(
+            JournalFaultControl::new()
+                .arm(JournalFaultPoint::CommitWritten, FaultAction::InjectError),
+        );
+        let input = tx_input(1);
+        let before = journal.sync_count();
+        assert!(matches!(
+            journal.append_transaction(&input),
+            Err(JournalError::AmbiguousCommit {
+                stage: CommitStage::Sync,
+                ..
+            })
+        ));
+        assert_eq!(journal.sync_count(), before);
+        assert!(matches!(
+            journal.reconcile_write(&input).unwrap(),
+            WriteReconciliation::Committed { .. }
+        ));
+        assert_eq!(journal.sync_count(), before + 1);
+        assert!(!journal.acknowledged_this_session(input.transaction_id().unwrap()));
+        journal.fault = None;
+        journal.append_transaction(&tx_input(2)).unwrap();
+        assert_eq!(
+            scan_bound_file(&path, &founding, &root_id)
+                .unwrap()
+                .committed
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn writer_rejects_out_of_budget_records_before_writing_any_frames() {
+        let dir = TestDir::new("append-budget");
+        let path = dir.journal();
+        let mut journal = T1Journal::open(&path).unwrap();
+        let committed = journal.append_transaction(&tx_input(1)).unwrap();
+        let original = read_journal_bytes(&path).unwrap();
+        // Model the last committed boundary of a nearly full generation
+        // without allocating a multi-gigabyte fixture.
+        journal.state.append_offset = MAX_JOURNAL_FILE_BYTES - 1;
+        let assert_limit = |error| {
+            assert!(matches!(
+                error,
+                JournalError::Format(SaveError::Limit {
+                    kind: "file-length",
+                    ..
+                })
+            ))
+        };
+        assert_limit(journal.append_transaction(&tx_input(2)).unwrap_err());
+        assert_limit(
+            journal
+                .append_cancellation(committed.id, CancellationReason::CausalSupersession, b"")
+                .unwrap_err(),
+        );
+        assert_eq!(read_journal_bytes(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn capture_phase_failure_retries_on_the_same_handle() {
+        let dir = TestDir::new("capture-retry-live");
+        let path = dir.journal();
+        let input = tx_input(1);
+        let mut journal = faulted(&path, JournalFaultPoint::MidCaptureWrite).unwrap();
+        assert!(matches!(
+            journal.append_transaction(&input),
+            Err(JournalError::AbortedBeforeCommit { .. })
+        ));
+        journal.fault = None;
+        journal.append_transaction(&input).unwrap();
+        let scan = T1Journal::scan_file(&path).unwrap();
+        assert_eq!(scan.committed.len(), 1);
+        assert_eq!(scan.tail, TailState::Clean);
     }
 
     #[test]

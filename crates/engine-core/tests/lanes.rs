@@ -294,3 +294,22 @@ fn legacy_single_lane_is_deterministic_in_the_stage0_domain() {
     assert_eq!(first.state_fingerprint(), second.state_fingerprint());
     assert_eq!(first.stats().executed, first.stats().scheduled);
 }
+
+#[test]
+fn shared_prerequisites_release_fanout_once_in_order() {
+    let mut spine = Spine::with_reservation(CountingWorld::new(), 127, 63);
+    let first = spine.schedule(at(Field::Far, 2, 0)).unwrap();
+    let last = spine.schedule(at(Field::Far, 4, 1)).unwrap();
+    for payload in 2..2050 {
+        spine
+            .schedule(at(Field::Near, 1, payload).with_dependencies(vec![first, last, first]))
+            .unwrap();
+    }
+    spine.run_ticks(2);
+    assert_eq!(spine.blocked_count(), 2048);
+    assert_eq!(spine.world().executed, [0]);
+    assert_eq!(spine.suspend_matching(|v| v.payload == 27), 1);
+    assert_eq!(spine.resume_matching(|v| v.payload == 27), 1);
+    spine.run_to_completion(40);
+    assert_eq!(spine.world().executed, (0..2050).collect::<Vec<_>>());
+}

@@ -67,6 +67,8 @@ cargo run --release -p engine-slice -- --help                                   
 The pinned toolchain installs automatically via `rust-toolchain.toml`;
 the vendored SDL builds through the normal `cargo build` flow.
 
+[Player controls](docs/PLAYER-INPUT.md) covers rebinding, mouse sensitivity, and encounter HUD scale.
+
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or

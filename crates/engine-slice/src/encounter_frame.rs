@@ -41,6 +41,14 @@ struct SightKey {
 }
 
 impl EncounterFrame {
+    pub(crate) fn set_hud_scale(&mut self, scale: f32) {
+        self.hud.set_scale_multiplier(scale);
+    }
+
+    pub(crate) fn set_reset_label(&mut self, label: impl Into<String>) {
+        self.hud.set_reset_label(label.into());
+    }
+
     /// Consume each ordered fact once for all three consumers. Aging proceeds
     /// even on zero-tick, minimized, and terminal frames.
     pub fn observe(&mut self, demo: &mut EncounterDemo, dt: Duration, mut play: impl FnMut(Cue)) {

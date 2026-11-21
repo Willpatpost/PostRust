@@ -58,6 +58,16 @@ when reading results (yours or anyone's):
    avg)` line, and PresentMon's external count (the authority for avg FPS,
    1%-low FPS, and the frame-time distribution).
 
+The paced interval, poll-to-present duration, and GPU timestamp reports
+use bounded histograms over the full run, with a separately tracked maximum.
+Percentiles report bucket upper bounds within roughly 1.6% of the measured
+quantile. The paced interval includes deferred and minimized iterations.
+Poll-to-present measures frames that present and includes Vulkan blocking
+time. GPU timestamps cover samples collected from completed frame slots.
+The graphical persistence demo also reports p95, p99, and maximum
+complete-tick latency for region transitions, including any canonical
+confirmation on those ticks.
+
 A run is an **unrestricted-ceiling attempt** only when pacing was `uncapped`
 AND the resolved present mode was `immediate`. Anything less is bounded by an
 identifiable factor — report the factor, not just the number.

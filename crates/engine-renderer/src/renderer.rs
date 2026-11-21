@@ -3,6 +3,8 @@
 //! safe surface, and collects instrumentation.
 
 use ash::vk;
+use engine_core::timing::TimingSamples;
+use std::time::Duration;
 
 use sdl3::video::Window as SdlWindow;
 
@@ -87,37 +89,29 @@ pub struct RenderStats {
     pub overlay_truncated_vertices: u64,
     pub overlay_supplied_peak_vertices: u32,
     pub overlay_capacity_vertices: u32,
-    gpu_history_ms: Vec<f64>,
+    gpu_timing: TimingSamples,
 }
 
 impl RenderStats {
-    fn percentile(&self, quantile: f64) -> f64 {
-        if self.gpu_history_ms.is_empty() {
-            return 0.0;
-        }
-        let mut sorted = self.gpu_history_ms.clone();
-        sorted.sort_by(|a, b| a.total_cmp(b));
-        let index = ((quantile * sorted.len() as f64).ceil() as usize)
-            .saturating_sub(1)
-            .min(sorted.len() - 1);
-        sorted[index]
-    }
-
     /// GPU render time (timestamp-derived), millisecond percentiles.
     pub fn gpu_ms_p50(&self) -> f64 {
-        self.percentile(0.50)
+        self.gpu_timing.percentile_ms(0.50)
     }
 
     pub fn gpu_ms_p95(&self) -> f64 {
-        self.percentile(0.95)
+        self.gpu_timing.percentile_ms(0.95)
     }
 
     pub fn gpu_ms_p99(&self) -> f64 {
-        self.percentile(0.99)
+        self.gpu_timing.percentile_ms(0.99)
+    }
+
+    pub fn gpu_ms_max(&self) -> f64 {
+        self.gpu_timing.max_ms()
     }
 
     pub fn gpu_sample_count(&self) -> usize {
-        self.gpu_history_ms.len()
+        self.gpu_timing.sample_count()
     }
 }
 
@@ -169,7 +163,7 @@ impl Renderer {
                 return Err(error);
             }
         };
-        let (width, height) = window.size();
+        let (width, height) = window.size_in_pixels();
         let mut swapchain = match SwapchainState::new(
             &ctx,
             (width, height),
@@ -221,7 +215,7 @@ impl Renderer {
             overlay_truncated_vertices: 0,
             overlay_supplied_peak_vertices: 0,
             overlay_capacity_vertices: 0,
-            gpu_history_ms: Vec::new(),
+            gpu_timing: TimingSamples::default(),
         };
         Ok(Renderer {
             ctx,
@@ -266,7 +260,10 @@ impl Renderer {
     /// Draws the world, an optional foreground with independent depth,
     /// and one screen-space batch. World and foreground share the same
     /// scene slot, in that order. HUD and diagnostics share the overlay
-    /// slot in that order. All supplied batches are triangle lists (three
+    /// slot in that order. At capacity, foreground takes precedence over
+    /// world geometry and HUD takes precedence over diagnostics. Omitted
+    /// vertex counts are returned in `FrameResult::geometry`.
+    /// All supplied batches are triangle lists (three
     /// vertices per primitive). The diagnostics toggle controls only the text.
     pub fn render_layers(
         &mut self,
@@ -344,12 +341,11 @@ impl Renderer {
             self.stats.extent = (self.swapchain.extent.width, self.swapchain.extent.height);
             self.stats.swapchain_images = self.swapchain.image_count;
         }
-        if let Some(milliseconds) = outcome.gpu_render_ms {
-            self.stats.gpu_history_ms.push(milliseconds);
-            let len = self.stats.gpu_history_ms.len();
-            if len > 600 {
-                self.stats.gpu_history_ms.drain(0..len - 600);
-            }
+        if let Some(duration) = outcome
+            .gpu_render_ms
+            .and_then(|ms| Duration::try_from_secs_f64(ms / 1000.0).ok())
+        {
+            self.stats.gpu_timing.record(duration);
         }
         for (class, message) in drain_validation_messages() {
             match class {

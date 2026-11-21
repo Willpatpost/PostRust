@@ -15,7 +15,7 @@
 //!    `Vec` per executed event (`Spine`'s `scratch_follow_ups`, the
 //!    F-02 caller-held-scratch discipline applied to the spine).
 //! 3. A causality-blocked event that is only PARTIALLY released (some
-//!    dependencies executed, others not) is re-registered in place
+//!    dependencies executed, others not) keeps its other registrations
 //!    and never leaves the blocked map — a B-tree remove+reinsert
 //!    could deallocate and reallocate nodes per partial release (the
 //!    independent review's P1 correction; the scenario below
@@ -190,8 +190,8 @@ fn due_offset(clock_before: u64, offset: u64) -> Schedule {
 /// for its counted window. Wave shape: four four-deep execution chains
 /// (one per lane mix), two three-way fanouts, and one
 /// causality-blocked near-lane event with TWO dependencies resolving
-/// four ticks apart — it parks, is PARTIALLY released (in-place
-/// re-registration, the review's P1 path), and is fully released four
+/// four ticks apart — it parks, is PARTIALLY released (existing
+/// registrations, the review's P1 path), and is fully released four
 /// ticks after the partial release.
 ///
 /// The two dependency events are scheduled and the blocked event's

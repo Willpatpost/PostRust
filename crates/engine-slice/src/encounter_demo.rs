@@ -61,8 +61,8 @@ use engine_shell::{
 use crate::encounter_events::{PresentationEvent, PresentationStream, RayFact, RayImpact, Volley};
 use crate::encounter_frame::EncounterFrame;
 use crate::frame_timing::FrameTiming;
-use crate::math;
 use crate::playable_demo::{map_playable_input, playable_player_config};
+use crate::player_controls::{Action, PlayerControls};
 
 // ==================================================== the arena layout
 //
@@ -2172,6 +2172,17 @@ pub fn push_rotated_box(
 /// the basic overlay (SEAT F renders the refined presentation
 /// against the same `EncounterHud` read).
 pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
+    run_encounter_demo_with_hud_scale(options, 1.0)
+}
+
+/// Runs the encounter with HUD text and geometry scaled relative to the default.
+pub fn run_encounter_demo_with_hud_scale(
+    options: EncounterOptions,
+    hud_scale: f32,
+) -> Result<(), String> {
+    if !(0.75..=4.0).contains(&hud_scale) {
+        return Err("HUD scale must be a number from 0.75 to 4".to_owned());
+    }
     let shell_config = ShellConfig {
         title: "Cycle 5 — Courtyard encounter".to_string(),
         width: 1280,
@@ -2180,6 +2191,7 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
         driver: DriverPreference::Real,
     };
     let mut app = ShellApp::new(shell_config)?;
+    let controls = PlayerControls::load()?;
     app.set_relative_mouse(true);
 
     // C's capability (AUDIO-CUE-API contracts 1/3): construct ONCE
@@ -2187,6 +2199,8 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
     // to the observable Silent status, never an error.
     let mut audio = Audio::initialize(app.platform());
     let mut frame = EncounterFrame::default();
+    frame.set_reset_label(controls.key(Action::Reset).name());
+    frame.set_hud_scale(hud_scale);
 
     // The scene-separation idiom: a game scene — the default omitted
     // renderer with the demo's OWN geometry.
@@ -2230,9 +2244,14 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
             "  scene: the courtyard renders its own geometry — the Stage-2 demo \
              scene is omitted"
         );
-        println!(
-            "  controls: WASD move · mouse look · LMB fire · 1 precision / 2 spread / Q cycle · C camera · R reset · \
-             O overlay · Esc/close quit"
+        controls.print(
+            &[
+                Action::Reset,
+                Action::Precision,
+                Action::Spread,
+                Action::Cycle,
+            ],
+            true,
         );
         println!(
             "  the loop: cross the activation line → the adversaries wake → fight \
@@ -2240,7 +2259,7 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
         );
     }
 
-    let mut cpu_work_ms: Vec<f64> = Vec::new();
+    let mut cpu_work = engine_core::timing::TimingSamples::default();
     let mut presented: u64 = 0;
     let start = std::time::Instant::now();
     let frame_interval = if options.fps == 0 {
@@ -2255,7 +2274,12 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
     let mut diagnostic_at = None;
     loop {
         let frame_start = std::time::Instant::now();
-        let snapshot = app.frame();
+        let mut snapshot = app.frame();
+        let sprint_held = controls.map_frame(&mut snapshot, |key| app.is_held(key));
+        if snapshot.focus_lost || snapshot.minimized {
+            demo.driver.clear_pending_input();
+            demo.pending_fire = false;
+        }
         if snapshot.quit_requested || snapshot.keys_pressed.contains(&Keycode::Escape) {
             break;
         }
@@ -2264,7 +2288,7 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
         }
         let split = timing.begin_frame(frame_start, !snapshot.minimized);
 
-        let mapped = map_encounter_input(&snapshot, app.is_held(Keycode::LShift));
+        let mapped = map_encounter_input(&snapshot, sprint_held);
         if mapped.toggle_camera {
             demo.driver.state_mut().toggle_camera_mode();
         }
@@ -2318,7 +2342,7 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
                 let _ = writeln!(
                     diagnostic,
                     "CPU {:.2}  GPU {:.2} ms p95",
-                    math::percentile(&cpu_work_ms, 0.95),
+                    cpu_work.percentile_ms(0.95),
                     stats.gpu_ms_p95()
                 );
                 let _ = writeln!(
@@ -2352,11 +2376,7 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
 
         if frame_result.presented {
             presented += 1;
-            cpu_work_ms.push((frame_start.elapsed().as_secs_f64() * 1000.0).min(1000.0));
-            let len = cpu_work_ms.len();
-            if len > 600 {
-                cpu_work_ms.drain(0..len - 600);
-            }
+            cpu_work.record(frame_start.elapsed());
         }
         if let Some(limit) = options.frames
             && presented >= limit
@@ -2381,10 +2401,12 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
         presented as f64 / elapsed.as_secs_f64().max(0.001)
     );
     println!(
-        "cpu work (poll→present, excl. pacing sleep): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms",
-        math::percentile(&cpu_work_ms, 0.50),
-        math::percentile(&cpu_work_ms, 0.95),
-        math::percentile(&cpu_work_ms, 0.99)
+        "cpu work (poll→present, includes Vulkan waits): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms · max {:.2} ms ({} samples)",
+        cpu_work.percentile_ms(0.50),
+        cpu_work.percentile_ms(0.95),
+        cpu_work.percentile_ms(0.99),
+        cpu_work.max_ms(),
+        cpu_work.sample_count()
     );
     println!(
         "outcome: {} · rounds {} · fires {} · hits {} · blocked {} · out of range {} · \
@@ -2420,10 +2442,11 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
     );
     let stats = renderer.stats();
     println!(
-        "GPU p50/p95/p99 {:.3}/{:.3}/{:.3} ms ({} timestamps); peak scene/HUD vertices {}/{}; omitted {}/{}",
+        "GPU p50/p95/p99/max {:.3}/{:.3}/{:.3}/{:.3} ms ({} timestamps); peak scene/HUD vertices {}/{}; omitted {}/{}",
         stats.gpu_ms_p50(),
         stats.gpu_ms_p95(),
         stats.gpu_ms_p99(),
+        stats.gpu_ms_max(),
         stats.gpu_sample_count(),
         stats.region_supplied_peak_vertices,
         stats.overlay_supplied_peak_vertices,

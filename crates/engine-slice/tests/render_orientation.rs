@@ -130,7 +130,12 @@ fn world_renders_right_side_up_offscreen() {
                            overlay: Option<&str>| {
         let _snapshot = app.frame();
         renderer
-            .render_frame(frame_view_proj, scene, overlay, app.window_size())
+            .render_frame(
+                frame_view_proj,
+                scene,
+                overlay,
+                app.window().size_in_pixels(),
+            )
             .expect("the frame renders");
     };
 

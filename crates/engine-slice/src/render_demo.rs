@@ -330,8 +330,8 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
     } else {
         Camera::default()
     };
-    let mut cpu_work_ms: Vec<f64> = Vec::new();
-    let mut frame_intervals_ms: Vec<f64> = Vec::new();
+    let mut cpu_work = engine_core::timing::TimingSamples::default();
+    let mut frame_intervals = engine_core::timing::TimingSamples::default();
     // The overlay's LOD-levels line cache: rebuilt only when the
     // levels actually change (LOD transitions are rare), never per
     // frame.
@@ -370,13 +370,7 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
         let split = timing.begin_frame(frame_start, !snapshot.minimized);
         // Full frame interval — includes the previous iteration's
         // pacing sleep; distinct from the CPU work measurement below.
-        // Capped at 100 ms in the readout (it measures pacing quality,
-        // not stall length).
-        frame_intervals_ms.push((split.sim_advance.as_secs_f64() * 1000.0).min(100.0));
-        let len = frame_intervals_ms.len();
-        if len > 600 {
-            frame_intervals_ms.drain(0..len - 600);
-        }
+        frame_intervals.record(split.sim_advance);
 
         if snapshot.minimized {
             // Rendering is unavailable, but the application is still
@@ -451,7 +445,7 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
             let mut text = format!(
                 "Sektor7 Stage 2 - Vulkan\nFPS {:.0} (cpu work p95 {:.2} ms / gpu p95 {:.2} ms)\npresent {} / {}x{} / {} images / recreations {}\n{} {} / Vulkan {}\nvalidation {} (err {} / warn {})\nsim tick {} @ {} Hz · out {} · ev/s {:.0}\nnear/far {}/{} · pend {} · blk {} · late {} · bud-exh {}\nwm {} / {}\ncam ({:.1}, {:.1}, {:.1}) yaw {:.2} pitch {:.2}",
                 presented as f64 / elapsed,
-                math::percentile(&cpu_work_ms, 0.95),
+                cpu_work.percentile_ms(0.95),
                 stats.gpu_ms_p95(),
                 stats.present_mode,
                 width,
@@ -520,10 +514,10 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
         });
 
         let window_size = if options.resize_test && presented == 10 {
-            let (width, height) = app.window_size();
+            let (width, height) = app.window().size_in_pixels();
             (width + 128, height + 72)
         } else {
-            app.window_size()
+            app.window().size_in_pixels()
         };
         let frame_result = renderer
             .render_frame(
@@ -547,11 +541,7 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
             // CPU work duration: poll → camera → overlay build → render
             // → present call, excluding the pacing sleep (distinct from
             // the paced frame interval above).
-            cpu_work_ms.push((frame_start.elapsed().as_secs_f64() * 1000.0).min(1000.0));
-            let len = cpu_work_ms.len();
-            if len > 600 {
-                cpu_work_ms.drain(0..len - 600);
-            }
+            cpu_work.record(frame_start.elapsed());
         }
         if let Some(limit) = options.frames
             && presented >= limit
@@ -576,27 +566,32 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
         presented as f64 / elapsed.as_secs_f64().max(0.001)
     );
     println!(
-        "cpu work (poll→present, excl. pacing sleep): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms",
-        math::percentile(&cpu_work_ms, 0.50),
-        math::percentile(&cpu_work_ms, 0.95),
-        math::percentile(&cpu_work_ms, 0.99)
+        "cpu work (poll→present, includes Vulkan waits): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms · max {:.2} ms ({} samples)",
+        cpu_work.percentile_ms(0.50),
+        cpu_work.percentile_ms(0.95),
+        cpu_work.percentile_ms(0.99),
+        cpu_work.max_ms(),
+        cpu_work.sample_count()
     );
     println!(
-        "paced frame interval (incl. pacing sleep; target {}): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms",
+        "paced frame interval (incl. pacing sleep; target {}): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms · max {:.2} ms ({} samples)",
         match options.fps {
             0 => "uncapped".to_string(),
             fps => format!("{fps} fps"),
         },
-        math::percentile(&frame_intervals_ms, 0.50),
-        math::percentile(&frame_intervals_ms, 0.95),
-        math::percentile(&frame_intervals_ms, 0.99)
+        frame_intervals.percentile_ms(0.50),
+        frame_intervals.percentile_ms(0.95),
+        frame_intervals.percentile_ms(0.99),
+        frame_intervals.max_ms(),
+        frame_intervals.sample_count()
     );
     println!(
-        "gpu render (timestamps, {} samples): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms",
+        "gpu render (timestamps, {} samples): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms · max {:.2} ms",
         stats.gpu_sample_count(),
         stats.gpu_ms_p50(),
         stats.gpu_ms_p95(),
-        stats.gpu_ms_p99()
+        stats.gpu_ms_p99(),
+        stats.gpu_ms_max()
     );
     println!(
         "present mode {} · swapchain recreations {} · validation err/warn {}/{}",

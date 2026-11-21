@@ -2446,8 +2446,10 @@ pub fn publish_journal_root_binding(
         }
         let bootstrap_journal = std::path::Path::new(location);
         let bootstrap_bytes =
-            std::fs::read(bootstrap_journal).map_err(|_error| MediumError::Chain {
-                rule: "journal-root/bootstrap-evidence-missing",
+            crate::journal::read_journal_bytes(bootstrap_journal).map_err(|_error| {
+                MediumError::Chain {
+                    rule: "journal-root/bootstrap-evidence-missing",
+                }
             })?;
         match crate::journal::read_bound_header(&bootstrap_bytes, founding, root_id) {
             Ok(crate::journal::BoundHeaderState::Matching { .. }) => {}
@@ -2623,8 +2625,8 @@ pub fn collect_bound_reclaimable_journal_files(
             continue;
         }
         let path = journal_root.with_file_name(&name);
-        let bytes =
-            std::fs::read(&path).map_err(|_error| refused("journal-root/generation-missing"))?;
+        let bytes = crate::journal::read_journal_bytes(&path)
+            .map_err(|_error| refused("journal-root/generation-missing"))?;
         match crate::journal::read_bound_header(&bytes, founding, root_id) {
             Ok(crate::journal::BoundHeaderState::Matching { .. }) => {}
             _ => return Err(refused("journal-root/generation-identity-mismatch")),

@@ -45,6 +45,7 @@ use engine_shell::{DriverPreference, InputSnapshot, Keycode, ShellApp, ShellConf
 
 use crate::frame_timing::FrameTiming;
 use crate::math;
+use crate::player_controls::{Action, PlayerControls};
 
 // ==================================================== the gatehouse layout
 //
@@ -622,31 +623,13 @@ pub struct PlayableMappedInput {
 /// toggles the camera; focus loss and minimization neutralize
 /// everything (the shell's anti-stuck discipline).
 pub fn map_playable_input(snapshot: &InputSnapshot, sprint_held: bool) -> PlayableMappedInput {
-    let neutral = snapshot.focus_lost || snapshot.minimized;
-    let intent = if neutral {
-        MoveIntent::default()
-    } else {
-        MoveIntent {
-            forward: snapshot.move_forward,
-            strafe: snapshot.move_strafe,
-            jump_pressed: snapshot.keys_pressed.contains(&Keycode::Space),
-            sprint: sprint_held,
-            look: (
-                // The post-orientation hardening: mouse-X is negated
-                // at the mapping — this engine's +yaw turns toward
-                // world-LEFT (look_direction = [−sin(yaw), …]), so a
-                // rightward mouse delta must produce a NEGATIVE yaw
-                // delta to turn the view right. The vertical mapping
-                // below is unchanged.
-                -snapshot.look_delta.0 * crate::player_demo::DEMO_LOOK_SENSITIVITY,
-                -snapshot.look_delta.1 * crate::player_demo::DEMO_LOOK_SENSITIVITY,
-            ),
-        }
-    };
+    let player = crate::player_demo::map_intent(snapshot, sprint_held);
     PlayableMappedInput {
-        intent,
-        interact_pressed: !neutral && snapshot.keys_pressed.contains(&Keycode::E),
-        toggle_camera: !neutral && snapshot.keys_pressed.contains(&Keycode::C),
+        intent: player.intent,
+        interact_pressed: !snapshot.focus_lost
+            && !snapshot.minimized
+            && snapshot.keys_pressed.contains(&Keycode::E),
+        toggle_camera: player.toggle_camera,
     }
 }
 
@@ -1050,6 +1033,7 @@ pub fn run_playable_demo(options: PlayableOptions) -> Result<(), String> {
         driver: DriverPreference::Real,
     };
     let mut app = ShellApp::new(shell_config)?;
+    let controls = PlayerControls::load()?;
     app.set_relative_mouse(true);
 
     // The P3 omission, stated explicitly: the playable world renders
@@ -1090,17 +1074,15 @@ pub fn run_playable_demo(options: PlayableOptions) -> Result<(), String> {
              courtyard floor) — the Stage-2 demo scene is omitted; --render keeps \
              the original demonstration"
         );
+        controls.print(&[Action::Interact], false);
         println!(
-            "  controls: WASD move · Space jump · Shift sprint · E interact · \
-             C camera mode · mouse look · O overlay · Esc/close quit"
-        );
-        println!(
-            "  the loop: climb the stairs → toggle the switch (E) → the gate opens → \
+            "  the loop: climb the stairs → toggle the switch → the gate opens → \
              the corridor (third person pulls in) → collect 3 pickups → the goal pad"
         );
     }
 
-    let mut cpu_work_ms: Vec<f64> = Vec::new();
+    let mut cpu_work = engine_core::timing::TimingSamples::default();
+    let interact_label = controls.key(Action::Interact).name();
     let mut presented: u64 = 0;
     let start = Instant::now();
     let frame_interval = if options.fps == 0 {
@@ -1115,7 +1097,11 @@ pub fn run_playable_demo(options: PlayableOptions) -> Result<(), String> {
 
     loop {
         let frame_start = Instant::now();
-        let snapshot = app.frame();
+        let mut snapshot = app.frame();
+        let sprint_held = controls.map_frame(&mut snapshot, |key| app.is_held(key));
+        if snapshot.focus_lost || snapshot.minimized {
+            demo.driver.clear_pending_input();
+        }
         if snapshot.quit_requested || snapshot.keys_pressed.contains(&Keycode::Escape) {
             break;
         }
@@ -1124,7 +1110,7 @@ pub fn run_playable_demo(options: PlayableOptions) -> Result<(), String> {
         }
         let split = timing.begin_frame(frame_start, !snapshot.minimized);
 
-        let mapped = map_playable_input(&snapshot, app.is_held(Keycode::LShift));
+        let mapped = map_playable_input(&snapshot, sprint_held);
         if mapped.toggle_camera {
             demo.driver.state_mut().toggle_camera_mode();
         }
@@ -1162,11 +1148,11 @@ pub fn run_playable_demo(options: PlayableOptions) -> Result<(), String> {
             let elapsed = start.elapsed().as_secs_f64().max(0.001);
             let stats = renderer.stats();
             let target_line = match demo.current_target() {
-                Some((id, _)) if id == SWITCH_ID => "[E] toggle the switch".to_string(),
+                Some((id, _)) if id == SWITCH_ID => format!("[{interact_label}] toggle the switch"),
                 Some((id, _)) if PICKUP_IDS.contains(&id) => {
-                    format!("[E] collect pickup {}", PICKUP_IDS.iter().position(|p| *p == id).unwrap() + 1)
+                    format!("[{interact_label}] collect pickup {}", PICKUP_IDS.iter().position(|p| *p == id).unwrap() + 1)
                 }
-                Some((id, _)) => format!("[E] interact {id}"),
+                Some((id, _)) => format!("[{interact_label}] interact {id}"),
                 None => {
                     if demo.gatehouse.switch_on {
                         "no target — the gate is open".to_string()
@@ -1196,7 +1182,7 @@ pub fn run_playable_demo(options: PlayableOptions) -> Result<(), String> {
                  cam {} {}/{} m (obstruction {})\n\
                  move tick {} @ {} Hz · out {} · refused {}",
                 presented as f64 / elapsed,
-                math::percentile(&cpu_work_ms, 0.95),
+                cpu_work.percentile_ms(0.95),
                 stats.device_type,
                 stats.gpu_name,
                 stats.api_version,
@@ -1231,7 +1217,7 @@ pub fn run_playable_demo(options: PlayableOptions) -> Result<(), String> {
                 &view_proj,
                 &scene_vertices,
                 overlay_text.as_deref(),
-                app.window_size(),
+                app.window().size_in_pixels(),
             )
             .map_err(|error| format!("{error}"))?;
 
@@ -1242,11 +1228,7 @@ pub fn run_playable_demo(options: PlayableOptions) -> Result<(), String> {
 
         if frame_result.presented {
             presented += 1;
-            cpu_work_ms.push((frame_start.elapsed().as_secs_f64() * 1000.0).min(1000.0));
-            let len = cpu_work_ms.len();
-            if len > 600 {
-                cpu_work_ms.drain(0..len - 600);
-            }
+            cpu_work.record(frame_start.elapsed());
         }
         if let Some(limit) = options.frames
             && presented >= limit
@@ -1271,10 +1253,12 @@ pub fn run_playable_demo(options: PlayableOptions) -> Result<(), String> {
         presented as f64 / elapsed.as_secs_f64().max(0.001)
     );
     println!(
-        "cpu work (poll→present, excl. pacing sleep): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms",
-        math::percentile(&cpu_work_ms, 0.50),
-        math::percentile(&cpu_work_ms, 0.95),
-        math::percentile(&cpu_work_ms, 0.99)
+        "cpu work (poll→present, includes Vulkan waits): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms · max {:.2} ms ({} samples)",
+        cpu_work.percentile_ms(0.50),
+        cpu_work.percentile_ms(0.95),
+        cpu_work.percentile_ms(0.99),
+        cpu_work.max_ms(),
+        cpu_work.sample_count()
     );
     println!(
         "goal: {} · pickups {}/3 · switch {} · events {}",

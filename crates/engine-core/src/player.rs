@@ -1002,10 +1002,9 @@ pub struct DriveStep {
 /// Fixed-step movement driver — the SimDriver discipline applied to
 /// the player: elapsed monotonic time decides WHEN ticks are due;
 /// logical state ever sees only the fixed tick. `advance` is the
-/// frame-sampled live-input path (every tick in one frame's catch-up
-/// batch consumes the same live intent sample — a genuinely
-/// cadence-dependent external input, exactly like camera presence; no
-/// cross-cadence determinism is claimed through it). `run_headless`
+/// live-input path. Held movement applies to every tick in the frame.
+/// Mouse displacement and jump presses accumulate until the next tick
+/// and are consumed once. `run_headless`
 /// is the scripted deterministic path: the intent is a function of the
 /// logical tick index, so trace history is cadence-independent.
 pub struct PlayerDriver {
@@ -1016,6 +1015,8 @@ pub struct PlayerDriver {
     period_ns: u128,
     max_catchup_per_frame: u32,
     accumulator_ns: u128,
+    pending_look: (f32, f32),
+    pending_jump: bool,
     total_advanced_ns: u128,
     headless_ticks: u64,
     executed_ticks: u64,
@@ -1061,6 +1062,8 @@ impl PlayerDriver {
             period_ns: 1_000_000_000u128 / u128::from(rate),
             max_catchup_per_frame: max_catchup_per_frame.max(1),
             accumulator_ns: 0,
+            pending_look: (0.0, 0.0),
+            pending_jump: false,
             total_advanced_ns: 0,
             headless_ticks: 0,
             executed_ticks: 0,
@@ -1104,6 +1107,12 @@ impl PlayerDriver {
         self.world = world;
     }
 
+    /// Discards unconsumed mouse and jump input when the window loses focus.
+    pub fn clear_pending_input(&mut self) {
+        self.pending_look = (0.0, 0.0);
+        self.pending_jump = false;
+    }
+
     /// Advances by elapsed monotonic time (frame-sampled live
     /// intent). R4b: the due-tick arithmetic is u128-wide with u64
     /// public accounting — exact across the whole tick-rate range
@@ -1142,8 +1151,16 @@ impl PlayerDriver {
         self.accumulator_ns += granted;
         let due = self.accumulator_ns / self.period_ns;
         let executed = due.min(u128::from(self.max_catchup_per_frame));
+        self.pending_look.0 += intent.look.0;
+        self.pending_look.1 += intent.look.1;
+        self.pending_jump |= intent.jump_pressed;
         for index in 0..executed {
-            self.tick(intent);
+            let tick_intent = MoveIntent {
+                look: std::mem::take(&mut self.pending_look),
+                jump_pressed: std::mem::take(&mut self.pending_jump),
+                ..intent
+            };
+            self.tick(tick_intent);
             after_step(&self.state, index as u64 + 1);
         }
         self.accumulator_ns -= executed * self.period_ns;
@@ -1715,6 +1732,56 @@ mod tests {
         );
         assert_eq!(bits(corrupt.position), position_before);
         assert_eq!(bits(corrupt.velocity), velocity_before);
+    }
+
+    #[test]
+    fn live_input_consumes_displacement_and_jump_once() {
+        let mut state = PlayerState::spawn([0.0; 3]);
+        state.on_ground = true;
+        let mut driver = PlayerDriver::new(
+            state,
+            PlayerConfig::default(),
+            CollisionWorld::new(0.0),
+            100,
+        );
+        let press = MoveIntent {
+            look: (0.125, 0.0625),
+            jump_pressed: true,
+            ..idle()
+        };
+        assert_eq!(
+            driver
+                .advance(Duration::from_millis(3), press)
+                .executed_ticks,
+            0
+        );
+        driver.advance(
+            Duration::from_millis(2),
+            MoveIntent {
+                look: (0.125, 0.0),
+                ..idle()
+            },
+        );
+        let mut observed = Vec::new();
+        let step = driver.advance_observed(Duration::from_millis(25), idle(), |state, _| {
+            observed.push((state.yaw, state.pitch, state.velocity[1]));
+        });
+        assert_eq!(step.executed_ticks, 3);
+        assert!(
+            observed
+                .iter()
+                .all(|&(yaw, pitch, _)| (yaw, pitch) == (0.25, 0.0625))
+        );
+        assert!(observed[0].2 > 0.0, "jump captured before the first tick");
+        assert!(observed[1].2 < observed[0].2);
+
+        driver.advance(Duration::ZERO, press);
+        driver.clear_pending_input();
+        driver.state_mut().on_ground = true;
+        driver.state_mut().velocity = [0.0; 3];
+        driver.advance(Duration::from_millis(10), idle());
+        assert_eq!(driver.state().yaw, 0.25);
+        assert!(driver.state().velocity[1] <= 0.0);
     }
 
     #[test]

@@ -57,6 +57,7 @@ pub mod lod;
 pub mod npc_world_save;
 pub mod player;
 pub mod spine;
+pub mod timing;
 pub mod weapons;
 pub mod wire;
 

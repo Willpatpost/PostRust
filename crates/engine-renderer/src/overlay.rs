@@ -19,9 +19,8 @@ const SCALE: f32 = 2.0;
 /// Maximum glyphs buffered (guard for the persistently mapped vertex
 /// buffer; ~6 KB of text).
 const MAX_GLYPHS: usize = 6_000;
-/// Overlay vertex-buffer capacity: generous worst-case glyph density
-/// (600k vertices ≈ 14 MB host-visible memory; typical stats text uses
-/// ~1–2% of it).
+/// Maximum total overlay capacity. Each frame slot grows independently
+/// on demand up to its share of this budget.
 pub fn overlay_capacity_vertices() -> u32 {
     600_000
 }

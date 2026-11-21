@@ -41,6 +41,7 @@ use engine_shell::{DriverPreference, InputSnapshot, Keycode, ShellApp, ShellConf
 
 use crate::frame_timing::FrameTiming;
 use crate::math;
+use crate::player_controls::PlayerControls;
 
 /// Demo movement tick rate (a demo policy value, not an engine-wide
 /// rate — the same reviewer clarification `sim.rs` records).
@@ -285,6 +286,7 @@ pub fn run_player_demo(options: PlayerOptions) -> Result<(), String> {
         driver: DriverPreference::Real,
     };
     let mut app = ShellApp::new(shell_config)?;
+    let controls = PlayerControls::load()?;
     app.set_relative_mouse(true);
 
     // The explicit opt-in (P3): this demo's collision world IS the
@@ -326,17 +328,14 @@ pub fn run_player_demo(options: PlayerOptions) -> Result<(), String> {
             stats.extent.1,
             stats.validation_active
         );
-        println!(
-            "  controls: WASD move · Space jump · Shift sprint · C camera mode · \
-             mouse look · O overlay · Esc/close quit"
-        );
+        controls.print(&[], false);
         println!(
             "  movement: fixed {} Hz tick · budgeted catch-up · no-discard accounting",
             DEMO_TICK_HZ
         );
     }
 
-    let mut cpu_work_ms: Vec<f64> = Vec::new();
+    let mut cpu_work = engine_core::timing::TimingSamples::default();
     let mut presented: u64 = 0;
     let start = Instant::now();
     let frame_interval = if options.fps == 0 {
@@ -353,7 +352,11 @@ pub fn run_player_demo(options: PlayerOptions) -> Result<(), String> {
 
     loop {
         let frame_start = Instant::now();
-        let snapshot = app.frame();
+        let mut snapshot = app.frame();
+        let sprint_held = controls.map_frame(&mut snapshot, |key| app.is_held(key));
+        if snapshot.focus_lost || snapshot.minimized {
+            driver.clear_pending_input();
+        }
         if snapshot.quit_requested || snapshot.keys_pressed.contains(&Keycode::Escape) {
             break;
         }
@@ -365,7 +368,7 @@ pub fn run_player_demo(options: PlayerOptions) -> Result<(), String> {
         // Movement advances on the full raw interval — render pacing
         // never gates the fixed-step tick (the charter requirement);
         // minimized frames accrue their ticks like everyone else's.
-        let mapped = map_intent(&snapshot, app.is_held(Keycode::LShift));
+        let mapped = map_intent(&snapshot, sprint_held);
         if mapped.toggle_camera {
             driver.state_mut().toggle_camera_mode();
         }
@@ -421,7 +424,7 @@ pub fn run_player_demo(options: PlayerOptions) -> Result<(), String> {
                  move tick {} @ {} Hz · out {} · due {}\n\
                  cam {} ({:.1}, {:.1}, {:.1}) yaw {:.2} pitch {:.2}",
                 presented as f64 / elapsed,
-                math::percentile(&cpu_work_ms, 0.95),
+                cpu_work.percentile_ms(0.95),
                 stats.device_type,
                 stats.gpu_name,
                 stats.api_version,
@@ -453,7 +456,7 @@ pub fn run_player_demo(options: PlayerOptions) -> Result<(), String> {
                 &view_proj,
                 &player_proxy,
                 overlay_text.as_deref(),
-                app.window_size(),
+                app.window().size_in_pixels(),
             )
             .map_err(|error| format!("{error}"))?;
 
@@ -464,11 +467,7 @@ pub fn run_player_demo(options: PlayerOptions) -> Result<(), String> {
 
         if frame_result.presented {
             presented += 1;
-            cpu_work_ms.push((frame_start.elapsed().as_secs_f64() * 1000.0).min(1000.0));
-            let len = cpu_work_ms.len();
-            if len > 600 {
-                cpu_work_ms.drain(0..len - 600);
-            }
+            cpu_work.record(frame_start.elapsed());
         }
         if let Some(limit) = options.frames
             && presented >= limit
@@ -494,10 +493,12 @@ pub fn run_player_demo(options: PlayerOptions) -> Result<(), String> {
         presented as f64 / elapsed.as_secs_f64().max(0.001)
     );
     println!(
-        "cpu work (poll→present, excl. pacing sleep): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms",
-        math::percentile(&cpu_work_ms, 0.50),
-        math::percentile(&cpu_work_ms, 0.95),
-        math::percentile(&cpu_work_ms, 0.99)
+        "cpu work (poll→present, includes Vulkan waits): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms · max {:.2} ms ({} samples)",
+        cpu_work.percentile_ms(0.50),
+        cpu_work.percentile_ms(0.95),
+        cpu_work.percentile_ms(0.99),
+        cpu_work.max_ms(),
+        cpu_work.sample_count()
     );
     println!(
         "present mode {} · swapchain recreations {} · validation err/warn {}/{}",

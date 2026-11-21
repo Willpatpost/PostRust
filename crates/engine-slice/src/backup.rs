@@ -444,8 +444,12 @@ pub fn backup_campaign(
     drop(journal_guard);
     // (4) The captured set's own coherence: the database validates to
     // the source's chain; the journal hash binds.
-    let journal_bytes = fs::read(&backup_journal)
-        .map_err(|e| io_err("read the captured journal", &backup_journal, e))?;
+    let journal_bytes =
+        engine_persist::journal::read_journal_bytes(&backup_journal).map_err(|error| {
+            BackupError::Incoherent {
+                detail: error.to_string(),
+            }
+        })?;
     let journal_sha256 = hash_object(&journal_bytes);
     let mut audit = SqliteMedium::open_read_only(&backup_db).map_err(BackupError::Medium)?;
     let captured = audit.validate().map_err(BackupError::Medium)?;
@@ -567,8 +571,12 @@ pub fn verify_backup(backup_dir: &Path) -> Result<ChainSummary, BackupError> {
             ),
         });
     }
-    let journal_bytes = fs::read(&backup_journal)
-        .map_err(|e| io_err("read the captured journal", &backup_journal, e))?;
+    let journal_bytes =
+        engine_persist::journal::read_journal_bytes(&backup_journal).map_err(|error| {
+            BackupError::Incoherent {
+                detail: error.to_string(),
+            }
+        })?;
     if hash_object(&journal_bytes) != manifest.journal_sha256 {
         return Err(BackupError::Incoherent {
             detail: "the captured journal does not hash to the manifest's binding \

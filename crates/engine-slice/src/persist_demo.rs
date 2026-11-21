@@ -884,6 +884,8 @@ pub struct PersistDemo {
     /// schema field (the confirmation latency already lives in the
     /// persistence evidence family).
     boundary_ms_history: Vec<f64>,
+    /// Complete boundary duration for every tick that changed region LOD.
+    region_boundaries: engine_core::timing::TimingSamples,
     /// The FULL-RUN maximum complete-boundary duration and its
     /// campaign tick (the S6-C4 review corrective): unlike the
     /// rolling 600-tick window — whose percentiles lose an early
@@ -929,6 +931,7 @@ impl PersistDemo {
             headless_ticks: 0,
             tick_ms_history: Vec::new(),
             boundary_ms_history: Vec::new(),
+            region_boundaries: engine_core::timing::TimingSamples::default(),
             boundary_max_ms: 0.0,
             boundary_max_tick: 0,
             presence: vec![DEMO_PRESENCE],
@@ -1356,7 +1359,8 @@ impl PersistDemo {
                     report.regions_transitioned.contains(&region)
                         && self.session.region_level(region) == LodLevel::Dormant
                 });
-            if !report.regions_transitioned.is_empty() {
+            let transitioned = !report.regions_transitioned.is_empty();
+            if transitioned {
                 // A capture-bearing boundary occurred: drive the
                 // required canonical confirmation (the tests'
                 // discipline — T1 durability precedes it, and the
@@ -1438,7 +1442,11 @@ impl PersistDemo {
             // any capture-bearing canonical confirmation included that
             // `tick_ms` (the `session.tick` call alone, its existing
             // meaning preserved) structurally excludes.
-            let boundary_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let boundary_duration = start.elapsed();
+            if transitioned {
+                self.region_boundaries.record(boundary_duration);
+            }
+            let boundary_ms = boundary_duration.as_secs_f64() * 1000.0;
             self.boundary_ms_history.push(boundary_ms);
             let boundary_len = self.boundary_ms_history.len();
             if boundary_len > 600 {
@@ -2684,8 +2692,8 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         position: [100.0, 2.0, 9.0],
         ..Camera::default()
     };
-    let mut cpu_work_ms: Vec<f64> = Vec::new();
-    let mut frame_intervals_ms: Vec<f64> = Vec::new();
+    let mut cpu_work = engine_core::timing::TimingSamples::default();
+    let mut frame_intervals = engine_core::timing::TimingSamples::default();
     // The overlay's LOD-levels line cache: the compact form is rebuilt
     // only when the levels actually change (LOD transitions are rare —
     // a handful per campaign minute), never per frame.
@@ -2790,11 +2798,7 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         }
 
         let split = frame_timing.begin_frame(frame_start, !snapshot.minimized);
-        frame_intervals_ms.push((split.sim_advance.as_secs_f64() * 1000.0).min(100.0));
-        let len = frame_intervals_ms.len();
-        if len > 600 {
-            frame_intervals_ms.drain(0..len - 600);
-        }
+        frame_intervals.record(split.sim_advance);
         evidence_sample_index += 1;
 
         if snapshot.minimized {
@@ -2899,7 +2903,7 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
             let mut text = format!(
                 "Sektor7 Slice 0 - integration demo\nFPS {:.0} (cpu work p95 {:.2} ms / gpu p95 {:.2} ms)\npresent {} / {}x{} / {} images / recreations {}\n{} {} / Vulkan {}\nvalidation {} (err {} / warn {})\nsim tick {} @ {} Hz · out {} · ev/s {:.0}\nnear/far {}/{} · pend {} · blk {} · late {} · bud-exh {}\nwm {} / {}\ncam ({:.1}, {:.1}, {:.1}) yaw {:.2} pitch {:.2}",
                 presented as f64 / elapsed,
-                math::percentile(&cpu_work_ms, 0.95),
+                cpu_work.percentile_ms(0.95),
                 stats.gpu_ms_p95(),
                 stats.present_mode,
                 width,
@@ -3001,7 +3005,7 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
             &view_proj,
             region_scene,
             overlay_text.as_deref(),
-            app.window_size(),
+            app.window().size_in_pixels(),
         ) {
             Ok(result) => result,
             Err(error) => {
@@ -3050,11 +3054,7 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
 
         if frame_result.presented {
             presented += 1;
-            cpu_work_ms.push((frame_start.elapsed().as_secs_f64() * 1000.0).min(1000.0));
-            let len = cpu_work_ms.len();
-            if len > 600 {
-                cpu_work_ms.drain(0..len - 600);
-            }
+            cpu_work.record(frame_start.elapsed());
         }
         if let Some(limit) = options.frames
             && presented >= limit
@@ -3125,17 +3125,28 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         presented as f64 / elapsed.as_secs_f64().max(0.001)
     );
     println!(
-        "cpu work (poll→present, excl. pacing sleep): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms",
-        math::percentile(&cpu_work_ms, 0.50),
-        math::percentile(&cpu_work_ms, 0.95),
-        math::percentile(&cpu_work_ms, 0.99)
+        "cpu work (poll→present, includes Vulkan waits): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms · max {:.2} ms ({} samples)",
+        cpu_work.percentile_ms(0.50),
+        cpu_work.percentile_ms(0.95),
+        cpu_work.percentile_ms(0.99),
+        cpu_work.max_ms(),
+        cpu_work.sample_count()
     );
     println!(
-        "gpu render (timestamps, {} samples): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms",
+        "paced frame interval (incl. pacing sleep): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms · max {:.2} ms ({} samples)",
+        frame_intervals.percentile_ms(0.50),
+        frame_intervals.percentile_ms(0.95),
+        frame_intervals.percentile_ms(0.99),
+        frame_intervals.max_ms(),
+        frame_intervals.sample_count()
+    );
+    println!(
+        "gpu render (timestamps, {} samples): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms · max {:.2} ms",
         stats.gpu_sample_count(),
         stats.gpu_ms_p50(),
         stats.gpu_ms_p95(),
-        stats.gpu_ms_p99()
+        stats.gpu_ms_p99(),
+        stats.gpu_ms_max()
     );
     println!(
         "present mode {} · swapchain recreations {} · validation err/warn {}/{}",
@@ -3144,6 +3155,16 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         stats.validation_errors,
         stats.validation_warnings
     );
+    if demo.region_boundaries.sample_count() > 0 {
+        println!(
+            "region transition boundary (includes confirmation): p95 {:.3} ms · p99 {:.3} ms · max {:.3} ms ({} ticks)",
+            demo.region_boundaries.percentile_ms(0.95),
+            demo.region_boundaries.percentile_ms(0.99),
+            demo.region_boundaries.max_ms(),
+            demo.region_boundaries.sample_count()
+        );
+    }
+
     // F-03 Step 1: dynamic-geometry truncation belongs in the run
     // summary — zero on every ordinary run; nonzero is reported with
     // the supplied/capacity context, never fatal.

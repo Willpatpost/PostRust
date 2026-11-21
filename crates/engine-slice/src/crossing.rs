@@ -1006,12 +1006,13 @@ impl<S: MediumSource> SessionCrossing<S> {
         // conservative ambiguous-recovery policy — the automatic
         // repair is prohibited).
         if journal_path.exists() {
-            let residue_bytes = std::fs::read(journal_path).map_err(|_error| {
-                TransitionError::InstallIncompatible {
-                    region: 0,
-                    detail: "journal-root/residue-unreadable",
-                }
-            })?;
+            let residue_bytes =
+                engine_persist::journal::read_journal_bytes(journal_path).map_err(|_error| {
+                    TransitionError::InstallIncompatible {
+                        region: 0,
+                        detail: "journal-root/residue-unreadable",
+                    }
+                })?;
             match engine_persist::journal::read_bound_header(&residue_bytes, &founding, &root_id) {
                 Err(_error) => {
                     return Err(TransitionError::InstallIncompatible {

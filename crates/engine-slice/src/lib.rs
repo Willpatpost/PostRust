@@ -20,6 +20,7 @@ pub mod orchestration;
 pub mod perf_sweep;
 pub mod persist_demo;
 pub mod playable_demo;
+mod player_controls;
 pub mod player_demo;
 pub mod region;
 pub mod region_render;

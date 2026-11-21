@@ -53,7 +53,7 @@ ARM64) with a five-job CI:
   path** (2026-11-20): diagnostics construction is threshold-gated
   (`Diagnostics::would_log` — a suppressed record allocates nothing),
   handler follow-ups collect into a reused scratch, partially-released
-  blocked events re-register in place (never removed-and-reinserted),
+  blocked events keep their registrations on the remaining prerequisites,
   and the unmet-dependency paths are allocation-free — gated by the
   `spine_allocations` integration test (a counting global allocator
   pinning BOTH allocation events and bytes for a multi-dependency
@@ -121,13 +121,15 @@ re-measured from actual output on every change, never estimated):
 
 | CI partition | Linux | Windows |
 |---|---:|---:|
-| Main shard (`--workspace --exclude engine-slice`) | 1104 | 1053 |
-| Heavy shard (`-p engine-slice --features crash-test-seams`) | 565 | 564 |
-| **Combined** | **1669** | **1617** |
+| Main shard (`--workspace --exclude engine-slice`) | 1110 | 1059 |
+| Heavy shard (`-p engine-slice --features crash-test-seams`) | 569 | 568 |
+| **Combined** | **1679** | **1627** |
 
 (The macOS job runs its own execution partition — no combined count is
 defined for it. Ignored: 2 main / 7 heavy, all deliberate measurement soaks.
-**These are the PostRust-extraction counts** — MEASURED at `main` @
+The audit fixes add six main and three heavy tests across existing binaries.
+Both Windows shards ran locally. Linux expectations use the same
+platform-independent additions. The extraction baseline was measured at `main` @
 `b19d210` by five-job CI run `44827915274` (and identical at the Sektor7
 pre-extraction mainline `2640b64`, run `44825693818`): the Cycle-3-era
 values this table carried before the 2026-11-20 reconciliation (1011/960 +
@@ -253,6 +255,8 @@ The ledger is `docs/DECISIONS.md`; the load-bearing accepted decisions:
   DELIVERED in Cycle 1** (the fail-visible truncation counters — §2 —
   measured zero-truncation on every ordinary run, and the oversize
   lavapipe smoke proves the exact counting through the real render path);
+  The current renderer gives foreground and gameplay HUD vertices priority
+  within the existing caps and allocates overlay storage on demand.
   **Step 2** (constants-derived capacity + typed refusal at the
   `render_frame` boundary) remains deferred awaiting the owner's separate
   decision — the technical recommendation with alternatives and tradeoffs
@@ -362,12 +366,12 @@ The ledger is `docs/DECISIONS.md`; the load-bearing accepted decisions:
   region-vertex capacity** (F-03 — the truncation is now COUNTED and
   reported, measured zero on every ordinary run, but the capacity limit
   itself stands; the Step-2 refusal policy is deferred by design).
-- The player prototype is prototype-class: kinematic axis-aligned
-  collision only (no capsules/rotated geometry/slopes/moving platforms),
-  the third-person camera has no collision handling, controller state is
-  **transient** (not persisted; restart resets the player), movement runs
-  beside the spine (not as spine events), and **no human-played run has
-  occurred** — offscreen runs are correctness smokes.
+- Player movement uses kinematic box collision. The playable gatehouse and
+  courtyard encounter use a constrained third-person camera, and the
+  encounter includes rotated cover. Controller state remains transient and
+  movement runs beside the spine. The interactive demos provide rebindable
+  controls and adjustable mouse sensitivity, and the encounter also provides
+  user-controlled HUD scaling. See [Player controls](PLAYER-INPUT.md).
 - The sustained-load harness's documented Cycle-1 limitations: class 6's
   RegionDirector-protocol anchor is harness-driven (the director's own
   transition semantics stay covered by the regions/s6 suites, not the

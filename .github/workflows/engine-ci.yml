@@ -291,8 +291,9 @@ jobs:
           # +2 platform-uniform, confirmed by this candidate's own run —
           # a mismatch is corrected from actuals, never by weakening a
           # test.
-          expected=1104
-          if [ "$(uname -s)" != "Linux" ]; then expected=1053; fi
+          # Audit fixes add six platform-uniform tests in existing binaries (Windows 1059/2/32 measured locally).
+          expected=1110
+          if [ "$(uname -s)" != "Linux" ]; then expected=1059; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -866,8 +867,9 @@ jobs:
           # this candidate's own run; result lines unchanged (the same
           # combat_world binary). The main shard is untouched (every
           # batch-2 change is engine-slice).
-          expected=566
-          if [ "$(uname -s)" != "Linux" ]; then expected=565; fi
+          # Audit fixes add three platform-uniform tests in existing binaries (Windows 568/7/55 measured locally).
+          expected=569
+          if [ "$(uname -s)" != "Linux" ]; then expected=568; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)

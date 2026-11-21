@@ -91,6 +91,7 @@ use engine_shell::{
 use crate::frame_timing::FrameTiming;
 use crate::math;
 use crate::playable_demo::{map_playable_input, playable_player_config};
+use crate::player_controls::{Action, PlayerControls};
 
 // ==================================================== the arena layout
 //
@@ -1660,6 +1661,7 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
         driver: DriverPreference::Real,
     };
     let mut app = ShellApp::new(shell_config)?;
+    let controls = PlayerControls::load()?;
     app.set_relative_mouse(true);
 
     // SEAT C's capability (AUDIO-CUE-API.md contract 1/3): construct
@@ -1701,10 +1703,7 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
             stats.extent.1,
             stats.validation_active
         );
-        println!(
-            "  controls: WASD move · Space jump · Shift sprint · LMB fire · \
-             C camera mode · R reset the encounter · mouse look · O overlay · Esc/close quit"
-        );
+        controls.print(&[Action::Reset], true);
         println!(
             "  the encounter: cross the blue line to wake the adversary → \
              it pursues and attacks → fire back (range + line of sight \
@@ -1712,7 +1711,8 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
         );
     }
 
-    let mut cpu_work_ms: Vec<f64> = Vec::new();
+    let mut cpu_work = engine_core::timing::TimingSamples::default();
+    let reset_label = controls.key(Action::Reset).name();
     let mut presented: u64 = 0;
     let start = Instant::now();
     let frame_interval = if options.fps == 0 {
@@ -1742,7 +1742,12 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
 
     loop {
         let frame_start = Instant::now();
-        let snapshot = app.frame();
+        let mut snapshot = app.frame();
+        let sprint_held = controls.map_frame(&mut snapshot, |key| app.is_held(key));
+        if snapshot.focus_lost || snapshot.minimized {
+            demo.driver.clear_pending_input();
+            demo.pending_fire = false;
+        }
         if snapshot.quit_requested || snapshot.keys_pressed.contains(&Keycode::Escape) {
             break;
         }
@@ -1756,7 +1761,7 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
         }
         let split = timing.begin_frame(frame_start, !snapshot.minimized);
 
-        let mapped = map_combat_input(&snapshot, app.is_held(Keycode::LShift));
+        let mapped = map_combat_input(&snapshot, sprint_held);
         if mapped.toggle_camera {
             demo.driver.state_mut().toggle_camera_mode();
         }
@@ -1847,7 +1852,7 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
                 EncounterPhase::Dormant => "DORMANT - cross the blue line to start".to_string(),
                 EncounterPhase::Active => "ACTIVE - the adversary pursues".to_string(),
                 EncounterPhase::Won { tick } => {
-                    format!("WON at tick {tick} - [R] reset for another round")
+                    format!("WON at tick {tick} - [{reset_label}] reset for another round")
                 }
                 EncounterPhase::Lost { tick } => {
                     // The defeat banner (the vignette's HUD side): the
@@ -1855,7 +1860,7 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
                     // counters — a presentation of the existing
                     // record, never a new one.
                     format!(
-                        "DEFEAT at tick {tick} - the adversary prevails | [R] try again"
+                        "DEFEAT at tick {tick} - the adversary prevails | [{reset_label}] try again"
                     )
                 }
             };
@@ -1927,7 +1932,7 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
                  fires {} | hits {} | blocked {} | out of range {}\n\
                  move tick {} @ {} Hz | out {} | refused {}",
                 presented as f64 / elapsed,
-                math::percentile(&cpu_work_ms, 0.95),
+                cpu_work.percentile_ms(0.95),
                 stats.device_type,
                 stats.gpu_name,
                 stats.api_version,
@@ -1965,7 +1970,7 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
                 &view_proj,
                 &scene_vertices,
                 overlay_text.as_deref(),
-                app.window_size(),
+                app.window().size_in_pixels(),
             )
             .map_err(|error| format!("{error}"))?;
 
@@ -1976,11 +1981,7 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
 
         if frame_result.presented {
             presented += 1;
-            cpu_work_ms.push((frame_start.elapsed().as_secs_f64() * 1000.0).min(1000.0));
-            let len = cpu_work_ms.len();
-            if len > 600 {
-                cpu_work_ms.drain(0..len - 600);
-            }
+            cpu_work.record(frame_start.elapsed());
         }
         if let Some(limit) = options.frames
             && presented >= limit
@@ -2005,10 +2006,12 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
         presented as f64 / elapsed.as_secs_f64().max(0.001)
     );
     println!(
-        "cpu work (poll→present, excl. pacing sleep): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms",
-        math::percentile(&cpu_work_ms, 0.50),
-        math::percentile(&cpu_work_ms, 0.95),
-        math::percentile(&cpu_work_ms, 0.99)
+        "cpu work (poll→present, includes Vulkan waits): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms · max {:.2} ms ({} samples)",
+        cpu_work.percentile_ms(0.50),
+        cpu_work.percentile_ms(0.95),
+        cpu_work.percentile_ms(0.99),
+        cpu_work.max_ms(),
+        cpu_work.sample_count()
     );
     println!(
         "outcome: {} · fires {} · hits {} · attacks taken {}",

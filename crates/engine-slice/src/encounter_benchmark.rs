@@ -174,7 +174,8 @@ fn measure(
         let recording = (WARMUP..WARMUP + SAMPLES).contains(&index);
         let start = Instant::now();
         let snapshot = app.frame();
-        if snapshot.quit_requested || snapshot.minimized || app.window_size() != EXTENT {
+        if snapshot.quit_requested || snapshot.minimized || app.window().size_in_pixels() != EXTENT
+        {
             return Err("benchmark interrupted by close, minimize, or resize".into());
         }
         if index < WARMUP + SAMPLES {
