@@ -234,6 +234,15 @@ impl SimDriver {
         self.presence = presence;
     }
 
+    /// The single-sample form of [`Self::set_presence`] — the common
+    /// graphical-loop case (one live camera per frame) reuses the
+    /// retained vector's capacity instead of allocating a fresh
+    /// one-element `Vec` every frame.
+    pub fn set_presence_sample(&mut self, sample: PresenceSample) {
+        self.presence.clear();
+        self.presence.push(sample);
+    }
+
     /// Sets the scripted presence scenario — the headless deterministic
     /// input (Batch 2 corrective finding B): every completed logical
     /// tick receives the scenario's sample at THAT tick's index, so
@@ -337,7 +346,12 @@ impl SimDriver {
                     .as_ref()
                     .map(|director| director.config().centers),
             ) {
-                self.presence = vec![scenario.sample_at(self.spine.clock().as_u64(), &centers)];
+                // The retained-capacity single-sample form (the batch-2
+                // review's P2: no fresh Vec per applicable scripted
+                // tick — the same reuse as set_presence_sample).
+                let sample = scenario.sample_at(self.spine.clock().as_u64(), &centers);
+                self.presence.clear();
+                self.presence.push(sample);
             }
             // Stage 4 tick-boundary transitions: the director reshapes
             // the queues from the current presence BEFORE the tick.

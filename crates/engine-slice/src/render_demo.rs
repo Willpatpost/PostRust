@@ -5,6 +5,7 @@
 
 use std::time::{Duration, Instant};
 
+use engine_core::{LodLevel, REGION_COUNT};
 use engine_renderer::{
     DemoScenePreference, PresentModePreference, RenderConfig, RenderStats, Renderer,
     ValidationPreference,
@@ -331,6 +332,10 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
     };
     let mut cpu_work_ms: Vec<f64> = Vec::new();
     let mut frame_intervals_ms: Vec<f64> = Vec::new();
+    // The overlay's LOD-levels line cache: rebuilt only when the
+    // levels actually change (LOD transitions are rare), never per
+    // frame.
+    let mut levels_line_cache: Option<([LodLevel; REGION_COUNT], String)> = None;
     let mut presented: u64 = 0;
     let start = Instant::now();
     let frame_interval = if options.fps == 0 {
@@ -391,11 +396,11 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
         // consumes the same live sample; a genuinely cadence-dependent
         // external input, documented as such on the scripted path).
         if options.regions {
-            sim.set_presence(vec![camera_presence(
+            sim.set_presence_sample(camera_presence(
                 camera.position,
                 camera_displacement,
                 camera_dt,
-            )]);
+            ));
         }
 
         // Fixed-step simulation advance: the full raw elapsed interval
@@ -488,9 +493,19 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
             if options.regions {
                 let director = sim.director().expect("region driver");
                 let diagnostics = director.diagnostics();
+                let levels = director.levels();
+                if levels_line_cache
+                    .as_ref()
+                    .is_none_or(|(prev, _)| *prev != levels)
+                {
+                    levels_line_cache = Some((levels, levels_compact(&levels)));
+                }
+                let levels_line = levels_line_cache
+                    .as_ref()
+                    .map(|(_, text)| text.as_str())
+                    .unwrap_or("");
                 text.push_str(&format!(
-                    "\nregions {}\nact {} · deact {} · invalid {} · recon {}\ncaptured {} · reapplied {} · act-lat p50 {:.2} / p95 {:.2} ms",
-                    levels_compact(&director.levels()),
+                    "\nregions {levels_line}\nact {} · deact {} · invalid {} · recon {}\ncaptured {} · reapplied {} · act-lat p50 {:.2} / p95 {:.2} ms",
                     diagnostics.activations,
                     diagnostics.deactivations,
                     diagnostics.invalid_transitions,

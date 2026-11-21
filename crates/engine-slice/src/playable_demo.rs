@@ -530,59 +530,69 @@ impl PlayableDemo {
         self.gatehouse.events.push((tick, line));
     }
 
-    /// The visible world: every layout box in its current state —
-    /// collide-what-you-see, and every interaction visibly confirmed
-    /// (the gate disappears when open, collected pickups vanish, the
-    /// switch head recolors).
+    /// The visible world as an iterator (the zero-allocation form the
+    /// per-frame scene builder consumes directly — no intermediate
+    /// Vec; `render_boxes` is the owned convenience for tests):
+    /// every layout box in its current state — collide-what-you-see,
+    /// and every interaction visibly confirmed (the gate disappears
+    /// when open, collected pickups vanish, the switch head recolors).
+    pub fn render_boxes_iter(&self) -> impl Iterator<Item = ([f32; 3], [f32; 3], [f32; 3])> + '_ {
+        GATEHOUSE_BOXES
+            .iter()
+            .filter_map(|class_box| {
+                let color = match class_box.role {
+                    GatehouseRole::Perimeter => [0.35, 0.35, 0.40],
+                    GatehouseRole::Step => [0.55, 0.50, 0.45],
+                    GatehouseRole::Platform => [0.50, 0.55, 0.50],
+                    GatehouseRole::SwitchPillar => [0.40, 0.35, 0.30],
+                    GatehouseRole::GateWall => [0.30, 0.30, 0.35],
+                    GatehouseRole::Gate => {
+                        if self.gatehouse.gate_open() {
+                            return None;
+                        }
+                        [0.70, 0.25, 0.20]
+                    }
+                    GatehouseRole::Corridor => [0.42, 0.42, 0.48],
+                    GatehouseRole::Lintel => [0.25, 0.25, 0.30],
+                    GatehouseRole::Occluder => [0.50, 0.30, 0.30],
+                    GatehouseRole::Pickup => {
+                        let index = pickup_index_of(class_box);
+                        if self.gatehouse.pickups[index] {
+                            return None;
+                        }
+                        [0.90, 0.75, 0.10]
+                    }
+                    GatehouseRole::GoalPad => {
+                        if self.gatehouse.complete.is_some() {
+                            [0.20, 0.80, 0.40]
+                        } else {
+                            [0.20, 0.40, 0.90]
+                        }
+                    }
+                    GatehouseRole::SwitchTop => {
+                        if self.gatehouse.switch_on {
+                            [0.20, 0.80, 0.30]
+                        } else {
+                            [0.80, 0.20, 0.20]
+                        }
+                    }
+                };
+                Some((class_box.min, class_box.max, color))
+            })
+            // The player proxy in third person (the same derived-pose
+            // rule as the Cycle-1 demo).
+            .chain(
+                (self.driver.state().camera_mode == CameraMode::ThirdPerson).then(|| {
+                    let (min, max) = player_box(self.driver.state().position, self.driver.config());
+                    (min, max, [0.20, 0.80, 0.35])
+                }),
+            )
+    }
+
+    /// The owned convenience over [`Self::render_boxes_iter`] (tests
+    /// and one-shot reads; the scene builder iterates directly).
     pub fn render_boxes(&self) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
-        let mut boxes = Vec::new();
-        for class_box in GATEHOUSE_BOXES {
-            let color = match class_box.role {
-                GatehouseRole::Perimeter => [0.35, 0.35, 0.40],
-                GatehouseRole::Step => [0.55, 0.50, 0.45],
-                GatehouseRole::Platform => [0.50, 0.55, 0.50],
-                GatehouseRole::SwitchPillar => [0.40, 0.35, 0.30],
-                GatehouseRole::GateWall => [0.30, 0.30, 0.35],
-                GatehouseRole::Gate => {
-                    if self.gatehouse.gate_open() {
-                        continue;
-                    }
-                    [0.70, 0.25, 0.20]
-                }
-                GatehouseRole::Corridor => [0.42, 0.42, 0.48],
-                GatehouseRole::Lintel => [0.25, 0.25, 0.30],
-                GatehouseRole::Occluder => [0.50, 0.30, 0.30],
-                GatehouseRole::Pickup => {
-                    let index = pickup_index_of(class_box);
-                    if self.gatehouse.pickups[index] {
-                        continue;
-                    }
-                    [0.90, 0.75, 0.10]
-                }
-                GatehouseRole::GoalPad => {
-                    if self.gatehouse.complete.is_some() {
-                        [0.20, 0.80, 0.40]
-                    } else {
-                        [0.20, 0.40, 0.90]
-                    }
-                }
-                GatehouseRole::SwitchTop => {
-                    if self.gatehouse.switch_on {
-                        [0.20, 0.80, 0.30]
-                    } else {
-                        [0.80, 0.20, 0.20]
-                    }
-                }
-            };
-            boxes.push((class_box.min, class_box.max, color));
-        }
-        // The player proxy in third person (the same derived-pose
-        // rule as the Cycle-1 demo).
-        if self.driver.state().camera_mode == CameraMode::ThirdPerson {
-            let (min, max) = player_box(self.driver.state().position, self.driver.config());
-            boxes.push((min, max, [0.20, 0.80, 0.35]));
-        }
-        boxes
+        self.render_boxes_iter().collect()
     }
 }
 
@@ -1022,7 +1032,7 @@ pub fn build_scene_vertices_into(out: &mut Vec<SceneVertex>, demo: &PlayableDemo
         [5.85, 0.0, 9.85],
         [0.32, 0.30, 0.28],
     );
-    for (min, max, color) in demo.render_boxes() {
+    for (min, max, color) in demo.render_boxes_iter() {
         push_rect_box(out, min, max, color);
     }
 }

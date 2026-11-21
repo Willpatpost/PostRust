@@ -465,6 +465,28 @@ pub struct PersistenceStatus {
     pub action: Option<ActionRecord>,
 }
 
+/// The borrowed form of [`PersistenceStatus`] — the per-frame overlay
+/// reads this instead of cloning the owned snapshot's strings, the
+/// tracked publication state, and the action record every frame (the
+/// once-per-run summary and the tests keep the owned form).
+pub struct PersistenceStatusView<'a> {
+    pub founded: bool,
+    pub tick: Tick,
+    pub phase_active: bool,
+    pub worker_healthy: bool,
+    pub tier: SyncTier,
+    pub pending_publications: usize,
+    pub publication: Option<&'a PublicationState>,
+    pub publication_capture_tick: Option<u64>,
+    pub last_refusal: Option<SubmitRefusal>,
+    pub last_capture_error: Option<&'a str>,
+    pub captures_pending: u64,
+    pub captures_applied: u64,
+    pub confirmed_revision: Option<Hash>,
+    pub last_commit: Option<&'a str>,
+    pub action: Option<&'a ActionRecord>,
+}
+
 /// The launch report: what this application start did with the
 /// campaign (founded + anchored, or recovered — and from what state).
 #[derive(Debug, Clone)]
@@ -1103,6 +1125,15 @@ impl PersistDemo {
         self.presence = presence;
     }
 
+    /// The single-sample form of [`Self::set_presence`] — the common
+    /// graphical-loop case (one live camera per frame) reuses the
+    /// retained vector's capacity instead of allocating a fresh
+    /// one-element `Vec` every frame.
+    pub fn set_presence_sample(&mut self, sample: PresenceSample) {
+        self.presence.clear();
+        self.presence.push(sample);
+    }
+
     /// The demonstration's fixed-step timing configuration.
     pub fn config(&self) -> SimConfig {
         self.timing
@@ -1224,7 +1255,10 @@ impl PersistDemo {
             // overrides the scripted presence while an action's
             // excursion is active.
             if let Some(step) = self.scenario.as_mut().map(|scenario| scenario.step()) {
-                self.presence = vec![step.presence];
+                // The scripted presence replaces the frame-sampled
+                // camera for this tick — through the retained-capacity
+                // single-sample form (no fresh Vec per scripted tick).
+                self.set_presence_sample(step.presence);
                 let upcoming = self.session.clock().as_u64() + 1;
                 for burst in step.bursts {
                     let spec = EventSpec::new(
@@ -1920,6 +1954,34 @@ impl PersistDemo {
             confirmed_revision: self.confirmed_revision,
             last_commit: self.last_commit.clone(),
             action: self.action.clone(),
+        }
+    }
+
+    /// The per-frame borrowed form of [`Self::status`] — identical
+    /// fields, zero clones (the overlay's input; the owned snapshot
+    /// stays for the once-per-run summary and the tests).
+    pub fn status_view(&self) -> PersistenceStatusView<'_> {
+        let session = &self.session;
+        let ledger = session.director().ledger();
+        PersistenceStatusView {
+            founded: self.founded,
+            tick: session.clock(),
+            phase_active: session.phase() == SessionPhase::Active,
+            worker_healthy: session.healthy(),
+            tier: session.worker_tier(),
+            pending_publications: session.pending_publications(),
+            publication: self.publication.as_ref().map(|tracked| &tracked.state),
+            publication_capture_tick: self
+                .publication
+                .as_ref()
+                .map(|tracked| tracked.capture_tick),
+            last_refusal: self.last_refusal,
+            last_capture_error: self.last_capture_error.as_deref(),
+            captures_pending: ledger.pending_total(),
+            captures_applied: ledger.applied_count() as u64,
+            confirmed_revision: self.confirmed_revision,
+            last_commit: self.last_commit.as_deref(),
+            action: self.action.as_ref(),
         }
     }
 
@@ -2624,6 +2686,10 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
     };
     let mut cpu_work_ms: Vec<f64> = Vec::new();
     let mut frame_intervals_ms: Vec<f64> = Vec::new();
+    // The overlay's LOD-levels line cache: the compact form is rebuilt
+    // only when the levels actually change (LOD transitions are rare —
+    // a handful per campaign minute), never per frame.
+    let mut levels_line_cache: Option<([LodLevel; REGION_COUNT], String)> = None;
     let mut presented: u64 = 0;
     // S6-C1: the evidence bookkeeping — the loop-iteration sample
     // index and the memory cadence anchor (1 s wall).
@@ -2762,11 +2828,11 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
 
         let camera_dt = split.camera_dt.unwrap_or_default().as_secs_f32();
         let camera_displacement = camera.update(&snapshot, &app, camera_dt);
-        demo.set_presence(vec![camera_presence(
+        demo.set_presence_sample(camera_presence(
             camera.position,
             camera_displacement,
             camera_dt,
-        )]);
+        ));
 
         // Fixed-step advance of the ONE authoritative session (the
         // camera is the live, frame-sampled presence source — the same
@@ -2872,9 +2938,19 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
             );
             let director = session.director();
             let diagnostics = director.diagnostics();
+            let levels = director.levels();
+            if levels_line_cache
+                .as_ref()
+                .is_none_or(|(prev, _)| *prev != levels)
+            {
+                levels_line_cache = Some((levels, levels_compact(&levels)));
+            }
+            let levels_line = levels_line_cache
+                .as_ref()
+                .map(|(_, text)| text.as_str())
+                .unwrap_or("");
             text.push_str(&format!(
-                "\nregions {}\nact {} · deact {} · invalid {} · recon {}\ncaptured {} · reapplied {} · act-lat p50 {:.2} / p95 {:.2} ms",
-                levels_compact(&director.levels()),
+                "\nregions {levels_line}\nact {} · deact {} · invalid {} · recon {}\ncaptured {} · reapplied {} · act-lat p50 {:.2} / p95 {:.2} ms",
                 diagnostics.activations,
                 diagnostics.deactivations,
                 diagnostics.invalid_transitions,
@@ -2885,8 +2961,9 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
                 director.activation_latency_percentile(0.95),
             ));
             // The truthful campaign block (behavior *D*): every line
-            // derives from the actual lifecycle surfaces.
-            let status = demo.status();
+            // derives from the actual lifecycle surfaces — read
+            // through the borrowed view (zero per-frame clones).
+            let status = demo.status_view();
             text.push_str(&format!(
                 "\n--- campaign ---\n{} · worker {} · tier {:?}\ntick {} · phase {} · captures pending {} · applied {}\npub pending {} @ {} · last {}\nrefusal {:?} · capture-err {}\ncommit {}\nconfirmed {}\naction {}",
                 if status.founded { "founded" } else { "recovered" },
@@ -2903,19 +2980,17 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
                     .unwrap_or_else(|| "-".into()),
                 status
                     .publication
-                    .as_ref()
                     .map(|state| state.label())
                     .unwrap_or_else(|| "none".into()),
                 status.last_refusal,
-                status.last_capture_error.as_deref().unwrap_or("none"),
-                status.last_commit.as_deref().unwrap_or("none yet"),
+                status.last_capture_error.unwrap_or("none"),
+                status.last_commit.unwrap_or("none yet"),
                 status
                     .confirmed_revision
                     .map(|revision| revision.to_string())
                     .unwrap_or_else(|| "none yet".into()),
                 status
                     .action
-                    .as_ref()
                     .map(|record| record.describe())
                     .unwrap_or_else(|| "idle — Space starts the region's consequence cycle".into()),
             ));
