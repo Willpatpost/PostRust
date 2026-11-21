@@ -2,7 +2,11 @@ name: engine-ci
 
 on:
   push:
-    branches: [main, stage5, macos-port]
+    # perf-batch2-demo-loops (perf batch 2): a CANDIDATE-VALIDATION
+    # trigger, added on this branch only so the five-job gates run at
+    # the exact candidate SHA. REMOVED at the merge to main — the
+    # merged workflow keeps only the mainline branches.
+    branches: [main, stage5, macos-port, perf-batch2-demo-loops]
     paths:
       - "crates/**"
       - "build/**"
