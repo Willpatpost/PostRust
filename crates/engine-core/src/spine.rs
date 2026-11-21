@@ -1786,9 +1786,9 @@ impl<W: World> Spine<W> {
                 executed += 1;
             } else {
                 // Due, but causality-blocked: parked, not dropped. Blocked
-                // transitions consume no execution budget (no work was
-                // done), and the parked event keeps capping the safe
-                // watermark until its dependencies resolve.
+                // transitions take bookkeeping time outside the execution
+                // budget. The parked event caps the safe watermark
+                // until its dependencies resolve.
                 self.stats.blocked_transitions += 1;
                 if self.diag.would_log(Level::Trace) {
                     self.diag.log(

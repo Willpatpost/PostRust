@@ -113,23 +113,46 @@ with LOD, crash recovery, soak evidence, and rendering together.
 | The Vulkan renderer's current shape (static scene buffers, host-visible persistently-mapped dynamic buffers, 2 frames in flight, bounded region-vertex capacity with **fail-visible truncation counters** — F-03 Step 1 delivered; the Step-2 capacity/refusal policy deferred) | **Prototype-class** rendering design — correct and validated, not the final architecture (see §8) |
 | The Cycle-1 player prototype (`engine-core` player module + the `--player` demo layer) | **Prototype-class** kinematic mechanics — reusable engine surface, reversible, explicitly not a ratified production physics backend |
 
+### November 21 audit and corrective candidate
+
+The audit examined `219f800`. Its fixes landed directly on `main` as
+`a4eb372`, spanning 34 files. The change covered journal recovery and
+reclamation, scheduler and player input, drawable sizing and geometry
+capacity, whole-run timing, the CLI and documentation. Four existing
+ignored Vulkan smoke tests were run separately. Three gained assertions.
+The old `overlay_slot_regions_are_disjoint` test covered offsets in a
+shared mapped buffer. Per-slot overlay buffers retired that layout, and
+the replacement test covers on-demand capacity growth.
+
+The review candidate combines `a4eb372` with Batch 3 (`e0b52e8`).
+It retains the pipeline cache, hybrid frame pacing, validation gating and
+release shader-orientation check. The validation queue updates its pending
+flag under the same mutex as its messages. Resize hints trigger a drawable-pixel
+extent check. CPU and GPU percentiles both use whole-run `TimingSamples`.
+The journal sidecar now allows a short writer handoff and reports typed
+contention after two seconds. Tests exercise double-open and release, frame
+end arithmetic at the integer boundary, and capture reconciliation after
+an operating-system sync error.
+
 ## 4. Current automated test coverage
 
-The five-job CI (`.github/workflows/engine-ci.yml`) partitions the battery
-exactly and gates the counts (the F2 exact-count discipline — counts are
-re-measured from actual output on every change, never estimated):
+The main and heavy CI jobs check the number of passes, ignored tests and
+result lines. The table gives the local Linux and Windows measurements
+for the combined candidate.
 
 | CI partition | Linux | Windows |
 |---|---:|---:|
-| Main shard (`--workspace --exclude engine-slice`) | 1110 | 1059 |
+| Main shard (`--workspace --exclude engine-slice`) | 1114 | 1063 |
 | Heavy shard (`-p engine-slice --features crash-test-seams`) | 569 | 568 |
-| **Combined** | **1679** | **1627** |
+| **Combined** | **1683** | **1631** |
 
-(The macOS job runs its own execution partition — no combined count is
-defined for it. Ignored: 2 main / 7 heavy, all deliberate measurement soaks.
-The audit fixes add six main and three heavy tests across existing binaries.
-Both Windows shards ran locally. Linux expectations use the same
-platform-independent additions. The extraction baseline was measured at `main` @
+The macOS job has its own partition. Main has two ignored tests and 32
+result lines. Heavy has seven ignored tests and 55 result lines.
+At `a4eb372`, Windows counts were measured before landing. Linux counts
+were inferred at landing and subsequently confirmed by GitHub run
+`44937616390` (1110/1059 main and 569/568 heavy, Linux/Windows).
+
+(The extraction baseline was measured at `main` @
 `b19d210` by five-job CI run `44827915274` (and identical at the Sektor7
 pre-extraction mainline `2640b64`, run `44825693818`): the Cycle-3-era
 values this table carried before the 2026-11-20 reconciliation (1011/960 +
@@ -250,6 +273,21 @@ The ledger is `docs/DECISIONS.md`; the load-bearing accepted decisions:
 - Production-persistence decisions: `docs/PRODUCTION-PERSISTENCE-DECISIONS.md`.
 
 ## 6. Deferred design decisions (documented, not yet authorized)
+
+The following audit findings remain open for owner review.
+
+- **Jump input.** The first executed simulation tick consumes a queued
+  press. An airborne player must press again after landing. A landing
+  buffer would change which tick can start a jump.
+- **Render overflow.** At the shared scene-vertex cap, foreground draws
+  take priority and world geometry truncates first.
+- **Timing.** A percentile reports the upper bound of its nearest-rank
+  histogram bucket, capped at the observed maximum. The maximum is exact.
+- **Scheduler budget (audit F4).** The per-tick limit counts executed
+  events. Registering blocked events and waking their dependents still
+  costs CPU outside that limit. A hard limit on this bookkeeping is
+  deferred pending a decision on how dependency work should carry across
+  ticks and affect the deterministic execution order.
 
 - **F-03** — the region-render vertex-capacity policy: **Step 1 is
   DELIVERED in Cycle 1** (the fail-visible truncation counters — §2 —

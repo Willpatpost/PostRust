@@ -152,11 +152,8 @@ pub enum MediumError {
     /// A persisted object failed strict decoding (the Batch 1 typed
     /// error carried through).
     Format(SaveError),
-    /// Writer contention persisted past the configured busy timeout —
-    /// the SQLite write lock was unavailable (PP-B1). **Never evidence
-    /// of a stale parent** (no parent comparison occurred — no
-    /// transaction work began) and **never an uncertain commit** (the
-    /// failure precedes the transaction's first write).
+    /// A SQLite write or journal publication lock remained busy through
+    /// its acquisition timeout. The operation has made no write.
     Contention {
         /// What was contended and where.
         detail: String,

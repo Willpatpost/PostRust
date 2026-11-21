@@ -410,6 +410,8 @@ pub struct JournalScan {
 /// `CorruptCommitted` is fail-closed with the evidence preserved.
 #[derive(Debug)]
 pub enum JournalError {
+    /// Another writer holds the journal sidecar.
+    Busy { path: PathBuf },
     Io {
         op: &'static str,
         path: String,
@@ -455,6 +457,9 @@ pub enum JournalError {
 impl fmt::Display for JournalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            JournalError::Busy { path } => {
+                write!(f, "journal is already in use: {}", path.display())
+            }
             JournalError::Io { op, path, source } => {
                 write!(f, "journal I/O failure during {op} at {path}: {source}")
             }
@@ -1236,6 +1241,11 @@ fn strict_bound_state(
     }
 }
 
+fn frame_end(payload_start: usize, declared: u64, file_len: usize) -> Option<u64> {
+    let end = (payload_start as u64).checked_add(declared)?;
+    (end <= file_len as u64).then_some(end)
+}
+
 /// The shared sequential walk (both header shapes): the state's
 /// append_offset carries the header length; the chain anchors at the
 /// header's hash.
@@ -1266,15 +1276,14 @@ fn classify_from(
             break;
         }
         let len = u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("8 bytes"));
-        if len > (remaining - 8) as u64 {
+        let Some(frame_end) = frame_end(offset + 8, len, bytes.len()) else {
             // The frame claims more bytes than remain — torn.
             damage = Some(Damage {
                 offset: offset as u64,
                 kind: TailKind::TornFrame,
             });
             break;
-        }
-        let frame_end = (offset + 8) as u64 + len;
+        };
         if len == 0 {
             // A zero-length frame is the documented zero-fill
             // artifact (or garbage): damage, walked past.
@@ -1559,6 +1568,8 @@ pub struct T1Journal {
     acknowledged: BTreeSet<TransactionId>,
     fault: Option<JournalFaultControl>,
     sync_count: u64,
+    #[cfg(test)]
+    next_sync_handle: Option<File>,
     platform_tier: SyncTier,
 }
 
@@ -1612,6 +1623,8 @@ impl T1Journal {
             acknowledged: BTreeSet::new(),
             fault,
             sync_count: 0,
+            #[cfg(test)]
+            next_sync_handle: None,
             platform_tier: platform_tier(),
         };
         match read_header(&bytes)? {
@@ -1708,6 +1721,8 @@ impl T1Journal {
             acknowledged: BTreeSet::new(),
             fault: None,
             sync_count: 0,
+            #[cfg(test)]
+            next_sync_handle: None,
             platform_tier: platform_tier(),
         };
         journal.state = strict_bound_state(&bytes, founding, root_id)?;
@@ -1885,6 +1900,8 @@ impl T1Journal {
             acknowledged: BTreeSet::new(),
             fault: None,
             sync_count: 0,
+            #[cfg(test)]
+            next_sync_handle: None,
             platform_tier: platform_tier(),
         };
         let header = bound_header_bytes(founding, root_id);
@@ -2426,8 +2443,19 @@ impl T1Journal {
             })
     }
 
+    #[cfg(test)]
+    pub(crate) fn use_handle_for_next_sync(&mut self, handle: File) {
+        self.next_sync_handle = Some(handle);
+    }
+
     fn sync(&mut self) -> io::Result<()> {
-        self.file.sync_all().map(|()| {
+        #[cfg(test)]
+        let next = self.next_sync_handle.take();
+        #[cfg(test)]
+        let file = next.as_ref().unwrap_or(&self.file);
+        #[cfg(not(test))]
+        let file = &self.file;
+        file.sync_all().map(|()| {
             self.sync_count += 1;
         })
     }
@@ -2522,8 +2550,7 @@ impl PublicationLockGuard {
 /// (V2-W F4, F4-R7) Acquires the journal root's exclusive sidecar
 /// lock — the publication serialization boundary (the same lock a
 /// concurrent rotation honors; a live unrotated crossing holds it
-/// through its own active-journal handle, blocking this acquire by
-/// design). The offline/standalone publication policy: the
+/// through its own active-journal handle until release or timeout). The offline/standalone publication policy: the
 /// provider-neutral plan publication is legal ONLY under this held
 /// lock — never merely from possessing a bound root's path.
 pub fn hold_publication_lock(path: &Path) -> Result<PublicationLockGuard, JournalError> {
@@ -2533,13 +2560,6 @@ pub fn hold_publication_lock(path: &Path) -> Result<PublicationLockGuard, Journa
     })
 }
 
-/// Opens and exclusively locks the journal's sidecar lock file (the
-/// B2 `HEAD.lock` pattern): created once, never unlinked; the OS
-/// releases ownership at handle close or process death — a crashed
-/// writer never leaves a stale lock, and there is no application
-/// lock lifecycle to corrupt. A same-process second open blocks here
-/// until the first instance drops. The lock deliberately does NOT
-/// cover the data file's bytes (see [`T1Journal::open_with`]).
 /// (R11-A) Whether the sidecar lock file exists at the path (the
 /// prior-journal-life evidence: created once, never unlinked — its
 /// presence with no data file means a journal was removed).
@@ -2552,6 +2572,8 @@ fn sidecar_lock_exists(path: &Path) -> bool {
     path.with_file_name(name).exists()
 }
 
+/// Waits up to two seconds for a short handoff before returning
+/// [`JournalError::Busy`]. Closing the handle releases the lock.
 pub fn open_lock_file(path: &Path) -> Result<File, JournalError> {
     let mut name = path
         .file_name()
@@ -2565,8 +2587,27 @@ pub fn open_lock_file(path: &Path) -> Result<File, JournalError> {
         .truncate(false)
         .open(path.with_file_name(name))
         .map_err(|e| io_err("open journal lock", path, e))?;
-    lock.lock().map_err(|e| io_err("lock journal", path, e))?;
-    Ok(lock)
+    use std::fs::TryLockError;
+    use std::time::{Duration, Instant};
+
+    const TIMEOUT: Duration = Duration::from_secs(2);
+    let mut deadline = None;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(TryLockError::Error(source)) => return Err(io_err("lock journal", path, source)),
+            Err(TryLockError::WouldBlock) => {
+                let until = deadline.get_or_insert_with(|| Instant::now() + TIMEOUT);
+                let remaining = until.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(JournalError::Busy {
+                        path: path.to_owned(),
+                    });
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+        }
+    }
 }
 
 fn platform_tier() -> SyncTier {
@@ -2891,6 +2932,35 @@ mod tests {
         assert_eq!(journal.transactions().len(), 1);
         journal.append_transaction(&tx_input(2)).unwrap();
         assert_eq!(T1Journal::scan_file(&path).unwrap().committed.len(), 2);
+    }
+
+    #[test]
+    fn contended_writer_returns_busy_then_reopens_after_release() {
+        let dir = TestDir::new("writer-busy");
+        let path = dir.journal();
+        let first = T1Journal::open(&path).unwrap();
+        let second_path = path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let result = T1Journal::open(&second_path);
+            let _ =
+                tx.send(matches!(result, Err(JournalError::Busy { path }) if path == second_path));
+        });
+        let contention = rx.recv_timeout(std::time::Duration::from_secs(10));
+        drop(first);
+        second.join().unwrap();
+        assert!(contention.unwrap());
+        T1Journal::open(&path).unwrap();
+    }
+
+    #[test]
+    fn declared_frame_length_must_fit_the_remaining_payload() {
+        for start in [8, 128, 4096] {
+            let file_len = start + 64;
+            assert_eq!(frame_end(start, 64, file_len), Some(file_len as u64));
+            assert_eq!(frame_end(start, 65, file_len), None);
+            assert_eq!(frame_end(start, u64::MAX, file_len), None);
+        }
     }
 
     #[test]

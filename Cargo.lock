@@ -183,6 +183,7 @@ dependencies = [
  "font8x8",
  "naga",
  "sdl3",
+ "sdl3-sys",
 ]
 
 [[package]]

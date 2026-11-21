@@ -13,7 +13,7 @@ use crate::overlay::{OverlayVertex, build_overlay_vertices_into};
 use crate::scene::SceneVertex;
 use crate::vulkan::{
     self, CapturedFrame, FrameState, PipelineState, RendererError, SwapchainState, VulkanContext,
-    drain_validation_messages, pick_depth_format, pick_surface_format,
+    drain_validation_messages, environment_pending, pick_depth_format, pick_surface_format,
 };
 
 /// A batch of triangles with its own transform into clip space. A
@@ -347,17 +347,27 @@ impl Renderer {
         {
             self.stats.gpu_timing.record(duration);
         }
-        for (class, message) in drain_validation_messages() {
-            match class {
-                2 => {
-                    self.stats.validation_errors += 1;
-                    self.push_validation_message(message);
+        // The validation drain is gated (perf batch 3, corrected per
+        // the review's P2): an inactive validation layer takes no
+        // per-frame mutex round-trip — EXCEPT while environment
+        // diagnostics (loader limitations recorded through the queue)
+        // are pending, which a cheap atomic check catches; the hint
+        // clears after that drain, so the ordinary inactive frame
+        // stays round-trip-free without ever suppressing the
+        // environment warnings.
+        if self.stats.validation_active || environment_pending() {
+            for (class, message) in drain_validation_messages() {
+                match class {
+                    2 => {
+                        self.stats.validation_errors += 1;
+                        self.push_validation_message(message);
+                    }
+                    1 => {
+                        self.stats.validation_warnings += 1;
+                        self.push_validation_message(message);
+                    }
+                    _ => {}
                 }
-                1 => {
-                    self.stats.validation_warnings += 1;
-                    self.push_validation_message(message);
-                }
-                _ => {}
             }
         }
         Ok(FrameResult {

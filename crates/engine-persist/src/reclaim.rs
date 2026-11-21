@@ -3559,14 +3559,21 @@ pub fn publish_reclamation_plan(
     // a concurrent rotation; possessing a bound root's path is never
     // itself authorization), then the authorized core. A LIVE
     // crossing holding the root's own lock (its active journal)
-    // blocks here by design — the production route through the
-    // crossing does not reacquire.
+    // can hold this call until the acquisition deadline. The crossing
+    // publishes using its existing lock.
     let authority = verify_bound_journal_authority(medium, journal_root)?;
-    let guard = crate::journal::hold_publication_lock(journal_root).map_err(|_error| {
-        MediumError::Chain {
-            rule: "journal-root/lock",
-        }
-    })?;
+    let guard =
+        crate::journal::hold_publication_lock(journal_root).map_err(|error| match error {
+            crate::journal::JournalError::Busy { .. } => MediumError::Contention {
+                detail: error.to_string(),
+            },
+            crate::journal::JournalError::Io { op, path, source } => {
+                MediumError::Io { op, path, source }
+            }
+            _ => MediumError::Chain {
+                rule: "journal-root/lock",
+            },
+        })?;
     publish_reclamation_plan_authorized(
         medium,
         mk,

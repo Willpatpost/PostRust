@@ -36,3 +36,13 @@ naga = { version = "=29.0.4", features = ["glsl-in", "spv-out"] }
 # Test-side re-parse of the build-emitted SPIR-V (the orientation
 # corrective's A4 pin): the SAME pinned naga, with the spv-in frontend.
 naga = { version = "=29.0.4", features = ["spv-in"] }
+
+[target.'cfg(unix)'.dependencies]
+# The same console-build enabler engine-shell carries (Stage 1's
+# Unix-without-desktop-libs workaround): headless environments without
+# X11/Wayland development libraries (the CI runners) otherwise fail
+# SDL's CMake configure. In a WORKSPACE build engine-shell's copy
+# unifies this feature in anyway; the isolated release battery (the
+# batch-3 review's CI step) builds this crate alone, so the enabler
+# must be carried here too. Inert on Windows.
+sdl3-sys = { version = "0.7.2", default-features = false, features = ["sdl-unix-console-build"] }

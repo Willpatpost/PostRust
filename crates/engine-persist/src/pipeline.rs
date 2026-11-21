@@ -1951,6 +1951,47 @@ mod tests {
         CommitPipeline::open(clean_medium(dir), journal).unwrap()
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn capture_reconciles_after_operating_system_sync_error() {
+        let dir = TestDir::new("os-sync-error");
+        let path = dir.path().join("journal.t1");
+        let mut journal = T1Journal::create_bound_generation(
+            &path,
+            &crate::hash::hash_object(b"founding"),
+            &crate::hash::hash_object(b"root"),
+        )
+        .unwrap();
+        // Windows rejects FlushFileBuffers on a read-only handle. Unix rejects
+        // fsync on a socket. Both exercise File::sync_all's actual error path.
+        #[cfg(windows)]
+        let handle = fs::File::open(&path).unwrap();
+        #[cfg(unix)]
+        let handle = {
+            let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            fs::File::from(std::os::fd::OwnedFd::from(socket))
+        };
+        assert!(handle.sync_all().is_err());
+        let barriers = journal.sync_count();
+        journal.use_handle_for_next_sync(handle);
+        let mut pipeline = CommitPipeline::open(clean_medium(&dir), journal).unwrap();
+        pipeline.stage(staged_envelope(1)).unwrap();
+        let b = boundary(1);
+        let receipt = pipeline
+            .capture(
+                b.position,
+                b.classification,
+                b.dependencies,
+                b.frontier,
+                b.plan,
+            )
+            .unwrap();
+        assert!(receipt.reconciled);
+        assert_eq!(pipeline.journal().sync_count(), barriers + 1);
+        assert!(pipeline.journal().is_committed(receipt.journal.id));
+        capture_index(&mut pipeline, 2);
+    }
+
     fn capture_index(pipeline: &mut CommitPipeline<LocalFileMedium>, index: u64) -> TransactionId {
         pipeline.stage(staged_envelope(index)).unwrap();
         let boundary = boundary(index);
