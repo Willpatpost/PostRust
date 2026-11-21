@@ -62,6 +62,7 @@
 
 use std::ffi::{CStr, CString};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ash::ext;
 use ash::khr;
@@ -93,6 +94,27 @@ const WAIT_TIMEOUT_NS: u64 = 2_000_000_000;
 /// [`crate::Renderer`] each frame.
 static VALIDATION_QUEUE: Mutex<Vec<(u8, String)>> = Mutex::new(Vec::new());
 
+/// Whether the queue holds ENVIRONMENT diagnostics (loader
+/// limitations recorded through [`queue_environment_message`]) that
+/// must be drained even when the validation layer is inactive (the
+/// batch-3 review's P2: the per-frame drain gate must not suppress
+/// them, and must not restore an unconditional per-frame mutex
+/// round-trip either). Set when an environment message is queued;
+/// cleared by the renderer after a drain with the layer inactive.
+static ENVIRONMENT_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Whether the queue holds environment diagnostics awaiting a drain
+/// (cheap atomic read — the per-frame drain gate consults this).
+pub(crate) fn environment_pending() -> bool {
+    ENVIRONMENT_PENDING.load(Ordering::Relaxed)
+}
+
+/// Clears the environment-pending hint (called by the renderer after
+/// a drain with the validation layer inactive).
+pub(crate) fn clear_environment_pending() {
+    ENVIRONMENT_PENDING.store(false, Ordering::Relaxed);
+}
+
 /// Drains queued validation messages (public-safe).
 pub(crate) fn drain_validation_messages() -> Vec<(u8, String)> {
     match VALIDATION_QUEUE.lock() {
@@ -106,6 +128,7 @@ pub(crate) fn drain_validation_messages() -> Vec<(u8, String)> {
 /// channel every run summary drains, so the limitation is explicitly
 /// diagnosable without new architecture (Mac 2 review follow-up B).
 fn queue_environment_message(text: String) {
+    ENVIRONMENT_PENDING.store(true, Ordering::Relaxed);
     if let Ok(mut queue) = VALIDATION_QUEUE.lock()
         && queue.len() < 256
     {
@@ -515,9 +538,26 @@ impl VulkanContext {
         // pipeline state before the context). An empty
         // PipelineCacheCreateInfo starts a fresh in-memory cache (disk
         // persistence remains a separately authorized follow-up).
-        let pipeline_cache =
-            unsafe { device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) }
-                .map_err(|error| RendererError::vk(error, "pipeline cache creation"))?;
+        // Failure here runs the established partial-initialization
+        // cleanup (the batch-3 review's P2): the messenger, device,
+        // surface, and instance all exist at this point and are
+        // released before the error escapes - never leaked.
+        let pipeline_cache = match unsafe {
+            device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
+        } {
+            Ok(cache) => cache,
+            Err(error) => {
+                unsafe {
+                    if messenger != vk::DebugUtilsMessengerEXT::null() {
+                        debug_utils.destroy_debug_utils_messenger(messenger, None);
+                    }
+                    device.destroy_device(None);
+                    surface_ext.destroy_surface(surface, None);
+                    instance.destroy_instance(None);
+                }
+                return Err(RendererError::vk(error, "pipeline cache creation"));
+            }
+        };
 
         let context = VulkanContext {
             entry,
@@ -2535,19 +2575,21 @@ pub(crate) fn render_frame(
     }
 
     // Proactive resize handling: the window size moved away from the
-    // swapchain extent.
+    // swapchain extent. DEFERRED, not inline (the batch-3 review's
+    // lifecycle finding: every recreation entry point honors surface
+    // availability): the mismatch latches the recreation intent and
+    // the deferral hint, and the next frame's probe-gated
+    // consume-and-recreate block performs the recreation once the
+    // drawable reports a valid extent — the application-side size can
+    // be nonzero while the native surface is mid-transition (the
+    // exact transient condition the deferral protection exists for).
+    // Nothing has been acquired yet, so no synchronization state
+    // exists to unwind.
     if window_size.0 != swapchain.extent.width || window_size.1 != swapchain.extent.height {
-        recreate_swapchain(
-            ctx,
-            swapchain,
-            pipes,
-            frames,
-            window_size,
-            present_preference,
-            replace_pipelines,
-            demo_scene,
-        )?;
-        outcome.recreated = true;
+        mark_suboptimal(&mut frames.needs_recreate);
+        frames.surface_probe_pending = true;
+        outcome.deferred = true;
+        return Ok(outcome);
     }
 
     // The capture readback's destination buffer, prepared BEFORE any
@@ -2595,25 +2637,19 @@ pub(crate) fn render_frame(
         // The out-of-date inline recreation ALSO probes first (the
         // batch-3 review's directive: every recreation path checks
         // surface availability before recreating) — a mid-transition
-        // surface must not be recreated into. Unavailable: restore the
-        // slot fence to the signaled state (the wait above consumed
-        // its signal and no submission will provide a new one), latch
-        // the deferral hint, PRESERVE the recreation intent through
-        // the deferral, and defer the frame. No image was acquired, so
-        // no semaphore waits.
+        // surface must not be recreated into. Unavailable: PRESERVE
+        // the already-signaled slot fence (vkWaitForFences does not
+        // consume a signaled fence — it stays signaled until the next
+        // submission's owner resets it, so the next frame's wait
+        // passes and every images_in_flight reference stays valid;
+        // destroying and recreating the fence here would leave
+        // per-image references to a dead handle — the review's fence
+        // finding), latch the deferral hint, PRESERVE the recreation
+        // intent, and defer. No image was acquired, so no semaphore
+        // waits.
         if surface_probe_decision(false, true, surface_available_now(ctx)?)
             == SurfaceProbeDecision::ProbeDeferred
         {
-            unsafe {
-                ctx.device.destroy_fence(frames.in_flight[slot], None);
-                frames.in_flight[slot] = ctx
-                    .device
-                    .create_fence(
-                        &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                        None,
-                    )
-                    .map_err(|error| RendererError::vk(error, "recreate fence"))?;
-            }
             mark_suboptimal(&mut frames.needs_recreate);
             frames.surface_probe_pending = true;
             outcome.deferred = true;
@@ -2642,16 +2678,16 @@ pub(crate) fn render_frame(
     let (image_index, suboptimal) = match acquire_result {
         Ok((index, suboptimal)) => (index, suboptimal),
         Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-            unsafe {
-                ctx.device.destroy_fence(frames.in_flight[slot], None);
-                frames.in_flight[slot] = ctx
-                    .device
-                    .create_fence(
-                        &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                        None,
-                    )
-                    .map_err(|error| RendererError::vk(error, "recreate fence"))?;
-            }
+            // The retry after recreation also failed: no submission
+            // happened this frame, and vkWaitForFences did NOT consume
+            // the slot fence's signal (a signaled fence stays signaled
+            // until its owner resets it for the next submission) — the
+            // fence is preserved as-is, and every images_in_flight
+            // reference to it stays valid. (The former
+            // destroy-and-recreate here — and its "the wait consumed
+            // the signal" comment — rested on the incorrect
+            // assumption the batch-3 review corrected; replacing the
+            // handle left per-image references to a destroyed fence.)
             return Ok(outcome);
         }
         Err(vk::Result::TIMEOUT) => {
@@ -3024,17 +3060,16 @@ pub(crate) fn render_frame(
             }
         }
         Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-            recreate_swapchain(
-                ctx,
-                swapchain,
-                pipes,
-                frames,
-                window_size,
-                present_preference,
-                replace_pipelines,
-                demo_scene,
-            )?;
-            outcome.recreated = true;
+            // DEFERRED, not inline (the batch-3 review's lifecycle
+            // finding: every recreation entry point honors surface
+            // availability): the presentation is gone; latch the
+            // recreation intent and the deferral hint — the next
+            // frame's probe-gated consume-and-recreate block rebuilds
+            // once the drawable is available again. This frame's
+            // submission completed and its fence will signal normally;
+            // no synchronization state is touched here.
+            mark_suboptimal(&mut frames.needs_recreate);
+            frames.surface_probe_pending = true;
         }
         Err(error) => return Err(RendererError::vk(error, "queue_present")),
     }
@@ -3902,6 +3937,17 @@ mod surface_probe_tests {
     /// - the stale-nonzero-window mid-transition case reaches the same
     ///   table through the pending-recreation hint the out-of-date
     ///   acquire path sets.
+    ///
+    /// The corrective-round extension: EVERY recreation entry point
+    /// now routes through this table — the proactive-resize path
+    /// (extent mismatch) and the out-of-date PRESENT path both latch
+    /// the recreation intent plus the deferral hint and defer, so
+    /// their recreation happens only on a frame where the probe
+    /// reports the drawable available (ProbeAvailable); and NO
+    /// deferral path destroys the slot fence — vkWaitForFences does
+    /// not consume a signaled fence, so every images_in_flight
+    /// reference stays valid by construction across acquisition
+    /// failure, deferral, and recovery (the review's fence finding).
     #[test]
     fn probe_decision_table_preserves_recreation_intent_through_deferral() {
         // Ordinary frame: no evidence of trouble, no probe - the

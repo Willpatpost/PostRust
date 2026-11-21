@@ -11,7 +11,8 @@ use crate::overlay::{OverlayVertex, build_overlay_vertices_into};
 use crate::scene::SceneVertex;
 use crate::vulkan::{
     self, CapturedFrame, FrameState, PipelineState, RendererError, SwapchainState, VulkanContext,
-    drain_validation_messages, pick_depth_format, pick_surface_format,
+    clear_environment_pending, drain_validation_messages, environment_pending, pick_depth_format,
+    pick_surface_format,
 };
 
 /// A batch of triangles with its own transform into clip space. A
@@ -390,10 +391,15 @@ impl Renderer {
             // equivalence-pinned maintenance method.
             self.stats.record_gpu_ms(milliseconds);
         }
-        // The validation drain is gated on the layer being active
-        // (perf batch 3): an inactive renderer takes no per-frame
-        // mutex round-trip at all.
-        if self.stats.validation_active {
+        // The validation drain is gated (perf batch 3, corrected per
+        // the review's P2): an inactive validation layer takes no
+        // per-frame mutex round-trip — EXCEPT while environment
+        // diagnostics (loader limitations recorded through the queue)
+        // are pending, which a cheap atomic check catches; the hint
+        // clears after that drain, so the ordinary inactive frame
+        // stays round-trip-free without ever suppressing the
+        // environment warnings.
+        if self.stats.validation_active || environment_pending() {
             for (class, message) in drain_validation_messages() {
                 match class {
                     2 => {
@@ -406,6 +412,9 @@ impl Renderer {
                     }
                     _ => {}
                 }
+            }
+            if !self.stats.validation_active {
+                clear_environment_pending();
             }
         }
         Ok(FrameResult {

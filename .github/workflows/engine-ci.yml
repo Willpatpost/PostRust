@@ -332,9 +332,10 @@ jobs:
       # 42 passed / 2 result lines (the lib battery + doc-tests),
       # platform-uniform.
       - name: Isolated release engine-renderer battery (the orientation-pin CI gap)
+        shell: bash
         run: |
-          cargo test -p engine-renderer --release 2>&1 | tee tests-renderer-release.log
           set -o pipefail
+          cargo test -p engine-renderer --release 2>&1 | tee tests-renderer-release.log
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-renderer-release.log)
           results=$(grep -c 'test result:' tests-renderer-release.log || true)
           echo "renderer release: $passed passed, $results test-result lines (expected 42 / 2)"
