@@ -449,7 +449,12 @@ pub struct EncounterState {
     /// reverse scan of `events` reconstructed; the render loop reads
     /// this O(1) instead).
     pub last_fire_line: Option<String>,
-    /// (tick, line) — the deterministic event log.
+    /// (tick, line) — the deterministic event log. CACHE-CONSISTENCY
+    /// INVARIANT (the batch-2 review's P1): every write goes through
+    /// the log helpers, which keep `last_fire_line` synchronized with
+    /// the most recent fire-prefixed line; the field is `pub` for the
+    /// scripted tests' READS, but pushing to it directly would
+    /// desynchronize the stored line from the log.
     pub events: Vec<(u64, String)>,
 }
 
@@ -1114,9 +1119,15 @@ impl CombatDemo {
         )
     }
 
-    /// Public event logging for the scripted scenarios' own markers.
+    /// Public event logging for the scripted scenarios' own markers —
+    /// routed through the same centralized helper as every internal
+    /// write, so a fire-prefixed marker line updates the stored
+    /// `last_fire_line` exactly as an internal fire line would (the
+    /// batch-2 review's P1: the former direct `events.push` here
+    /// bypassed the cache, desynchronizing it from what a scan of the
+    /// log would find).
     pub fn log_public(&mut self, tick: u64, line: impl Into<String>) {
-        self.encounter.events.push((tick, line.into()));
+        Self::log(&mut self.encounter, tick, line);
     }
 
     /// The visible world: every arena box in its current state plus

@@ -346,7 +346,12 @@ impl SimDriver {
                     .as_ref()
                     .map(|director| director.config().centers),
             ) {
-                self.presence = vec![scenario.sample_at(self.spine.clock().as_u64(), &centers)];
+                // The retained-capacity single-sample form (the batch-2
+                // review's P2: no fresh Vec per applicable scripted
+                // tick — the same reuse as set_presence_sample).
+                let sample = scenario.sample_at(self.spine.clock().as_u64(), &centers);
+                self.presence.clear();
+                self.presence.push(sample);
             }
             // Stage 4 tick-boundary transitions: the director reshapes
             // the queues from the current presence BEFORE the tick.

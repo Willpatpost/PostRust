@@ -859,8 +859,19 @@ jobs:
           # passed, +1 ignored, +1 result line; local verification per
           # the C CI-counts delivery; Windows 564 = the prior 552 + the
           # same 12, platform-uniform).
-          expected=565
-          if [ "$(uname -s)" != "Linux" ]; then expected=564; fi
+          # Perf batch 2 corrections (perf-batch2-demo-loops, 2026-11-21):
+          # +1 combat_world test platform-uniform — the fire-line cache
+          # consistency regression (the review's P1: the public marker
+          # path through log_public now routes through the centralized
+          # helper, and the regression pins every write path plus the
+          # reset). Windows 565/7/55 MEASURED locally with this step's
+          # own counting (cargo exit 0, zero non-ok lines); Linux 566 =
+          # the prior 565 + the same 1, platform-uniform, confirmed by
+          # this candidate's own run; result lines unchanged (the same
+          # combat_world binary). The main shard is untouched (every
+          # batch-2 change is engine-slice).
+          expected=566
+          if [ "$(uname -s)" != "Linux" ]; then expected=565; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)

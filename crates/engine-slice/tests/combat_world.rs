@@ -1495,3 +1495,67 @@ fn overlay_boundary_sanitizes_the_embedded_event_text() {
     // Pure-ASCII text passes through unchanged.
     assert_eq!(overlay_ascii("no fire yet"), "no fire yet");
 }
+
+/// The fire-line cache's consistency invariant (the batch-2 review's
+/// P1): the stored `last_fire_line` tracks EVERY write path - the
+/// internal fire lines (the dormant refusal here, which needs no
+/// arena traversal) and the public marker path - always equaling the
+/// most recent fire-prefixed line in the log (exactly what the
+/// overlay's former per-frame reverse scan reconstructed), and the
+/// transient reset clears it with the rest of the round state.
+#[test]
+fn fire_line_cache_tracks_every_write_path_and_reset_clears_it() {
+    // The internal path: a fire press while DORMANT writes the honest
+    // refusal line through the centralized log helper.
+    let mut demo = CombatDemo::new();
+    demo.tick(engine_core::MoveIntent::default(), true);
+    let scanned = demo
+        .encounter
+        .events
+        .iter()
+        .rev()
+        .find_map(|(_, line)| line.starts_with("fire ").then(|| line.clone()));
+    assert_eq!(
+        demo.encounter.last_fire_line, scanned,
+        "the stored line equals the log's most recent fire line"
+    );
+    assert!(
+        demo.encounter.last_fire_line.is_some(),
+        "the dormant fire refusal is itself a fire-prefixed line"
+    );
+
+    // The public marker path (the P1 gap this regression pins): a
+    // fire-prefixed marker line updates the stored line too, not
+    // just the log.
+    demo.log_public(7, "fire marker - the scripted scenario's own line");
+    assert_eq!(
+        demo.encounter.last_fire_line.as_deref(),
+        Some("fire marker - the scripted scenario's own line")
+    );
+    let scanned = demo
+        .encounter
+        .events
+        .iter()
+        .rev()
+        .find_map(|(_, line)| line.starts_with("fire ").then(|| line.clone()));
+    assert_eq!(
+        demo.encounter.last_fire_line, scanned,
+        "the stored line still equals the log's most recent fire line"
+    );
+
+    // A non-fire marker does NOT displace the stored fire line.
+    demo.log_public(8, "marker - not a fire line");
+    assert_eq!(
+        demo.encounter.last_fire_line.as_deref(),
+        Some("fire marker - the scripted scenario's own line"),
+        "only fire-prefixed lines update the stored line"
+    );
+
+    // The transient reset clears the cache with the rest of the round
+    // state (the overlay falls back to "no fire yet").
+    demo.reset();
+    assert_eq!(
+        demo.encounter.last_fire_line, None,
+        "the reset clears the stored fire line"
+    );
+}
