@@ -45,7 +45,8 @@ pub mod input;
 pub mod platform;
 
 pub use app::{
-    FrameStats, LoopControl, QuitReason, RunSummary, ShellApp, ShellConfig, resident_set_kib,
+    FrameStats, LoopControl, QuitReason, RunSummary, SPIN_MARGIN, ShellApp, ShellConfig,
+    pace_until, resident_set_kib,
 };
 pub use input::{InputSnapshot, InputState};
 pub use platform::{DriverPreference, Platform};

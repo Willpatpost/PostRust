@@ -13,6 +13,36 @@ use sdl3::video::{Window, WindowBuildError};
 use crate::input::{InputSnapshot, InputState};
 use crate::platform::{DriverPreference, Platform};
 
+/// The hybrid pacing spin margin: sleep until `target - SPIN_MARGIN`,
+/// then spin the remainder. `thread::sleep` on Windows quantizes to
+/// the OS timer resolution (1–15.6 ms depending on timeBeginPeriod),
+/// which alone can exceed the ENTIRE budget at high target rates
+/// (6.9 ms at 144 FPS, 4.2 ms at 240 FPS) — the bounded spin removes
+/// that quantization from the measured frame-interval tail. The cost
+/// is at most 2 ms of one core per PACED frame (uncapped frames never
+/// pace); OS time still never enters simulation logic (the loop's own
+/// Stage 1 invariant — this is presentation policy only).
+pub const SPIN_MARGIN: Duration = Duration::from_millis(2);
+
+/// Hybrid pacing to an absolute target instant (perf batch 3): sleep
+/// most of the gap, then spin the last [`SPIN_MARGIN`] — the shared
+/// form of [`ShellApp::run`]'s cadence and the graphical demos' own
+/// `--fps` pacing (the former sleep-only form made the frame-interval
+/// p99 measure the OS timer, not the engine, at high target rates).
+pub fn pace_until(target: Instant) {
+    let now = Instant::now();
+    if target <= now {
+        return;
+    }
+    let wake_at = target - SPIN_MARGIN;
+    if wake_at > now {
+        thread::sleep(wake_at - now);
+    }
+    while Instant::now() < target {
+        core::hint::spin_loop();
+    }
+}
+
 /// Configuration for [`ShellApp::new`].
 pub struct ShellConfig {
     pub title: String,
@@ -233,7 +263,7 @@ impl ShellApp {
             }
             let frame_end = Instant::now();
             if next_frame_at > frame_end {
-                thread::sleep(next_frame_at - frame_end);
+                pace_until(next_frame_at);
             } else {
                 next_frame_at = frame_end;
             }

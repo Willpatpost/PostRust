@@ -2,7 +2,11 @@ name: engine-ci
 
 on:
   push:
-    branches: [main, stage5, macos-port]
+    # perf-batch3-renderer-shell (perf batch 3): a CANDIDATE-VALIDATION
+    # trigger, added on this branch only so the five-job gates run at
+    # the exact candidate SHA. REMOVED at the merge to main — the
+    # merged workflow keeps only the mainline branches.
+    branches: [main, stage5, macos-port, perf-batch3-renderer-shell]
     paths:
       - "crates/**"
       - "build/**"
@@ -291,8 +295,18 @@ jobs:
           # +2 platform-uniform, confirmed by this candidate's own run —
           # a mismatch is corrected from actuals, never by weakening a
           # test.
-          expected=1104
-          if [ "$(uname -s)" != "Linux" ]; then expected=1053; fi
+          # Perf batch 3 (perf-batch3-renderer-shell, 2026-11-21): +1
+          # engine-renderer lib test platform-uniform — the GPU-time
+          # ring/sorted-mirror equivalence pin (value-identity with the
+          # former clone-and-sort percentile at every step, across the
+          # 600-sample eviction boundary). Windows 1054/2/32 MEASURED
+          # locally with this step's own counting (cargo exit 0, zero
+          # non-ok lines); Linux 1105 = the prior 1104 + the same 1,
+          # platform-uniform, confirmed by this candidate's own run;
+          # result lines unchanged. Heavy unchanged (no engine-slice
+          # test moves; the pacing-site changes are loop code).
+          expected=1105
+          if [ "$(uname -s)" != "Linux" ]; then expected=1054; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)

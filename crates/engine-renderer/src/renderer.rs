@@ -56,7 +56,7 @@ pub struct FrameResult {
 /// These are instrumentation readings of the simple Stage 2 scene — they
 /// are not claims about the first game's performance (TECH-ARCHITECTURE
 /// §6, stage-table policy).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RenderStats {
     pub gpu_name: String,
     pub device_type: String,
@@ -87,20 +87,60 @@ pub struct RenderStats {
     pub overlay_truncated_vertices: u64,
     pub overlay_supplied_peak_vertices: u32,
     pub overlay_capacity_vertices: u32,
-    gpu_history_ms: Vec<f64>,
+    /// The rolling GPU-time window (perf batch 3: a deque — the former
+    /// `Vec` paid an O(n) front-drain memmove every frame once warm;
+    /// push_front/pop_back is O(1) and capacity is retained).
+    gpu_history_ms: std::collections::VecDeque<f64>,
+    /// The SAME window maintained in sorted order at the push site
+    /// (perf batch 3): an O(n) ordered insert/remove on a retained
+    /// buffer — no allocation in steady state — so every percentile
+    /// read is an O(1) index instead of the former per-call
+    /// clone-the-history-and-sort (a 4.8 KB heap allocation plus an
+    /// O(n log n) sort per overlay read, per frame).
+    gpu_sorted_ms: Vec<f64>,
 }
 
 impl RenderStats {
     fn percentile(&self, quantile: f64) -> f64 {
-        if self.gpu_history_ms.is_empty() {
+        if self.gpu_sorted_ms.is_empty() {
             return 0.0;
         }
-        let mut sorted = self.gpu_history_ms.clone();
-        sorted.sort_by(|a, b| a.total_cmp(b));
-        let index = ((quantile * sorted.len() as f64).ceil() as usize)
+        // The same index formula over the same (sorted) multiset —
+        // value-identical to the former clone-and-sort form, pinned
+        // by the ring-equivalence unit test.
+        let index = ((quantile * self.gpu_sorted_ms.len() as f64).ceil() as usize)
             .saturating_sub(1)
-            .min(sorted.len() - 1);
-        sorted[index]
+            .min(self.gpu_sorted_ms.len() - 1);
+        self.gpu_sorted_ms[index]
+    }
+
+    /// Records one GPU-time sample into the rolling window and its
+    /// sorted mirror (the perf-batch-3 ring maintenance, extracted as
+    /// a method for the equivalence unit test): newest first, evicting
+    /// the oldest beyond the 600-sample window; the sorted multiset is
+    /// maintained at the same two points, so percentile reads never
+    /// allocate or sort.
+    fn record_gpu_ms(&mut self, milliseconds: f64) {
+        self.gpu_history_ms.push_front(milliseconds);
+        // The upper bound (count of elements <= the sample): inserting
+        // there keeps the mirror ascending — the multiset semantics
+        // the equivalence test pins.
+        let insert_at = self
+            .gpu_sorted_ms
+            .partition_point(|x| x.total_cmp(&milliseconds) != std::cmp::Ordering::Greater);
+        self.gpu_sorted_ms.insert(insert_at, milliseconds);
+        if self.gpu_history_ms.len() > 600 {
+            let evicted = self
+                .gpu_history_ms
+                .pop_back()
+                .expect("the length check guarantees an element");
+            // The lower bound (count of elements < the evicted sample):
+            // the element at that index equals the evicted sample.
+            let remove_at = self
+                .gpu_sorted_ms
+                .partition_point(|x| x.total_cmp(&evicted) == std::cmp::Ordering::Less);
+            self.gpu_sorted_ms.remove(remove_at);
+        }
     }
 
     /// GPU render time (timestamp-derived), millisecond percentiles.
@@ -221,7 +261,8 @@ impl Renderer {
             overlay_truncated_vertices: 0,
             overlay_supplied_peak_vertices: 0,
             overlay_capacity_vertices: 0,
-            gpu_history_ms: Vec::new(),
+            gpu_history_ms: std::collections::VecDeque::new(),
+            gpu_sorted_ms: Vec::new(),
         };
         Ok(Renderer {
             ctx,
@@ -345,23 +386,26 @@ impl Renderer {
             self.stats.swapchain_images = self.swapchain.image_count;
         }
         if let Some(milliseconds) = outcome.gpu_render_ms {
-            self.stats.gpu_history_ms.push(milliseconds);
-            let len = self.stats.gpu_history_ms.len();
-            if len > 600 {
-                self.stats.gpu_history_ms.drain(0..len - 600);
-            }
+            // The ring + sorted mirror (perf batch 3) — the
+            // equivalence-pinned maintenance method.
+            self.stats.record_gpu_ms(milliseconds);
         }
-        for (class, message) in drain_validation_messages() {
-            match class {
-                2 => {
-                    self.stats.validation_errors += 1;
-                    self.push_validation_message(message);
+        // The validation drain is gated on the layer being active
+        // (perf batch 3): an inactive renderer takes no per-frame
+        // mutex round-trip at all.
+        if self.stats.validation_active {
+            for (class, message) in drain_validation_messages() {
+                match class {
+                    2 => {
+                        self.stats.validation_errors += 1;
+                        self.push_validation_message(message);
+                    }
+                    1 => {
+                        self.stats.validation_warnings += 1;
+                        self.push_validation_message(message);
+                    }
+                    _ => {}
                 }
-                1 => {
-                    self.stats.validation_warnings += 1;
-                    self.push_validation_message(message);
-                }
-                _ => {}
             }
         }
         Ok(FrameResult {
@@ -443,5 +487,55 @@ impl Drop for Renderer {
         self.swapchain.destroy(&self.ctx);
         self.pipes.destroy(&self.ctx);
         self.ctx.destroy();
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    /// The perf-batch-3 equivalence pin: the ring + sorted-mirror
+    /// percentile is VALUE-IDENTICAL to the former clone-and-sort
+    /// form at every step of a deterministic pseudo-random sequence —
+    /// including across the 600-sample eviction boundary (driven well
+    /// past it at 1500 samples) and at every read quantile. The
+    /// reference side is the exact former algorithm (clone the
+    /// window, sort, index); equality is bit-exact because both sides
+    /// index the same multiset's same element.
+    #[test]
+    fn gpu_percentile_ring_matches_clone_and_sort_reference() {
+        let mut stats = RenderStats::default();
+        let mut reference: Vec<f64> = Vec::new();
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        for step in 0..1500u64 {
+            // A deterministic LCG (no rand dependency, no platform
+            // divergence) with a sawtooth mixed in for duplicates.
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let sample = (seed >> 33) as f64 % 40.0 + (step % 7) as f64;
+            stats.record_gpu_ms(sample);
+            reference.push(sample);
+            if reference.len() > 600 {
+                reference.remove(0);
+            }
+            let mut sorted_reference = reference.clone();
+            sorted_reference.sort_by(|a, b| a.total_cmp(b));
+            for quantile in [0.50, 0.95, 0.99, 1.0] {
+                let expected = ((quantile * sorted_reference.len() as f64).ceil() as usize)
+                    .saturating_sub(1)
+                    .min(sorted_reference.len() - 1);
+                assert_eq!(
+                    stats.percentile(quantile),
+                    sorted_reference[expected],
+                    "step {step} quantile {quantile}: the ring must match the clone-and-sort reference"
+                );
+            }
+        }
+        assert_eq!(
+            stats.gpu_sample_count(),
+            600,
+            "the window holds exactly the last 600 samples"
+        );
     }
 }

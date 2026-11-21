@@ -1988,10 +1988,10 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
             break;
         }
         if let Some(interval) = frame_interval {
-            let elapsed = frame_start.elapsed();
-            if elapsed < interval {
-                std::thread::sleep(interval - elapsed);
-            }
+            // Hybrid pacing (perf batch 3): the shared sleep+spin form
+            // — sleep-only quantizes to the OS timer resolution, which
+            // alone can exceed the whole budget at high target rates.
+            engine_shell::pace_until(frame_start + interval);
         }
     }
 

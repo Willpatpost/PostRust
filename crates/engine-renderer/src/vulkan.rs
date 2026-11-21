@@ -1153,6 +1153,14 @@ pub(crate) struct PipelineState {
     pub scene_layout: vk::PipelineLayout,
     pub overlay_pipeline: vk::Pipeline,
     pub overlay_layout: vk::PipelineLayout,
+    /// The renderer's pipeline cache (perf batch 3): created once
+    /// with this state and passed to EVERY `create_graphics_pipelines`
+    /// call — swapchain recreations and pipeline replacements reuse
+    /// the driver's cached compilation instead of recompiling both
+    /// pipelines from scratch with a null cache (the former resize
+    /// hitch: tens of milliseconds of shader-to-ISA compilation
+    /// exactly when the user is dragging a window edge).
+    pub pipeline_cache: vk::PipelineCache,
     pub scene_vbo: vk::Buffer,
     pub scene_vbo_memory: vk::DeviceMemory,
     pub scene_ibo: vk::Buffer,
@@ -1198,6 +1206,7 @@ impl PipelineState {
             scene_layout: vk::PipelineLayout::null(),
             overlay_pipeline: vk::Pipeline::null(),
             overlay_layout: vk::PipelineLayout::null(),
+            pipeline_cache: vk::PipelineCache::null(),
             scene_vbo: vk::Buffer::null(),
             scene_vbo_memory: vk::DeviceMemory::null(),
             scene_ibo: vk::Buffer::null(),
@@ -1214,6 +1223,14 @@ impl PipelineState {
             region_slot_bytes: 0,
             region_mapped: core::ptr::null_mut(),
         };
+        // The pipeline cache (perf batch 3): created BEFORE the build
+        // so every pipeline compilation inside — and every later
+        // swapchain recreation on this state — goes through it; an
+        // empty `PipelineCacheCreateInfo` starts a fresh in-memory
+        // cache (disk persistence is a separately authorized follow-up).
+        let cache_info = vk::PipelineCacheCreateInfo::default();
+        state.pipeline_cache = unsafe { ctx.device.create_pipeline_cache(&cache_info, None) }
+            .map_err(|error| RendererError::vk(error, "pipeline cache creation"))?;
         if let Err(error) = state.build(ctx, color_format, depth_format, demo_scene) {
             state.destroy(ctx);
             return Err(error);
@@ -1533,7 +1550,7 @@ impl PipelineState {
             .subpass(0);
         out.scene_pipeline = unsafe {
             ctx.device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[scene_info], None)
+                .create_graphics_pipelines(out.pipeline_cache, &[scene_info], None)
         }
         .map_err(|(_, error)| RendererError::vk(error, "scene pipeline"))?[0];
 
@@ -1583,7 +1600,7 @@ impl PipelineState {
             .subpass(0);
         out.overlay_pipeline = unsafe {
             ctx.device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[overlay_info], None)
+                .create_graphics_pipelines(out.pipeline_cache, &[overlay_info], None)
         }
         .map_err(|(_, error)| RendererError::vk(error, "overlay pipeline"))?[0];
 
@@ -1614,6 +1631,9 @@ impl PipelineState {
             ctx.device.destroy_pipeline(self.scene_pipeline, None);
             ctx.device.destroy_pipeline_layout(self.scene_layout, None);
             ctx.device.destroy_render_pass(self.render_pass, None);
+            // The pipeline cache (perf batch 3): released with the
+            // state that owns it — after every pipeline it cached.
+            ctx.device.destroy_pipeline_cache(self.pipeline_cache, None);
         }
     }
 }
@@ -2174,6 +2194,12 @@ pub(crate) struct FrameState {
     pub timestamps_written: [bool; FRAMES_IN_FLIGHT as usize],
     /// A present reported suboptimal — recreate before the next frame.
     pub needs_recreate: bool,
+    /// Hint-gated surface probing (perf batch 3): true while the
+    /// surface's drawable is believed unavailable (the previous frame
+    /// deferred), so minimized/transitional surfaces keep probing
+    /// until valid while ordinary frames skip the per-frame driver
+    /// round-trip entirely.
+    pub surface_probe_pending: bool,
     pub frame_slot: usize,
     pub image_index: u32,
     /// The bounded frame-capture readback (lazily allocated on first
@@ -2198,6 +2224,7 @@ impl FrameState {
             timestamps_supported: ctx.timestamp_valid_bits > 0,
             timestamps_written: [false; FRAMES_IN_FLIGHT as usize],
             needs_recreate: false,
+            surface_probe_pending: false,
             frame_slot: 0,
             image_index: 0,
             capture: CaptureState::dead(),
@@ -2403,9 +2430,23 @@ pub(crate) fn render_frame(
     // surface reports a valid extent again (correction of the 1×1
     // fabrication defect, VUID-VkSwapchainCreateInfoKHR-pNext-07781,
     // found on the rig 2026-10-20).
-    if !surface_available_now(ctx)? {
-        outcome.deferred = true;
-        return Ok(outcome);
+    //
+    // HINT-GATED PROBING (perf batch 3): the probe is a driver
+    // round-trip that formerly ran EVERY frame; it now runs only when
+    // evidence suggests the drawable may be unavailable — a pending
+    // recreation (the last present reported suboptimal or
+    // out-of-date) or the previous frame's deferral (minimized or
+    // transitional surfaces re-probe until valid). Ordinary frames
+    // skip the round-trip; acquire's ERROR_OUT_OF_DATE_KHR handling
+    // below remains the authority for everything the hints miss.
+    let recreate_pending = consume_recreate(&mut frames.needs_recreate);
+    if frames.surface_probe_pending || recreate_pending {
+        if !surface_available_now(ctx)? {
+            outcome.deferred = true;
+            frames.surface_probe_pending = true;
+            return Ok(outcome);
+        }
+        frames.surface_probe_pending = false;
     }
 
     // Lazy region-scene buffer (Stage 4 final-verification finding):
@@ -2420,7 +2461,7 @@ pub(crate) fn render_frame(
     // A previous present reported suboptimal — recreate before drawing
     // (verification requirement: suboptimal must eventually trigger
     // recreation).
-    if consume_recreate(&mut frames.needs_recreate) {
+    if recreate_pending {
         recreate_swapchain(
             ctx,
             swapchain,

@@ -476,10 +476,8 @@ pub fn run_player_demo(options: PlayerOptions) -> Result<(), String> {
             break;
         }
         if let Some(interval) = frame_interval {
-            let elapsed = frame_start.elapsed();
-            if elapsed < interval {
-                std::thread::sleep(interval - elapsed);
-            }
+            // Hybrid pacing (perf batch 3): the shared sleep+spin form.
+            engine_shell::pace_until(frame_start + interval);
         }
     }
 
