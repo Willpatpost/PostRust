@@ -444,6 +444,11 @@ pub struct EncounterState {
     pub last_hit_tick: Option<u64>,
     /// The player's last damage tick (the overlay damage line).
     pub last_damage_tick: Option<u64>,
+    /// The most recent fire-prefixed event line — stored AT THE WRITE
+    /// by the log helper (exactly what the overlay's former per-frame
+    /// reverse scan of `events` reconstructed; the render loop reads
+    /// this O(1) instead).
+    pub last_fire_line: Option<String>,
     /// (tick, line) — the deterministic event log.
     pub events: Vec<(u64, String)>,
 }
@@ -467,6 +472,7 @@ impl EncounterState {
             cooldown_remaining: 0,
             last_hit_tick: None,
             last_damage_tick: None,
+            last_fire_line: None,
             events: Vec::new(),
         }
     }
@@ -793,9 +799,17 @@ impl CombatDemo {
     }
 
     /// The parts-scoped event log push (the transition and the fire
-    /// resolution operate on the split fields).
+    /// resolution operate on the split fields). Fire-prefixed lines
+    /// also update the stored `last_fire_line` AT THE WRITE — exactly
+    /// the value the overlay's former per-frame reverse scan of this
+    /// log reconstructed (the most recent `fire ` line), now read in
+    /// O(1) instead of O(events) per frame.
     fn log(encounter: &mut EncounterState, tick: u64, line: impl Into<String>) {
-        encounter.events.push((tick, line.into()));
+        let line = line.into();
+        if line.starts_with("fire ") {
+            encounter.last_fire_line = Some(line.clone());
+        }
+        encounter.events.push((tick, line));
     }
 
     /// The scripted-logical-tick path: one movement tick plus the
@@ -1110,8 +1124,12 @@ impl CombatDemo {
     /// state visibly confirmed (the pad recolors on activation, the
     /// adversary recolors by phase and hit-flash, the player proxy
     /// appears in third person).
-    pub fn render_boxes(&self) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
-        let mut boxes = Vec::new();
+    /// The visible world into a caller-held scratch (the F-02
+    /// discipline: the render loop's retained buffer is cleared and
+    /// refilled, zero per-frame allocation); `render_boxes` is the
+    /// owned convenience for tests and one-shot reads.
+    pub fn render_boxes_into(&self, out: &mut Vec<([f32; 3], [f32; 3], [f32; 3])>) {
+        out.clear();
         for class_box in ARENA_BOXES {
             let color = match class_box.role {
                 ArenaRole::Perimeter => [0.35, 0.35, 0.40],
@@ -1126,7 +1144,7 @@ impl CombatDemo {
                 }
                 ArenaRole::AdversaryMarker => [0.25, 0.25, 0.30],
             };
-            boxes.push((class_box.min, class_box.max, color));
+            out.push((class_box.min, class_box.max, color));
         }
         // The adversary's body (B's live state): patrolling gray,
         // threatening red, hit-flash white, defeated dark.
@@ -1151,12 +1169,19 @@ impl CombatDemo {
             [0.50, 0.50, 0.55]
         };
         let (min, max) = adversary_body(adversary.position);
-        boxes.push((min, max, adversary_color));
+        out.push((min, max, adversary_color));
         // The player proxy in third person (the playable demo's rule).
         if self.driver.state().camera_mode == CameraMode::ThirdPerson {
             let (min, max) = player_box(self.driver.state().position, self.driver.config());
-            boxes.push((min, max, [0.20, 0.80, 0.35]));
+            out.push((min, max, [0.20, 0.80, 0.35]));
         }
+    }
+
+    /// The owned convenience over [`Self::render_boxes_into`] (tests
+    /// and one-shot reads; the render loop uses the scratch form).
+    pub fn render_boxes(&self) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
+        let mut boxes = Vec::new();
+        self.render_boxes_into(&mut boxes);
         boxes
     }
 }
@@ -1688,6 +1713,12 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
     };
     let mut timing = FrameTiming::new();
     let mut scene_vertices: Vec<SceneVertex> = Vec::new();
+    // The retained box scratch (F-02: cleared and refilled per frame,
+    // never reallocated) and the sanitized fire-line cache (rebuilt
+    // only when the stored source line changes — a fire is an edge
+    // event, so the overlay's ASCII mapping no longer runs per frame).
+    let mut scene_boxes: Vec<([f32; 3], [f32; 3], [f32; 3])> = Vec::new();
+    let mut fire_line_ascii: (Option<String>, String) = (None, String::new());
     // The defeat vignette's presentation-local anchor: the wall-clock
     // moment the LOST terminal was first observed (NONE before it, and
     // reset clears it) — a RENDER-LOOP-LOCAL value, deliberately NOT
@@ -1781,7 +1812,8 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
         // window (the last box is the proxy — the render_boxes
         // contract).
         scene_vertices.clear();
-        let mut boxes = demo.render_boxes();
+        demo.render_boxes_into(&mut scene_boxes);
+        let boxes = &mut scene_boxes;
         if let (Some(vignette), true, Some(last)) = (vignette, third_person, boxes.last_mut()) {
             // The proxy treatment: the color desaturates toward the
             // defeat gray over the vignette window.
@@ -1792,7 +1824,7 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
                 lerp(last.2[2], 0.38),
             ];
         }
-        for (min, max, color) in boxes {
+        for &(min, max, color) in boxes.iter() {
             push_rect_box(&mut scene_vertices, min, max, color);
         }
 
@@ -1824,20 +1856,25 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
                 AdversaryState::Attack => "attack",
                 AdversaryState::Recover => "recover",
             };
-            let last_fire = demo
+            // The stored fire line (updated AT THE WRITE by the log
+            // helper — exactly the line the former per-frame reverse
+            // scan of the ever-growing event log reconstructed), read
+            // in O(1) and sanitized only when it changes. The MINOR-1
+            // rule (SEAT I's review) stays: the embedded event text
+            // carries non-ASCII punctuation (the em-dash — font8x8
+            // renders every non-ASCII code point as '?'), so the
+            // OVERLAY BOUNDARY maps the vocabulary to ASCII (the
+            // console evidence records keep the original text).
+            let last_fire: &str = demo
                 .encounter
-                .events
-                .iter()
-                .rev()
-                .find_map(|(_, line)| line.starts_with("fire ").then(|| line.clone()))
-                .unwrap_or_else(|| "no fire yet".to_string());
-            // The MINOR-1 fix (SEAT I's review): the embedded event
-            // text carries non-ASCII punctuation (the em-dash —
-            // font8x8 renders every non-ASCII code point as '?'),
-            // so the OVERLAY BOUNDARY maps the vocabulary to ASCII
-            // (the console evidence records keep the original text —
-            // only the on-screen line is sanitized).
-            let last_fire = overlay_ascii(&last_fire);
+                .last_fire_line
+                .as_deref()
+                .unwrap_or("no fire yet");
+            if fire_line_ascii.0.as_deref() != Some(last_fire) {
+                fire_line_ascii.1 = overlay_ascii(last_fire);
+                fire_line_ascii.0 = Some(last_fire.to_string());
+            }
+            let last_fire = fire_line_ascii.1.as_str();
             let damage_line = match (demo.encounter.last_damage_tick, demo.tick_index()) {
                 (Some(last), now) if now.saturating_sub(last) <= 90 => {
                     format!(
