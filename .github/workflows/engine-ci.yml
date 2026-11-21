@@ -305,8 +305,15 @@ jobs:
           # platform-uniform, confirmed by this candidate's own run;
           # result lines unchanged. Heavy unchanged (no engine-slice
           # test moves; the pacing-site changes are loop code).
-          expected=1105
-          if [ "$(uname -s)" != "Linux" ]; then expected=1054; fi
+          # Perf batch 3 corrections (perf-batch3-renderer-shell,
+          # 2026-11-21): +1 more engine-renderer lib test — the
+          # surface-probe decision table (the lifecycle regression:
+          # recreation intent preserved through deferral). Windows
+          # 1055/2/32 MEASURED locally; Linux 1106 = the prior 1105 +
+          # the same 1, platform-uniform, confirmed by this candidate's
+          # run; result lines unchanged. Heavy unchanged.
+          expected=1106
+          if [ "$(uname -s)" != "Linux" ]; then expected=1055; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -314,6 +321,25 @@ jobs:
           [ "$passed" -eq "$expected" ] || { echo "MAIN SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           [ "$ignored" -eq 2 ] || { echo "MAIN SHARD IGNORED MISMATCH: $ignored != 2"; exit 1; }
           [ "$results" -eq 32 ] || { echo "MAIN SHARD RESULT-LINE MISMATCH: $results != 32"; exit 1; }
+      # (The batch-3 review's corrective item 4) The ISOLATED RELEASE
+      # engine-renderer battery — the configuration the orientation
+      # pin's representation-sensitive former matcher failed in while
+      # every existing gate stayed green (the main shard runs the
+      # workspace in debug; the heavy shard is engine-slice in
+      # release). This step closes that gap permanently: the pin is
+      # now representation-robust (a raw SPIR-V dataflow check on the
+      # emitted words) and this check keeps the configuration covered.
+      # 42 passed / 2 result lines (the lib battery + doc-tests),
+      # platform-uniform.
+      - name: Isolated release engine-renderer battery (the orientation-pin CI gap)
+        run: |
+          cargo test -p engine-renderer --release 2>&1 | tee tests-renderer-release.log
+          set -o pipefail
+          passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-renderer-release.log)
+          results=$(grep -c 'test result:' tests-renderer-release.log || true)
+          echo "renderer release: $passed passed, $results test-result lines (expected 42 / 2)"
+          [ "$passed" -eq 42 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 42"; exit 1; }
+          [ "$results" -eq 2 ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != 2"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production
       # tests are cfg(test)-only (never feature-gated), and this

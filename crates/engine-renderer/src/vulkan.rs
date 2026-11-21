@@ -245,6 +245,13 @@ pub(crate) struct VulkanContext {
     pub device_type: String,
     pub api_version: String,
     pub supported_present_modes: Vec<vk::PresentModeKHR>,
+    /// The renderer's pipeline cache, owned at DEVICE lifetime (the
+    /// batch-3 review's lifecycle finding 2): created once with the
+    /// context and destroyed at its teardown — AFTER every pipeline
+    /// state that used it — so swapchain recreations and pipeline
+    /// replacements REUSE the warmed cache instead of each building a
+    /// fresh empty one that dies with its state.
+    pub pipeline_cache: vk::PipelineCache,
 }
 
 impl VulkanContext {
@@ -499,6 +506,18 @@ impl VulkanContext {
         };
         let graphics_queue = unsafe { device.get_device_queue(graphics_family, 0) };
         let swapchain_ext = khr::swapchain::Device::new(&instance, &device);
+        // The device-lifetime pipeline cache (the batch-3 review's
+        // lifecycle finding 2): created once with the context, so
+        // every pipeline build — initial, swapchain-recreation, and
+        // format-change replacement alike — goes through the SAME
+        // warmed cache; destroyed at context teardown, after every
+        // pipeline state that used it (Renderer::drop destroys the
+        // pipeline state before the context). An empty
+        // PipelineCacheCreateInfo starts a fresh in-memory cache (disk
+        // persistence remains a separately authorized follow-up).
+        let pipeline_cache =
+            unsafe { device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) }
+                .map_err(|error| RendererError::vk(error, "pipeline cache creation"))?;
 
         let context = VulkanContext {
             entry,
@@ -518,6 +537,7 @@ impl VulkanContext {
             device_type,
             api_version,
             supported_present_modes,
+            pipeline_cache,
         };
         Ok((context, validation_active))
     }
@@ -531,6 +551,11 @@ impl VulkanContext {
                     .destroy_debug_utils_messenger(self.messenger, None);
                 self.messenger = vk::DebugUtilsMessengerEXT::null();
             }
+            // The pipeline cache is a device object: released before
+            // the device, after every pipeline state that used it
+            // (destroyed by the owning Renderer before this teardown).
+            self.device
+                .destroy_pipeline_cache(self.pipeline_cache, None);
             self.device.destroy_device(None);
             self.surface_ext.destroy_surface(self.surface, None);
             self.instance.destroy_instance(None);
@@ -1105,6 +1130,43 @@ fn surface_available_now(ctx: &VulkanContext) -> Result<bool, RendererError> {
     Ok(!surface_extent_unavailable(&capabilities))
 }
 
+/// The hint-gated probe decision (pure over the frame-state flags —
+/// extracted for the state-transition regression, the batch-3 review's
+/// corrective item 3). THE LIFECYCLE CONTRACT (finding 1): a
+/// `ProbeDeferred` outcome defers the frame WITHOUT touching
+/// `needs_recreate` — a pending recreation's intent survives the
+/// deferral and is consumed only by the recreate block on a frame
+/// where the probe reports the drawable available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SurfaceProbeDecision {
+    /// No evidence of trouble — no driver round-trip this frame.
+    Skip,
+    /// A probe was warranted and the drawable is available: clear the
+    /// deferral hint; a pending recreation proceeds to its own
+    /// consume-and-recreate block.
+    ProbeAvailable,
+    /// A probe was warranted and the drawable is unavailable: defer
+    /// the frame, latch the deferral hint, and PRESERVE any pending
+    /// recreation intent.
+    ProbeDeferred,
+}
+
+/// The pure decision table: `surface_available` is the probed answer,
+/// consulted only when the hints warrant a probe.
+pub(crate) fn surface_probe_decision(
+    surface_probe_pending: bool,
+    needs_recreate: bool,
+    surface_available: bool,
+) -> SurfaceProbeDecision {
+    if !surface_probe_pending && !needs_recreate {
+        SurfaceProbeDecision::Skip
+    } else if surface_available {
+        SurfaceProbeDecision::ProbeAvailable
+    } else {
+        SurfaceProbeDecision::ProbeDeferred
+    }
+}
+
 /// Depth format for the graphics device; chosen **once per renderer** and
 /// shared by the render pass and every depth attachment, so they cannot
 /// drift apart (corrective finding F).
@@ -1153,14 +1215,6 @@ pub(crate) struct PipelineState {
     pub scene_layout: vk::PipelineLayout,
     pub overlay_pipeline: vk::Pipeline,
     pub overlay_layout: vk::PipelineLayout,
-    /// The renderer's pipeline cache (perf batch 3): created once
-    /// with this state and passed to EVERY `create_graphics_pipelines`
-    /// call — swapchain recreations and pipeline replacements reuse
-    /// the driver's cached compilation instead of recompiling both
-    /// pipelines from scratch with a null cache (the former resize
-    /// hitch: tens of milliseconds of shader-to-ISA compilation
-    /// exactly when the user is dragging a window edge).
-    pub pipeline_cache: vk::PipelineCache,
     pub scene_vbo: vk::Buffer,
     pub scene_vbo_memory: vk::DeviceMemory,
     pub scene_ibo: vk::Buffer,
@@ -1206,7 +1260,6 @@ impl PipelineState {
             scene_layout: vk::PipelineLayout::null(),
             overlay_pipeline: vk::Pipeline::null(),
             overlay_layout: vk::PipelineLayout::null(),
-            pipeline_cache: vk::PipelineCache::null(),
             scene_vbo: vk::Buffer::null(),
             scene_vbo_memory: vk::DeviceMemory::null(),
             scene_ibo: vk::Buffer::null(),
@@ -1223,14 +1276,6 @@ impl PipelineState {
             region_slot_bytes: 0,
             region_mapped: core::ptr::null_mut(),
         };
-        // The pipeline cache (perf batch 3): created BEFORE the build
-        // so every pipeline compilation inside — and every later
-        // swapchain recreation on this state — goes through it; an
-        // empty `PipelineCacheCreateInfo` starts a fresh in-memory
-        // cache (disk persistence is a separately authorized follow-up).
-        let cache_info = vk::PipelineCacheCreateInfo::default();
-        state.pipeline_cache = unsafe { ctx.device.create_pipeline_cache(&cache_info, None) }
-            .map_err(|error| RendererError::vk(error, "pipeline cache creation"))?;
         if let Err(error) = state.build(ctx, color_format, depth_format, demo_scene) {
             state.destroy(ctx);
             return Err(error);
@@ -1550,7 +1595,7 @@ impl PipelineState {
             .subpass(0);
         out.scene_pipeline = unsafe {
             ctx.device
-                .create_graphics_pipelines(out.pipeline_cache, &[scene_info], None)
+                .create_graphics_pipelines(ctx.pipeline_cache, &[scene_info], None)
         }
         .map_err(|(_, error)| RendererError::vk(error, "scene pipeline"))?[0];
 
@@ -1600,7 +1645,7 @@ impl PipelineState {
             .subpass(0);
         out.overlay_pipeline = unsafe {
             ctx.device
-                .create_graphics_pipelines(out.pipeline_cache, &[overlay_info], None)
+                .create_graphics_pipelines(ctx.pipeline_cache, &[overlay_info], None)
         }
         .map_err(|(_, error)| RendererError::vk(error, "overlay pipeline"))?[0];
 
@@ -1631,9 +1676,6 @@ impl PipelineState {
             ctx.device.destroy_pipeline(self.scene_pipeline, None);
             ctx.device.destroy_pipeline_layout(self.scene_layout, None);
             ctx.device.destroy_render_pass(self.render_pass, None);
-            // The pipeline cache (perf batch 3): released with the
-            // state that owns it — after every pipeline it cached.
-            ctx.device.destroy_pipeline_cache(self.pipeline_cache, None);
         }
     }
 }
@@ -2431,22 +2473,37 @@ pub(crate) fn render_frame(
     // fabrication defect, VUID-VkSwapchainCreateInfoKHR-pNext-07781,
     // found on the rig 2026-10-20).
     //
-    // HINT-GATED PROBING (perf batch 3): the probe is a driver
-    // round-trip that formerly ran EVERY frame; it now runs only when
-    // evidence suggests the drawable may be unavailable — a pending
-    // recreation (the last present reported suboptimal or
-    // out-of-date) or the previous frame's deferral (minimized or
-    // transitional surfaces re-probe until valid). Ordinary frames
-    // skip the round-trip; acquire's ERROR_OUT_OF_DATE_KHR handling
-    // below remains the authority for everything the hints miss.
-    let recreate_pending = consume_recreate(&mut frames.needs_recreate);
-    if frames.surface_probe_pending || recreate_pending {
-        if !surface_available_now(ctx)? {
-            outcome.deferred = true;
-            frames.surface_probe_pending = true;
-            return Ok(outcome);
+    // HINT-GATED PROBING (perf batch 3, corrected per the batch-3
+    // review's lifecycle finding 1): the probe is a driver round-trip
+    // that formerly ran EVERY frame; it now runs only when evidence
+    // suggests the drawable may be unavailable — a pending recreation
+    // (the last present reported suboptimal or out-of-date) or the
+    // previous frame's deferral. THE LIFECYCLE INVARIANT: the gate
+    // only PEEKS at needs_recreate — a pending recreation's intent
+    // SURVIVES a deferral (the flag stays set; the recreation happens
+    // on the first frame the surface reports a valid extent again,
+    // through the unchanged consume-and-recreate block below).
+    // Ordinary frames skip the round-trip; acquire's
+    // ERROR_OUT_OF_DATE_KHR handling remains the authority for
+    // everything the hints miss.
+    if frames.surface_probe_pending || frames.needs_recreate {
+        match surface_probe_decision(
+            frames.surface_probe_pending,
+            frames.needs_recreate,
+            surface_available_now(ctx)?,
+        ) {
+            SurfaceProbeDecision::ProbeAvailable => frames.surface_probe_pending = false,
+            SurfaceProbeDecision::ProbeDeferred => {
+                // needs_recreate is deliberately NOT touched here —
+                // the deferral preserves the recreation intent.
+                outcome.deferred = true;
+                frames.surface_probe_pending = true;
+                return Ok(outcome);
+            }
+            SurfaceProbeDecision::Skip => {
+                unreachable!("a pending flag requested this probe")
+            }
         }
-        frames.surface_probe_pending = false;
     }
 
     // Lazy region-scene buffer (Stage 4 final-verification finding):
@@ -2460,8 +2517,10 @@ pub(crate) fn render_frame(
 
     // A previous present reported suboptimal — recreate before drawing
     // (verification requirement: suboptimal must eventually trigger
-    // recreation).
-    if recreate_pending {
+    // recreation). The consume happens HERE, only when the recreation
+    // can actually proceed (the probe above already established the
+    // surface is available whenever a recreation was pending).
+    if consume_recreate(&mut frames.needs_recreate) {
         recreate_swapchain(
             ctx,
             swapchain,
@@ -2533,6 +2592,33 @@ pub(crate) fn render_frame(
         )
     };
     if let Err(vk::Result::ERROR_OUT_OF_DATE_KHR) = acquire_result {
+        // The out-of-date inline recreation ALSO probes first (the
+        // batch-3 review's directive: every recreation path checks
+        // surface availability before recreating) — a mid-transition
+        // surface must not be recreated into. Unavailable: restore the
+        // slot fence to the signaled state (the wait above consumed
+        // its signal and no submission will provide a new one), latch
+        // the deferral hint, PRESERVE the recreation intent through
+        // the deferral, and defer the frame. No image was acquired, so
+        // no semaphore waits.
+        if surface_probe_decision(false, true, surface_available_now(ctx)?)
+            == SurfaceProbeDecision::ProbeDeferred
+        {
+            unsafe {
+                ctx.device.destroy_fence(frames.in_flight[slot], None);
+                frames.in_flight[slot] = ctx
+                    .device
+                    .create_fence(
+                        &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                        None,
+                    )
+                    .map_err(|error| RendererError::vk(error, "recreate fence"))?;
+            }
+            mark_suboptimal(&mut frames.needs_recreate);
+            frames.surface_probe_pending = true;
+            outcome.deferred = true;
+            return Ok(outcome);
+        }
         recreate_swapchain(
             ctx,
             swapchain,
@@ -3524,104 +3610,102 @@ mod orientation {
         })
     }
 
-    /// True when the module stores a NEGATED load of the Y component
-    /// (index 1) of a `gl_Position` variable back into that same
-    /// component — the compiler-generated position-flip epilogue
-    /// (naga's `write_epilogue_position_y_flip`: AccessChain the y,
-    /// OpLoad, OpFNegate, OpStore). Name- and shape-matched, never
-    /// handle-pinned, so unrelated codegen changes cannot break the
-    /// walk — only the disappearance of the adjustment itself can.
-    fn stores_negated_position_y(module: &naga::Module) -> bool {
-        use naga::Expression;
+    /// The orientation pin's REPRESENTATION-ROBUST form (the batch-3
+    /// review's corrective item 4): checks the EMITTED WORDS' dataflow
+    /// directly — an access chain into the Position builtin's Y
+    /// component (index 1), loaded, negated, and stored back — instead
+    /// of a naga-round-trip whose expression arrangement depends on
+    /// how a particular naga build reconstructs the module. The
+    /// emitted shader carries the adjustment whenever this dataflow
+    /// exists, however the instructions are ordered or numbered; the
+    /// former structural matcher failed on equivalent-but-differently-
+    /// arranged emissions (reproduced: the isolated release-profile
+    /// build-script emission).
+    fn spv_negates_position_y(bytes: &[u8]) -> bool {
         use std::collections::HashSet;
+        // Stable SPIR-V core opcode and enum numbers.
+        const OP_STORE: u32 = 62;
+        const OP_LOAD: u32 = 61;
+        const OP_ACCESS_CHAIN: u32 = 65;
+        const OP_CONSTANT: u32 = 43;
+        const OP_DECORATE: u32 = 71;
+        const OP_FNEGATE: u32 = 127;
+        // OpDecorate's operands are [target, Decoration, ...params]:
+        // the Decoration enum value for BuiltIn, then the BuiltIn enum
+        // value for Position.
+        const DECORATION_BUILTIN: u32 = 11;
+        const BUILTIN_POSITION: u32 = 0;
 
-        let position_globals: HashSet<naga::Handle<naga::GlobalVariable>> = module
-            .global_variables
+        let words: Vec<u32> = bytes
+            .as_chunks::<4>()
+            .0
             .iter()
-            .filter(|(_, global)| global.name.as_deref() == Some("gl_Position"))
-            .map(|(handle, _)| handle)
+            .map(|word| u32::from_le_bytes(*word))
             .collect();
-        if position_globals.is_empty() {
+        if words.len() < 5 || words[0] != 0x0723_0203 {
             return false;
         }
-
-        fn block_stores(
-            statements: &[naga::Statement],
-            negated: naga::Handle<Expression>,
-            target: naga::Handle<Expression>,
-        ) -> bool {
-            for statement in statements {
-                let found = match *statement {
-                    naga::Statement::Store { pointer, value } => {
-                        pointer == target && value == negated
-                    }
-                    naga::Statement::Block(ref body) => block_stores(body, negated, target),
-                    naga::Statement::If {
-                        ref accept,
-                        ref reject,
-                        ..
-                    } => {
-                        block_stores(accept, negated, target)
-                            || block_stores(reject, negated, target)
-                    }
-                    naga::Statement::Loop { ref body, .. } => block_stores(body, negated, target),
-                    _ => false,
-                };
-                if found {
-                    return true;
-                }
+        // (opcode, operands) pairs in stream order; a malformed stream
+        // (zero count or overrun) is not the adjustment.
+        let mut instructions: Vec<(u32, Vec<u32>)> = Vec::new();
+        let mut cursor = 5;
+        while cursor < words.len() {
+            let head = words[cursor];
+            let count = (head >> 16) as usize;
+            if count == 0 || cursor + count > words.len() {
+                return false;
             }
-            false
+            instructions.push((head & 0xffff, words[cursor + 1..cursor + count].to_vec()));
+            cursor += count;
         }
-
-        let functions = module
-            .functions
+        // The ids decorated BuiltIn Position (the gl_Position output):
+        // OpDecorate [target, BuiltIn(11), Position(0)].
+        let position_vars: HashSet<u32> = instructions
             .iter()
-            .map(|(_, function)| function)
-            .chain(module.entry_points.iter().map(|entry| &entry.function));
-        for function in functions {
-            let expressions = &function.expressions;
-            for (access, expression) in expressions.iter() {
-                // The accessed component: <position global>[u32 1].
-                let Expression::Access { base, index } = expression else {
-                    continue;
-                };
-                let Expression::GlobalVariable(global) = &expressions[*base] else {
-                    continue;
-                };
-                if !position_globals.contains(global) {
-                    continue;
-                }
-                let Expression::Constant(constant) = &expressions[*index] else {
-                    continue;
-                };
-                let init = module.constants[*constant].init;
-                if !matches!(
-                    module.global_expressions[init],
-                    Expression::Literal(naga::Literal::U32(1))
-                ) {
-                    continue;
-                }
-                // The negation of exactly that loaded component...
-                for (negated, negation) in expressions.iter() {
-                    let Expression::Unary {
-                        op: naga::UnaryOperator::Negate,
-                        expr: load,
-                    } = negation
-                    else {
-                        continue;
-                    };
-                    let Expression::Load { pointer } = &expressions[*load] else {
-                        continue;
-                    };
-                    if *pointer != access {
-                        continue;
-                    }
-                    // ...stored back into it.
-                    if block_stores(&function.body, negated, access) {
-                        return true;
-                    }
-                }
+            .filter(|(opcode, operands)| {
+                *opcode == OP_DECORATE
+                    && operands.len() >= 3
+                    && operands[1] == DECORATION_BUILTIN
+                    && operands[2] == BUILTIN_POSITION
+            })
+            .map(|(_, operands)| operands[0])
+            .collect();
+        if position_vars.is_empty() {
+            return false;
+        }
+        // The scalar-1 constant ids (the Y component's index).
+        let one_constants: HashSet<u32> = instructions
+            .iter()
+            .filter(|(opcode, operands)| {
+                *opcode == OP_CONSTANT && operands.len() == 3 && operands[2] == 1
+            })
+            .map(|(_, operands)| operands[1])
+            .collect();
+        // The dataflow: accessChain(position, 1) -> load -> negate ->
+        // store back into the same access chain.
+        for (opcode, operands) in &instructions {
+            // [result type, result, base, index] — exactly one index.
+            if *opcode != OP_ACCESS_CHAIN
+                || operands.len() != 4
+                || !position_vars.contains(&operands[2])
+                || !one_constants.contains(&operands[3])
+            {
+                continue;
+            }
+            let access = operands[1];
+            let load = instructions.iter().find_map(|(op, o)| {
+                (*op == OP_LOAD && o.len() == 3 && o[2] == access).then(|| o[1])
+            });
+            let Some(load) = load else { continue };
+            let negate = instructions.iter().find_map(|(op, o)| {
+                (*op == OP_FNEGATE && o.len() == 3 && o[2] == load).then(|| o[1])
+            });
+            let Some(negate) = negate else { continue };
+            if instructions
+                .iter()
+                .any(|(op, o)| *op == OP_STORE && o.len() == 2 && o[0] == access && o[1] == negate)
+            {
+                return true;
             }
         }
         false
@@ -3640,30 +3724,35 @@ mod orientation {
     /// flip).
     #[test]
     fn emitted_vertex_shaders_carry_the_position_y_adjustment() {
-        let scene = parse_emitted(SCENE_VERT_SPV, "scene.vert.spv");
+        // Well-formedness prelude: the emitted bytes re-parse through
+        // the pinned naga (the raw matcher below checks the semantics;
+        // this keeps the re-parse property the pin always had).
+        let _ = parse_emitted(SCENE_VERT_SPV, "scene.vert.spv");
+        let _ = parse_emitted(OVERLAY_VERT_SPV, "overlay.vert.spv");
+        let _ = parse_emitted(SCENE_FRAG_SPV, "scene.frag.spv");
+        let _ = parse_emitted(OVERLAY_FRAG_SPV, "overlay.frag.spv");
+        // The semantic pin, representation-robust (the raw dataflow on
+        // the emitted words — profile- and arrangement-independent).
         assert!(
-            stores_negated_position_y(&scene),
+            spv_negates_position_y(SCENE_VERT_SPV),
             "the emitted scene.vert.spv must negate gl_Position.y (the naga \
              ADJUST_COORDINATE_SPACE epilogue) — its absence flips the world"
         );
-        let overlay = parse_emitted(OVERLAY_VERT_SPV, "overlay.vert.spv");
         assert!(
-            stores_negated_position_y(&overlay),
+            spv_negates_position_y(OVERLAY_VERT_SPV),
             "the emitted overlay.vert.spv must negate gl_Position.y — the \
              overlay's NDC authoring is correct only WITH the adjustment"
         );
         // Negative controls: no Position output, no adjustment to find.
-        let scene_frag = parse_emitted(SCENE_FRAG_SPV, "scene.frag.spv");
         assert!(
-            !stores_negated_position_y(&scene_frag),
+            !spv_negates_position_y(SCENE_FRAG_SPV),
             "the fragment shader has no position output — a match here means \
-             the walker matches structure that is not the adjustment"
+             the matcher matches structure that is not the adjustment"
         );
-        let overlay_frag = parse_emitted(OVERLAY_FRAG_SPV, "overlay.frag.spv");
         assert!(
-            !stores_negated_position_y(&overlay_frag),
+            !spv_negates_position_y(OVERLAY_FRAG_SPV),
             "the fragment shader has no position output — a match here means \
-             the walker matches structure that is not the adjustment"
+             the matcher matches structure that is not the adjustment"
         );
     }
 
@@ -3790,5 +3879,66 @@ mod orientation {
         // With the capability present, the same match serves (the
         // positive control).
         assert!(cached.matches(1280, 720, vk::Format::B8G8R8A8_UNORM, true));
+    }
+}
+
+#[cfg(test)]
+mod surface_probe_tests {
+    use super::{SurfaceProbeDecision, surface_probe_decision};
+
+    /// The hint-gated probe state table (the batch-3 review's
+    /// corrective item 3) - the lifecycle transitions the render loop
+    /// implements over this pure decision:
+    /// - an ordinary frame (no hints) NEVER probes - no driver
+    ///   round-trip;
+    /// - a pending recreation on an available surface proceeds (the
+    ///   recreation is consumed by its own block - the decision never
+    ///   touches the flag);
+    /// - a pending recreation on an UNAVAILABLE surface defers AND
+    ///   PRESERVES the intent (the review's finding 1: the flag
+    ///   survives the deferral; the recreation happens on recovery);
+    /// - a prior deferral re-probes until available, then clears the
+    ///   hint (recovery);
+    /// - the stale-nonzero-window mid-transition case reaches the same
+    ///   table through the pending-recreation hint the out-of-date
+    ///   acquire path sets.
+    #[test]
+    fn probe_decision_table_preserves_recreation_intent_through_deferral() {
+        // Ordinary frame: no evidence of trouble, no probe - the
+        // availability answer is not even consulted.
+        assert_eq!(
+            surface_probe_decision(false, false, true),
+            SurfaceProbeDecision::Skip
+        );
+        assert_eq!(
+            surface_probe_decision(false, false, false),
+            SurfaceProbeDecision::Skip
+        );
+        // Pending recreation, drawable available: proceed - the
+        // consume-and-recreate block runs this frame.
+        assert_eq!(
+            surface_probe_decision(false, true, true),
+            SurfaceProbeDecision::ProbeAvailable
+        );
+        // Pending recreation, drawable unavailable: DEFER - and the
+        // decision's contract keeps needs_recreate untouched, so the
+        // intent survives to the recovery frame (finding 1).
+        assert_eq!(
+            surface_probe_decision(false, true, false),
+            SurfaceProbeDecision::ProbeDeferred
+        );
+        assert_eq!(
+            surface_probe_decision(true, true, false),
+            SurfaceProbeDecision::ProbeDeferred
+        );
+        // Recovery: the deferred hint re-probes; available clears it.
+        assert_eq!(
+            surface_probe_decision(true, false, true),
+            SurfaceProbeDecision::ProbeAvailable
+        );
+        assert_eq!(
+            surface_probe_decision(true, true, true),
+            SurfaceProbeDecision::ProbeAvailable
+        );
     }
 }
