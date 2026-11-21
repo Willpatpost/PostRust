@@ -2,7 +2,8 @@
 name = "engine-renderer"
 version.workspace = true
 edition.workspace = true
-description = "Sektor7 original engine — Stage 2 Vulkan presentation and first render"
+description = "PostRust — Vulkan presentation backend (ash)"
+license.workspace = true
 
 [dependencies]
 # Vulkan binding (T-03 investigation concluded: ash 0.38, the de-facto

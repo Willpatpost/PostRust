@@ -1,4 +1,4 @@
-# SEKTOR7 — CURRENT STATUS INDEX
+# PostRust — Current Status Index
 
 **Purpose:** the maintained, always-current index of what the engine actually
 is — integrated, tested, measured, and pending. The stage records in
@@ -10,10 +10,13 @@ work from THIS file alone.
 
 - **Maintained since:** 2026-11-14 (the post-audit remediation cycle, F-13);
   reconciled for Cycle 1 on 2026-11-15.
-- **Baseline at introduction:** `main` @ `a4fe0ec` — that remediation
-  candidate was subsequently **merged** (`main` has sat at `900b0ea` since).
-  This revision reflects the **Cycle-1 integration candidate**
-  (`s7-cycle1-integration`, §9) with its measured counts.
+- **Reconciled for the PostRust extraction on 2026-11-20:** the engine moved
+  from the Sektor7 game repository to this repository
+  (https://github.com/Willpatpost/PostRust) with full history; the workspace
+  now lives at the repository ROOT (no `engine/` prefix — historical records
+  below still use it). This pass also brought the §4 counts and the
+  capability matrix current through Cycle 5 + perf-hardening batch 1; the
+  extraction baseline is `main` @ `b19d210`, five-job CI run `44827915274`.
 - **Update rule:** every change that alters capabilities, test counts,
   performance evidence, or priorities updates this file in the same change.
 
@@ -30,14 +33,14 @@ work from THIS file alone.
 | Slice 0 integration acceptance | `docs/SLICE0-INTEGRATION-ACCEPTANCE-RECORD-2026-10-26.md` |
 | Production-persistence line records (PP-B1…B4) | `docs/PP-B1-SQLITE-PERSISTENCE-RECORD.md` … `PP-B4-ORCHESTRATION-VALIDATION-RECORD.md` |
 | Stage 6 evidence schema, burst validation, soak runbooks | `docs/STAGE6-*.md` |
-| The vision and design bible | `docs/VISION.md`, `docs/DESIGN-BIBLE.md`, `docs/TECH-ARCHITECTURE.md` |
+| The game-side vision and design bible | `VISION.md`, `DESIGN-BIBLE.md` in the **Sektor7 game repository** (https://github.com/Willpatpost/Sektor7 — they moved with the game at the extraction); `docs/TECH-ARCHITECTURE.md` here |
 
 These are point-in-time acceptance records. Later work does not edit them to
 appear further along; later state lives in this index.
 
 ## 2. Current integrated engine capabilities (what `main` actually carries)
 
-Five-crate workspace (`engine/`), all cross-platform (Linux, Windows, macOS
+Five-crate workspace at the repository root (`crates/`), all cross-platform (Linux, Windows, macOS
 ARM64) with a five-job CI:
 
 - **`engine-core`** — the deterministic simulation spine: `(due, seq)` event
@@ -118,18 +121,22 @@ re-measured from actual output on every change, never estimated):
 
 | CI partition | Linux | Windows |
 |---|---:|---:|
-| Main shard (`--workspace --exclude engine-slice`) | 1050 | 999 |
-| Heavy shard (`-p engine-slice --features crash-test-seams`) | 512 | 513 |
-| **Combined** | **1562** | **1512** |
+| Main shard (`--workspace --exclude engine-slice`) | 1104 | 1053 |
+| Heavy shard (`-p engine-slice --features crash-test-seams`) | 565 | 564 |
+| **Combined** | **1669** | **1617** |
 
 (The macOS job runs its own execution partition — no combined count is
-defined for it. Ignored: 2 main / 6 heavy, all deliberate measurement soaks.
-**The Cycle-3 integrated candidate** (`s7-cycle3-integration`, §9) moved
-the pins from 1011/960 + 498/497: combat +21 main (A), adversary +13 main
-(B), audio +3 main (C), scene separation +1 main/+2 heavy (D), the
-exclusion witness +1 main (E), the combat_world battery +12 heavy (F) —
-all MEASURED at the integrated tree; the Windows values are the
-platform-uniform inference this candidate's CI confirms.)
+defined for it. Ignored: 2 main / 7 heavy, all deliberate measurement soaks.
+**These are the PostRust-extraction counts** — MEASURED at `main` @
+`b19d210` by five-job CI run `44827915274` (and identical at the Sektor7
+pre-extraction mainline `2640b64`, run `44825693818`): the Cycle-3-era
+values this table carried before the 2026-11-20 reconciliation (1011/960 +
+498/497 at Cycle 3, then 1050/999 + 512/513) were superseded by Cycle 4
+(+46 main platform-uniform across its batches), Cycle 5 (+2 main, +12 heavy
++1 ignored), and perf-hardening batch 1 (+2 main, +1 result line — the
+spine allocation gate). Every step was measured at its integrated tree;
+the history is preserved in the workflow's comment chains and the cycle
+commit messages.)
 
 **The Cycle-1 candidate** (was `s7-cycle1-integration`;
 **merged to `main` 2026-11-15**, superseded by the Cycle-2 merge below)
@@ -379,8 +386,11 @@ The ledger is `docs/DECISIONS.md`; the load-bearing accepted decisions:
   are bounded observation windows, not complete drains.
 - No GPU asset streaming (F-04); dynamic content moves through per-frame
   host-visible copies.
-- No networking, replication, physics, combat, procedural generation, asset
-  pipeline, or editor systems (§10 — not yet designed, not hidden).
+- No networking, replication, procedural generation, asset pipeline, or
+  editor systems (§10 — not yet designed, not hidden). Combat, adversary,
+  and encounter prototypes landed through Cycles 2–5 (§2, the capability
+  matrix) — game-scale gameplay on top of them remains undesigned; the
+  physics backend remains the reversible Cycle-1 prototype.
 - The engine is a **development foundation + demo**, not a production game
   engine; nothing in the current evidence supports production-readiness
   claims for the complete game.
@@ -534,7 +544,7 @@ not implemented** / **not yet designed**.
 | GPU resource streaming | Not yet designed | F-04 deferred; host-visible copies only |
 | NPC/world representation (LOD) | Partially implemented | The region director, four LOD levels, activation/reconstruction — validated at 1000 NPCs / 8 regions; game-scale behaviors undesigned |
 | Physics and collision | Prototype only | The Cycle-1 kinematic player prototype (`engine-core` player module: swept-AABB collision, fixed-step movement, FP/TP cameras) — headless/offscreen validated, collide-what-you-see; reversible and explicitly NOT a ratified production physics backend (§8) |
-| Combat and gameplay systems | Not yet designed | — |
+| Combat and gameplay systems | Partially implemented (demo-scale prototype, validated) | The Cycle 2–5 line: `engine-core` combat resolution (`resolve_attack`, pure, allocation-free) + the adversary cadence model + the encounter composition with cover/HUD/cues in `engine-slice` — pinned by the combat_world (21) and encounter_world (30) batteries with byte-identical scenario traces; game-scale gameplay systems (progression, economy, AI beyond the cadence prototype) remain undesigned |
 | Networking and replication | Not yet designed | The player-facing multiplayer and governance rules are **ratified** in `docs/MULTIPLAYER-SPEC.md`; the networking/transport/replication implementation choices remain unratified and undesigned |
 | Listen-server authority | Not yet designed | Player-hosted listen-server is the stated working preference (unratified); no engine system |
 | Host handoff | Not yet designed | Planned-required per the ratified multiplayer requirements; no engine system |

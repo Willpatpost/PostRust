@@ -2,7 +2,8 @@
 name = "engine-slice"
 version.workspace = true
 edition.workspace = true
-description = "Sektor7 original engine — Stage 0 interactive slice application"
+description = "PostRust — integration and demonstration driver (the demo/test battery)"
+license.workspace = true
 build = "build.rs"
 
 [features]

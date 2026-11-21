@@ -2,7 +2,8 @@
 name = "engine-shell"
 version.workspace = true
 edition.workspace = true
-description = "Sektor7 original engine — Stage 1 SDL3 application shell: windowing, input intents, application lifecycle"
+description = "PostRust — SDL3 application shell: windowing, input intents, application lifecycle"
+license.workspace = true
 
 [dependencies]
 # Diagnostics reuse (Stage 1 corrective pass, finding 4): the shell records

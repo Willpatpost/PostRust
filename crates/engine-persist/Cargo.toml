@@ -2,7 +2,8 @@
 name = "engine-persist"
 version.workspace = true
 edition.workspace = true
-description = "Sektor7 original engine — Stage 5 B2: content-addressed revision store and local canonical medium"
+description = "PostRust — content-addressed revision store, canonical mediums, journal, commit pipeline, and recovery"
+license.workspace = true
 
 [dependencies]
 engine-core = { path = "../engine-core" }

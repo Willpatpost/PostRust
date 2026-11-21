@@ -11,8 +11,11 @@ work, with Vulkan presentation on top.
   fingerprints, and byte-identical replay: every scenario trace,
   fingerprint, and save round-trip is pinned in CI and compared
   exactly on Linux, Windows, and macOS ARM64.
-- **Zero-allocation main path** — gated by a counting-allocator test
-  (events *and* bytes, cold and warm windows), not just code review.
+- **Zero *avoidable* hot-path allocations** — the simulation main path
+  performs no allocation beyond the pinned structural storage its
+  canonical containers require (index nodes, ledger growth); gated by a
+  counting-allocator test (events *and* bytes, cold and warm windows),
+  not just code review.
 - **Production persistence** — a SHA-256 content-addressed revision
   store, a durable hash-chained journal, a commit pipeline with
   canonical confirmation, and crash-recovery proven by real
