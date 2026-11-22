@@ -30,7 +30,9 @@ bytemuck = { version = "1", features = ["derive"] }
 # rig). The permanent shader-toolchain decision remains deferred.
 # Pinned to 29.0.4: naga 30.0.1's glsl-in frontend does not compile against its
 # own ir module (apply_default_interpolation missing) — observed 2026-10-19.
-naga = { version = "=29.0.4", features = ["glsl-in", "spv-out"] }
+# wgsl-in added for the Cycle 6-A atlas shaders (the probed finding: glsl-in
+# cannot express sampled textures on this version).
+naga = { version = "=29.0.4", features = ["glsl-in", "spv-out", "wgsl-in"] }
 
 [dev-dependencies]
 # Test-side re-parse of the build-emitted SPIR-V (the orientation

@@ -41,8 +41,11 @@
 #![deny(unsafe_code)]
 
 pub mod config;
+pub mod descriptors;
+pub mod glyph_atlas;
 pub mod overlay;
 pub mod scene;
+pub mod textures;
 
 mod renderer;
 mod vulkan;

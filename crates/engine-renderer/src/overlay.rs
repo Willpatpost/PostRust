@@ -17,8 +17,10 @@ pub struct OverlayVertex {
 /// Pixels per glyph axis (font8x8 is 8×8), scaled 2×.
 const SCALE: f32 = 2.0;
 /// Maximum glyphs buffered (guard for the persistently mapped vertex
-/// buffer; ~6 KB of text).
-const MAX_GLYPHS: usize = 6_000;
+/// buffer; ~6 KB of text). pub(crate): the atlas quad emitter in
+/// glyph_atlas.rs enforces the SAME cap — the legacy and atlas forms
+/// must refuse identically.
+pub(crate) const MAX_GLYPHS: usize = 6_000;
 /// Maximum total overlay capacity. Each frame slot grows independently
 /// on demand up to its share of this budget.
 pub fn overlay_capacity_vertices() -> u32 {
