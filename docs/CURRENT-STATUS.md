@@ -272,17 +272,35 @@ The ledger is `docs/DECISIONS.md`; the load-bearing accepted decisions:
 - SDL3 vendored-static; the engine never links system SDL.
 - Production-persistence decisions: `docs/PRODUCTION-PERSISTENCE-DECISIONS.md`.
 
-## 6. Deferred design decisions (documented, not yet authorized)
+## 6. Owner-ratified decisions and deferred design items
 
-The following audit findings remain open for owner review.
+The following three behavioral and measurement decisions were
+**ratified by the owner on 2026-11-22** (the decision ledger:
+`docs/DECISIONS.md`, entries T-16/T-17/T-18). They are accepted
+behavior, not open questions — future changes require an explicit
+tradeoff analysis and owner approval.
 
-- **Jump input.** The first executed simulation tick consumes a queued
-  press. An airborne player must press again after landing. A landing
-  buffer would change which tick can start a jump.
-- **Render overflow.** At the shared scene-vertex cap, foreground draws
-  take priority and world geometry truncates first.
-- **Timing.** A percentile reports the upper bound of its nearest-rank
-  histogram bucket, capped at the observed maximum. The maximum is exact.
+- **Jump input (ratified).** The first executed simulation tick
+  consumes a queued press; an airborne player must press again
+  after landing. Future gameplay polish may propose configurable,
+  bounded jump buffering (with coyote-time) under the ratified
+  requirements in the decision entry — none is implemented.
+- **Render overflow (ratified).** At the shared scene-vertex cap,
+  foreground draws (player-visible geometry, weapon/viewmodel
+  presentation) take priority and world geometry truncates first.
+  The permanent geometry-capacity policy (complete primitives,
+  scalable overflow handling) remains renderer-development backlog
+  work — the fixed current cap is a prototype constraint, not
+  endorsed architecture.
+- **Timing percentiles (ratified).** Live CPU/GPU diagnostics use
+  the bounded histogram (bucket-upper-bound percentiles, exact
+  maxima, documented ≤ ~1.6% relative error). Engineering
+  benchmarks that justify optimization or architecture claims must
+  use exact measurements or rigorous A/B methodology — approximate
+  histogram percentiles are never presented as exact observations.
+
+The following audit finding remains genuinely open:
+
 - **Scheduler budget (audit F4).** The per-tick limit counts executed
   events. Registering blocked events and waking their dependents still
   costs CPU outside that limit. A hard limit on this bookkeeping is
