@@ -2988,6 +2988,69 @@ mod tests {
         ));
     }
 
+    /// The wrap-window frame length — the audit's EMPIRICAL repro: a
+    /// damaged length field of u64::MAX made the pre-guard loop's
+    /// `offset + 8 + len` arithmetic wrap around (reproduced against
+    /// the pre-fix tree in BOTH profiles: debug failed the add-overflow
+    /// check, release took the slice-index panic at the record slice).
+    /// The pure arithmetic test above pins the `frame_end` boundary;
+    /// THIS test drives the exact repro bytes through the real FILE
+    /// paths both ways: the scan-classify walk, and a full open —
+    /// which additionally resolves the inert tail and must complete
+    /// (the release-profile panic lived on that path). A refactor back
+    /// to unchecked frame arithmetic would pass the arithmetic test
+    /// and fail here.
+    #[test]
+    fn wrap_window_frame_length_is_a_torn_tail_through_scan_and_open() {
+        let dir = TestDir::new("wrap-window-length");
+        let path = dir.journal();
+        let mut journal = T1Journal::open(&path).unwrap();
+        journal.append_transaction(&tx_input(1)).unwrap();
+        drop(journal);
+
+        // The repro: a frame header whose declared length is u64::MAX
+        // (eight 0xFF bytes) followed by 12 bytes of tail garbage —
+        // the exact wrap-window input, 20 damaged bytes total.
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(&[0xFF; 8]);
+        bytes.extend_from_slice(b"tail-garbage");
+        let damaged_len = bytes.len();
+        fs::write(&path, &bytes).unwrap();
+
+        // The scan walk classifies the damage as an inert torn tail.
+        let scan = T1Journal::scan_file(&path).unwrap();
+        assert_eq!(
+            scan.committed.len(),
+            1,
+            "the committed transaction survives"
+        );
+        assert!(matches!(
+            scan.tail,
+            TailState::Inert {
+                kind: TailKind::TornFrame,
+                byte_len: 20,
+                ..
+            }
+        ));
+
+        // The full open resolves the inert tail and completes — this
+        // is the path the release-profile panic lived on.
+        let reopened = T1Journal::open(&path).unwrap();
+        assert_eq!(
+            reopened.transactions().len(),
+            1,
+            "the committed transaction survives the reopen"
+        );
+        drop(reopened);
+        // Tail resolution truncated exactly the 20 damaged bytes.
+        let clean = fs::read(&path).unwrap();
+        assert_eq!(
+            clean.len(),
+            damaged_len - 20,
+            "the inert wrap-window tail was truncated away"
+        );
+    }
+
     // ------------------------------------------- committed corruption
 
     #[test]

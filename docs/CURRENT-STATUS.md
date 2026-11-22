@@ -142,9 +142,9 @@ for the combined candidate.
 
 | CI partition | Linux | Windows |
 |---|---:|---:|
-| Main shard (`--workspace --exclude engine-slice`) | 1114 | 1063 |
+| Main shard (`--workspace --exclude engine-slice`) | 1115 | 1064 |
 | Heavy shard (`-p engine-slice --features crash-test-seams`) | 569 | 568 |
-| **Combined** | **1683** | **1631** |
+| **Combined** | **1684** | **1632** |
 
 The macOS job has its own partition. Main has two ignored tests and 32
 result lines. Heavy has seven ignored tests and 55 result lines.

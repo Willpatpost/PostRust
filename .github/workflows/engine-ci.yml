@@ -296,9 +296,14 @@ jobs:
           # a mismatch is corrected from actuals, never by weakening a
           # test.
           # a4eb372 added six main tests. The combined candidate adds one
-          # surface-probe test and three journal regressions.
-          expected=1114
-          if [ "$(uname -s)" != "Linux" ]; then expected=1063; fi
+          # surface-probe test and three journal regressions. The
+          # wrap-window file-level regression (the audit's outstanding
+          # acceptance item) adds one more engine-persist lib test:
+          # Windows 1064/2/32 MEASURED locally with this step's own
+          # counting; Linux 1115 = the prior 1114 + the same 1,
+          # platform-uniform, confirmed by this candidate's own run.
+          expected=1115
+          if [ "$(uname -s)" != "Linux" ]; then expected=1064; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
