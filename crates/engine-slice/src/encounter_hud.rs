@@ -3,7 +3,7 @@ use std::fmt::Write;
 use std::time::Duration;
 
 use engine_core::{WeaponId, adversary::AdversaryState};
-use engine_renderer::overlay::{OverlayVertex, push_rect_px, push_text_px};
+use engine_renderer::overlay::{AtlasText, OverlayVertex, push_rect_px};
 
 use crate::encounter_demo::{EncounterDemo, EncounterPhase};
 use crate::encounter_events::{PresentationEvent, RayImpact};
@@ -26,6 +26,7 @@ pub(crate) struct CombatHud {
     reset_label: Option<String>,
     targets: Vec<(f32, AdversaryState)>,
     text: String,
+    atlas_text: AtlasText,
     pub vertices: Vec<OverlayVertex>,
 }
 
@@ -121,6 +122,7 @@ impl CombatHud {
             .min(h / 100.);
         let mut canvas = Canvas {
             vertices: &mut self.vertices,
+            atlas_text: &mut self.atlas_text,
             extent,
             scale,
         };
@@ -244,7 +246,7 @@ impl CombatHud {
             let x = cx - width * 0.5;
             let y = h * 0.72;
             canvas.rect(x, y, width, 18., INK);
-            push_text_px(
+            canvas.atlas_text.push_text_px(
                 canvas.vertices,
                 extent,
                 [(x + 6. * fit) * scale, (y + 5.) * scale],
@@ -259,6 +261,7 @@ impl CombatHud {
 
 struct Canvas<'a> {
     vertices: &'a mut Vec<OverlayVertex>,
+    atlas_text: &'a mut AtlasText,
     extent: (u32, u32),
     scale: f32,
 }
@@ -274,6 +277,7 @@ impl Canvas<'_> {
     }
     fn text(&mut self, x: f32, y: f32, text: &str, color: [f32; 4]) {
         let s = self.scale;
-        push_text_px(self.vertices, self.extent, [x * s, y * s], s, text, color);
+        self.atlas_text
+            .push_text_px(self.vertices, self.extent, [x * s, y * s], s, text, color);
     }
 }

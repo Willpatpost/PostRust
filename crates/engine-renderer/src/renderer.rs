@@ -9,7 +9,7 @@ use std::time::Duration;
 use sdl3::video::Window as SdlWindow;
 
 use crate::config::{RenderConfig, present_mode_str};
-use crate::overlay::{OverlayVertex, build_overlay_vertices_into};
+use crate::overlay::{AtlasText, OverlayVertex};
 use crate::scene::SceneVertex;
 use crate::vulkan::{
     self, CapturedFrame, FrameState, PipelineState, RendererError, SwapchainState, VulkanContext,
@@ -51,6 +51,18 @@ pub struct FrameResult {
     pub deferred: bool,
     pub gpu_render_ms: Option<f64>,
     pub geometry: GeometryStats,
+}
+
+/// Successful Vulkan allocation calls since renderer construction and the
+/// resident byte size of the atlas allocation (including its staging tail).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocationStats {
+    pub device_memory: u64,
+    pub texture_memory: u64,
+    pub texture_bytes: u64,
+    pub descriptor_pools: u64,
+    pub descriptor_sets: u64,
+    pub samplers: u64,
 }
 
 /// Long-lived renderer statistics (Stage 2 authorization, item 4).
@@ -133,12 +145,14 @@ pub struct Renderer {
     /// frame (the capacity from the first frames is reused — no
     /// per-frame allocation or growth; the vertex content is
     /// identical to the allocating form).
-    overlay_vertices: Vec<crate::overlay::OverlayVertex>,
+    overlay_vertices: Vec<OverlayVertex>,
+    atlas_text: AtlasText,
 }
 
 impl Renderer {
     pub fn new(window: &SdlWindow, config: RenderConfig) -> Result<Renderer, RendererError> {
-        let (mut ctx, validation_active) = VulkanContext::new(window, &config)?;
+        let atlas_text = AtlasText::default();
+        let (mut ctx, validation_active) = VulkanContext::new(window, atlas_text.atlas(), &config)?;
         // Cross-stage cleanup (corrective finding G): each constructor
         // cleans up its own partials; this ladder releases completed
         // stages when a later stage fails.
@@ -227,6 +241,7 @@ impl Renderer {
             overlay_enabled: true,
             overlay_color: [0.72, 1.0, 0.78, 0.85],
             overlay_vertices: Vec::new(),
+            atlas_text,
         })
     }
 
@@ -281,7 +296,7 @@ impl Renderer {
         // allocation or growth; the vertex content is identical).
         if self.overlay_enabled {
             if let Some(text) = debug_text {
-                build_overlay_vertices_into(
+                self.atlas_text.build_overlay_vertices_into(
                     &mut self.overlay_vertices,
                     text,
                     window_size,
@@ -389,6 +404,11 @@ impl Renderer {
                     + u64::from(outcome.overlay.drawn) * size_of::<OverlayVertex>() as u64,
             },
         })
+    }
+
+    /// Reads cumulative allocation counters on demand.
+    pub fn allocations(&self) -> AllocationStats {
+        self.ctx.allocations()
     }
 
     pub fn stats(&self) -> &RenderStats {

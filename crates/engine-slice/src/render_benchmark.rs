@@ -28,7 +28,7 @@
 
 use std::time::{Duration, Instant};
 
-use engine_renderer::overlay::build_overlay_vertices;
+use engine_renderer::overlay::{AtlasText, build_legacy_overlay_into};
 
 use crate::benchmark::{report, scenario_pair};
 use crate::math;
@@ -104,7 +104,7 @@ fn representative_overlay_text(
 /// Runs the render-path CPU benchmark and prints the report.
 pub fn run() {
     println!(
-        "Sektor7 render-path CPU benchmark (F-02/F-05 — POD CPU evidence only, NOT physical-rig or real-GPU evidence)"
+        "Sektor7 render-path CPU benchmark (F-02/F-05 — host CPU geometry and instrumentation timings)"
     );
     println!(
         "workload: the deterministic 1000-NPC / 8-region Lod scenario at 150 ticks (the accrual peak), the fixed frame state"
@@ -217,27 +217,64 @@ pub fn run() {
         &mut percentile_pair,
     );
 
-    // D. F-05 — the overlay vertex rebuild over the formatted text
-    //    (the glyph quad regeneration, the per-frame Vec).
+    // D. Compare the two full CPU geometry builders, including NDC and the
+    // final vertex writes. Use the original 24-byte solid ABI for the baseline.
+    // Alternate order over the same fixture and retain both buffers.
     let text = representative_overlay_text(59.7, 1.234, 0.987, 0.456, 0.789);
-    let mut overlay_vertices = Vec::new();
-    let mut overlay_vertex_count = 0usize;
+    // Preserve section D's original allocate-and-rebuild workload as a
+    // separate distribution; its allocation cost is excluded from the A/B.
+    let mut fresh_times = Vec::with_capacity(2000);
     for i in 0..2200 {
         let start = Instant::now();
-        let vertices = build_overlay_vertices(&text, (1280, 720), [1.0, 1.0, 1.0, 1.0]);
-        overlay_vertices.push(start.elapsed());
-        overlay_vertex_count = vertices.len();
-        if i < 200 {
-            overlay_vertices.pop();
+        let mut fresh = Vec::new();
+        build_legacy_overlay_into(&mut fresh, &text, (1280, 720), [1.; 4]);
+        std::hint::black_box(fresh.as_slice());
+        let elapsed = start.elapsed();
+        if i >= 200 {
+            fresh_times.push(elapsed);
         }
     }
-    report(
-        "overlay vertex rebuild (build_overlay_vertices, per frame)",
-        &mut overlay_vertices,
-    );
+    report("D legacy per-pixel geometry (fresh Vec)", &mut fresh_times);
+    let mut solid = Vec::new();
+    let mut sampled = Vec::new();
+    let mut font = AtlasText::default();
+    let mut legacy_times = Vec::with_capacity(2000);
+    let mut atlas_times = Vec::with_capacity(2000);
+    for i in 0..2200 {
+        let mut time_legacy = || {
+            let start = Instant::now();
+            build_legacy_overlay_into(&mut solid, &text, (1280, 720), [1.; 4]);
+            std::hint::black_box(solid.as_slice());
+            start.elapsed()
+        };
+        let mut time_atlas = || {
+            let start = Instant::now();
+            font.build_overlay_vertices_into(&mut sampled, &text, (1280, 720), [1.; 4]);
+            std::hint::black_box(sampled.as_slice());
+            start.elapsed()
+        };
+        let (legacy, atlas) = if i % 2 == 0 {
+            (time_legacy(), time_atlas())
+        } else {
+            let atlas = time_atlas();
+            (time_legacy(), atlas)
+        };
+        if i >= 200 {
+            legacy_times.push(legacy);
+            atlas_times.push(atlas);
+        }
+    }
+    report("D legacy per-pixel geometry (retained)", &mut legacy_times);
+    report("D atlas glyph geometry (retained)", &mut atlas_times);
+    let median_us = |sorted: &[Duration]| sorted[sorted.len() / 2].as_secs_f64() * 1e6;
     println!(
-        "  glyph geometry: {overlay_vertex_count} overlay vertices for the {}-byte text",
-        text.len()
+        "  {} vertices / {} bytes -> {} vertices / {} bytes ({:.2}x fewer vertices); median CPU saving {:.3} us",
+        solid.len(),
+        size_of_val(solid.as_slice()),
+        sampled.len(),
+        size_of_val(sampled.as_slice()),
+        solid.len() as f64 / sampled.len() as f64,
+        median_us(&legacy_times) - median_us(&atlas_times)
     );
 
     // The budget interpretation: the measured overlay-on
@@ -254,12 +291,12 @@ pub fn run() {
     // The vertex rebuild is a renderer-side cost of the overlay text
     // (it runs inside the renderer's draw path when the overlay is
     // enabled) — counted in the overlay-on share.
-    let overlay_on_extra = overlay_ms + median_ms(&overlay_vertices);
+    let overlay_on_extra = overlay_ms + median_ms(&atlas_times);
     println!(
         "frame-budget share (medians): region scene {region_ms:.3} ms/frame; overlay-on extra {overlay_on_extra:.3} ms/frame (format {:.3} + percentiles {:.3} + vertices {:.3})",
         median_ms(&overlay_format),
         median_ms(&percentile_pair),
-        median_ms(&overlay_vertices),
+        median_ms(&atlas_times),
     );
     for (fps, budget) in [(60u32, 16.7f64), (144, 6.9), (240, 4.2)] {
         let share = (region_ms + overlay_on_extra) / budget * 100.0;
@@ -269,6 +306,6 @@ pub fn run() {
         );
     }
     println!(
-        "NOTE: these are the POD's CPU-side costs of the derived render path in isolation — the full frame cost (presentation, GPU waits, simulation, durability I/O) is separate; the real-GPU evidence is the owner's Windows rig per the profiling kit"
+        "NOTE: these are this host's CPU-side costs of the derived render path in isolation — the full frame cost (presentation, GPU waits, simulation, durability I/O) is separate"
     );
 }

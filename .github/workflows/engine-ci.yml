@@ -298,8 +298,10 @@ jobs:
           # Windows 1064/2/32 MEASURED locally with this step's own
           # counting; Linux 1115 = the prior 1114 + the same 1,
           # platform-uniform, confirmed by this candidate's own run.
-          expected=1115
-          if [ "$(uname -s)" != "Linux" ]; then expected=1064; fi
+          # Cycle 6-A: the three platform-uniform atlas layout/UV/metric
+          # pins add three passes; ignored and result-line counts stay fixed.
+          expected=1118
+          if [ "$(uname -s)" != "Linux" ]; then expected=1067; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -315,7 +317,7 @@ jobs:
       # release). This step closes that gap permanently: the pin is
       # now representation-robust (a raw SPIR-V dataflow check on the
       # emitted words) and this check keeps the configuration covered.
-      # 41 passed / 2 result lines (the lib battery + doc-tests),
+      # Cycle 6-A adds the three atlas tests: 41 -> 44 passed / 2 result lines (the lib battery + doc-tests),
       # platform-uniform.
       - name: Isolated release engine-renderer battery (the orientation-pin CI gap)
         shell: bash
@@ -324,8 +326,8 @@ jobs:
           cargo test -p engine-renderer --release 2>&1 | tee tests-renderer-release.log
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-renderer-release.log)
           results=$(grep -c 'test result:' tests-renderer-release.log || true)
-          echo "renderer release: $passed passed, $results test-result lines (expected 41 / 2)"
-          [ "$passed" -eq 41 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 41"; exit 1; }
+          echo "renderer release: $passed passed, $results test-result lines (expected 44 / 2)"
+          [ "$passed" -eq 44 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 44"; exit 1; }
           [ "$results" -eq 2 ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != 2"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production
@@ -455,6 +457,11 @@ jobs:
         shell: bash
         run: |
           SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_orientation -- --ignored --nocapture
+      - name: Atlas RGBA equivalence and allocation regression (Linux Vulkan)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_glyph_atlas -- --ignored --nocapture
       - name: Encounter and legacy scene framebuffer regressions (Linux Vulkan)
         if: runner.os == 'Linux'
         shell: bash
@@ -894,14 +901,16 @@ jobs:
           # combat_world binary). The main shard is untouched (every
           # batch-2 change is engine-slice).
           # Audit fixes add three platform-uniform tests in existing binaries (Windows 568/7/55 measured locally).
+          # Cycle 6-A adds one separate ignored graphical test binary,
+          # executed in the Linux Vulkan step: +1 ignored / +1 result line.
           expected=569
           if [ "$(uname -s)" != "Linux" ]; then expected=568; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 7 / 55)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 8 / 56)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
-          [ "$ignored" -eq 7 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 7"; exit 1; }
+          [ "$ignored" -eq 8 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 8"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
@@ -921,7 +930,7 @@ jobs:
           # result line (its single framebuffer test is #[ignore]d in
           # the plain run and executed by the dedicated framebuffer
           # step; MEASURED at the candidate with the local heavy pass).
-          [ "$results" -eq 55 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 55"; exit 1; }
+          [ "$results" -eq 56 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 56"; exit 1; }
       # (F-06, the 2026-11-12 quality audit — Agent C) The release-mode
       # render-path CPU canary: the comparative microbenchmark in
       # release mode on the llvipe runner — NO timing thresholds (the

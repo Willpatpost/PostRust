@@ -303,6 +303,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hexf-parse"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -384,6 +390,7 @@ dependencies = [
  "codespan-reporting",
  "half",
  "hashbrown 0.16.1",
+ "hexf-parse",
  "indexmap",
  "libm",
  "log",
@@ -394,6 +401,7 @@ dependencies = [
  "rustc-hash",
  "spirv",
  "thiserror",
+ "unicode-ident",
 ]
 
 [[package]]
