@@ -6,7 +6,12 @@ on:
     # trigger, added on this branch only so the five-job gates run at
     # the exact candidate SHA. REMOVED at the merge to main — the
     # merged workflow keeps only the mainline branches.
-    branches: [main, stage5, macos-port, perf-batch3-renderer-shell]
+    # codex/audit-corrective (the a4eb372 audit-corrective candidate,
+    # integrating Batch 3): a CANDIDATE-VALIDATION trigger, on this
+    # branch only so the five-job gates run at the exact candidate SHA.
+    # REMOVED at the merge to main - the merged workflow keeps only the
+    # mainline branches.
+    branches: [main, stage5, macos-port, perf-batch3-renderer-shell, codex/audit-corrective]
     paths:
       - "crates/**"
       - "build/**"
