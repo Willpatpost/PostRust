@@ -344,7 +344,8 @@ mod tests {
         use crate::scene::SceneVertex;
 
         assert_eq!(std::mem::size_of::<SceneVertex>(), 24);
-        assert_eq!(std::mem::size_of::<OverlayVertex>(), 24);
+        assert_eq!(std::mem::size_of::<OverlayVertex>(), 32);
+        assert_eq!(size_of::<crate::overlay::SolidVertex>(), 24);
         for (supplied, capacity) in [
             (36_288_usize, 36_800_u32),
             (37_800, 36_800),
@@ -356,15 +357,17 @@ mod tests {
                 clamp.drawn <= clamp.capacity,
                 "draw never exceeds the per-slot capacity"
             );
-            let slot_bytes = capacity as usize * 24;
-            assert!(
-                clamp.drawn as usize * 24 <= slot_bytes,
-                "copy bytes fit the slot"
-            );
-            assert!(
-                clamp.drawn as usize * 24 <= supplied * 24,
-                "copy bytes never exceed the supplied bytes"
-            );
+            for stride in [size_of::<SceneVertex>(), size_of::<OverlayVertex>()] {
+                let slot_bytes = capacity as usize * stride;
+                assert!(
+                    clamp.drawn as usize * stride <= slot_bytes,
+                    "copy bytes fit the slot"
+                );
+                assert!(
+                    clamp.drawn as usize * stride <= supplied * stride,
+                    "copy bytes never exceed the supplied bytes"
+                );
+            }
         }
     }
 

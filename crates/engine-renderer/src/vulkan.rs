@@ -47,7 +47,8 @@
 //! present semaphores, acquire semaphores, fences, query pool → swapchain
 //! framebuffers, views, per-image depth views/images/memories, swapchain
 //! (framebuffers **before** the render pass they reference) → pipelines,
-//! layouts, render pass and scene buffers → context. Frame slots release
+//! layouts, render pass and scene buffers → atlas pool, layout, sampler, image
+//! view, image and memory → device. Frame slots release
 //! their mapped overlay buffers during frame-state teardown. Failed
 //! swapchain replacements release the retired chain and leave a pending
 //! recreation for the next renderable frame.
@@ -57,6 +58,7 @@
 // deny is overridable at closer scope, and this is the ONLY override.
 #![allow(unsafe_code)]
 
+use std::cell::Cell;
 use std::ffi::{CStr, CString};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,6 +68,11 @@ use ash::khr;
 use ash::vk;
 use ash::{Device, Entry, Instance};
 
+#[path = "descriptors.rs"]
+pub mod descriptors;
+#[path = "textures.rs"]
+pub mod textures;
+
 use crate::SceneLayer;
 use crate::config::{
     DemoScenePreference, DynamicClamp, FRAMES_IN_FLIGHT, PresentModePreference, RenderConfig,
@@ -73,6 +80,8 @@ use crate::config::{
 };
 use crate::overlay::OverlayVertex;
 use crate::scene::SceneVertex;
+use descriptors::DescriptorFoundation;
+use textures::{SamplerPool, Texture};
 
 use sdl3::video::Window as SdlWindow;
 
@@ -262,11 +271,20 @@ pub(crate) struct VulkanContext {
     /// replacements REUSE the warmed cache instead of each building a
     /// fresh empty one that dies with its state.
     pub pipeline_cache: vk::PipelineCache,
+    texture: Texture,
+    samplers: SamplerPool,
+    descriptors: DescriptorFoundation,
+    memory_allocations: Cell<u64>,
+    texture_allocations: u64,
+    descriptor_pools: Cell<u64>,
+    descriptor_sets: Cell<u64>,
+    sampler_creations: Cell<u64>,
 }
 
 impl VulkanContext {
     pub(crate) fn new(
         window: &SdlWindow,
+        atlas: &crate::glyph_atlas::GlyphAtlas,
         config: &RenderConfig,
     ) -> Result<(VulkanContext, bool), RendererError> {
         let entry = unsafe { Entry::load() }
@@ -546,7 +564,7 @@ impl VulkanContext {
             }
         };
 
-        let context = VulkanContext {
+        let mut context = VulkanContext {
             entry,
             instance,
             messenger,
@@ -565,13 +583,69 @@ impl VulkanContext {
             api_version,
             supported_present_modes,
             pipeline_cache,
+            texture: Default::default(),
+            samplers: Default::default(),
+            descriptors: Default::default(),
+            memory_allocations: Cell::new(0),
+            texture_allocations: 0,
+            descriptor_pools: Cell::new(0),
+            descriptor_sets: Cell::new(0),
+            sampler_creations: Cell::new(0),
         };
+        if let Err(e) = context.init_atlas(atlas) {
+            context.destroy();
+            return Err(e);
+        }
         Ok((context, validation_active))
+    }
+
+    fn init_atlas(&mut self, atlas: &crate::glyph_atlas::GlyphAtlas) -> Result<(), RendererError> {
+        use crate::glyph_atlas::{ATLAS_HEIGHT, ATLAS_WIDTH};
+        let before = self.memory_allocations.get();
+        self.texture = Texture::upload(
+            self,
+            vk::Format::R8_UNORM,
+            vk::Extent2D {
+                width: ATLAS_WIDTH,
+                height: ATLAS_HEIGHT,
+            },
+            atlas.atlas_bitmap(),
+        )?;
+        self.texture_allocations += self.memory_allocations.get() - before;
+        self.samplers = SamplerPool::new(self)?;
+        self.descriptors =
+            DescriptorFoundation::new(self, self.texture.view, self.samplers.nearest())?;
+        Ok(())
+    }
+
+    /// SAFETY: callers pass allocation info for this device and own the returned memory.
+    unsafe fn allocate_memory(
+        &self,
+        info: &vk::MemoryAllocateInfo<'_>,
+    ) -> Result<vk::DeviceMemory, vk::Result> {
+        let memory = unsafe { self.device.allocate_memory(info, None) }?;
+        self.memory_allocations
+            .set(self.memory_allocations.get() + 1);
+        Ok(memory)
+    }
+
+    pub(crate) fn allocations(&self) -> crate::AllocationStats {
+        crate::AllocationStats {
+            device_memory: self.memory_allocations.get(),
+            texture_memory: self.texture_allocations,
+            texture_bytes: self.texture.allocation_bytes,
+            descriptor_pools: self.descriptor_pools.get(),
+            descriptor_sets: self.descriptor_sets.get(),
+            samplers: self.sampler_creations.get(),
+        }
     }
 
     /// Full teardown in manifest order (assumes swapchain/pipelines/frames
     /// were already destroyed by the owning Renderer).
     pub(crate) fn destroy(&mut self) {
+        std::mem::take(&mut self.descriptors).destroy(self);
+        std::mem::take(&mut self.samplers).destroy(self);
+        std::mem::take(&mut self.texture).destroy(self);
         unsafe {
             if self.messenger != vk::DebugUtilsMessengerEXT::null() {
                 self.debug_utils
@@ -1039,7 +1113,7 @@ impl SwapchainState {
             let allocate_info = vk::MemoryAllocateInfo::default()
                 .allocation_size(memory_requirements.size)
                 .memory_type_index(depth_memory_index);
-            let depth_memory = unsafe { ctx.device.allocate_memory(&allocate_info, None) }
+            let depth_memory = unsafe { ctx.allocate_memory(&allocate_info) }
                 .map_err(|error| RendererError::vk(error, "allocate depth memory"))?;
             self.depth_memories.push(depth_memory);
             unsafe { ctx.device.bind_image_memory(depth_image, depth_memory, 0) }
@@ -1461,16 +1535,15 @@ impl PipelineState {
 
         let scene_vert = include_bytes!(concat!(env!("OUT_DIR"), "/scene.vert.spv"));
         let scene_frag = include_bytes!(concat!(env!("OUT_DIR"), "/scene.frag.spv"));
-        let overlay_vert = include_bytes!(concat!(env!("OUT_DIR"), "/overlay.vert.spv"));
-        let overlay_frag = include_bytes!(concat!(env!("OUT_DIR"), "/overlay.frag.spv"));
+        let atlas_spv = include_bytes!(concat!(env!("OUT_DIR"), "/overlay_atlas.spv"));
 
         let scene_vert_module = create_shader_module(ctx, scene_vert)?;
         modules.push(scene_vert_module);
         let scene_frag_module = create_shader_module(ctx, scene_frag)?;
         modules.push(scene_frag_module);
-        let overlay_vert_module = create_shader_module(ctx, overlay_vert)?;
+        let overlay_vert_module = create_shader_module(ctx, atlas_spv)?;
         modules.push(overlay_vert_module);
-        let overlay_frag_module = create_shader_module(ctx, overlay_frag)?;
+        let overlay_frag_module = create_shader_module(ctx, atlas_spv)?;
         modules.push(overlay_frag_module);
 
         let push_range = vk::PushConstantRange::default()
@@ -1482,7 +1555,8 @@ impl PipelineState {
             vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_ranges);
         out.scene_layout = unsafe { ctx.device.create_pipeline_layout(&scene_layout_info, None) }
             .map_err(|error| RendererError::vk(error, "scene layout"))?;
-        let overlay_layout_info = vk::PipelineLayoutCreateInfo::default();
+        let layouts = [ctx.descriptors.layout];
+        let overlay_layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts);
         out.overlay_layout = unsafe {
             ctx.device
                 .create_pipeline_layout(&overlay_layout_info, None)
@@ -1525,6 +1599,12 @@ impl PipelineState {
                 location: 1,
                 format: vk::Format::R32G32B32A32_SFLOAT,
                 offset: 8,
+            },
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 2,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: std::mem::offset_of!(OverlayVertex, uv) as u32,
             },
         ];
 
@@ -1631,11 +1711,11 @@ impl PipelineState {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(overlay_vert_module)
-                .name(ENTRY_MAIN),
+                .name(c"vs_main"),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(overlay_frag_module)
-                .name(ENTRY_MAIN),
+                .name(c"fs_main"),
         ];
         let overlay_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&overlay_stages)
@@ -1696,6 +1776,61 @@ fn create_shader_module(
         .map_err(|error| RendererError::vk(error, "create_shader_module"))
 }
 
+/// Records an init-time transfer on the graphics queue. The staging resources
+/// may be released or reused only after the fence signals.
+fn with_upload_commands(
+    ctx: &VulkanContext,
+    record: impl FnOnce(vk::CommandBuffer),
+) -> Result<(), RendererError> {
+    let mut pool = vk::CommandPool::null();
+    let mut fence = vk::Fence::null();
+    let result = (|| {
+        let pool_info =
+            vk::CommandPoolCreateInfo::default().queue_family_index(ctx.graphics_family);
+        pool = unsafe { ctx.device.create_command_pool(&pool_info, None) }
+            .map_err(|error| RendererError::vk(error, "staging command pool"))?;
+        let command_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let command = unsafe { ctx.device.allocate_command_buffers(&command_info) }
+            .map_err(|error| RendererError::vk(error, "staging command buffer"))?[0];
+        unsafe {
+            ctx.device
+                .begin_command_buffer(
+                    command,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(|error| RendererError::vk(error, "begin staging"))?;
+            record(command);
+            ctx.device
+                .end_command_buffer(command)
+                .map_err(|error| RendererError::vk(error, "end staging"))?;
+            fence = ctx
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(|error| RendererError::vk(error, "staging fence"))?;
+            let staging_commands = [command];
+            let submit_info = vk::SubmitInfo::default().command_buffers(&staging_commands);
+            ctx.device
+                .queue_submit(ctx.graphics_queue, &[submit_info], fence)
+                .map_err(|error| RendererError::vk(error, "staging submit"))?;
+            ctx.device
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .map_err(|error| RendererError::vk(error, "staging wait"))?;
+        }
+        Ok(())
+    })();
+    // SAFETY: a successful submit was waited above (or the device was lost).
+    // Destroying the pool also releases its single primary command buffer.
+    unsafe {
+        ctx.device.destroy_fence(fence, None);
+        ctx.device.destroy_command_pool(pool, None);
+    }
+    result
+}
+
 fn create_device_local_buffer_with_data(
     ctx: &VulkanContext,
     usage: vk::BufferUsageFlags,
@@ -1710,8 +1845,6 @@ fn create_device_local_buffer_with_data(
     let mut memory = vk::DeviceMemory::null();
     let mut staging = vk::Buffer::null();
     let mut staging_memory = vk::DeviceMemory::null();
-    let mut pool = vk::CommandPool::null();
-    let mut fence = vk::Fence::null();
     let result = (|| -> Result<(), RendererError> {
         let buffer_info = vk::BufferCreateInfo::default()
             .size(size)
@@ -1733,7 +1866,7 @@ fn create_device_local_buffer_with_data(
         let memory_info = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
             .memory_type_index(memory_index);
-        memory = unsafe { ctx.device.allocate_memory(&memory_info, None) }
+        memory = unsafe { ctx.allocate_memory(&memory_info) }
             .map_err(|error| RendererError::vk(error, "allocate_memory"))?;
         unsafe { ctx.device.bind_buffer_memory(buffer, memory, 0) }
             .map_err(|error| RendererError::vk(error, "bind_buffer_memory"))?;
@@ -1755,7 +1888,7 @@ fn create_device_local_buffer_with_data(
         let staging_memory_info = vk::MemoryAllocateInfo::default()
             .allocation_size(staging_requirements.size)
             .memory_type_index(staging_index);
-        staging_memory = unsafe { ctx.device.allocate_memory(&staging_memory_info, None) }
+        staging_memory = unsafe { ctx.allocate_memory(&staging_memory_info) }
             .map_err(|error| RendererError::vk(error, "allocate staging memory"))?;
         unsafe { ctx.device.bind_buffer_memory(staging, staging_memory, 0) }
             .map_err(|error| RendererError::vk(error, "bind staging memory"))?;
@@ -1768,24 +1901,7 @@ fn create_device_local_buffer_with_data(
             ctx.device.unmap_memory(staging_memory);
         }
 
-        let pool_info =
-            vk::CommandPoolCreateInfo::default().queue_family_index(ctx.graphics_family);
-        pool = unsafe { ctx.device.create_command_pool(&pool_info, None) }
-            .map_err(|error| RendererError::vk(error, "staging command pool"))?;
-        let command_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let command = unsafe { ctx.device.allocate_command_buffers(&command_info) }
-            .map_err(|error| RendererError::vk(error, "staging command buffer"))?[0];
-        unsafe {
-            ctx.device
-                .begin_command_buffer(
-                    command,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )
-                .map_err(|error| RendererError::vk(error, "begin staging"))?;
+        with_upload_commands(ctx, |command| unsafe {
             ctx.device.cmd_copy_buffer(
                 command,
                 staging,
@@ -1796,26 +1912,8 @@ fn create_device_local_buffer_with_data(
                     size,
                 }],
             );
-            ctx.device
-                .end_command_buffer(command)
-                .map_err(|error| RendererError::vk(error, "end staging"))?;
-            fence = ctx
-                .device
-                .create_fence(&vk::FenceCreateInfo::default(), None)
-                .map_err(|error| RendererError::vk(error, "staging fence"))?;
-            let staging_commands = [command];
-            let submit_info = vk::SubmitInfo::default().command_buffers(&staging_commands);
-            ctx.device
-                .queue_submit(ctx.graphics_queue, &[submit_info], fence)
-                .map_err(|error| RendererError::vk(error, "staging submit"))?;
-            ctx.device
-                .wait_for_fences(&[fence], true, u64::MAX)
-                .map_err(|error| RendererError::vk(error, "staging wait"))?;
-            ctx.device.destroy_fence(fence, None);
-            fence = vk::Fence::null();
-            ctx.device.free_command_buffers(pool, &[command]);
-            ctx.device.destroy_command_pool(pool, None);
-            pool = vk::CommandPool::null();
+        })?;
+        unsafe {
             ctx.device.destroy_buffer(staging, None);
             staging = vk::Buffer::null();
             ctx.device.free_memory(staging_memory, None);
@@ -1827,12 +1925,6 @@ fn create_device_local_buffer_with_data(
         Ok(()) => Ok((buffer, memory)),
         Err(error) => {
             unsafe {
-                if fence != vk::Fence::null() {
-                    ctx.device.destroy_fence(fence, None);
-                }
-                if pool != vk::CommandPool::null() {
-                    ctx.device.destroy_command_pool(pool, None);
-                }
                 if staging != vk::Buffer::null() {
                     ctx.device.destroy_buffer(staging, None);
                 }
@@ -1876,7 +1968,7 @@ fn create_mapped_buffer(
         let memory_info = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
             .memory_type_index(memory_index);
-        memory = unsafe { ctx.device.allocate_memory(&memory_info, None) }
+        memory = unsafe { ctx.allocate_memory(&memory_info) }
             .map_err(|error| RendererError::vk(error, "allocate overlay memory"))?;
         unsafe { ctx.device.bind_buffer_memory(buffer, memory, 0) }
             .map_err(|error| RendererError::vk(error, "bind overlay memory"))?;
@@ -2892,6 +2984,14 @@ pub(crate) fn render_frame(
                 0,
                 &[frames.overlay_slots[slot].buffer],
                 &[0],
+            );
+            ctx.device.cmd_bind_descriptor_sets(
+                command,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipes.overlay_layout,
+                0,
+                &[ctx.descriptors.set],
+                &[],
             );
             ctx.device.cmd_draw(command, outcome.overlay.drawn, 1, 0, 0);
         }

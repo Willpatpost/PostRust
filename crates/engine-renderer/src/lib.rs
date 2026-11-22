@@ -41,15 +41,16 @@
 #![deny(unsafe_code)]
 
 pub mod config;
-pub mod descriptors;
+pub use vulkan::{descriptors, textures};
 pub mod glyph_atlas;
 pub mod overlay;
 pub mod scene;
-pub mod textures;
 
 mod renderer;
 mod vulkan;
 
 pub use config::{DemoScenePreference, PresentModePreference, RenderConfig, ValidationPreference};
-pub use renderer::{FrameResult, GeometryStats, RenderStats, Renderer, SceneLayer};
+pub use renderer::{
+    AllocationStats, FrameResult, GeometryStats, RenderStats, Renderer, SceneLayer,
+};
 pub use vulkan::{CaptureFormat, CapturedFrame, RendererError};

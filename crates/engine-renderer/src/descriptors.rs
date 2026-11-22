@@ -1,41 +1,12 @@
-//! The descriptor-set foundation (the Cycle 6-A scaffold — see
-//! `docs/CYCLE6-6A-BRIEF.md`). STUBBED: the contracts are the
-//! architecture; the implementer (Astra/Sol per the owner's plan)
-//! fills the Vulkan bodies.
-//!
-//! THE CONTRACTS (binding on the implementation):
-//!
-//! 1. NO PER-FRAME ALLOCATION: descriptor sets are allocated at
-//!    init/recreate time, NEVER in the frame loop. The glyph atlas
-//!    needs exactly ONE immutable set (bound every frame, written
-//!    once): a combined image sampler over the atlas texture + the
-//!    nearest sampler.
-//! 2. BOUNDED, REPORTED GROWTH: the pool is created with an explicit
-//!    maximum (the 6-A acceptance: one combined-image-sampler set;
-//!    the pool sized for a documented headroom, the count reported —
-//!    never silent growth, the audit's P1-4 discipline).
-//! 3. LIFETIME: sets live for the renderer's lifetime; the pool is
-//!    reset NEVER (no frees, no per-frame reset — static bindings);
-//!    `destroy` releases the pool after the sets stop being used
-//!    (the ordered teardown, images before device).
-//! 4. LAYOUT: the 6-A layout is a single binding — binding 0,
-//!    FRAGMENT shader, one combined image sampler. The scene
-//!    pipeline's push-constant layout is UNTOUCHED (the atlas set is
-//!    additive; the overlay pipeline gains the set, the scene
-//!    pipeline does not).
-//! 5. FAIL-CLOSED: pool creation or set allocation failure returns
-//!    the typed error with partial-init cleanup (the
-//!    PipelineState::new discipline: dead handles start null, destroy
-//!    releases exactly what exists).
-
+//! Renderer-lifetime atlas descriptors. The single set is written once and
+//! survives swapchain changes and pipeline replacement.
+use super::{RendererError, VulkanContext};
 use ash::vk;
 
-use crate::RendererError;
+/// One live atlas set and one spare set's worth of pool capacity.
+const POOL_SETS: u32 = 2;
 
-/// The 6-A descriptor infrastructure: one pool, one layout, one
-/// immutable combined-image-sampler set. NOT YET WIRED — see the
-/// module doc.
-#[allow(dead_code)]
+#[derive(Default)]
 pub struct DescriptorFoundation {
     pub pool: vk::DescriptorPool,
     pub layout: vk::DescriptorSetLayout,
@@ -43,26 +14,78 @@ pub struct DescriptorFoundation {
 }
 
 impl DescriptorFoundation {
-    /// Creates the pool, the single-binding layout, allocates the
-    /// set, and writes the atlas binding into it.
-    ///
-    /// STUB — the implementer fills this in. `atlas_view` and
-    /// `sampler` come from `textures::Texture`/`textures::SamplerPool`.
-    #[allow(dead_code)]
     pub(crate) fn new(
-        _ctx: &crate::vulkan::VulkanContext,
-        _atlas_view: vk::ImageView,
-        _sampler: vk::Sampler,
-    ) -> Result<DescriptorFoundation, RendererError> {
-        Err(RendererError::Vulkan(
-            "DescriptorFoundation::new not implemented (the 6-A implementer's third body)".into(),
-        ))
+        ctx: &VulkanContext,
+        atlas_view: vk::ImageView,
+        sampler: vk::Sampler,
+    ) -> Result<Self, RendererError> {
+        let mut state = Self::default();
+        let ty = vk::DescriptorType::COMBINED_IMAGE_SAMPLER;
+        let samplers = [sampler];
+        let bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(ty)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .immutable_samplers(&samplers)];
+        // SAFETY: the view and immutable sampler outlive the layout/pool.
+        // Store each handle as soon as ownership transfers to the partial state.
+        let result = (|| unsafe {
+            state.layout = ctx
+                .device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                    None,
+                )
+                .map_err(|e| RendererError::vk(e, "create atlas set layout"))?;
+            let sizes = [vk::DescriptorPoolSize {
+                ty,
+                descriptor_count: POOL_SETS,
+            }];
+            state.pool = ctx
+                .device
+                .create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .max_sets(POOL_SETS)
+                        .pool_sizes(&sizes),
+                    None,
+                )
+                .map_err(|e| RendererError::vk(e, "create atlas descriptor pool"))?;
+            ctx.descriptor_pools.set(ctx.descriptor_pools.get() + 1);
+            state.set = ctx
+                .device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(state.pool)
+                        .set_layouts(&[state.layout]),
+                )
+                .map_err(|e| RendererError::vk(e, "allocate atlas descriptor set"))?[0];
+            ctx.descriptor_sets.set(ctx.descriptor_sets.get() + 1);
+            let image = [vk::DescriptorImageInfo::default()
+                .image_view(atlas_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(state.set)
+                .dst_binding(0)
+                .descriptor_type(ty)
+                .image_info(&image);
+            ctx.device.update_descriptor_sets(&[write], &[]);
+            Ok(())
+        })();
+        if let Err(e) = result {
+            state.destroy(ctx);
+            return Err(e);
+        }
+        Ok(state)
     }
-
-    /// Idempotent teardown (pool last, after the sets are unused).
-    #[allow(dead_code)]
-    pub(crate) fn destroy(&mut self, _ctx: &crate::vulkan::VulkanContext) {
-        // The implementer: destroy the layout, destroy the pool —
-        // null-guarded, in that order.
+    pub(crate) fn destroy(&mut self, ctx: &VulkanContext) {
+        // SAFETY: pipeline layouts and all submitted users are gone. The pool
+        // owns the set; null handles from partial/repeated teardown are valid.
+        unsafe {
+            ctx.device
+                .destroy_descriptor_set_layout(std::mem::take(&mut self.layout), None);
+            ctx.device
+                .destroy_descriptor_pool(std::mem::take(&mut self.pool), None);
+        }
+        self.set = vk::DescriptorSet::null();
     }
 }

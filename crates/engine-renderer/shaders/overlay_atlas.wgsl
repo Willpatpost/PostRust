@@ -17,8 +17,8 @@
 //
 // BINDINGS: group 0, binding 0 = the atlas texture (R8, nearest),
 // binding 1 = the sampler — SEPARATE texture and sampler bindings
-// (WGSL's form; the implementer's descriptor set writes one
-// combined image sampler covering both).
+// in WGSL. The SPIR-V backend maps both variables to set 0, binding 0,
+// backed by one Vulkan combined image sampler.
 
 struct VertexOut {
     @builtin(position) position: vec4<f32>,
@@ -48,5 +48,8 @@ fn fs_main(@location(0) tint: vec4<f32>,
            @location(1) frag_uv: vec2<f32>)
     -> @location(0) vec4<f32> {
     let lum = textureSample(glyph_atlas, glyph_sampler, frag_uv).r;
+    // An unlit legacy texel emitted no fragment. Preserve destination alpha
+    // as well as RGB when drawing over translucent HUD geometry.
+    if lum == 0.0 { discard; }
     return vec4<f32>(tint.rgb, lum * tint.a);
 }

@@ -49,7 +49,7 @@ fn main() {
     // The Cycle 6-A atlas overlay shaders (see docs/CYCLE6-6A-BRIEF.md):
     // WGSL, because the pinned naga's glsl-in cannot express sampled
     // textures (the probed finding in the shader's header). ONE module
-    // carries BOTH entry points (vs_main / fs_main); the implementer
+    // carries BOTH entry points (vs_main / fs_main); the overlay pipeline
     // creates the two shader modules from these same bytes, naming the
     // entry points.
     compile_wgsl("overlay_atlas.wgsl", "overlay_atlas.spv");
@@ -73,9 +73,20 @@ fn compile_wgsl(file: &str, out_name: &str) {
     )
     .validate(&module)
     .unwrap_or_else(|error| panic!("WGSL validation {file}: {error:?}"));
-    let words =
-        naga::back::spv::write_vec(&module, &info, &naga::back::spv::Options::default(), None)
-            .unwrap_or_else(|error| panic!("SPIR-V generation {file}: {error:?}"));
+    // WGSL requires distinct bindings. Vulkan permits separate OpTypeImage
+    // and OpTypeSampler variables to alias the same combined descriptor.
+    let mut options = naga::back::spv::Options {
+        fake_missing_bindings: false,
+        ..Default::default()
+    };
+    for binding in [0, 1] {
+        options.binding_map.insert(
+            naga::ResourceBinding { group: 0, binding },
+            naga::back::spv::BindingInfo::default(),
+        );
+    }
+    let words = naga::back::spv::write_vec(&module, &info, &options, None)
+        .unwrap_or_else(|error| panic!("SPIR-V generation {file}: {error:?}"));
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join(out_name);
     let mut bytes = Vec::with_capacity(words.len() * 4);

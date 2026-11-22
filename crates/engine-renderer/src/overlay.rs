@@ -1,17 +1,87 @@
-//! Debug-overlay glyph quad building (Stage 2 authorization, item 4).
-//!
-//! Minimal by design: the public-domain font8x8 bitmap font rendered as
-//! solid alpha-blended quads — one small quad per set pixel — so the
-//! overlay needs no glyph texture, sampler, or descriptor infrastructure.
-//! No UI framework.
+//! Screen-space rectangles and bitmap text, batched in painter's order.
 
-/// Overlay vertex: NDC position + RGBA color (24 bytes, matches
-/// `overlay.vert`).
+use crate::glyph_atlas::{GlyphAtlas, GlyphQuad, push_glyph_quads};
+
+/// Overlay pipeline ABI. Solid triangles sample the sampler's white border.
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct OverlayVertex {
     pub pos: [f32; 2],
     pub col: [f32; 4],
+    pub uv: [f32; 2],
+}
+
+/// Original 24-byte vertex used by the CPU rasterization benchmark.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SolidVertex {
+    pub pos: [f32; 2],
+    pub col: [f32; 4],
+}
+
+impl From<SolidVertex> for OverlayVertex {
+    fn from(v: SolidVertex) -> Self {
+        Self {
+            pos: v.pos,
+            col: v.col,
+            uv: [-1.0; 2],
+        }
+    }
+}
+
+/// Retained scratch for one text producer. The renderer uploads this same
+/// font once and reuses the quad vector on every diagnostic frame.
+#[derive(Default)]
+pub struct AtlasText {
+    atlas: GlyphAtlas,
+    quads: Vec<GlyphQuad>,
+}
+
+impl AtlasText {
+    pub(crate) fn atlas(&self) -> &GlyphAtlas {
+        &self.atlas
+    }
+
+    pub fn build_overlay_vertices_into(
+        &mut self,
+        vertices: &mut Vec<OverlayVertex>,
+        text: &str,
+        extent: (u32, u32),
+        color: [f32; 4],
+    ) {
+        vertices.clear();
+        self.push_text_px(vertices, extent, [0.0, 4.0], SCALE, text, color);
+    }
+
+    pub fn push_text_px(
+        &mut self,
+        vertices: &mut Vec<OverlayVertex>,
+        extent: (u32, u32),
+        origin: [f32; 2],
+        scale: f32,
+        text: &str,
+        color: [f32; 4],
+    ) {
+        self.quads.clear();
+        push_glyph_quads(&mut self.quads, origin, scale, text, color, &self.atlas);
+        vertices.reserve(self.quads.len() * 6);
+        for quad in &self.quads {
+            let Some([x0, y0, x1, y1]) = ndc_bounds(extent, quad.dst_px) else {
+                continue;
+            };
+            let [u0, v0, u1, v1] = quad.uv;
+            let corner = |pos, uv| OverlayVertex {
+                pos,
+                uv,
+                col: quad.color,
+            };
+            let tl = corner([x0, y0], [u0, v0]);
+            let tr = corner([x1, y0], [u1, v0]);
+            let br = corner([x1, y1], [u1, v1]);
+            let bl = corner([x0, y1], [u0, v1]);
+            vertices.extend_from_slice(&[tl, tr, br, tl, br, bl]);
+        }
+    }
 }
 
 /// Pixels per glyph axis (font8x8 is 8×8), scaled 2×.
@@ -68,30 +138,59 @@ pub fn push_rect_px(
 }
 
 #[inline]
-fn append_quad(
-    vertices: &mut Vec<OverlayVertex>,
+fn append_quad<V: From<SolidVertex>>(
+    vertices: &mut Vec<V>,
     extent: (u32, u32),
     bounds: [f32; 4],
     color: [f32; 4],
 ) {
+    let Some([x0, y0, x1, y1]) = ndc_bounds(extent, bounds) else {
+        return;
+    };
+    for pos in [[x0, y0], [x1, y0], [x1, y1], [x0, y0], [x1, y1], [x0, y1]] {
+        vertices.push(SolidVertex { pos, col: color }.into());
+    }
+}
+
+#[inline]
+fn ndc_bounds(extent: (u32, u32), bounds: [f32; 4]) -> Option<[f32; 4]> {
     let [left, top, right, bottom] = bounds;
     let (width, height) = (extent.0.max(1) as f32, extent.1.max(1) as f32);
     let x0 = left / width * 2.0 - 1.0;
     let x1 = right / width * 2.0 - 1.0;
     let y0 = 1.0 - top / height * 2.0;
     let y1 = 1.0 - bottom / height * 2.0;
-    if ![x0, y0, x1, y1].into_iter().all(f32::is_finite) {
-        return;
-    }
-    for pos in [[x0, y0], [x1, y0], [x1, y1], [x0, y0], [x1, y1], [x0, y1]] {
-        vertices.push(OverlayVertex { pos, col: color });
-    }
+    let ndc = [x0, y0, x1, y1];
+    ndc.into_iter().all(f32::is_finite).then_some(ndc)
+}
+
+/// Builds the original per-set-pixel geometry with its original stride for
+/// the section D comparison. Both variants retain their buffers between runs.
+pub fn build_legacy_overlay_into(
+    vertices: &mut Vec<SolidVertex>,
+    text: &str,
+    extent: (u32, u32),
+    color: [f32; 4],
+) {
+    vertices.clear();
+    push_legacy_text(vertices, extent, [0.0, 4.0], SCALE, text, color);
 }
 
 /// Appends bitmap text at a pixel-space origin, with each font texel
 /// covering `scale` pixels on each axis. Newlines return to that origin.
 pub fn push_text_px(
     vertices: &mut Vec<OverlayVertex>,
+    extent: (u32, u32),
+    origin: [f32; 2],
+    scale: f32,
+    text: &str,
+    color: [f32; 4],
+) {
+    push_legacy_text(vertices, extent, origin, scale, text, color);
+}
+
+fn push_legacy_text<V: From<SolidVertex>>(
+    vertices: &mut Vec<V>,
     extent: (u32, u32),
     origin: [f32; 2],
     scale: f32,

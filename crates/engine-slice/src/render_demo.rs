@@ -557,6 +557,16 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
     let elapsed = start.elapsed();
     let stats = renderer.stats();
     println!("--- run summary ---");
+    let alloc = renderer.allocations();
+    println!(
+        "atlas: {} texture memory allocation(s), {} bytes; {} descriptor pool(s), {} set(s), {} sampler(s); device memory allocations (all resources): {}",
+        alloc.texture_memory,
+        alloc.texture_bytes,
+        alloc.descriptor_pools,
+        alloc.descriptor_sets,
+        alloc.samplers,
+        alloc.device_memory
+    );
     println!(
         "presented {} frames over {:.1}s ({:.1} fps avg)",
         presented,

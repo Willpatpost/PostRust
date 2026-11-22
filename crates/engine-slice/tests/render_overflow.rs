@@ -101,12 +101,17 @@ fn oversized_region_and_overlay_report_exact_truncation() {
         .expect("the renderer constructs under the software ICD");
     renderer.set_overlay_enabled(true);
 
-    let mut frame = |renderer: &mut Renderer, region: &[SceneVertex], overlay: Option<&str>| {
+    let mut frame = |renderer: &mut Renderer,
+                     region: &[SceneVertex],
+                     hud: &[engine_renderer::overlay::OverlayVertex],
+                     overlay: Option<&str>| {
         let _snapshot = app.frame();
         renderer
-            .render_frame(
+            .render_layers(
                 &IDENTITY_VIEW_PROJ,
                 region,
+                None,
+                hud,
                 overlay,
                 app.window().size_in_pixels(),
             )
@@ -116,7 +121,7 @@ fn oversized_region_and_overlay_report_exact_truncation() {
     // Frame 1 (control): empty region, short overlay — the lazy region
     // buffer must stay unallocated and nothing may be counted.
     let short_text = "F-03 Step 1 oversize smoke";
-    frame(&mut renderer, &[], Some(short_text));
+    frame(&mut renderer, &[], &[], Some(short_text));
     let stats = renderer.stats();
     assert_eq!(stats.region_truncated_vertices, 0);
     assert_eq!(
@@ -139,7 +144,7 @@ fn oversized_region_and_overlay_report_exact_truncation() {
     // 1,000, NOT 2,000 (the two historical min() clamps now consume
     // one decision).
     let oversize = oversize_region_scene();
-    frame(&mut renderer, &oversize, Some(short_text));
+    frame(&mut renderer, &oversize, &[], Some(short_text));
     let stats = renderer.stats();
     assert_eq!(stats.region_truncated_vertices, 1_000);
     assert_eq!(stats.region_supplied_peak_vertices, 37_800);
@@ -156,7 +161,7 @@ fn oversized_region_and_overlay_report_exact_truncation() {
 
     // Frame 3: the same oversize again (the second frame slot) — the
     // counters accumulate per recorded frame.
-    frame(&mut renderer, &oversize, Some(short_text));
+    frame(&mut renderer, &oversize, &[], Some(short_text));
     let stats = renderer.stats();
     assert_eq!(stats.region_truncated_vertices, 2_000);
     println!(
@@ -165,15 +170,26 @@ fn oversized_region_and_overlay_report_exact_truncation() {
         stats.region_truncated_vertices
     );
 
-    // Frame 4: the oversize overlay — 2,000 'A' glyphs × 168 verts =
-    // 336,000 supplied vs the 300,000 capacity → exactly 36,000
-    // omitted. 2,000 glyphs sit below MAX_GLYPHS (6,000), so the
-    // builder's own glyph cap cannot confound the measurement; the
-    // region is in-capacity, so its counters must not move
-    // (cross-contamination guard).
-    let big_text = "A".repeat(2_000);
+    // Frame 4: 48,000 solid rectangles (288,000 vertices), 4,000 HUD
+    // glyphs (24,000) and 4,000 diagnostic glyphs (24,000). The HUD
+    // fills the slot first, truncating 12,000 HUD + 24,000 diagnostic
+    // vertices. Keep the original 336,000 / 300,000 / 36,000 pins.
+    let big_text = "A".repeat(4_000);
+    let mut hud = Vec::with_capacity(312_000);
+    for _ in 0..48_000 {
+        engine_renderer::overlay::push_rect_px(&mut hud, (1280, 720), [0., 0., 1., 1.], [1.; 4]);
+    }
+    engine_renderer::overlay::AtlasText::default().push_text_px(
+        &mut hud,
+        (1280, 720),
+        [0., 0.],
+        1.,
+        &big_text,
+        [1.; 4],
+    );
+    assert_eq!(hud.len(), 312_000);
     let in_capacity = in_capacity_region_scene();
-    frame(&mut renderer, &in_capacity, Some(&big_text));
+    frame(&mut renderer, &in_capacity, &hud, Some(&big_text));
     let stats = renderer.stats();
     assert_eq!(stats.overlay_truncated_vertices, 36_000);
     assert_eq!(stats.overlay_supplied_peak_vertices, 336_000);
@@ -194,7 +210,7 @@ fn oversized_region_and_overlay_report_exact_truncation() {
 
     // Frame 5 (control): in-capacity inputs only — the counters must
     // not move (in-capacity geometry is never counted).
-    frame(&mut renderer, &in_capacity, Some(short_text));
+    frame(&mut renderer, &in_capacity, &[], Some(short_text));
     let stats = renderer.stats();
     assert_eq!(stats.region_truncated_vertices, 2_000);
     assert_eq!(stats.overlay_truncated_vertices, 36_000);
