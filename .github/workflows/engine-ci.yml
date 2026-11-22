@@ -2,7 +2,7 @@ name: engine-ci
 
 on:
   push:
-    branches: [main, stage5, macos-port]
+    branches: [main]
     paths:
       - "crates/**"
       - "build/**"
