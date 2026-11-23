@@ -486,7 +486,11 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
 
     // The independent oracle pins (single instance, orthographic,
     // per-pixel against the 6-B CPU reference with albedo * tint):
-    // the NPC torso's +Z wall and the vehicle body's +Z wall.
+    // the v2 humanoid TORSO's +Z wall and the v2 sedan BODY's +Z
+    // nose wall (the Era-1 silhouettes' flat faces — the dead-on
+    // camera frames each wall's rectangle exactly; the neighboring
+    // boxes — arms, head, cabin — sit outside the framed rectangle,
+    // the wheels behind the nose).
     let npc_wall = OracleWall {
         instance: ProxyInstance {
             transform: InstanceTransform {
@@ -497,9 +501,9 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
             tint: [0.9, 0.7, 0.6],
         },
         material: 1,
-        half_width: 0.24,
-        y_local: [0.85, 1.45],
-        eye: [0.0, 1.17, 4.0],
+        half_width: 0.21,
+        y_local: [1.06, 1.60],
+        eye: [0.0, 1.35, 4.0],
     };
     let single_npc = [npc_wall.instance];
     check_single_instance_oracle(
@@ -518,9 +522,9 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
             tint: [0.75, 0.18, 0.15],
         },
         material: 2,
-        half_width: 0.9,
-        y_local: [0.35, 1.0],
-        eye: [0.0, 0.675, 6.0],
+        half_width: 0.95,
+        y_local: [0.35, 0.90],
+        eye: [0.0, 0.625, 6.0],
     };
     let single_vehicle = [vehicle_wall.instance];
     check_single_instance_oracle(

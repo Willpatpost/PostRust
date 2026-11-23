@@ -42,16 +42,20 @@
 //!   at y = 0.02 (the 6-E seam convention: on the ground, off its
 //!   exact plane), uniform scale 1.0 — a placement table, not a
 //!   height sampler (scale variety is the gate fixture's job);
-//! - the pedestrian footprint is a circle of radius 0.28 m (the
-//!   proxy's worst corner, torso 0.24 x 0.14); non-crossing
-//!   pedestrians keep it fully off the road (min(|x|,|z|) >= 4.28);
+//! - the pedestrian footprint is a circle of radius 0.36 m (the v2
+//!   humanoid's worst corner, the upper arms at |x| 0.33 x z 0.06);
+//!   non-crossing pedestrians keep it fully off the road
+//!   (min(|x|,|z|) >= 4.36);
 //! - vehicles rest in their right-hand-traffic lanes — westbound
 //!   keeps the north half (z in (0, 4)), northbound the east half
 //!   (x in (0, 4)) — clear of the intersection box, at y = 0;
 //! - EVERY placement clears the camera route (the corner route's
 //!   own waypoint polyline) by at least 1.0 m, footprint included;
-//! - pedestrians never overlap: >= 0.7 m center-to-center (the
-//!   0.56 m bounding-circle contact bound, with margin); vehicles
+//! - pedestrians never overlap: >= 0.7 m center-to-center (at the
+//!   table's cardinal facings the worst mesh contact is the
+//!   arm-to-arm reach, 0.66 m across — the 0.72 m arbitrary-
+//!   orientation bounding circle is NOT reachable at cardinal
+//!   turns; the 0.7 m rule carries 0.04 m of true margin); vehicles
 //!   clear pedestrians, each other, and the building masses by at
 //!   least 0.5 m footprint-inclusive, and everything stays inside
 //!   the scene extent.
@@ -102,22 +106,26 @@ const NPC_TABLE: [ProxyInstance; 24] = [
     //    only southeast look (waypoint 3) frames the east band's
     //    south segment and the SE mass base, not that strip.
     // West band, north of the E-W road: walking north (turn 0) and
-    // south (turn 32768).
+    // south (turn 32768). The v2 footprint (0.36 m) moved the
+    // band's building-clear line outward — the southbound stroller
+    // stands at x -4.8 (the corner clearance 1.2 m).
     ProxyInstance { transform: InstanceTransform { pos: [-5.0, 0.02, 7.5], turn: 0, scale: 1.0 }, tint: [0.55, 0.40, 0.30] },
-    ProxyInstance { transform: InstanceTransform { pos: [-5.2, 0.02, 10.0], turn: 32768, scale: 1.0 }, tint: [0.80, 0.50, 0.30] },
+    ProxyInstance { transform: InstanceTransform { pos: [-4.8, 0.02, 10.0], turn: 32768, scale: 1.0 }, tint: [0.80, 0.50, 0.30] },
     // West band, south of the E-W road.
     ProxyInstance { transform: InstanceTransform { pos: [-5.1, 0.02, -7.5], turn: 32768, scale: 1.0 }, tint: [0.30, 0.30, 0.35] },
     ProxyInstance { transform: InstanceTransform { pos: [-4.9, 0.02, -10.0], turn: 0, scale: 1.0 }, tint: [0.90, 0.75, 0.60] },
-    // East band, north of the E-W road.
+    // East band, north of the E-W road. The southbound stroller
+    // stands at x 4.8 for the v2 footprint's corner clearance.
     ProxyInstance { transform: InstanceTransform { pos: [5.0, 0.02, 8.0], turn: 0, scale: 1.0 }, tint: [0.25, 0.60, 0.40] },
-    ProxyInstance { transform: InstanceTransform { pos: [5.2, 0.02, 10.5], turn: 32768, scale: 1.0 }, tint: [0.85, 0.60, 0.70] },
+    ProxyInstance { transform: InstanceTransform { pos: [4.8, 0.02, 10.5], turn: 32768, scale: 1.0 }, tint: [0.85, 0.60, 0.70] },
     // East band, south of the E-W road.
     ProxyInstance { transform: InstanceTransform { pos: [5.1, 0.02, -7.0], turn: 0, scale: 1.0 }, tint: [0.40, 0.40, 0.55] },
     ProxyInstance { transform: InstanceTransform { pos: [4.9, 0.02, -9.5], turn: 32768, scale: 1.0 }, tint: [0.95, 0.55, 0.30] },
     // North band, west of the N-S road: walking east (turn 16384)
-    // and west (turn 49152).
+    // and west (turn 49152). The westbound stroller stands at
+    // z 4.8 for the v2 footprint's corner clearance.
     ProxyInstance { transform: InstanceTransform { pos: [-7.5, 0.02, 5.0], turn: 16384, scale: 1.0 }, tint: [0.65, 0.75, 0.30] },
-    ProxyInstance { transform: InstanceTransform { pos: [-10.0, 0.02, 5.2], turn: 49152, scale: 1.0 }, tint: [0.50, 0.65, 0.80] },
+    ProxyInstance { transform: InstanceTransform { pos: [-10.0, 0.02, 4.8], turn: 49152, scale: 1.0 }, tint: [0.50, 0.65, 0.80] },
     // North band, east of the N-S road.
     ProxyInstance { transform: InstanceTransform { pos: [7.5, 0.02, 5.0], turn: 49152, scale: 1.0 }, tint: [0.80, 0.35, 0.45] },
     ProxyInstance { transform: InstanceTransform { pos: [10.0, 0.02, 4.9], turn: 16384, scale: 1.0 }, tint: [0.30, 0.70, 0.55] },
@@ -159,12 +167,14 @@ mod tests {
     use engine_renderer::lit_scene::{SCENE_EXTENT, camera_route};
     use engine_renderer::proxy_instances::{INSTANCE_STRIDE, repack_populations};
 
-    /// The pedestrian footprint radius: the NPC proxy's worst corner
-    /// (torso 0.24 x 0.14 -> half-diagonal ~0.278, rounded up).
-    const FOOTPRINT: f32 = 0.28;
-    /// The sedan's half extents (width x, length z at turn 0).
-    const VEHICLE_HALF_WIDTH: f32 = 0.9;
-    const VEHICLE_HALF_LENGTH: f32 = 2.1;
+    /// The pedestrian footprint radius: the v2 humanoid's worst
+    /// corner (the upper arms at |x| 0.33, z 0.06 → half-diagonal
+    /// ~0.335; the lower legs' forward feet smaller; rounded up).
+    const FOOTPRINT: f32 = 0.36;
+    /// The v2 sedan's half extents (width x, length z at turn 0):
+    /// the wheels' outer edge 0.975 and the body's nose/tail 2.20.
+    const VEHICLE_HALF_WIDTH: f32 = 0.98;
+    const VEHICLE_HALF_LENGTH: f32 = 2.20;
     /// The building masses begin where BOTH coordinates reach 6 m
     /// (the corner blocks; the road edge is 4 m, the sidewalk ring
     /// spans between).
@@ -337,9 +347,11 @@ mod tests {
         }
     }
 
-    /// Pedestrians never overlap: >= 0.7 m center-to-center against
-    /// the 0.56 m bounding-circle contact bound (two 0.28 m
-    /// footprints), with margin.
+    /// Pedestrians never overlap: >= 0.7 m center-to-center. At the
+    /// table's cardinal facings the worst true mesh contact is the
+    /// arm-to-arm reach (|x| 0.33 a side — 0.66 m across, the 0.7 m
+    /// rule's 0.04 m of margin); the 0.72 m arbitrary-orientation
+    /// bounding circle is not reachable at cardinal turns.
     #[test]
     fn pedestrians_never_overlap() {
         let (npc, _) = corner_population();
@@ -387,7 +399,12 @@ mod tests {
     /// The measured-actual FNV-1a of the pinned placement table
     /// above (the placeholder-pin discipline: the first run measures,
     /// the pin follows, and any later movement is an investigation).
-    const PINNED_FNV: u64 = 9_133_392_768_426_866_649;
+    /// Repinned in the Era-1 population-v2 package: the three
+    /// strollers nudged outward for the v2 silhouettes' true
+    /// footprint (the 0.36 m radius's 0.5 m building clearance —
+    /// the movement this pin exists to catch), from the
+    /// population-package value 9_133_392_768_426_866_649.
+    const PINNED_FNV: u64 = 4_298_571_200_219_075_995;
 
     // ------------------------------------------------------- helpers
     // (pure f32; the pins carry margins, so platform ulp differences

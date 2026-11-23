@@ -95,7 +95,11 @@ ARM64) with a five-job CI:
   (the lazily-created per-frame-slot mapped command buffer, the
   byte-pinned pure command packing, byte-identical output to the
   direct instanced draw — the mechanism the deferred GPU-culling
-  package authors counts through).
+  package authors counts through). The Era-1 **population v2**: the
+  shipped proxy meshes are the v2 silhouettes (`populated_meshes` —
+  the eleven-box humanoid, the sedan with libm-free cylinder
+  wheels; the instance transform contract unchanged, origin at
+  feet/ground-center).
   Cycle 6-F **directional shadow path**: the deterministic light-space
   cascade core, the per-slot shadow maps behind a depth-only pass
   (an external subpass dependency orders the writes before the main
@@ -219,7 +223,14 @@ one-time command-buffer allocation pin, an oracle wall through the
 indirect submission — in the same binary); Linux 1146/69 and
 576/12/58 MEASURED locally with the workflow's own awk, Windows
 1095/69 and 575/12/58 = the same platform-uniform deltas (to be
-confirmed by the candidate's CI run). The
+confirmed by the candidate's CI run). The Era-1 population-v2
+package (2026-11-23): the v2 silhouettes (`populated_meshes` — the
+eleven-box humanoid at 396 vertices, the sedan with cylinder wheels
+at 552) become the population path's shipped meshes; the
+`proxy_indirect` command pins and both packed-bytes FNV pins
+re-measured for the new counts and the three stroller placements
+nudged for the true 0.36 m footprint (every count UNCHANGED — the
+repins are values inside existing tests, no new test anywhere).
 Cycle 6-F candidate's Linux counts were MEASURED locally with the
 workflow's own awk (1146 main = the pre-6-F 1138 + 8 platform-uniform
 engine-renderer tests — the shadow core's full battery; heavy passed

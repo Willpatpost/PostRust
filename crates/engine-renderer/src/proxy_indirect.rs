@@ -43,7 +43,7 @@
 //! slot S's fence). The block is small enough to live in a stack
 //! array — no per-frame Vec, no allocation at all.
 
-use crate::proxy_mesh::{npc_proxy_mesh, vehicle_proxy_mesh};
+use crate::populated_meshes::{humanoid_mesh, sedan_mesh};
 
 /// One `VkDrawIndirectCommand`'s byte size: four u32 fields
 /// (vertexCount, instanceCount, firstVertex, firstInstance).
@@ -82,7 +82,8 @@ pub fn append_indirect_command(bytes: &mut [u8], vertex_count: u32, instance_cou
 /// One frame slot's full command block for a population: the NPC
 /// command at offset 0, the vehicle command at offset 16 — each
 /// kind's mesh vertex count (the pinned proxy-mesh constants: NPC
-/// 108, vehicle 72) paired with its instance count. Empty kinds
+/// 396, vehicle 552 — the Era-1 v2 silhouettes) paired with its
+/// instance count. Empty kinds
 /// pack `instanceCount = 0` commands (the draw loop never submits
 /// them; the block's shape stays fixed regardless).
 ///
@@ -96,12 +97,12 @@ pub fn indirect_slot_commands(npc_count: u32, vehicle_count: u32) -> [u8; INDIRE
     let mut block = [0u8; INDIRECT_SLOT_BYTES];
     append_indirect_command(
         &mut block[indirect_kind_offset(0)..],
-        npc_proxy_mesh().len() as u32,
+        humanoid_mesh().len() as u32,
         npc_count,
     );
     append_indirect_command(
         &mut block[indirect_kind_offset(1)..],
-        vehicle_proxy_mesh().len() as u32,
+        sedan_mesh().len() as u32,
         vehicle_count,
     );
     block
@@ -129,11 +130,12 @@ mod tests {
         let a = indirect_slot_commands(24, 2);
         let b = indirect_slot_commands(24, 2);
         assert_eq!(a, b, "double-packing reproduces the identical bytes");
-        // The proxy-mesh vertex pins (proxy_mesh's own tests pin
-        // 108/72; the command bytes carry the same numbers).
-        assert_eq!(word(&a, 0), 108, "npc vertexCount = the mesh's 108");
+        // The proxy-mesh vertex pins (populated_meshes's own tests
+        // pin 396/552 — the Era-1 v2 silhouettes; the command bytes
+        // carry the same numbers).
+        assert_eq!(word(&a, 0), 396, "npc vertexCount = the mesh's 396");
         assert_eq!(word(&a, 4), 24, "npc instanceCount = the population");
-        assert_eq!(word(&a, 16), 72, "vehicle vertexCount = the mesh's 72");
+        assert_eq!(word(&a, 16), 552, "vehicle vertexCount = the mesh's 552");
         assert_eq!(word(&a, 20), 2, "vehicle instanceCount = the population");
         // The pinned zero words: firstVertex and firstInstance on
         // BOTH commands.
@@ -147,12 +149,9 @@ mod tests {
         // asserted so a field swap cannot pass silently.
         assert_eq!(
             (word(&a, 0), word(&a, 4)),
-            (npc_proxy_mesh().len() as u32, 24)
+            (humanoid_mesh().len() as u32, 24)
         );
-        assert_eq!(
-            (word(&a, 16), word(&a, 20)),
-            (vehicle_proxy_mesh().len() as u32, 2)
-        );
+        assert_eq!((word(&a, 16), word(&a, 20)), (sedan_mesh().len() as u32, 2));
     }
 
     /// THE CROSS-PLATFORM BYTE PIN (the fingerprint-pin discipline
@@ -177,13 +176,15 @@ mod tests {
     }
 
     /// The measured-actual FNV-1a of the shipped population's
-    /// command block (24 npc + 2 vehicle over the pinned 108/72
-    /// vertex counts) — measured at this package's first test run on
-    /// this pod (the placeholder-pin discipline the instance
-    /// buffer's own FNV pin documents: run once, read the actual,
-    /// pin it; a later mismatch is an investigation, never a silent
+    /// command block (24 npc + 2 vehicle over the Era-1 v2
+    /// silhouettes' 396/552 vertex counts — the population-v2
+    /// package's deliberate mesh swap, the documented cause of the
+    /// repin from the 6-E2 value 5608403408697128027) — measured at
+    /// this package's first test run on this pod (the
+    /// placeholder-pin discipline: run once, read the actual, pin
+    /// it; a later mismatch is an investigation, never a silent
     /// repin).
-    const PINNED_FNV: u64 = 5608403408697128027;
+    const PINNED_FNV: u64 = 1080195817659645834;
 
     /// Empty kinds pack zero-instanceCount commands — the block's
     /// shape is fixed (two commands) regardless of which kinds are
@@ -193,9 +194,9 @@ mod tests {
     #[test]
     fn empty_kinds_pack_zero_instance_counts() {
         let empty = indirect_slot_commands(0, 0);
-        assert_eq!(word(&empty, 0), 108, "the npc command stays present");
+        assert_eq!(word(&empty, 0), 396, "the npc command stays present");
         assert_eq!(word(&empty, 4), 0, "npc instanceCount zero");
-        assert_eq!(word(&empty, 16), 72, "the vehicle command stays present");
+        assert_eq!(word(&empty, 16), 552, "the vehicle command stays present");
         assert_eq!(word(&empty, 20), 0, "vehicle instanceCount zero");
         // Half-populated: the empty kind's command is zeroed, the
         // populated kind's carries its count.
