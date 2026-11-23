@@ -605,6 +605,23 @@ jobs:
           done
           grep -Eq 'directional shadows: one cascade \(1024 texels\)' corner-shadows.log
           grep -Eq 'validation warnings/errors 0/0' corner-shadows.log
+          # (Era 1 package 1: free-look) The interactive camera's
+          # offscreen smoke: the REAL free-look loop end to end —
+          # construction on the route's entry waypoint (the first
+          # frame is matrix-identical to the route's first — the
+          # shared orientation conversion is lib-tested), presentation
+          # through the same submission selection, the bounded
+          # --frames auto-quit — under the ACTIVE validation layer
+          # with zero input (offscreen delivers none; the
+          # camera-math battery is the lib tests). 70 frames > the
+          # 60-frame warmup so the demo's own warmed-allocation
+          # constancy assertion executes (no resize in offscreen —
+          # the no-recreation regime the gate covers). Lavapipe:
+          # correctness evidence, NOT performance evidence.
+          cargo run -q -p engine-slice -- --corner --free-look --frames 70 --fps uncapped --validation on | tee corner-freelook.log
+          grep -Eq 'free-look: presentation only' corner-freelook.log
+          grep -Eq 'free-look: 70 presented frames; validation warnings/errors 0/0; swapchain recreations 0' corner-freelook.log
+          grep -Eq 'warmed Vulkan allocations held across the session' corner-freelook.log
       - name: Encounter and legacy scene framebuffer regressions (Linux Vulkan)
         if: runner.os == 'Linux'
         shell: bash
@@ -1089,8 +1106,19 @@ jobs:
           # gates + the render_shadows gate), result lines 57 -> 59;
           # passed counts stay the population package's (6-F adds no
           # engine-slice test).
-          expected=576
-          if [ "$(uname -s)" != "Linux" ]; then expected=575; fi
+          # Era 1 package 1 (free-look, 2026-11-23): the corner_demo
+          # camera battery grows the lib binary's passed count by 6
+          # platform-uniform tests (the route-entry matrix identity,
+          # the world-AABB/eye-band clamp, the Stage-2-speed movement
+          # along the camera basis, the runaway-input clamp, the
+          # shared look-mapping composition, the pitch pin) within
+          # its existing result line. Linux 582/13/59 MEASURED
+          # locally with this step's own awk; Windows 581 = the
+          # prior 575 + the same 6 (platform-uniform — pure f32
+          # arithmetic and struct equality, no cfg gates); ignored
+          # and result lines unchanged.
+          expected=582
+          if [ "$(uname -s)" != "Linux" ]; then expected=581; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
