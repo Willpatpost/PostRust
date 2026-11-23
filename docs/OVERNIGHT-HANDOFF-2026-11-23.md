@@ -1646,16 +1646,27 @@
 //! verified against ground truth). This session did, string by
 //! string:
 
-//! - **Every commit sha resolves on the correct branch** — the four
+//! - **Every commit sha resolves on the correct branch** — 20
+//!   unique commit strings across the four bodies (9 in the 6-E
+//!   body, 9 in 6-F's, 8 in population's, 8 in 6-E2's; the exact
+//!   per-body sets measured and logged at
+//!   `~/verify13-session17/audit-exact-sets.log`): the four
 //!   implementation commits (`511b157` / `96dee7c` / `5c9690d` /
-//!   `6ee89b4`), `1fe89b7` on all five refs, and every intermediate
-//!   tip each body cites (`3e5a811`, `14d30f9`, `f38c1c2`,
-//!   `0c19c9f`, `5cee5b4`, `1c50065` on 6-E; `4b5b228`, `1b05252`,
-//!   `d53fa2e`, `e858f40`, `f0c83e1`, `980e432` on 6-F; `cb92088`,
-//!   `4c5edbf`, `7fed835`, `9b48125`, `7fed835`-lineage on
-//!   population; `3522e55`, `9f40161`, `ae7bcf5`, `faa01a0`,
-//!   `fb8bfa2`, `f29a22a` on 6-E2) — each verified by
-//!   `merge-base --is-ancestor` against the five refs.
+//!   `6ee89b4`), `1fe89b7` on all five refs, the 6-E2 stack tip
+//!   `3522e55` (cited by all four bodies), and each branch's own
+//!   cited intermediates (`3e5a811`, `14d30f9`, `f38c1c2`,
+//!   `0c19c9f` on 6-E; `4b5b228`, `1b05252`, `d53fa2e`, `e858f40`
+//!   on 6-F; `cb92088`, `4c5edbf`, `7fed835` on population;
+//!   `9f40161`, `ae7bcf5`, `faa01a0` on 6-E2) — each verified by
+//!   `merge-base --is-ancestor` against the five refs. (Corrective
+//!   within this session, on record: this bullet's first committed
+//!   form over-enumerated — it named six shas no body cites
+//!   (`5cee5b4`, `1c50065`, `f0c83e1`, `980e432`, `fb8bfa2`,
+//!   `f29a22a` — the branch tips, which the bodies reference as
+//!   "this session's commit adding this section" WITHOUT shas) and
+//!   counted 21. The measured count is 20; the corrective commit's
+//!   message carries the full record. The error never reached any
+//!   PR body or payload — the PR-body file is untouched by it.)
 //! - **The sim-repo citations resolve in their home repos**: the
 //!   merge-dryrun simulation repo is still present with `76a673e`
 //!   as its HEAD (the 31-hunk sim merge) and `d5dafe8` as a tree;
@@ -1717,17 +1728,22 @@
 //! README pins updated. The other three payloads are byte-unchanged
 //! (their bodies untouched — regeneration proven a no-op for each).
 
-//! ### The closing loop on this session's own commit
+//! ### The closing loop on this session's own commits
 
-//! Documentation only — the diffstat is this handoff doc and the
-//! population PR-body file; no `.rs`, no workflow, no pins, no
-//! test. Gates for this commit: `cargo fmt --all -- --check` clean
-//! and `cargo clippy --workspace --all-targets --release -- -D
-//! warnings` clean, run on this tip. After the commit: the merge
-//! kit re-executed on the post-commit tips (the union doc gains
-//! this section; the code-subset check against `f02ddef` must stay
-//! zero files), and all four payloads re-verified byte-identical
-//! to their branch bodies — the kit README carries the run record.
+//! Documentation only — the session's diff is this handoff doc and
+//! (the first commit only) the population PR-body file; no `.rs`,
+//! no workflow, no pins, no test. Gates for each commit: `cargo
+//! fmt --all -- --check` clean and `cargo clippy --workspace
+//! --all-targets --release -- -D warnings` clean, run on the tip.
+//! After each commit: the merge kit re-executed on the post-commit
+//! tips (the code-subset check against `f02ddef` must stay zero
+//! files), and all four payloads re-verified byte-identical to
+//! their branch bodies — the kit README carries the run records.
+//! The session lands two commits: `35bf43d` (the audit, the
+//! lineage reproduction, and the population body's tip-statement
+//! corrective) and the enumeration corrective this section carries
+//! (handoff-doc only; the population payload is untouched by it —
+//! the `03945511` regeneration stands).
 
 //! ### Notes for the owner (session 17)
 
