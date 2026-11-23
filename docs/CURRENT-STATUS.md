@@ -341,11 +341,16 @@ The following audit finding remains genuinely open:
 - **The F-05 overlay throttle** — deliberately NOT implemented (the measured
   costs are negligible at target frame budgets; revisit only with rig
   evidence).
-- Compaction follow-ups and the multiplayer/replication **implementation
-  choices** — `docs/MULTIPLAYER-SPEC.md`'s player-facing multiplayer and
-  governance rules are **ratified product requirements**; what remains
-  incomplete or unratified is the networking, transport, and replication
-  implementation design (the spec is never treated as mere research).
+- Compaction follow-ups and the multiplayer **implementation** —
+  `docs/MULTIPLAYER-SPEC.md`'s player-facing multiplayer and governance
+  rules are **ratified product requirements**; the in-session
+  architecture boundaries are **designed** (unratified) in
+  `docs/CYCLE6-6D-SESSION-REPLICATION-BOUNDARIES.md` (Cycle 6-D,
+  2026-11-23 — sim placement, input ordering, replication scope,
+  divergence detection, session lifecycle, with the owner decision
+  list in its §9); what remains open beyond it is the owner's §9
+  rulings, the transport/provider selection (T-06 deferral), and all
+  implementation (owner-gated batches, its §10).
 
 ## 7. Actual performance evidence (and what is NOT evidence)
 
@@ -610,9 +615,9 @@ not implemented** / **not yet designed**.
 | NPC/world representation (LOD) | Partially implemented | The region director, four LOD levels, activation/reconstruction — validated at 1000 NPCs / 8 regions; game-scale behaviors undesigned |
 | Physics and collision | Prototype only | The Cycle-1 kinematic player prototype (`engine-core` player module: swept-AABB collision, fixed-step movement, FP/TP cameras) — headless/offscreen validated, collide-what-you-see; reversible and explicitly NOT a ratified production physics backend (§8) |
 | Combat and gameplay systems | Partially implemented (demo-scale prototype, validated) | The Cycle 2–5 line: `engine-core` combat resolution (`resolve_attack`, pure, allocation-free) + the adversary cadence model + the encounter composition with cover/HUD/cues in `engine-slice` — pinned by the combat_world (21) and encounter_world (30) batteries with byte-identical scenario traces; game-scale gameplay systems (progression, economy, AI beyond the cadence prototype) remain undesigned |
-| Networking and replication | Not yet designed | The player-facing multiplayer and governance rules are **ratified** in `docs/MULTIPLAYER-SPEC.md`; the networking/transport/replication implementation choices remain unratified and undesigned |
-| Listen-server authority | Not yet designed | Player-hosted listen-server is the stated working preference (unratified); no engine system |
-| Host handoff | Not yet designed | Planned-required per the ratified multiplayer requirements; no engine system |
+| Networking and replication | In-session boundaries **designed (unratified)** | The player-facing multiplayer and governance rules are **ratified** in `docs/MULTIPLAYER-SPEC.md`; the campaign-level authority/persistence research lives in `docs/MULTIPLAYER-ARCHITECTURE-RESEARCH.md` (unapproved); the **in-session architecture** — sim placement, input ordering, replication scope, divergence detection, session lifecycle — is designed in `docs/CYCLE6-6D-SESSION-REPLICATION-BOUNDARIES.md` (**unratified**; owner decision list §9); transport/provider selection remains undesigned (T-06 deferral) |
+| Listen-server authority | Designed (unratified) | The 6-D design's S3 direction — host-authoritative canonical spine with optional non-authoritative client mirror — is a PROPOSAL; no engine system |
+| Host handoff | Designed (unratified) | Planned-required per the ratified multiplayer requirements; the 6-D design maps the handoff onto the research §5 lease/epoch machinery over `engine-persist`; no engine system |
 | Co-op roster governance | Not yet designed | The player-facing governance rules (roster democracy, unanimity requirements) are **ratified** in `docs/MULTIPLAYER-SPEC.md`; no engine system |
 | Procedural world generation | Not yet designed | — |
 | Dense city streaming | Not yet designed | F-08 deferred |

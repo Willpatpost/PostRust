@@ -2,7 +2,7 @@ name: engine-ci
 
 on:
   push:
-    branches: [main, stage5, macos-port, cycle6/6c-scheduler-bookkeeping]
+    branches: [main, stage5, macos-port, cycle6/6d-multiplayer-boundaries]
     paths:
       - "crates/**"
       - "build/**"
