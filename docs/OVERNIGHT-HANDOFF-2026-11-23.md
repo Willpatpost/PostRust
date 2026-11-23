@@ -1538,7 +1538,7 @@
 //!   harmless);
 //! - all four `~/push-handoff` payloads byte-identical to the
 //!   canonical PR-body files on the branch tips (sha
-//!   `a90cc2fd` / `1b91fdcb` / `161c2ca9` / `81385ae`; body
+//!   `a90cc2fd` / `1b91fdcd` / `161c2ca9` / `81385ae9`; body
 //!   sizes 26,319 / 28,027 / 25,071 / 26,026 bytes — sessions
 //!   12/13's recorded numbers, re-measured) and the
 //!   `/tmp/opencode` twins sha-identical; the stack parsed
