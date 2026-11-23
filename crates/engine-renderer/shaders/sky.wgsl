@@ -5,6 +5,19 @@
 // implementer (the brief documents the standard NDC->ray
 // reconstruction) — the COLOR equation below is the pinned part.
 //
+// THE RAY RECONSTRUCTION (the package-6 first-run correction):
+// the NDC position is the varying (its interpolation is EXACT —
+// the screen-space position is affine in NDC by construction) and
+// the fragment shader reconstructs and normalizes its OWN ray.
+// The original per-vertex form interpolated three NORMALIZED
+// directions affinely — the blend is shorter than unit length and
+// mispointed (a rational field cannot be reproduced by an affine
+// blend of three samples), so the disc's dot product never reached
+// its 0.99927 threshold anywhere: THE SUN DISC NEVER RENDERED, and
+// the gradient was distorted (found on the first real execution of
+// the sky gate — the step had never run before; see the post
+// package's PR for the evidence trail).
+//
 // THE EQUATION (sky.rs :: sky_color):
 //   gradient = lerp(horizon, zenith, smoothstep(-0.08, 0.45, dir.y))
 //   disc     = smoothstep(0.99927, 0.99939, dot(dir, disc_dir))
@@ -29,7 +42,10 @@ var<uniform> frame: SkyParams;
 
 struct VertexOut {
     @builtin(position) position: vec4<f32>,
-    @location(0) view_dir: vec3<f32>,
+    // The NDC this fragment renders — interpolated EXACTLY (the
+    // screen-space position is affine in NDC; a vec2 of it carries
+    // no rational curvature for the interpolation to miss).
+    @location(0) ndc: vec2<f32>,
 };
 
 @vertex
@@ -43,10 +59,7 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOut {
     let p = positions[index];
     var out: VertexOut;
     out.position = vec4<f32>(p, 0.999999, 1.0);
-    // The view ray: the far-plane point through this NDC position.
-    let near_point = frame.view_proj_inv * vec4<f32>(p, 0.0, 1.0);
-    let far_point = frame.view_proj_inv * vec4<f32>(p, 1.0, 1.0);
-    out.view_dir = normalize(far_point.xyz / far_point.w - near_point.xyz / near_point.w);
+    out.ndc = p;
     return out;
 }
 
@@ -56,7 +69,14 @@ fn smoothstep_f(edge0: f32, edge1: f32, x: f32) -> f32 {
 }
 
 @fragment
-fn fs_main(@location(0) view_dir: vec3<f32>) -> @location(0) vec4<f32> {
+fn fs_main(@location(0) ndc: vec2<f32>) -> @location(0) vec4<f32> {
+    // The view ray: the far-plane point through this fragment's own
+    // NDC (per-fragment — the reconstruction the CPU oracle's ray
+    // property pins: the inverse maps the NDC back onto the camera
+    // axis through the look-at target).
+    let near_point = frame.view_proj_inv * vec4<f32>(ndc, 0.0, 1.0);
+    let far_point = frame.view_proj_inv * vec4<f32>(ndc, 1.0, 1.0);
+    let view_dir = normalize(far_point.xyz / far_point.w - near_point.xyz / near_point.w);
     // Mirrors sky.rs :: sky_color exactly, term-for-term.
     let g = smoothstep_f(-0.08, 0.45, view_dir.y);
     let d = dot(view_dir, frame.disc_dir.xyz);

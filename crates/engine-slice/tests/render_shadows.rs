@@ -38,6 +38,22 @@ use engine_renderer::{
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 
+/// The binary's SDL serialization (the engine-shell test pattern —
+/// render_instanced's own copy, applied to this binary now that
+/// the PCF package grew it to TWO SDL-touching gates; found when
+/// the gates first executed in parallel: SDL refuses init off the
+/// main thread, and cargo test runs the two tests concurrently).
+/// The guard is declared FIRST in each test so it drops LAST
+/// (reverse declaration order): the app and renderer are fully
+/// dropped — SDL quit, the main-thread declaration reset — before
+/// the lock releases and the next test initializes.
+fn sdl_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap()
+}
+
 /// The bias under test (the demo's own policy — one source for both).
 const BIAS: ShadowBias = ShadowBias {
     constant: 0.0015,
@@ -303,6 +319,7 @@ fn check_ground_patch(
 #[test]
 #[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
 fn shadow_map_depths_match_the_raycaster_and_pixels_gate() {
+    let _guard = sdl_lock();
     let mut app = ShellApp::new(ShellConfig {
         title: "Cycle 6-F directional shadows".into(),
         width: 256,
@@ -644,6 +661,7 @@ fn factored_ground_color(
 #[test]
 #[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
 fn pcf_penumbra_pixels_match_the_cpu_filter_over_the_same_map_bytes() {
+    let _guard = sdl_lock();
     let mut app = ShellApp::new(ShellConfig {
         title: "Era 1 soft shadows".into(),
         width: 256,
