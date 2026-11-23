@@ -590,3 +590,114 @@
 //! commands stand unchanged (the watcher performs the whole
 //! delivery from the same canonical bytes the moment a credential
 //! returns).
+
+//! ---
+
+//! ## SESSION 8 ADDENDUM — the hardened-form re-rehearsal of the
+//! delivery path (2026-11-23, ~12:06 UTC)
+
+//! The eighth session re-probed the push blocker first: **unchanged**
+//! (both `/tmp/vscode-git-*.sock` sockets probed with a raw AF_UNIX
+//! connect — ConnectionRefused on both, dead files; `git push
+//! --dry-run` exit 128; still no `gh`, no `GH_TOKEN`, no
+//! `~/.git-credentials`, no `~/.netrc`, no SSH keys — only
+//! `known_hosts`; anonymous read works, `origin/main` remains at
+//! `1fe89b7` with only the seven historical PR refs beside it — no
+//! drift, and no cycle6 branch has appeared on the remote, so the
+//! watcher has correctly never fired).
+
+//! ### The gap this session closed — the rehearsal predated the
+//! hardening
+
+//! Session 7 hardened the watcher's `push_and_pr` (11:53:44 UTC)
+//! but verified it only with `bash -n` and a standalone mini-test
+//! of the write pattern; the full delivery rehearsal
+//! (`/tmp/opencode/rehearsal/`) had run at 07:53 — BEFORE the
+//! hardening — and its TEST B wrote the askpass file with the
+//! pre-hardening pattern. "The push, extraction, and curl lines are
+//! unchanged" was a diff-based claim; the deployed hardened
+//! sequence had never been executed end-to-end. Session 8 closed
+//! it the measured way:
+
+//! - TEST B strengthened to the deployed watcher's EXACT hardened
+//!   sequence — `(umask 077; printf … > askpass)` write, `chmod
+//!   700`, the push, the `rm -f` — with the three mechanism lines
+//!   first verified **verbatim in both deployed watcher copies**
+//!   (`grep -qF` against `/tmp/opencode/push-watcher-3branch.sh`
+//!   and its `~/push-handoff` twin). New assertions: **B0** (the
+//!   write under `umask 077` creates the file at mode 600 — no 644
+//!   window between create and chmod, session 7's mini-test claim
+//!   now pinned in-sequence — and 700 after the watcher's chmod)
+//!   and **B2** (the askpass file removed the moment the push
+//!   attempt ends — the failure outcome is exactly the
+//!   push-fails-and-retries scenario the hardening exists for).
+//!   A1, A2, B, C unchanged. A strengthening only; the summary
+//!   line now expects 7 PASS.
+//! - Three runs, all reported: 12:06:17Z **6/7** — B0 FAIL, an
+//!   ENVIRONMENTAL cause fully root-caused on record (the 07:53
+//!   rehearsal's own leftover `.push-askpass.sh` artifact at mode
+//!   700; `>` truncates without touching mode, so the probe saw
+//!   the stale artifact, not a fresh create; the mechanism was
+//!   correct — the fix adds the watcher's loop-start invariant, a
+//!   pre-write `rm -f`, making the test MORE faithful, never
+//!   weaker; the cause is commented in the driver with this
+//!   history, the 07:53 test-correction precedent); 12:06:56Z
+//!   **7/7 PASS**; 12:06:58Z **7/7 PASS**. Raw clean-run log:
+//!   `/tmp/opencode/rehearsal/rehearsal-run-session8.log`; the
+//!   session-8 section of `rehearsal/README.md` carries the full
+//!   record including the survivor-mode analysis (a 644 survivor
+//!   from the pre-hardening era is unreachable — `push_and_pr`
+//!   never fired, both possible askpass paths verified absent).
+//! - **The re-rehearsal proves, for the DEPLOYED form**: the
+//!   extraction through the real code-server askpass chain, the
+//!   hardened askpass write (600 at create, 700 in use), the
+//!   echo-token push reaching GitHub's HTTP auth layer, the token
+//!   never surviving a push attempt, and the payload-through-curl
+//!   PR creation. Still unprovable from this pod (unchanged):
+//!   whether the owner's code-server session returns.
+
+//! ### The delivery chain, verified this session (all MEASURED)
+
+//! The supervisor (PID 858) and the four-branch watcher (PID 442510,
+//! started 11:53:44Z from the hardened `/tmp` copy — the hardened
+//! form, the hardening lines byte-identical in both copies) alive;
+//! all four `~/push-handoff` payloads byte-identical to the
+//! canonical PR body files on their branch tips (`jq -j .body` vs
+//! `git show branch:file`, `cmp` clean, 23441/25041/22054/22637
+//! bytes for 6-E/6-F/population/6-E2); the `/tmp/opencode` and
+//! `~/push-handoff` payload twins sha256-identical (all four pairs);
+//! the lavapipe environment functional without re-provision
+//! (llvmpipe, mesa 25.2.8, Vulkan 1.4.318). One initially-suspected
+//! discrepancy resolved as INTENTIONAL and now documented in the
+//! rehearsal README: the two watcher copies differ in PATHS only
+//! (each references its own askpass location and payload twins;
+//! the supervisor re-arms `/tmp` first, the persistent twin
+//! survives a `/tmp` wipe).
+
+//! ### The docs-only proof, measured for all four branches
+
+//! Every branch tip is documentation-only above its implementation
+//! commit — `git diff --name-only` from each implementation commit
+//! (`511b157` / `96dee7c` / `5c9690d` / `6ee89b4`) to its tip
+//! (`5cee5b4` / `f0c83e1` / `98c7d63` / `fb8bfa2`) lists only
+//! `docs/OVERNIGHT-HANDOFF-2026-11-23.md` and the branch's PR-body
+//! file — no code, no workflow, no pins. Every measured record in
+//! every session's tables therefore applies to the exact tips the
+//! watcher will push.
+
+//! ### Notes for the owner (session 8)
+
+//! `~/OVERNIGHT-DONE` remains correctly absent (the PRs do not
+//! exist; the honest form stands). `SURVIVED.txt` remains unexplained
+//! and was left strictly alone. This session's commit is
+//! documentation-only (this handoff doc; no `.rs`, no workflow, no
+//! pins) — the population PR body is UNCHANGED (run-wide work is
+//! handoff-doc-only, the session-7 precedent), so the payload
+//! regeneration is a proven no-op and the watcher payloads stand
+//! as verified. The morning commands stand unchanged. Gates for
+//! this commit: `cargo fmt --all -- --check` clean and
+//! `cargo clippy --workspace --all-targets --release -- -D
+//! warnings` clean, run on this tip; the full suites are the
+//! sessions 3/4/6/7 measured records on the identical code tree
+//! (the docs-only proof above). engine-core untouched; AGENTS.md
+//! untouched.
