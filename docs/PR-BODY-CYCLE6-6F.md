@@ -277,3 +277,43 @@ file). Every commit beyond `96dee7c` is documentation only —
 workflow, no pins. This PR's base is `main`, so the doc commits
 appear in the diff (nothing cancels); they are the run's audit
 record, not scope creep.
+
+---
+
+### Session 6 — the heavy shard's direct clean-environment run (2026-11-23, the ~11:30 UTC session)
+
+The one second-run gap this branch still carried: the heavy shard
+had session 3's single direct measurement (570/10/58), taken
+before the clean-environment discipline THIS lane's own polluted-env
+FAIL established (session 4's first main-shard attempt here failed
+inside the exported lavapipe environment — engine-shell's
+relative-mouse test, a package this diff does not touch — and the
+root-cause produced the run-wide operational lesson; the clean
+re-run 1146/2/33 is the record). Session 6 closed the heavy gap the
+same way the lesson prescribes: the CI command verbatim (`cargo
+test -p engine-slice --features engine-slice/crash-test-seams`),
+the workflow's own awk counting, in a shell with no SDL/VK
+variables, directly on this branch's tip (`d53fa2e` at run time;
+the code tree is exactly `96dee7c`'s — every commit above the
+package commit is documentation only):
+
+| Step (MEASURED this session, this tip) | Result |
+|---|---|
+| `cargo fmt --all -- --check`; clippy `-D warnings` in both forms (the CI debug form, the standing-order release form) | clean |
+| **the full heavy shard** | **570 passed / 10 ignored / 58 result lines, rc=0, zero failures — the branch pin, its first post-clean-discipline direct run (session 3's 570/10/58 re-confirmed on this tree)** |
+
+Raw log: `/tmp/opencode/session6-6f-heavy.log` on the pod (a /tmp
+path — may not survive a pod restart; the numbers here are the
+durable record). The watcher payload and its `~/push-handoff` twin
+were regenerated from this file byte-for-byte after this section
+landed.
+
+**The tip statement (supersedes the one above):** the pushed tip is
+this branch's head = the package commit `96dee7c` + the run-wide
+handoff doc (`4b5b228`) + session 4's addendum (`1b05252`) +
+session 5's payload-sync commit (`d53fa2e`) + session 6's
+heavy-shard verification addendum (the commit adding this section).
+Every commit beyond `96dee7c` is documentation only — `git diff
+--name-only 96dee7c..HEAD` lists only
+`docs/OVERNIGHT-HANDOFF-2026-11-23.md` and this file; no code, no
+workflow, no pins.
