@@ -7,6 +7,14 @@
 //! gap.** The one action this run needs from you is at
 //! "THE ONE BLOCKER" below.
 //!
+//! (Navigation note, added by the ninth session: the push commands
+//! inside "THE ONE BLOCKER" are the original session-3 form; the
+//! corrected form — PR bodies from the canonical files committed
+//! on the branches — is in the SESSION 5 ADDENDUM below, and doing
+//! nothing is also correct: the live push watcher performs the
+//! whole delivery from the same bytes the moment a credential
+//! returns.)
+//!
 //! ## What exists (the whole ladder, complete)
 //!
 //! Four packages, four branches, one commit each (plus this
@@ -701,3 +709,135 @@
 //! sessions 3/4/6/7 measured records on the identical code tree
 //! (the docs-only proof above). engine-core untouched; AGENTS.md
 //! untouched.
+
+//! ---
+
+//! ## SESSION 9 ADDENDUM — the delivery-chain audit session
+//! (2026-11-23, ~12:10 UTC)
+
+//! The ninth session re-probed the push blocker first: **unchanged**
+//! (both `/tmp/vscode-git-*.sock` sockets probed by raw AF_UNIX
+//! connect — ConnectionRefused on both; `git push --dry-run` exit
+//! 128 with `remote: No anonymous write access`; anonymous read
+//! works, `origin/main` remains at `1fe89b7` with only the seven
+//! historical PR refs beside it — no drift, no remote cycle6
+//! branch, so the watcher has correctly never fired; still no
+//! `gh`, no write credential of any form).
+
+//! ### What this session did (and why)
+
+//! The code ladder and its local evidence were saturated by
+//! sessions 3–7 (every pinned shard ≥ 2 direct measurements with
+//! at least one in a clean environment; every graphical linchpin
+//! at three direct measurements on its exact code tree; every rig
+//! block pre-flighted verbatim in release on the final tips) and
+//! the delivery path was rehearsed end-to-end by session 8. Per
+//! this handoff's standing mandate — improve the weakest evidence,
+//! never new scope — the weakest remaining evidence was not in the
+//! packages but in the DELIVERY MACHINERY's audit trail: the
+//! supervisor script had been described (the watcher's header, the
+//! README) but never audited line-by-line on the record, and one
+//! environmental contingency — what restarts the supervisor itself
+//! after a pod reboot — had never been probed. This session closed
+//! both and re-verified the whole chain fresh.
+
+//! ### The delivery chain, re-verified fresh (all MEASURED,
+//! 12:10–12:20 UTC)
+
+//! - The supervisor (PID 858) and the four-branch watcher (PID
+//!   442510, the hardened 11:53:44Z form) both alive; the watcher
+//!   log shows only start lines — correct, no credential has ever
+//!   appeared.
+//! - All four `~/push-handoff` payloads byte-identical to the
+//!   canonical PR body files on the branch tips (`jq -j .body` vs
+//!   `git show branch:file`, cmp clean, 23441/25041/22054/22637
+//!   bytes for 6-E/6-F/population/6-E2); the `/tmp/opencode` twins
+//!   sha256-identical (`4a66e281` 6-E / `b74cb5f5` 6-F /
+//!   `1acdfc12` population / `eb660d12` 6-E2 — the README pins
+//!   hold); every payload's title/head/base/draft re-verified by
+//!   parsing (6-E→main, 6-F→main, population→6-E, 6-E2→population,
+//!   draft true everywhere — the stack).
+//! - The watcher's socket selection audited: it takes the
+//!   NEWEST-mtime `/tmp/vscode-git-*.sock` (`ls -t | head -1`). A
+//!   returning code-server session creates a fresh socket, so no
+//!   stale or foreign socket can mask it; the session-8 rehearsal
+//!   mock bound `/tmp/opencode/rehearsal/askpass-mock.sock`
+//!   (deliberately non-matching the glob) and is DEAD with its
+//!   socket file gone — the two surviving `vscode-git-*.sock`
+//!   files are the genuine stale code-server sockets (05:09/05:20),
+//!   both refused on raw connect.
+//! - No askpass artifact anywhere (the watcher's
+//!   `/tmp/opencode/push-askpass.sh` and every alternative path
+//!   absent — the session-7 hardening's removal-on-both-outcomes
+//!   holding in the steady state).
+//! - The `wt-6e2` worktree clean at `fb8bfa2` — no drift between
+//!   the checked-out tree and the branch the watcher will push.
+//! - Every cited raw-log location present: `~/verify3`,
+//!   `~/verify4-rig`, `~/verify5-merge`, `~/verify6-6e2`,
+//!   `~/verify7-union`, `~/verify8-session5`,
+//!   `/tmp/opencode/session6-population/`, the three
+//!   `session7-*-gate.log`s, and `rehearsal/` with its session-8
+//!   clean-run log.
+//! - The docs-only proof re-verified by diffstat on the exact tips:
+//!   `511b157..5cee5b4`, `96dee7c..f0c83e1`, `5c9690d..ceadaa7`,
+//!   and `6ee89b4..fb8bfa2` each list only
+//!   `docs/OVERNIGHT-HANDOFF-2026-11-23.md` and the branch's
+//!   PR-body file — every measured record in every session's
+//!   tables applies to the exact tips the watcher will push.
+
+//! ### The supervisor audit (line-by-line, the first on the record)
+
+//! `~/overnight-supervisor.sh` sources `~/.overnight.env` (the
+//! opencode auth key + PATH — key NAMES verified only, no secret
+//! material read or handled), cds to `~/PostRust`, and loops:
+//! the STOP and DONE marker exits (both markers also honored by
+//! the watcher itself); the re-arm check
+//! `pgrep -f push-watcher-3branch.sh`, re-arming from
+//! `/tmp/opencode/push-watcher-3branch.sh` first and falling back
+//! to the persistent `~/push-handoff/push-watcher-3branch.sh`
+//! (whose payload paths point at the persistent payload twins) —
+//! so a `/tmp` wipe while the supervisor lives re-arms a COMPLETE
+//! delivery chain from persistent storage; then the AGENTS.md
+//! wait, and `opencode run --auto` per session with a 30 s sleep.
+//! It never touches refs, never merges, never edits the repo. The
+//! re-arm path is additionally witnessed DEPLOYED: the 11:53:44Z
+//! hardened-watcher restart is the kill-and-re-arm sequence
+//! sessions 7/8 executed and logged.
+
+//! ### The one remaining environmental contingency, now on record
+
+//! Nothing on this pod auto-starts the SUPERVISOR: the crontab
+//! binary is absent, there is no systemd user bus ("Failed to
+//! connect to bus: No medium found"), and no profile.d/bashrc hook
+//! references the overnight machinery (grep clean). A pod reboot
+//! therefore kills the supervisor AND the watcher and may clear
+//! `/tmp` — but home persists. Recovery is one command from any
+//! shell on the pod:
+
+//!     bash ~/push-handoff/push-watcher-3branch.sh
+
+//! (the persistent twin references the persistent payloads — a
+//! complete chain on its own), or the manual push + PR commands in
+//! the SESSION 5 ADDENDUM. This was implicit in the README's
+//! "survives a /tmp wipe" design; it is now explicit.
+
+//! ### Notes for the owner (session 9)
+
+//! `~/OVERNIGHT-DONE` remains correctly absent (the PRs do not
+//! exist; the honest form stands). `SURVIVED.txt` remains
+//! unexplained (0 bytes, mtime 04:58:35 UTC, untracked) and was
+//! again left strictly alone. This session's commit is
+//! documentation-only: this handoff doc, plus a two-line navigation
+//! note in its header pointing the original session-3 morning
+//! commands at the session-5 corrected form (an audit-speed
+//! improvement — the owner reading top-down would otherwise meet
+//! the stale form first). No `.rs`, no workflow, no pins, no
+//! PR-body change — the payload regeneration is a proven no-op
+//! (the population payload re-verified byte-identical to the
+//! unchanged body after this commit, sha256 `1acdfc12`). Gates for
+//! this commit: `cargo fmt --all -- --check` clean and
+//! `cargo clippy --workspace --all-targets --release -- -D
+//! warnings` clean, run on this tip; the full suites are the
+//! sessions 3/4/6/7 measured records on the identical code tree
+//! (the docs-only proof above, re-verified). engine-core
+//! untouched; AGENTS.md untouched.
