@@ -172,6 +172,19 @@ impl CornerResources {
         self.textures.iter().map(|t| t.allocation_bytes).sum()
     }
 
+    /// The FrameParams dynamic-uniform offset stride (one per frame
+    /// slot) — the proxy draws' 6-E companion path binds the same
+    /// per-slot offsets the corner mesh draws use.
+    pub(crate) fn dynamic_stride(&self) -> u32 {
+        self.stride
+    }
+
+    /// The material set for a material table index, or `None` outside
+    /// the table (the proxy frame flow validates before recording).
+    pub(crate) fn material_set(&self, material: u32) -> Option<vk::DescriptorSet> {
+        self.sets.get(material as usize).copied()
+    }
+
     /// Called inside the lit render pass only after this slot's fence
     /// wait (the caller writes the slot's FrameParams first — the
     /// 6-F split, so the shadowed path can write the EXTENDED block

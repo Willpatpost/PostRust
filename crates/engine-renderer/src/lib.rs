@@ -47,6 +47,7 @@ mod lit_mesh;
 pub mod lit_scene;
 pub mod overlay;
 pub mod proc_texture;
+pub mod proxy_indirect;
 pub mod proxy_instances;
 pub mod proxy_mesh;
 pub mod scene;
@@ -57,7 +58,7 @@ mod vulkan;
 
 pub use config::{DemoScenePreference, PresentModePreference, RenderConfig, ValidationPreference};
 pub use renderer::{
-    AllocationStats, FrameResult, GeometryStats, RenderStats, Renderer, SceneLayer,
-    ShadowMapReadback,
+    AllocationStats, FrameResult, GeometryStats, ProxyDrawMode, ProxyPopulation, RenderStats,
+    Renderer, SceneLayer, ShadowMapReadback,
 };
 pub use vulkan::{CaptureFormat, CapturedFrame, RendererError};

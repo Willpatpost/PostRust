@@ -38,6 +38,41 @@ pub struct SceneLayer<'a> {
     pub view_proj: &'a [[f32; 4]; 4],
 }
 
+/// One proxy population for a populated corner frame: the NPC and
+/// vehicle instance lists plus the per-kind material indices into the
+/// corner scene's material table (which specular/shininess set each
+/// kind draws with — CALLER policy, not engine policy; the demo and
+/// the equivalence gate document their choices). The renderer packs
+/// both lists into its retained instance buffer in the fixed
+/// npc-then-vehicle order.
+#[derive(Debug, Clone, Copy)]
+pub struct ProxyPopulation<'a> {
+    pub npc: &'a [crate::proxy_instances::ProxyInstance],
+    pub npc_material: u32,
+    pub vehicle: &'a [crate::proxy_instances::ProxyInstance],
+    pub vehicle_material: u32,
+}
+
+/// How proxy instances are submitted (the 6-E equivalence gate's
+/// axis): `Instanced` — one draw per populated proxy kind (the
+/// production path, the package's headline); `PerInstance` — one
+/// draw per INSTANCE through the same shader, bytes, and descriptor
+/// sets (the pre-6-E per-object submission shape, kept as the
+/// N-draws reference for the pixel-equivalence gate and the
+/// before/after draw-call evidence — production paths never set it);
+/// `Indirect` — the 6-E2 mechanism: one `vkCmdDrawIndirect` per
+/// populated kind with the instance count read from GPU memory at
+/// draw time (the packed [`crate::proxy_indirect`] command block),
+/// byte-identical output to `Instanced` — the submission stops
+/// carrying the count so a later GPU pass can author it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProxyDrawMode {
+    #[default]
+    Instanced,
+    PerInstance,
+    Indirect,
+}
+
 /// Actual dynamic uploads and draws recorded in this frame.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct GeometryStats {
@@ -50,6 +85,14 @@ pub struct GeometryStats {
     pub scene_omitted: u32,
     pub overlay_omitted: u32,
     pub dynamic_draw_calls: u32,
+    /// Proxy draw calls recorded this frame (the 6-E headline: one
+    /// per populated kind in [`ProxyDrawMode::Instanced`] and
+    /// [`ProxyDrawMode::Indirect`] alike — the GPU-side count
+    /// changes where N lives, never the draw-call count — and one
+    /// per instance in [`ProxyDrawMode::PerInstance`]). Counts proxy
+    /// submission only — the corner mesh's own material draws are
+    /// not included. Zero on unpopulated frames.
+    pub proxy_draw_calls: u32,
     pub uploaded_bytes: u64,
 }
 
@@ -162,6 +205,14 @@ pub struct Renderer {
     /// identical to the allocating form).
     overlay_vertices: Vec<OverlayVertex>,
     atlas_text: AtlasText,
+    /// The 6-E retained instance-byte buffer (the same F-05
+    /// discipline, applied through
+    /// [`crate::proxy_instances::repack_populations`]): repacked in
+    /// place every populated frame; the capacity from the first
+    /// populated frames is reused — no per-frame allocation or
+    /// growth.
+    instance_bytes: Vec<u8>,
+    proxy_draw_mode: ProxyDrawMode,
 }
 
 impl Renderer {
@@ -258,6 +309,8 @@ impl Renderer {
             overlay_color: [0.72, 1.0, 0.78, 0.85],
             overlay_vertices: Vec::new(),
             atlas_text,
+            instance_bytes: Vec::new(),
+            proxy_draw_mode: ProxyDrawMode::default(),
         })
     }
 
@@ -340,6 +393,7 @@ impl Renderer {
             &self.overlay_vertices,
             None,
             None,
+            None,
         )?;
         Ok(self.finish_frame(outcome))
     }
@@ -373,6 +427,78 @@ impl Renderer {
             &[],
             &[],
             Some(&params),
+            None,
+            None,
+        )?;
+        Ok(self.finish_frame(outcome))
+    }
+
+    /// Draws the resident corner mesh PLUS a proxy population, the
+    /// Cycle 6-E path: the instances are repacked into the retained
+    /// buffer (zero per-frame allocation after the first populated
+    /// frames) and submitted per [`ProxyDrawMode`] — one draw call
+    /// per populated kind in the production `Instanced` mode and the
+    /// 6-E2 `Indirect` mode alike (the latter reads the instance
+    /// counts from the GPU-side command block — see
+    /// [`crate::proxy_indirect`]). The
+    /// population is validated BEFORE any frame state is touched: a
+    /// typed refusal (over-capacity total, invalid field, or a
+    /// material index outside the corner table) renders nothing and
+    /// leaves the frame flow untouched.
+    pub fn render_corner_populated(
+        &mut self,
+        view_proj: &[[f32; 4]; 4],
+        eye: [f32; 3],
+        light: crate::lit_scene::LightParams,
+        population: &ProxyPopulation<'_>,
+        size: (u32, u32),
+    ) -> Result<FrameResult, RendererError> {
+        if self.config.demo_scene != crate::DemoScenePreference::Corner {
+            return Err(RendererError::Vulkan(
+                "render_corner_populated requires the Corner scene preference".into(),
+            ));
+        }
+        let material_table = crate::lit_scene::materials().len() as u32;
+        if population.npc_material >= material_table
+            || population.vehicle_material >= material_table
+        {
+            return Err(RendererError::Vulkan(format!(
+                "proxy material index outside the corner material table \
+                 ({} materials, npc {}, vehicle {})",
+                material_table, population.npc_material, population.vehicle_material
+            )));
+        }
+        crate::proxy_instances::repack_populations(
+            &mut self.instance_bytes,
+            population.npc,
+            population.vehicle,
+        )
+        .map_err(RendererError::ProxyPack)?;
+        let params = vulkan::corner::FrameParams::new(*view_proj, eye, light);
+        let upload = vulkan::proxy_draw::ProxyFrameUpload {
+            bytes: &self.instance_bytes,
+            npc_count: population.npc.len() as u32,
+            vehicle_count: population.vehicle.len() as u32,
+            npc_material: population.npc_material,
+            vehicle_material: population.vehicle_material,
+            mode: self.proxy_draw_mode,
+        };
+        let outcome = vulkan::render_frame(
+            &mut self.ctx,
+            &mut self.swapchain,
+            &mut self.pipes,
+            &mut self.frames,
+            size,
+            self.config.present_mode,
+            self.config.replace_pipelines,
+            self.config.demo_scene,
+            view_proj,
+            &[],
+            None,
+            &[],
+            &[],
+            Some(&params),
+            Some(&upload),
             None,
         )?;
         Ok(self.finish_frame(outcome))
@@ -442,9 +568,22 @@ impl Renderer {
             &[],
             &[],
             None,
+            None,
             Some(&params),
         )?;
         Ok(self.finish_frame(outcome))
+    }
+
+    /// Sets the proxy submission mode (the equivalence gate's axis —
+    /// see [`ProxyDrawMode`]; the default is the production
+    /// `Instanced` mode).
+    pub fn set_proxy_draw_mode(&mut self, mode: ProxyDrawMode) {
+        self.proxy_draw_mode = mode;
+    }
+
+    /// The current proxy submission mode.
+    pub fn proxy_draw_mode(&self) -> ProxyDrawMode {
+        self.proxy_draw_mode
     }
 
     /// Requests the NEXT shadowed frame's shadow-map readback (the
@@ -554,6 +693,7 @@ impl Renderer {
                 dynamic_draw_calls: u32::from(outcome.region.drawn > outcome.foreground_drawn)
                     + u32::from(outcome.foreground_drawn > 0)
                     + u32::from(outcome.overlay.drawn > 0),
+                proxy_draw_calls: outcome.proxy_draw_calls,
                 uploaded_bytes: u64::from(outcome.region.drawn) * size_of::<SceneVertex>() as u64
                     + u64::from(outcome.overlay.drawn) * size_of::<OverlayVertex>() as u64,
             },

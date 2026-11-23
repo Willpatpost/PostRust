@@ -1,16 +1,26 @@
 //! One Corner of the City. One deterministic pose per presented frame.
+use crate::corner_population::corner_population;
 use crate::math::{Mat4, camera_view, mul, percentile, perspective};
 use engine_core::timing::TimingSamples;
 use engine_renderer::config::FRAMES_IN_FLIGHT;
 use engine_renderer::lit_scene::{RouteWaypoint, camera_route, day_preset, night_preset};
 use engine_renderer::{
-    DemoScenePreference, PresentModePreference, RenderConfig, Renderer, ValidationPreference,
+    DemoScenePreference, PresentModePreference, ProxyDrawMode, ProxyPopulation, RenderConfig,
+    Renderer, ValidationPreference,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig, pace_until};
 use std::time::{Duration, Instant};
 
 const STEPS: usize = 120;
 const WARMUP: usize = 60;
+
+/// The demo's proxy materials (the caller policy `ProxyPopulation`
+/// carries): NPCs with the concrete facade set (broad dim specular
+/// — matte clothing), vehicles with the dark stone set (tighter,
+/// slightly brighter — paint sheen). Documented choice, not engine
+/// policy.
+const NPC_MATERIAL: u32 = 1;
+const VEHICLE_MATERIAL: u32 = 2;
 
 /// Two seconds per segment at the reference 60 Hz. Uncapped runs present
 /// the identical sequence. Shared waypoints appear once, including both ends.
@@ -113,11 +123,22 @@ pub fn demo_bias() -> engine_renderer::shadows::ShadowBias {
     }
 }
 
+// The four-way union's arg arithmetic: each branch's run() stayed at
+// or under clippy's 7 (the 6-E stack's 7 with the 6-E2 proxy-instanced
+// flag; 6-F's 5); the UNION carries both feature axes and crosses to
+// 8. The flat flag list is the CLI's own shape (one bool per demo
+// mode, main.rs passes them straight through); grouping them into a
+// config struct would restructure both packages' code inside a merge
+// resolution — the render_frame precedent (vulkan.rs) is the allow.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     night: bool,
     fps: u32,
     present: PresentModePreference,
     validation: ValidationPreference,
+    populated: bool,
+    proxy_reference: bool,
+    proxy_instanced: bool,
     shadows: bool,
 ) -> Result<(), String> {
     let mut app = ShellApp::new(ShellConfig {
@@ -137,6 +158,50 @@ pub fn run(
         },
     )
     .map_err(|e| e.to_string())?;
+    let (npc, vehicle) = if populated {
+        corner_population()
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let population = if populated {
+        Some(ProxyPopulation {
+            npc: &npc,
+            npc_material: NPC_MATERIAL,
+            vehicle: &vehicle,
+            vehicle_material: VEHICLE_MATERIAL,
+        })
+    } else {
+        None
+    };
+    // The submission mode, in evidence order: the per-object
+    // reference (one draw per instance — the pre-6-E shape, the
+    // before/after measurement mode), the direct 6-E instanced
+    // submission (--proxy-instanced, the indirect path's A/B
+    // partner), and — the populated route's DEFAULT since 6-E2 —
+    // the indirect submission (one vkCmdDrawIndirect per kind, the
+    // instance counts read from GPU memory; the mechanism the
+    // deferred GPU-culling package builds on). The default exercises
+    // the shipped mechanism at route scale; the renderer API's own
+    // default remains the direct instanced mode (the 6-E contract).
+    let proxy_mode = if proxy_reference {
+        ProxyDrawMode::PerInstance
+    } else if proxy_instanced {
+        ProxyDrawMode::Instanced
+    } else {
+        ProxyDrawMode::Indirect
+    };
+    renderer.set_proxy_draw_mode(proxy_mode);
+    // The combination refusal (the union's policy, from the verified
+    // three-way resolution): proxy shadows (a populated scene drawn
+    // through the shadowed path) are a deferred package on both the
+    // population and the 6-F deferral lists, so asking for both is a
+    // typed upfront refusal — never a silent mode drop.
+    if populated && shadows {
+        return Err(
+            "--populated and --shadows together is not implemented (proxy shadows are a deferred package)"
+                .into(),
+        );
+    }
     let stats = renderer.stats();
     let size = stats.extent;
     let preset = if night { "night" } else { "day" };
@@ -152,6 +217,25 @@ pub fn run(
         stats.validation_active,
         cfg!(debug_assertions)
     );
+    if populated {
+        let mode_label = match proxy_mode {
+            ProxyDrawMode::PerInstance => "per-object reference mode",
+            ProxyDrawMode::Instanced => "instanced mode",
+            ProxyDrawMode::Indirect => "indirect mode",
+        };
+        println!(
+            "proxy population: {} instances ({} npc + {} vehicle), {} draw calls per frame ({})",
+            npc.len() + vehicle.len(),
+            npc.len(),
+            vehicle.len(),
+            if proxy_reference {
+                (npc.len() + vehicle.len()) as u32
+            } else {
+                u32::from(!npc.is_empty()) + u32::from(!vehicle.is_empty())
+            },
+            mode_label
+        );
+    }
     if validation == ValidationPreference::On && !stats.validation_active {
         return Err("requested validation layer is unavailable".into());
     }
@@ -187,8 +271,14 @@ pub fn run(
             pose = poses.next().unwrap();
         }
         let matrix = view_projection(pose, aspect);
+        // Submission selection: the shadowed route (6-F) or the
+        // populated route (6-E/6-E2, the mode set above); the
+        // combination was refused above (proxy shadows are the
+        // deferred package).
         let frame = if shadows {
             renderer.render_corner_shadowed(&matrix, pose.position, light, bias, size)
+        } else if let Some(population) = population.as_ref() {
+            renderer.render_corner_populated(&matrix, pose.position, light, population, size)
         } else {
             renderer.render_corner(&matrix, pose.position, light, size)
         }
@@ -198,6 +288,9 @@ pub fn run(
             return Err(format!(
                 "route presentation interrupted at submission {i}: {frame:?}"
             ));
+        }
+        if populated && frame.geometry.proxy_draw_calls == 0 {
+            return Err("populated route drew no proxy calls".into());
         }
         if measured.contains(&i) {
             cpu.record((end - start).as_secs_f64() * 1000.);

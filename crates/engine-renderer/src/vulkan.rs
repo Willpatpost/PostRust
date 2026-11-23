@@ -48,6 +48,34 @@
 //! fenced slot. Each material descriptor points past all slots into a read-only tail.
 //! The render-pass-dependent lit pipeline is released before those descriptors.
 //!
+//! **Instanced proxies (6-E)** — the optional proxy state (`PipelineState::
+//! proxy`, lazily created at the first populated corner frame) owns two
+//! device-local mesh VBOs (staged, fence-waited uploads) and one persistently
+//! mapped host-visible instance buffer with a disjoint region per frame slot.
+//! Slot S's region is written only inside the frame flow that first waited
+//! slot S's fence, immediately before recording the draw that reads it. The
+//! proxy pipeline and layout die with their `PipelineState`; a replacement
+//! re-ensures identical resources before installation (finding A). Proxy
+//! descriptor sets are the CORNER's material sets (shared ownership — never
+//! destroyed by the proxy state), bound with the corner's per-slot FrameParams
+//! dynamic offset.
+//!
+//! **Indirect proxy commands (6-E2)** — the proxy state's OPTIONAL indirect
+//! member (one level lazier: created at the first INDIRECT-mode populated
+//! frame only, so the direct path's allocation pins pay nothing) is one
+//! persistently mapped host-visible INDIRECT_BUFFER with one 32-byte command
+//! block per frame slot (npc command at +0, vehicle at +16 — the repack's
+//! fixed kind order; the bytes are the pure `proxy_indirect` packing with
+//! `firstVertex`/`firstInstance` pinned zero, so no `drawIndirectFirstInstance`
+//! feature is required). The write discipline is the instance buffer's own:
+//! slot S's block is written only inside the frame flow that first waited
+//! slot S's fence, immediately before recording the `vkCmdDrawIndirect`
+//! (drawCount 1 per kind) that reads it; the HOST_COHERENT write is visible
+//! to that submission's draws by queue-submit ordering. A pipeline
+//! replacement re-ensures the command buffer with the same resources
+//! (finding A). The buffer is destroyed only while the device is idle,
+//! after the draws reading it.
+//!
 //! **Destruction order** — `device_wait_idle` → command buffers/pool,
 //! present semaphores, acquire semaphores, fences, query pool → swapchain
 //! framebuffers, views, per-image depth views/images/memories, swapchain
@@ -77,6 +105,8 @@ use ash::{Device, Entry, Instance};
 pub(crate) mod corner;
 #[path = "descriptors.rs"]
 pub mod descriptors;
+#[path = "proxy_draw.rs"]
+pub(crate) mod proxy_draw;
 #[path = "shadow_draw.rs"]
 pub(crate) mod shadow_draw;
 #[path = "textures.rs"]
@@ -203,6 +233,11 @@ pub enum RendererError {
     /// recorded. Never recorded against a mismatched destination; the
     /// frame itself renders normally.
     CaptureDropped(String),
+    /// A proxy population was refused by the instance packer (the
+    /// D2 no-partial-overflow discipline): over-capacity total or an
+    /// invalid per-field value. Nothing was rendered and no frame
+    /// state was touched.
+    ProxyPack(crate::proxy_instances::InstancePackError),
 }
 
 impl RendererError {
@@ -242,7 +277,17 @@ impl std::fmt::Display for RendererError {
             RendererError::CaptureDropped(reason) => {
                 write!(f, "frame capture dropped: {reason}")
             }
+            RendererError::ProxyPack(error) => write!(
+                f,
+                "proxy population refused (no partial buffer was produced): {error:?}"
+            ),
         }
+    }
+}
+
+impl From<crate::proxy_instances::InstancePackError> for RendererError {
+    fn from(error: crate::proxy_instances::InstancePackError) -> Self {
+        RendererError::ProxyPack(error)
     }
 }
 
@@ -1346,6 +1391,8 @@ pub(crate) struct PipelineState {
     pub render_pass: vk::RenderPass,
     lit_pipeline: vk::Pipeline,
     lit_layout: vk::PipelineLayout,
+    proxy_pipeline: vk::Pipeline,
+    proxy_layout: vk::PipelineLayout,
     pub scene_pipeline: vk::Pipeline,
     pub scene_layout: vk::PipelineLayout,
     pub overlay_pipeline: vk::Pipeline,
@@ -1357,6 +1404,13 @@ pub(crate) struct PipelineState {
     pub scene_index_count: u32,
     pub region_vbo: vk::Buffer,
     pub region_vbo_memory: vk::DeviceMemory,
+    /// The Cycle 6-E instanced-proxy resources (the two mesh VBOs +
+    /// the mapped per-slot instance buffer), created LAZILY at the
+    /// first populated corner frame — the region-buffer precedent:
+    /// the unpopulated path pays nothing. Dies with this state (the
+    /// proxy pipeline reading it does); a replacement re-ensures an
+    /// identical set before installation (finding A).
+    pub proxy: Option<proxy_draw::ProxyResources>,
     /// The Cycle 6-F shadow state (the per-slot shadow maps, the
     /// depth-only pass, the shadowed lit pipeline, and the readback
     /// path), created LAZILY at the first shadowed corner frame —
@@ -1393,6 +1447,8 @@ impl PipelineState {
             render_pass: vk::RenderPass::null(),
             lit_pipeline: vk::Pipeline::null(),
             lit_layout: vk::PipelineLayout::null(),
+            proxy_pipeline: vk::Pipeline::null(),
+            proxy_layout: vk::PipelineLayout::null(),
             scene_pipeline: vk::Pipeline::null(),
             scene_layout: vk::PipelineLayout::null(),
             overlay_pipeline: vk::Pipeline::null(),
@@ -1407,6 +1463,7 @@ impl PipelineState {
             region_capacity: 0,
             region_slot_bytes: 0,
             region_mapped: core::ptr::null_mut(),
+            proxy: None,
             shadows: None,
         };
         if let Err(error) = state.build(ctx, color_format, depth_format, demo_scene) {
@@ -1485,6 +1542,22 @@ impl PipelineState {
         self.region_vbo = region_vbo;
         self.region_vbo_memory = region_vbo_memory;
         self.region_mapped = region_mapped;
+        Ok(())
+    }
+
+    /// Allocates the Cycle 6-E proxy resources on first populated
+    /// corner frame (the same lazy discipline as the region buffer:
+    /// the unpopulated corner path pays nothing). A no-op once
+    /// allocated. Partial-state safe: `destroy` handles the `None`
+    /// this leaves on the unpopulated path.
+    pub(crate) fn ensure_proxy_resources(
+        &mut self,
+        ctx: &VulkanContext,
+    ) -> Result<(), RendererError> {
+        if self.proxy.is_some() {
+            return Ok(());
+        }
+        self.proxy = Some(proxy_draw::ProxyResources::new(ctx)?);
         Ok(())
     }
 
@@ -1800,6 +1873,112 @@ impl PipelineState {
                     .create_graphics_pipelines(ctx.pipeline_cache, &[info], None)
             }
             .map_err(|(_, e)| RendererError::vk(e, "lit pipeline"))?[0];
+
+            // The Cycle 6-E instanced-proxy pipeline (see
+            // docs/CYCLE6-6E-BRIEF.md): the SAME render pass,
+            // descriptor layout, rasterizer (the proxy meshes wind
+            // CCW about their outward normals — the lit convention),
+            // and depth contract as the lit pipeline. The vertex
+            // input carries TWO bindings: binding 0 the proxy mesh at
+            // VERTEX rate (the lit 32-byte pos/normal/uv format,
+            // locations 0-2), binding 1 the packed instance bytes at
+            // INSTANCE rate (stride INSTANCE_STRIDE, locations 3-7
+            // as R32G32B32A32_SFLOAT: the four column-major matrix
+            // columns then the tint vec4 — the
+            // proxy_instances::pack layout, byte-pinned by tests).
+            let module = create_shader_module(
+                ctx,
+                include_bytes!(concat!(env!("OUT_DIR"), "/instanced_proxy.spv")),
+            )?;
+            modules.push(module);
+            // SAFETY: corner owns its descriptor layout across pipeline
+            // replacements; the partial PipelineState owns the pipeline
+            // layout immediately.
+            out.proxy_layout = unsafe {
+                ctx.device.create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts),
+                    None,
+                )
+            }
+            .map_err(|e| RendererError::vk(e, "proxy layout"))?;
+            let proxy_stages = [
+                scene_stages[0].module(module).name(c"vs_main"),
+                scene_stages[1].module(module).name(c"fs_main"),
+            ];
+            let mesh_binding = vk::VertexInputBindingDescription {
+                binding: 0,
+                stride: std::mem::size_of::<crate::proxy_mesh::ProxyVertex>() as u32,
+                input_rate: vk::VertexInputRate::VERTEX,
+            };
+            let instance_binding = vk::VertexInputBindingDescription {
+                binding: 1,
+                stride: crate::proxy_instances::INSTANCE_STRIDE as u32,
+                input_rate: vk::VertexInputRate::INSTANCE,
+            };
+            let proxy_bindings = [mesh_binding, instance_binding];
+            let vec4 = vk::Format::R32G32B32A32_SFLOAT;
+            let proxy_attributes = [
+                scene_attributes[0],
+                scene_attributes[1],
+                vk::VertexInputAttributeDescription {
+                    location: 2,
+                    binding: 0,
+                    format: vk::Format::R32G32_SFLOAT,
+                    offset: std::mem::offset_of!(crate::proxy_mesh::ProxyVertex, uv) as u32,
+                },
+                vk::VertexInputAttributeDescription {
+                    location: 3,
+                    binding: 1,
+                    format: vec4,
+                    offset: 0,
+                },
+                vk::VertexInputAttributeDescription {
+                    location: 4,
+                    binding: 1,
+                    format: vec4,
+                    offset: 16,
+                },
+                vk::VertexInputAttributeDescription {
+                    location: 5,
+                    binding: 1,
+                    format: vec4,
+                    offset: 32,
+                },
+                vk::VertexInputAttributeDescription {
+                    location: 6,
+                    binding: 1,
+                    format: vec4,
+                    offset: 48,
+                },
+                vk::VertexInputAttributeDescription {
+                    location: 7,
+                    binding: 1,
+                    format: vec4,
+                    offset: 64,
+                },
+            ];
+            let proxy_inputs = vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(&proxy_bindings)
+                .vertex_attribute_descriptions(&proxy_attributes);
+            let proxy_info = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&proxy_stages)
+                .vertex_input_state(&proxy_inputs)
+                .input_assembly_state(&scene_input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&raster)
+                .multisample_state(&multisampling)
+                .depth_stencil_state(&scene_depth)
+                .color_blend_state(&color_blend)
+                .dynamic_state(&dynamic_state)
+                .layout(out.proxy_layout)
+                .render_pass(out.render_pass)
+                .subpass(0);
+            // SAFETY: same render pass, depth and viewport contract as the lit pipeline.
+            out.proxy_pipeline = unsafe {
+                ctx.device
+                    .create_graphics_pipelines(ctx.pipeline_cache, &[proxy_info], None)
+            }
+            .map_err(|(_, e)| RendererError::vk(e, "proxy pipeline"))?[0];
         }
 
         let overlay_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
@@ -1857,6 +2036,9 @@ impl PipelineState {
 
     pub(crate) fn destroy(&mut self, ctx: &VulkanContext) {
         unsafe {
+            if let Some(proxy) = self.proxy.take() {
+                proxy.destroy(ctx);
+            }
             if let Some(shadows) = self.shadows.take() {
                 shadows.destroy(ctx);
             }
@@ -1872,6 +2054,8 @@ impl PipelineState {
             ctx.device.free_memory(self.scene_vbo_memory, None);
             ctx.device.destroy_pipeline(self.lit_pipeline, None);
             ctx.device.destroy_pipeline_layout(self.lit_layout, None);
+            ctx.device.destroy_pipeline(self.proxy_pipeline, None);
+            ctx.device.destroy_pipeline_layout(self.proxy_layout, None);
             ctx.device.destroy_pipeline(self.overlay_pipeline, None);
             ctx.device
                 .destroy_pipeline_layout(self.overlay_layout, None);
@@ -2769,6 +2953,12 @@ pub(crate) struct FrameOutcome {
     pub region: DynamicClamp,
     pub foreground_drawn: u32,
     pub overlay: DynamicClamp,
+    /// The proxy draw calls recorded this frame (the 6-E headline:
+    /// one per populated kind instanced; one per instance in the
+    /// per-object reference). Zero on unpopulated and deferred
+    /// frames. The corner mesh's own material draws are NOT counted
+    /// here — this counts proxy submission only.
+    pub proxy_draw_calls: u32,
 }
 
 /// The full frame flow: wait → acquire → (recreate if needed) → record →
@@ -2792,10 +2982,42 @@ pub(crate) fn render_frame(
     hud: &[OverlayVertex],
     debug_overlay: &[OverlayVertex],
     corner_params: Option<&corner::FrameParams>,
+    proxy: Option<&proxy_draw::ProxyFrameUpload<'_>>,
     shadowed: Option<&shadow_draw::ShadowFrameParams>,
 ) -> Result<FrameOutcome, RendererError> {
     let mut outcome = FrameOutcome::default();
     let slot = frames.frame_slot;
+
+    // The proxy materials are validated before ANY synchronization
+    // state is touched (the capture-refusal discipline: a refusal
+    // here can never leave a fence reset-but-unsignaled or an
+    // acquired image's semaphore unconsumed). A populated kind whose
+    // material index falls outside the corner table is a typed error;
+    // an EMPTY kind may carry any index (it draws nothing).
+    let proxy_sets = match (ctx.corner.as_ref(), proxy) {
+        (Some(corner), Some(upload)) => {
+            let npc_set = corner.material_set(upload.npc_material);
+            let vehicle_set = corner.material_set(upload.vehicle_material);
+            if (upload.npc_count > 0 && npc_set.is_none())
+                || (upload.vehicle_count > 0 && vehicle_set.is_none())
+            {
+                return Err(RendererError::Vulkan(format!(
+                    "proxy material index outside the corner material table \
+                     (npc {}, vehicle {})",
+                    upload.npc_material, upload.vehicle_material
+                )));
+            }
+            Some([
+                npc_set.unwrap_or(vk::DescriptorSet::null()),
+                vehicle_set.unwrap_or(vk::DescriptorSet::null()),
+            ])
+        }
+        // A proxy upload without corner resources is structurally
+        // unreachable (the safe layer requires the Corner scene
+        // preference, whose renderer construction built them) —
+        // treated as the unpopulated frame rather than an error.
+        (None, Some(_)) | (None, None) | (Some(_), None) => None,
+    };
 
     // Minimized windows report a zero extent — present nothing.
     if window_size.0 == 0 || window_size.1 == 0 {
@@ -2839,6 +3061,24 @@ pub(crate) fn render_frame(
     let foreground_vertices = foreground.map_or(&[][..], |layer| layer.vertices);
     if !region_vertices.is_empty() || !foreground_vertices.is_empty() {
         pipes.ensure_region_capacity(ctx)?;
+    }
+
+    // The 6-E lazy proxy resources (the same discipline): created at
+    // the first populated frame only, outside command recording —
+    // the unpopulated corner path pays nothing. Structural invariant:
+    // a proxy upload implies corner resources (the safe layer's
+    // scene-preference gate), hence `ctx.corner` in the pattern.
+    // The 6-E2 indirect command state is one level lazier still:
+    // created at the first INDIRECT-mode populated frame only, so
+    // the direct instanced path's allocation pins (the 6-E gates)
+    // pay nothing for the mechanism they never touch.
+    if proxy.is_some() && ctx.corner.is_some() {
+        pipes.ensure_proxy_resources(ctx)?;
+        if proxy.is_some_and(|upload| matches!(upload.mode, crate::ProxyDrawMode::Indirect))
+            && let Some(proxy_state) = pipes.proxy.as_mut()
+        {
+            proxy_state.ensure_indirect(ctx)?;
+        }
     }
 
     // The 6-F lazy shadow state (the same discipline): created at
@@ -3056,6 +3296,27 @@ pub(crate) fn render_frame(
         };
     }
 
+    // The 6-E instance upload: this slot's region of the mapped
+    // instance buffer, written after the slot's fence wait (the
+    // region/overlay discipline — the previous submission through
+    // this slot, which read this region, has completed). The bytes
+    // are the safe layer's repacked population (≤ the region's
+    // bound by the repack's validated capacity). The 6-E2 indirect
+    // command block follows the identical discipline in the same
+    // place: this slot's 32 command bytes (the pure proxy_indirect
+    // packing of the pinned mesh vertex counts and this frame's
+    // per-kind counts), written only in the indirect mode (the
+    // state exists — the frame flow's ensure ran before the fence
+    // wait, outside command recording).
+    if let (Some(proxy_state), Some(upload)) = (&pipes.proxy, proxy) {
+        unsafe { proxy_state.write_slot(slot, upload.bytes) };
+        if let Some(indirect) = proxy_state.indirect.as_ref()
+            && matches!(upload.mode, crate::ProxyDrawMode::Indirect)
+        {
+            unsafe { indirect.write_slot(slot, upload.npc_count, upload.vehicle_count) };
+        }
+    }
+
     // Disjoint window-depth intervals allow self-occlusion in both layers
     // using one depth attachment, without a clear, barrier or extra pass.
     // The gap at the boundary also accommodates fixed-point depth formats.
@@ -3161,6 +3422,45 @@ pub(crate) fn render_frame(
                 resources.sets(),
                 slot as u32 * resources.frame_stride(),
             );
+            // The 6-E instanced-proxy draws (same render pass, after
+            // the static corner mesh — the corner ground plane wins
+            // the coplanar depth at proxy footprints deterministically
+            // in BOTH submission modes, since the corner mesh draws
+            // first and proxy order is the packed instance order).
+            if let (Some(proxy_state), Some(upload), Some(sets)) = (&pipes.proxy, proxy, proxy_sets)
+            {
+                ctx.device.cmd_bind_pipeline(
+                    command,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipes.proxy_pipeline,
+                );
+                // SAFETY: the proxy pipeline is bound with its own
+                // layout inside its render pass; `sets` were validated
+                // before recording; this slot's instance region holds
+                // this frame's bytes (written above, after the fence
+                // wait).
+                let recorded = proxy_state.draw(
+                    ctx,
+                    command,
+                    pipes.proxy_layout,
+                    resources,
+                    slot,
+                    upload,
+                    sets,
+                );
+                // The recorded count and the pure submission model must
+                // agree (the unit test pins the model; this co-pins the
+                // loop against it in debug builds).
+                debug_assert_eq!(
+                    recorded,
+                    proxy_draw::proxy_draw_call_count(
+                        upload.mode,
+                        upload.npc_count,
+                        upload.vehicle_count
+                    )
+                );
+                outcome.proxy_draw_calls = recorded;
+            }
         } else {
             ctx.device.cmd_bind_pipeline(
                 command,
@@ -3526,6 +3826,31 @@ fn recreate_swapchain(
             replacement.destroy(ctx);
             return Err(error);
         }
+        // The 6-E companion: a populated renderer's proxy resources
+        // must likewise exist on the replacement BEFORE installation
+        // (the same finding-A discipline — the replacement pipeline
+        // reads the same lazily-created mesh VBOs and instance
+        // buffer, so a half-installed state must never draw through
+        // null handles). The 6-E2 indirect command state re-ensures
+        // the same way when the outgoing state owned one: the
+        // replacement's indirect draws read the same lazily-created
+        // command buffer.
+        if pipes.proxy.is_some() {
+            if let Err(error) = replacement.ensure_proxy_resources(ctx) {
+                replacement.destroy(ctx);
+                return Err(error);
+            }
+            if pipes
+                .proxy
+                .as_ref()
+                .is_some_and(|state| state.indirect.is_some())
+                && let Some(state) = replacement.proxy.as_mut()
+                && let Err(error) = state.ensure_indirect(ctx)
+            {
+                replacement.destroy(ctx);
+                return Err(error);
+            }
+        }
         // The 6-F companion: a shadowed renderer's shadow state must
         // likewise exist on the replacement BEFORE installation (the
         // same finding-A discipline — the replacement's shadowed
@@ -3620,6 +3945,61 @@ pub(crate) fn consume_recreate(needs_recreate: &mut bool) -> bool {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+
+    /// The 6-E per-kind instance ranges: the fixed npc-then-vehicle
+    /// order partitions the slot (disjoint, contiguous, covering the
+    /// total), and the draw-call count is the pinned headline — one
+    /// per populated kind instanced, one per instance in the
+    /// per-object reference.
+    #[test]
+    fn proxy_kind_ranges_and_draw_call_counts() {
+        use crate::ProxyDrawMode;
+        use proxy_draw::{ProxyKind, kind_instance_range, proxy_draw_call_count};
+
+        let stride = crate::proxy_instances::INSTANCE_STRIDE as u64;
+        // A mixed population: npc [0, 3), vehicle [3, 5).
+        let npc = kind_instance_range(3, 2, ProxyKind::Npc);
+        let vehicle = kind_instance_range(3, 2, ProxyKind::Vehicle);
+        assert_eq!(npc, 0..3);
+        assert_eq!(vehicle, 3..5);
+        assert_eq!(npc.end, vehicle.start, "contiguous");
+        assert_eq!(vehicle.end, 5, "covers the total");
+        // Byte offsets (the vertex-buffer binding arithmetic).
+        assert_eq!(npc.start * stride, 0);
+        assert_eq!(vehicle.start * stride, 3 * stride);
+
+        // The pinned integers: the populated corner scene's proxy
+        // submission count under each mode. The 6-E2 indirect mode
+        // records the SAME count as the direct instanced mode — the
+        // GPU-side count changes where N lives, never how many draws
+        // submit (the headline must not regress).
+        assert_eq!(
+            proxy_draw_call_count(ProxyDrawMode::Instanced, 24, 2),
+            2,
+            "one per kind"
+        );
+        assert_eq!(
+            proxy_draw_call_count(ProxyDrawMode::Indirect, 24, 2),
+            2,
+            "the indirect mode: still one per kind"
+        );
+        assert_eq!(
+            proxy_draw_call_count(ProxyDrawMode::PerInstance, 24, 2),
+            26,
+            "one per instance"
+        );
+        assert_eq!(
+            proxy_draw_call_count(ProxyDrawMode::Indirect, 0, 2),
+            1,
+            "empty kind draws nothing"
+        );
+        assert_eq!(proxy_draw_call_count(ProxyDrawMode::PerInstance, 0, 0), 0);
+        assert_eq!(
+            proxy_draw_call_count(ProxyDrawMode::Indirect, 0, 0),
+            0,
+            "empty population"
+        );
+    }
 
     #[test]
     fn layered_upload_preserves_order_truncation_and_neighboring_slots() {

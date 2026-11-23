@@ -7,6 +7,7 @@ pub mod backup;
 pub mod benchmark;
 pub mod combat_demo;
 pub mod corner_demo;
+pub mod corner_population;
 pub mod crossing;
 pub mod encounter_benchmark;
 pub mod encounter_demo;

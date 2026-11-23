@@ -63,6 +63,11 @@ Interactive modes
   --window [--dummy]                 SDL window and input
   --render [--regions]               Vulkan scene and optional region LOD
   --corner [--night]                 Full lit city route (day by default)
+  --corner --populated               Route with the deterministic 24-NPC + 2-vehicle population
+                                    (default: the 6-E2 indirect submission, one vkCmdDrawIndirect
+                                    per kind with GPU-side counts; --proxy-instanced: the direct
+                                    6-E submission; --proxy-reference: one draw per instance, the
+                                    pre-6-E shape for before/after runs)
   --corner --shadows                 The route with directional shadows (one
                                     cascade, the deterministic core's oracle)
   --player | --playable              Movement and gatehouse demos
@@ -516,6 +521,9 @@ fn main() {
     if args.iter().any(|arg| arg == "--corner") {
         let run = || -> Result<(), String> {
             let mut night = false;
+            let mut populated = false;
+            let mut proxy_reference = false;
+            let mut proxy_instanced = false;
             let mut shadows = false;
             let mut fps = 60;
             let mut present = engine_renderer::PresentModePreference::Auto;
@@ -525,6 +533,16 @@ fn main() {
                 match arg.as_str() {
                     "--corner" => {}
                     "--night" => night = true,
+                    "--populated" => populated = true,
+                    // The 6-E equivalence reference: submit the same
+                    // population one draw per instance (the pre-6-E
+                    // shape) — the before/after measurement mode.
+                    "--proxy-reference" => proxy_reference = true,
+                    // The direct-instanced route (the 6-E production
+                    // shape) — the indirect submission's A/B partner;
+                    // the populated route defaults to the 6-E2
+                    // indirect submission.
+                    "--proxy-instanced" => proxy_instanced = true,
                     "--shadows" => shadows = true,
                     "--fps" => {
                         fps = parse_fps(options.next().ok_or("--fps requires a value")?)?
@@ -545,7 +563,16 @@ fn main() {
                     _ => return Err(format!("unrecognized corner option {arg}")),
                 }
             }
-            engine_slice::corner_demo::run(night, fps, present, validation, shadows)
+            engine_slice::corner_demo::run(
+                night,
+                fps,
+                present,
+                validation,
+                populated,
+                proxy_reference,
+                proxy_instanced,
+                shadows,
+            )
         };
         if let Err(e) = run() {
             eprintln!("error: {e}");

@@ -154,6 +154,22 @@ impl ProxyInstance {
     }
 }
 
+/// Appends one instance's bytes in the fixed field order (the four
+/// matrix columns, tint rgb + alpha 1.0, the 16 reserved zero bytes).
+/// The single packing implementation both the allocating and the
+/// retained forms share — the byte layout exists exactly once.
+fn append_instance_bytes(bytes: &mut Vec<u8>, instance: &ProxyInstance) {
+    for column in instance_columns(&instance.transform) {
+        for value in column {
+            bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+    }
+    for value in [instance.tint[0], instance.tint[1], instance.tint[2], 1.0] {
+        bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+    }
+    bytes.extend_from_slice(&[0u8; 16]);
+}
+
 /// Packs `instances` into the instance-buffer bytes (little-endian
 /// f32 bit patterns, the fixed field order: column 0, 1, 2, 3, tint
 /// rgb + 1.0 alpha, four reserved zero f32s). Byte-identical on
@@ -184,17 +200,48 @@ pub fn pack_instances_bounded(
     }
     let mut bytes = Vec::with_capacity(instances.len() * INSTANCE_STRIDE);
     for instance in instances {
-        for column in instance_columns(&instance.transform) {
-            for value in column {
-                bytes.extend_from_slice(&value.to_bits().to_le_bytes());
-            }
-        }
-        for value in [instance.tint[0], instance.tint[1], instance.tint[2], 1.0] {
-            bytes.extend_from_slice(&value.to_bits().to_le_bytes());
-        }
-        bytes.extend_from_slice(&[0u8; 16]);
+        append_instance_bytes(&mut bytes, instance);
     }
     Ok(bytes)
+}
+
+/// Repacks the two proxy populations — `npc` then `vehicle`, the
+/// FIXED per-frame buffer order — INTO `buffer` in place (the F-05
+/// retained-buffer discipline applied to the instance bytes: the Vec
+/// is cleared and refilled, so its capacity from the first populated
+/// frames is reused every frame — no per-frame allocation or growth;
+/// the byte content is identical to the allocating form
+/// concatenated in the same order). Both populations are validated
+/// BEFORE the clear: a typed refusal leaves the previous frame's
+/// bytes intact — an atomic repack, never a partial buffer.
+///
+/// The bound is [`MAX_INSTANCES`] TOTAL across both kinds (the
+/// sustained-load entity range the constant documents: one frame's
+/// whole population, not per kind), because one slot region of the
+/// GPU instance buffer holds exactly that many packed instances.
+pub fn repack_populations(
+    buffer: &mut Vec<u8>,
+    npc: &[ProxyInstance],
+    vehicle: &[ProxyInstance],
+) -> Result<(), InstancePackError> {
+    let total = npc.len() + vehicle.len();
+    if total > MAX_INSTANCES {
+        return Err(InstancePackError::Capacity {
+            capacity: MAX_INSTANCES,
+            requested: total,
+        });
+    }
+    for (index, instance) in npc.iter().chain(vehicle).enumerate() {
+        if let Some(field) = instance.validate() {
+            return Err(InstancePackError::Invalid { index, field });
+        }
+    }
+    buffer.clear();
+    buffer.reserve(total * INSTANCE_STRIDE);
+    for instance in npc.iter().chain(vehicle) {
+        append_instance_bytes(buffer, instance);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -426,4 +473,93 @@ mod tests {
     /// sign bug before any of it landed: the pin discipline working
     /// as designed).
     const PINNED_FNV: u64 = 14524014449239426066;
+
+    /// Two small fixture populations (varied turns, scales, tints —
+    /// enough shape to make an ordering or field bug visible in the
+    /// bytes).
+    fn fixture_populations() -> (Vec<ProxyInstance>, Vec<ProxyInstance>) {
+        let instance = |pos: [f32; 3], turn: u16, scale: f32, tint: [f32; 3]| ProxyInstance {
+            transform: InstanceTransform { pos, turn, scale },
+            tint,
+        };
+        (
+            vec![
+                instance([1.0, 0.0, -2.0], 0, 1.0, [0.9, 0.9, 0.9]),
+                instance([-3.0, 0.0, 4.0], 16384, 1.1, [0.8, 0.6, 0.5]),
+            ],
+            vec![
+                instance([7.0, 0.0, 1.0], 40000, 1.0, [0.2, 0.4, 0.9]),
+                instance([-8.0, 0.0, -1.0], 8192, 0.9, [0.9, 0.2, 0.2]),
+            ],
+        )
+    }
+
+    /// The retained repack produces byte-identical content to the
+    /// allocating form concatenated in the fixed per-frame order (npc
+    /// first, vehicle after), at the pinned stride math — the F-05
+    /// reuse changes WHERE the bytes live, never WHAT they are.
+    #[test]
+    fn repack_matches_allocating_form_in_kind_order() {
+        let (npc, vehicle) = fixture_populations();
+        let mut buffer = Vec::new();
+        repack_populations(&mut buffer, &npc, &vehicle).unwrap();
+        let mut expected = pack_instances(&npc).unwrap();
+        expected.extend_from_slice(&pack_instances(&vehicle).unwrap());
+        assert_eq!(buffer, expected);
+        assert_eq!(buffer.len(), (npc.len() + vehicle.len()) * INSTANCE_STRIDE);
+    }
+
+    /// The repack refusal is ATOMIC: an over-capacity or invalid
+    /// input leaves the previous frame's bytes untouched (a failed
+    /// frame never corrupts the buffer content; the chained index
+    /// crosses the kind boundary — npc.len() + 0).
+    #[test]
+    fn repack_refusal_preserves_the_prior_frame() {
+        let (npc, vehicle) = fixture_populations();
+        let mut buffer = Vec::new();
+        repack_populations(&mut buffer, &npc, &vehicle).unwrap();
+        let prior = buffer.clone();
+        let mut bad = vehicle.clone();
+        bad[0].tint = [2.0, 0.0, 0.0]; // outside [0, 1]
+        assert_eq!(
+            repack_populations(&mut buffer, &npc, &bad),
+            Err(InstancePackError::Invalid {
+                index: npc.len(),
+                field: "tint"
+            })
+        );
+        assert_eq!(buffer, prior, "the refusal left the prior bytes intact");
+        let over: Vec<_> = vec![npc[0]; MAX_INSTANCES];
+        assert_eq!(
+            repack_populations(&mut buffer, &over, &vehicle),
+            Err(InstancePackError::Capacity {
+                capacity: MAX_INSTANCES,
+                requested: MAX_INSTANCES + vehicle.len()
+            })
+        );
+        assert_eq!(buffer, prior);
+    }
+
+    /// The retained buffer reuses its capacity across frames (the
+    /// F-05 discipline made assertable): repacking the same or a
+    /// smaller population never reallocates once warmed.
+    #[test]
+    fn repack_reuses_capacity_without_growth() {
+        let (npc, vehicle) = fixture_populations();
+        let mut buffer = Vec::new();
+        repack_populations(&mut buffer, &npc, &vehicle).unwrap();
+        let warmed = buffer.capacity();
+        assert!(warmed >= (npc.len() + vehicle.len()) * INSTANCE_STRIDE);
+        for _ in 0..3 {
+            repack_populations(&mut buffer, &npc, &vehicle).unwrap();
+            assert_eq!(buffer.capacity(), warmed, "no reallocation once warmed");
+        }
+        repack_populations(&mut buffer, &npc, &[]).unwrap();
+        assert_eq!(
+            buffer.capacity(),
+            warmed,
+            "a smaller population keeps the capacity"
+        );
+        assert_eq!(buffer.len(), npc.len() * INSTANCE_STRIDE);
+    }
 }

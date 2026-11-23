@@ -279,70 +279,27 @@
 //! are how that evidence gets taken.
 //!
 //! ### Corrective — the 6-F commit message's stale CI paragraph
-//! (RESOLVED this session by direct measurement)
 //!
 //! `96dee7c`'s message says "the main shard 1138 -> 1140 (Windows
 //! 1087 -> 1089, the same platform-uniform 2); the release
 //! battery 61 -> 63". That paragraph was written before the
 //! `shadows.rs` battery grew from 2 tests to 8 during the
 //! INVERTED-depth convention-bug hunt the same message describes,
-//! and it was never refreshed. The paragraph's numbers were never
-//! the measured state of any tree on this branch. The tree's
-//! actual pins — the workflow this branch carries, its comment
-//! chain ("Linux 1146 = 1138 + the same 8; Windows 1095 = 1087 +
-//! the same 8", "61 -> 69"), session 3's handoff record, and now
-//! SESSION 4'S OWN MEASUREMENTS on this tip — all agree:
+//! and it was never refreshed. The tree's actual pins — the
+//! workflow the 6-F branch carries, its comment chain ("Linux
+//! 1146 = 1138 + the same 8; Windows 1095 = 1087 + the same 8",
+//! "61 -> 69"), and session 3's handoff record — all agree; the
+//! paragraph's numbers were never the measured state of any tree
+//! on that branch. Session 4 independently re-measured the 6-F
+//! tree's shards; the 6-F branch's own session-4 addendum carries
+//! those numbers. When creating the 6-F PR, append this
+//! corrective to the body.
 //!
-//! - **main shard (clean environment, the workflow's own awk):
-//!   1146 passed / 2 ignored / 33 result lines, rc=0, zero
-//!   failures** (= 1138 + the 8 shadows tests; NOT 1140);
-//! - **renderer release battery: 69/2** (NOT 63);
-//! - **targeted `shadows` battery (debug): 8/8 passed** — the
-//!   exact eight tests the message itself lists.
+//! ### This branch's session-4 verification table (6-E2, tip
+//! `3522e55` + this addendum commit)
 //!
-//! When creating the 6-F PR, append this corrective to the body
-//! (the message's evidence sections — the gate results, the
-//! allocation pins — are correct; only the CI-delta paragraph is
-//! stale).
-//!
-//! ### The one lane FAIL — an environment artifact, root-caused
-//! (the §3.1 discipline applied to this session's own instrument)
-//!
-//! This branch's gap-verification lane reported one FAIL, on the
-//! main shard: 1130 passed / 1 ignored / 27 result lines with
-//! `engine-shell`'s
-//! `input_dispatch::look_deltas_require_relative_capture_and_do_not_accumulate`
-//! panicking at `assertion failed: app.relative_mouse()`, and
-//! cargo's fail-fast skipping the six later binaries. The
-//! investigation (the failing test is in engine-shell — a package
-//! this diff does not touch):
-//!
-//! 1. The lane script exports `SDL_VIDEODRIVER=offscreen` and the
-//!    user-local lavapipe variables for its graphical steps; the
-//!    main shard ran inside that exported environment — a script
-//!    design error (CI runs the main shard in the runner's clean
-//!    environment; only the Linux-only graphical steps set
-//!    `SDL_VIDEODRIVER` per command).
-//! 2. **Differential proof**: with `SDL_VIDEODRIVER=offscreen`
-//!    the suite fails (12 passed / 1 failed); in a clean
-//!    environment it passes 13/13. The offscreen video driver
-//!    does not support relative mouse capture, and the test
-//!    correctly asserts that capture succeeds.
-//! 3. **The clean full re-run is the CI-parity record**: 1146/2/33,
-//!    rc=0, zero failures (the table below).
-//!
-//! CI is unaffected (the workflow never sets `SDL_VIDEODRIVER`
-//! on the Tests step). The operational lesson for future pod
-//! sessions, now on record: run the CPU shards in a clean
-//! environment and export the lavapipe variables only for the
-//! graphical commands — this is exactly how CI scopes them.
-//!
-//! ### This branch's session-4 verification table (6-F, tip
-//! `4b5b228` + this addendum commit)
-//!
-//! All steps below ran this session on this branch's tip, 64/65
-//! green in the lane plus the root-caused re-run — zero code
-//! failures, zero flakes. These are the CI steps NO prior session
+//! All steps below ran this session on this branch's tip, 65/65
+//! green, zero flakes. These are the CI steps NO prior session
 //! had executed locally plus targeted re-verification of this
 //! package's own linchpins:
 //!
@@ -356,24 +313,25 @@
 //! | Stage 3 sim smoke ×2 | double-run equal; `executed 45717`, `engine-lanes=5591d3eb05643e78`, `state-lanes=9d90cb3bbd45b032` |
 //! | Stage 4 presence ×3 ×2 | stationary `da1b2d1a7e5cd49e`, walk `1df391ad488848bf`, tour `495ab27b37549e93` — all pinned values, double-run equal |
 //! | feature-disabled production-path (B-P1, B-R1a2) | green |
-//! | targeted shadow-core battery (debug) | 8/8 passed — the eight tests the commit message lists |
-//! | renderer release battery | **MEASURED 69/2** (the branch pin 69/2; the stale message paragraph claims 63) |
-//! | **the full main shard (CLEAN environment, the workflow's awk)** | **MEASURED 1146/2/33, rc=0, zero failures — the branch pin; a second independent full-shard confirmation of session 3's record** (the lane's polluted-env FAIL is root-caused above) |
+//! | proxy unit battery (debug) | 17 passed (the 6-E line's 13 + this package's 4 `proxy_indirect` tests) |
+//! | `corner_population` placement battery | 6 passed |
+//! | renderer release battery | MEASURED 69/2 (the branch pin 69/2) |
 //! | F-06 benchmark canary | green (region scene median 0.048 ms/frame; overlay-on extra 0.030 ms/frame) |
 //! | the five `--render` offscreen smokes | green |
 //! | `render_scene_separation` + `render_encounter` `--ignored` | green |
 //! | playable-world smoke | green |
 //! | plain day/night corner routes (601 frames, every CI grep) | green — first local execution of these steps |
-//! | shadowed route | `directional shadows: one cascade (1024 texels), bias constant 0.0015 / slope 0.0020`, all n=601 grep families, validation 0/0 |
-//! | `render_shadows --ignored` | green — the map known-answer + the pixel equivalence gates re-confirmed |
+//! | populated route | 26 instances (24 npc + 2 vehicle), **2 draw calls per frame (indirect mode)**, validation 0/0 |
+//! | `render_instanced --ignored` | all THREE gates green — the three-way 26 == 2 == 2 byte-equality re-confirmed |
+//! | **the full main shard** (session 4's own run, the workflow's awk) | **MEASURED 1146 passed / 2 ignored / 33 result lines, rc=0, zero failures — the branch pin, a second independent full-shard confirmation of session 3's record** |
 //! | S6-C3 soak smoke + fresh-process recovery | evidence package verified complete; workload gate PASS |
 //!
 //! Session 3's shard measurements for this branch (main
-//! 1146/2/33, heavy 570/10/58, renderer release 69/2) are the
+//! 1146/2/33, heavy 576/12/58, renderer release 69/2) are the
 //! immutable-tree records; session 4's own full main-shard run
-//! above and its targeted re-runs of every test this package
-//! added agree with them (8/8 shadows + 69/2 release + the full
-//! shard's 1146/2/33).
+//! above and its targeted re-runs of every test this package line
+//! added agree with them (17 proxy + 6 placement + 3 gates + 69/2
+//! release + the full shard's 1146/2/33).
 //!
 //! ---
 //!
@@ -402,12 +360,12 @@
 //! the stale-message corrective). This commit closes the gap and
 //! removes the class of gap:
 //!
-//! - **`docs/PR-BODY-CYCLE6-6F.md` (new) — the canonical PR body,
+//! - **`docs/PR-BODY-CYCLE6-6E2.md` (new) — the canonical PR body,
 //!   committed to the branch.** The assembled body (every addendum
 //!   through the four-way union) plus the session-4/5 sync section:
 //!   the canonical rig block below, session 4's verification
 //!   headline, the tip statement, and session 5's verbatim
-//!   pre-flight of the rig block on this tip — rc=0 on all three
+//!   pre-flight of the rig block on this tip — rc=0 on all four
 //!   runs, every headline line reproduced (logs at
 //!   `~/verify8-session5/` on the pod). The watcher payloads and
 //!   the `~/push-handoff` twins are REGENERATED from this file
@@ -452,37 +410,39 @@
 //! tip this session; the full test suites are sessions 3/4's
 //! measured records on the code tree this commit does not touch.
 //! Session 5's own execution evidence on this tip: the canonical
-//! rig block verbatim — rc=0 ×3, the pinned headline lines
-//! reproduced (the one-cascade line on both shadowed runs, validation
-//! 0/0 on all three). engine-core untouched; no pins changed; no
+//! rig block verbatim — rc=0 ×4, the pinned headline lines
+//! reproduced (26 / 2 indirect, 2 direct-instanced, 26 per-object,
+//! validation 0/0 on all four). engine-core untouched; no pins changed; no
 //! test modified; AGENTS.md untouched.
 
 //! ---
 
 //! ## SESSION 6 ADDENDUM — the heavy shard's direct
-//! clean-environment run (2026-11-23, ~11:50 UTC)
+//! clean-environment run (2026-11-23, ~11:55 UTC)
 //!
 //! The blocker, re-probed: unchanged (dead askpass sockets, no
 //! write credentials; `origin/main` still `1fe89b7`). This
 //! branch's one second-run gap — the heavy shard had session 3's
-//! direct run only, predating THIS lane's own clean-environment
-//! lesson (session 4's polluted-env main-shard FAIL, root-caused)
-//! — closed this session the way the lesson prescribes: CI command
-//! verbatim, the workflow's awk, a clean shell (no SDL/VK
-//! variables), on this branch's tip: **570 passed / 10 ignored /
-//! 58 result lines, rc=0, zero failures — the branch pin, its
-//! first post-clean-discipline direct run.** fmt and clippy (`-D
-//! warnings`, both forms) clean on the final tip. Raw log:
-//! `/tmp/opencode/session6-6f-heavy.log` on the pod; the PR body's
-//! Session 6 section carries the same table, and the watcher
-//! payload + twin were regenerated from it byte-for-byte after the
-//! commit. (The population branch's larger gap — main AND heavy —
-//! and the 6-E heavy gap were closed earlier this session; the
-//! 6-E2 heavy gap follows in this session's next commit.)
+//! direct run only (576/12/58), predating the clean-environment
+//! discipline — closed this session: CI command verbatim, the
+//! workflow's awk, a clean shell (no SDL/VK variables), on this
+//! branch's tip (run in the pod's standing 6-E2 worktree,
+//! `/tmp/opencode/wt-6e2`, clean at `ae7bcf5`): **576 passed /
+//! 12 ignored / 58 result lines, rc=0, zero failures — the branch
+//! pin, its first post-clean-discipline direct run.** fmt and
+//! clippy (`-D warnings`, both forms) clean on the final tip. Raw
+//! log: `/tmp/opencode/session6-6e2-heavy.log` on the pod; the PR
+//! body's Session 6 section carries the same table, and the
+//! watcher payload + twin were regenerated from it byte-for-byte
+//! after the commit. (This closes the LAST of the recorded
+//! second-run gaps: the population branch's main+heavy and the
+//! 6-E / 6-F heavy shards were closed earlier this session —
+//! every branch's every pinned shard now has at least two direct
+//! measurements, at least one in a clean environment.)
 
 //! ---
 
-//! ## SESSION 7 ADDENDUM — the linchpin gate's third direct run
+//! ## SESSION 7 ADDENDUM — the linchpin gates' third direct run
 //! (2026-11-23, ~11:54 UTC)
 //!
 //! The blocker, re-probed first: unchanged (dead askpass sockets,
@@ -491,21 +451,21 @@
 //! base, so nothing has drifted underneath the branches). The
 //! delivery machinery verified healthy and then HARDENED (see the
 //! population branch's session-7 note for the run-wide record).
-//! This branch's evidence asymmetry — its graphical linchpin had
-//! two direct measurements (sessions 3, 4) vs the population
-//! branch's three — closed this session: `render_shadows
-//! --ignored` run a THIRD time directly on this tip (`e858f40` at
-//! run time; the code tree exactly `96dee7c`'s), lavapipe
-//! variables scoped to the gate command only (the discipline this
-//! lane's own polluted-env FAIL established): **1 passed, rc=0,
-//! every pinned line reproduced — the map known-answer 1006779
-//! compared / 41797 edge-skipped (3.99%) / 0 mismatches / max
-//! |Δdepth| 2.68e-7 against the CPU raycaster; the pixel oracles
-//! 0/255 (shadowed patch) and 1/255 (lit patch); 65536/65536 frame
-//! pixels changed; warmed device_memory 17 constant; the
-//! replacement lifecycle re-verified with the identical
-//! known-answer.** fmt `--check` and clippy `-D warnings` (release
-//! form) clean on the committed tip. Raw log:
-//! `/tmp/opencode/session7-6f-gate.log`; the PR body's Session 7
+//! This branch's evidence asymmetry — its graphical linchpins (the
+//! render_instanced battery) had two direct measurements (sessions
+//! 3, 4) vs the population branch's three — closed this session:
+//! the full battery run a THIRD time directly on this tip
+//! (`faa01a0` at run time; the code tree exactly `6ee89b4`'s),
+//! lavapipe variables scoped to the gate command only: **3 passed,
+//! rc=0, every pinned line reproduced — the three-way 26
+//! instances, per-object 26 == direct 2 == indirect 2 draws,
+//! byte-equal frames; ink 2745/65536 on both paths; the indirect
+//! mechanism's one-time device_memory 18 → 19; the direct path's
+//! warmed 18 constant with the replacement lifecycle 18 → 38
+//! (delta 20); both single-instance oracle walls 0/255 (the
+//! three-way wall within 2/255 through the indirect submission).**
+//! fmt `--check` and clippy `-D warnings` (release form) clean on
+//! the committed tip. Raw log:
+//! `/tmp/opencode/session7-6e2-gate.log`; the PR body's Session 7
 //! section carries the table, and the watcher payload + twin were
 //! regenerated from it byte-for-byte after the commit.
