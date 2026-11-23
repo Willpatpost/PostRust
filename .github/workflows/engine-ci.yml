@@ -2,7 +2,10 @@ name: engine-ci
 
 on:
   push:
-    branches: [main, stage5, macos-port, cycle6/ci-flake-correctives]
+    # CI-trigger hygiene after the 6-D and flake-corrective merges:
+    # both feature branches are merged and deleted — the push filter
+    # carries only living branches.
+    branches: [main, stage5, macos-port]
     paths:
       - "crates/**"
       - "build/**"
