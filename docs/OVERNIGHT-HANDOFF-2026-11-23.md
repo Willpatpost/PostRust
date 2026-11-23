@@ -1607,3 +1607,136 @@
 //! sufficient for the watcher to fire — when such a session
 //! actually exists.
 
+//! ---
+
+//! ## SESSION 17 ADDENDUM — the body cross-reference audit, the
+//! payload-lineage reproduction, and the population body's stale
+//! tip statement corrected (2026-11-23, ~13:40 UTC)
+
+//! The seventeenth session re-probed the push blocker first:
+//! **unchanged** (both `/tmp/vscode-git-*.sock` sockets dead by all
+//! three session-15 discriminators — raw AF_UNIX connect refused
+//! on both, `git credential fill` stderr ECONNREFUSED, token_len 0;
+//! `git push --dry-run` exit 128, `remote: No anonymous write
+//! access`; anonymous read works, `origin/main` remains at `1fe89b7`
+//! with only main plus the seven historical PR refs — no drift, no
+//! cycle6 branch ever leaked; no `gh`, no `GH_TOKEN`, no
+//! `~/.git-credentials`, no `~/.netrc`, no SSH keys; the supervisor
+//! PID 858 and the hardened four-branch watcher PID 442510 both
+//! alive, the watcher log start-lines-only — correctly never fired;
+//! no `~/PR-CREATED-*` markers; `~/OVERNIGHT-DONE` and
+//! `~/OVERNIGHT-STOP` correctly absent; `SURVIVED.txt` untouched —
+//! session 10's bound stands). The delivery chain re-verified fresh
+//! on the entry tips (all four payload bodies byte-identical to
+//! their branch PR-body files — sha `a90cc2fd` / `1b91fdcd` /
+//! `161c2ca9` / `81385ae9`, 26,319 / 28,027 / 25,071 / 26,026
+//! bytes; the `/tmp/opencode` twins sha-identical; the stack
+//! parsed; `engine-core` zero-diff vs main on all four branches;
+//! `git fsck --full --strict` clean; the `wt-6e2` worktree clean at
+//! `f29a22a`; the lavapipe environment functional without
+//! re-provision — llvmpipe, Vulkan 1.4.318). Raw logs for all of
+//! the above, born persistent: `~/verify13-session17/`.
+
+//! ### The audit this session ran — the session-16 corrective's
+//! class, applied systematically to all four PR bodies
+
+//! Session 16 found a one-digit sha typo in THIS doc by direct
+//! re-measurement; no session had systematically audited the four
+//! PR bodies' cross-references (every sha-like string and citation
+//! verified against ground truth). This session did, string by
+//! string:
+
+//! - **Every commit sha resolves on the correct branch** — the four
+//!   implementation commits (`511b157` / `96dee7c` / `5c9690d` /
+//!   `6ee89b4`), `1fe89b7` on all five refs, and every intermediate
+//!   tip each body cites (`3e5a811`, `14d30f9`, `f38c1c2`,
+//!   `0c19c9f`, `5cee5b4`, `1c50065` on 6-E; `4b5b228`, `1b05252`,
+//!   `d53fa2e`, `e858f40`, `f0c83e1`, `980e432` on 6-F; `cb92088`,
+//!   `4c5edbf`, `7fed835`, `9b48125`, `7fed835`-lineage on
+//!   population; `3522e55`, `9f40161`, `ae7bcf5`, `faa01a0`,
+//!   `fb8bfa2`, `f29a22a` on 6-E2) — each verified by
+//!   `merge-base --is-ancestor` against the five refs.
+//! - **The sim-repo citations resolve in their home repos**: the
+//!   merge-dryrun simulation repo is still present with `76a673e`
+//!   as its HEAD (the 31-hunk sim merge) and `d5dafe8` as a tree;
+//!   `9c0cdb8` and the gated tree `f02ddef` resolve in the
+//!   session11-final clone.
+//! - **The decimal look-alikes are counts, verified against the
+//!   records** (1,006,779 / 1,048,576 — the shadows known-answer
+//!   texel counts; the allocations tuple containing 1589248).
+//! - **The payload-sha citations are the one class that needed
+//!   deeper verification — and it closed a real gap** (next
+//!   section).
+
+//! ### The payload-lineage reproduction (the delivery substrate's
+//! strongest form)
+
+//! The population body's session-6 section records its no-op
+//! regeneration proof at payload sha `7343a3eb`; the README's
+//! history pins `1acdfc12` (sessions 7–10) and `3af8c528` (session
+//! 11 onward). No session had re-derived any of them. This session
+//! reconstructed each historical payload from the branch's body-
+//! file history ALONE (the body at `7fed835` / `9b48125` /
+//! `f94679e`, the live payload's metadata and key order, the
+//! regen script's pinned serialization — `ensure_ascii=True,
+//! indent=1`, trailing newline), in a scratch directory, never
+//! touching the live copies: **all three reproduce exactly**
+//! (`7343a3eb` from the session-5 body; `1acdfc12` from the
+//! session-6 body; `3af8c528` from the session-11 body — which is
+//! byte-identical to the current tip's body). Two consequences,
+//! both now measured claims: the historical sha citations in the
+//! bodies are accurate (the session-6 no-op line included), and
+//! **the delivery payloads are a deterministic function of the
+//! repository alone** — if both payload copies were ever lost,
+//! `regen-payload.py` rebuilds them byte-exactly from the branch
+//! refs. The persistent twins are redundant by construction, not
+//! merely mirrored.
+
+//! ### THE CORRECTIVE — the population body's final tip statement
+//! was five sessions stale
+
+//! The audit's one real finding. Each PR body ends with a tip
+//! statement enumerating what the pushed tip contains; the three
+//! sibling bodies' statements are EXACT (verified against their
+//! actual commit chains: package commit + handoff doc + sessions
+//! 4–7 + the session-11 census refresh — their tips are their
+//! session-11 commits, unmoved since). The population body's final
+//! statement stopped at "sessions 4 through 11" while its tip had
+//! advanced to `033281d` — five documentation commits further
+//! (the session-12/13 union batteries, the session-14/15 audits,
+//! the session-16 corrective). The statement is the owner-facing
+//! text: it becomes the GitHub PR body, where the pod-local
+//! README's tip tracking does not reach, so an auditor
+//! cross-checking the body's stated tip against the PR's actual
+//! head would have met a mismatch — the exact stale-record class
+//! this run keeps correcting. The statement now enumerates
+//! sessions 4 through 16 plus this session's own corrective (the
+//! session-11 self-reference pattern, exact at commit time); the
+//! population payload was regenerated from the corrected body via
+//! the established script (both copies, JSON-validated), and the
+//! README pins updated. The other three payloads are byte-unchanged
+//! (their bodies untouched — regeneration proven a no-op for each).
+
+//! ### The closing loop on this session's own commit
+
+//! Documentation only — the diffstat is this handoff doc and the
+//! population PR-body file; no `.rs`, no workflow, no pins, no
+//! test. Gates for this commit: `cargo fmt --all -- --check` clean
+//! and `cargo clippy --workspace --all-targets --release -- -D
+//! warnings` clean, run on this tip. After the commit: the merge
+//! kit re-executed on the post-commit tips (the union doc gains
+//! this section; the code-subset check against `f02ddef` must stay
+//! zero files), and all four payloads re-verified byte-identical
+//! to their branch bodies — the kit README carries the run record.
+
+//! ### Notes for the owner (session 17)
+
+//! `~/OVERNIGHT-DONE` remains correctly absent (the PRs do not
+//! exist; the honest form stands). The morning commands stand
+//! unchanged. The blocker is the same one action it has been since
+//! session 3: a GitHub-authenticated session on this pod (sign
+//! into GitHub inside a live code-server workbench session) or a
+//! push from any machine with credentials — the watcher performs
+//! the whole delivery from the canonical bytes, and those bytes
+//! are now proven reconstructible from the repository itself.
+
