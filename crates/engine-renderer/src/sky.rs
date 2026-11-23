@@ -166,8 +166,25 @@ pub struct AtmosphereFrame {
     pub light: LightParams,
     pub sky: SkyPalette,
     /// The celestial disc's direction (unit, toward the body) — the
-    /// sun by day, the moon by night (the presets' light directions).
+    /// sun by day, the moon by night (the presets' light
+    /// directions, NORMALIZED: the night preset's raw direction is
+    /// 0.9055 long, and the disc's cosine threshold contract needs
+    /// the unit form — the first-run correction found when the sky
+    /// gate finally executed; the LIGHT parameters stay raw
+    /// exactly as the presets carry them).
     pub disc_dir: [f32; 3],
+}
+
+/// The unit vector along `dir` (pure IEEE sqrt — deterministic;
+/// the zero vector maps to +Y so a degenerate input never
+/// fabricates a disc).
+fn unit_dir(dir: [f32; 3]) -> [f32; 3] {
+    let length = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+    if length == 0.0 {
+        [0.0, 1.0, 0.0]
+    } else {
+        [dir[0] / length, dir[1] / length, dir[2] / length]
+    }
 }
 
 /// The full day/night cycle at `t` in [0, 1]: t=0 is EXACTLY the
@@ -186,14 +203,14 @@ pub fn atmosphere_at(t: f32) -> AtmosphereFrame {
         return AtmosphereFrame {
             light: day_light,
             sky: day_sky_palette,
-            disc_dir: day_light.dir_toward_light,
+            disc_dir: unit_dir(day_light.dir_toward_light),
         };
     }
     if t >= 1.0 {
         return AtmosphereFrame {
             light: night_light,
             sky: night_sky_palette,
-            disc_dir: night_light.dir_toward_light,
+            disc_dir: unit_dir(night_light.dir_toward_light),
         };
     }
     let lerp = |a: f32, b: f32| a + (b - a) * t;
@@ -242,8 +259,10 @@ pub fn atmosphere_at(t: f32) -> AtmosphereFrame {
             ],
         },
         // The disc direction follows the light direction (the sun
-        // sets as the moon rises — one shared axis in this model).
-        disc_dir: [
+        // sets as the moon rises — one shared axis in this model),
+        // normalized to the unit contract (a lerped pair of unit
+        // vectors is not unit).
+        disc_dir: unit_dir([
             lerp(
                 day_light.dir_toward_light[0],
                 night_light.dir_toward_light[0],
@@ -256,7 +275,7 @@ pub fn atmosphere_at(t: f32) -> AtmosphereFrame {
                 day_light.dir_toward_light[2],
                 night_light.dir_toward_light[2],
             ),
-        ],
+        ]),
     }
 }
 
