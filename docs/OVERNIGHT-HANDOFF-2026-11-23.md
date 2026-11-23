@@ -954,3 +954,126 @@
 //! AGENTS.md untouched. The morning commands stand unchanged (the
 //! watcher performs the whole delivery from the same canonical
 //! bytes the moment a credential returns).
+
+//! ---
+
+//! ## SESSION 11 ADDENDUM — the merge census refreshed on the
+//! current tips, and the resolution kit (2026-11-23, ~12:30 UTC)
+
+//! The eleventh session re-probed the push blocker first: **unchanged**
+//! (both `/tmp/vscode-git-*.sock` sockets dead — `git push --dry-run`
+//! exit 128, `remote: No anonymous write access`; anonymous read
+//! works, `origin/main` remains at `1fe89b7`, the merge base, with
+//! only the seven historical PR refs — no drift, no remote cycle6
+//! branch; no `gh`, no write credential of any form; code-server's
+//! tree still has no extension host, so no fresh socket can appear
+//! before the owner's workbench session returns). The delivery chain
+//! re-verified healthy: the supervisor (PID 858) and the hardened
+//! four-branch watcher (PID 442510) both alive, the watcher log
+//! start-lines-only (correctly never fired), no `~/PR-CREATED-*`
+//! markers, `~/OVERNIGHT-DONE` correctly absent, `SURVIVED.txt`
+//! untouched (session 10's bound stands), no askpass artifacts.
+
+//! ### The gap this session closed — the merge censuses went stale
+//! (morning-relevant)
+
+//! verify5 (~08:45) and verify7 (10:13) gated the branch MERGES —
+//! on the tips as they stood then. Sessions 4–10 subsequently
+//! committed this run's per-branch documentation (each branch's
+//! session addenda to THIS doc, plus the session-5 PR-body files)
+//! on the same shared path on all four branches, and no census had
+//! re-measured the merges since. The morning map's claims —
+//! "the stack PRs ff-merge" and "8 files / 31 conflict hunks" at
+//! the 6-F step — no longer described what the owner's merge
+//! morning would actually hit. The session-11 census measured it
+//! (`git merge-tree` on the current tips, a standalone clone; the
+//! real repo's refs and object DB untouched):
+
+//! - **The stack no longer fast-forwards.** population's merge base
+//!   with the 6-E tip is `511b157` (the 6-E implementation commit —
+//!   6-E's own documentation commits are not in population's
+//!   history), and 6-E2's base with the population tip is `5c9690d`
+//!   likewise. Each stacked merge step is therefore a true three-way
+//!   merge that conflicts add/add on exactly ONE file — this
+//!   handoff doc (each branch's own addenda on the shared path, by
+//!   design; zero code conflicts at either step).
+//! - **The 6-F step grew one file.** Its 10:13 census set is
+//!   UNCHANGED — re-measured per file on the current tips: vulkan 9,
+//!   engine-ci 6, renderer 5, main 4, CURRENT-STATUS 3,
+//!   corner_demo 2, corner 1, lib 1 = 31 code hunks (the code is
+//!   untouched since) — plus the same handoff-doc add/add (10 hunks
+//!   at these tips): **9 files / 41 hunks**.
+
+//! ### The resolution kit (mechanical, pre-gated, drift-proof)
+
+//! `~/push-handoff/merge-kit/` — `merge-morning.sh` with
+//! `handoff_union.py` and verify7's `resolution.patch` — performs
+//! the owner's merge order (6-E → population → 6-E2 → 6-F) on a
+//! scratch branch from main and **never pushes** (the GO stays the
+//! owner's; the script's every merge is inspectable and
+//! discardable). The two resolutions:
+
+//! - **The handoff doc** resolves at every conflicted step to the
+//!   UNION of the four branch versions, computed at run time from
+//!   the branch refs (so it cannot drift from whatever the branches
+//!   carry when the kit runs): the preamble from the side that is a
+//!   line-superset of every other (population's — it carries
+//!   session 9's navigation note; the script FAILS LOUDLY if no
+//!   superset side exists), every addendum section in (session,
+//!   ladder) order, deduplicated by exact section bytes.
+//! - **The 8 code files** resolve by verify7's gated patch
+//!   restricted to the conflicted set (`git apply --include` per
+//!   file) — the merge already brings 6-F's new files and build.rs
+//!   in cleanly, and an unrestricted apply double-applies there and
+//!   refuses (the operational lesson from this session's first
+//!   step-4 attempt, embedded as a comment in the script). If the
+//!   code has drifted from the gated census the patch refuses and
+//!   the script STOPS — no silent weaving.
+
+//! ### The executed proof (all MEASURED this session)
+
+//! The kit ran end-to-end on the session's entry tips (the
+//! standalone clone; rc=0, every step mechanical):
+
+//! - **Determinism**: the union doc resolved to the SAME blob
+//!   (`a24d1c7b`) at all three conflicted steps AND in a standalone
+//!   build — the union is a function of the four branch versions,
+//!   nothing else.
+//! - **The code-subset proof**: the resulting four-way union tree's
+//!   code subset is **byte-identical to verify7's fully-gated tree
+//!   `f02ddef`** — `git diff` between them lists ZERO files outside
+//!   this doc and the four PR-body files (which `f02ddef`
+//!   predates). verify7's entire measured battery therefore carries
+//!   to the current-tips union by the docs-only proof: fmt/clippy
+//!   clean, main shard 1154/2/33, renderer release 77/2, heavy
+//!   576/13/59, every lavapipe gate and route green with its pinned
+//!   evidence lines.
+//! - **Fresh smokes on the union tree itself** (belt-and-braces
+//!   beyond the byte-identity): `cargo fmt --all -- --check` clean;
+//!   `cargo clippy --workspace --all-targets --release -- -D
+//!   warnings` clean (1m13s). Raw logs:
+//!   `/tmp/opencode/session11-union/`.
+
+//! After this session's commits landed, the kit was RE-EXECUTED on
+//! the final tips (the protocol closing the loop on the session's
+//! own documentation changes); the kit README carries both run
+//! records and the census tables.
+
+//! ### Notes for the owner (session 11)
+
+//! `~/OVERNIGHT-DONE` remains correctly absent (the PRs do not
+//! exist; the honest form stands). The morning commands stand
+//! unchanged (the watcher performs the delivery from the canonical
+//! bytes). The merge morning now has two equivalent paths, both
+//! documented in the kit README: resolve the stacked PRs through
+//! GitHub with the kit's resolution applied locally to each PR
+//! branch, or run the kit's scratch-branch sequence and push main
+//! yourself — the kit never pushes in either path. Gates for this
+//! commit: `cargo fmt --all -- --check` clean and `cargo clippy
+//! --workspace --all-targets --release -- -D warnings` clean on
+//! this tip; the full suites remain the prior sessions' measured
+//! records on the identical code tree (this session's commits are
+//! documentation-only — the diffstat proof, per branch). engine-core
+//! untouched; AGENTS.md untouched; no pins changed; no test
+//! modified.
+
