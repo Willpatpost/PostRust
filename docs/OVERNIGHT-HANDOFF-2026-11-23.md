@@ -414,3 +414,28 @@
 //! reproduced (26 / 2 indirect, 2 direct-instanced, 26 per-object,
 //! validation 0/0 on all four). engine-core untouched; no pins changed; no
 //! test modified; AGENTS.md untouched.
+
+//! ---
+
+//! ## SESSION 6 ADDENDUM — the heavy shard's direct
+//! clean-environment run (2026-11-23, ~11:55 UTC)
+//!
+//! The blocker, re-probed: unchanged (dead askpass sockets, no
+//! write credentials; `origin/main` still `1fe89b7`). This
+//! branch's one second-run gap — the heavy shard had session 3's
+//! direct run only (576/12/58), predating the clean-environment
+//! discipline — closed this session: CI command verbatim, the
+//! workflow's awk, a clean shell (no SDL/VK variables), on this
+//! branch's tip (run in the pod's standing 6-E2 worktree,
+//! `/tmp/opencode/wt-6e2`, clean at `ae7bcf5`): **576 passed /
+//! 12 ignored / 58 result lines, rc=0, zero failures — the branch
+//! pin, its first post-clean-discipline direct run.** fmt and
+//! clippy (`-D warnings`, both forms) clean on the final tip. Raw
+//! log: `/tmp/opencode/session6-6e2-heavy.log` on the pod; the PR
+//! body's Session 6 section carries the same table, and the
+//! watcher payload + twin were regenerated from it byte-for-byte
+//! after the commit. (This closes the LAST of the recorded
+//! second-run gaps: the population branch's main+heavy and the
+//! 6-E / 6-F heavy shards were closed earlier this session —
+//! every branch's every pinned shard now has at least two direct
+//! measurements, at least one in a clean environment.)

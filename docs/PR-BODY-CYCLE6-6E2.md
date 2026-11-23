@@ -301,3 +301,42 @@ run), the populated route in indirect mode (26 instances, 2 draws,
 validation 0/0), the placement battery 6/6, the proxy battery 17/17
 (13 + this package's 4), and the renderer release battery
 **69/2** matching the pin.
+
+---
+
+### Session 6 — the heavy shard's direct clean-environment run (2026-11-23, the ~11:30 UTC session)
+
+The one second-run gap this branch still carried: the heavy shard
+had session 3's single direct measurement (576/12/58), taken
+before the clean-environment discipline the 6-F lane's polluted-env
+FAIL established — the main shard already had session 4's direct
+clean-environment run on this tree (1146/2/33). Session 6 closed
+the heavy gap: the CI command verbatim (`cargo test -p
+engine-slice --features engine-slice/crash-test-seams`), the
+workflow's own awk counting, in a shell with no SDL/VK variables,
+directly on this branch's tip (`ae7bcf5` at run time; the code tree
+is exactly `6ee89b4`'s — every commit above the package commit is
+documentation only):
+
+| Step (MEASURED this session, this tip) | Result |
+|---|---|
+| `cargo fmt --all -- --check`; clippy `-D warnings` in both forms (the CI debug form, the standing-order release form) | clean |
+| **the full heavy shard** | **576 passed / 12 ignored / 58 result lines, rc=0, zero failures — the branch pin, its first post-clean-discipline direct run (session 3's 576/12/58 re-confirmed on this tree)** |
+
+Raw log: `/tmp/opencode/session6-6e2-heavy.log` on the pod (a /tmp
+path — may not survive a pod restart; the numbers here are the
+durable record). The watcher payload and its `~/push-handoff` twin
+were regenerated from this file byte-for-byte after this section
+landed.
+
+**The tip statement (supersedes the Branch tip note above):** the
+pushed tip is this branch's head = the package commit `6ee89b4` +
+the run-wide handoff doc (`3522e55`) + session 4's addendum
+(`9f40161`) + session 5's payload-sync commit (`ae7bcf5`) +
+session 6's heavy-shard verification addendum (the commit adding
+this section). Every commit beyond `6ee89b4` is documentation only
+— `git diff --name-only 6ee89b4..HEAD` lists only
+`docs/OVERNIGHT-HANDOFF-2026-11-23.md` and this file; no code, no
+workflow, no pins. This PR's base is the population branch's tip,
+which carries the same doc line; the doc commits' evolution between
+the branches remains documentation only.
