@@ -248,3 +248,39 @@ file). Every commit beyond `511b157` is documentation only —
 workflow, no pins. This PR's base is `main`, so the doc commits
 appear in the diff (nothing cancels); they are the run's audit
 record, not scope creep.
+
+---
+
+### Session 6 — the heavy shard's direct clean-environment run (2026-11-23, the ~11:30 UTC session)
+
+The one second-run gap this branch still carried: the heavy shard
+had session 3's single direct measurement (570/10/58), taken
+before the clean-environment discipline the 6-F lane's polluted-env
+FAIL established — the main shard already had session 4's direct
+clean-environment run on this tree. Session 6 closed the heavy gap:
+the CI command verbatim (`cargo test -p engine-slice --features
+engine-slice/crash-test-seams`), the workflow's own awk counting,
+in a shell with no SDL/VK variables, directly on this branch's tip
+(`f38c1c2` at run time; the code tree is exactly `511b157`'s —
+every commit above the package commit is documentation only):
+
+| Step (MEASURED this session, this tip) | Result |
+|---|---|
+| `cargo fmt --all -- --check`; clippy `-D warnings` in both forms (the CI debug form, the standing-order release form) | clean |
+| **the full heavy shard** | **570 passed / 10 ignored / 58 result lines, rc=0, zero failures — the branch pin, its first post-clean-discipline direct run (session 3's 570/10/58 re-confirmed on this tree)** |
+
+Raw log: `/tmp/opencode/session6-6e-heavy.log` on the pod (a /tmp
+path — may not survive a pod restart; the numbers here are the
+durable record). The watcher payload and its `~/push-handoff` twin
+were regenerated from this file byte-for-byte after this section
+landed.
+
+**The tip statement (supersedes the one above):** the pushed tip is
+this branch's head = the package commit `511b157` + the run-wide
+handoff doc (`3e5a811`) + session 4's addendum (`14d30f9`) +
+session 5's payload-sync commit (`f38c1c2`) + session 6's
+heavy-shard verification addendum (the commit adding this section).
+Every commit beyond `511b157` is documentation only — `git diff
+--name-only 511b157..HEAD` lists only
+`docs/OVERNIGHT-HANDOFF-2026-11-23.md` and this file; no code, no
+workflow, no pins.
