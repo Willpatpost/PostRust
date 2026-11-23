@@ -1077,3 +1077,98 @@
 //! untouched; AGENTS.md untouched; no pins changed; no test
 //! modified.
 
+//! ---
+
+//! ## SESSION 12 ADDENDUM — the union battery, measured directly on
+//! the merge-morning tree (2026-11-23, 12:40–12:51 UTC)
+
+//! The twelfth session re-probed the push blocker first: **unchanged**
+//! (both `/tmp/vscode-git-*.sock` sockets dead files; `git push
+//! --dry-run` exit 128, `remote: No anonymous write access`;
+//! anonymous read works, `origin/main` remains at `1fe89b7`, the
+//! merge base, with only the seven historical PR refs — no drift,
+//! no remote cycle6 branch; no `gh`, no write credential of any
+//! form; code-server's tree still has no extension host). The
+//! delivery chain healthy: the supervisor (PID 858) and the
+//! hardened four-branch watcher (PID 442510, the 11:53:44Z form)
+//! both alive, the watcher log start-lines-only (correctly never
+//! fired), all four `~/push-handoff` payloads byte-identical to
+//! the canonical PR body files on the branch tips (re-verified
+//! this session, cmp clean — 26,319 / 28,027 / 25,071 / 26,026
+//! bytes for 6-E / 6-F / population / 6-E2, the stack parsed and
+//! draft everywhere), no `~/PR-CREATED-*` markers,
+//! `~/OVERNIGHT-DONE` correctly absent, `SURVIVED.txt` untouched
+//! (session 10's bound stands).
+
+//! ### The gap this session closed — the union's batteries were
+//! carried, not direct
+
+//! Session 11's merge kit proved the current-tips four-way union's
+//! code subset byte-identical to verify7's fully-gated tree
+//! `f02ddef`, measured fmt/clippy directly on the union, and
+//! carried verify7's battery by that proof. Sound — but it left
+//! the merge-morning tree, the exact tree the owner's GO produces,
+//! with strictly fewer direct measurements than any branch tip
+//! carries (the branches' closing standard: every pinned shard ≥ 2
+//! direct measurements, every graphical linchpin ≥ 3). Session 12
+//! closed the asymmetry the only honest way: the CI's own battery,
+//! run directly on the exact tree.
+
+//! The tree, verified before anything ran on it: the standalone
+//! clone `/tmp/opencode/session11-final` (cloned from the main
+//! repo; the real refs untouched), clean, at the kit's final-tips
+//! union `298bd7e` — re-verified as the deterministic union of the
+//! CURRENT tips (the four merge steps' second parents are exactly
+//! `1c50065` / `f94679e` / `f29a22a` / `980e432`; the code-subset
+//! check against `f02ddef`, excluding this doc and the PR-body
+//! files: ZERO files).
+
+//! ### The battery (all MEASURED this session on `298bd7e`,
+//! 12:40–12:51 UTC)
+
+//! | Step | Result |
+//! |---|---|
+//! | fmt `--all -- --check` | clean |
+//! | clippy `--workspace --all-targets -- -D warnings` (the CI form) | clean, 48.4 s |
+//! | clippy `--workspace --all-targets --release -- -D warnings` | clean (cached — session 11's identical-tree run) |
+//! | main shard (the standing-order command, clean env) | rc=0, **1154 / 2 / 33 — the pin** (4 m 33 s) |
+//! | renderer release battery | rc=0, **77 / 2 — the pin** |
+//! | heavy shard (`-p engine-slice --features engine-slice/crash-test-seams`) | rc=0, **576 / 13 / 59 — the pin** (3 m 19 s) |
+//! | `render_instanced` ×3 (lavapipe, `--ignored`) | rc=0 — the fixture 13 == 2, the full table 26 == 2, the indirect three-way 26 == 2 == 2; byte-equal frames; ink 3,728 and 2,745; oracle walls 0/255; warmed device_memory 18 (indirect 19), replacement 18 → 38 (indirect 19 → 41) |
+//! | `render_shadows` (lavapipe, `--ignored`) | rc=0 — known-answer 1,006,779 compared / 41,797 edge-skipped (3.99%) / 0 mismatches / max Δdepth 2.68e-7, identical after replacement; shadowed patch 0/255; 65,536/65,536 frame pixels changed; warmed device_memory 17 |
+//! | `render_corner` / `render_orientation` / `render_overflow` / `render_glyph_atlas` (lavapipe) | rc=0 each |
+//! | routes, release, the rig commands' verbatim form | populated-indirect ("26 instances (24 npc + 2 vehicle), 2 draw calls per frame (indirect mode)", 0/0), populated-instanced, populated-reference (26 draws), shadows (the cascade banner, 1024 texels, bias 0.0015 / 0.0020, 0/0), plain day AND night (0/0, no feature banners), the `--populated --shadows` typed refusal (rc=1, the deferred-package message); the CI route step's own greps applied to all six logs — live/exact × the three timing series × n=601 + peak RSS — ALL green |
+//! | actionlint + PyYAML strict on the merged workflow | clean / clean |
+
+//! Every evidence line the gates printed is IDENTICAL to verify7's
+//! record — the determinism contract holding across the union, now
+//! witnessed by a direct measurement on the exact tree rather than
+//! carried by the byte-identity proof. Raw logs and the battery
+//! script: `/tmp/opencode/session12-union/` (a `/tmp` path — the
+//! same survival caveat as session 11's).
+
+//! ### The closing loop on this session's own commit
+
+//! This session's commit is documentation-only (this doc; no
+//! `.rs`, no workflow, no pins — the diffstat from `5c9690d` lists
+//! only this doc and the PR-body file, which is unchanged). Gates
+//! for the commit: fmt clean and clippy `-D warnings` (release
+//! form) clean, run on the tip. After the commit: the merge kit
+//! re-executed on the post-commit tips (the union doc gains this
+//! section; the code-subset check against `f02ddef` must stay
+//! zero-files), and the population payload re-verified
+//! byte-identical to the unchanged PR body — the kit README
+//! carries both records.
+
+//! ### Notes for the owner (session 12)
+
+//! `~/OVERNIGHT-DONE` remains correctly absent (the PRs do not
+//! exist; the honest form stands). The morning commands stand
+//! unchanged. The merge-morning tree now carries the same class of
+//! evidence as the branches: every shard, gate, and route directly
+//! measured on the exact tree the kit produces, in addition to
+//! verify7's byte-identity carry. Windows pins remain
+//! platform-uniform inferences, to be confirmed by the merged
+//! candidate's CI run (the honest form; a mismatch is corrected
+//! from actuals, never by weakening a test).
+
