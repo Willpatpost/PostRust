@@ -2871,3 +2871,204 @@
 //! unchanged — the watcher performs the whole delivery from the
 //! canonical bytes the moment a credential returns. The one
 //! action the run needs remains the credential itself.
+
+//! ---
+
+//! ## SESSION 26 ADDENDUM — the first live workbench since
+//! 05:22:24, a NEW askpass signature measured, and the eleventh
+//! direct tip confirmation (2026-11-23, ~16:05 UTC)
+
+//! Session 26 opened the way every session since 15 has — the
+//! blocker re-probed first, the entry state verified — and for
+//! the first time in the run THE ENVIRONMENT CHANGED UNDER THE
+//! BLOCKER: a browser workbench reconnected to code-server at
+//! **16:01:31.241 UTC** (the `remoteagent.log` record:
+//! `[127.0.0.1][f3d518cd][ManagementConnection] New connection
+//! established.`, extension host `670448` = `exthost14` launched
+//! 16:01:31.779) — the first workbench connection since the
+//! overnight sessions ended 05:22:24 (exthost1–13, 04:59–05:22,
+//! each short-lived, all exited by 05:22:24).
+
+//! ### The measured facts of the 16:01 workbench (all from the
+//! code-server logs — attribution beyond "a client through the
+//! workspace proxy" is not measurable from this pod)
+
+//! - Its workspace root is `/var/www`, NOT `~/PostRust`: the git
+//!   extension's initial scan (`exthost14/vscode.git/Git.log`,
+//!   16:01:32.553) ran `git rev-parse --show-toplevel` against
+//!   /var/www and found "not a git repository (or any parent up
+//!   to mount point /var/www)" — repositories (0). The workbench
+//!   did not open the repo.
+//! - No GitHub sign-in: `exthost14/vscode.github/GitHub.log`
+//!   holds exactly ONE line (its 16:01:32.713 log-level line) —
+//!   no auth session, no token activity; and the
+//!   `vscode.github-authentication` extension dir (present in the
+//!   overnight exthost13) does NOT exist in exthost14 — the auth
+//!   provider never activated.
+//! - No terminal: `ptyhost.log` is untouched since 05:12:37 — no
+//!   terminal has been opened in the new workbench.
+//! - Its askpass socket `/tmp/vscode-git-44eae31ccd.sock`
+//!   (created 16:01) is the FIRST socket of the run that ACCEPTS
+//!   a raw AF_UNIX connect (CONNECT-OK; the 05:09 socket
+//!   `e7dd8c37b3` beside it stays ConnectionRefused).
+
+//! ### The NEW askpass signature (the session-14/15 record
+//! extended by direct measurement)
+
+//! The run's askpass record now holds THREE measured states:
+
+//! 1. **dead** — raw connect ConnectionRefused, fill stderr
+//!   ECONNREFUSED, no token (session 15's correct reading; the
+//!   state of both sockets from ~05:25 through 16:00).
+//! 2. **"live-but-empty"** — session 14's 13:14 claim; re-measured
+//!   by session 15 and corrected to a MISRECORD (the sockets were
+//!   dead then; no extension host existed 05:22–16:01).
+//! 3. **live-accepting, unanswered** — NEW, measured by this
+//!   session (16:04 probe and the 16:11:33 battery step, agreeing
+//!   exactly): the socket ACCEPTS the connection, but
+//!   `git credential fill` through it produces NO password line
+//!   and no error — it hangs to its timeout (fill exit 124 at
+//!   the battery's 8 s bound). The askpass server is listening
+//!   inside exthost14 but has no GitHub credential to answer
+//!   with — consistent with the one-line GitHub.log above. This
+//!   is the signature of a live workbench ONE SIGN-IN AWAY from
+//!   arming the delivery.
+
+//! The watcher's behavior in the new topology is measured-correct:
+//! its `ls -t` socket selection picks the 16:01 socket (newest
+//! mtime — a returning session's fresh socket cannot be masked,
+//! the session-9 audit), the `timeout 10`-bounded fill inside its
+//! 60 s loop yields no token, the >20-char guard is not met, and
+//! the watcher stays silent — `~/push-watcher.log` remains
+//! start-lines-only (verified at entry and at battery exit), no
+//! misfire. The hang is bounded by the timeout; the loop stays
+//! ~60 s cadenced.
+
+//! ### What the new state means for the delivery (the morning
+//! map, one fact firmer)
+
+//! The documented morning trigger — "signing into GitHub inside
+//! code-server is itself a sufficient morning trigger" — is now
+//! IMMEDIATELY available to whoever holds the 16:01 browser
+//! session: one GitHub sign-in in that workbench lands the
+//! credential in exthost14's secret storage, the askpass answers
+//! the watcher's next fill, and the whole four-branch delivery
+//! (push + four draft PRs from the pinned payloads) fires within
+//! ~70 s. The watcher is armed and healthy (PID 442510, the
+//! supervisor's re-arm backstop under it); the payloads are
+//! pinned and twin-identical (verified fresh this session — the
+//! 16:01:33 session-25 regen a proven no-op at `7cd9b1b9`); the
+//! remote is undrifted (only `main` at `1fe89b7`). If instead the
+//! browser session is an unattended reconnect (e.g. a machine
+//! waking from sleep with the workbench tab open) and nobody
+//! signs in, the blocker stands exactly as documented and the
+//! manual morning commands remain the path. **No attribution is
+//! claimed** — "a client through the workspace proxy" is the
+//! measurable boundary; the run records the fact and the two
+//! readings, and the delivery is correct under both.
+
+//! ### The battery — the standard form, on the entry tip `d08c82a`
+
+//! One battery (`~/verify22-session26/session26-battery.sh`,
+//! expectations pinned to the measured records, a mismatch a
+//! finding; checkouts between existing tips only, a trap
+//! restoring the population checkout on every exit path; the
+//! 6-E2 shard family untouched in the standing `wt-6e2`
+//! worktree, clean before and after) — **81 green checks / zero
+//! FAIL**, 16:11:32–16:15:51 UTC, raw logs born persistent in
+//! `~/verify22-session26/`:
+
+//! - **the blocker, three discriminators + the new topology**:
+//!   dry-run exit 128 "No anonymous write access"; the 16:01
+//!   socket live-accepting (raw CONNECT-OK, fill exit 124, no
+//!   token), the 05:09 socket dead (raw ConnectionRefused, fill
+//!   stderr ECONNREFUSED); no gh, no token env, no
+//!   `~/.git-credentials`, no `~/.netrc`, `~/.ssh` only
+//!   known_hosts; the watcher correctly not fired.
+//! - **the 16:01 workbench, seven measured facts** (the 0a-bis
+//!   step, new this session): exthost14 exists and its extension
+//!   host process is alive; the 16:01:31 connection is the last
+//!   on record (14 ManagementConnections total since the 04:59
+//!   boot); its GitHub.log holds exactly 1 line; no
+//!   `vscode.github-authentication` dir; `ptyhost.log` untouched
+//!   since 05:12:37; its workspace root `/var/www` (the git scan
+//!   found zero repositories).
+//! - **the delivery chain**: all four payload bodies
+//!   byte-identical to their branch PR-body files (`a90cc2fd` /
+//!   `1b91fdcd` / `65d85477` / `81385ae9`; 26,319 / 28,027 /
+//!   25,959 / 26,026 bytes), payload file shas matching the
+//!   README pins (`6deda5e6` / `327c9d3f` / `7cd9b1b9` /
+//!   `a39c6102`), twins identical, the stack parsed (bases
+//!   main / main / 6-E / population, `draft: true` everywhere),
+//!   the docs-only proof per branch (impl..tip = 2 doc files
+//!   each), engine-core zero-diff vs main on all four branches,
+//!   `git fsck --full --strict` clean, the counting awk
+//!   ground-truthed on session-25's raw logs, and the lavapipe
+//!   environment functional without re-provision (llvmpipe LLVM
+//!   20.1.2, Mesa 25.2.8, Vulkan API 1.4.318).
+//! - **the population graphical linchpin DIRECTLY on `d08c82a`**
+//!   (eleventh direct branch-tip confirmation, its first on this
+//!   tip): rc=0, 2 passed — the 24+2 table (26 instances 24/2
+//!   npc/vehicle, per-object 26 == instanced 2 draws, byte-equal
+//!   frames, ink 2,745/65,536, warmed `device_memory` 18
+//!   constant across warmed frames) and the 13-instance fixture
+//!   (13 == 2, byte-equal, ink 3,728, both single-instance oracle
+//!   walls 0/255 over 57,600 pixels, the pipeline-replacement
+//!   lifecycle 18 → 38, delta 20) — every pinned line IDENTICAL
+//!   to the session-18/15/7/21/22/23/24/25 records (warm build
+//!   0.13 s, tests 0.47 s; session 25's identical-tree run
+//!   measured 0.45 s).
+//! - **the population CPU battery (the CI's own commands, clean
+//!   env)**: fmt clean (3 s), clippy clean in BOTH forms
+//!   (cached), the main shard **1142/2/33** (rc=0, 82 s), the
+//!   renderer release battery **65/0/2** (rc=0, 0.03 s test
+//!   time — the pure-CPU unit battery), the heavy shard
+//!   **576/11/58** (rc=0, 155 s) — every count the branch pin,
+//!   identical to session 25's direct run on the parent tip
+//!   `40c7f2b`.
+
+//! The sibling branches were NOT re-measured this session: their
+//! tips are unmoved since session 11, and sessions 18 (linchpin),
+//! 19 (CPU ×2, runs 1+2), and 20 (workflow lint) measured each
+//! directly on those exact tips — the saturated state. The
+//! merge-morning union was likewise not re-batteried this session:
+//! session 21's third direct full battery ran on a union of the
+//! same code bytes, and the docs-only carry is the sanctioned
+//! form for doc-only deltas; the merge kit's post-commit
+//! re-execution below re-proves the code-subset identity on the
+//! exact post-commit tips.
+
+//! ### The closing loop on this session's own commit
+
+//! Documentation only — this handoff doc and the population PR
+//! body's tip statement; no `.rs`, no workflow, no pins, no
+//! test. Gates for the commit: `cargo fmt --all -- --check`
+//! clean and `cargo clippy --workspace --all-targets --release
+//! -- -D warnings` clean — run on this tip by the battery itself
+//! (the pre-commit tree's code bytes are identical to the
+//! post-commit tree's; re-verified after the doc edits). After
+//! the commit: the population payload regenerated from the
+//! refreshed body via the established script (both copies,
+//! JSON-validated; the sha recorded in the push-handoff README
+//! pins), the other three payloads re-verified byte-unchanged
+//! no-ops, and the merge kit re-executed on the post-commit tips
+//! (the union doc gains this section; the code-subset check
+//! against `f02ddef` must stay zero files) — the kit README
+//! carries the run record.
+
+//! ### Notes for the owner (session 26)
+
+//! `~/OVERNIGHT-DONE` remains correctly absent (the PRs do not
+//! exist; the honest form stands). The one action the run needs
+//! remains the credential itself — and as of 16:01:31 there is a
+//! live workbench one GitHub sign-in away from arming it: sign
+//! into GitHub inside code-server (any browser session on this
+//! pod) and the watcher performs the whole delivery within ~70 s;
+//! or run the morning commands from any credentialed machine.
+//! The endgame after the PRs exist: the five-job CI runs on each
+//! pull_request; when all four PRs are green, the next session
+//! (or you) creates `~/OVERNIGHT-DONE` and leaves the final
+//! summary comment on the last PR — the repo is public (anonymous
+//! read measured, the session-8 record), so CI status is readable
+//! anonymously via `api.github.com`, and the comment token comes
+//! from the same askpass the watcher uses.

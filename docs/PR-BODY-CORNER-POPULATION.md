@@ -420,7 +420,7 @@ entry tips and the post-session-11 tips.
 
 **The tip statement (supersedes the one above):** the branch tip is
 the package commit `5c9690d` + the run-wide handoff doc (`cb92088`)
-+ the per-session documentation commits for sessions 4 through 25
++ the per-session documentation commits for sessions 4 through 26
 (payload sync, direct shard verification, the run-wide session 6–10
 addenda, the session-11 census refresh, the session-12/13 union
 batteries and raw-evidence persistence, the session-14/15
@@ -435,10 +435,16 @@ battery on the entry tips, session 22's population
 linchpin-and-CPU re-measurement on the entry tip `f4b4db7`,
 session 23's population linchpin-and-CPU re-measurement on the
 entry tip `e2c1c49`, session 24's population
-linchpin-and-CPU re-measurement on the entry tip `ec6bf5e`, and
-this session's population linchpin-and-CPU re-measurement on the
-entry tip `40c7f2b`, refreshing this statement). Every commit
-beyond `5c9690d` remains documentation only —
+linchpin-and-CPU re-measurement on the entry tip `ec6bf5e`,
+session 25's population linchpin-and-CPU re-measurement on the
+entry tip `40c7f2b`, and session 26's population
+linchpin-and-CPU re-measurement on the entry tip `d08c82a`
+together with the run's first live-workbench blocker-state record
+(the 16:01:31 UTC code-server workbench — live-accepting
+unanswered askpass socket, no GitHub sign-in, the morning trigger
+one sign-in away; the full measured record is the SESSION 26
+ADDENDUM in the handoff doc), refreshing this statement). Every
+commit beyond `5c9690d` remains documentation only —
 `git diff --name-only 5c9690d..HEAD` lists only
 `docs/OVERNIGHT-HANDOFF-2026-11-23.md` and this file; no code, no
 workflow, no pins, and engine-core untouched throughout.
