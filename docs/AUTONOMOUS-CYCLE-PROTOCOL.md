@@ -103,6 +103,25 @@ reads it as information). An all-night thrash on one wall — or worse,
 a "fix" that weakens a gate to get past it — is the failure mode
 this section exists to prevent. **Never debug by changing tests.**
 
+### 3.1 Runner flakes (known, on record, not yours to fix)
+
+A CI failure in a test **your diff does not touch**, which has passed
+in other runs of the same code, is a runner flake. Three are on
+record from 2026-11-23 alone: the spine-allocation pin (libtest's
+main-thread mpmc waker — fixed by thread attribution), the persist
+setup helper (transient filesystem `Unknown` — fixed by
+reconciliation), and the `s6_soak` late-window fsync race (a
+726 ms runner stall letting the WAL fsync land before the hard exit
+— a wall-clock race in the test's setup, open). The protocol for a
+suspected flake: **rerun the failed job once**
+(`gh run rerun --failed -R Willpatpost/PostRust <run-id>`), document
+the occurrence and your diff-relevance analysis in the PR, and if it
+fails twice leave it red with the analysis — never modify the test,
+never weaken the gate, never "fix" engine code a flake implicated
+without the full investigation discipline (the allocation flake's
+root-cause record in `spine_allocations.rs`'s module docs is the
+standard your analysis should aim for).
+
 ## 4. What the morning audit checks (write for it)
 
 Every PR is audited against: scope (the diff is the brief, nothing

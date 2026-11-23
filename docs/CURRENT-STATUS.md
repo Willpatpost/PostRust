@@ -446,6 +446,21 @@ The following audit finding remains genuinely open:
   follow-up tightening).
 - The entity-scale benchmark's 5k/20k dead-chain read-through (§7): the
   historical at-scale evidence is one-1000-chain steady state.
+- **The s6_soak late-window fsync race (flake C, 2026-11-23, macOS run
+  45104773498):** `deterministic_late_window_hard_exit_control_recovers`
+  assumes the tick-3300 publication's WAL fsync cannot complete within
+  the five sim ticks before the controlled hard exit ("the pure-sim
+  ticks between always outrun the fsync") — but a 726 ms runner stall
+  on the sim path let the fsync land first (the campaign recovered at
+  tick 3300, not the asserted 3054). A genuine wall-clock race in the
+  test's SETUP, not an engine defect (recovery, conservation, and
+  close integrity all held). The principled fix — a test-only
+  fsync-timing control (a fault-seam delay in the journal path making
+  the in-flight state deterministic) — is an open engine-persist
+  package; until then the test may flake rarely on contended runners
+  (the third 2026-11-23 runner-timing flake; see
+  `docs/AUTONOMOUS-CYCLE-PROTOCOL.md` §3.1 for the rerun-once
+  protocol).
 - Sustained-load scale is QUALIFIED with composition-dependent
   interpretations (sustainable at 1k across scenarios; at 5k the full and
   mixed compositions genuinely overload the 200/tick budget while
