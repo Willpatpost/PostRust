@@ -73,6 +73,11 @@ Interactive modes
   --corner --sky                     The sky layer behind the scene (Era 1: the
                                     atmosphere_at day/night palette + the sun or
                                     moon disc; composes with every corner flag)
+  --corner --day-night <seconds>     The day/night cycle (Era 1: the period in
+                                    seconds; the atmosphere advances with the
+                                    demo clock — the light and the sky ride the
+                                    same atmosphere_at frame; implies the sky
+                                    layer)
   --corner --free-look               Interactive WASD + mouse camera (Era 1's
                                     eyeball mode — presentation only, the camera
                                     never enters a measured claim; starts on the
@@ -536,6 +541,7 @@ fn main() {
             let mut proxy_instanced = false;
             let mut shadows = false;
             let mut sky = false;
+            let mut day_night: Option<f32> = None;
             let mut free_look = false;
             let mut free_look_frames: Option<u64> = None;
             let mut fps = 60;
@@ -563,6 +569,24 @@ fn main() {
                     // flag — the eyeball form is --corner
                     // --free-look --sky).
                     "--sky" => sky = true,
+                    // Era 1 package 4: the day/night cycle — the
+                    // period in seconds (the atmosphere advances
+                    // with the demo clock; implies the sky layer).
+                    "--day-night" => {
+                        let period = options
+                            .next()
+                            .ok_or("--day-night requires a period in seconds")?
+                            .parse::<f32>()
+                            .map_err(|_| "--day-night requires a numeric period")?;
+                        // Typed refusal, never a silent clamp: the
+                        // period must be a positive finite number.
+                        if !period.is_finite() || period <= 0.0 {
+                            return Err(
+                                "--day-night requires a positive finite period in seconds".into()
+                            );
+                        }
+                        day_night = Some(period);
+                    }
                     // Era 1 package 1: the interactive eyeball
                     // camera (presentation only; the scripted
                     // measurement route is the default without it).
@@ -622,6 +646,7 @@ fn main() {
                     frames: free_look_frames,
                 }),
                 sky,
+                day_night,
             )
         };
         if let Err(e) = run() {

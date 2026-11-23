@@ -287,6 +287,7 @@ pub fn run(
     shadows: bool,
     free_look: Option<FreeLookOptions>,
     sky: bool,
+    day_night: Option<f32>,
 ) -> Result<(), String> {
     let mut app = ShellApp::new(ShellConfig {
         title: "One Corner of the City".into(),
@@ -368,6 +369,15 @@ pub fn run(
                 .into(),
         );
     }
+    // Era 1 package 4: the day/night cycle drives the atmosphere
+    // (the light AND the sky) from the day endpoint — a static
+    // --night start alongside it is contradictory, refused upfront.
+    if night && day_night.is_some() {
+        return Err(
+            "--night and --day-night together is contradictory (the cycle drives the preset from day)"
+                .into(),
+        );
+    }
     let stats = renderer.stats();
     let size = stats.extent;
     let preset = if night { "night" } else { "day" };
@@ -415,9 +425,18 @@ pub fn run(
         );
     }
     let aspect = size.0 as f32 / size.1 as f32;
-    let light = if night { night_preset() } else { day_preset() };
+    let mut light = if night { night_preset() } else { day_preset() };
     let bias = demo_bias();
     let pace = (fps > 0).then(|| Duration::from_secs_f64(1. / f64::from(fps)));
+    // Era 1 package 4: the day/night cycle's banner (the wiring
+    // below advances the atmosphere — the light AND the sky layer,
+    // which the cycle implies — with each loop's own demo clock).
+    if let Some(period) = day_night {
+        println!(
+            "day/night cycle: {period}s period (the atmosphere advances with the demo clock; \
+             the sky and the lit scene ride the same atmosphere_at frame)"
+        );
+    }
     // Era 1's free-look: the interactive eyeball camera returns its
     // own presentation-only summary; the scripted measurement route
     // below is untouched (its series print only when the mode is off).
@@ -429,6 +448,7 @@ pub fn run(
             shadows,
             light,
             bias,
+            day_night,
             options,
             pace,
         );
@@ -450,6 +470,21 @@ pub fn run(
         }
         if measured.contains(&i) {
             pose = poses.next().unwrap();
+        }
+        // Era 1 package 4: the atmosphere advances with the demo
+        // clock — the presented-frame count at the route's own
+        // reference 60 Hz cadence (deterministic: frame k always
+        // shows cycle position t_k; the measurement series are
+        // untouched — the same submission work per frame).
+        if let Some(period) = day_night {
+            let atmosphere = engine_renderer::sky::atmosphere_at(
+                engine_renderer::sky::cycle_position(i as f32 / 60.0, period),
+            );
+            light = atmosphere.light;
+            renderer.set_sky(Some(engine_renderer::SkyFrame {
+                palette: atmosphere.sky,
+                disc_dir: atmosphere.disc_dir,
+            }));
         }
         let matrix = view_projection(pose, aspect);
         // Submission selection: the shadowed route (6-F) or the
@@ -532,8 +567,9 @@ fn run_free_look(
     renderer: &mut Renderer,
     population: Option<&ProxyPopulation<'_>>,
     shadows: bool,
-    light: LightParams,
+    mut light: LightParams,
     bias: engine_renderer::shadows::ShadowBias,
+    day_night: Option<f32>,
     options: FreeLookOptions,
     pace: Option<Duration>,
 ) -> Result<(), String> {
@@ -567,6 +603,22 @@ fn run_free_look(
         // frames (no presentation, no movement — the render-demo
         // discipline).
         let split = timing.begin_frame(frame_start, !snapshot.minimized);
+        // Era 1 package 4: the free-look clock drives the cycle (the
+        // wall elapsed time FrameTiming accumulates — presentation
+        // policy only; the interactive session makes no measured
+        // claim).
+        if let Some(period) = day_night {
+            let atmosphere =
+                engine_renderer::sky::atmosphere_at(engine_renderer::sky::cycle_position(
+                    timing.total_sim_advanced().as_secs_f32(),
+                    period,
+                ));
+            light = atmosphere.light;
+            renderer.set_sky(Some(engine_renderer::SkyFrame {
+                palette: atmosphere.sky,
+                disc_dir: atmosphere.disc_dir,
+            }));
+        }
         if snapshot.minimized {
             std::thread::sleep(Duration::from_millis(50));
             continue;

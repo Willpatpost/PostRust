@@ -112,7 +112,13 @@ ARM64) with a five-job CI:
   mirroring `sky.rs`'s equation; the palette and disc direction from
   `atmosphere_at`; the CPU-computed inverse view-projection driving
   the ray reconstruction) — lazily created, and a fully-covered
-  frame stays byte-identical with the sky on and off.
+  frame stays byte-identical with the sky on and off. The Era-1
+  **day/night cycle** (`--corner --day-night <seconds>`): the
+  triangle-wave clock (`sky::cycle_position`) advances the
+  atmosphere with the demo clock — the lit scene's light parameters
+  and the sky layer ride the same `atmosphere_at` frame each frame
+  (the free-look path uses the wall clock; the scripted route the
+  presented-frame count at its reference 60 Hz, deterministic).
 - **`engine-shell`** — the SDL3 application shell (statically-linked vendored
   SDL 3.4.18; real window + offscreen/dummy modes).
 - **`engine-slice`** — the integration/demo driver: the stdin CLI, `--window`,

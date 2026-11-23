@@ -260,6 +260,21 @@ pub fn atmosphere_at(t: f32) -> AtmosphereFrame {
     }
 }
 
+/// The day/night CYCLE position for a demo-clock reading: the
+/// triangle wave over the period — `t` advances 0→1 over the first
+/// half (day→night) and back 1→0 over the second (night→day),
+/// smooth at both endpoints (no sunrise snap), every intermediate
+/// value the deterministic [`atmosphere_at`] blend. `elapsed` may
+/// run arbitrarily long or negative (the phase wraps through
+/// `rem_euclid`); `period` must be positive (the CLI validates —
+/// the caller's contract).
+pub fn cycle_position(elapsed_seconds: f32, period_seconds: f32) -> f32 {
+    // The phase advances over HALF periods: 0→1 across the first
+    // half (day→night), 1→0 across the second (night→day).
+    let phase = (elapsed_seconds / period_seconds * 2.0).rem_euclid(2.0);
+    if phase <= 1.0 { phase } else { 2.0 - phase }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,6 +494,63 @@ mod tests {
                 assert!(length > 0.0, "depth {depth}: in front of the camera");
             }
         }
+    }
+
+    /// The day/night cycle's clock: the triangle wave advances
+    /// 0→1 over the first half period and back over the second,
+    /// wraps for arbitrarily long (or negative) elapsed times, and
+    /// composed with `atmosphere_at` the endpoints are EXACTLY the
+    /// presets (the brief's gate — the full wiring's endpoints,
+    /// bit-equal through the cycle, not just through direct t).
+    #[test]
+    fn cycle_position_is_the_triangle_wave_with_preset_endpoints() {
+        let period = 20.0f32;
+        // The endpoints and halves, hand-computed.
+        assert_eq!(cycle_position(0.0, period), 0.0);
+        assert_eq!(cycle_position(5.0, period), 0.5);
+        assert_eq!(cycle_position(10.0, period), 1.0);
+        assert_eq!(cycle_position(15.0, period), 0.5);
+        assert_eq!(cycle_position(20.0, period), 0.0);
+        // The wraparound: two periods later, the same positions (the
+        // 41 s entry carries float phase arithmetic — tolerance).
+        for (elapsed, expected) in [(25.0, 0.5), (30.0, 1.0), (41.0, 0.1), (60.0, 0.0)] {
+            let position = cycle_position(elapsed, period);
+            assert!(
+                (position - expected).abs() < 1e-5,
+                "{elapsed}s: {position} vs {expected}"
+            );
+        }
+        // Negative elapsed wraps forward (rem_euclid).
+        assert_eq!(cycle_position(-10.0, period), 1.0);
+        assert_eq!(cycle_position(-15.0, period), 0.5);
+        // Monotone up the first half period (elapsed 0→10 s),
+        // down the second (10→20 s) — no snap anywhere.
+        let mut last = 0.0f32;
+        for step in 0..=40 {
+            let elapsed = step as f32 * 0.5;
+            let t = cycle_position(elapsed, period);
+            if step <= 20 {
+                assert!(t >= last, "rising at {elapsed}s: {t} after {last}");
+            } else {
+                assert!(t <= last, "falling at {elapsed}s: {t} after {last}");
+            }
+            last = t;
+        }
+        // THE ENDPOINT COMPOSITION (the wiring's gate): the cycle's
+        // day and night instants are BIT-EQUAL to the presets.
+        assert_eq!(
+            atmosphere_at(cycle_position(0.0, period)).light,
+            crate::lit_scene::day_preset()
+        );
+        assert_eq!(atmosphere_at(cycle_position(0.0, period)).sky, day_sky());
+        assert_eq!(
+            atmosphere_at(cycle_position(10.0, period)).light,
+            crate::lit_scene::night_preset()
+        );
+        assert_eq!(atmosphere_at(cycle_position(10.0, period)).sky, night_sky());
+        // And a full period later, dawn again — the same day bit
+        // for bit.
+        assert_eq!(atmosphere_at(cycle_position(20.0, period)).sky, day_sky());
     }
 
     fn mul4(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
