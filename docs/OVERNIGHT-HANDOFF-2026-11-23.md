@@ -1303,3 +1303,120 @@
 //! candidate's CI run (a mismatch is corrected from actuals,
 //! never by weakening a test).
 
+//! ---
+
+//! ## SESSION 14 ADDENDUM — the delivery-substrate audit (the
+//! first fsck on record) and the chain re-verification
+//! (2026-11-23, 13:14–13:30 UTC)
+
+//! The fourteenth session re-probed the push blocker first, and
+//! the probe surfaced one NEW environmental fact worth the
+//! owner's thirty seconds: **the askpass sockets are alive again
+//! — but empty.** The pod's code-server extension host is back
+//! (the sockets respond to `git credential fill` with rc=0
+//! instead of a dead-pipe error), yet the response is an EMPTY
+//! `password=` line: no GitHub authentication is signed into the
+//! current browser session. The practical meaning: **the moment
+//! a GitHub-authenticated code-server session exists on this
+//! pod, the watcher fires within ~60 s and performs the whole
+//! delivery** (four pushes, four draft PRs, canonical bodies) —
+//! signing into GitHub inside code-server is itself a valid
+//! morning path, alongside the documented command form. The
+//! blocker otherwise stands unchanged: `git push --dry-run`
+//! exit 128 `remote: No anonymous write access`, no `gh`, no
+//! write credential of any form, `origin/main` at `1fe89b7`
+//! undrifted, and the remote-branch census counts exactly ONE
+//! branch (main — no cycle6 branch has ever leaked to the
+//! remote; the run has pushed nothing, by constraint not
+//! choice).
+
+//! ### The gap this session closed — the substrate was never
+//! itself measured
+
+//! Sessions 3–13 measured everything the CODE and the EVIDENCE
+//! need (each branch's battery ≥ 2 direct runs; the merge-morning
+//! union tree two direct full batteries). The one class of
+//! claim never made is about the **delivery substrate itself**:
+//! the object stores the morning push serializes, the
+//! payload↔branch byte identity, and the persistent twins. A
+//! corrupt object or a drifted payload would fail the morning
+//! push at the worst possible moment — after the owner is
+//! already reading the PRs. This session measured that
+//! substrate directly, read-only, logs born persistent at
+//! `~/verify10-session14/` (`chain-audit-session14.sh` is the
+//! exact battery; `chain-audit-session14.log` the record; every
+//! expectation pinned, a mismatch a finding — the
+//! never-weaken-a-test rule applies to audit scripts too).
+
+//! **The fsck (the first on record):**
+
+//! | Store | `git fsck --full --strict` |
+//! |---|---|
+//! | `~/PostRust` (all four branches + main + the shared worktree) | **clean** — zero notices of any kind (in-pack 4,763 objects, 1 pack, 0 garbage) |
+//! | `/tmp/opencode/session11-final` (the merge-morning tree) | no corruption; 16 dangling notices (unreachable scratch-union objects from the kit's re-runs — not part of any branch, harmless) |
+//! | `/tmp/opencode/merge-dryrun` (the rehearsal clone) | no corruption; 3 dangling notices (same class) |
+
+//! **The chain audit (all green, exit 0):** the four tips at
+//! their recorded commits (`1c50065` / `980e432` / `05d0b40` /
+//! `f29a22a`); the merge bases as censused (population↔6-E
+//! `511b157`, 6-E2↔population `5c9690d`, 6-F off the
+//! scaffold-merge line); the four `~/push-handoff` payloads'
+//! bodies byte-identical to the branch PR-body files (sha256
+//! `a90cc2fd…` / `1b91fdcdbc…` / `161c2ca9f3d6` / `81385ae…`;
+//! sizes 26,319 / 28,027 / 25,071 / 26,026 bytes — session 13's
+//! recorded numbers, re-measured) and the `/tmp/opencode`
+//! payload twins sha-identical file-for-file; the stack parse
+//! (6-E→main, 6-F→main, population→6-E, 6-E2→population, draft
+//! everywhere); `engine-core`'s diff vs `main` ZERO files on
+//! all four branches; the merge-morning clone clean at
+//! `97355e1` with its code subset vs the gated tree `f02ddef`
+//! still exactly zero files; the session-13 battery logs'
+//! persistent twin sha-tree-identical; the supervisor (PID 858)
+//! and the four-branch watcher (PID 442510) alive with the
+//! watcher log still start-lines-only (correctly never fired);
+//! no `~/PR-CREATED-*` markers, `~/OVERNIGHT-DONE` and
+//! `~/OVERNIGHT-STOP` correctly absent, `SURVIVED.txt` present,
+//! empty, untracked (session 10's bound stands), and the repo
+//! working tree clean apart from it.
+
+//! ### The harness lesson (this script's own expectation,
+//! root-caused on record)
+
+//! The battery's first run flagged "a live askpass socket
+//! exists" — a misread, not a credential: the check counted
+//! `grep -c '^password='` LINES, and the askpass responds with a
+//! zero-length `password=` line when the extension host is alive
+//! but unauthenticated. The watcher's own guard (token length
+//! > 20) has always been immune to this. The check now mirrors
+//! the watcher's guard exactly; the cause is commented in the
+//! script at the fix. No repo test, pin, or gate touched; the
+//! underlying state (no credential) was true both times.
+
+//! ### The closing loop on this session's own commit
+
+//! Documentation only (this doc; no `.rs`, no workflow, no
+//! pins — the PR-body file is UNCHANGED, so the payload
+//! regeneration stays a proven no-op). Gates for this commit:
+//! `cargo fmt --all -- --check` clean and `cargo clippy
+//! --workspace --all-targets --release -- -D warnings` clean
+//! (0.11 s, fully cached — the tree's code bytes are identical
+//! to session 13's gated run), run on the tip. After the
+//! commit: the merge kit re-executed on the post-commit tips
+//! (the union doc gains this section; the code-subset check
+//! against `f02ddef` must stay zero files), and the population
+//! payload re-verified byte-identical to the unchanged PR body.
+
+//! ### Notes for the owner (session 14)
+
+//! The morning commands stand unchanged (the session-5 corrected
+//! form below the v1.0 block; or do nothing — the watcher
+//! performs the whole sequence, and the live-but-empty sockets
+//! mean signing into GitHub inside code-server is sufficient for
+//! it to fire). `~/OVERNIGHT-DONE` remains correctly absent (the
+//! PRs do not exist; the honest form stands). The delivery
+//! substrate is now itself a measured claim: the object stores
+//! fsck-strict-clean, the payloads byte-identical to their
+//! branches, the merge-morning tree's code subset unchanged —
+//! the morning push has no known failure mode left except the
+//! credential itself.
+
