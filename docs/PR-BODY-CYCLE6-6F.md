@@ -360,3 +360,55 @@ commit beyond `96dee7c` is documentation only — `git diff
 --name-only 96dee7c..HEAD` lists only
 `docs/OVERNIGHT-HANDOFF-2026-11-23.md` and this file; no code, no
 workflow, no pins.
+
+### Session 11 — the merge census refreshed on the current tips; the resolution kit (2026-11-23, the ~12:30 UTC session)
+
+The merge-order sections above were measured on the 10:13 UTC tips.
+Sessions 4–10 then committed this run's per-branch documentation
+(each branch's session addenda to
+`docs/OVERNIGHT-HANDOFF-2026-11-23.md`, plus the session-5 PR-body
+files) on that one shared path — and no census had re-measured the
+merges since. The session-11 census did (`git merge-tree` on the
+current tips; the full record is the SESSION 11 ADDENDUM in the
+handoff doc on the population branch):
+
+- **This PR is the grown step.** Its 10:13 census's 8 code files /
+  31 hunks are UNCHANGED on the current tips (re-measured per
+  file: vulkan 9, engine-ci 6, renderer 5, main 4, CURRENT-STATUS
+  3, corner_demo 2, corner 1, lib 1 — the code untouched since),
+  plus the same handoff-doc add/add the per-branch documentation
+  introduced everywhere (10 hunks at these tips): **9 files / 41
+  hunks** when merged against the full stack.
+- **The stack steps changed shape** (no code involved):
+  population (base `511b157`) and 6-E2 (base `5c9690d`) no longer
+  fast-forward onto the stack — each conflicts add/add on exactly
+  the handoff doc, zero code conflicts.
+
+`~/push-handoff/merge-kit/merge-morning.sh` performs the owner's
+whole merge order on a scratch branch from main and NEVER pushes:
+at every step the handoff doc resolves to the mechanical union of
+the four branch versions (computed at run time from the branch
+refs, so it cannot drift), and THIS PR's 8 code files via verify7's
+gated resolution patch restricted to the conflicted set (the
+merge brings this branch's new files and build.rs in cleanly; the
+patch weaves only the conflicted set — an unrestricted apply
+double-applies and refuses). Executed end-to-end this session
+(rc=0, every step mechanical; the union doc blob identical across
+all three resolution steps — deterministic): the resulting
+four-way union's code subset is **byte-identical to verify7's
+fully-gated tree `f02ddef`** (zero files differ outside the
+handoff doc and the PR-body files), so verify7's measured battery
+(fmt/clippy clean, main 1154/2/33, release 77/2, heavy 576/13/59,
+every lavapipe gate green) carries to the union by the docs-only
+proof — and this session's own fresh fmt and clippy `-D warnings`
+runs on the union tree were both clean. The kit README carries
+the run records for the entry tips and the post-session-11 tips.
+
+**The tip statement (supersedes the one above):** the branch tip is
+the package commit `96dee7c` + the run-wide handoff doc
+(`4b5b228`) + the per-session documentation commits for sessions 4
+through 7 and this session's census-refresh commit adding this
+section. Every commit beyond `96dee7c` remains documentation only —
+`git diff --name-only 96dee7c..HEAD` lists only
+`docs/OVERNIGHT-HANDOFF-2026-11-23.md` and this file; no code, no
+workflow, no pins, and engine-core untouched throughout.
