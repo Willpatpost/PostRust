@@ -325,3 +325,51 @@ workflow, no pins. This PR's base is the 6-E branch's tip, so the
 diff is the population package commit plus the handoff-doc
 evolution between the two branches' addenda (documentation only —
 the 6-E code itself sits in the base and is not re-diffed here).
+
+---
+
+### Session 6 — the direct clean-environment shard verification (2026-11-23, the ~11:30 UTC session)
+
+The one evidence gap this branch still carried: session 4's
+main-shard confirmation was measured on the **6-E tree** (whose
+main-shard test set this branch shares exactly — an inference,
+documented as such at the time), and the **heavy shard** had only
+session 3's single direct run — both predating the
+clean-environment discipline the 6-F lane's polluted-env FAIL
+established. Session 6 closed the gap: every CI shard command
+**verbatim** (the workflow's own awk counting), in a shell with
+**no SDL/VK variables of any kind**, directly on this branch's tip
+(`7fed835` at run time — docs-only above the package commit, so
+the code tree is exactly `5c9690d`'s; this section's commit is
+docs-only too):
+
+| Step (all MEASURED this session, this tip) | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` (the CI form) | clean |
+| `cargo clippy --workspace --all-targets --release -- -D warnings` (the standing-order form) | clean |
+| **the full main shard** (`--workspace --exclude engine-slice --features engine-persist/composite-test-fixture`) | **1142 passed / 2 ignored / 33 result lines, rc=0, zero failures — the branch pin, the FIRST direct clean-environment run on this branch's own tree** (session 3's 1142/2/33 and session 4's 6-E-tree run now both independently confirmed on this tree) |
+| **the full heavy shard** (`-p engine-slice --features engine-slice/crash-test-seams`) | **576 passed / 11 ignored / 58 result lines, rc=0, zero failures — the branch pin, its first post-clean-discipline direct run (session 3's 576/11/58 re-confirmed)** |
+| the renderer release battery (`-p engine-renderer --release`) | 65/2, rc=0 — the branch pin |
+| the `render_instanced` lavapipe gate (`--ignored --nocapture`, the pod's user-local mesa 25.2.8) | BOTH gates green, rc=0 — the full 24+2 table: 26 instances, per-object 26 == instanced 2 draws, byte-equal frames, ink 2745/65536, warmed `device_memory` 18 constant, zero per-frame allocation; the 13-instance fixture: 13 == 2 draws, byte-equal, ink 3728, single-instance oracles 0/255 on both materials, the pipeline-replacement lifecycle (`device_memory` 18 → 38) — the third independent confirmation of this PR's linchpin on this tip |
+
+Raw logs: `/tmp/opencode/session6-population/` on the pod (a /tmp
+path — may not survive a pod restart; the numbers in this section
+are the durable record). The watcher payloads and their
+`~/push-handoff` twins were regenerated from this file
+byte-for-byte after this section landed (the session-5
+single-source discipline; the regeneration script was first proven
+a byte-identical no-op on the unchanged body, sha256 `7343a3eb`).
+
+**The tip statement (supersedes the one above):** the pushed tip is
+this branch's head = the package commit `5c9690d` + the run-wide
+handoff doc (`cb92088`) + session 4's addendum (`4c5edbf`) + session
+5's payload-sync commit (`7fed835`) + session 6's
+direct-verification addendum (the commit adding this section).
+Every commit beyond `5c9690d` is documentation only — `git diff
+--name-only 5c9690d..HEAD` lists only
+`docs/OVERNIGHT-HANDOFF-2026-11-23.md` and this file; no code, no
+workflow, no pins. This PR's base is the 6-E branch's tip, so the
+code diff remains the population package commit plus the
+handoff-doc evolution between the branches (documentation only —
+the 6-E code itself sits in the base and is not re-diffed here).

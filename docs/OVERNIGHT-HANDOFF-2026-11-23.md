@@ -422,3 +422,72 @@
 //! reproduced (26 instances / 2 draws instanced, 26 per-object,
 //! validation 0/0). engine-core untouched; no pins changed; no
 //! test modified; AGENTS.md untouched.
+//!
+//! ---
+//!
+//! ## SESSION 6 ADDENDUM — the direct clean-environment shard
+//! verification (2026-11-23, ~11:30 UTC)
+//!
+//! The sixth session re-probed the push blocker first: **unchanged**
+//! (the askpass sockets remain dead files, `No anonymous write
+//! access`, exit 128; anonymous read still works — `origin/main`
+//! remains at `1fe89b7`, the merge base, so nothing has drifted
+//! underneath the branches; no `gh`, no `GH_TOKEN`, no
+//! `~/.git-credentials`, no `~/.netrc`, no SSH keys). The delivery
+//! machinery is healthy: the supervisor and the four-branch push
+//! watcher are both alive, and the watcher's payloads remain
+//! byte-identical to the canonical body files committed on the
+//! branches (all four re-verified this session — the README's
+//! sha256 pins hold, `7343a3eb` population among them).
+//!
+//! ### The gap this session closed — the population branch's own
+//! shards
+//!
+//! Session 4's main-shard confirmation for
+//! `cycle6/corner-population` was measured on the 6-E tree (the
+//! shared-test-set inference, documented as such), and the heavy
+//! shard had session 3's single direct run — both predating the
+//! clean-environment discipline. Session 6 ran every CPU shard
+//! command verbatim, in a clean shell (no SDL/VK variables),
+//! directly on the population tip `7fed835`:
+//!
+//! - fmt `--all -- --check`: clean. Clippy `-D warnings`: clean in
+//!   BOTH forms (the CI debug form and the standing-order release
+//!   form).
+//! - **the full main shard: 1142 passed / 2 ignored / 33 result
+//!   lines, rc=0, zero failures — the branch pin, the first DIRECT
+//!   clean-environment run on this branch's own tree.**
+//! - **the full heavy shard: 576 passed / 11 ignored / 58 result
+//!   lines, rc=0, zero failures — the branch pin, its first
+//!   post-clean-discipline direct run.**
+//! - the renderer release battery: 65/2, rc=0 — the branch pin.
+//! - the `render_instanced` lavapipe gate re-run on this tip:
+//!   BOTH gates green, rc=0 — the 24+2 table (26 instances,
+//!   per-object 26 == instanced 2 draws, byte-equal, ink
+//!   2745/65536, warmed `device_memory` 18 constant) and the
+//!   13-instance fixture (13 == 2, byte-equal, ink 3728, oracles
+//!   0/255, the replacement lifecycle 18 → 38) — the linchpin's
+//!   third independent confirmation on this tip.
+//!
+//! Raw logs: `/tmp/opencode/session6-population/` on the pod. The
+//! branch's PR body (`docs/PR-BODY-CORNER-POPULATION.md`) carries
+//! the same table as its Session 6 section; the watcher payloads
+//! and twins were regenerated from it byte-for-byte (README pins
+//! updated; the regeneration script was first proven a
+//! byte-identical no-op on the unchanged body).
+//!
+//! ### The remaining second-run gaps (recorded for the next
+//! sessions)
+//!
+//! The same heavy-shard gap class exists on the other three
+//! branches (each has session 3's direct run only,
+//! pre-clean-discipline): 6-E `570/10/58`, 6-F `570/10/58`, 6-E2
+//! `576/12/58`. Their main shards have session 4's direct
+//! clean-environment confirmations, and the merge-dry-run /
+//! four-way-union passes gated the RESOLVED combined trees (heavy
+//! `576/12/59` and `576/13/59` there) — adjacent evidence, not a
+//! substitute for each branch's own pin. A session with idle time
+//! should close them the same way (clean shell, the workflow's
+//! awk, the branch's own tip) and append the numbers to each
+//! branch's body file — never new scope, no code changes, payloads
+//! regenerated after.
