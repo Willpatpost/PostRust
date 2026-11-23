@@ -386,3 +386,61 @@ commit beyond `6ee89b4` is documentation only — `git diff
 workflow, no pins. This PR's base is the population branch's tip,
 which carries the same doc line; the doc commits' evolution between
 the branches remains documentation only.
+
+### Session 11 — the merge census refreshed on the current tips; the ff-merge claim corrected; the resolution kit (2026-11-23, the ~12:30 UTC session)
+
+**One claim above needs an explicit correction.** The merge-order
+section's framing — "the owner's order: the stack PRs ff-merge,
+then 6-F is the one true three-way merge" — was measured on the
+10:13 UTC tips and no longer holds. Sessions 4–10 then committed
+this run's per-branch documentation (each branch's session addenda
+to `docs/OVERNIGHT-HANDOFF-2026-11-23.md`, plus the session-5
+PR-body files) on that one shared path, and the session-11 census
+(`git merge-tree` on the current tips; the full record is the
+SESSION 11 ADDENDUM in the handoff doc on the population branch)
+found:
+
+- **The stack no longer fast-forwards — this PR is one of the two
+  changed steps.** This branch's merge base with the population tip
+  is `5c9690d` (the population implementation commit —
+  population's own documentation commits are not in this branch's
+  history), so merging this PR onto main-after-population is a
+  true three-way merge that conflicts add/add on exactly ONE
+  file, the handoff doc (each branch's own addenda on the shared
+  path, by design; zero code conflicts). The population step is
+  the same single-file conflict (base `511b157`). There are now
+  THREE true three-way merges in the owner's order, not one.
+- **The 6-F step is its 10:13 census's 8 code files / 31 hunks
+  UNCHANGED** (re-measured per file on the current tips: vulkan 9,
+  engine-ci 6, renderer 5, main 4, CURRENT-STATUS 3, corner_demo 2,
+  corner 1, lib 1 — the code untouched since) **plus the same
+  handoff-doc add/add (10 hunks at these tips): 9 files / 41
+  hunks.** The census's other conclusion stands exactly: this
+  package's indirect arm adds NO new conflict region against 6-F.
+
+`~/push-handoff/merge-kit/merge-morning.sh` performs the owner's
+whole merge order on a scratch branch from main and NEVER pushes:
+at every step the handoff doc resolves to the mechanical union of
+the four branch versions (computed at run time from the branch
+refs, so it cannot drift), and the 8 code files via verify7's
+gated resolution patch restricted to the conflicted set. Executed
+end-to-end this session (rc=0, every step mechanical; the union
+doc blob identical across all three resolution steps —
+deterministic): the resulting four-way union's code subset is
+**byte-identical to verify7's fully-gated tree `f02ddef`** (zero
+files differ outside the handoff doc and the PR-body files), so
+verify7's measured battery (fmt/clippy clean, main 1154/2/33,
+release 77/2, heavy 576/13/59, every lavapipe gate green) carries
+to the union by the docs-only proof — and this session's own
+fresh fmt and clippy `-D warnings` runs on the union tree were
+both clean. The kit README carries the run records for the
+entry tips and the post-session-11 tips.
+
+**The tip statement (supersedes the one above):** the branch tip is
+the package commit `6ee89b4` + the run-wide handoff doc
+(`3522e55`) + the per-session documentation commits for sessions 4
+through 7 and this session's census-refresh commit adding this
+section. Every commit beyond `6ee89b4` remains documentation only —
+`git diff --name-only 6ee89b4..HEAD` lists only
+`docs/OVERNIGHT-HANDOFF-2026-11-23.md` and this file; no code, no
+workflow, no pins, and engine-core untouched throughout.
