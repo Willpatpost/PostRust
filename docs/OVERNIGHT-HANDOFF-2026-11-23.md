@@ -1172,3 +1172,134 @@
 //! candidate's CI run (the honest form; a mismatch is corrected
 //! from actuals, never by weakening a test).
 
+//! ---
+
+//! ## SESSION 13 ADDENDUM — the second direct union battery, and
+//! the raw-evidence persistence closure (2026-11-23, ~13:07 UTC)
+
+//! The thirteenth session re-probed the push blocker first:
+//! **unchanged** (both `/tmp/vscode-git-*.sock` sockets dead;
+//! `git push --dry-run` exit 128, `remote: No anonymous write
+//! access`; anonymous read works, `origin/main` remains at
+//! `1fe89b7`, the merge base, with only the seven historical PR
+//! refs — no drift, no remote cycle6 branch; no `gh`, no write
+//! credential of any form; code-server's tree still has no
+//! extension host). The delivery chain healthy: the supervisor
+//! (PID 858) and the hardened four-branch watcher (PID 442510)
+//! both alive, the watcher log start-lines-only (correctly never
+//! fired), all four `~/push-handoff` payloads byte-identical to
+//! the canonical PR body files on the branch tips (re-verified
+//! this session — 26,319 / 28,027 / 25,071 / 26,026 bytes, the
+//! stack re-parsed: 6-E→main, 6-F→main, population→6-E,
+//! 6-E2→population, draft everywhere), the `/tmp/opencode`
+//! payload twins sha256-identical, `engine-core`'s diff vs `main`
+//! ZERO files on all four branches, no askpass artifacts anywhere,
+//! `~/OVERNIGHT-DONE` correctly absent, `SURVIVED.txt` untouched
+//! (session 10's bound stands).
+
+//! ### The two gaps this session closed
+
+//! - **Session 12's own doc commit re-created the carry it had
+//!   closed.** The current-tips union — `7e30c4d`, the merge
+//!   kit's four-way union of `1c50065` / `cf551b2` / `f29a22a` /
+//!   `980e432` (the merge steps' second parents, verified before
+//!   anything ran: clean standalone clone; the code-subset diff
+//!   vs `f02ddef` exactly the five doc files) — carried session
+//!   12's battery by the docs-only proof (12's direct run was on
+//!   `298bd7e`, one population-side doc commit behind). Session
+//!   13 ran the CI's own FULL battery directly on `7e30c4d` —
+//!   the exact tree the owner's merge morning produces from
+//!   today's tips — giving the union its SECOND direct
+//!   full-battery run (the branches' closing standard: every
+//!   pinned shard ≥ 2 direct measurements).
+//! - **The /tmp survival caveat, closed for the raw logs.**
+//!   Sessions 6, 7, 11, and 12 measured their evidence into
+//!   `/tmp/opencode` paths that do not survive a pod reboot (both
+//!   union sessions flagged it; the kit README's own closing line
+//!   says "this README and the repo docs are the durable record").
+//!   This session twinned every /tmp-only evidence set the record
+//!   cites — `session6-population`, the three session-7 gate
+//!   logs, `session11-union`, `session12-union`, and session 8's
+//!   `rehearsal/` — into persistent home at
+//!   `~/tmp-opencode-mirror/`, each verified sha-identical after
+//!   the copy; and this session's own battery logs are BORN
+//!   persistent (`~/verify9-session13-union/`, written by the
+//!   battery script's EXIT trap on every exit path — 23 files,
+//!   sha-verified identical to the `/tmp` original). The home
+//!   `~/verify3` … `~/verify8-session5` dirs were confirmed
+//!   present. A pod reboot no longer orphans any raw log the PR
+//!   bodies cite.
+
+//! ### The battery (all MEASURED this session on `7e30c4d`,
+//! 13:00:45–13:05:57 UTC, warm target cache)
+
+//! | Step | Result |
+//! |---|---|
+//! | tree verification | clean clone; code-subset diff vs `f02ddef` = exactly the five doc files |
+//! | fmt `--all -- --check` | clean |
+//! | clippy (the CI form) / (the release form) | clean / clean |
+//! | main shard (the standing-order command, clean env) | rc=0, **1154 / 2 / 33 — the pin** |
+//! | renderer release battery | rc=0, **77 passed / 0 ignored / 2 result lines — the pin** |
+//! | heavy shard | rc=0, **576 / 13 / 59 — the pin** |
+//! | `render_instanced` ×3 (lavapipe, `--ignored`) | rc=0 — the full table 26 == 2, the indirect three-way 26 == 2 == 2, the fixture 13 == 2, byte-equal frames; ink 2,745 and 3,728; oracle walls 0/255; warmed device_memory 18 (indirect 19); replacement 18 → 38 (indirect 19 → 41) |
+//! | `render_shadows` (lavapipe, `--ignored`) | rc=0 — known-answer 1,006,779 compared / 41,797 edge-skipped (3.99%) / 0 mismatches / max |Δdepth| 2.68e-7, identical after replacement; shadowed patch 0/255; 65,536/65,536 frame pixels changed; warmed device_memory 17 |
+//! | `render_corner` / `render_orientation` / `render_overflow` / `render_glyph_atlas` (lavapipe) | rc=0 each |
+//! | the six routes (release, the rig commands' verbatim form) | all green (the combination refusal rc=1 by design, the typed message), every pinned banner, validation 0/0, 60 warmup + 601 route frames |
+//! | actionlint + PyYAML strict on the merged workflow | clean / clean |
+
+//! **The repeatability witness:** every pinned evidence line
+//! IDENTICAL to session 12's direct record — the shadows gate and
+//! all six routes line-for-line on their pinned lines; the
+//! instanced gate's lines identical order-independently (libtest's
+//! parallel `--nocapture` interleaving varies the print order
+//! between runs; the pinned assertions — byte-equal frames, draw
+//! counts, oracle walls — are order-independent and all hold).
+//! The determinism contract is now witnessed at the battery level
+//! by two independent direct full-battery runs of the union's
+//! code, on trees one doc commit apart.
+
+//! ### The two harness lessons (this script's own expectations,
+//! both root-caused on record)
+
+//! The battery script's first launch failed its own tree check on
+//! a locale-collation artifact (the UTF-8 collation ignores '.'
+//! at the primary level, so `CYCLE6-6E2.md` sorts before
+//! `CYCLE6-6E.md` against the ASCII-typed expectation string); its
+//! second launch failed the renderer-release check by misreading
+//! the record's "77/2" shorthand as passed/ignored — the CI's own
+//! form pins passed and result-lines, and session 12's raw log and
+//! this run both measure 77 passed / 0 ignored / 2 result lines.
+//! Both were fixed in the script (both sides sorted under
+//! `LC_ALL=C`; the expectation now pins all four values), the
+//! cause commented in place; neither touched a repo test, a pin,
+//! or a gate; the underlying runs were green both times (the raw
+//! logs prove it — no battery step had run at the first failure,
+//! and the renderer numbers matched the pin at the second). The
+//! corrected script with its comments:
+//! `~/verify9-session13-union/gate-union-session13.sh`.
+
+//! ### The closing loop on this session's own commit
+
+//! This session's commit is documentation-only (this doc; no
+//! `.rs`, no workflow, no pins — the diffstat from `5c9690d`
+//! lists only this doc and the unchanged PR-body file). Gates for
+//! the commit: `cargo fmt --all -- --check` clean and `cargo
+//! clippy --workspace --all-targets --release -- -D warnings`
+//! clean, run on the tip. After the commit: the merge kit
+//! re-executed on the post-commit tips (the union doc gains this
+//! section; the code-subset check against `f02ddef` must stay
+//! zero-files), and the population payload re-verified
+//! byte-identical to the unchanged PR body — the kit README
+//! carries the run record.
+
+//! ### Notes for the owner (session 13)
+
+//! `~/OVERNIGHT-DONE` remains correctly absent (the PRs do not
+//! exist; the honest form stands). The morning commands stand
+//! unchanged. The raw-log citations in the PR bodies' session
+//! sections now have persistent twins (`~/tmp-opencode-mirror/`
+//! and `~/verify9-session13-union/`); Windows pins remain
+//! platform-uniform inferences, to be confirmed by the merged
+//! candidate's CI run (a mismatch is corrected from actuals,
+//! never by weakening a test).
+
