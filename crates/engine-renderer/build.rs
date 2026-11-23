@@ -66,6 +66,10 @@ fn main() {
     // variant (lit_scene's bindings plus the depth map at 4).
     compile_wgsl("shadow_depth.wgsl", "shadow_depth.spv");
     compile_wgsl("lit_scene_shadowed.wgsl", "lit_scene_shadowed.spv");
+    // The Era-1 atmosphere shaders (see docs/CYCLE6-ERA1-BRIEF.md):
+    // the sky (equation-mirroring sky.rs) and the post pass (post.rs).
+    compile_wgsl("sky.wgsl", "sky.spv");
+    compile_wgsl("post.wgsl", "post.spv");
 }
 
 /// The WGSL path (Cycle 6-A): parse + validate + emit ONE SPIR-V

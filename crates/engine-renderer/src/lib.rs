@@ -46,12 +46,17 @@ pub mod glyph_atlas;
 mod lit_mesh;
 pub mod lit_scene;
 pub mod overlay;
+pub mod planar;
+pub mod populated_meshes;
+pub mod post;
 pub mod proc_texture;
 pub mod proxy_indirect;
 pub mod proxy_instances;
 pub mod proxy_mesh;
 pub mod scene;
+pub mod shadow_filter;
 pub mod shadows;
+pub mod sky;
 
 mod renderer;
 mod vulkan;
