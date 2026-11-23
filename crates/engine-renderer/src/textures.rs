@@ -15,7 +15,7 @@ pub struct Texture {
 }
 
 impl Texture {
-    /// Uploads tightly packed R8 texels. The image and the temporary transfer
+    /// Uploads tightly packed R8 or RGBA8 UNORM texels. The image and the temporary transfer
     /// buffer occupy disjoint pages in one device-local allocation. Its full
     /// size (including alignment and the staging tail) is reported at runtime.
     pub(crate) fn upload(
@@ -24,12 +24,15 @@ impl Texture {
         extent: vk::Extent2D,
         texels: &[u8],
     ) -> Result<Self, RendererError> {
-        if format != vk::Format::R8_UNORM
-            || texels.is_empty()
-            || u64::from(extent.width) * u64::from(extent.height) != texels.len() as u64
-        {
+        let bytes_per_pixel = match format {
+            vk::Format::R8_UNORM => 1,
+            vk::Format::R8G8B8A8_UNORM => 4,
+            _ => return Err(RendererError::Vulkan("unsupported texture format".into())),
+        };
+        let pixels = u64::from(extent.width) * u64::from(extent.height);
+        if texels.is_empty() || pixels.checked_mul(bytes_per_pixel) != Some(texels.len() as u64) {
             return Err(RendererError::Vulkan(
-                "expected tightly packed, nonempty R8 atlas".into(),
+                "expected tightly packed, nonempty texture".into(),
             ));
         }
         let usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED;
@@ -44,10 +47,10 @@ impl Texture {
                 vk::ImageCreateFlags::empty(),
             )
         }
-        .map_err(|e| RendererError::vk(e, "atlas image format/usage"))?;
+        .map_err(|e| RendererError::vk(e, "texture image format/usage"))?;
         if extent.width > limits.max_extent.width || extent.height > limits.max_extent.height {
             return Err(RendererError::Vulkan(
-                "atlas exceeds device format extent".into(),
+                "texture exceeds device format extent".into(),
             ));
         }
         let mut texture = Self {
@@ -83,7 +86,7 @@ impl Texture {
             texture.image = ctx
                 .device
                 .create_image(&info, None)
-                .map_err(|e| RendererError::vk(e, "create atlas image"))?;
+                .map_err(|e| RendererError::vk(e, "create texture image"))?;
             let buffer_info = vk::BufferCreateInfo::default()
                 .size(size.next_multiple_of(4))
                 .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
@@ -91,7 +94,7 @@ impl Texture {
             staging = ctx
                 .device
                 .create_buffer(&buffer_info, None)
-                .map_err(|e| RendererError::vk(e, "create atlas staging buffer"))?;
+                .map_err(|e| RendererError::vk(e, "create texture staging buffer"))?;
             let image_req = ctx.device.get_image_memory_requirements(texture.image);
             let stage_req = ctx.device.get_buffer_memory_requirements(staging);
             let granularity = ctx
@@ -99,7 +102,7 @@ impl Texture {
                 .get_physical_device_properties(ctx.physical_device)
                 .limits
                 .buffer_image_granularity;
-            let overflow = || RendererError::Vulkan("atlas allocation size overflow".into());
+            let overflow = || RendererError::Vulkan("texture allocation size overflow".into());
             let stage_offset = image_req
                 .size
                 .checked_next_multiple_of(stage_req.alignment.max(granularity))
@@ -119,20 +122,22 @@ impl Texture {
             let memory_type = mapped_type
                 .or_else(|| find_memory_type(ctx, compatible, local))
                 .ok_or_else(|| {
-                    RendererError::NoDevice("no compatible DEVICE_LOCAL atlas memory".into())
+                    RendererError::NoDevice("no compatible DEVICE_LOCAL texture memory".into())
                 })?;
             let alloc = vk::MemoryAllocateInfo::default()
                 .memory_type_index(memory_type)
                 .allocation_size(texture.allocation_bytes);
             texture.memory = ctx
                 .allocate_memory(&alloc)
-                .map_err(|e| RendererError::vk(e, "allocate atlas image and staging memory"))?;
+                .map_err(|e| RendererError::vk(e, "allocate texture image and staging memory"))?;
+            ctx.texture_allocations
+                .set(ctx.texture_allocations.get() + 1);
             ctx.device
                 .bind_image_memory(texture.image, texture.memory, 0)
-                .map_err(|e| RendererError::vk(e, "bind atlas image"))?;
+                .map_err(|e| RendererError::vk(e, "bind texture image"))?;
             ctx.device
                 .bind_buffer_memory(staging, texture.memory, stage_offset)
-                .map_err(|e| RendererError::vk(e, "bind atlas staging buffer"))?;
+                .map_err(|e| RendererError::vk(e, "bind texture staging buffer"))?;
             if mapped_type.is_some() {
                 let dst = ctx
                     .device
@@ -142,7 +147,7 @@ impl Texture {
                         size,
                         vk::MemoryMapFlags::empty(),
                     )
-                    .map_err(|e| RendererError::vk(e, "map atlas staging buffer"))?;
+                    .map_err(|e| RendererError::vk(e, "map texture staging buffer"))?;
                 std::ptr::copy_nonoverlapping(texels.as_ptr(), dst.cast(), texels.len());
                 ctx.device.unmap_memory(texture.memory);
             }
@@ -221,7 +226,7 @@ impl Texture {
             texture.view = ctx
                 .device
                 .create_image_view(&view_info, None)
-                .map_err(|e| RendererError::vk(e, "create atlas view"))?;
+                .map_err(|e| RendererError::vk(e, "create texture view"))?;
             Ok(())
         })();
         // SAFETY: upload is complete, failed before submission, or device lost.
@@ -253,18 +258,23 @@ pub struct SamplerPool {
 }
 impl SamplerPool {
     pub(crate) fn new(ctx: &VulkanContext) -> Result<Self, RendererError> {
-        let border = vk::SamplerAddressMode::CLAMP_TO_BORDER;
+        Self::with_address_mode(ctx, vk::SamplerAddressMode::CLAMP_TO_BORDER)
+    }
+    pub(super) fn with_address_mode(
+        ctx: &VulkanContext,
+        address: vk::SamplerAddressMode,
+    ) -> Result<Self, RendererError> {
         let info = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::NEAREST)
             .min_filter(vk::Filter::NEAREST)
             .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-            .address_mode_u(border)
-            .address_mode_v(border)
-            .address_mode_w(border)
+            .address_mode_u(address)
+            .address_mode_v(address)
+            .address_mode_w(address)
             .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE);
         // SAFETY: one live device owns this sampler until descriptor teardown.
         let nearest = unsafe { ctx.device.create_sampler(&info, None) }
-            .map_err(|e| RendererError::vk(e, "create atlas sampler"))?;
+            .map_err(|e| RendererError::vk(e, "create texture sampler"))?;
         ctx.sampler_creations.set(ctx.sampler_creations.get() + 1);
         Ok(Self { nearest })
     }

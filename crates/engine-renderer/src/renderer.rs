@@ -54,7 +54,7 @@ pub struct FrameResult {
 }
 
 /// Successful Vulkan allocation calls since renderer construction and the
-/// resident byte size of the atlas allocation (including its staging tail).
+/// resident byte size of the texture allocations (including staging tails).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AllocationStats {
     pub device_memory: u64,
@@ -83,6 +83,7 @@ pub struct RenderStats {
     pub frames_presented: u64,
     pub swapchain_recreations: u64,
     pub validation_active: bool,
+    pub gpu_timestamps_supported: bool,
     pub validation_errors: u64,
     pub validation_warnings: u64,
     /// Last validation messages (bounded), most recent last.
@@ -220,6 +221,7 @@ impl Renderer {
             frames_presented: 0,
             swapchain_recreations: 0,
             validation_active,
+            gpu_timestamps_supported: frames.timestamps_supported,
             validation_errors: 0,
             validation_warnings: 0,
             recent_validation: Vec::new(),
@@ -308,7 +310,6 @@ impl Renderer {
         } else {
             self.overlay_vertices.clear();
         }
-        let overlay = &self.overlay_vertices;
         let outcome = vulkan::render_frame(
             &mut self.ctx,
             &mut self.swapchain,
@@ -322,8 +323,46 @@ impl Renderer {
             world,
             foreground,
             hud,
-            overlay,
+            &self.overlay_vertices,
+            None,
         )?;
+        Ok(self.finish_frame(outcome))
+    }
+
+    /// Draws the resident corner mesh with this camera and preset.
+    pub fn render_corner(
+        &mut self,
+        view_proj: &[[f32; 4]; 4],
+        eye: [f32; 3],
+        light: crate::lit_scene::LightParams,
+        size: (u32, u32),
+    ) -> Result<FrameResult, RendererError> {
+        if self.config.demo_scene != crate::DemoScenePreference::Corner {
+            return Err(RendererError::Vulkan(
+                "render_corner requires the Corner scene preference".into(),
+            ));
+        }
+        let params = vulkan::corner::FrameParams::new(*view_proj, eye, light);
+        let outcome = vulkan::render_frame(
+            &mut self.ctx,
+            &mut self.swapchain,
+            &mut self.pipes,
+            &mut self.frames,
+            size,
+            self.config.present_mode,
+            self.config.replace_pipelines,
+            self.config.demo_scene,
+            view_proj,
+            &[],
+            None,
+            &[],
+            &[],
+            Some(&params),
+        )?;
+        Ok(self.finish_frame(outcome))
+    }
+
+    fn finish_frame(&mut self, outcome: vulkan::FrameOutcome) -> FrameResult {
         // F-03 Step 1: accumulate the frame's capacity decisions —
         // cumulative omitted vertices, peak supplied, and the per-slot
         // capacities (region stays 0 until its lazy buffer allocates).
@@ -385,7 +424,7 @@ impl Renderer {
                 }
             }
         }
-        Ok(FrameResult {
+        FrameResult {
             presented: outcome.presented,
             recreated: outcome.recreated,
             suboptimal: outcome.suboptimal,
@@ -403,7 +442,7 @@ impl Renderer {
                 uploaded_bytes: u64::from(outcome.region.drawn) * size_of::<SceneVertex>() as u64
                     + u64::from(outcome.overlay.drawn) * size_of::<OverlayVertex>() as u64,
             },
-        })
+        }
     }
 
     /// Reads cumulative allocation counters on demand.

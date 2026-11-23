@@ -69,6 +69,23 @@ the vendored SDL builds through the normal `cargo build` flow.
 
 [Player controls](docs/PLAYER-INPUT.md) covers rebinding, mouse sensitivity, and encounter HUD scale.
 
+### One Corner of the City
+
+Run the fixed camera route over the lit intersection. Add `--night` for moonlight.
+
+```sh
+cargo run --release -p engine-slice -- --corner
+cargo run --release -p engine-slice -- --corner --night
+```
+
+For the RTX 5070 Ti measurement, add `--fps uncapped --present immediate --validation off`
+to each command. The summary identifies the selected GPU and actual present mode.
+Each run measures the same 601 poses after 60 warmup frames. The CPU series includes
+Vulkan waits, the frame interval includes pacing between present returns, and GPU
+timestamps cover the render pass. Use the **exact** nearest-rank p50/p95/p99 from
+repeated runs for comparisons. The live histogram reports bucket upper bounds.
+Peak resident memory covers the process lifetime on Windows and Linux.
+
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or
