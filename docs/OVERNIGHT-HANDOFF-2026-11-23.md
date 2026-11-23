@@ -22,6 +22,14 @@
 //! host never returned; nothing about the blocker or the morning
 //! paths changed.)
 //!
+//! (Third navigation note, added by the twentieth session:
+//! session 19's closing limitation says the workflow-lint tools
+//! are "not present in this session's shell" — they were, at the
+//! /tmp/opencode paths the run's earlier sessions created; the
+//! SESSION 20 ADDENDUM corrects the record, closes the limitation
+//! itself, and adds the population CPU battery's two direct runs
+//! on the final tip.)
+//!
 //! ## What exists (the whole ladder, complete)
 //!
 //! Four packages, four branches, one commit each (plus this
@@ -2053,4 +2061,168 @@
 //! delivers, with the merge-morning union twice directly
 //! battery-measured besides. The one action the run needs remains
 //! the credential itself.
+
+//! ---
+
+//! ## SESSION 20 ADDENDUM — session 19's workflow-lint limitation
+//! closed and its tooling claim corrected, the population CPU
+//! battery twice on the final tip (2026-11-23, ~14:46 UTC onward)
+//!
+//! The twentieth session re-probed the push blocker first:
+//! **unchanged** (both `/tmp/vscode-git-*.sock` sockets dead by
+//! the three session-15 discriminators — the raw AF_UNIX connect
+//! refused on both, `git push --dry-run` exit 128 with `remote:
+//! No anonymous write access` and the askpass fill stderr
+//! ECONNREFUSED; anonymous read works, `origin/main` remains at
+//! `1fe89b7` with exactly one remote branch — no drift, no
+//! cycle6 branch ever leaked; no `gh`, no write credential of any
+//! form; the supervisor PID 858 and the hardened four-branch
+//! watcher PID 442510 both alive, the watcher log
+//! start-lines-only — correctly never fired; no `~/PR-CREATED-*`
+//! markers; `~/OVERNIGHT-DONE` and `~/OVERNIGHT-STOP` correctly
+//! absent; `SURVIVED.txt` untouched — session 10's bound stands).
+//! The delivery chain re-verified fresh on the entry tips: all
+//! four payload bodies byte-identical to their branch PR-body
+//! files (`a90cc2fd` / `1b91fdcd` / `9491852d` / `81385ae9`;
+//! 26,319 / 28,027 / 25,369 / 26,026 bytes — session 19's
+//! recorded numbers, re-measured), the `/tmp/opencode` twins
+//! sha-identical with the payload file shas matching the README
+//! pins (`6deda5e6` / `327c9d3f` / `b34f9430` / `a39c6102`), the
+//! stack parsed (6-E→main, 6-F→main, population→6-E,
+//! 6-E2→population, draft everywhere), `engine-core` zero-diff vs
+//! main on all four branches, `git fsck --full --strict` clean
+//! (zero notices of any kind — the pre-amend commit from session
+//! 19's in-session amend remains reachable through the reflog,
+//! so nothing dangles), the `wt-6e2` worktree clean at `f29a22a`,
+//! and the docs-only proof re-measured per branch.
+//!
+//! ### THE CORRECTIVE — session 19's "neither tool is present in
+//! this session's shell" was an under-probed claim (the
+//! session-14/15 misrecord class, measured this session)
+//!
+//! Session 19's closing limitation records that "actionlint and
+//! PyYAML strict (the workflow-lint steps of the union batteries)
+//! were NOT re-run per branch — neither tool is present in this
+//! session's shell." The actionable half (the checks not re-run
+//! per branch) was a real gap and is closed below. The tooling
+//! half was a misrecord: **both tools have existed on this pod
+//! since 08:18–08:19 UTC** — roughly six hours before session 19
+//! — at the exact `/tmp/opencode` paths the run's own earlier
+//! sessions created for these checks: `actionlint` 1.7.7
+//! (extracted from the release tarball, `/tmp/opencode/
+//! actionlint.tar.gz`) and PyYAML 6.0.4 under
+//! `/tmp/opencode/yamlvenv` with `/tmp/opencode/yamlcheck.py`
+//! (the strict checker). The verify5 merge-dryrun battery first
+//! used them (its README's "actionlint 1.7.7 + PyYAML strict
+//! parse clean"), then verify7 and the session-12/13 union
+//! batteries ran exactly these invocations — always on the
+//! MERGED workflow, which is why the per-branch gap was real.
+//! Session 19's own record cites the session-12/13 battery logs
+//! (persisted at `~/verify9-session13-union/` and
+//! `~/tmp-opencode-mirror/`) whose scripts name these paths
+//! line-by-line; the probe that produced "not present" evidently
+//! checked PATH only. Both tools were verified functional this
+//! session before anything ran (actionlint `--version` 1.7.7;
+//! yamlvenv pyyaml 6.0.4) — the session-15 discipline (probe the
+//! substrate directly, never infer from one shallow signal),
+//! applied to tooling.
+//!
+//! ### The first gap this session closed — the per-branch
+//! workflow lint (session 19's limitation, executed)
+//!
+//! The four branch tips' workflow files had been lint-validated
+//! only as the MERGED workflow (verify5/verify7/sessions 12/13);
+//! the per-branch coverage was carried by the docs-only proof.
+//! The battery ran actionlint 1.7.7 and PyYAML strict directly
+//! on each branch tip's `.github/workflows/engine-ci.yml`, and
+//! re-measured the carry claim itself per branch (the workflow
+//! file unchanged since the branch's implementation commit):
+//!
+//! | Branch (tip) | unchanged since impl | actionlint | PyYAML strict | workflow sha256 (first 16) |
+//! |---|---|---|---|---|
+//! | 6-E (`1c50065`) | yes (`511b157`) | CLEAN | OK — 3 jobs: build-and-test, macos-arm64, heavy-tests | `786d4d9f01d21a04` |
+//! | 6-F (`980e432`) | yes (`96dee7c`) | CLEAN | same | `b10f212de32d479a` |
+//! | population (`8e22707`) | yes (`5c9690d`) | CLEAN | same | `50630b0dc5bf3023` |
+//! | 6-E2 (`f29a22a`, the wt-6e2 worktree) | yes (`6ee89b4`) | CLEAN | same | `131a7d9635687780` |
+//!
+//! Every branch's workflow file is byte-distinct (the per-branch
+//! pin comment chains) and every one lints clean — session 19's
+//! recorded limitation is closed by direct measurement on the
+//! exact tips the morning push delivers, no longer carried by
+//! the docs-only proof alone.
+//!
+//! ### The second gap this session closed — the population CPU
+//! battery, twice on the final tip (session 19's run-1 asymmetry)
+//!
+//! Session 19's runs 1 and 2 put 6-E, 6-F, and 6-E2 at TWO direct
+//! CPU-battery runs each on their exact final tips — but
+//! population's run 1 failed its own checkout guard BEFORE
+//! measuring (the harness lesson session 19 root-caused), so
+//! population stood at one direct run on the PARENT tip `fbcdecf`
+//! and ZERO on `8e22707`, the tip the watcher pushes (advanced by
+//! session 19's own documentation commit). This session ran the
+//! CI's own CPU commands verbatim, TWICE, directly on `8e22707`:
+//!
+//! | Run | fmt / clippy CI / clippy release | main shard | renderer release | heavy shard |
+//! |---|---|---|---|---|
+//! | A | clean (3 s) / clean (3 s) / clean (5 s) | **1142 / 2 / 33**, rc=0 (82 s) | **65 passed / 0 ignored / 2 result lines**, rc=0 (2 s) | **576 / 11 / 58**, rc=0 (167 s) |
+//! | B | clean (3 s) / clean (0 s, cached) / clean (0 s, cached) | **1142 / 2 / 33**, rc=0 (83 s) | **65 / 0 / 2**, rc=0 (0 s, cached) | **576 / 11 / 58**, rc=0 (155 s) |
+//!
+//! Every count IDENTICAL between the runs and to the branch pins
+//! in the canonical PR body (and to the union batteries'
+//! measurements of the same code bytes, sessions 12/13) — the
+//! population branch's CPU battery now stands at TWO direct runs
+//! on its exact final tip, uniform with the siblings' session-19
+//! run-1+run-2 pairs, besides session 6's direct run on
+//! `7fed835` and session 19's run-2 on the parent tip `fbcdecf`
+//! (the same code bytes by the docs-only proof). The battery
+//! window: 14:46:19–14:54:44 UTC, warm target cache.
+//!
+//! The harness was validated before launch (the session-13/19
+//! discipline): `bash -n` clean, and the counting awk (the
+//! workflow's own, copied verbatim) reproduced session 19's raw
+//! logs exactly (1142/2/33, 65/2, 576/11/58) before any new
+//! measurement ran. The battery script:
+//! `~/verify16-session20/lint-and-cpu-battery-session20.sh`
+//! (expectations pinned, a mismatch a finding, never an
+//! adjustment; checkouts move only the main repo's working tree
+//! between existing tips, a trap restoring the population
+//! checkout on every exit path; the 6-E2 lint in the standing
+//! `wt-6e2` worktree, verified clean before and after; CPU
+//! shards in a clean environment, the SDL/VK variables unset).
+//!
+//! ### The closing loop on this session's own commit
+//!
+//! Documentation only — this handoff doc (the addendum plus a
+//! third header navigation note pointing session 19's limitation
+//! at this corrective) and the population PR body's tip
+//! statement; no `.rs`, no workflow, no pins, no test. Gates for
+//! the commit: `cargo fmt --all -- --check` clean and `cargo
+//! clippy --workspace --all-targets --release -- -D warnings`
+//! clean, run on this tip by the battery itself (the pre-commit
+//! tree's code bytes are identical to the post-commit tree's;
+//! re-verified after the commit). After the commit: the merge
+//! kit re-executed on the post-commit tips (the union doc gains
+//! this section; the code-subset check against `f02ddef` must
+//! stay zero files), the population payload regenerated from the
+//! corrected body via the established script (both copies,
+//! JSON-validated; the sha recorded in the push-handoff README
+//! pins — the session-17 form, no in-session amend), the other
+//! three payloads re-verified byte-unchanged no-ops, and the kit
+//! README carries the run record.
+//!
+//! ### Notes for the owner (session 20)
+//!
+//! `~/OVERNIGHT-DONE` remains correctly absent (the PRs do not
+//! exist; the honest form stands). The morning commands stand
+//! unchanged — the watcher performs the whole delivery from the
+//! canonical bytes the moment a credential returns. The ladder's
+//! evidence now includes the last recorded limitation closed:
+//! every branch tip's workflow file directly lint-clean
+//! (actionlint + PyYAML strict), every branch's graphical
+//! linchpin (session 18) AND CPU battery (session 19 plus this
+//! session's population runs) directly measured on the exact
+//! tips the morning push delivers, with the merge-morning union
+//! twice directly battery-measured besides. The one action the
+//! run needs remains the credential itself.
 
