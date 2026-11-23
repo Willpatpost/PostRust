@@ -443,3 +443,32 @@
 //! commit. (The population branch's larger gap — main AND heavy —
 //! was closed first this session; see that branch's addendum. The
 //! 6-F and 6-E2 heavy gaps follow the same pattern.)
+
+//! ---
+
+//! ## SESSION 7 ADDENDUM — the linchpin gate's third direct run
+//! (2026-11-23, ~11:54 UTC)
+//!
+//! The blocker, re-probed first: unchanged (dead askpass sockets,
+//! no write credentials, `git push --dry-run` exit 128; anonymous
+//! read still works — `origin/main` still `1fe89b7`, the merge
+//! base, so nothing has drifted underneath the branches). The
+//! delivery machinery verified healthy and then HARDENED (see the
+//! population branch's session-7 note for the run-wide record:
+//! payload/branch byte-identity re-verified, the watcher's
+//! token-lifetime fix, the restart). This branch's evidence
+//! asymmetry — its graphical linchpin had two direct measurements
+//! (sessions 3, 4) vs the population branch's three — closed this
+//! session: `render_instanced --ignored` run a THIRD time directly
+//! on this tip (`0c19c9f` at run time; the code tree exactly
+//! `511b157`'s), lavapipe variables scoped to the gate command
+//! only: **1 passed, rc=0, every pinned line reproduced — 13
+//! instances (10/3), per-object 13 == instanced 2 draws,
+//! byte-equal frames; ink 3728/65536; both single-instance oracle
+//! walls 0/255 (gate wall within 2/255); warmed device_memory 18
+//! constant; the replacement lifecycle 18 → 38 (delta 20).** fmt
+//! `--check` and clippy `-D warnings` (release form) clean on the
+//! committed tip. Raw log: `/tmp/opencode/session7-6e-gate.log`;
+//! the PR body's Session 7 section carries the table, and the
+//! watcher payload + twin were regenerated from it byte-for-byte
+//! after the commit.

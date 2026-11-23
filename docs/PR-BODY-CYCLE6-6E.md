@@ -284,3 +284,44 @@ Every commit beyond `511b157` is documentation only — `git diff
 --name-only 511b157..HEAD` lists only
 `docs/OVERNIGHT-HANDOFF-2026-11-23.md` and this file; no code, no
 workflow, no pins.
+
+---
+
+### Session 7 — the linchpin gate's third direct run (2026-11-23, the ~11:54 UTC session)
+
+The evidence table's one remaining asymmetry after session 6: this
+branch's graphical linchpin (`render_instanced`, the N-vs-1
+pixel-equivalence gate) had two direct measurements (session 3's
+final-tree run, session 4's tip re-run) while the population
+branch's linchpin carried three. Session 7 closed the asymmetry —
+the gate run a third time, directly on this branch's tip
+(`0c19c9f` at run time; the code tree is exactly `511b157`'s —
+every commit above the package commit is documentation only), in
+the scoped environment (the lavapipe variables on the gate command
+only, per session 4's operational lesson):
+
+| Assertion (MEASURED this session, this tip) | Result |
+|---|---|
+| `render_instanced --ignored` | **1 passed, rc=0 — every pinned evidence line reproduced exactly** |
+| the fixture | 13 instances (10/3 npc/vehicle), per-object 13 == instanced 2 draws, byte-equal frames |
+| the ink control | 3728 of 65536 framebuffer bytes changed by the population |
+| the CPU oracle walls | single-instance oracles, materials 1 and 2: 57600 pixels each, max RGB error 0/255; the gate's oracle wall within 2/255 |
+| the allocation gate | warmed `AllocationStats { device_memory: 18, … }` constant across warmed frames; the pipeline-replacement lifecycle 18 → 38 (delta 20) |
+
+Raw log: `/tmp/opencode/session7-6e-gate.log` on the pod (a /tmp
+path — may not survive a pod restart; the numbers here are the
+durable record). The watcher payload and its `~/push-handoff` twin
+were regenerated from this file byte-for-byte after this section
+landed. The linchpin now holds three direct measurements on this
+branch's code tree, matching the population branch's count.
+
+**The tip statement (supersedes the one above):** the pushed tip is
+this branch's head = the package commit `511b157` + the run-wide
+handoff doc (`3e5a811`) + session 4's addendum (`14d30f9`) +
+session 5's payload-sync commit (`f38c1c2`) + session 6's
+heavy-shard verification addendum + session 7's linchpin
+verification addendum (the commit adding this section). Every
+commit beyond `511b157` is documentation only — `git diff
+--name-only 511b157..HEAD` lists only
+`docs/OVERNIGHT-HANDOFF-2026-11-23.md` and this file; no code, no
+workflow, no pins.
