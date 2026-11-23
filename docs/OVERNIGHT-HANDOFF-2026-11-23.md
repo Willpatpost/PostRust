@@ -1870,3 +1870,187 @@
 //! tree by the docs-only proof. The one action the run needs
 //! remains the credential itself.
 
+//! ---
+
+//! ## SESSION 19 ADDENDUM — the CPU batteries on the final tips
+//! (the session-18 standard applied to the CPU shards), and the
+//! population body's tip statement re-refreshed (2026-11-23,
+//! ~14:10 UTC onward)
+
+//! The nineteenth session re-probed the push blocker first:
+//! **unchanged** (both `/tmp/vscode-git-*.sock` sockets dead by the
+//! three session-15 discriminators — the raw AF_UNIX connect
+//! refused on both, the `git push --dry-run` fill stderr
+//! ECONNREFUSED with `remote: No anonymous write access`, exit 128;
+//! anonymous read works, `origin/main` remains at `1fe89b7` with
+//! exactly one remote branch — no drift, no cycle6 branch ever
+//! leaked; no `gh`, no write credential of any form; the supervisor
+//! PID 858 and the hardened four-branch watcher PID 442510 both
+//! alive, the watcher log start-lines-only — correctly never fired;
+//! no `~/PR-CREATED-*` markers; `~/OVERNIGHT-DONE` and
+//! `~/OVERNIGHT-STOP` correctly absent; `SURVIVED.txt` untouched —
+//! session 10's bound stands). The delivery chain re-verified fresh
+//! on the entry tips: all four payload bodies byte-identical to
+//! their branch PR-body files (26,319 / 28,027 / 25,257 / 26,026
+//! bytes — population at session 17's regenerated `03945511`), the
+//! `/tmp/opencode` twins sha-identical, the stack parsed (6-E→main,
+//! 6-F→main, population→6-E, 6-E2→population, draft everywhere),
+//! `engine-core` zero-diff vs main on all four branches, the
+//! `wt-6e2` worktree clean at `f29a22a`.
+
+//! ### The gap this session closed — the CPU shards' final-tip
+//! asymmetry (session 18's own closing line)
+
+//! Session 18 closed the final-tip asymmetry for the GRAPHICAL
+//! linchpins (every branch's gate run directly on the tip the
+//! watcher pushes) and recorded the remaining class in its closing
+//! line: "the CPU shards' records stand on the identical code tree
+//! by the docs-only proof." Every branch's pinned CPU battery —
+//! fmt, clippy in both forms, the main shard, the renderer release
+//! battery, the heavy shard — carries multiple direct measurements,
+//! but the latest BRANCH-TIP runs sit on the session-3/4/6 tips,
+//! and the full batteries of sessions 12/13 ran on the UNION trees
+//! (the same code bytes, merged): no branch's CPU battery had ever
+//! run directly on the final tips the morning push delivers
+//! (`1c50065` / `980e432` / `fbcdecf` / `f29a22a`). Session 19
+//! closed the asymmetry the session-18 way, uniformly: **the CI's
+//! own CPU commands, verbatim, run directly on the exact final
+//! tips, every count checked with the workflow's own awk against
+//! the pins in the canonical PR bodies.**
+
+//! The battery: `~/verify15-session19/cpu-battery-session19.sh`
+//! (logs born persistent in `~/verify15-session19/`; expectations
+//! pinned, a mismatch a finding, never an adjustment; entry and
+//! exit state checked — tips, both worktrees clean, the remote
+//! undrifted, the machinery alive, the markers and SURVIVED.txt
+//! bounds; the checkouts move only the main repo's working tree
+//! between existing tips, a trap restoring the population checkout
+//! on every exit path; the 6-E2 battery ran in the standing
+//! `wt-6e2` worktree, verified clean before and after; the CPU
+//! shards ran in a clean environment — the SDL/VK variables
+//! explicitly unset, session 4's lesson). Before launch the harness
+//! itself was validated: `bash -n` clean, and the counting helpers
+//! (the workflow's awk, copied verbatim) reproduced the session-12
+//! union battery's raw-log numbers exactly (main 1154/2/33,
+//! renderer 77/2, heavy 576/13/59) — the ground-truth check
+//! session 13's harness lessons prescribe. The docs-only proof was
+//! re-measured per branch in the same entry block (each
+//! implementation-commit→tip diff lists only the handoff doc and
+//! the PR-body file).
+
+//! ### The two harness lessons from run 1 (root-caused on record;
+//! run 1's logs archived at `~/verify15-session19/run1/`)
+
+//! Run 1 failed its own entry check and its population tip check —
+//! both harness expectations, neither a repo finding, both
+//! root-caused the session-13 way (fix the script with the cause
+//! commented, never a repo test, pin, or gate; the underlying
+//! state was green both times):
+
+//! - **The watcher-log line-count pin was wrong from this session's
+//!   start.** The check pinned "exactly 5 lines" because the
+//!   session's earlier `tail -5` showed five — the log's first line
+//!   (`06:04:16Z watcher started`) was simply cut off. The log has
+//!   SIX start lines (06:04:16 through 11:53:44), was mtime-frozen
+//!   at 11:53:44 (before this session), and no line appeared during
+//!   run 1: session 18's "start-lines-only" claim was content-true
+//!   all along. The corrected check is content-based — every line
+//!   must be a start line — which is what "start-lines-only"
+//!   actually means and stays correct across any future watcher
+//!   restart.
+//! - **The population battery's checkout guard.** The battery
+//!   function skipped the checkout for the population branch
+//!   (assuming the entry checkout persisted through the run), but
+//!   the 6-F battery had just left the main repo on `980e432`; the
+//!   population battery's own tip check caught it and run 1 FAILED
+//!   VISIBLE without measuring the wrong tree — the intended
+//!   fail-visible behavior; the guard was the bug. The checkout is
+//!   now unconditional for main-repo batteries. Run 1's three
+//!   sibling batteries are valid measurements (correct tips, every
+//!   pin exact) and stand as second samples beside run 2's.
+
+//! Run 2 — the corrected script, the same entry tips — is the
+//! battery of record below.
+
+//! ### The battery (all MEASURED this session on the final tips)
+
+//! | Branch (tip) | fmt / clippy CI / clippy release | main shard | renderer release | heavy shard |
+//! |---|---|---|---|---|
+//! | 6-E (`1c50065`, first direct CPU run on this tree) | clean (2 s) / clean (6 s) / clean (5 s) | **1142 / 2 / 33** (rc=0, 83 s) | **65 passed / 0 ignored / 2 result lines** (rc=0, 3 s) | **570 / 10 / 58** (rc=0, 173 s) |
+//! | 6-F (`980e432`, first direct CPU run on this tree) | clean (2 s) / clean (6 s) / clean (4 s) | **1146 / 2 / 33** (rc=0, 82 s) | **69 passed / 0 ignored / 2 result lines** (rc=0, 3 s) | **570 / 10 / 58** (rc=0, 173 s) |
+//! | 6-E2 (`f29a22a`, the wt-6e2 worktree) | clean (2 s) / clean / clean | **1146 / 2 / 33** (rc=0, 81 s) | **69 passed / 0 ignored / 2 result lines** (rc=0, 1 s) | **576 / 12 / 58** (rc=0, 155 s) |
+//! | population (`fbcdecf`, the entry tip) | clean (2 s) / clean (6 s) / clean (5 s) | **1142 / 2 / 33** (rc=0, 83 s) | **65 passed / 0 ignored / 2 result lines** (rc=0, 3 s) | **576 / 11 / 58** (rc=0, 173 s) |
+
+//! Every count is IDENTICAL to the branch pins recorded in the
+//! canonical PR bodies and to the union batteries' measurements of
+//! the same code bytes (sessions 12/13) — the determinism contract
+//! now witnessed, for every branch's CPU battery, on the exact tip
+//! the morning push delivers. **The repeatability witness:** run
+//! 1's three sibling batteries (the valid subset before the
+//! harness fix) measured the identical counts on the same tips —
+//! two independent direct runs, every number equal. Step rc's and
+//! elapsed times are in the per-step logs
+//! (`~/verify15-session19/<branch>-<step>.log`, 24 steps, all
+//! rc=0); the battery's own summary line: `BATTERY PASS: all four
+//! branches' CPU batteries green on the session-19 entry tips,
+//! every pin exact` (14:16:35–14:34:09 UTC, warm target cache).
+
+//! One honest limitation, recorded rather than papered over:
+//! actionlint and PyYAML strict (the workflow-lint steps of the
+//! union batteries) were NOT re-run per branch — neither tool is
+//! present in this session's shell. The merged workflow's lint
+//! (session 12/13) plus the docs-only proof (each branch's workflow
+//! file unchanged since its implementation commit) carry that
+//! coverage; the branch tips' workflow files are byte-identical to
+//! what sessions 3/4 validated.
+
+//! ### The population body's tip statement, re-refreshed (the
+//! session-17 corrective class)
+
+//! Session 17 corrected the population PR body's final tip
+//! statement (it had stopped at "sessions 4 through 16" while the
+//! tip had advanced five doc commits — the stale-record class this
+//! run keeps correcting). Session 18 then committed its addendum
+//! WITHOUT refreshing the statement (its documented choice: "the
+//! PR-body file is UNCHANGED"), leaving the statement one session
+//! stale again. This session's commit advances the tip by one more
+//! doc commit, so the statement is refreshed IN the same commit
+//! that makes it stale — the session-17 pattern, exact at commit
+//! time: the statement now enumerates sessions 4 through 19 and
+//! names this session's CPU-battery addendum as its own closing
+//! entry. The population payload was regenerated from the corrected
+//! body via the established script (both copies, JSON-validated,
+//! sha256 `b34f9430` — filled in by the commit's amend: the
+//! regeneration postdates the commit it describes, so the sha could
+//! not precede it), and the README pins updated; the other
+//! three payloads are byte-unchanged (their bodies untouched —
+//! regeneration proven a no-op for each).
+
+//! ### The closing loop on this session's own commit
+
+//! Documentation only — the session's diff is this handoff doc and
+//! the population PR-body file's tip statement; no `.rs`, no
+//! workflow, no pins, no test. Gates for the commit: `cargo fmt
+//! --all -- --check` clean and `cargo clippy --workspace
+//! --all-targets --release -- -D warnings` clean — run on this tip
+//! by the battery itself (the pre-commit tree's code bytes are
+//! identical to the post-commit tree's; re-verified after the
+//! commit). After the commit: the merge kit re-executed on the
+//! post-commit tips (the union doc gains this section; the
+//! code-subset check against `f02ddef` must stay zero files), and
+//! all four payloads re-verified byte-identical to their branch
+//! bodies — the kit README carries the run record.
+
+//! ### Notes for the owner (session 19)
+
+//! `~/OVERNIGHT-DONE` remains correctly absent (the PRs do not
+//! exist; the honest form stands). The morning commands stand
+//! unchanged — the watcher performs the whole delivery from the
+//! canonical bytes the moment a credential returns. The ladder's
+//! evidence is now uniform end to end at the final tips: every
+//! graphical linchpin (session 18) AND every CPU battery (this
+//! session) directly measured on the exact tips the morning push
+//! delivers, with the merge-morning union twice directly
+//! battery-measured besides. The one action the run needs remains
+//! the credential itself.
+
