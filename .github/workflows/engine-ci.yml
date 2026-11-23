@@ -334,8 +334,35 @@ jobs:
           # IEEE). The combined tree carries ALL THREE additions:
           # Linux 1154 = 1138 + 4 (6-E) + 4 (6-E2) + 8 (6-F);
           # Windows 1103 = 1087 + the same 16.
-          expected=1173
-          if [ "$(uname -s)" != "Linux" ]; then expected=1122; fi
+          # Era 1 scaffold (PR #12): +19 engine-renderer tests —
+          # 1173 / 1122 (the scaffold's own measured pins).
+          # Era 1 package 2 (soft shadows, 2026-11-23): +3
+          # platform-uniform engine-renderer lib tests (the
+          # shadow_filter point-oracle battery: the step-map
+          # projection pin, the OOB corner at point level, the
+          # corner-scene bias-discipline sweep). Linux 1176/2/33
+          # MEASURED locally with this step's own awk; Windows 1125
+          # = 1122 + the same 3 (platform-uniform — pure f32
+          # arithmetic, no cfg gates). Package 1 (free-look) adds
+          # only engine-slice tests — this shard is untouched by it.
+          # Era 1 package 3 (the sky, 2026-11-23): +2 platform-uniform
+          # engine-renderer lib tests (the mat4_inverse contract and
+          # ray property). Linux 1178/2/33 MEASURED locally with this
+          # step's own awk; Windows 1127 = 1125 + the same 2.
+          # Era 1 package 4 (day/night, 2026-11-23): +1 platform-uniform
+          # engine-renderer lib test (the cycle clock's triangle wave
+          # and endpoint composition). Linux 1179/2/33 MEASURED
+          # locally with this step's own awk; Windows 1128 = 1127 +
+          # the same 1.
+          # Era 1 package 6 (post, 2026-11-23): +8 platform-uniform
+          # engine-renderer lib tests (post.rs's chain reference —
+          # the bright-pass zero contract, the mip extent, the
+          # downsample box, the knee feed, the blur taps, the
+          # bilinear weights, the composite, the hand-computed 8x8
+          # chain). Linux 1187/2/33 MEASURED locally with this
+          # step's own awk; Windows 1136 = 1128 + the same 8.
+          expected=1187
+          if [ "$(uname -s)" != "Linux" ]; then expected=1136; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -370,8 +397,28 @@ jobs:
           # Cycle 6-F: +8 shadow-core tests (the same +8 as the main
           # shard, platform-uniform). The combined tree carries ALL
           # THREE additions: 61 + 4 + 4 + 8 = 77.
-          echo "renderer release: $passed passed, $results test-result lines (expected 96 / 2)"
-          [ "$passed" -eq 96 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 96"; exit 1; }
+          # Era 1 scaffold (PR #12): 77 -> 96 (the scaffold's own
+          # measured pin).
+          # Era 1 package 2 (soft shadows, 2026-11-23): +3 (the
+          # shadow_filter point-oracle battery, the same +3 as the
+          # main shard, platform-uniform) — 96 -> 99. MEASURED
+          # locally with this step's own awk (99/0 failures/2 result
+          # lines).
+          # Era 1 package 3 (the sky): +2 (the mat4_inverse pair, the
+          # same +2 as the main shard) — 99 -> 101. MEASURED locally
+          # with this step's own awk (101/0 failures/2 result lines).
+          # Era 1 package 4 (day/night): +1 (the cycle clock test, the
+          # same +1 as the main shard) — 101 -> 102. MEASURED locally
+          # (102/0 failures/2 result lines).
+          # Era 1 package 6 (post, 2026-11-23): +8 (post.rs's chain
+          # reference — the bright-pass zero contract, the mip extent,
+          # the downsample box, the knee feed, the blur taps, the
+          # bilinear weights, the composite, the hand-computed 8x8
+          # chain — the same +8 as the main shard, platform-uniform)
+          # — 102 -> 110. MEASURED locally with this step's own awk
+          # (110/0 failures/2 result lines).
+          echo "renderer release: $passed passed, $results test-result lines (expected 110 / 2)"
+          [ "$passed" -eq 110 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 110"; exit 1; }
           [ "$results" -eq 2 ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != 2"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production
@@ -549,11 +596,47 @@ jobs:
       # path stays pixel-identical). The per-stage println! evidence
       # (the texel census, the max depth error, the patch errors, the
       # allocation pins) is what the CI log must show.
+      # (Era 1 package 2, soft shadows) The same binary's SECOND
+      # #[ignore]d gate now runs here too: the PCF penumbra
+      # pixel-equivalence — the shader's filtered factor vs the CPU
+      # filter (pcf_at_point) over the SAME captured map bytes, per
+      # pixel on a patch straddling the day shadow edge, the
+      # documented exposure-class tolerances, the regime census
+      # (deep shadow / penumbra / full light), and the warmed-
+      # allocation constancy. The command is unchanged (the binary
+      # runs both tests).
       - name: Directional-shadow gates (lavapipe)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_shadows -- --ignored --nocapture
+      # (Era 1 package 3, the sky gates) The sky's known-answer
+      # pixels (the gradient extremes and the disc center vs the CPU
+      # sky_color, per-pixel rays), the composition proof (a
+      # fully-covered frame byte-identical with the sky on and off;
+      # the background replaced on a sky-visible pose), the one-time
+      # sky-state allocation delta, and the warmed constancy. The
+      # per-stage println! evidence is what the CI log must show.
+      - name: Sky gates (lavapipe)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_sky -- --ignored --nocapture
+      # (Era 1 package 6, the post gates) The HDR chain's
+      # known-answer pixels vs post.rs's full-chain reference
+      # through the real render path (MEASURED 0/255 on the dev
+      # pod's lavapipe — the sun-disc center blooming, the
+      # bloom-falloff ring lifted above the no-bloom tonemap, the
+      # far corners the pure ACES tonemap), the postless path's
+      # byte-identity, the one-time allocation delta, and the
+      # corner-family composition smokes. The per-stage println!
+      # evidence (the max-error lines, the lift, the delta) is
+      # what the CI log must show.
+      - name: Post gates (lavapipe)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_post -- --ignored --nocapture
       - name: Full day and night route measurements (lavapipe)
         if: runner.os == 'Linux'
         shell: bash
@@ -605,6 +688,53 @@ jobs:
           done
           grep -Eq 'directional shadows: one cascade \(1024 texels\)' corner-shadows.log
           grep -Eq 'validation warnings/errors 0/0' corner-shadows.log
+          # (Era 1 package 4: day/night) The cycling route: the same
+          # 601-frame measurement regime with the atmosphere advancing
+          # with the demo clock (--day-night 20 — the route's ~11 s
+          # wall at uncapped speed spans past the half-period night
+          # endpoint: day → night → dawn within one run). The series
+          # still print (the same submission work per frame); the
+          # cycle's banner and clean validation are the additions.
+          cargo run -q -p engine-slice -- --corner --day-night 20 --fps uncapped --validation on | tee corner-daynight.log
+          for regime in live exact; do
+            for series in 'CPU frame work' 'frame interval' 'GPU render pass'; do
+              grep -Eq "^$regime $series .*n=601" corner-daynight.log
+            done
+          done
+          grep -Eq 'day/night cycle: 20s period' corner-daynight.log
+          grep -Eq 'validation warnings/errors 0/0' corner-daynight.log
+          # (Era 1 package 6: post) The post route: the same
+          # 601-frame measurement regime through the HDR
+          # render-target chain (the scene pass into the
+          # RGBA16F target, the bloom mips, the ACES composite).
+          # The series still print (the chain is presentation
+          # work on the same submission); the post banner and
+          # clean validation are the additions.
+          cargo run -q -p engine-slice -- --corner --sky --post --fps uncapped --validation on | tee corner-post.log
+          for regime in live exact; do
+            for series in 'CPU frame work' 'frame interval' 'GPU render pass'; do
+              grep -Eq "^$regime $series .*n=601" corner-post.log
+            done
+          done
+          grep -Eq 'post: the HDR chain' corner-post.log
+          grep -Eq 'validation warnings/errors 0/0' corner-post.log
+          # (Era 1 package 1: free-look) The interactive camera's
+          # offscreen smoke: the REAL free-look loop end to end —
+          # construction on the route's entry waypoint (the first
+          # frame is matrix-identical to the route's first — the
+          # shared orientation conversion is lib-tested), presentation
+          # through the same submission selection, the bounded
+          # --frames auto-quit — under the ACTIVE validation layer
+          # with zero input (offscreen delivers none; the
+          # camera-math battery is the lib tests). 70 frames > the
+          # 60-frame warmup so the demo's own warmed-allocation
+          # constancy assertion executes (no resize in offscreen —
+          # the no-recreation regime the gate covers). Lavapipe:
+          # correctness evidence, NOT performance evidence.
+          cargo run -q -p engine-slice -- --corner --free-look --frames 70 --fps uncapped --validation on | tee corner-freelook.log
+          grep -Eq 'free-look: presentation only' corner-freelook.log
+          grep -Eq 'free-look: 70 presented frames; validation warnings/errors 0/0; swapchain recreations 0' corner-freelook.log
+          grep -Eq 'warmed Vulkan allocations held across the session' corner-freelook.log
       - name: Encounter and legacy scene framebuffer regressions (Linux Vulkan)
         if: runner.os == 'Linux'
         shell: bash
@@ -1089,14 +1219,53 @@ jobs:
           # gates + the render_shadows gate), result lines 57 -> 59;
           # passed counts stay the population package's (6-F adds no
           # engine-slice test).
-          expected=576
-          if [ "$(uname -s)" != "Linux" ]; then expected=575; fi
+          # Era 1 package 1 (free-look, 2026-11-23): the corner_demo
+          # camera battery grows the lib binary's passed count by 6
+          # platform-uniform tests (the route-entry matrix identity,
+          # the world-AABB/eye-band clamp, the Stage-2-speed movement
+          # along the camera basis, the runaway-input clamp, the
+          # shared look-mapping composition, the pitch pin) within
+          # its existing result line. Linux 582/13/59 MEASURED
+          # locally with this step's own awk; Windows 581 = the
+          # prior 575 + the same 6 (platform-uniform — pure f32
+          # arithmetic and struct equality, no cfg gates); ignored
+          # and result lines unchanged.
+          expected=582
+          if [ "$(uname -s)" != "Linux" ]; then expected=581; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 13 / 59)"
+          # Era 1 package 2 (soft shadows, 2026-11-23): the SECOND
+          # #[ignore]d render_shadows gate (the PCF penumbra
+          # pixel-equivalence against the CPU filter over the same
+          # captured map bytes — executed by the unchanged
+          # Directional-shadow-gates Linux Vulkan step below) adds
+          # +1 ignored (13 -> 14) in the same binary; passed counts
+          # and result lines unchanged (the package's other tests
+          # are engine-renderer lib tests — the main shard's).
+          # Linux 582/14/59 MEASURED locally with this step's own
+          # awk; Windows 581/14/59 platform-uniform.
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 16 / 61)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
-          [ "$ignored" -eq 13 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 13"; exit 1; }
+          # Era 1 package 3 (the sky, 2026-11-23): the NEW
+          # tests/render_sky.rs binary carries ONE #[ignore]d
+          # lavapipe gate (the sky's known-answer pixels, the
+          # composition proof, the allocation delta - executed by
+          # the dedicated Linux Vulkan step below): +1 ignored
+          # (14 -> 15) AND +1 result line (59 -> 60); passed counts
+          # unchanged. Linux 582/15/60 MEASURED locally with this
+          # step's own awk.
+          # Era 1 package 6 (post, 2026-11-23): the NEW
+          # tests/render_post.rs binary carries ONE #[ignore]d
+          # lavapipe gate (the known-answer pixels vs post.rs's
+          # chain — MEASURED 0/255 — the bloom-ring lift, the
+          # postless byte-identity, the allocation delta, the
+          # composition smokes; executed by the dedicated
+          # Post-gates Linux Vulkan step below): +1 ignored
+          # (15 -> 16) AND +1 result line (60 -> 61); passed counts
+          # unchanged. Linux 582/16/61 MEASURED locally with this
+          # step's own awk.
+          [ "$ignored" -eq 16 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 16"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
@@ -1131,7 +1300,7 @@ jobs:
           # its own result line on the combined tree (58 -> 59; its
           # single gate test is #[ignore]d in the plain run and
           # executed by the dedicated Linux Vulkan step).
-          [ "$results" -eq 59 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 59"; exit 1; }
+          [ "$results" -eq 61 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 60"; exit 1; }
       # (F-06, the 2026-11-12 quality audit — Agent C) The release-mode
       # render-path CPU canary: the comparative microbenchmark in
       # release mode on the llvipe runner — NO timing thresholds (the
