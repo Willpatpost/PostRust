@@ -2,7 +2,7 @@ name: engine-ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, stage5, macos-port, cycle6/6c-scheduler-bookkeeping]
     paths:
       - "crates/**"
       - "build/**"
@@ -301,8 +301,12 @@ jobs:
           # Cycle 6-A: the three platform-uniform atlas layout/UV/metric
           # pins add three passes; ignored and result-line counts stay fixed.
           # Cycle 6-B: eight platform-uniform scene/oracle and texture tests.
-          expected=1126
-          if [ "$(uname -s)" != "Linux" ]; then expected=1075; fi
+          # Cycle 6-C (the F4 closure): +3 engine-core integration
+          # tests (spine_bookkeeping — the structural linearity pins)
+          # and +1 result line (the new binary). Windows 1078/2/33
+          # MEASURED locally; Linux 1129 = 1126 + the same 3.
+          expected=1129
+          if [ "$(uname -s)" != "Linux" ]; then expected=1078; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
