@@ -82,7 +82,15 @@ ARM64) with a five-job CI:
   routing, the debug bitmap overlay, and the Cycle-1 **dynamic-geometry
   truncation counters** (F-03 Step 1: per-frame region/overlay
   omitted-vertex counts with supplied/capacity context, reported in every
-  run summary — fail-visible over the former silent clamps).
+  run summary — fail-visible over the former silent clamps), and the
+  Cycle 6-F **directional shadow path**: the deterministic light-space
+  cascade core, the per-slot shadow maps behind a depth-only pass
+  (an external subpass dependency orders the writes before the main
+  pass's fragment reads), the shadowed lit pipeline sampling the map
+  (hard shadows, a compare-time analytical bias shared verbatim with
+  the CPU oracle), the known-answer map readback, and the
+  `--corner --shadows` route — all lazily created (the unshadowed
+  path's allocation pins untouched, its renders pixel-identical).
 - **`engine-shell`** — the SDL3 application shell (statically-linked vendored
   SDL 3.4.18; real window + offscreen/dummy modes).
 - **`engine-slice`** — the integration/demo driver: the stdin CLI, `--window`,
@@ -142,15 +150,25 @@ for the combined candidate.
 
 | CI partition | Linux | Windows |
 |---|---:|---:|
-| Main shard (`--workspace --exclude engine-slice`) | 1115 | 1064 |
-| Heavy shard (`-p engine-slice --features crash-test-seams`) | 569 | 568 |
-| **Combined** | **1684** | **1632** |
+| Main shard (`--workspace --exclude engine-slice`) | 1146 | 1095 |
+| Heavy shard (`-p engine-slice --features crash-test-seams`) | 570 | 569 |
+| **Combined** | **1716** | **1664** |
 
-The macOS job has its own partition. Main has two ignored tests and 32
-result lines. Heavy has seven ignored tests and 55 result lines.
-At `a4eb372`, Windows counts were measured before landing. Linux counts
-were inferred at landing and subsequently confirmed by GitHub run
-`44937616390` (1110/1059 main and 569/568 heavy, Linux/Windows).
+The macOS job has its own partition. Main has two ignored tests and 33
+result lines. Heavy has ten ignored tests and 58 result lines. The
+Cycle 6-F candidate's Linux counts were MEASURED locally with the
+workflow's own awk (1146 main = the pre-6-F 1138 + 8 platform-uniform
+engine-renderer tests — the shadow core's full battery; heavy passed counts unchanged, its new
+`render_shadows` binary contributing +1 ignored / +1 result line);
+Windows = the prior 1087/569 + the same platform-uniform deltas
+(inference, confirmed by the candidate's CI run — a mismatch is
+corrected from actuals, never by weakening a test). The parallel 6-E
+implementation PR carries its own +4 main-shard delta from the same
+baseline; whichever lands first, the other's rebase adds its delta on
+top (the workflow's comment chains state each branch's arithmetic).
+(At `a4eb372`, Windows counts were measured before landing; Linux
+counts were inferred at landing and subsequently confirmed by GitHub
+run `44937616390`.)
 
 (The extraction baseline was measured at `main` @
 `b19d210` by five-job CI run `44827915274` (and identical at the Sektor7
@@ -628,6 +646,7 @@ not implemented** / **not yet designed**.
 | Shader/material architecture | Prototype only | Hand-written build-time naga shaders; no material system |
 | GPU resource streaming | Not yet designed | F-04 deferred; host-visible copies only |
 | Instanced/indirect draws | **Scaffolded (6-E)** | The deterministic core landed 2026-11-23: the libm-free turn-fraction transforms, the byte-pinned instance packing (the FNV cross-platform pin), the proxy meshes, and the `instanced_proxy.wgsl` shader reusing the 6-B binding layout — see `docs/CYCLE6-6E-BRIEF.md` (the implementer wires the instance-rate vertex input, the zero-alloc instance buffer, the single instanced draw, and the N-vs-1 pixel-equivalence gate; indirect draws deferred to 6-E2) |
+| Directional shadows | **Implemented (6-F)** | The Cycle 6-F implementation landed 2026-11-23: the deterministic core (the light-space orthographic cascade, the compare-time slope-scaled bias model, the CPU raycaster oracle — pure IEEE, unit-pinned) + the depth-only pass + the shadowed lit pipeline sampling the map (hard shadows, one cascade, the corner scene). The gates: the map's known-answer (every texel vs the raycaster, max |Δdepth| 2.7e-7 on lavapipe) and the pixel equivalence (a shadowed ground patch renders exactly `albedo·ambient`, a lit patch the unshadowed equation, the unshadowed path pixel-identical) — `tests/render_shadows.rs`, executed by the CI's Linux Vulkan step. The `--corner --shadows` demo mode runs the full route. PCF/softening, cascaded splits, and proxy shadows are open |
 | NPC/world representation (LOD) | Partially implemented | The region director, four LOD levels, activation/reconstruction — validated at 1000 NPCs / 8 regions; game-scale behaviors undesigned |
 | Physics and collision | Prototype only | The Cycle-1 kinematic player prototype (`engine-core` player module: swept-AABB collision, fixed-step movement, FP/TP cameras) — headless/offscreen validated, collide-what-you-see; reversible and explicitly NOT a ratified production physics backend (§8) |
 | Combat and gameplay systems | Partially implemented (demo-scale prototype, validated) | The Cycle 2–5 line: `engine-core` combat resolution (`resolve_attack`, pure, allocation-free) + the adversary cadence model + the encounter composition with cover/HUD/cues in `engine-slice` — pinned by the combat_world (21) and encounter_world (30) batteries with byte-identical scenario traces; game-scale gameplay systems (progression, economy, AI beyond the cadence prototype) remain undesigned |

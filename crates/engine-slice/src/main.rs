@@ -63,6 +63,8 @@ Interactive modes
   --window [--dummy]                 SDL window and input
   --render [--regions]               Vulkan scene and optional region LOD
   --corner [--night]                 Full lit city route (day by default)
+  --corner --shadows                 The route with directional shadows (one
+                                    cascade, the deterministic core's oracle)
   --player | --playable              Movement and gatehouse demos
   --combat | --encounter             Combat and courtyard demos
   --demo-persist <campaign-dir>      Persistent campaign
@@ -514,6 +516,7 @@ fn main() {
     if args.iter().any(|arg| arg == "--corner") {
         let run = || -> Result<(), String> {
             let mut night = false;
+            let mut shadows = false;
             let mut fps = 60;
             let mut present = engine_renderer::PresentModePreference::Auto;
             let mut validation = engine_renderer::ValidationPreference::Auto;
@@ -522,6 +525,7 @@ fn main() {
                 match arg.as_str() {
                     "--corner" => {}
                     "--night" => night = true,
+                    "--shadows" => shadows = true,
                     "--fps" => {
                         fps = parse_fps(options.next().ok_or("--fps requires a value")?)?
                             .ok_or("--fps requires 1-1000 or uncapped")?;
@@ -541,7 +545,7 @@ fn main() {
                     _ => return Err(format!("unrecognized corner option {arg}")),
                 }
             }
-            engine_slice::corner_demo::run(night, fps, present, validation)
+            engine_slice::corner_demo::run(night, fps, present, validation, shadows)
         };
         if let Err(e) = run() {
             eprintln!("error: {e}");

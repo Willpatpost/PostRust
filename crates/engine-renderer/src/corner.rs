@@ -172,39 +172,110 @@ impl CornerResources {
         self.textures.iter().map(|t| t.allocation_bytes).sum()
     }
 
-    /// Called inside the lit render pass only after this slot's fence wait.
+    /// Called inside the lit render pass only after this slot's fence
+    /// wait (the caller writes the slot's FrameParams first — the
+    /// 6-F split, so the shadowed path can write the EXTENDED block
+    /// into the shadow state's own uniform instead). The 6-F
+    /// parameterized form: `sets` are the per-material descriptor
+    /// sets to bind (the corner's own for the unshadowed path; the
+    /// shadow state's per-slot sets for the shadowed path) and
+    /// `frame_offset` the FrameParams dynamic offset matching those
+    /// sets' uniform buffer.
     pub fn draw(
         &self,
         ctx: &VulkanContext,
         cmd: vk::CommandBuffer,
         layout: vk::PipelineLayout,
-        slot: usize,
-        params: &FrameParams,
+        sets: &[vk::DescriptorSet; 3],
+        frame_offset: u32,
     ) {
-        let offset = slot as u32 * self.stride;
-        // SAFETY: slot < FRAMES_IN_FLIGHT. The coherent frame ranges do not
-        // overlap other slots or the immutable material tail. All draws refer
-        // to complete triangle ranges in the uploaded VBO.
+        // SAFETY: the bound vertex buffer is the corner mesh's own;
+        // all draws refer to complete triangle ranges in it. The
+        // sets' frame regions were written after the slot's fence
+        // wait (the caller's write, the coherent-buffer discipline).
         unsafe {
-            self.mapped
-                .byte_add(offset as usize)
-                .cast::<FrameParams>()
-                .write(*params);
             ctx.device
                 .cmd_bind_vertex_buffers(cmd, 0, &[self.vertices], &[0]);
-            for (set, range) in self.sets.iter().zip(&self.draws) {
+            for (set, range) in sets.iter().zip(&self.draws) {
                 ctx.device.cmd_bind_descriptor_sets(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
                     layout,
                     0,
                     &[*set],
-                    &[offset],
+                    &[frame_offset],
                 );
                 ctx.device
                     .cmd_draw(cmd, range.end - range.start, 1, range.start, 0);
             }
         }
+    }
+
+    /// The corner's own per-material descriptor sets (the unshadowed
+    /// path's `draw` binding).
+    pub(crate) fn sets(&self) -> &[vk::DescriptorSet; 3] {
+        &self.sets
+    }
+
+    /// The FrameParams dynamic-uniform stride (the unshadowed path's
+    /// per-slot offsets).
+    pub(crate) fn frame_stride(&self) -> u32 {
+        self.stride
+    }
+
+    /// Writes one slot's FrameParams region (the write half of `draw`,
+    /// split for the 6-F shadowed path, which writes the EXTENDED
+    /// block into the shadow state's own uniform instead).
+    ///
+    /// # Safety
+    /// `slot` must be owned (its fence wait passed).
+    pub(crate) unsafe fn write_frame(&self, slot: usize, params: &FrameParams) {
+        let offset = slot as u32 * self.stride;
+        // SAFETY: the coherent frame regions do not overlap other
+        // slots or the immutable material tail.
+        unsafe {
+            self.mapped
+                .byte_add(offset as usize)
+                .cast::<FrameParams>()
+                .write(*params);
+        }
+    }
+
+    /// The corner mesh's vertex buffer and its material-grouped draw
+    /// ranges (the shadow state's depth-only pass draws the whole
+    /// mesh through them).
+    pub(crate) fn mesh(&self) -> (vk::Buffer, [Range<u32>; 3]) {
+        (
+            self.vertices,
+            [
+                Range {
+                    start: self.draws[0].start,
+                    end: self.draws[0].end,
+                },
+                Range {
+                    start: self.draws[1].start,
+                    end: self.draws[1].end,
+                },
+                Range {
+                    start: self.draws[2].start,
+                    end: self.draws[2].end,
+                },
+            ],
+        )
+    }
+
+    /// The albedo texture view for a material index (the shadowed
+    /// sets bind the same textures the corner's own sets do).
+    pub(crate) fn albedo_view(&self, material: u32) -> Option<vk::ImageView> {
+        let table = materials();
+        let mat = table.get(material as usize)?;
+        Some(self.textures[mat.texture as usize].view)
+    }
+
+    /// The corner's REPEAT-addressed sampler (the shadowed sets'
+    /// immutable sampler — identical sampling to the unshadowed path).
+    pub(crate) fn repeat_sampler(&self) -> vk::Sampler {
+        self.sampler.nearest()
     }
 
     pub fn destroy(mut self, ctx: &VulkanContext) {

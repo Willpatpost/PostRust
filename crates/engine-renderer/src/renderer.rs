@@ -16,6 +16,20 @@ use crate::vulkan::{
     drain_validation_messages, environment_pending, pick_depth_format, pick_surface_format,
 };
 
+/// One captured shadow-map readback (the 6-F known-answer path): the
+/// depth-only pass's map, one f32 per texel, row-major with row 0
+/// first, at the map's square extent. The depths are UNBIASED
+/// light-space values in [0, 1] (the compare-time analytical bias is
+/// applied at lookup, never written) — exactly the CPU raycaster's
+/// `t / (far − near)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShadowMapReadback {
+    /// The map's square texel extent.
+    pub extent: u32,
+    /// `extent × extent` depths, row-major, row 0 first.
+    pub depths: Vec<f32>,
+}
+
 /// A batch of triangles with its own transform into clip space. A
 /// foreground batch typically supplies camera-local vertices and a projection.
 #[derive(Debug, Clone, Copy)]
@@ -325,6 +339,7 @@ impl Renderer {
             hud,
             &self.overlay_vertices,
             None,
+            None,
         )?;
         Ok(self.finish_frame(outcome))
     }
@@ -358,8 +373,108 @@ impl Renderer {
             &[],
             &[],
             Some(&params),
+            None,
         )?;
         Ok(self.finish_frame(outcome))
+    }
+
+    /// Draws the corner scene with DIRECTIONAL SHADOWS (Cycle 6-F):
+    /// one cascade computed from the light direction and the scene's
+    /// world AABB (the deterministic core's `cascade_for`), rendered
+    /// through the depth-only pass, then the main pass with the
+    /// shadowed lit pipeline sampling the map (hard shadows, the
+    /// compare-time analytical bias). The unshadowed `render_corner`
+    /// path is untouched — pixel-identical to the pre-6-F renderer.
+    /// The bias parameters are CALLER policy (documented per caller;
+    /// the shader and the CPU oracle share the same expression).
+    pub fn render_corner_shadowed(
+        &mut self,
+        view_proj: &[[f32; 4]; 4],
+        eye: [f32; 3],
+        light: crate::lit_scene::LightParams,
+        bias: crate::shadows::ShadowBias,
+        size: (u32, u32),
+    ) -> Result<FrameResult, RendererError> {
+        if self.config.demo_scene != crate::DemoScenePreference::Corner {
+            return Err(RendererError::Vulkan(
+                "render_corner_shadowed requires the Corner scene preference".into(),
+            ));
+        }
+        let boxes = crate::lit_scene::intersection_boxes();
+        let (min, max) = crate::shadows::scene_bounds(&boxes);
+        let cascade = crate::shadows::cascade_for(light.dir_toward_light, min, max);
+        let [r, g, b] = light.ambient;
+        let params = vulkan::shadow_draw::ShadowFrameParams {
+            view_proj: *view_proj,
+            light_dir: [
+                light.dir_toward_light[0],
+                light.dir_toward_light[1],
+                light.dir_toward_light[2],
+                eye[0],
+            ],
+            light_color: [
+                light.light_color[0],
+                light.light_color[1],
+                light.light_color[2],
+                eye[1],
+            ],
+            ambient: [r, g, b, eye[2]],
+            light_view_proj: cascade.matrix,
+            shadow_control: [
+                crate::shadows::SHADOW_MAP_EXTENT as f32,
+                bias.constant,
+                bias.slope_scale,
+                0.0,
+            ],
+        };
+        let outcome = vulkan::render_frame(
+            &mut self.ctx,
+            &mut self.swapchain,
+            &mut self.pipes,
+            &mut self.frames,
+            size,
+            self.config.present_mode,
+            self.config.replace_pipelines,
+            self.config.demo_scene,
+            view_proj,
+            &[],
+            None,
+            &[],
+            &[],
+            None,
+            Some(&params),
+        )?;
+        Ok(self.finish_frame(outcome))
+    }
+
+    /// Requests the NEXT shadowed frame's shadow-map readback (the
+    /// 6-F known-answer path — the depth-only pass's map, one f32
+    /// per texel, row-major). Single-flight like the color capture.
+    /// Ensures the shadow state if no shadowed frame has run yet
+    /// (the lazy discipline's request-side completion — the request
+    /// precedes the frame it wants recorded).
+    pub fn request_shadow_map_capture(&mut self) -> Result<(), RendererError> {
+        if self.pipes.shadows.is_none() {
+            if self.config.demo_scene != crate::DemoScenePreference::Corner {
+                return Err(RendererError::Vulkan(
+                    "shadow capture requires the Corner scene preference".into(),
+                ));
+            }
+            self.pipes.ensure_shadow_resources(&self.ctx)?;
+        }
+        vulkan::request_shadow_readback(&mut self.frames)
+    }
+
+    /// Takes the completed shadow-map readback, if one is ready (the
+    /// recording slot's fence is waited — the color capture's take
+    /// discipline). The depths are the UNBIASED light-space depths
+    /// the depth-only pass rasterized.
+    pub fn take_shadow_map_capture(&mut self) -> Result<Option<ShadowMapReadback>, RendererError> {
+        let depths = vulkan::take_shadow_readback(&self.ctx, &mut self.pipes, &mut self.frames)?;
+        Ok(depths.map(|depths| ShadowMapReadback {
+            extent: crate::shadows::SHADOW_MAP_EXTENT,
+            depths,
+        }))
     }
 
     fn finish_frame(&mut self, outcome: vulkan::FrameOutcome) -> FrameResult {

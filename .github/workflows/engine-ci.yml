@@ -311,8 +311,15 @@ jobs:
           # counts and validity). Windows 1087/2/33 MEASURED
           # locally; Linux 1138 = 1129 + the same 9, platform-
           # uniform (the new core is pure IEEE arithmetic).
-          expected=1138
-          if [ "$(uname -s)" != "Linux" ]; then expected=1087; fi
+          # Cycle 6-F: +8 platform-uniform engine-renderer tests
+          # (shadows: the basis, the matrix coverage, the synthetic
+          # cube, the corner census, the raycaster's synthetic and
+          # corner pins, the texel round-trip, the bias model — pure
+          # IEEE). Linux 1146 = 1138 + the same 8; Windows 1095 =
+          # 1087 + the same 8. (If the 6-E implementation PR lands
+          # first, the rebase adds its +4: 1150/1099.)
+          expected=1146
+          if [ "$(uname -s)" != "Linux" ]; then expected=1095; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -339,8 +346,10 @@ jobs:
           results=$(grep -c 'test result:' tests-renderer-release.log || true)
           # Cycle 6-E scaffold: the renderer release battery
           # 52 -> 61 (the same +9 proxy unit tests).
-          echo "renderer release: $passed passed, $results test-result lines (expected 61 / 2)"
-          [ "$passed" -eq 61 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 61"; exit 1; }
+          # Cycle 6-F: 61 -> 69 (the same +8 shadow-core tests as
+          # the main shard, platform-uniform; 73 if 6-E lands first).
+          echo "renderer release: $passed passed, $results test-result lines (expected 69 / 2)"
+          [ "$passed" -eq 69 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 69"; exit 1; }
           [ "$results" -eq 2 ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != 2"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production
@@ -480,6 +489,20 @@ jobs:
         shell: bash
         run: |
           SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_corner -- --ignored --nocapture
+      # (Cycle 6-F, the shadow gates) The shadow map's known-answer
+      # (every texel vs the deterministic core's CPU raycaster — the
+      # depth-only pass's map at float-epsilon) and the pixel
+      # equivalence (a fully-shadowed ground patch renders exactly
+      # albedo·ambient, a fully-lit patch the unshadowed equation,
+      # the shadow visibly changes the frame, and the unshadowed
+      # path stays pixel-identical). The per-stage println! evidence
+      # (the texel census, the max depth error, the patch errors, the
+      # allocation pins) is what the CI log must show.
+      - name: Directional-shadow gates (lavapipe)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_shadows -- --ignored --nocapture
       - name: Full day and night route measurements (lavapipe)
         if: runner.os == 'Linux'
         shell: bash
@@ -497,6 +520,19 @@ jobs:
             done
             grep -Eq 'peak process resident memory: [1-9][0-9]* KiB' corner.log
           done
+          # (Cycle 6-F) The shadowed route: the same 601-frame
+          # measurement regime through the depth-only pass + the
+          # shadowed lit pipeline — steady-state evidence for the
+          # shadow path (lavapipe is a software rasterizer:
+          # correctness evidence, NOT performance evidence).
+          cargo run -q -p engine-slice -- --corner --shadows --fps uncapped --validation on | tee corner-shadows.log
+          for regime in live exact; do
+            for series in 'CPU frame work' 'frame interval' 'GPU render pass'; do
+              grep -Eq "^$regime $series .*n=601" corner-shadows.log
+            done
+          done
+          grep -Eq 'directional shadows: one cascade \(1024 texels\)' corner-shadows.log
+          grep -Eq 'validation warnings/errors 0/0' corner-shadows.log
       - name: Encounter and legacy scene framebuffer regressions (Linux Vulkan)
         if: runner.os == 'Linux'
         shell: bash
@@ -939,14 +975,18 @@ jobs:
           # Cycle 6-A adds one separate ignored graphical test binary,
           # executed in the Linux Vulkan step: +1 ignored / +1 result line.
           # Cycle 6-B: full-route camera pin plus one ignored capture binary.
+          # Cycle 6-F: the new tests/render_shadows.rs binary carries ONE
+          # #[ignore]d lavapipe gate (the map known-answer + the pixel
+          # oracles, executed by the dedicated Linux Vulkan step): +1
+          # ignored / +1 result line, passed counts unchanged.
           expected=570
           if [ "$(uname -s)" != "Linux" ]; then expected=569; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 9 / 57)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 10 / 58)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
-          [ "$ignored" -eq 9 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 9"; exit 1; }
+          [ "$ignored" -eq 10 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 10"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
@@ -966,7 +1006,11 @@ jobs:
           # result line (its single framebuffer test is #[ignore]d in
           # the plain run and executed by the dedicated framebuffer
           # step; MEASURED at the candidate with the local heavy pass).
-          [ "$results" -eq 57 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 57"; exit 1; }
+          # Cycle 6-F: 57 -> 58 — the new tests/render_shadows.rs
+          # binary adds the 58th result line (its single gate test is
+          # #[ignore]d in the plain run and executed by the dedicated
+          # Linux Vulkan step).
+          [ "$results" -eq 58 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 58"; exit 1; }
       # (F-06, the 2026-11-12 quality audit — Agent C) The release-mode
       # render-path CPU canary: the comparative microbenchmark in
       # release mode on the llvipe runner — NO timing thresholds (the
