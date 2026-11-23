@@ -3748,7 +3748,45 @@ mod exclusion_tests {
             ],
         };
         let (audit, outcome) = publish_reclamation_ledger(&mut medium, &ledger, 5).unwrap();
-        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        // (The 2026-11-23 CI-flake corrective.) A transient runner
+        // filesystem failure inside the medium's uncertain window
+        // (object write / HEAD.tmp+rename / post-rename sync) surfaces
+        // as `AppendOutcome::Unknown` BY CONTRACT — observed once on
+        // a windows-latest CI run in hundreds of green executions
+        // (run 45097608474, this setup helper, the
+        // epoch-overflow test's caller). The production contract
+        // reconciles Unknown under the lock; this setup helper
+        // previously asserted bare `Accepted`, which a healthy
+        // filesystem gives but a contended CI runner cannot
+        // guarantee. The reconciliation here: installed at HEAD ->
+        // the post-publication state this setup exists to produce;
+        // not installed -> retry the SAME idempotent publication
+        // (the parent head is unchanged, so the record — and its id
+        // — rebuild identically; the content-addressed object
+        // rewrites are byte-identical insert-once writes). A
+        // stale-parent rejection stays a loud failure: single-
+        // threaded setup has no competitor, so a moved head is a
+        // real bug this helper must surface, never paper over.
+        if !matches!(outcome, AppendOutcome::Accepted { .. }) {
+            assert!(
+                matches!(outcome, AppendOutcome::Unknown { .. }),
+                "setup publication rejected with no competitor: {outcome:?}"
+            );
+            if medium.head().unwrap() != Some(audit) {
+                let (audit_retry, outcome_retry) =
+                    publish_reclamation_ledger(&mut medium, &ledger, 5).unwrap();
+                assert_eq!(
+                    audit_retry, audit,
+                    "the idempotent retry rebuilds the identical record"
+                );
+                assert!(
+                    matches!(outcome_retry, AppendOutcome::Accepted { .. })
+                        || medium.head().unwrap() == Some(audit_retry),
+                    "the setup publication did not install after reconciliation: \
+                     {outcome_retry:?}"
+                );
+            }
+        }
         (root, medium, audit, mk.id(), shared.hash(), private.hash())
     }
 
