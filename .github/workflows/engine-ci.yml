@@ -2,7 +2,7 @@ name: engine-ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, stage5, macos-port, cycle6/6c-scheduler-bookkeeping]
     paths:
       - "crates/**"
       - "build/**"
@@ -301,15 +301,23 @@ jobs:
           # Cycle 6-A: the three platform-uniform atlas layout/UV/metric
           # pins add three passes; ignored and result-line counts stay fixed.
           # Cycle 6-B: eight platform-uniform scene/oracle and texture tests.
-          expected=1126
-          if [ "$(uname -s)" != "Linux" ]; then expected=1075; fi
+          # Cycle 6-C (the F4 closure): +3 engine-core integration
+          # tests (spine_bookkeeping — the structural linearity pins)
+          # and +1 result line (the new binary: 32 -> 33). Windows
+          # 1078/2/33 MEASURED locally; Linux 1129 = 1126 + the same
+          # 3. The result-line count 33 confirmed by this run's
+          # actuals (the commit message's "32" was the projection
+          # error — corrected from actuals, never by weakening a
+          # test).
+          expected=1129
+          if [ "$(uname -s)" != "Linux" ]; then expected=1078; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
-          echo "main shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 2 / 32)"
+          echo "main shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 2 / 33)"
           [ "$passed" -eq "$expected" ] || { echo "MAIN SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           [ "$ignored" -eq 2 ] || { echo "MAIN SHARD IGNORED MISMATCH: $ignored != 2"; exit 1; }
-          [ "$results" -eq 32 ] || { echo "MAIN SHARD RESULT-LINE MISMATCH: $results != 32"; exit 1; }
+          [ "$results" -eq 33 ] || { echo "MAIN SHARD RESULT-LINE MISMATCH: $results != 33"; exit 1; }
       # (The batch-3 review's corrective item 4) The ISOLATED RELEASE
       # engine-renderer battery — the configuration the orientation
       # pin's representation-sensitive former matcher failed in while

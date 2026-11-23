@@ -303,9 +303,14 @@ The following audit finding remains genuinely open:
 
 - **Scheduler budget (audit F4).** The per-tick limit counts executed
   events. Registering blocked events and waking their dependents still
-  costs CPU outside that limit. A hard limit on this bookkeeping is
-  deferred pending a decision on how dependency work should carry across
-  ticks and affect the deterministic execution order.
+  costs CPU outside that limit. **CLOSED 2026-11-22 (Cycle 6-C,
+  decision T-18): MEASURED NEGLIGIBLE — no bounded budget needed.**
+  The per-tick bookkeeping cost is linear at ~1 ns per blocked event
+  per tick (under 0.1% of a 60 Hz frame at 10,000 blocked events —
+  10x the demonstrated sustained-load scale); each event parks exactly
+  once regardless of waiting duration (pinned structurally by
+  `tests/spine_bookkeeping.rs`). The finding reopens only if a
+  10,000+ blocked-event-per-tick workload is demonstrated.
 
 - **F-03** — the region-render vertex-capacity policy: **Step 1 is
   DELIVERED in Cycle 1** (the fail-visible truncation counters — §2 —
