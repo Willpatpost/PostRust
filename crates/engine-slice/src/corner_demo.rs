@@ -3,14 +3,80 @@ use crate::math::{Mat4, camera_view, mul, percentile, perspective};
 use engine_core::timing::TimingSamples;
 use engine_renderer::config::FRAMES_IN_FLIGHT;
 use engine_renderer::lit_scene::{RouteWaypoint, camera_route, day_preset, night_preset};
+use engine_renderer::proxy_instances::{InstanceTransform, ProxyInstance};
 use engine_renderer::{
-    DemoScenePreference, PresentModePreference, RenderConfig, Renderer, ValidationPreference,
+    DemoScenePreference, PresentModePreference, ProxyDrawMode, ProxyPopulation, RenderConfig,
+    Renderer, ValidationPreference,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig, pace_until};
 use std::time::{Duration, Instant};
 
 const STEPS: usize = 120;
 const WARMUP: usize = 60;
+
+/// The proxy materials the demo population draws with (the caller
+/// policy `ProxyPopulation` carries): NPCs with the concrete facade
+/// set (broad dim specular — matte clothing), vehicles with the dark
+/// stone set (tighter, slightly brighter — paint sheen). Documented
+/// choice, not engine policy.
+const NPC_MATERIAL: u32 = 1;
+const VEHICLE_MATERIAL: u32 = 2;
+
+/// The demo's deterministic proxy population — a FIXED TABLE (not
+/// seeded), hand-authored in the intersection's road-cross frame:
+/// NPCs stand on the sidewalk ring (|x| or |z| = 5, between the 4 m
+/// road edge and the 6 m building line), vehicles rest in the road
+/// lanes clear of the camera route (the route runs z≈0 westbound
+/// then x≈0 northbound; the vehicles sit in the opposite lanes).
+/// Feet at y = 0.02 — on the ground, off its exact plane (the
+/// coplanar underside/ground seam). Pure data, byte-stable; the
+/// ladder's next package replaces this with the full 24-NPC +
+/// 2-vehicle placement table.
+fn demo_population() -> (Vec<ProxyInstance>, Vec<ProxyInstance>) {
+    let npc = |pos: [f32; 3], turn: u16, tint: [f32; 3]| ProxyInstance {
+        transform: InstanceTransform {
+            pos,
+            turn,
+            scale: 1.0,
+        },
+        tint,
+    };
+    let vehicle = |pos: [f32; 3], turn: u16, tint: [f32; 3]| ProxyInstance {
+        transform: InstanceTransform {
+            pos,
+            turn,
+            scale: 1.0,
+        },
+        tint,
+    };
+    (
+        vec![
+            // West sidewalk (x = -5), facing the road (+X).
+            npc([-5.0, 0.02, -6.0], 0, [0.85, 0.70, 0.55]),
+            npc([-5.0, 0.02, -2.0], 0, [0.20, 0.45, 0.75]),
+            npc([-5.0, 0.02, 3.0], 0, [0.90, 0.35, 0.20]),
+            npc([-5.0, 0.02, 7.0], 0, [0.35, 0.75, 0.30]),
+            // East sidewalk (x = 5), facing the road (-X).
+            npc([5.0, 0.02, -7.0], 32768, [0.75, 0.30, 0.60]),
+            npc([5.0, 0.02, 2.0], 32768, [0.95, 0.80, 0.40]),
+            npc([5.0, 0.02, 6.0], 32768, [0.15, 0.55, 0.85]),
+            // North sidewalk (z = 5), facing the road (-Z).
+            npc([-3.0, 0.02, 5.0], 49152, [0.60, 0.60, 0.65]),
+            npc([4.0, 0.02, 5.0], 49152, [0.80, 0.50, 0.30]),
+            // South sidewalk (z = -5), facing the road (+Z).
+            npc([-8.0, 0.02, -5.0], 16384, [0.45, 0.80, 0.75]),
+            npc([1.0, 0.02, -5.0], 16384, [0.70, 0.20, 0.20]),
+            // Crossing the west crosswalk, mid-stride north.
+            npc([-4.5, 0.02, 0.5], 16384, [0.90, 0.75, 0.60]),
+        ],
+        vec![
+            // Westbound lane (z = +2), stopped short of the cross.
+            vehicle([-10.0, 0.0, 2.0], 16384, [0.75, 0.18, 0.15]),
+            // Northbound lane (x = +2), north of the cross.
+            vehicle([2.0, 0.0, 9.0], 0, [0.15, 0.25, 0.70]),
+        ],
+    )
+}
 
 /// Two seconds per segment at the reference 60 Hz. Uncapped runs present
 /// the identical sequence. Shared waypoints appear once, including both ends.
@@ -105,6 +171,8 @@ pub fn run(
     fps: u32,
     present: PresentModePreference,
     validation: ValidationPreference,
+    populated: bool,
+    proxy_reference: bool,
 ) -> Result<(), String> {
     let mut app = ShellApp::new(ShellConfig {
         title: "One Corner of the City".into(),
@@ -123,6 +191,29 @@ pub fn run(
         },
     )
     .map_err(|e| e.to_string())?;
+    let (npc, vehicle) = if populated {
+        demo_population()
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let population = if populated {
+        Some(ProxyPopulation {
+            npc: &npc,
+            npc_material: NPC_MATERIAL,
+            vehicle: &vehicle,
+            vehicle_material: VEHICLE_MATERIAL,
+        })
+    } else {
+        None
+    };
+    // The equivalence gate's reference mode (one draw per instance —
+    // the pre-6-E submission shape), for before/after measurement;
+    // production never sets it.
+    renderer.set_proxy_draw_mode(if proxy_reference {
+        ProxyDrawMode::PerInstance
+    } else {
+        ProxyDrawMode::Instanced
+    });
     let stats = renderer.stats();
     let size = stats.extent;
     let preset = if night { "night" } else { "day" };
@@ -138,6 +229,24 @@ pub fn run(
         stats.validation_active,
         cfg!(debug_assertions)
     );
+    if populated {
+        println!(
+            "proxy population: {} instances ({} npc + {} vehicle), {} draw calls per frame ({})",
+            npc.len() + vehicle.len(),
+            npc.len(),
+            vehicle.len(),
+            if proxy_reference {
+                (npc.len() + vehicle.len()) as u32
+            } else {
+                u32::from(!npc.is_empty()) + u32::from(!vehicle.is_empty())
+            },
+            if proxy_reference {
+                "per-object reference mode"
+            } else {
+                "instanced mode"
+            }
+        );
+    }
     if validation == ValidationPreference::On && !stats.validation_active {
         return Err("requested validation layer is unavailable".into());
     }
@@ -162,14 +271,22 @@ pub fn run(
         if measured.contains(&i) {
             pose = poses.next().unwrap();
         }
-        let frame = renderer
-            .render_corner(&view_projection(pose, aspect), pose.position, light, size)
-            .map_err(|e| e.to_string())?;
+        let matrix = view_projection(pose, aspect);
+        let frame = match population.as_ref() {
+            Some(population) => {
+                renderer.render_corner_populated(&matrix, pose.position, light, population, size)
+            }
+            None => renderer.render_corner(&matrix, pose.position, light, size),
+        }
+        .map_err(|e| e.to_string())?;
         let end = Instant::now();
         if !frame.presented || frame.recreated || frame.suboptimal {
             return Err(format!(
                 "route presentation interrupted at submission {i}: {frame:?}"
             ));
+        }
+        if populated && frame.geometry.proxy_draw_calls == 0 {
+            return Err("populated route drew no proxy calls".into());
         }
         if measured.contains(&i) {
             cpu.record((end - start).as_secs_f64() * 1000.);

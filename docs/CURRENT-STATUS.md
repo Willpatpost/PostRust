@@ -79,10 +79,17 @@ ARM64) with a five-job CI:
   handling, present-mode preference with FIFO fallback, depth-correct scene,
   the dynamic region-scene vertex path (the F-02 caller-held scratch form),
   the retained overlay-vertex buffer (F-05), GPU timestamps, validation-layer
-  routing, the debug bitmap overlay, and the Cycle-1 **dynamic-geometry
+  routing, the debug bitmap overlay, the Cycle-1 **dynamic-geometry
   truncation counters** (F-03 Step 1: per-frame region/overlay
   omitted-vertex counts with supplied/capacity context, reported in every
-  run summary — fail-visible over the former silent clamps).
+  run summary — fail-visible over the former silent clamps), and the
+  Cycle 6-E **instanced proxy path**: the instance-rate vertex input
+  (mesh binding + packed-instance binding), the lazily-created
+  per-frame-slot mapped instance buffer and per-kind mesh VBOs
+  (zero per-frame allocation — the counters stay constant across
+  warmed populated frames), one draw call per populated proxy kind,
+  and the per-object reference submission mode kept as the
+  equivalence gate's N-draws side.
 - **`engine-shell`** — the SDL3 application shell (statically-linked vendored
   SDL 3.4.18; real window + offscreen/dummy modes).
 - **`engine-slice`** — the integration/demo driver: the stdin CLI, `--window`,
@@ -142,15 +149,25 @@ for the combined candidate.
 
 | CI partition | Linux | Windows |
 |---|---:|---:|
-| Main shard (`--workspace --exclude engine-slice`) | 1115 | 1064 |
-| Heavy shard (`-p engine-slice --features crash-test-seams`) | 569 | 568 |
-| **Combined** | **1684** | **1632** |
+| Main shard (`--workspace --exclude engine-slice`) | 1142 | 1091 |
+| Heavy shard (`-p engine-slice --features crash-test-seams`) | 570 | 569 |
+| **Combined** | **1712** | **1660** |
 
-The macOS job has its own partition. Main has two ignored tests and 32
-result lines. Heavy has seven ignored tests and 55 result lines.
-At `a4eb372`, Windows counts were measured before landing. Linux counts
-were inferred at landing and subsequently confirmed by GitHub run
-`44937616390` (1110/1059 main and 569/568 heavy, Linux/Windows).
+The macOS job has its own partition. Main has two ignored tests and 33
+result lines. Heavy has ten ignored tests and 58 result lines. The
+Cycle 6-E implementation candidate's Linux counts were MEASURED
+locally with the workflow's own awk (1142 main = the 6-E scaffold's
+1138 + 4 platform-uniform engine-renderer tests; heavy passed counts
+unchanged, its new `render_instanced` binary contributing +1 ignored
+/+1 result line); Windows = the prior 1087/569 + the same platform-
+uniform deltas (inference, confirmed by the candidate's CI run — a
+mismatch is corrected from actuals, never by weakening a test). The
+pre-6-E-implementation workflow pins (1138/1087 main, 570/569 heavy
+with 9 ignored / 57 lines) carried the 6-A/6-B/6-E-scaffold history;
+the workflow's comment chains remain the per-batch measurement record.
+(At `a4eb372`, Windows counts were measured before landing; Linux
+counts were inferred at landing and subsequently confirmed by GitHub
+run `44937616390`.)
 
 (The extraction baseline was measured at `main` @
 `b19d210` by five-job CI run `44827915274` (and identical at the Sektor7
@@ -627,7 +644,7 @@ not implemented** / **not yet designed**.
 | Rendering (Vulkan presentation) | Partially implemented (prototype-class design) | `engine-renderer`; lavapipe + rig validation; F-03 Step 1 delivered (fail-visible truncation counters), Step-2 policy + F-04 open |
 | Shader/material architecture | Prototype only | Hand-written build-time naga shaders; no material system |
 | GPU resource streaming | Not yet designed | F-04 deferred; host-visible copies only |
-| Instanced/indirect draws | **Scaffolded (6-E)** | The deterministic core landed 2026-11-23: the libm-free turn-fraction transforms, the byte-pinned instance packing (the FNV cross-platform pin), the proxy meshes, and the `instanced_proxy.wgsl` shader reusing the 6-B binding layout — see `docs/CYCLE6-6E-BRIEF.md` (the implementer wires the instance-rate vertex input, the zero-alloc instance buffer, the single instanced draw, and the N-vs-1 pixel-equivalence gate; indirect draws deferred to 6-E2) |
+| Instanced/indirect draws | **Implemented (6-E), indirect deferred (6-E2)** | The Cycle 6-E implementation landed 2026-11-23 on the scaffold's deterministic core (the libm-free turn-fraction transforms, the byte-pinned packing, the proxy meshes, the `instanced_proxy.wgsl` shader): the instance-rate vertex input, the lazily-created zero-per-frame-allocation instance buffer (allocations constant across warmed populated frames), one draw call per populated kind (the populated corner route: 14 instances in 2 calls), the N-vs-1 pixel-equivalence gate (`tests/render_instanced.rs`, byte-equal frames, per-pixel 6-B oracle checks at 0/255 max error on lavapipe), the draw-call pins, and the `--corner --populated` demo mode — see `docs/CYCLE6-6E-BRIEF.md`. The rig measurement commands live in the 6-E PR (lavapipe is correctness evidence only). Indirect draws (`vkCmdDrawIndirect`) are the separate 6-E2 package |
 | NPC/world representation (LOD) | Partially implemented | The region director, four LOD levels, activation/reconstruction — validated at 1000 NPCs / 8 regions; game-scale behaviors undesigned |
 | Physics and collision | Prototype only | The Cycle-1 kinematic player prototype (`engine-core` player module: swept-AABB collision, fixed-step movement, FP/TP cameras) — headless/offscreen validated, collide-what-you-see; reversible and explicitly NOT a ratified production physics backend (§8) |
 | Combat and gameplay systems | Partially implemented (demo-scale prototype, validated) | The Cycle 2–5 line: `engine-core` combat resolution (`resolve_attack`, pure, allocation-free) + the adversary cadence model + the encounter composition with cover/HUD/cues in `engine-slice` — pinned by the combat_world (21) and encounter_world (30) batteries with byte-identical scenario traces; game-scale gameplay systems (progression, economy, AI beyond the cadence prototype) remain undesigned |

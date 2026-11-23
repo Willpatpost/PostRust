@@ -63,6 +63,9 @@ Interactive modes
   --window [--dummy]                 SDL window and input
   --render [--regions]               Vulkan scene and optional region LOD
   --corner [--night]                 Full lit city route (day by default)
+  --corner --populated               Route with the deterministic proxy population
+                                    (--proxy-reference: one draw per instance, the
+                                    pre-6-E submission shape for before/after runs)
   --player | --playable              Movement and gatehouse demos
   --combat | --encounter             Combat and courtyard demos
   --demo-persist <campaign-dir>      Persistent campaign
@@ -514,6 +517,8 @@ fn main() {
     if args.iter().any(|arg| arg == "--corner") {
         let run = || -> Result<(), String> {
             let mut night = false;
+            let mut populated = false;
+            let mut proxy_reference = false;
             let mut fps = 60;
             let mut present = engine_renderer::PresentModePreference::Auto;
             let mut validation = engine_renderer::ValidationPreference::Auto;
@@ -522,6 +527,11 @@ fn main() {
                 match arg.as_str() {
                     "--corner" => {}
                     "--night" => night = true,
+                    "--populated" => populated = true,
+                    // The 6-E equivalence reference: submit the same
+                    // population one draw per instance (the pre-6-E
+                    // shape) — the before/after measurement mode.
+                    "--proxy-reference" => proxy_reference = true,
                     "--fps" => {
                         fps = parse_fps(options.next().ok_or("--fps requires a value")?)?
                             .ok_or("--fps requires 1-1000 or uncapped")?;
@@ -541,7 +551,14 @@ fn main() {
                     _ => return Err(format!("unrecognized corner option {arg}")),
                 }
             }
-            engine_slice::corner_demo::run(night, fps, present, validation)
+            engine_slice::corner_demo::run(
+                night,
+                fps,
+                present,
+                validation,
+                populated,
+                proxy_reference,
+            )
         };
         if let Err(e) = run() {
             eprintln!("error: {e}");

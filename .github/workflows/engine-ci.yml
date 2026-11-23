@@ -311,8 +311,15 @@ jobs:
           # counts and validity). Windows 1087/2/33 MEASURED
           # locally; Linux 1138 = 1129 + the same 9, platform-
           # uniform (the new core is pure IEEE arithmetic).
-          expected=1138
-          if [ "$(uname -s)" != "Linux" ]; then expected=1087; fi
+          # Cycle 6-E implementation: +4 platform-uniform
+          # engine-renderer tests (proxy_instances: the retained
+          # repack's byte-equality with the allocating form, the
+          # atomic typed refusals, the capacity-reuse pin; vulkan
+          # policy_tests: the per-kind instance ranges and the
+          # draw-call count model). Linux 1142 = 1138 + the same 4;
+          # Windows 1091 = 1087 + the same 4.
+          expected=1142
+          if [ "$(uname -s)" != "Linux" ]; then expected=1091; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -339,8 +346,10 @@ jobs:
           results=$(grep -c 'test result:' tests-renderer-release.log || true)
           # Cycle 6-E scaffold: the renderer release battery
           # 52 -> 61 (the same +9 proxy unit tests).
-          echo "renderer release: $passed passed, $results test-result lines (expected 61 / 2)"
-          [ "$passed" -eq 61 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 61"; exit 1; }
+          # Cycle 6-E implementation: 61 -> 65 (the same +4 repack/
+          # policy tests as the main shard, platform-uniform).
+          echo "renderer release: $passed passed, $results test-result lines (expected 65 / 2)"
+          [ "$passed" -eq 65 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 65"; exit 1; }
           [ "$results" -eq 2 ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != 2"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production
@@ -480,6 +489,21 @@ jobs:
         shell: bash
         run: |
           SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_corner -- --ignored --nocapture
+      # (Cycle 6-E, the merge-blocking equivalence gate) The N-vs-1
+      # instanced-draw proof: the SAME population as N single-instance
+      # draws vs ONE instanced draw per kind must produce byte-equal
+      # captured frames, with the draw-call counts pinned (13 vs 2),
+      # single-instance per-pixel oracle checks against the 6-B CPU
+      # reference, the zero-per-frame-allocation pin, and the
+      # pipeline-replacement lifecycle. The per-stage println!
+      # evidence (the instanced/per-object call counts, the changed-
+      # pixel count, the oracle max-error lines, the warmed
+      # allocation stats) is what the CI log must show.
+      - name: Instanced-proxy equivalence gate (lavapipe)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_instanced -- --ignored --nocapture
       - name: Full day and night route measurements (lavapipe)
         if: runner.os == 'Linux'
         shell: bash
@@ -497,6 +521,21 @@ jobs:
             done
             grep -Eq 'peak process resident memory: [1-9][0-9]* KiB' corner.log
           done
+          # (Cycle 6-E) The populated route through the instanced
+          # path: the same 601-frame measurement regime with the
+          # deterministic proxy population live — the draw-call
+          # headline and the populated-route stability evidence
+          # (lavapipe is a software rasterizer: correctness and
+          # steady-state evidence, NOT performance evidence — the
+          # rig measurement commands live in the package's PR).
+          cargo run -q -p engine-slice -- --corner --populated --fps uncapped --validation on | tee corner-populated.log
+          for regime in live exact; do
+            for series in 'CPU frame work' 'frame interval' 'GPU render pass'; do
+              grep -Eq "^$regime $series .*n=601" corner-populated.log
+            done
+          done
+          grep -Eq 'proxy population: [1-9][0-9]* instances \([0-9]+ npc \+ [0-9]+ vehicle\), 2 draw calls per frame \(instanced mode\)' corner-populated.log
+          grep -Eq 'validation warnings/errors 0/0' corner-populated.log
       - name: Encounter and legacy scene framebuffer regressions (Linux Vulkan)
         if: runner.os == 'Linux'
         shell: bash
@@ -939,14 +978,19 @@ jobs:
           # Cycle 6-A adds one separate ignored graphical test binary,
           # executed in the Linux Vulkan step: +1 ignored / +1 result line.
           # Cycle 6-B: full-route camera pin plus one ignored capture binary.
+          # Cycle 6-E implementation: the new tests/render_instanced.rs
+          # binary carries ONE #[ignore]d lavapipe gate (the N-vs-1
+          # pixel-equivalence + draw-call + allocation pins, executed
+          # by the dedicated Linux Vulkan step): +1 ignored / +1
+          # result line, passed counts unchanged.
           expected=570
           if [ "$(uname -s)" != "Linux" ]; then expected=569; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 9 / 57)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 10 / 58)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
-          [ "$ignored" -eq 9 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 9"; exit 1; }
+          [ "$ignored" -eq 10 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 10"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
@@ -966,7 +1010,12 @@ jobs:
           # result line (its single framebuffer test is #[ignore]d in
           # the plain run and executed by the dedicated framebuffer
           # step; MEASURED at the candidate with the local heavy pass).
-          [ "$results" -eq 57 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 57"; exit 1; }
+          # Cycle 6-E implementation: 57 -> 58 — the new
+          # tests/render_instanced.rs binary adds the 58th result
+          # line (its single equivalence-gate test is #[ignore]d in
+          # the plain run and executed by the dedicated Linux Vulkan
+          # step).
+          [ "$results" -eq 58 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 58"; exit 1; }
       # (F-06, the 2026-11-12 quality audit — Agent C) The release-mode
       # render-path CPU canary: the comparative microbenchmark in
       # release mode on the llvipe runner — NO timing thresholds (the
