@@ -2407,3 +2407,125 @@
 //! third on today's tips. The one action the run needs remains
 //! the credential itself.
 
+//! ---
+
+//! ## SESSION 22 ADDENDUM — the population re-measurements on the
+//! entry tip `f4b4db7` (2026-11-23, 15:22–15:27 UTC)
+
+//! The twenty-second session re-probed the push blocker first:
+//! **unchanged** (both `/tmp/vscode-git-*.sock` sockets dead by the
+//! three session-15 discriminators — the raw AF_UNIX connect
+//! refused on both, the `git credential fill` stderr ECONNREFUSED
+//! with token_len 0, `git push --dry-run` exit 128 with `remote:
+//! No anonymous write access`; no `gh`, no GH_TOKEN/GITHUB_TOKEN,
+//! no `~/.git-credentials`, no `~/.netrc`, `~/.ssh` holding only
+//! `known_hosts`, and no extension host in code-server's process
+//! tree, so no fresh socket can appear before the owner's
+//! workbench session returns; anonymous read works, `origin/main`
+//! remains at `1fe89b7` with exactly one remote branch — no drift,
+//! no cycle6 branch ever leaked; the supervisor PID 858 and the
+//! hardened four-branch watcher PID 442510 both alive, the watcher
+//! log start-lines-only — correctly never fired; no
+//! `~/PR-CREATED-*` markers; `~/OVERNIGHT-DONE` and
+//! `~/OVERNIGHT-STOP` correctly absent; `SURVIVED.txt` untouched —
+//! session 10's bound stands). The delivery chain re-verified
+//! fresh on the entry tips: all four payload bodies byte-identical
+//! to their branch PR-body files (`a90cc2fd` / `1b91fdcd` /
+//! `f5edc209` / `81385ae9`; 26,319 / 28,027 / 25,623 / 26,026
+//! bytes — session 21's post-commit state, re-measured), the
+//! payload file shas matching the README pins (`6deda5e6` /
+//! `327c9d3f` / `b3a90a2a` / `a39c6102`), the `/tmp/opencode`
+//! twins identical, the stack parsed (6-E→main, 6-F→main,
+//! population→6-E, 6-E2→population, draft everywhere), the
+//! docs-only proof re-measured per branch (each
+//! implementation-commit→tip diff lists only this doc and the
+//! PR-body file), `engine-core`'s diff vs `main` ZERO files on all
+//! four branches, `git fsck --full --strict` clean (zero notices
+//! of any kind), the `wt-6e2` worktree clean at `f29a22a`, and
+//! the lavapipe environment functional without re-provision
+//! (llvmpipe LLVM 20.1.2, Mesa 25.2.8, Vulkan API 1.4.318 — probed
+//! scoped, before any gate ran). Raw logs for all of the above,
+//! born persistent: `~/verify18-session22/` (the entry battery,
+//! 70 pinned checks green / zero FAIL, its counting awk
+//! ground-truthed against session 21's raw logs before any new
+//! measurement ran).
+
+//! ### The gap this session closed — the population branch's own
+//! batteries, directly on the entry tip `f4b4db7` (the tip the
+//! watcher pushes as this session starts)
+
+//! The class every session since 18 has closed: each session's
+//! documentation commit advances the population tip, the code
+//! bytes never change, and the run's closing standard is direct
+//! measurement on the exact tip. At entry, both of the population
+//! branch's latest direct measurements were session 21's, on
+//! `dbbc8b4` — one doc commit back (session 21's own addendum).
+//! This session re-measured both on `f4b4db7`
+//! (15:22:32–15:26:35 UTC, warm target cache):
+
+//! - **the graphical linchpin** (`render_instanced --ignored`,
+//!   lavapipe, the variables scoped to the gate command only —
+//!   session 18's exact form): 2 passed, rc=0, 0.46 s — the full
+//!   24+2 table (26 instances 24/2 npc/vehicle, per-object 26 ==
+//!   instanced 2 draws, byte-equal frames, ink 2,745/65,536,
+//!   warmed `device_memory` 18 constant across warmed frames) and
+//!   the 13-instance fixture (13 == 2, byte-equal, ink 3,728,
+//!   both single-instance oracle walls 0/255 over 57,600 pixels,
+//!   the pipeline-replacement lifecycle 18 → 38, delta 20).
+//!   Every pinned line IDENTICAL to the session-18/15/7/21
+//!   records — the linchpin's seventh direct branch-tip
+//!   confirmation, its first on this tip.
+//! - **the CPU battery** (the CI's own commands, verbatim, clean
+//!   environment — the SDL/VK variables explicitly unset, session
+//!   4's lesson): fmt clean (3 s), clippy clean in BOTH forms
+//!   (cached — session 21's identical-tree runs), the main shard
+//!   **1142 / 2 / 33** (rc=0, 82 s), the renderer release battery
+//!   **65 passed / 0 ignored / 2 result lines** (rc=0, cached),
+//!   the heavy shard **576 / 11 / 58** (rc=0, 155 s) — every count
+//!   the branch pin, identical to session 21's direct run on the
+//!   parent tip `dbbc8b4` and to the union batteries'
+//!   measurements of the same code bytes.
+
+//! The sibling branches were NOT re-measured this session: their
+//! tips are unmoved since session 11, and sessions 18 (linchpin),
+//! 19 (CPU ×2, runs 1+2), and 20 (workflow lint) measured each
+//! directly on those exact tips — the saturated state. The
+//! merge-morning union was likewise not re-batteried this session:
+//! its third direct full battery (session 21) ran on a union of
+//! the same code bytes (one population doc commit back), and the
+//! docs-only carry is the sanctioned form for doc-only deltas
+//! (the sessions 14–20 precedent) — the merge kit's post-commit
+//! re-execution below re-proves the code-subset identity on the
+//! exact post-commit tips.
+
+//! ### The closing loop on this session's own commit
+
+//! Documentation only — this handoff doc and the population PR
+//! body's tip statement; no `.rs`, no workflow, no pins, no test.
+//! Gates for the commit: `cargo fmt --all -- --check` clean and
+//! `cargo clippy --workspace --all-targets --release -- -D
+//! warnings` clean — run on this tip by the battery itself (the
+//! pre-commit tree's code bytes are identical to the post-commit
+//! tree's; re-verified after the commit). After the commit: the
+//! population payload regenerated from the refreshed body via the
+//! established script (both copies, JSON-validated; the sha
+//! recorded in the push-handoff README pins — the session-20/21
+//! form, no in-session amend), the other three payloads
+//! re-verified byte-unchanged no-ops, and the merge kit
+//! re-executed on the post-commit tips (the union doc gains this
+//! section; the code-subset check against `f02ddef` must stay
+//! zero files) — the kit README carries the run record.
+
+//! ### Notes for the owner (session 22)
+
+//! `~/OVERNIGHT-DONE` remains correctly absent (the PRs do not
+//! exist; the honest form stands). The morning commands stand
+//! unchanged — the watcher performs the whole delivery from the
+//! canonical bytes the moment a credential returns. One
+//! housekeeping note for the morning read: `~/OVERNIGHT-STATUS.md`
+//! (the early sessions' home-dir convenience summary) remains at
+//! its self-dated session-16 state by the sessions-17–21
+//! precedent — the in-repo handoff doc and the branch PR bodies
+//! are the canonical record; nothing in that file is load-bearing.
+//! The one action the run needs remains the credential itself.
+
