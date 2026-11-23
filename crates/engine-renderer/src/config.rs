@@ -78,6 +78,8 @@ pub enum DemoScenePreference {
     #[default]
     Omitted,
     Included,
+    /// Upload the static lit intersection and its material descriptors.
+    Corner,
 }
 
 /// Renderer configuration. Presentation *pacing* (frame-rate targets,

@@ -12,10 +12,7 @@
 //
 // TRANSPORT NOTE: the pinned naga 29.0.4's wgsl-in does not
 // recognize `var<push_constant>` (probed at scaffold time). The
-// parameters below arrive through a uniform buffer (the implementer's
-// wiring; the PUSH layout struct is defined at the bottom of this
-// file as the contract). The CPU reference equation is unchanged by
-// the transport.
+// frame and material blocks below are uniform buffers.
 
 @group(0) @binding(0)
 var albedo_tex: texture_2d<f32>;
@@ -26,9 +23,9 @@ var albedo_sampler: sampler;
 // uniform buffer at group 0 binding 2 by the implementer.
 struct FrameParams {
     view_proj: mat4x4<f32>,
-    light_dir: vec4<f32>,   // xyz = toward light (normalized), w unused
-    light_color: vec4<f32>, // rgb irradiance, a unused
-    ambient: vec4<f32>,     // rgb ambient, a unused
+    light_dir: vec4<f32>,   // xyz = toward light (normalized), w = eye.x
+    light_color: vec4<f32>, // rgb irradiance, w = eye.y
+    ambient: vec4<f32>,     // rgb ambient, w = eye.z
 };
 @group(0) @binding(2)
 var<uniform> frame: FrameParams;
@@ -83,14 +80,10 @@ fn fs_main(@location(0) world_normal: vec3<f32>,
            @location(1) world_pos: vec3<f32>,
            @location(2) uv: vec2<f32>)
     -> @location(0) vec4<f32> {
-    // NOTE: front_facing removed at scaffold time — the pinned naga's
-    // spv writer flagged MissingBinding with it present (root cause
-    // unclear; the probe without it passes). The implementer
-    // investigates whether double-sided geometry needs it (the scene
-    // boxes are closed volumes — back faces are depth-occluded, so
-    // the sign flip is likely unnecessary; document the finding).
+    // Static geometry supplies outward face normals; back faces are culled.
     let n = normalize(world_normal);
-    let v = normalize(-world_pos);
+    let eye = vec3<f32>(frame.light_dir.w, frame.light_color.w, frame.ambient.w);
+    let v = normalize(eye - world_pos);
     let l = normalize(frame.light_dir.xyz);
     let n_dot_l = clamp(dot(n, l), 0.0, 1.0);
     let h = normalize(l + v);

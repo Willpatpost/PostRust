@@ -85,7 +85,12 @@ fn compile_wgsl(file: &str, out_name: &str) {
     for binding in [0, 1, 2, 3] {
         options.binding_map.insert(
             naga::ResourceBinding { group: 0, binding },
-            naga::back::spv::BindingInfo::default(),
+            naga::back::spv::BindingInfo {
+                // Texture + sampler share descriptor 0. The two uniform
+                // blocks must retain their distinct SPIR-V decorations.
+                binding: if binding == 1 { 0 } else { binding },
+                ..Default::default()
+            },
         );
     }
     let words = naga::back::spv::write_vec(&module, &info, &options, None)

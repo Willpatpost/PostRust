@@ -62,6 +62,7 @@ Usage: engine-slice [MODE] [OPTIONS]
 Interactive modes
   --window [--dummy]                 SDL window and input
   --render [--regions]               Vulkan scene and optional region LOD
+  --corner [--night]                 Full lit city route (day by default)
   --player | --playable              Movement and gatehouse demos
   --combat | --encounter             Combat and courtyard demos
   --demo-persist <campaign-dir>      Persistent campaign
@@ -505,6 +506,45 @@ fn main() {
             }
         } else if let Err(message) = engine_slice::persist_demo::run_persist_demo(options) {
             eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if args.iter().any(|arg| arg == "--corner") {
+        let run = || -> Result<(), String> {
+            let mut night = false;
+            let mut fps = 60;
+            let mut present = engine_renderer::PresentModePreference::Auto;
+            let mut validation = engine_renderer::ValidationPreference::Auto;
+            let mut options = args.iter().skip(1);
+            while let Some(arg) = options.next() {
+                match arg.as_str() {
+                    "--corner" => {}
+                    "--night" => night = true,
+                    "--fps" => {
+                        fps = parse_fps(options.next().ok_or("--fps requires a value")?)?
+                            .ok_or("--fps requires 1-1000 or uncapped")?;
+                    }
+                    "--present" => {
+                        present = options
+                            .next()
+                            .and_then(|v| engine_renderer::PresentModePreference::parse(v))
+                            .ok_or("--present requires auto, fifo, mailbox or immediate")?;
+                    }
+                    "--validation" => {
+                        validation = options
+                            .next()
+                            .and_then(|v| engine_renderer::ValidationPreference::parse(v))
+                            .ok_or("--validation requires auto, on or off")?;
+                    }
+                    _ => return Err(format!("unrecognized corner option {arg}")),
+                }
+            }
+            engine_slice::corner_demo::run(night, fps, present, validation)
+        };
+        if let Err(e) = run() {
+            eprintln!("error: {e}");
             std::process::exit(1);
         }
         return;

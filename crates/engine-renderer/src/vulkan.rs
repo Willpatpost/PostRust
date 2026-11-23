@@ -43,6 +43,11 @@
 //! supports them and read only after the slot fence proves that slot's
 //! queries resolved at least once (finding E).
 //!
+//! **Lit materials** - the optional corner owns a static mesh, three image sets
+//! and a coherent UBO at device lifetime. The dynamic frame offset selects the
+//! fenced slot. Each material descriptor points past all slots into a read-only tail.
+//! The render-pass-dependent lit pipeline is released before those descriptors.
+//!
 //! **Destruction order** — `device_wait_idle` → command buffers/pool,
 //! present semaphores, acquire semaphores, fences, query pool → swapchain
 //! framebuffers, views, per-image depth views/images/memories, swapchain
@@ -68,6 +73,8 @@ use ash::khr;
 use ash::vk;
 use ash::{Device, Entry, Instance};
 
+#[path = "corner.rs"]
+pub(crate) mod corner;
 #[path = "descriptors.rs"]
 pub mod descriptors;
 #[path = "textures.rs"]
@@ -271,11 +278,12 @@ pub(crate) struct VulkanContext {
     /// replacements REUSE the warmed cache instead of each building a
     /// fresh empty one that dies with its state.
     pub pipeline_cache: vk::PipelineCache,
+    corner: Option<corner::CornerResources>,
     texture: Texture,
     samplers: SamplerPool,
     descriptors: DescriptorFoundation,
     memory_allocations: Cell<u64>,
-    texture_allocations: u64,
+    texture_allocations: Cell<u64>,
     descriptor_pools: Cell<u64>,
     descriptor_sets: Cell<u64>,
     sampler_creations: Cell<u64>,
@@ -583,11 +591,12 @@ impl VulkanContext {
             api_version,
             supported_present_modes,
             pipeline_cache,
+            corner: None,
             texture: Default::default(),
             samplers: Default::default(),
             descriptors: Default::default(),
             memory_allocations: Cell::new(0),
-            texture_allocations: 0,
+            texture_allocations: Cell::new(0),
             descriptor_pools: Cell::new(0),
             descriptor_sets: Cell::new(0),
             sampler_creations: Cell::new(0),
@@ -596,12 +605,22 @@ impl VulkanContext {
             context.destroy();
             return Err(e);
         }
+        if config.demo_scene == DemoScenePreference::Corner {
+            match corner::CornerResources::new(&context) {
+                Ok(resources) => {
+                    context.corner = Some(resources);
+                }
+                Err(e) => {
+                    context.destroy();
+                    return Err(e);
+                }
+            }
+        }
         Ok((context, validation_active))
     }
 
     fn init_atlas(&mut self, atlas: &crate::glyph_atlas::GlyphAtlas) -> Result<(), RendererError> {
         use crate::glyph_atlas::{ATLAS_HEIGHT, ATLAS_WIDTH};
-        let before = self.memory_allocations.get();
         self.texture = Texture::upload(
             self,
             vk::Format::R8_UNORM,
@@ -611,7 +630,6 @@ impl VulkanContext {
             },
             atlas.atlas_bitmap(),
         )?;
-        self.texture_allocations += self.memory_allocations.get() - before;
         self.samplers = SamplerPool::new(self)?;
         self.descriptors =
             DescriptorFoundation::new(self, self.texture.view, self.samplers.nearest())?;
@@ -632,8 +650,9 @@ impl VulkanContext {
     pub(crate) fn allocations(&self) -> crate::AllocationStats {
         crate::AllocationStats {
             device_memory: self.memory_allocations.get(),
-            texture_memory: self.texture_allocations,
-            texture_bytes: self.texture.allocation_bytes,
+            texture_memory: self.texture_allocations.get(),
+            texture_bytes: self.texture.allocation_bytes
+                + self.corner.as_ref().map_or(0, |r| r.texture_bytes()),
             descriptor_pools: self.descriptor_pools.get(),
             descriptor_sets: self.descriptor_sets.get(),
             samplers: self.sampler_creations.get(),
@@ -643,6 +662,9 @@ impl VulkanContext {
     /// Full teardown in manifest order (assumes swapchain/pipelines/frames
     /// were already destroyed by the owning Renderer).
     pub(crate) fn destroy(&mut self) {
+        if let Some(corner) = self.corner.take() {
+            corner.destroy(self);
+        }
         std::mem::take(&mut self.descriptors).destroy(self);
         std::mem::take(&mut self.samplers).destroy(self);
         std::mem::take(&mut self.texture).destroy(self);
@@ -1320,6 +1342,8 @@ fn find_memory_type(
 /// Render pass, pipelines, and the scene/overlay vertex + index buffers.
 pub(crate) struct PipelineState {
     pub render_pass: vk::RenderPass,
+    lit_pipeline: vk::Pipeline,
+    lit_layout: vk::PipelineLayout,
     pub scene_pipeline: vk::Pipeline,
     pub scene_layout: vk::PipelineLayout,
     pub overlay_pipeline: vk::Pipeline,
@@ -1357,6 +1381,8 @@ impl PipelineState {
         // start dead; on failure `destroy` releases exactly what exists.
         let mut state = PipelineState {
             render_pass: vk::RenderPass::null(),
+            lit_pipeline: vk::Pipeline::null(),
+            lit_layout: vk::PipelineLayout::null(),
             scene_pipeline: vk::Pipeline::null(),
             scene_layout: vk::PipelineLayout::null(),
             overlay_pipeline: vk::Pipeline::null(),
@@ -1686,6 +1712,62 @@ impl PipelineState {
         }
         .map_err(|(_, error)| RendererError::vk(error, "scene pipeline"))?[0];
 
+        if let Some(corner) = &ctx.corner {
+            use crate::lit_mesh::LitVertex;
+            let module = create_shader_module(
+                ctx,
+                include_bytes!(concat!(env!("OUT_DIR"), "/lit_scene.spv")),
+            )?;
+            modules.push(module);
+            let layouts = [corner.layout];
+            // SAFETY: corner owns its descriptor layout across pipeline replacements;
+            // the partial PipelineState owns the pipeline layout immediately.
+            out.lit_layout = unsafe {
+                ctx.device.create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts),
+                    None,
+                )
+            }
+            .map_err(|e| RendererError::vk(e, "lit layout"))?;
+            let stages = [
+                scene_stages[0].module(module).name(c"vs_main"),
+                scene_stages[1].module(module).name(c"fs_main"),
+            ];
+            let bindings = [vk::VertexInputBindingDescription {
+                stride: size_of::<LitVertex>() as u32,
+                ..scene_binding
+            }];
+            let attributes = [
+                scene_attributes[0],
+                vk::VertexInputAttributeDescription {
+                    offset: std::mem::offset_of!(LitVertex, normal) as u32,
+                    ..scene_attributes[1]
+                },
+                vk::VertexInputAttributeDescription {
+                    location: 2,
+                    binding: 0,
+                    format: vk::Format::R32G32_SFLOAT,
+                    offset: std::mem::offset_of!(LitVertex, uv) as u32,
+                },
+            ];
+            let inputs = vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(&bindings)
+                .vertex_attribute_descriptions(&attributes);
+            // The corner mesh winds CCW about its outward normals.
+            let raster = scene_rasterizer.front_face(vk::FrontFace::COUNTER_CLOCKWISE);
+            let info = scene_info
+                .stages(&stages)
+                .vertex_input_state(&inputs)
+                .rasterization_state(&raster)
+                .layout(out.lit_layout);
+            // SAFETY: same render pass, depth and viewport contract as the world pipeline.
+            out.lit_pipeline = unsafe {
+                ctx.device
+                    .create_graphics_pipelines(ctx.pipeline_cache, &[info], None)
+            }
+            .map_err(|(_, e)| RendererError::vk(e, "lit pipeline"))?[0];
+        }
+
         let overlay_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
             .color_write_mask(vk::ColorComponentFlags::RGBA)
             .blend_enable(true)
@@ -1751,6 +1833,8 @@ impl PipelineState {
             ctx.device.free_memory(self.scene_ibo_memory, None);
             ctx.device.destroy_buffer(self.scene_vbo, None);
             ctx.device.free_memory(self.scene_vbo_memory, None);
+            ctx.device.destroy_pipeline(self.lit_pipeline, None);
+            ctx.device.destroy_pipeline_layout(self.lit_layout, None);
             ctx.device.destroy_pipeline(self.overlay_pipeline, None);
             ctx.device
                 .destroy_pipeline_layout(self.overlay_layout, None);
@@ -2611,6 +2695,7 @@ pub(crate) fn render_frame(
     foreground: Option<SceneLayer<'_>>,
     hud: &[OverlayVertex],
     debug_overlay: &[OverlayVertex],
+    corner_params: Option<&corner::FrameParams>,
 ) -> Result<FrameOutcome, RendererError> {
     let mut outcome = FrameOutcome::default();
     let slot = frames.frame_slot;
@@ -2821,7 +2906,8 @@ pub(crate) fn render_frame(
     let clear_values = [
         vk::ClearValue {
             color: vk::ClearColorValue {
-                float32: [0.02, 0.02, 0.04, 1.0],
+                float32: corner_params
+                    .map_or([0.02, 0.02, 0.04, 1.0], corner::FrameParams::clear_color),
             },
         },
         vk::ClearValue {
@@ -2919,57 +3005,74 @@ pub(crate) fn render_frame(
                 .clear_values(&clear_values),
             vk::SubpassContents::INLINE,
         );
-        ctx.device.cmd_bind_pipeline(
-            command,
-            vk::PipelineBindPoint::GRAPHICS,
-            pipes.scene_pipeline,
-        );
         ctx.device.cmd_set_viewport(command, 0, &[viewport]);
         ctx.device.cmd_set_scissor(command, 0, &[scissor]);
-        ctx.device.cmd_push_constants(
-            command,
-            pipes.scene_layout,
-            vk::ShaderStageFlags::VERTEX,
-            0,
-            bytemuck::bytes_of(view_proj),
-        );
-        // The static demonstration scene draws only when the explicit
-        // opt-in uploaded it (`scene_index_count > 0`, P3) — an
-        // omitted renderer binds nothing and draws nothing here; the
-        // scene pipeline below still draws the dynamic region
-        // geometry through the same bound state.
-        if pipes.scene_index_count > 0 {
-            ctx.device
-                .cmd_bind_vertex_buffers(command, 0, &[pipes.scene_vbo], &[0]);
-            ctx.device
-                .cmd_bind_index_buffer(command, pipes.scene_ibo, 0, vk::IndexType::UINT32);
-            ctx.device
-                .cmd_draw_indexed(command, pipes.scene_index_count, 1, 0, 0, 0);
-        }
-
-        if outcome.region.drawn > 0 {
-            let region_offset = (slot as vk::DeviceSize) * pipes.region_slot_bytes;
-            ctx.device
-                .cmd_bind_vertex_buffers(command, 0, &[pipes.region_vbo], &[region_offset]);
-            if world_drawn > 0 {
-                ctx.device.cmd_draw(command, world_drawn, 1, 0, 0);
-            }
-            if let Some(layer) = foreground.filter(|_| outcome.foreground_drawn > 0) {
-                let near_viewport = vk::Viewport {
-                    min_depth: 0.0,
-                    max_depth: FOREGROUND_MAX_DEPTH,
-                    ..viewport
-                };
-                ctx.device.cmd_set_viewport(command, 0, &[near_viewport]);
-                ctx.device.cmd_push_constants(
+        if let (Some(resources), Some(params)) = (&ctx.corner, corner_params) {
+            ctx.device.cmd_bind_pipeline(
+                command,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipes.lit_pipeline,
+            );
+            resources.draw(ctx, command, pipes.lit_layout, slot, params);
+        } else {
+            ctx.device.cmd_bind_pipeline(
+                command,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipes.scene_pipeline,
+            );
+            ctx.device.cmd_push_constants(
+                command,
+                pipes.scene_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                bytemuck::bytes_of(view_proj),
+            );
+            // The static demonstration scene draws only when the explicit
+            // opt-in uploaded it (`scene_index_count > 0`, P3) — an
+            // omitted renderer binds nothing and draws nothing here; the
+            // scene pipeline below still draws the dynamic region
+            // geometry through the same bound state.
+            if pipes.scene_index_count > 0 {
+                ctx.device
+                    .cmd_bind_vertex_buffers(command, 0, &[pipes.scene_vbo], &[0]);
+                ctx.device.cmd_bind_index_buffer(
                     command,
-                    pipes.scene_layout,
-                    vk::ShaderStageFlags::VERTEX,
+                    pipes.scene_ibo,
                     0,
-                    bytemuck::bytes_of(layer.view_proj),
+                    vk::IndexType::UINT32,
                 );
                 ctx.device
-                    .cmd_draw(command, outcome.foreground_drawn, 1, world_drawn, 0);
+                    .cmd_draw_indexed(command, pipes.scene_index_count, 1, 0, 0, 0);
+            }
+
+            if outcome.region.drawn > 0 {
+                let region_offset = (slot as vk::DeviceSize) * pipes.region_slot_bytes;
+                ctx.device.cmd_bind_vertex_buffers(
+                    command,
+                    0,
+                    &[pipes.region_vbo],
+                    &[region_offset],
+                );
+                if world_drawn > 0 {
+                    ctx.device.cmd_draw(command, world_drawn, 1, 0, 0);
+                }
+                if let Some(layer) = foreground.filter(|_| outcome.foreground_drawn > 0) {
+                    let near_viewport = vk::Viewport {
+                        min_depth: 0.0,
+                        max_depth: FOREGROUND_MAX_DEPTH,
+                        ..viewport
+                    };
+                    ctx.device.cmd_set_viewport(command, 0, &[near_viewport]);
+                    ctx.device.cmd_push_constants(
+                        command,
+                        pipes.scene_layout,
+                        vk::ShaderStageFlags::VERTEX,
+                        0,
+                        bytemuck::bytes_of(layer.view_proj),
+                    );
+                    ctx.device
+                        .cmd_draw(command, outcome.foreground_drawn, 1, world_drawn, 0);
+                }
             }
         }
 
