@@ -340,3 +340,49 @@ this section). Every commit beyond `6ee89b4` is documentation only
 workflow, no pins. This PR's base is the population branch's tip,
 which carries the same doc line; the doc commits' evolution between
 the branches remains documentation only.
+
+---
+
+### Session 7 — the linchpin gates' third direct run (2026-11-23, the ~11:54 UTC session)
+
+The evidence table's one remaining asymmetry after session 6: this
+branch's graphical linchpins (the `render_instanced` battery — the
+13-instance fixture, the 24+2 table, and the three-way per-object ==
+direct == indirect byte-equality) had two direct measurements
+(session 3's final-tree run, session 4's tip re-run) while the
+population branch's linchpin carried three. Session 7 closed the
+asymmetry — the full battery run a third time, directly on this
+branch's tip (`faa01a0` at run time; the code tree is exactly
+`6ee89b4`'s — every commit above the package commit is
+documentation only), in the scoped environment (the lavapipe
+variables on the gate command only, per session 4's operational
+lesson):
+
+| Assertion (MEASURED this session, this tip) | Result |
+|---|---|
+| `render_instanced --ignored` | **3 passed, rc=0 — every pinned evidence line reproduced exactly** |
+| the three-way gate | 26 instances (24/2 npc/vehicle), per-object 26 == direct 2 == indirect 2 draws, byte-equal frames |
+| the ink control | 2745 of 65536 pixels changed by the population (both the direct and indirect paths) |
+| the indirect mechanism cost | device_memory 18 → 19, one-time (the command buffer's host-visible memory; every other counter unchanged) |
+| the direct-path allocation gate | warmed `AllocationStats { device_memory: 18, … }` constant across warmed frames; the replacement lifecycle 18 → 38 (delta 20) |
+| the CPU oracle walls | single-instance oracles, materials 1 and 2: 57600 pixels each, max RGB error 0/255; the three-way gate's oracle wall within 2/255 through the indirect submission |
+
+Raw log: `/tmp/opencode/session7-6e2-gate.log` on the pod (a /tmp
+path — may not survive a pod restart; the numbers here are the
+durable record). The watcher payload and its `~/push-handoff` twin
+were regenerated from this file byte-for-byte after this section
+landed. The linchpins now hold three direct measurements on this
+branch's code tree, matching the population branch's count.
+
+**The tip statement (supersedes the one above):** the pushed tip is
+this branch's head = the package commit `6ee89b4` + the run-wide
+handoff doc (`3522e55`) + session 4's addendum (`9f40161`) +
+session 5's payload-sync commit (`ae7bcf5`) + session 6's
+heavy-shard verification addendum + session 7's linchpin
+verification addendum (the commit adding this section). Every
+commit beyond `6ee89b4` is documentation only — `git diff
+--name-only 6ee89b4..HEAD` lists only
+`docs/OVERNIGHT-HANDOFF-2026-11-23.md` and this file; no code, no
+workflow, no pins. This PR's base is the population branch's tip,
+which carries the same doc line; the doc commits' evolution between
+the branches remains documentation only.

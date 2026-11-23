@@ -439,3 +439,33 @@
 //! 6-E / 6-F heavy shards were closed earlier this session —
 //! every branch's every pinned shard now has at least two direct
 //! measurements, at least one in a clean environment.)
+
+//! ---
+
+//! ## SESSION 7 ADDENDUM — the linchpin gates' third direct run
+//! (2026-11-23, ~11:54 UTC)
+//!
+//! The blocker, re-probed first: unchanged (dead askpass sockets,
+//! no write credentials, `git push --dry-run` exit 128; anonymous
+//! read still works — `origin/main` still `1fe89b7`, the merge
+//! base, so nothing has drifted underneath the branches). The
+//! delivery machinery verified healthy and then HARDENED (see the
+//! population branch's session-7 note for the run-wide record).
+//! This branch's evidence asymmetry — its graphical linchpins (the
+//! render_instanced battery) had two direct measurements (sessions
+//! 3, 4) vs the population branch's three — closed this session:
+//! the full battery run a THIRD time directly on this tip
+//! (`faa01a0` at run time; the code tree exactly `6ee89b4`'s),
+//! lavapipe variables scoped to the gate command only: **3 passed,
+//! rc=0, every pinned line reproduced — the three-way 26
+//! instances, per-object 26 == direct 2 == indirect 2 draws,
+//! byte-equal frames; ink 2745/65536 on both paths; the indirect
+//! mechanism's one-time device_memory 18 → 19; the direct path's
+//! warmed 18 constant with the replacement lifecycle 18 → 38
+//! (delta 20); both single-instance oracle walls 0/255 (the
+//! three-way wall within 2/255 through the indirect submission).**
+//! fmt `--check` and clippy `-D warnings` (release form) clean on
+//! the committed tip. Raw log:
+//! `/tmp/opencode/session7-6e2-gate.log`; the PR body's Session 7
+//! section carries the table, and the watcher payload + twin were
+//! regenerated from it byte-for-byte after the commit.
