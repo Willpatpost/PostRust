@@ -40,6 +40,22 @@ use engine_renderer::{
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 
+/// SDL's initialization is process-global (the sdl3 crate declares
+/// one main thread per process; a second init while another test's
+/// SDL is alive fails the main-thread check — the engine-shell test
+/// binaries' `sdl_lock` pattern, applied to this binary now that it
+/// carries two SDL-touching gates). The guard is declared FIRST in
+/// each test so it drops LAST (reverse declaration order): the app
+/// and renderer are fully dropped — SDL quit, the main-thread
+/// declaration reset — before the lock releases and the next test
+/// initializes.
+fn sdl_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap()
+}
+
 /// The gate's fixed population: 10 NPCs + 3 vehicles (13 instances —
 /// the N in the N-vs-1 claim), placed in the intersection's
 /// road-cross frame. A depth STACK of three NPCs along the southwest
@@ -279,6 +295,7 @@ fn check_single_instance_oracle(
 #[test]
 #[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
 fn instanced_draws_match_per_object_pixels_and_pin_counts() {
+    let _guard = sdl_lock();
     let mut app = ShellApp::new(ShellConfig {
         title: "Cycle 6-E instanced draws".into(),
         width: 256,
@@ -557,4 +574,164 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
     // The stride contract the packed bytes rely on (defense in depth
     // for the buffer math this test exercised end to end).
     assert_eq!(INSTANCE_STRIDE, 96);
+}
+
+/// The ladder package 3 gate (the corner-scene population): the
+/// SHIPPED 24-NPC + 2-vehicle placement table
+/// (`corner_population`) through BOTH submission modes — byte-equal
+/// captured frames (26 per-object draws vs 2 instanced draws), the
+/// pinned counts, the ink control against the unpopulated corner,
+/// and the warmed-allocation constancy for the full table. The
+/// table's own placement validity (sidewalk/lane membership, route
+/// clearance, overlap freedom, the packed-bytes FNV pin) is
+/// `corner_population`'s unit battery; this gate proves the table
+/// THROUGH the real instanced path — the composition the ladder's
+/// "through the instanced path" wording demands.
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
+fn full_corner_population_matches_per_object_pixels() {
+    let _guard = sdl_lock();
+    let mut app = ShellApp::new(ShellConfig {
+        title: "Cycle 6-E corner population".into(),
+        width: 256,
+        height: 256,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    })
+    .unwrap();
+    let mut renderer = Renderer::new(
+        app.window(),
+        RenderConfig {
+            demo_scene: DemoScenePreference::Corner,
+            validation: ValidationPreference::On,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let size = app.window().size_in_pixels();
+    assert_eq!(size, (256, 256));
+    assert!(renderer.stats().validation_active);
+    let _ = app.frame();
+
+    // Above the road cross looking down at the intersection center
+    // (the gate camera's stand, raised): every placement group —
+    // both crosswalks, all four near bands, both lanes — falls
+    // inside the frustum, and no building mass stands between.
+    let (matrix, eye) = {
+        let matrix = engine_slice::corner_demo::view_projection(
+            engine_renderer::lit_scene::RouteWaypoint {
+                position: [-3.5, 18.0, -3.5],
+                look_at: [0.5, 0.0, 0.5],
+            },
+            1.0,
+        );
+        (matrix, [-3.5, 18.0, -3.5])
+    };
+    let light = day_preset();
+    let (npc, vehicle) = engine_slice::corner_population::corner_population();
+    let total = npc.len() + vehicle.len();
+    assert_eq!((npc.len(), vehicle.len(), total), (24, 2, 26));
+    // The demo's caller policy: NPCs with the facade set, vehicles
+    // with the dark stone set (corner_demo's documented choice).
+    let population = populated(&npc, &vehicle, 1, 2);
+
+    // THE FULL-TABLE EQUIVALENCE: 26 single-instance draws vs one
+    // instanced draw per kind — byte-equal frames.
+    let (reference, reference_calls) = capture_populated(
+        &mut renderer,
+        ProxyDrawMode::PerInstance,
+        &matrix,
+        eye,
+        light,
+        &population,
+        size,
+    );
+    assert_eq!(
+        reference_calls, 26,
+        "the full table: one draw per instance in the reference mode"
+    );
+    let (instanced, instanced_calls) = capture_populated(
+        &mut renderer,
+        ProxyDrawMode::Instanced,
+        &matrix,
+        eye,
+        light,
+        &population,
+        size,
+    );
+    assert_eq!(
+        instanced_calls, 2,
+        "the full table: one draw per populated kind"
+    );
+    assert_frames_equal(
+        &reference,
+        &instanced,
+        "the full table: 26 draws vs 2 instanced",
+    );
+    let (repeat, repeat_calls) = capture_populated(
+        &mut renderer,
+        ProxyDrawMode::Instanced,
+        &matrix,
+        eye,
+        light,
+        &population,
+        size,
+    );
+    assert_eq!(repeat_calls, 2);
+    assert_frames_equal(&instanced, &repeat, "full-table instanced repeat capture");
+
+    // The ink control (the glyph-atlas discipline): the population
+    // must actually reach the framebuffer.
+    let base = capture_base(&mut renderer, &matrix, eye, light, size);
+    let mut ink = 0;
+    for y in 0..size.1 {
+        for x in 0..size.0 {
+            ink += usize::from(instanced.pixel_rgba(x, y) != base.pixel_rgba(x, y));
+        }
+    }
+    println!(
+        "corner population: {total} instances ({}/{} npc/vehicle): per-object draws \
+         {reference_calls}, instanced draws {instanced_calls}, {ink} of {} pixels changed \
+         by the population",
+        npc.len(),
+        vehicle.len(),
+        size.0 * size.1
+    );
+    assert!(
+        ink > 1_300,
+        "visible full-table coverage: {ink} changed pixels"
+    );
+
+    // The zero-per-frame-allocation gate for the full table (both
+    // modes, both frame slots).
+    let warm = renderer.allocations();
+    for mode in [ProxyDrawMode::Instanced, ProxyDrawMode::PerInstance] {
+        for _ in 0..2 {
+            let (image, calls) =
+                capture_populated(&mut renderer, mode, &matrix, eye, light, &population, size);
+            assert_eq!(
+                calls,
+                if matches!(mode, ProxyDrawMode::PerInstance) {
+                    26
+                } else {
+                    2
+                }
+            );
+            assert_frames_equal(&instanced, &image, "warmed mode stability");
+            assert_eq!(renderer.allocations(), warm, "warmed allocations constant");
+        }
+    }
+    println!("warmed full-table populated allocations: {warm:?}");
+
+    assert_eq!(
+        renderer.stats().validation_errors,
+        0,
+        "{:?}",
+        renderer.stats().recent_validation
+    );
+    println!(
+        "population gate: {total} instances, per-object {reference_calls} draws == instanced \
+         {instanced_calls} draws, byte-equal frames, zero per-frame allocation across \
+         warmed frames"
+    );
 }
