@@ -2226,3 +2226,184 @@
 //! twice directly battery-measured besides. The one action the
 //! run needs remains the credential itself.
 
+//! ---
+
+//! ## SESSION 21 ADDENDUM — the population re-measurements on the
+//! pushed tip and the merge-morning union's third direct full
+//! battery (2026-11-23, 15:04–15:16 UTC)
+
+//! The twenty-first session re-probed the push blocker first:
+//! **unchanged** (both `/tmp/vscode-git-*.sock` sockets dead by
+//! the three session-15 discriminators — the raw AF_UNIX connect
+//! refused on both, `git push --dry-run` exit 128 with `remote:
+//! No anonymous write access`, the askpass fill stderr
+//! ECONNREFUSED with token_len 0 on both; no `gh`, no
+//! GH_TOKEN/GITHUB_TOKEN, no `~/.git-credentials`, no `~/.netrc`,
+//! `~/.ssh` holding only `known_hosts`; anonymous read works,
+//! `origin/main` remains at `1fe89b7` with exactly one remote
+//! branch — no drift, no cycle6 branch ever leaked; the supervisor
+//! PID 858 and the hardened four-branch watcher PID 442510 both
+//! alive, the watcher log start-lines-only — correctly never
+//! fired; no `~/PR-CREATED-*` markers; `~/OVERNIGHT-DONE` and
+//! `~/OVERNIGHT-STOP` correctly absent; `SURVIVED.txt` untouched —
+//! session 10's bound stands). The delivery chain re-verified
+//! fresh on the entry tips: all four payload bodies byte-identical
+//! to their branch PR-body files (`a90cc2fd` / `1b91fdcd` /
+//! `61f1eb04` / `81385ae9`; 26,319 / 28,027 / 25,473 / 26,026
+//! bytes — session 20's post-commit regeneration, re-measured),
+//! the payload file shas matching the README pins (`6deda5e6` /
+//! `327c9d3f` / `49b24d9f` / `a39c6102`), the `/tmp/opencode`
+//! twins identical, the stack parsed (6-E→main, 6-F→main,
+//! population→6-E, 6-E2→population, draft everywhere), the
+//! docs-only proof re-measured per branch (each
+//! implementation-commit→tip diff lists only this doc and the
+//! PR-body file), `engine-core`'s diff vs `main` ZERO files on all
+//! four branches, `git fsck --full --strict` clean (zero notices
+//! of any kind), the `wt-6e2` worktree clean at `f29a22a`, and
+//! the lavapipe environment functional without re-provision
+//! (llvmpipe LLVM 20.1.2, Mesa 25.2.8, Vulkan API 1.4.318 —
+//! probed scoped, before any gate ran). Raw logs for all of the
+//! above, born persistent: `~/verify17-session21/` (the entry
+//! battery) and `~/verify17-session21/union/` (the union
+//! battery); the harness scripts alongside, `bash -n`-validated,
+//! their counting awk ground-truthed against session 19's raw
+//! logs before any new measurement ran.
+
+//! ### The first gap this session closed — the population branch's
+//! own batteries, directly on the entry tip `dbbc8b4` (the tip the
+//! watcher pushes as this session starts)
+
+//! The class every session since 18 has closed: each session's
+//! documentation commit advances the population tip, the code
+//! bytes never change, and the run's closing standard is direct
+//! measurement on the exact tip. At entry, the population
+//! linchpin's latest direct run was session 18's (three doc
+//! commits back, on `0abb5a5`) and the CPU battery's was
+//! session 20's (one doc commit back, on `8e22707`). This
+//! session re-measured both on `dbbc8b4` (15:04:54–15:09:01 UTC,
+//! warm target cache):
+
+//! - **the graphical linchpin** (`render_instanced --ignored`,
+//!   lavapipe, the variables scoped to the gate command only —
+//!   session 18's exact form): 2 passed, rc=0, 0.47 s — the full
+//!   24+2 table (26 instances 24/2 npc/vehicle, per-object 26 ==
+//!   instanced 2 draws, byte-equal frames, ink 2,745/65,536,
+//!   warmed `device_memory` 18 constant across warmed frames) and
+//!   the 13-instance fixture (13 == 2, byte-equal, ink 3,728,
+//!   both single-instance oracle walls 0/255 over 57,600 pixels,
+//!   the pipeline-replacement lifecycle 18 → 38, delta 20).
+//!   Every pinned line IDENTICAL to the session-18/15/7 records —
+//!   the linchpin's sixth direct branch-tip confirmation, its
+//!   first on this tip.
+//! - **the CPU battery** (the CI's own commands, verbatim, clean
+//!   environment — the SDL/VK variables explicitly unset, session
+//!   4's lesson): fmt clean (2 s), clippy clean in BOTH forms
+//!   (CI 1 s, release cached), the main shard **1142 / 2 / 33**
+//!   (rc=0, 83 s), the renderer release battery **65 passed /
+//!   0 ignored / 2 result lines** (rc=0, cached), the heavy shard
+//!   **576 / 11 / 58** (rc=0, 156 s) — every count the branch
+//!   pin, identical to session 20's two direct runs on the parent
+//!   tip `8e22707` and to the union batteries' measurements of
+//!   the same code bytes.
+
+//! The sibling branches were NOT re-measured this session: their
+//! tips are unmoved since session 11, and sessions 18 (linchpin),
+//! 19 (CPU ×2, runs 1+2), and 20 (workflow lint) measured each
+//! directly on those exact tips — the saturated state.
+
+//! ### The second gap this session closed — the merge-morning
+//! union's THIRD direct full battery, on the current entry tips
+
+//! The union's previous direct full batteries are sessions 12 (on
+//! `298bd7e`) and 13 (on `7e30c4d`), both on population-side tips
+//! 8+ doc commits behind `dbbc8b4`; every session since carried
+//! the union by the kit's code-subset check alone (code bytes
+//! identical to the gated tree `f02ddef`). Sound — but the
+//! merge-morning tree is the most consequential tree of the run,
+//! and the run's closing standard is direct measurement on the
+//! exact tree. This session re-executed the merge kit on the
+//! entry tips in the standalone clone (the real repo's refs
+//! untouched) and ran the CI's own FULL battery directly on the
+//! resulting tree (15:10:33–15:16:00 UTC, warm target cache):
+
+//! - **the tree**: `a6694b5` (full:
+//!   `a6694b59170e6868fe18ed125726db1631d55d14`),
+//!   the four-way union of `1c50065` / `980e432` / `dbbc8b4` /
+//!   `f29a22a` — the merge chain's second parents verified as the
+//!   exact tips (pop `dbbc8b4` / 6-E2 `f29a22a` / 6-F `980e432`;
+//!   the 6-E tip an ancestor of the union, step 1's fast-forward);
+//!   the union doc ONE blob at every conflicted step, carrying
+//!   sessions through 20 (29 addendum sections, 3,174 lines); the
+//!   code subset vs the gated tree `f02ddef` exactly ZERO files
+//!   outside the doc set.
+//! - **the CPU battery**: fmt clean; clippy clean in both forms;
+//!   the main shard **1154 / 2 / 33** (rc=0, 82 s); the renderer
+//!   release battery **77 passed / 0 ignored / 2 result lines**
+//!   (rc=0); the heavy shard **576 / 13 / 59** (rc=0, 182 s).
+//! - **every graphical gate** (lavapipe, `--ignored`):
+//!   `render_instanced` 3 passed — the fixture 13 == 2, the full
+//!   table 26 == 2, the indirect three-way 26 == 2 == 2, all
+//!   byte-equal; ink 3,728 and 2,745; the oracle walls 0/255; the
+//!   one-time indirect `device_memory` 18 → 19; the replacement
+//!   lifecycle 19 → 41 (delta 22) and 18 → 38 (delta 20);
+//!   `render_shadows` 1 passed — the known-answer 1,006,779
+//!   compared / 41,797 edge-skipped (3.99%) / 0 mismatches / max
+//!   |Δdepth| 2.68e-7, identical after replacement; 536,888
+//!   shadowed texels; the patches 0/255 and 1/255; 65,536/65,536
+//!   frame pixels changed; warmed `device_memory` 17;
+//!   `render_corner` / `render_orientation` / `render_overflow` /
+//!   `render_glyph_atlas` rc=0 each.
+//! - **all six routes** (release, the rig commands' verbatim
+//!   form): populated-indirect ("26 instances (24 npc + 2
+//!   vehicle), 2 draw calls per frame (indirect mode)", 0/0),
+//!   populated-instanced (2 draws, 0/0), populated-reference (26
+//!   draws, 0/0), shadows (the cascade banner, 1024 texels, bias
+//!   0.0015 / 0.0020, 0/0), plain day AND night (0/0, no feature
+//!   banners), and the `--populated --shadows` typed refusal
+//!   (rc=1, "not implemented (proxy shadows are a deferred
+//!   package)").
+//! - **the workflow lints on the merged workflow**: actionlint
+//!   1.7.7 CLEAN, PyYAML strict 6.0.4 CLEAN (3 jobs).
+
+//! Every pinned line is IDENTICAL to the session-12/13 direct
+//! records — the determinism contract now witnessed at the
+//! battery level THREE times on merge-morning trees (sessions 12,
+//! 13, 21), the third on today's exact tips. The repeatability
+//! basis: the population branch's own battery (this session,
+//! `dbbc8b4`) and the union's (this session, same code bytes
+//! merged) measured the identical counts, as did sessions 19/20
+//! and 12/13 before them.
+
+//! ### The closing loop on this session's own commit
+
+//! Documentation only — this handoff doc and the population PR
+//! body's tip statement; no `.rs`, no workflow, no pins, no test.
+//! Gates for the commit: `cargo fmt --all -- --check` clean and
+//! `cargo clippy --workspace --all-targets --release -- -D
+//! warnings` clean — run on this tip by the battery itself (the
+//! pre-commit tree's code bytes are identical to the post-commit
+//! tree's; re-verified after the commit). After the commit: the
+//! population payload regenerated from the refreshed body via the
+//! established script (both copies, JSON-validated; the sha
+//! recorded in the push-handoff README pins — the session-20
+//! form, no in-session amend), the other three payloads
+//! re-verified byte-unchanged no-ops, and the merge kit
+//! re-executed on the post-commit tips (the union doc gains this
+//! section; the code-subset check against `f02ddef` must stay
+//! zero files) — the kit README carries the run record.
+
+//! ### Notes for the owner (session 21)
+
+//! `~/OVERNIGHT-DONE` remains correctly absent (the PRs do not
+//! exist; the honest form stands). The morning commands stand
+//! unchanged — the watcher performs the whole delivery from the
+//! canonical bytes the moment a credential returns. The ladder's
+//! evidence now stands uniform at the current tips end to end:
+//! every branch's graphical linchpin (session 18, plus this
+//! session's population run), every branch's CPU battery (session
+//! 19, plus sessions 20/21's population runs), every branch tip's
+//! workflow file directly lint-clean (session 20) — and the
+//! merge-morning union THREE times directly battery-measured, the
+//! third on today's tips. The one action the run needs remains
+//! the credential itself.
+
