@@ -56,6 +56,10 @@ fn main() {
     // The Cycle 6-B lit-scene shaders (see docs/CYCLE6-6B-BRIEF.md):
     // the same one-module/both-entry-points form.
     compile_wgsl("lit_scene.wgsl", "lit_scene.spv");
+    // The Cycle 6-E instanced-proxy shaders (see
+    // docs/CYCLE6-6E-BRIEF.md): the same one-module/both-entry-
+    // points form, the same binding set as lit_scene (0-3).
+    compile_wgsl("instanced_proxy.wgsl", "instanced_proxy.spv");
 }
 
 /// The WGSL path (Cycle 6-A): parse + validate + emit ONE SPIR-V
