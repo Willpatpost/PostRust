@@ -339,3 +339,85 @@
 //! relative-mouse test; export the lavapipe variables only for
 //! the graphical commands, exactly as CI scopes them. The full
 //! record is on the 6-F branch's addendum.)
+//!
+//! ---
+//!
+//! ## SESSION 5 ADDENDUM — the payload-sync session (2026-11-23,
+//! 11:15 UTC onward)
+//!
+//! The fifth session re-probed the push blocker first: unchanged
+//! (the askpass sockets remain dead files, `No anonymous write
+//! access`, exit 128; anonymous read still works — `origin/main`
+//! remains at `1fe89b7`, the merge base; nothing has drifted
+//! underneath the branches). The delivery machinery is healthy:
+//! the supervisor (`~/overnight-supervisor.sh`) and the four-branch
+//! push watcher are both alive, and the watcher pushes all four
+//! branches and opens their draft PRs within ~60 s of a live
+//! credential (markers `~/PR-CREATED-*`, log `~/push-watcher.log`;
+//! an already-existing PR is looked up and treated as done —
+//! never a retry loop, never a touch on main).
+//!
+//! ### The one stale link this session closed
+//!
+//! The watcher's PR payloads (`/tmp/opencode/pr-payload-*.json`,
+//! twinned in `~/push-handoff/`) were assembled at **10:38 UTC**,
+//! BEFORE session 4's per-branch addenda landed (10:57–11:04) —
+//! the PRs the watcher opens would have carried bodies one
+//! addendum behind the branches they document (for 6-F: without
+//! the stale-message corrective). This commit closes the gap and
+//! removes the class of gap:
+//!
+//! - **`docs/PR-BODY-CYCLE6-6E.md` (new) — the canonical PR body,
+//!   committed to the branch.** The assembled body (every addendum
+//!   through the four-way union) plus the session-4/5 sync section:
+//!   the canonical rig block below, session 4's verification
+//!   headline, the tip statement, and session 5's verbatim
+//!   pre-flight of the rig block on this tip — rc=0 on all three
+//!   runs, every headline line reproduced (logs at
+//!   `~/verify8-session5/` on the pod). The watcher payloads and
+//!   the `~/push-handoff` twins are REGENERATED from this file
+//!   byte-for-byte — the repo is the single source of truth, so
+//!   payload and branch can never drift apart again.
+//! - **The morning-command correction.** The recipe above (§"The
+//!   exact morning commands") predates the watcher and the
+//!   payloads; its `--body-file <(git log -1 --format=%B 511b157)`
+//!   form would put the implementation commit message on the PR
+//!   wholesale — for 6-F that carries the stale CI paragraph
+//!   (session 4's corrective). The corrected form, from any clone
+//!   with the branches pushed:
+//!
+//!   ```sh
+//!   gh pr create --draft --title "cycle 6-E: instanced draws" \
+//!     --head cycle6/6e-instanced-draws --base main \
+//!     --body-file docs/PR-BODY-CYCLE6-6E.md
+//!   gh pr create --draft --title "cycle 6-F: directional shadows" \
+//!     --head cycle6/6f-directional-shadows --base main \
+//!     --body-file docs/PR-BODY-CYCLE6-6F.md
+//!   gh pr create --draft --title "corner-scene population (6-E ladder package 3)" \
+//!     --head cycle6/corner-population --base cycle6/6e-instanced-draws \
+//!     --body-file docs/PR-BODY-CORNER-POPULATION.md
+//!   gh pr create --draft --title "cycle 6-E2: indirect draws" \
+//!     --head cycle6/6e2-indirect-draws --base cycle6/corner-population \
+//!     --body-file docs/PR-BODY-CYCLE6-6E2.md
+//!   ```
+//!
+//!   (the stacked `--base` choices stand; the four body files live
+//!   on their own branches, so each command finds its file on the
+//!   checked-out head). **Or do nothing**: the watcher performs
+//!   the whole sequence from the same bytes automatically.
+//!   Manual creation while the watcher is live is safe — the
+//!   watcher looks existing PRs up instead of duplicating them.
+//!
+//! ### The gates for this commit
+//!
+//! Documentation only — the diffstat is the proof (this handoff
+//! doc and the new body file; no `.rs`, no workflow edits, no
+//! pins). `cargo fmt --check` clean and `cargo clippy --workspace
+//! --all-targets --release -- -D warnings` clean, re-run on this
+//! tip this session; the full test suites are sessions 3/4's
+//! measured records on the code tree this commit does not touch.
+//! Session 5's own execution evidence on this tip: the canonical
+//! rig block verbatim — rc=0 ×3, the pinned headline lines
+//! reproduced (14 instances / 2 draws instanced, 14 per-object,
+//! validation 0/0). engine-core untouched; no pins changed; no
+//! test modified; AGENTS.md untouched.
