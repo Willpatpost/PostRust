@@ -508,8 +508,10 @@ impl Renderer {
     /// one cascade computed from the light direction and the scene's
     /// world AABB (the deterministic core's `cascade_for`), rendered
     /// through the depth-only pass, then the main pass with the
-    /// shadowed lit pipeline sampling the map (hard shadows, the
-    /// compare-time analytical bias). The unshadowed `render_corner`
+    /// shadowed lit pipeline sampling the map (Era-1 PCF soft
+    /// shadows — the 3×3 `shadow_filter` tap table over the validated
+    /// map, the compare-time analytical bias shared verbatim with the
+    /// CPU oracle). The unshadowed `render_corner`
     /// path is untouched — pixel-identical to the pre-6-F renderer.
     /// The bias parameters are CALLER policy (documented per caller;
     /// the shader and the CPU oracle share the same expression).

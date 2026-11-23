@@ -1,11 +1,15 @@
 //! The Cycle 6-F shadow gates (see docs/AUTONOMOUS-CYCLE-PROTOCOL.md
-//! §2 item 2): the shadow map's depth values pinned against the CPU
-//! raycaster (the known-answer check — every texel is the deterministic
-//! core's `map_texel_depth`), and the shadowed/unshadowed pixel
-//! equivalence (the render_corner oracle discipline applied to the
-//! shadow term: a fully-shadowed ground patch renders exactly
-//! `albedo · ambient`, a fully-lit patch renders exactly the
-//! unshadowed equation, and the shadow visibly changes the frame).
+//! §2 item 2) and the Era-1 SOFT-shadow gate: the shadow map's depth
+//! values pinned against the CPU raycaster (the known-answer check —
+//! every texel is the deterministic core's `map_texel_depth`), the
+//! shadowed/unshadowed pixel equivalence (the render_corner oracle
+//! discipline applied to the shadow term: a fully-shadowed ground
+//! patch renders exactly `albedo · ambient`, a fully-lit patch
+//! exactly the unshadowed equation, and the shadow visibly changes
+//! the frame), and — Era 1 — the PCF penumbra gate: the shadowed
+//! shader's filtered factor vs the CPU filter (`pcf_at_point`) over
+//! the SAME captured map bytes, per pixel, on a ground patch that
+//! straddles the day shadow edge.
 //!
 //! `#[ignore]`d like the other lavapipe smokes: it requires
 //! `SDL_VIDEODRIVER=offscreen` plus a software Vulkan ICD (lavapipe)
@@ -21,14 +25,16 @@
 //! ```
 
 use engine_renderer::lit_scene::{
-    LightParams, day_preset, intersection_boxes, lit_surface_color, materials,
+    LightParams, Material, day_preset, intersection_boxes, lit_surface_color, materials,
 };
 use engine_renderer::proc_texture::{TEXTURE_SIZE, procedural_texture};
+use engine_renderer::shadow_filter::{pcf_at_point, pcf_factor};
 use engine_renderer::shadows::{
     self, ShadowBias, ShadowCascade, is_shadowed, map_texel_depth, scene_bounds,
 };
 use engine_renderer::{
-    CapturedFrame, DemoScenePreference, RenderConfig, Renderer, ValidationPreference,
+    CapturedFrame, DemoScenePreference, RenderConfig, Renderer, ShadowMapReadback,
+    ValidationPreference,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 
@@ -475,4 +481,416 @@ fn shadow_map_depths_match_the_raycaster_and_pixels_gate() {
 fn assert_frames_equal_bytes(expected: &CapturedFrame, actual: &CapturedFrame) {
     assert_eq!(expected.format, actual.format);
     assert_eq!(expected.bytes, actual.bytes, "byte-identical captures");
+}
+
+// ------------------------------------------------------- the Era-1
+// soft-shadow gate's local helpers (the exposure-class mirror of
+// pcf_at_point's internals — the epsilons below absorb the
+// GPU/CPU ulp divergence the classes exist to classify).
+
+/// The compare-exposure epsilon (depth units): a tap whose biased
+/// compare margin sits within this of zero can flip between the
+/// shader's and the CPU's evaluation (their inputs are the same map
+/// bytes; the divergence is fma contraction in the projection and
+/// the WGSL normalize, ulp-scale). Matches the map gate's tolerance
+/// class; the corner scene's adjacent-tap depth steps (~0.0016 at
+/// the wall faces) are far above it, so at most ONE tap of nine is
+/// ever exposed — the ±1/9 factor slack below.
+const COMPARE_EXPOSURE_EPS: f32 = 1e-4;
+/// The texel-boundary epsilon (texel units): a projected texel
+/// coordinate within this of an integer can truncate to either
+/// side (the neighborhood shifts by one texel — up to four
+/// candidate anchors).
+const TEXEL_EXPOSURE_EPS: f32 = 1e-3;
+
+/// One pixel's CPU-side PCF diagnostics: the core's factor (via
+/// `pcf_at_point`, authoritative) plus the exposure classification
+/// from the mirrored projection.
+struct PcfPixel {
+    factor: f32,
+    /// Some tap's biased compare margin is within
+    /// [`COMPARE_EXPOSURE_EPS`] of zero (a flippable tap).
+    compare_exposed: bool,
+    /// The projected texel coordinate is within
+    /// [`TEXEL_EXPOSURE_EPS`] of an integer on either axis (a
+    /// truncatable anchor).
+    texel_exposed: bool,
+    /// The CPU anchor's (texel_x, texel_y) — for the alternate
+    /// neighborhoods a texel-exposed pixel may have sampled.
+    anchor: (u32, u32),
+}
+
+/// The gate's mirror of `pcf_at_point`'s projection (same
+/// expressions; the epsilons own the drift) with the exposure
+/// classification. `None` outside the cascade box (factor 1.0, not
+/// exposed — the corner scene's ground never leaves the box).
+fn pcf_pixel_diagnostics(
+    cascade: &ShadowCascade,
+    map: &ShadowMapReadback,
+    point: [f32; 3],
+    bias: ShadowBias,
+) -> Option<PcfPixel> {
+    let extent = map.extent;
+    let clip: [f32; 4] = std::array::from_fn(|i| {
+        cascade.matrix[0][i] * point[0]
+            + cascade.matrix[1][i] * point[1]
+            + cascade.matrix[2][i] * point[2]
+            + cascade.matrix[3][i]
+    });
+    let w = clip[3];
+    let ndc = [clip[0] / w, clip[1] / w, clip[2] / w];
+    if !(-1.0..=1.0).contains(&ndc[0])
+        || !(-1.0..=1.0).contains(&ndc[1])
+        || !(0.0..=1.0).contains(&ndc[2])
+    {
+        return None;
+    }
+    let extent_f = extent as f32;
+    let fx = (ndc[0] + 1.0) * 0.5 * extent_f;
+    let fy = (1.0 - (ndc[1] + 1.0) * 0.5) * extent_f;
+    let texel_x = (fx as u32).min(extent - 1);
+    let texel_y = (fy as u32).min(extent - 1);
+    let normal = [0.0, 1.0, 0.0];
+    let facing = (normal[0] * cascade.light[0]
+        + normal[1] * cascade.light[1]
+        + normal[2] * cascade.light[2])
+        .abs()
+        .max(1.0 / 64.0);
+    let bias_value = bias.constant + bias.slope_scale * (1.0 / facing - 1.0);
+    // The core's factor (authoritative — the same convention this
+    // mirror derives).
+    let read = |x: u32, y: u32| map.depths[(y * extent + x) as usize];
+    let factor = pcf_at_point(cascade, extent, point, normal, bias, read);
+    // The exposure classification over the same taps.
+    let mut compare_exposed = false;
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            let x = texel_x as i32 + dx;
+            let y = texel_y as i32 + dy;
+            let depth = if x < 0 || y < 0 || x >= extent as i32 || y >= extent as i32 {
+                1.0
+            } else {
+                map.depths[(y as u32 * extent + x as u32) as usize]
+            };
+            if (ndc[2] - (depth + bias_value)).abs() < COMPARE_EXPOSURE_EPS {
+                compare_exposed = true;
+            }
+        }
+    }
+    let boundary = |v: f32| (v - v.round()).abs();
+    let texel_exposed = boundary(fx) < TEXEL_EXPOSURE_EPS || boundary(fy) < TEXEL_EXPOSURE_EPS;
+    Some(PcfPixel {
+        factor,
+        compare_exposed,
+        texel_exposed,
+        anchor: (texel_x, texel_y),
+    })
+}
+
+/// The factored ground equation — the shadowed shader's EXACT form
+/// (the direct terms multiplied by the factor, the multiply order
+/// mirrored term-for-term):
+/// `albedo · (ambient + light · NdotL · f) + spec · light · NdotL · f · NdotH^shininess`.
+fn factored_ground_color(
+    albedo: [f32; 3],
+    factor: f32,
+    material: Material,
+    light: LightParams,
+    eye: [f32; 3],
+    pos: [f32; 3],
+) -> [f32; 3] {
+    let normalize = |v: [f32; 3]| {
+        let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        [v[0] / len, v[1] / len, v[2] / len]
+    };
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let n = [0.0, 1.0, 0.0];
+    let v = normalize(std::array::from_fn(|i| eye[i] - pos[i]));
+    let l = normalize(light.dir_toward_light);
+    let n_dot_l = dot(n, l).clamp(0.0, 1.0);
+    let h = normalize([l[0] + v[0], l[1] + v[1], l[2] + v[2]]);
+    let n_dot_h = dot(n, h).clamp(0.0, 1.0);
+    let mut spec = n_dot_h;
+    for _ in 0..material.shininess.trailing_zeros() {
+        spec = spec * spec;
+    }
+    std::array::from_fn(|c| {
+        albedo[c] * (light.ambient[c] + light.light_color[c] * n_dot_l * factor)
+            + material.specular[c] * light.light_color[c] * n_dot_l * factor * spec
+    })
+}
+
+/// The Era-1 SOFT-SHADOW gate (the brief's PCF contract): the
+/// shadowed shader's filtered factor vs the CPU filter
+/// (`pcf_at_point`) over the SAME captured map bytes, per pixel, on
+/// a ground patch that straddles the day preset's signature shadow
+/// edge — the deterministic flip walk ([0,0] toward [12,3], the
+/// scene's own known-shadowed and known-lit anchors) centers the
+/// patch exactly on the boundary, so the frame contains deep shadow,
+/// penumbra, and full light.
+///
+/// THE TOLERANCE (documented): interior pixels (no tap within
+/// [`COMPARE_EXPOSURE_EPS`] of the compare boundary, no projected
+/// texel coordinate within [`TEXEL_EXPOSURE_EPS`] of an integer)
+/// must match the CPU-filtered equation within 2/255 — the 6-B
+/// discipline, exact factor agreement. Compare-exposed pixels may
+/// flip ONE tap (the adjacent-tap depth step ~0.0016 dwarfs the
+/// exposure epsilon, so one tap at a time): the pixel must match the
+/// equation at the CPU factor OR at factor ± 1/9. Texel-exposed
+/// pixels may have truncated to the neighboring anchor: the pixel
+/// must match the equation at ANY of the five candidate anchors'
+/// factors. Every class is counted and printed — the CI log's
+/// evidence.
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
+fn pcf_penumbra_pixels_match_the_cpu_filter_over_the_same_map_bytes() {
+    let mut app = ShellApp::new(ShellConfig {
+        title: "Era 1 soft shadows".into(),
+        width: 256,
+        height: 256,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    })
+    .unwrap();
+    let mut renderer = Renderer::new(
+        app.window(),
+        RenderConfig {
+            demo_scene: DemoScenePreference::Corner,
+            validation: ValidationPreference::On,
+            replace_pipelines: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let size = app.window().size_in_pixels();
+    assert_eq!(size, (256, 256));
+    let _ = app.frame();
+    let light = day_preset();
+    let boxes = intersection_boxes();
+    let cascade = corner_cascade(light);
+
+    // The captured map: the SAME bytes the shader filtered (the 6-F
+    // gate pins them to the raycaster; this gate pins the FILTER).
+    renderer.request_shadow_map_capture().unwrap();
+    let probe = ground_camera([0.0, 0.0], 1.0);
+    assert!(
+        renderer
+            .render_corner_shadowed(&probe.0, probe.1, light, BIAS, size)
+            .unwrap()
+            .presented
+    );
+    let map = renderer.take_shadow_map_capture().unwrap().unwrap();
+    assert_eq!(map.extent, shadows::SHADOW_MAP_EXTENT);
+    let read = |x: u32, y: u32| map.depths[(y * map.extent + x) as usize];
+
+    // The deterministic flip walk: [0,0] (the known-shadowed anchor)
+    // toward [12,3] (the known-lit anchor) in fixed 0.01 m steps;
+    // the FIRST raycaster-lit point is the patch center (the walk is
+    // the unit-tested battery's own line — the regimes along it are
+    // pinned CPU-side).
+    let (ux, uz) = {
+        let len = (12.0f32 * 12.0 + 3.0 * 3.0).sqrt();
+        (12.0 / len, 3.0 / len)
+    };
+    let mut flip = None;
+    for step in 1..=1240 {
+        let t = step as f32 * 0.01;
+        let point = [ux * t, 0.0, uz * t];
+        if !is_shadowed(point, &cascade, &boxes) {
+            flip = Some(point);
+            break;
+        }
+    }
+    let flip = flip.expect("the walk reaches the known-lit anchor");
+    println!("penumbra patch centered on the flip point {flip:?}");
+
+    // The straddling patch: the same orthographic ground camera as
+    // the 6-F patches, 1.5 m square on the boundary.
+    let (matrix, eye) = ground_camera([flip[0], flip[2]], 0.75);
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner_shadowed(&matrix, eye, light, BIAS, size)
+            .unwrap()
+            .presented
+    );
+    let image = renderer.take_frame_capture().unwrap().unwrap();
+    let mat = materials()[0];
+    let texture = procedural_texture(mat.texture);
+
+    let quantized = |color: [f32; 3]| color.map(|c| (255. * c.clamp(0., 1.)).round() as u8);
+    let albedo_at = |pos: [f32; 3]| {
+        let uv_axes = [pos[0], pos[2]];
+        let [tx, ty] =
+            uv_axes.map(|m| ((m / 4.).rem_euclid(1.) * TEXTURE_SIZE as f32).floor() as usize);
+        let index = 4 * (ty * TEXTURE_SIZE as usize + tx);
+        std::array::from_fn(|c| texture[index + c] as f32 / 255.)
+    };
+
+    let mut interior = 0usize;
+    let mut compare_exposed = 0usize;
+    let mut texel_exposed = 0usize;
+    let mut penumbra = 0usize;
+    let mut deep_shadow = 0usize;
+    let mut full_light = 0usize;
+    let mut worst_interior_error = 0u8;
+    for y in 8..size.1 - 8 {
+        for x in 8..size.0 - 8 {
+            let dx = (x as f32 + 0.5) * 2. / size.0 as f32 - 1.;
+            let dy = (y as f32 + 0.5) * 2. / size.1 as f32 - 1.;
+            // The 6-F patch convention (the proven orientation): the
+            // world point of this pixel.
+            let pos = [flip[0] + dx * 0.75, 0.0, flip[2] + dy * 0.75];
+            let albedo = albedo_at(pos);
+            let pixel = image.pixel_rgba(x, y);
+            let expected_at = |factor: f32| {
+                quantized(factored_ground_color(albedo, factor, mat, light, eye, pos))
+            };
+            let Some(diag) = pcf_pixel_diagnostics(&cascade, &map, pos, BIAS) else {
+                // Outside the cascade box: the shader's early return
+                // (factor 1.0) — the ground patch cannot reach it,
+                // but the class is handled honestly if it ever does.
+                let expected = expected_at(1.0);
+                assert!(
+                    expected
+                        .iter()
+                        .zip(pixel)
+                        .map(|(e, a)| e.abs_diff(a))
+                        .max()
+                        .unwrap()
+                        <= 2,
+                    "outside-box pixel ({x},{y})"
+                );
+                full_light += 1;
+                continue;
+            };
+            match diag.factor {
+                0.0 => deep_shadow += 1,
+                1.0 => full_light += 1,
+                _ => penumbra += 1,
+            }
+            let close = |expected: [u8; 3]| {
+                expected
+                    .iter()
+                    .zip(pixel)
+                    .map(|(e, a)| e.abs_diff(a))
+                    .max()
+                    .unwrap()
+                    <= 2
+            };
+            if diag.texel_exposed {
+                texel_exposed += 1;
+                // The five candidate anchors: the CPU's own and the
+                // four one-texel neighbors (either axis may have
+                // truncated to the other side).
+                let normal = [0.0, 1.0, 0.0];
+                let facing = normal[1] * cascade.light[1];
+                let bias_value =
+                    BIAS.constant + BIAS.slope_scale * (1.0 / facing.max(1.0 / 64.0) - 1.0);
+                let clip_z = cascade.matrix[0][2] * pos[0]
+                    + cascade.matrix[1][2] * pos[1]
+                    + cascade.matrix[2][2] * pos[2]
+                    + cascade.matrix[3][2];
+                let reference = clip_z / 1.0;
+                let (tx, ty) = diag.anchor;
+                let mut matched = false;
+                for (ox, oy) in [(0i32, 0i32), (1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    let anchor_x = (tx as i32 + ox).clamp(0, map.extent as i32 - 1) as u32;
+                    let anchor_y = (ty as i32 + oy).clamp(0, map.extent as i32 - 1) as u32;
+                    let factor = pcf_factor(reference, bias_value, |dx, dy| {
+                        let x = anchor_x as i32 + dx;
+                        let y = anchor_y as i32 + dy;
+                        if x < 0 || y < 0 || x >= map.extent as i32 || y >= map.extent as i32 {
+                            1.0
+                        } else {
+                            read(x as u32, y as u32)
+                        }
+                    });
+                    if close(expected_at(factor)) {
+                        matched = true;
+                        break;
+                    }
+                }
+                assert!(
+                    matched,
+                    "texel-exposed pixel ({x},{y}) world {pos:?}: {:?} vs {pixel:?}",
+                    expected_at(diag.factor)
+                );
+            } else if diag.compare_exposed {
+                compare_exposed += 1;
+                // One tap may flip: the factor moves by exactly 1/9.
+                let f = diag.factor;
+                let alternates = [f, (f - 1.0 / 9.0).max(0.0), (f + 1.0 / 9.0).min(1.0)];
+                assert!(
+                    alternates.iter().any(|&f| close(expected_at(f))),
+                    "compare-exposed pixel ({x},{y}) world {pos:?} factor {f}: \
+                     {:?} vs {pixel:?}",
+                    expected_at(f)
+                );
+            } else {
+                interior += 1;
+                let expected = expected_at(diag.factor);
+                let error = expected
+                    .iter()
+                    .zip(pixel)
+                    .map(|(e, a)| e.abs_diff(a))
+                    .max()
+                    .unwrap();
+                worst_interior_error = worst_interior_error.max(error);
+                assert!(
+                    error <= 2,
+                    "interior pixel ({x},{y}) world {pos:?} factor {:?}: \
+                     {expected:?} vs {pixel:?}",
+                    diag.factor
+                );
+            }
+            assert_eq!(pixel[3], 255);
+        }
+    }
+    let total = (size.0 - 16) as usize * (size.1 - 16) as usize;
+    println!(
+        "PCF penumbra gate: {total} pixels — {interior} interior (max error \
+         {worst_interior_error}/255), {compare_exposed} compare-exposed, \
+         {texel_exposed} texel-exposed; regimes: {deep_shadow} deep shadow, \
+         {penumbra} penumbra, {full_light} full light"
+    );
+    // The non-vacuity floor: all three regimes present in force (the
+    // patch straddles the boundary by construction; the penumbra
+    // strip is ~0.22 m wide — the 1.5 m patch maps it to ~35 pixel
+    // rows).
+    assert!(deep_shadow > 5_000, "deep shadow: {deep_shadow}");
+    assert!(full_light > 5_000, "full light: {full_light}");
+    assert!(penumbra > 500, "penumbra pixels: {penumbra}");
+
+    // The warmed-allocation constancy across the gate's own renders.
+    let warm = renderer.allocations();
+    for _ in 0..2 {
+        renderer.request_frame_capture().unwrap();
+        assert!(
+            renderer
+                .render_corner_shadowed(&matrix, eye, light, BIAS, size)
+                .unwrap()
+                .presented
+        );
+        let repeat = renderer.take_frame_capture().unwrap().unwrap();
+        assert_eq!(
+            renderer.allocations(),
+            warm,
+            "warmed PCF allocations constant"
+        );
+        assert_frames_equal_bytes(&image, &repeat);
+    }
+    println!("warmed PCF shadowed allocations: {warm:?}");
+
+    assert_eq!(
+        renderer.stats().validation_errors,
+        0,
+        "{:?}",
+        renderer.stats().recent_validation
+    );
+    println!(
+        "Era-1 soft-shadow gate: the shader's PCF factor matches the CPU filter over the \
+         same map bytes — {interior} interior pixels at the 6-B 2/255 discipline, the \
+         exposure classes bounded by their documented one-tap/one-anchor slacks"
+    );
 }

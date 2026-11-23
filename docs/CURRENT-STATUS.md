@@ -100,10 +100,13 @@ ARM64) with a five-job CI:
   cascade core, the per-slot shadow maps behind a depth-only pass
   (an external subpass dependency orders the writes before the main
   pass's fragment reads), the shadowed lit pipeline sampling the map
-  (hard shadows, a compare-time analytical bias shared verbatim with
-  the CPU oracle), the known-answer map readback, and the
-  `--corner --shadows` route — all lazily created (the unshadowed
-  path's allocation pins untouched, its renders pixel-identical).
+  (Era-1 **PCF soft shadows** — the 3×3 `shadow_filter` tap table
+  over the validated map, a compare-time analytical bias shared
+  verbatim with the CPU oracle, both sides carrying the same
+  out-of-bounds-reads-clear convention), the known-answer map
+  readback, and the `--corner --shadows` route — all lazily created
+  (the unshadowed path's allocation pins untouched, its renders
+  pixel-identical).
 - **`engine-shell`** — the SDL3 application shell (statically-linked vendored
   SDL 3.4.18; real window + offscreen/dummy modes).
 - **`engine-slice`** — the integration/demo driver: the stdin CLI, `--window`,
