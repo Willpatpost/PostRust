@@ -499,6 +499,12 @@ jobs:
       # evidence (the instanced/per-object call counts, the changed-
       # pixel count, the oracle max-error lines, the warmed
       # allocation stats) is what the CI log must show.
+      # (Cycle 6-E ladder package 3) The same proof for the SHIPPED
+      # population: the full 24-NPC + 2-vehicle placement table
+      # (26 vs 2 draws, byte-equal frames, the ink control, the
+      # warmed-allocation constancy). The binary's two SDL tests
+      # serialize on its sdl_lock (the engine-shell test pattern);
+      # this step's command is unchanged.
       - name: Instanced-proxy equivalence gate (lavapipe)
         if: runner.os == 'Linux'
         shell: bash
@@ -983,14 +989,32 @@ jobs:
           # pixel-equivalence + draw-call + allocation pins, executed
           # by the dedicated Linux Vulkan step): +1 ignored / +1
           # result line, passed counts unchanged.
-          expected=570
-          if [ "$(uname -s)" != "Linux" ]; then expected=569; fi
+          # Cycle 6-E ladder package 3 (corner-scene population,
+          # 2026-11-23): the new engine-slice corner_population
+          # module's six-test placement battery (counts/heights/
+          # scales/turns, sidewalk-or-crosswalk membership, the lane
+          # and clearance rules, camera-route clearance, overlap
+          # freedom, the packed-bytes FNV pin) grows the lib binary's
+          # passed count within its existing result line, and the
+          # SECOND #[ignore]d render_instanced gate (the full
+          # 24-NPC + 2-vehicle table's N-vs-1) adds +1 ignored
+          # (10 -> 11), result lines unchanged (the same binary —
+          # its two SDL tests serialize on the sdl_lock pattern, so
+          # this step's command is unchanged). Linux 576/11/58
+          # MEASURED locally with this step's own awk; Windows 575
+          # = the prior 569 + the same 6, platform-uniform (the
+          # battery's pins are margin-based comparisons; the byte
+          # pin is pure-IEEE packing — to be confirmed by this
+          # candidate's CI run; a mismatch is corrected from
+          # actuals, never by weakening a test).
+          expected=576
+          if [ "$(uname -s)" != "Linux" ]; then expected=575; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 10 / 58)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 11 / 58)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
-          [ "$ignored" -eq 10 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 10"; exit 1; }
+          [ "$ignored" -eq 11 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 11"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
@@ -1015,6 +1039,10 @@ jobs:
           # line (its single equivalence-gate test is #[ignore]d in
           # the plain run and executed by the dedicated Linux Vulkan
           # step).
+          # Cycle 6-E ladder package 3: 58 unchanged, MEASURED with
+          # this step's local twin (the second render_instanced gate
+          # lives in the existing binary; the six placement tests
+          # live in the existing lib binary).
           [ "$results" -eq 58 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 58"; exit 1; }
       # (F-06, the 2026-11-12 quality audit — Agent C) The release-mode
       # render-path CPU canary: the comparative microbenchmark in

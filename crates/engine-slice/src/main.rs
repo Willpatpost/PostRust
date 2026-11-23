@@ -63,7 +63,7 @@ Interactive modes
   --window [--dummy]                 SDL window and input
   --render [--regions]               Vulkan scene and optional region LOD
   --corner [--night]                 Full lit city route (day by default)
-  --corner --populated               Route with the deterministic proxy population
+  --corner --populated               Route with the deterministic 24-NPC + 2-vehicle population
                                     (--proxy-reference: one draw per instance, the
                                     pre-6-E submission shape for before/after runs)
   --player | --playable              Movement and gatehouse demos
