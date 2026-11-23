@@ -109,6 +109,8 @@ pub mod descriptors;
 pub(crate) mod proxy_draw;
 #[path = "shadow_draw.rs"]
 pub(crate) mod shadow_draw;
+#[path = "sky_draw.rs"]
+pub(crate) mod sky_draw;
 #[path = "textures.rs"]
 pub mod textures;
 
@@ -1419,6 +1421,13 @@ pub(crate) struct PipelineState {
     /// state (the pipelines reading it do); a replacement re-ensures
     /// an identical set before installation (finding A).
     pub shadows: Option<shadow_draw::ShadowResources>,
+    /// The Era-1 sky state (the fullscreen-triangle pipeline + the
+    /// mapped per-slot SkyParams uniform), created LAZILY at the
+    /// first sky frame — the region-buffer precedent: the skyless
+    /// path pays nothing and its allocation pins are untouched. Dies
+    /// with this state (the pipeline reading it does); a replacement
+    /// re-ensures an identical set before installation (finding A).
+    pub sky: Option<sky_draw::SkyResources>,
     /// Per-slot vertex capacity of the dynamic region-scene buffer
     /// (Stage 4 graphical integration — the same disjoint per-slot
     /// pattern as the overlay).
@@ -1465,6 +1474,7 @@ impl PipelineState {
             region_mapped: core::ptr::null_mut(),
             proxy: None,
             shadows: None,
+            sky: None,
         };
         if let Err(error) = state.build(ctx, color_format, depth_format, demo_scene) {
             state.destroy(ctx);
@@ -1581,6 +1591,22 @@ impl PipelineState {
             self.render_pass,
             corner,
         )?);
+        Ok(())
+    }
+
+    /// Allocates the Era-1 sky state on the first sky frame (the
+    /// same lazy discipline: the skyless path pays nothing — its
+    /// allocation pins are untouched). The sky pipeline renders
+    /// inside THIS state's render pass, so the ensure carries it; a
+    /// no-op once allocated.
+    pub(crate) fn ensure_sky_resources(
+        &mut self,
+        ctx: &VulkanContext,
+    ) -> Result<(), RendererError> {
+        if self.sky.is_some() {
+            return Ok(());
+        }
+        self.sky = Some(sky_draw::SkyResources::new(ctx, self.render_pass)?);
         Ok(())
     }
 
@@ -2041,6 +2067,9 @@ impl PipelineState {
             }
             if let Some(shadows) = self.shadows.take() {
                 shadows.destroy(ctx);
+            }
+            if let Some(sky) = self.sky.take() {
+                sky.destroy(ctx);
             }
             if !self.region_mapped.is_null() {
                 ctx.device.unmap_memory(self.region_vbo_memory);
@@ -2966,6 +2995,9 @@ pub(crate) struct FrameOutcome {
 // Private frame orchestration: the four owning states plus the per-frame
 // inputs are exactly the parameters the record/submit/present sequence
 // needs; bundling them would hide the ownership story for no gain.
+// The Era-1 sky pass rides the same flat list (the one-Option-per-layer
+// shape; the sky is a layer like the shadowed one, drawn first when
+// present).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_frame(
     ctx: &mut VulkanContext,
@@ -2984,6 +3016,7 @@ pub(crate) fn render_frame(
     corner_params: Option<&corner::FrameParams>,
     proxy: Option<&proxy_draw::ProxyFrameUpload<'_>>,
     shadowed: Option<&shadow_draw::ShadowFrameParams>,
+    sky: Option<&sky_draw::SkyFrameParams>,
 ) -> Result<FrameOutcome, RendererError> {
     let mut outcome = FrameOutcome::default();
     let slot = frames.frame_slot;
@@ -3088,6 +3121,14 @@ pub(crate) fn render_frame(
     // scene-preference gate), which the ensure itself re-checks.
     if shadowed.is_some() {
         pipes.ensure_shadow_resources(ctx)?;
+    }
+
+    // The Era-1 lazy sky state (the same discipline): created at the
+    // first sky frame only, outside command recording — the skyless
+    // path pays nothing, and a pipeline replacement re-ensures an
+    // identical set at the next sky frame (the 6-F finding-A shape).
+    if sky.is_some() {
+        pipes.ensure_sky_resources(ctx)?;
     }
 
     // A previous present reported suboptimal — recreate before drawing
@@ -3388,6 +3429,23 @@ pub(crate) fn render_frame(
         );
         ctx.device.cmd_set_viewport(command, 0, &[viewport]);
         ctx.device.cmd_set_scissor(command, 0, &[scissor]);
+        // The Era-1 sky draw: FIRST inside the main render pass —
+        // the fullscreen triangle replaces the clear-color
+        // background with the sky equation, with NO depth
+        // interaction (no test, no write), so every scene draw below
+        // behaves exactly as it did over the clear (the
+        // unchanged-path proof: only the uncovered background
+        // changes). The ensure above guaranteed the state whenever
+        // `sky` is Some; the belt check keeps a skyless frame on the
+        // skyless path even if a prior sky frame created the state.
+        if let (Some(sky_state), Some(params)) = (&pipes.sky, sky) {
+            // SAFETY (both calls): this slot's fence wait passed above
+            // (the uniform region is disjoint from every other
+            // slot); the recording command buffer is inside the main
+            // render pass, before the scene draws.
+            sky_state.write_frame(slot, params);
+            sky_state.record(ctx, command, slot);
+        }
         if shadowed.is_some()
             && let (Some(resources), Some(shadow_state)) = (&ctx.corner, &pipes.shadows)
         {

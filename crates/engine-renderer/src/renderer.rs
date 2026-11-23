@@ -213,6 +213,27 @@ pub struct Renderer {
     /// growth.
     instance_bytes: Vec<u8>,
     proxy_draw_mode: ProxyDrawMode,
+    /// The Era-1 sky layer's sticky setting (the set_overlay_enabled
+    /// precedent): `Some` makes every subsequent corner-family frame
+    /// draw the sky pass first; `None` keeps the skyless byte-identical
+    /// path.
+    sky: Option<SkyFrame>,
+}
+
+/// The Era-1 sky layer's frame description (the sticky `set_sky`
+/// setting): the palette and the celestial disc's direction. The
+/// renderer derives the pass's remaining input (the inverse
+/// view-projection) per frame from the camera matrix it is already
+/// given — the caller supplies nothing per frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SkyFrame {
+    /// The gradient + disc palette (see [`crate::sky::SkyPalette`];
+    /// the day/night presets and `atmosphere_at` provide them).
+    pub palette: crate::sky::SkyPalette,
+    /// The direction TOWARD the celestial body (the sun by day, the
+    /// moon by night; the presets' light directions). The renderer
+    /// normalizes it (the CPU core's contract).
+    pub disc_dir: [f32; 3],
 }
 
 impl Renderer {
@@ -311,6 +332,7 @@ impl Renderer {
             atlas_text,
             instance_bytes: Vec::new(),
             proxy_draw_mode: ProxyDrawMode::default(),
+            sky: None,
         })
     }
 
@@ -394,6 +416,10 @@ impl Renderer {
             None,
             None,
             None,
+            // The sky layer is a corner-family feature (the sticky
+            // setting's documented scope); the general region path
+            // stays skyless.
+            None,
         )?;
         Ok(self.finish_frame(outcome))
     }
@@ -412,6 +438,7 @@ impl Renderer {
             ));
         }
         let params = vulkan::corner::FrameParams::new(*view_proj, eye, light);
+        let sky = self.sky_params(view_proj);
         let outcome = vulkan::render_frame(
             &mut self.ctx,
             &mut self.swapchain,
@@ -429,6 +456,7 @@ impl Renderer {
             Some(&params),
             None,
             None,
+            sky.as_ref(),
         )?;
         Ok(self.finish_frame(outcome))
     }
@@ -483,6 +511,7 @@ impl Renderer {
             vehicle_material: population.vehicle_material,
             mode: self.proxy_draw_mode,
         };
+        let sky = self.sky_params(view_proj);
         let outcome = vulkan::render_frame(
             &mut self.ctx,
             &mut self.swapchain,
@@ -500,6 +529,7 @@ impl Renderer {
             Some(&params),
             Some(&upload),
             None,
+            sky.as_ref(),
         )?;
         Ok(self.finish_frame(outcome))
     }
@@ -555,6 +585,7 @@ impl Renderer {
                 0.0,
             ],
         };
+        let sky = self.sky_params(view_proj);
         let outcome = vulkan::render_frame(
             &mut self.ctx,
             &mut self.swapchain,
@@ -572,6 +603,7 @@ impl Renderer {
             None,
             None,
             Some(&params),
+            sky.as_ref(),
         )?;
         Ok(self.finish_frame(outcome))
     }
@@ -586,6 +618,37 @@ impl Renderer {
     /// The current proxy submission mode.
     pub fn proxy_draw_mode(&self) -> ProxyDrawMode {
         self.proxy_draw_mode
+    }
+
+    /// Sets the Era-1 sky layer (the set_overlay_enabled precedent:
+    /// a sticky per-renderer setting). `Some` makes every subsequent
+    /// corner-family frame draw the sky pass FIRST — the fullscreen
+    /// triangle with NO depth interaction, so the scene's own
+    /// fragments are untouched and only the uncovered background
+    /// changes (the skyless path stays byte-identical). `None`
+    /// restores the skyless path (the state is lazily created either
+    /// way — the skyless allocation pins never move).
+    pub fn set_sky(&mut self, sky: Option<SkyFrame>) {
+        self.sky = sky;
+    }
+
+    /// The current sky setting.
+    pub fn sky(&self) -> Option<SkyFrame> {
+        self.sky
+    }
+
+    /// The sky pass's per-frame parameters from the sticky setting
+    /// and this frame's camera matrix (the CPU-computed inverse the
+    /// vertex shader reconstructs its ray from — `sky::mat4_inverse`,
+    /// the tested deterministic core).
+    fn sky_params(&self, view_proj: &[[f32; 4]; 4]) -> Option<vulkan::sky_draw::SkyFrameParams> {
+        self.sky.map(|frame| {
+            vulkan::sky_draw::SkyFrameParams::new(
+                crate::sky::mat4_inverse(view_proj),
+                frame.palette,
+                frame.disc_dir,
+            )
+        })
     }
 
     /// Requests the NEXT shadowed frame's shadow-map readback (the

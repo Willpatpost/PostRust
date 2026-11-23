@@ -70,6 +70,9 @@ Interactive modes
                                     pre-6-E shape for before/after runs)
   --corner --shadows                 The route with directional shadows (one
                                     cascade, the deterministic core's oracle)
+  --corner --sky                     The sky layer behind the scene (Era 1: the
+                                    atmosphere_at day/night palette + the sun or
+                                    moon disc; composes with every corner flag)
   --corner --free-look               Interactive WASD + mouse camera (Era 1's
                                     eyeball mode — presentation only, the camera
                                     never enters a measured claim; starts on the
@@ -532,6 +535,7 @@ fn main() {
             let mut proxy_reference = false;
             let mut proxy_instanced = false;
             let mut shadows = false;
+            let mut sky = false;
             let mut free_look = false;
             let mut free_look_frames: Option<u64> = None;
             let mut fps = 60;
@@ -553,6 +557,12 @@ fn main() {
                     // indirect submission.
                     "--proxy-instanced" => proxy_instanced = true,
                     "--shadows" => shadows = true,
+                    // Era 1 package 3: the sky layer behind the
+                    // scene (the atmosphere_at palette + the sun or
+                    // moon disc; composes with every other corner
+                    // flag — the eyeball form is --corner
+                    // --free-look --sky).
+                    "--sky" => sky = true,
                     // Era 1 package 1: the interactive eyeball
                     // camera (presentation only; the scripted
                     // measurement route is the default without it).
@@ -611,6 +621,7 @@ fn main() {
                 free_look.then_some(engine_slice::corner_demo::FreeLookOptions {
                     frames: free_look_frames,
                 }),
+                sky,
             )
         };
         if let Err(e) = run() {

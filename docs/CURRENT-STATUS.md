@@ -106,7 +106,13 @@ ARM64) with a five-job CI:
   out-of-bounds-reads-clear convention), the known-answer map
   readback, and the `--corner --shadows` route — all lazily created
   (the unshadowed path's allocation pins untouched, its renders
-  pixel-identical).
+  pixel-identical). The Era-1 **sky layer** (`--corner --sky`, the
+  sticky `set_sky` setting): the fullscreen-triangle sky pass drawn
+  first behind the scene with no depth interaction (`sky.wgsl`
+  mirroring `sky.rs`'s equation; the palette and disc direction from
+  `atmosphere_at`; the CPU-computed inverse view-projection driving
+  the ray reconstruction) — lazily created, and a fully-covered
+  frame stays byte-identical with the sky on and off.
 - **`engine-shell`** — the SDL3 application shell (statically-linked vendored
   SDL 3.4.18; real window + offscreen/dummy modes).
 - **`engine-slice`** — the integration/demo driver: the stdin CLI, `--window`,
