@@ -841,3 +841,116 @@
 //! sessions 3/4/6/7 measured records on the identical code tree
 //! (the docs-only proof above, re-verified). engine-core
 //! untouched; AGENTS.md untouched.
+
+//! ---
+
+//! ## SESSION 10 ADDENDUM — the SURVIVED.txt provenance closure,
+//! the process-level blocker proof, and the content-level body
+//! audit (2026-11-23, ~12:16 UTC)
+
+//! The tenth session re-probed the push blocker first: **unchanged**
+//! — and this session strengthened the proof from socket level to
+//! PROCESS level: code-server itself is still running (PID 111,
+//! `--auth none --port 13337`, its current instance began logging
+//! 04:59:46 UTC), but its process tree contains no extension host
+//! (`coder agent` PID 1 → code-server 111 → entry 133 → ptyHost 435
+//! → two terminal bash shells, PID 728 from 05:00:08 and PID 8943
+//! from 05:15:44 — nothing else). The vscode-git askpass sockets
+//! are served by the extension host; with no extension host process
+//! they cannot revive — the credential can only return with the
+//! owner's workbench session (which respawns it and a fresh socket;
+//! the watcher's newest-mtime glob, script line 118, picks that
+//! up). `git push --dry-run` exit 128, `remote: No anonymous write
+//! access`; anonymous read works, `origin/main` remains at `1fe89b7`
+//! with only the seven historical PR refs — no drift, no remote
+//! cycle6 branch, the watcher correctly never fired (its log:
+//! start lines only; no `~/PR-CREATED-*` markers; `~/OVERNIGHT-DONE`
+//! correctly absent).
+
+//! ### The chain delta, verified fresh (12:16 UTC, all MEASURED)
+
+//! The supervisor (PID 858, started 05:00:16, reparented to PID 1)
+//! and the hardened four-branch watcher (PID 442510, the 11:53:44Z
+//! form — the umask-077 askpass write at script line 71 and the
+//! newest-socket glob at line 118 verified present in the deployed
+//! copy) both alive; all four `~/push-handoff` payload bodies
+//! byte-identical to the canonical PR body files on the branch tips
+//! (`jq -j .body` vs `git show branch:file`, cmp clean —
+//! 23441/25041/22054/22637 bytes for 6-E/6-F/population/6-E2);
+//! every payload's title/head/base/draft re-parsed (the stack,
+//! draft true everywhere); the `/tmp/opencode` twins
+//! sha256-identical with the README pins holding (`4a66e281` 6-E /
+//! `b74cb5f5` 6-F / `1acdfc12` population / `eb660d12` 6-E2); the
+//! `wt-6e2` worktree clean at `fb8bfa2`; no askpass artifact
+//! anywhere; `engine-core` diff vs `main` ZERO files on all four
+//! branches (re-proven by diffstat); the main checkout clean except
+//! the untracked `SURVIVED.txt`; no stashes.
+
+//! ### The PR-body content audit (the check on top of session 9's
+//! byte-level check)
+
+//! Session 9 proved payload == branch body byte-for-byte; this
+//! session cross-checked the bodies' CONTENT against the run's
+//! measured records, headline by headline — all four consistent:
+//! 6-E (main 1142/2/33, release 65/2, heavy 570/10/58; the gate
+//! 13 vs 2 and the demo route 14 instances → 2 draws; ink 3,728;
+//! oracle walls 0/255 over 57,600 pixels), 6-F (main 1146/2/33,
+//! release 69/2, heavy 570/10/58; the known-answer 1,006,779
+//! compared / 41,797 edge-skipped / 0 mismatches / max |Δdepth|
+//! 2.68e-7; patches 0/255 and 1/255), population (main 1142/2/33,
+//! release 65/2, heavy 576/11/58; 26 instances in 2 draws; ink
+//! 3,728/2,745; validation 0/0), 6-E2 (main 1146, heavy 576/12/58;
+//! the three-way 26 == 2 == 2; the one-time device_memory 18 → 19;
+//! oracle walls 0/255). Every body carries its rig-command block
+//! (6/5/6/7 `cargo run --release` command lines — the 6-E brief's
+//! acceptance criterion 5). The delivery payloads are therefore
+//! verified at BOTH levels: byte-identity with the branches,
+//! number-consistency with the measurements.
+
+//! ### SURVIVED.txt — the provenance closed (read-only; the file
+//! untouched, as sessions 7 and 9 left it)
+
+//! The timeline, all UTC, from `stat` Birth and `ps` STARTED:
+
+//! | time | event |
+//! |---|---|
+//! | ~04:58 | pod boot (PID 1, the platform's `coder agent`, cwd `/tmp/coder.PpwUYa`) |
+//! | 04:58:35.143796 | **`SURVIVED.txt` born — empty, 0 data blocks, mtime == birth (never written since)** |
+//! | 04:59:30.616293 | its ctime bumped — a metadata-only inode operation, mtime unchanged |
+//! | 04:59:46 | code-server's current instance starts (logs dir `20261123T045946`) |
+//! | 05:00:08 | the earliest still-alive vscode terminal bash (PID 728) |
+//! | 05:00:16 | the overnight supervisor (PID 858, reparented to PID 1) |
+//! | 05:09 / 05:20 | the vscode-git askpass sockets (in-editor git usage) |
+//! | 06:04:30 | the first push watcher |
+
+//! The file therefore predates code-server, every interactive
+//! shell, and every process of the overnight run — **nothing in
+//! the run created it.** Corroborating negatives, all read-only:
+//! no boot script under `/etc`, `/usr/local/bin`, or `/opt`
+//! mentions it; the `coder agent` binary contains no such string
+//! (the only `SURVIV*` hit inside it is faker hobby data,
+//! "Survivalism"); `~/.bash_history` (146 lines, no timestamped
+//! entries) has no SURVIVED line; it is referenced by neither the
+//! supervisor nor either watcher copy nor any run document. The
+//! name reads as a boot-time survival marker from the platform
+//! side; the owner will recognize it. Left strictly alone — but
+//! the morning audit no longer meets an unexplained artifact: it
+//! meets a bounded one.
+
+//! ### Notes for the owner (session 10)
+
+//! `~/OVERNIGHT-DONE` remains correctly absent (the PRs do not
+//! exist; the honest form stands). This session's commit is
+//! documentation-only: this handoff doc — no `.rs`, no workflow,
+//! no pins, no PR-body change, so the payload regeneration is a
+//! proven no-op (the population payload re-verified byte-identical
+//! to the unchanged body after this commit, sha256 `1acdfc12`).
+//! Gates for this commit: `cargo fmt --all -- --check` clean and
+//! `cargo clippy --workspace --all-targets --release -- -D
+//! warnings` clean, run on this tip; the full suites are the
+//! sessions 3/4/6/7 measured records on the identical code tree
+//! (the docs-only proof: `5c9690d`..this tip lists only this doc
+//! and `docs/PR-BODY-CORNER-POPULATION.md`). engine-core untouched;
+//! AGENTS.md untouched. The morning commands stand unchanged (the
+//! watcher performs the whole delivery from the same canonical
+//! bytes the moment a credential returns).
