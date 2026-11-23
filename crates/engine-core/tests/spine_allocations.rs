@@ -41,18 +41,30 @@
 //! bytes) and windows-latest locally (reproduced once in 1000 runs:
 //! run-1 WARM inflated +4 events/+900 bytes). Both times the
 //! compared runs are byte-identical code on byte-identical fresh
-//! state, so deterministic engine code cannot be the difference;
-//! the signature (random window, random count, first-scenario only)
-//! is FOREIGN-thread runtime activity landing inside the open
-//! process-wide window. The corrective: the hook counts only
-//! allocations made by the thread that opened the window (a
-//! const-init thread-local flag — allocation-free to read, no lazy
-//! machinery). This extends the attribution discipline above from
-//! "every counted allocation is engine-side" to "every counted
-//! allocation is engine-side AND on the executing thread". The pin
-//! values are UNCHANGED — the attributed baseline measures the same
-//! (18, 6880) / (9, 3024), because engine-side work all runs on
-//! the measuring thread.
+//! state, so deterministic engine code cannot be the difference.
+//! THE CULPRIT, caught by an instrumented out-of-tree probe (per-
+//! event layout recording, thread attribution, and a reentrancy-
+//! guarded one-shot backtrace captured on the first foreign event;
+//! one hit in 2500 process runs): the foreign thread is libtest's
+//! MAIN thread, and the allocations are the std mpmc receiver's
+//! waker registration — `std::sync::mpmc::waker::Waker::register`
+//! growing its `Vec<Entry>` inside `list::Channel::recv` while the
+//! main thread awaits the test's completion (the captured stack:
+//! `raw_vec::grow_one` → `waker::register` → `Channel::recv` →
+//! `test::run_tests`). The waker's entry list grows lazily during
+//! the early run — which is exactly why both observed failures
+//! inflated a FIRST-scenario window, and why the event count and
+//! byte total vary randomly (the ~288-byte waker packet plus small
+//! Vec grows). The corrective: the hook counts only allocations
+//! made by the thread that opened the window (a const-init
+//! thread-local flag — allocation-free to read, no lazy machinery).
+//! This extends the attribution discipline above from "every
+//! counted allocation is engine-side" to "every counted allocation
+//! is engine-side AND on the executing thread". The pin values are
+//! UNCHANGED — the attributed baseline measures the same (18, 6880)
+//! / (9, 3024), because engine-side work all runs on the measuring
+//! thread; 5000 runs of the fixed binary were clean against the
+//! unfixed binary's 1-in-1000 rate.
 //!
 //! WAVE EQUIVALENCE (the review's first correction): every wave is
 //! scheduled CLOCK-RELATIVE (offsets +1 and +5 from
