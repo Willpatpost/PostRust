@@ -476,18 +476,22 @@
 //! updated; the regeneration script was first proven a
 //! byte-identical no-op on the unchanged body).
 //!
-//! ### The remaining second-run gaps (recorded for the next
-//! sessions)
+//! ### The remaining second-run gaps (recorded, then closed later
+//! this same session)
 //!
-//! The same heavy-shard gap class exists on the other three
-//! branches (each has session 3's direct run only,
+//! The same heavy-shard gap class existed on the other three
+//! branches (each had session 3's direct run only,
 //! pre-clean-discipline): 6-E `570/10/58`, 6-F `570/10/58`, 6-E2
-//! `576/12/58`. Their main shards have session 4's direct
+//! `576/12/58`. Their main shards had session 4's direct
 //! clean-environment confirmations, and the merge-dry-run /
 //! four-way-union passes gated the RESOLVED combined trees (heavy
 //! `576/12/59` and `576/13/59` there) — adjacent evidence, not a
-//! substitute for each branch's own pin. A session with idle time
-//! should close them the same way (clean shell, the workflow's
-//! awk, the branch's own tip) and append the numbers to each
-//! branch's body file — never new scope, no code changes, payloads
-//! regenerated after.
+//! substitute for each branch's own pin. **Session 6 closed all
+//! three in the same pass that closed this branch's gaps** (clean
+//! shell, the workflow's awk, each branch's own tip): 6-E heavy
+//! MEASURED `570/10/58` rc=0, 6-F heavy MEASURED `570/10/58` rc=0,
+//! 6-E2 heavy MEASURED `576/12/58` rc=0 — every branch's own
+//! session-6 addendum and PR-body section carries its table, its
+//! payload regenerated after. Every branch's every pinned shard
+//! now has at least two direct measurements, at least one in a
+//! clean environment.
