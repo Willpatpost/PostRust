@@ -124,6 +124,11 @@ pub(crate) struct PostFrameInputs<'a> {
     pub proxy_sets: Option<[vk::DescriptorSet; 2]>,
     pub shadowed: Option<&'a ShadowFrameParams>,
     pub sky: Option<&'a SkyFrameParams>,
+    /// The Era-1 wet reflection's ground re-draw lands inside THIS
+    /// pass (the HDR one) after the mesh draws — the frame flow's
+    /// mirrored-scene pass and barrier already preceded the scene
+    /// pass; the belt check keeps a dry frame off it.
+    pub wet: bool,
 }
 
 /// The extent-bound half of the post state: the per-slot HDR and
@@ -945,6 +950,13 @@ impl PostResources {
         .map(|pipelines| pipelines[0])
     }
 
+    /// The HDR scene render pass object (the wet reflection's pass
+    /// rides it — the attachment descriptions are identical, so the
+    /// reflection framebuffers bind this pass directly).
+    pub(super) fn hdr_render_pass(&self) -> vk::RenderPass {
+        self.hdr_pass
+    }
+
     /// Builds (or rebuilds) the extent-bound target bundle when the
     /// swapchain's extent or view set changed — a no-op when they
     /// match. SAFETY ARGUMENT (the rebuild proof): the extent and
@@ -1159,6 +1171,22 @@ impl PostResources {
                     );
                     proxy_calls = recorded;
                 }
+            }
+            // The Era-1 wet reflection's ground re-draw (package 7):
+            // inside the HDR scene pass, after the mesh draws — the
+            // ground quad re-rasterized (EQUAL depth) with the
+            // reflection sampled at the same screen position and the
+            // Schlick blend on the alpha stage. The mirrored-scene
+            // pass and its barrier preceded this pass (the frame
+            // flow's recording order).
+            // SAFETY: the command buffer is inside the HDR scene
+            // pass, past the mesh draws; this slot's corner
+            // FrameParams region holds the true camera (the frame
+            // flow's write).
+            if inputs.wet
+                && let (Some(reflection_state), Some(corner)) = (&pipes.reflection, &ctx.corner)
+            {
+                reflection_state.record_ground_redraw(ctx, corner, cmd, slot, true);
             }
             ctx.device.cmd_end_render_pass(cmd);
         }

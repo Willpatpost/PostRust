@@ -109,6 +109,8 @@ pub mod descriptors;
 pub(crate) mod post_draw;
 #[path = "proxy_draw.rs"]
 pub(crate) mod proxy_draw;
+#[path = "reflection_draw.rs"]
+pub(crate) mod reflection_draw;
 #[path = "shadow_draw.rs"]
 pub(crate) mod shadow_draw;
 #[path = "sky_draw.rs"]
@@ -1439,6 +1441,15 @@ pub(crate) struct PipelineState {
     /// replacement re-ensures an identical set before installation
     /// (finding A).
     pub post: Option<post_draw::PostResources>,
+    /// The Era-1 wet-ground reflection state (the mirrored-scene
+    /// pass + the ground re-draw), created LAZILY at the first wet
+    /// frame — the same discipline: the dry path pays nothing and
+    /// stays byte-identical. Depends on the POST STATE'S HDR RENDER
+    /// PASS OBJECT (the reflection pass is render-pass-compatible
+    /// with it — the identical attachment descriptions), so a wet
+    /// renderer always carries the post state; the post CHAIN
+    /// itself stays optional.
+    pub reflection: Option<reflection_draw::ReflectionResources>,
     /// Per-slot vertex capacity of the dynamic region-scene buffer
     /// (Stage 4 graphical integration — the same disjoint per-slot
     /// pattern as the overlay).
@@ -1487,6 +1498,7 @@ impl PipelineState {
             shadows: None,
             sky: None,
             post: None,
+            reflection: None,
         };
         if let Err(error) = state.build(ctx, color_format, depth_format, demo_scene) {
             state.destroy(ctx);
@@ -1649,6 +1661,36 @@ impl PipelineState {
             depth_format,
             self.lit_layout,
             self.proxy_layout,
+        )?);
+        Ok(())
+    }
+
+    /// Allocates the Era-1 wet-ground reflection state on the first
+    /// wet frame (the same lazy discipline: the dry path pays
+    /// nothing and stays byte-identical). The reflection pass rides
+    /// the POST STATE'S HDR RENDER PASS — a wet renderer always
+    /// carries the post state (the pass object), whether or not
+    /// the post chain itself runs.
+    pub(crate) fn ensure_reflection_resources(
+        &mut self,
+        ctx: &VulkanContext,
+    ) -> Result<(), RendererError> {
+        if self.reflection.is_some() {
+            return Ok(());
+        }
+        let corner = ctx.corner.as_ref().ok_or_else(|| {
+            RendererError::Vulkan("the wet reflection requires the Corner scene preference".into())
+        })?;
+        let post = self.post.as_ref().ok_or_else(|| {
+            RendererError::Vulkan(
+                "the wet reflection requires the post state's HDR render pass".into(),
+            )
+        })?;
+        self.reflection = Some(reflection_draw::ReflectionResources::new(
+            ctx,
+            corner,
+            post.hdr_render_pass(),
+            self.render_pass,
         )?);
         Ok(())
     }
@@ -2116,6 +2158,9 @@ impl PipelineState {
             }
             if let Some(post) = self.post.take() {
                 post.destroy(ctx);
+            }
+            if let Some(reflection) = self.reflection.take() {
+                reflection.destroy(ctx);
             }
             if !self.region_mapped.is_null() {
                 ctx.device.unmap_memory(self.region_vbo_memory);
@@ -3044,7 +3089,9 @@ pub(crate) struct FrameOutcome {
 // The Era-1 sky pass rides the same flat list (the one-Option-per-layer
 // shape; the sky is a layer like the shadowed one, drawn first when
 // present). The Era-1 post chain rides it as ONE bool (the chain has no
-// per-frame data at all — its only uniform is extent-static).
+// per-frame data at all — its only uniform is extent-static), and the
+// wet reflection as ONE Option (the camera description its mirrored
+// math consumes; None keeps the dry path).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_frame(
     ctx: &mut VulkanContext,
@@ -3065,6 +3112,7 @@ pub(crate) fn render_frame(
     shadowed: Option<&shadow_draw::ShadowFrameParams>,
     sky: Option<&sky_draw::SkyFrameParams>,
     post: bool,
+    wet: Option<&reflection_draw::WetCamera>,
 ) -> Result<FrameOutcome, RendererError> {
     let mut outcome = FrameOutcome::default();
     let slot = frames.frame_slot;
@@ -3201,6 +3249,16 @@ pub(crate) fn render_frame(
             let layout = sky_state.set_and_layout().1;
             post_state.ensure_sky_hdr(ctx, layout)?;
         }
+    }
+
+    // The Era-1 lazy wet-reflection state (the same discipline): a
+    // wet renderer always carries the post state (the reflection
+    // pass rides its HDR render pass object) — ensured ABOVE the
+    // post chain's own ensure so the pass exists; the chain itself
+    // stays optional.
+    if wet.is_some() {
+        pipes.ensure_post_resources(ctx, swapchain.format, swapchain.depth_format)?;
+        pipes.ensure_reflection_resources(ctx)?;
     }
 
     // A previous present reported suboptimal — recreate before drawing
@@ -3473,6 +3531,23 @@ pub(crate) fn render_frame(
         post_state.ensure_targets(ctx, extent, &swapchain.views)?;
     }
 
+    // The wet reflection's extent-bound targets: ensured beside the
+    // post targets (the same post-acquire point — the live extent
+    // and the HDR pass object; the corner preference is structural
+    // for a wet frame).
+    if wet.is_some()
+        && let (Some(post_state), Some(reflection_state), Some(corner)) =
+            (&pipes.post, &mut pipes.reflection, ctx.corner.as_ref())
+    {
+        reflection_state.ensure_targets(
+            ctx,
+            extent,
+            corner,
+            post_state.hdr_render_pass(),
+            swapchain.views.first().copied().unwrap_or_default(),
+        )?;
+    }
+
     unsafe {
         ctx.device
             .begin_command_buffer(
@@ -3505,6 +3580,36 @@ pub(crate) fn render_frame(
             shadow_state.record_depth_pass(ctx, command, corner, slot);
         }
 
+        // The Era-1 wet reflection's mirrored-scene pass (package 7)
+        // — recorded BEFORE the scene pass: the mirrored world
+        // rendered into this slot's offscreen target (the world-
+        // mirror construction, planar.rs's matrix), then the
+        // barrier ordering its writes before the ground re-draw's
+        // fragment reads inside the scene pass that follows. The
+        // ground re-draw itself lands INSIDE whichever scene pass
+        // runs (the post branch's or the main one's), after the
+        // mesh draws.
+        if let (Some(corner), Some(reflection_state), Some(post_state), Some(camera)) =
+            (&ctx.corner, &pipes.reflection, &pipes.post, wet)
+        {
+            // SAFETY: this slot's fence wait passed above (the
+            // mirrored params region is disjoint per slot); the
+            // command buffer is recording, before the scene pass;
+            // the targets were ensured against the live extent and
+            // this same HDR pass object after the acquire.
+            reflection_state.write_frame(slot, camera);
+            reflection_state.record_reflection_pass(
+                ctx,
+                corner,
+                command,
+                post_state.hdr_render_pass(),
+                slot,
+                extent,
+                clear_color,
+            );
+            reflection_state.record_read_barrier(ctx, command, slot);
+        }
+
         // The Era-1 post chain (package 6): a post frame REPLACES
         // the main render pass with the HDR chain — the scene pass
         // into the offscreen R16G16B16A16 target, the bloom mips,
@@ -3525,6 +3630,7 @@ pub(crate) fn render_frame(
                 proxy_sets,
                 shadowed,
                 sky,
+                wet: wet.is_some(),
             };
             // SAFETY: the command buffer is recording past the
             // shadow depth pass; this slot's fence wait passed (the
@@ -3719,6 +3825,26 @@ pub(crate) fn render_frame(
                     &[],
                 );
                 ctx.device.cmd_draw(command, outcome.overlay.drawn, 1, 0, 0);
+            }
+
+            // The Era-1 wet reflection's ground re-draw (package 7):
+            // inside the MAIN render pass, after the mesh draws —
+            // the ground quad re-rasterized (EQUAL depth) with the
+            // reflection sampled at the same screen position and
+            // the Schlick blend on the alpha stage. The mirrored-
+            // scene pass and its barrier preceded this pass (the
+            // frame flow's recording order, above the post branch).
+            // SAFETY: the command buffer is inside the main render
+            // pass, past the mesh draws; this slot's corner
+            // FrameParams region holds the true camera (the frame
+            // flow's write).
+            if wet.is_some()
+                && let (Some(reflection_state), Some(corner)) = (&pipes.reflection, &ctx.corner)
+            {
+                // SAFETY: the outer recording block's contract (the
+                // command buffer records inside the main render
+                // pass, past the mesh draws).
+                reflection_state.record_ground_redraw(ctx, corner, command, slot, false);
             }
 
             ctx.device.cmd_end_render_pass(command);

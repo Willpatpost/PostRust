@@ -292,6 +292,7 @@ pub fn run(
     sky: bool,
     day_night: Option<f32>,
     post: bool,
+    wet: bool,
 ) -> Result<(), String> {
     let mut app = ShellApp::new(ShellConfig {
         title: "One Corner of the City".into(),
@@ -350,6 +351,20 @@ pub fn run(
     // feeder the gate pins); the region path stays postless (the
     // setting's documented scope).
     renderer.set_post(post);
+    // Era 1 package 7: the wet-ground reflection (the sticky
+    // renderer setting — the mirrored scene into the offscreen
+    // target, the ground re-drawn Schlick-blended). Composes with
+    // every corner flag; the mirrored scene is the building masses
+    // (the sky and the proxies are the documented follow-ups).
+    renderer.set_wet(wet);
+    if wet {
+        println!(
+            "wet ground: the planar reflection (the mirrored scene about y={}, the ground \
+             re-drawn Schlick-blended, r0 {})",
+            engine_renderer::lit_scene::GROUND_Y,
+            engine_renderer::planar::REFLECTION_R0
+        );
+    }
     if post {
         println!(
             "post: the HDR chain (R16G16B16A16_SFLOAT scene target -> 1/{} bloom mips -> the \
