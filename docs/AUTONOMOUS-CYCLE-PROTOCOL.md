@@ -145,6 +145,26 @@ an owner who can GO quickly.
   in the open PRs (more samples, tighter assertions, better
   documentation) — not new scope.
 
+### 5.1 The diminishing-returns stop rule (the 2026-11-23 postmortem)
+
+"Improve the weakest evidence" has a FLOOR. If the ladder is
+complete, every PR is green, and the remaining improvements are
+re-measurements of already-triple-verified gates or documentation
+polish beyond what a PR body needs — create the DONE marker and
+stop. A night that finishes early and idles is a SUCCESS; a night
+that spins re-verification loops is a failure mode. Concretely: no
+gate gets re-run more than twice on the same tree; no doc gets more
+than one post-completion revision; when in doubt, DONE.
+
+### 5.2 Push as you go (the 2026-11-23 postmortem)
+
+Never stage a delivery. The moment a package compiles and its gates
+pass locally, push its branch and open the draft PR — CI judges it
+overnight, and the owner merges plain green PRs in the morning. No
+push watchers, no handoff kits, no payload twins. If pushing fails
+on credentials, park the package, document the blocker on the
+branch (a commit message), and continue with the next package.
+
 ---
 
 *This protocol binds autonomous runs. It does not change any

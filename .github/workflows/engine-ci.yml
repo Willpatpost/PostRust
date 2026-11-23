@@ -334,8 +334,8 @@ jobs:
           # IEEE). The combined tree carries ALL THREE additions:
           # Linux 1154 = 1138 + 4 (6-E) + 4 (6-E2) + 8 (6-F);
           # Windows 1103 = 1087 + the same 16.
-          expected=1154
-          if [ "$(uname -s)" != "Linux" ]; then expected=1103; fi
+          expected=1173
+          if [ "$(uname -s)" != "Linux" ]; then expected=1122; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -370,8 +370,8 @@ jobs:
           # Cycle 6-F: +8 shadow-core tests (the same +8 as the main
           # shard, platform-uniform). The combined tree carries ALL
           # THREE additions: 61 + 4 + 4 + 8 = 77.
-          echo "renderer release: $passed passed, $results test-result lines (expected 77 / 2)"
-          [ "$passed" -eq 77 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 77"; exit 1; }
+          echo "renderer release: $passed passed, $results test-result lines (expected 96 / 2)"
+          [ "$passed" -eq 96 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 96"; exit 1; }
           [ "$results" -eq 2 ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != 2"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production
