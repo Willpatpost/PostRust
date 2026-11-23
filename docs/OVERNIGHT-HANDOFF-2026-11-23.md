@@ -15,6 +15,13 @@
 //! whole delivery from the same bytes the moment a credential
 //! returns.)
 //!
+//! (Second navigation note, added by the fifteenth session:
+//! session 14's "live-but-empty askpass" finding below is a
+//! misrecord, corrected by direct measurement in the SESSION 15
+//! ADDENDUM — the sockets were dead then as now, the extension
+//! host never returned; nothing about the blocker or the morning
+//! paths changed.)
+//!
 //! ## What exists (the whole ladder, complete)
 //!
 //! Four packages, four branches, one commit each (plus this
@@ -1419,4 +1426,184 @@
 //! branches, the merge-morning tree's code subset unchanged —
 //! the morning push has no known failure mode left except the
 //! credential itself.
+
+//! ---
+
+//! ## SESSION 15 ADDENDUM — the session-14 askpass corrective
+//! (measured, reproducible), the substrate audit on the FINAL
+//! tips, and the linchpin's first direct run on the final tip
+//! (2026-11-23, 13:18 UTC onward)
+
+//! The fifteenth session re-probed the push blocker first:
+//! **unchanged** (both `/tmp/vscode-git-*.sock` sockets dead —
+//! raw AF_UNIX connect ConnectionRefused on both; `git push
+//! --dry-run` exit 128, `remote: No anonymous write access`;
+//! anonymous read works, `origin/main` remains at `1fe89b7`
+//! with exactly one remote branch — no drift, no cycle6 branch
+//! ever leaked, the watcher correctly never fired; no `gh`, no
+//! write credential of any form; the supervisor PID 858 and the
+//! hardened four-branch watcher PID 442510 both alive, the
+//! watcher log start-lines-only).
+
+//! ### THE CORRECTIVE — session 14's "live-but-empty" askpass
+//! finding was a misrecord (measured this session, reproducible
+//! on demand)
+
+//! Session 14's addendum claims "the askpass sockets are alive
+//! again — but empty... the extension host is back (the sockets
+//! respond to `git credential fill` with rc=0 instead of a
+//! dead-pipe error), yet the response is an EMPTY `password=`
+//! line." Direct measurement shows that exact observable —
+//! rc=0 plus a zero-length `password=` line — is the
+//! **DEAD-socket signature**:
+
+//! - **The transcript** (`~/verify11-session15/fill-transcript.*`
+//!   within `chain-audit-session15.log`, check 1c): against the
+//!   refused socket `44eae31ccd`, `git credential fill` returns
+//!   rc=0 with stdout `protocol=https` / `host=github.com` /
+//!   `username=146898928` / `password=` (zero length, cat -A
+//!   pinned) and stderr `Missing or invalid credentials.` +
+//!   `Error: connect ECONNREFUSED /tmp/vscode-git-…sock`.
+//! - **The mechanism**: `askpass.sh` runs `askpass-main.js`
+//!   under node with a mktemp pipe and `cat`s whatever node
+//!   leaves there; on ECONNREFUSED node prints the error to
+//!   stderr, leaves the pipe EMPTY, and exits 0 — and git
+//!   accepts empty askpass output as an empty password. Every
+//!   stale-socket fill therefore LOOKS like "rc=0, empty
+//!   password"; that probe alone cannot distinguish a dead
+//!   socket from a live host with no GitHub auth. The
+//!   discriminators are the raw connect and the fill's stderr.
+//! - **The independent proof no host existed at 13:14**: the
+//!   code-server `remoteagent.log` records the last extension
+//!   host launched 05:20:33 and exited 05:22:24 ("The client
+//!   has disconnected gracefully" / "Extension Host Process
+//!   exited with code: 0"); ZERO code-server log files are
+//!   newer than 06:00 UTC; no `extensionHost` process exists;
+//!   and both socket files are the 05:09 (exthost6) and 05:20
+//!   (exthost13) era files, stale since their hosts exited. A
+//!   host that never launched cannot have answered session
+//!   14's probe.
+//! - **What actually happened in session 14's first audit run**:
+//!   its `grep -c '^password='` counted the zero-length line the
+//!   DEAD socket produced and flagged "a live askpass socket
+//!   exists"; the harness lesson then rationalized it with
+//!   inverted causality ("the askpass responds with a
+//!   zero-length `password=` line when the extension host is
+//!   alive but unauthenticated" — the zero-length line is the
+//!   dead-socket behavior). Session 14's own corrected re-run
+//!   got it right in its log ("both askpass sockets dead") —
+//!   the addendum prose overrode the measured line. This
+//!   corrects the prose; the corrected script's verdict stands.
+//! - **The watcher was never at risk**: its guard is token
+//!   length > 20, and the dead-socket token measures 0 on both
+//!   sockets (check 1b: raw connect refused, fill stderr
+//!   ECONNREFUSED, `token_len=0`, on both). The delivery
+//!   machinery never had a misfire window.
+//! - **The morning advice survives for the right reason**:
+//!   signing into GitHub inside a LIVE code-server workbench
+//!   session remains a valid morning path — because that
+//!   session spawns a FRESH extension host and fresh socket
+//!   (which the watcher's newest-mtime glob picks up) carrying
+//!   a real token — not because any host was "already back."
+//!   The blocker statement reverts to the session-10 form: the
+//!   credential can only arrive with the owner's workbench
+//!   session.
+//! - **The audit check is strengthened for every future
+//!   session**: the session-15 probe uses the raw AF_UNIX
+//!   connect AND the fill's stderr (ECONNREFUSED = dead) AND
+//!   the watcher's own >20-char guard — three discriminators
+//!   where session 14's had one ambiguous one
+//!   (`~/verify11-session15/chain-audit-session15.sh`, checks
+//!   1b–1d; expectations pinned, a mismatch a finding).
+
+//! ### The substrate audit on the FINAL tips (the gap this
+//! session closed)
+
+//! Session 14's fsck/chain audit ran on the pre-final-commit
+//! tips (population at `05d0b40`; its addendum commit `58cbd9b`
+//! landed after — visible in the fsck count itself: 232 loose
+//! objects now vs 228 then, the +4 being that commit's
+//! objects). The session-15 audit re-ran the whole battery on
+//! the final tips, ALL GREEN, exit 0
+//! (`~/verify11-session15/chain-audit-session15.log`):
+
+//! - the four tips at `1c50065` / `980e432` / `58cbd9b` /
+//!   `f29a22a`; the merge bases as censused (population↔6-E
+//!   `511b157`, 6-E2↔population `5c9690d`, 6-F off the
+//!   scaffold-merge line `1fe89b7`);
+//! - `git fsck --full --strict` clean on `~/PostRust` (zero
+//!   notices of any kind, in-pack 4,763); the merge-morning
+//!   clone and the rehearsal clone corruption-free (19 + 3
+//!   dangling notices, the kit's unreachable scratch objects —
+//!   harmless);
+//! - all four `~/push-handoff` payloads byte-identical to the
+//!   canonical PR-body files on the branch tips (sha
+//!   `a90cc2fd` / `1b91fdcb` / `161c2ca9` / `81385ae`; body
+//!   sizes 26,319 / 28,027 / 25,071 / 26,026 bytes — sessions
+//!   12/13's recorded numbers, re-measured) and the
+//!   `/tmp/opencode` twins sha-identical; the stack parsed
+//!   (6-E→main, 6-F→main, population→6-E, 6-E2→population,
+//!   draft everywhere);
+//! - `engine-core` zero-diff on all four branches; the
+//!   merge-morning clone clean at `3dfd5c6` (the kit's union
+//!   of the final tips; merge steps' second parents `58cbd9b`
+//!   / `f29a22a` / `980e432`) with its code subset vs the
+//!   gated tree `f02ddef` exactly zero files;
+//! - the persistent twins intact (session-13 battery logs
+//!   sha-tree identical; the 57-file `~/tmp-opencode-mirror`;
+//!   session-14's audit artifacts present); the machinery
+//!   census green (supervisor + watcher alive, no PR markers,
+//!   `~/OVERNIGHT-DONE` and `~/OVERNIGHT-STOP` correctly
+//!   absent, `SURVIVED.txt` untouched — session 10's bound
+//!   stands — and the working tree clean apart from it).
+
+//! ### The linchpin's first direct run on the FINAL tip
+
+//! The population branch's graphical linchpin had three direct
+//! measurements, all on pre-final-tip trees (sessions 3/6 on
+//! earlier tips; the union batteries on the merged trees), with
+//! the docs-only proof carrying them to `58cbd9b`. Session 15
+//! ran the gate directly on the exact final tip the watcher
+//! will push
+//! (`~/verify11-session15/render-instanced-session15.log`,
+//! lavapipe, rc=0, 2 passed):
+
+//! - **the full 24+2 table**: 26 instances (24 npc / 2 vehicle),
+//!   per-object 26 draws == instanced 2 draws, byte-equal
+//!   frames, ink 2,745/65,536, warmed `device_memory` 18 with
+//!   zero per-frame allocation across warmed frames;
+//! - **the 13-instance fixture**: 13 == 2 draws, byte-equal,
+//!   ink 3,728/65,536, both single-instance oracle walls 0/255
+//!   over 57,600 pixels, the pipeline-replacement lifecycle
+//!   `device_memory` 18 → 38 (delta 20).
+
+//! Every pinned line is IDENTICAL to the prior records — the
+//! determinism contract witnessed on the exact tree the
+//! morning push delivers; the linchpin's fourth direct
+//! confirmation and its first on the final tip.
+
+//! ### The closing loop on this session's own commit
+
+//! Documentation only (this doc; no `.rs`, no workflow, no
+//! pins — the PR-body file is UNCHANGED, so the payload
+//! regeneration stays a proven no-op). Gates for this commit:
+//! `cargo fmt --all -- --check` clean and `cargo clippy
+//! --workspace --all-targets --release -- -D warnings` clean on
+//! the tip. After the commit: the merge kit re-executed on the
+//! post-commit tips (the union doc gains this section; the
+//! code-subset check against `f02ddef` must stay zero files),
+//! and the population payload re-verified byte-identical to the
+//! unchanged PR body.
+
+//! ### Notes for the owner (session 15)
+
+//! `~/OVERNIGHT-DONE` remains correctly absent (the PRs do not
+//! exist; the honest form stands). The morning commands stand
+//! unchanged — and read session 14's "live-but-empty" paragraph
+//! together with this corrective: the sockets were dead then as
+//! now; the one-action blocker statement and every delivery
+//! path are exactly as the v1.0 header describes. Signing into
+//! GitHub inside a live code-server workbench session remains
+//! sufficient for the watcher to fire — when such a session
+//! actually exists.
 
