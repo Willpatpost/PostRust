@@ -1756,3 +1756,117 @@
 //! the whole delivery from the canonical bytes, and those bytes
 //! are now proven reconstructible from the repository itself.
 
+//! ---
+
+//! ## SESSION 18 ADDENDUM — the linchpin-on-final-tips asymmetry
+//! closed uniformly (2026-11-23, 13:52–13:58 UTC)
+
+//! The eighteenth session re-probed the push blocker first:
+//! **unchanged** (both `/tmp/vscode-git-*.sock` sockets dead by
+//! the three session-15 discriminators — the raw AF_UNIX connect
+//! refused on both, `git push --dry-run` exit 128, `remote: No
+//! anonymous write access`; no extension host in code-server's
+//! process tree, so no fresh socket can appear before the owner's
+//! workbench session returns; anonymous read works, `origin/main`
+//! remains at `1fe89b7` with exactly one remote branch — no
+//! drift, no cycle6 branch ever leaked; no `gh`, no write
+//! credential of any form; the supervisor PID 858 and the hardened
+//! four-branch watcher PID 442510 both alive, the watcher log
+//! start-lines-only — correctly never fired; no `~/PR-CREATED-*`
+//! markers; `~/OVERNIGHT-DONE` and `~/OVERNIGHT-STOP` correctly
+//! absent; `SURVIVED.txt` untouched — session 10's bound stands).
+
+//! ### The gap this session closed — session 15's final-tip
+//! standard, applied to the three siblings
+
+//! Session 15 ran the population branch's graphical linchpin
+//! directly on its final tip ("the linchpin's fourth direct
+//! confirmation and its first on the final tip") — but the three
+//! sibling branches' latest DIRECT linchpin runs were their
+//! session-7 runs, recorded by the session-7 commits (`5cee5b4`
+//! 6-E / `f0c83e1` 6-F / `fb8bfa2` 6-E2), which sit one
+//! documentation commit (the session-11 census refresh) behind
+//! the final tips the watcher will push (`1c50065` / `980e432` /
+//! `f29a22a`) — carried since by the docs-only proof alone. The
+//! population linchpin's latest direct run (session 15, on
+//! `58cbd9b`) was likewise four doc commits behind the session-18
+//! entry tip `0abb5a5`. Session 18 closed the asymmetry the
+//! session-15 way, uniformly: **every branch's linchpin gate run
+//! DIRECTLY on the session-18 entry tips, one battery, every
+//! pinned evidence line checked against the session-7/15 raw
+//! records.** The battery script:
+//! `~/verify14-session18/linchpin-battery-session18.sh`
+//! (expectations pinned, a mismatch a finding, never an
+//! adjustment; entry and exit state checked — tips, both worktrees
+//! clean, the remote undrifted, the machinery alive; the checkouts
+//! move only the main repo's working tree between existing tips,
+//! a trap restoring the population checkout on every exit path;
+//! the 6-E2 gate ran in the standing `wt-6e2` worktree, verified
+//! clean before and after).
+
+//! ### The battery (all MEASURED this session, 13:52:47–13:53:08
+//! UTC, lavapipe, the lavapipe variables scoped to the gate
+//! commands only; warm cache — the code bytes are identical
+//! across the tips, so every gate rebuilt in seconds)
+
+//! - **6-E** on `1c50065` (its first direct run on the final tip):
+//!   `render_instanced` 1 passed, rc=0 — the 13-instance fixture,
+//!   per-object 13 == instanced 2 draws, byte-equal frames, ink
+//!   3,728/65,536, both single-instance oracle walls 0/255 over
+//!   57,600 pixels, warmed `device_memory` 18, the pipeline
+//!   replacement lifecycle 18 → 38 (delta 20).
+//! - **6-F** on `980e432` (its first direct run on the final tip):
+//!   `render_shadows` 1 passed, rc=0 — the depth known-answer
+//!   1,006,779 compared / 41,797 edge-skipped (3.99%) / 0
+//!   mismatches / max |Δdepth| 2.68e-7, identical after
+//!   replacement; 536,888/1,048,576 shadowed texels; the shadowed
+//!   patch 0/255 and the lit patch 1/255; 65,536/65,536 frame
+//!   pixels changed by the shadow; warmed `device_memory` 17.
+//! - **population** on `0abb5a5` (its FIFTH direct confirmation on
+//!   a branch tip, the first on this tip): `render_instanced`
+//!   2 passed, rc=0 — the full 24+2 table (26 == 2 draws,
+//!   byte-equal, ink 2,745, warmed `device_memory` 18 constant
+//!   across warmed frames) and the 13-instance fixture (13 == 2,
+//!   ink 3,728, oracles 0/255, replacement 18 → 38).
+//! - **6-E2** on `f29a22a` (its first direct run on the final tip):
+//!   `render_instanced` 3 passed, rc=0 — the three-way per-object
+//!   26 == direct 2 == indirect 2 draws, byte-equal frames; the
+//!   one-time `device_memory` 18 → 19; the indirect-path warmed
+//!   19; the replacement 19 → 41 (delta 22); ink 2,745 and 3,728;
+//!   the oracle walls 0/255.
+
+//! Every pinned line is IDENTICAL to the session-7/15 records —
+//! the determinism contract now witnessed, for every branch, on
+//! the exact tip the morning push delivers. Every branch's
+//! linchpin stands at four direct branch-tip measurements
+//! (population: five), besides the two union-battery runs
+//! (sessions 12/13) on trees carrying the same code bytes. Raw
+//! logs born persistent: `~/verify14-session18/`.
+
+//! ### The closing loop on this session's own commit
+
+//! Documentation only (this doc; no `.rs`, no workflow, no pins —
+//! the PR-body file is UNCHANGED, so the payload regeneration
+//! stays a proven no-op). Gates for the commit: `cargo fmt --all
+//! -- --check` clean and `cargo clippy --workspace --all-targets
+//! --release -- -D warnings` clean (4.74 s), run on the tip
+//! before the commit. After the commit: the merge kit
+//! re-executed on the post-commit tips (the union doc gains this
+//! section; the code-subset check against `f02ddef` must stay
+//! zero files), and all four payloads re-verified byte-identical
+//! to their branch bodies — the kit README carries the run
+//! record.
+
+//! ### Notes for the owner (session 18)
+
+//! `~/OVERNIGHT-DONE` remains correctly absent (the PRs do not
+//! exist; the honest form stands). The morning commands stand
+//! unchanged — the watcher performs the whole delivery from the
+//! canonical bytes the moment a credential returns. The ladder's
+//! graphical linchpins are now uniform end to end: every one
+//! measured directly on the exact tips the morning push delivers,
+//! with the merge-morning union twice directly battery-measured
+//! besides; the CPU shards' records stand on the identical code
+//! tree by the docs-only proof. The one action the run needs
+//! remains the credential itself.
+
