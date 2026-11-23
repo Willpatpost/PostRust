@@ -165,3 +165,212 @@
 //! the PR, leave it red with the analysis if it fails twice.
 //! Known open flake: `s6_soak`'s late-window fsync race
 //! (docs/AUTONOMOUS-CYCLE-PROTOCOL.md §3.1, flake C).
+//!
+//! ---
+//!
+//! ## SESSION 4 ADDENDUM — the verification session (2026-11-23,
+//! later the same day)
+//!
+//! The fourth session inherited the mandate this document gives
+//! future sessions: the ladder complete, nothing pushed, "improve
+//! the weakest evidence in the existing packages — never new
+//! scope; do not re-implement anything." Nothing below
+//! re-implements anything; every change this session commits is
+//! documentation.
+//!
+//! ### The push blocker, re-probed live — unchanged, still the one
+//! blocker
+//!
+//! `git push --dry-run` fails exactly as session 3 recorded: the
+//! code-server askpass sockets are dead files
+//! (`ECONNREFUSED /tmp/vscode-git-*.sock`) and the remote answers
+//! `No anonymous write access.` (exit 128). No `gh`, no
+//! `GITHUB_TOKEN`, no `~/.git-credentials`, no `~/.netrc`, no SSH
+//! keys, no credential helper — re-verified individually. Anonymous
+//! READ still works: `git ls-remote origin` shows `origin/main` at
+//! `1fe89b7` — the exact merge base of all four ladder branches,
+//! with only the seven historical PR refs beside it — so nothing
+//! has drifted underneath the branches. They remain one
+//! authenticated push away; the morning commands above stand
+//! unchanged.
+//!
+//! ### The session-4 audit (the morning audit's checklist, pre-run
+//! by an independent session)
+//!
+//! - **Scope** — each package commit's diff is its brief and
+//!   nothing else: 6-E touches 11 files (engine-renderer,
+//!   engine-slice, the workflow, CURRENT-STATUS), 6-F 14, the
+//!   population 7, 6-E2 10. `engine-core` is untouched in all
+//!   four; AGENTS.md untouched; no drive-by refactors in any
+//!   diffstat.
+//! - **The equivalence gates are real assertions** — byte-equality
+//!   with first-mismatch pixel reports; ink controls that reject
+//!   vacuous comparisons (`render_instanced`'s changed-pixel
+//!   floor, `render_shadows`' occluder-coverage and
+//!   visible-change guards in BOTH directions); allocation
+//!   constancy asserted on the FULL allocations struct across
+//!   warmed frames in EVERY submission mode; the 6-B CPU-oracle
+//!   cross-checks; the shadow map's known-answer against the CPU
+//!   raycaster with the mismatch count pinned at 0.
+//! - **Unsafe carries its proofs** — every new unsafe block
+//!   documents its caller contract (`# Safety` + inline SAFETY
+//!   notes: `proxy_draw`'s `write_slot`/`draw`, `proxy_indirect`'s
+//!   `write_slot`, `shadow_draw`'s readback) inside the vulkan
+//!   module's invariants manifest; the crate-level
+//!   `#![deny(unsafe_code)]` still bounds everything outside it.
+//! - **The determinism contract held** — every pinned selftest
+//!   re-executed this session on this branch (the table below):
+//!   the Stage 0 engine/state fingerprints, the canonical save
+//!   bytes, the Stage 3 lane fingerprints, the Stage 4 presence
+//!   fingerprints — byte-identical, double-run equal.
+//!
+//! ### THE RIG MEASUREMENT COMMANDS — written down at last
+//!
+//! The 6-E brief's acceptance criterion 5 was delivered circular:
+//! the commit messages said "the rig commands are in the PR body"
+//! while this handoff's PR-creation recipe uses the commit
+//! message AS the body — the commands existed nowhere. They exist
+//! now, in this section (carry the relevant block into each PR
+//! body when creating the PRs). The discipline is
+//! `docs/WINDOWS-GPU-PROFILING-KIT.md` §1–2: release build,
+//! `--present immediate --fps uncapped` for the ceiling attempt,
+//! every run at least twice with both reported, PresentMon
+//! optional, never conflate pacing / presentation / GPU time /
+//! presented frames. Every run below exits itself (the corner
+//! route's fixed 601-frame regime) and prints the engine's own
+//! run summary (live + exact `TimingSamples` percentiles, the
+//! draw-call headline, peak RSS).
+//!
+//! PowerShell, from the repo root:
+//!
+//! ```powershell
+//! # 6-E (and the population package — the same flags, the 24+2 table):
+//! git checkout cycle6/6e-instanced-draws   # or cycle6/corner-population
+//! cargo build --release
+//! cargo run --release -p engine-slice -- --corner --populated --present immediate --fps uncapped
+//! cargo run --release -p engine-slice -- --corner --populated --proxy-reference --present immediate --fps uncapped
+//! # THE A/B: 26 instances in 2 draw calls (instanced) vs 26 draw calls
+//! # (reference); the CPU p50/p95/p99 lines (live AND exact) are the claim.
+//! cargo run --release -p engine-slice -- --corner --populated --validation on
+//! # one validation-active correctness run (the CI gate's rig equivalent)
+//!
+//! # 6-F:
+//! git checkout cycle6/6f-directional-shadows
+//! cargo build --release
+//! cargo run --release -p engine-slice -- --corner --shadows --present immediate --fps uncapped
+//! cargo run --release -p engine-slice -- --corner --present immediate --fps uncapped
+//! # THE A/B: the depth pass + shadowed-lit cost vs the unshadowed route.
+//! cargo run --release -p engine-slice -- --corner --shadows --validation on
+//!
+//! # 6-E2:
+//! git checkout cycle6/6e2-indirect-draws
+//! cargo build --release
+//! cargo run --release -p engine-slice -- --corner --populated --present immediate --fps uncapped
+//! cargo run --release -p engine-slice -- --corner --populated --proxy-instanced --present immediate --fps uncapped
+//! cargo run --release -p engine-slice -- --corner --populated --proxy-reference --present immediate --fps uncapped
+//! # THE three-way: 26 == 2 == 2 draws; the indirect submission's CPU cost
+//! # vs the direct one on real hardware.
+//! cargo run --release -p engine-slice -- --corner --populated --validation on
+//! ```
+//!
+//! Lavapipe numbers (the timing lines in every commit message)
+//! remain correctness evidence only — no measurement in any of
+//! these packages was taken on the owner's rig; these commands
+//! are how that evidence gets taken.
+//!
+//! ### Corrective — the 6-F commit message's stale CI paragraph
+//! (RESOLVED this session by direct measurement)
+//!
+//! `96dee7c`'s message says "the main shard 1138 -> 1140 (Windows
+//! 1087 -> 1089, the same platform-uniform 2); the release
+//! battery 61 -> 63". That paragraph was written before the
+//! `shadows.rs` battery grew from 2 tests to 8 during the
+//! INVERTED-depth convention-bug hunt the same message describes,
+//! and it was never refreshed. The paragraph's numbers were never
+//! the measured state of any tree on this branch. The tree's
+//! actual pins — the workflow this branch carries, its comment
+//! chain ("Linux 1146 = 1138 + the same 8; Windows 1095 = 1087 +
+//! the same 8", "61 -> 69"), session 3's handoff record, and now
+//! SESSION 4'S OWN MEASUREMENTS on this tip — all agree:
+//!
+//! - **main shard (clean environment, the workflow's own awk):
+//!   1146 passed / 2 ignored / 33 result lines, rc=0, zero
+//!   failures** (= 1138 + the 8 shadows tests; NOT 1140);
+//! - **renderer release battery: 69/2** (NOT 63);
+//! - **targeted `shadows` battery (debug): 8/8 passed** — the
+//!   exact eight tests the message itself lists.
+//!
+//! When creating the 6-F PR, append this corrective to the body
+//! (the message's evidence sections — the gate results, the
+//! allocation pins — are correct; only the CI-delta paragraph is
+//! stale).
+//!
+//! ### The one lane FAIL — an environment artifact, root-caused
+//! (the §3.1 discipline applied to this session's own instrument)
+//!
+//! This branch's gap-verification lane reported one FAIL, on the
+//! main shard: 1130 passed / 1 ignored / 27 result lines with
+//! `engine-shell`'s
+//! `input_dispatch::look_deltas_require_relative_capture_and_do_not_accumulate`
+//! panicking at `assertion failed: app.relative_mouse()`, and
+//! cargo's fail-fast skipping the six later binaries. The
+//! investigation (the failing test is in engine-shell — a package
+//! this diff does not touch):
+//!
+//! 1. The lane script exports `SDL_VIDEODRIVER=offscreen` and the
+//!    user-local lavapipe variables for its graphical steps; the
+//!    main shard ran inside that exported environment — a script
+//!    design error (CI runs the main shard in the runner's clean
+//!    environment; only the Linux-only graphical steps set
+//!    `SDL_VIDEODRIVER` per command).
+//! 2. **Differential proof**: with `SDL_VIDEODRIVER=offscreen`
+//!    the suite fails (12 passed / 1 failed); in a clean
+//!    environment it passes 13/13. The offscreen video driver
+//!    does not support relative mouse capture, and the test
+//!    correctly asserts that capture succeeds.
+//! 3. **The clean full re-run is the CI-parity record**: 1146/2/33,
+//!    rc=0, zero failures (the table below).
+//!
+//! CI is unaffected (the workflow never sets `SDL_VIDEODRIVER`
+//! on the Tests step). The operational lesson for future pod
+//! sessions, now on record: run the CPU shards in a clean
+//! environment and export the lavapipe variables only for the
+//! graphical commands — this is exactly how CI scopes them.
+//!
+//! ### This branch's session-4 verification table (6-F, tip
+//! `4b5b228` + this addendum commit)
+//!
+//! All steps below ran this session on this branch's tip, 64/65
+//! green in the lane plus the root-caused re-run — zero code
+//! failures, zero flakes. These are the CI steps NO prior session
+//! had executed locally plus targeted re-verification of this
+//! package's own linchpins:
+//!
+//! | Step | Result |
+//! |---|---|
+//! | fmt `--check`; clippy `-D warnings` (CI form AND the standing-order release form) | clean / clean |
+//! | activation + crash-seam isolation (nm on the feature-disabled rlibs) | activation 0, adversarial 0, authorized read-only surfaces present, seam arms 0 |
+//! | workspace inventory guard | exactly the five authorized packages |
+//! | fingerprint selftest ×2 | double-run equal; `engine=6504123a47cab66f`, `state=937bd3b6f56f07e0` |
+//! | spine-save selftest ×2 | double-run equal; `save-len=1209`, `save-fnv=c6c1b46c7d21843b` |
+//! | Stage 3 sim smoke ×2 | double-run equal; `executed 45717`, `engine-lanes=5591d3eb05643e78`, `state-lanes=9d90cb3bbd45b032` |
+//! | Stage 4 presence ×3 ×2 | stationary `da1b2d1a7e5cd49e`, walk `1df391ad488848bf`, tour `495ab27b37549e93` — all pinned values, double-run equal |
+//! | feature-disabled production-path (B-P1, B-R1a2) | green |
+//! | targeted shadow-core battery (debug) | 8/8 passed — the eight tests the commit message lists |
+//! | renderer release battery | **MEASURED 69/2** (the branch pin 69/2; the stale message paragraph claims 63) |
+//! | **the full main shard (CLEAN environment, the workflow's awk)** | **MEASURED 1146/2/33, rc=0, zero failures — the branch pin; a second independent full-shard confirmation of session 3's record** (the lane's polluted-env FAIL is root-caused above) |
+//! | F-06 benchmark canary | green (region scene median 0.048 ms/frame; overlay-on extra 0.030 ms/frame) |
+//! | the five `--render` offscreen smokes | green |
+//! | `render_scene_separation` + `render_encounter` `--ignored` | green |
+//! | playable-world smoke | green |
+//! | plain day/night corner routes (601 frames, every CI grep) | green — first local execution of these steps |
+//! | shadowed route | `directional shadows: one cascade (1024 texels), bias constant 0.0015 / slope 0.0020`, all n=601 grep families, validation 0/0 |
+//! | `render_shadows --ignored` | green — the map known-answer + the pixel equivalence gates re-confirmed |
+//! | S6-C3 soak smoke + fresh-process recovery | evidence package verified complete; workload gate PASS |
+//!
+//! Session 3's shard measurements for this branch (main
+//! 1146/2/33, heavy 570/10/58, renderer release 69/2) are the
+//! immutable-tree records; session 4's own full main-shard run
+//! above and its targeted re-runs of every test this package
+//! added agree with them (8/8 shadows + 69/2 release + the full
+//! shard's 1146/2/33).
