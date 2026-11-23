@@ -318,8 +318,17 @@ jobs:
           # policy_tests: the per-kind instance ranges and the
           # draw-call count model). Linux 1142 = 1138 + the same 4;
           # Windows 1091 = 1087 + the same 4.
-          expected=1142
-          if [ "$(uname -s)" != "Linux" ]; then expected=1091; fi
+          # Cycle 6-E2 indirect draws: +4 platform-uniform
+          # engine-renderer tests (proxy_indirect: the command
+          # packing determinism with the pinned wire layout, the
+          # command-bytes FNV cross-platform pin, the empty-kind
+          # zero-count commands, the slot-region/offset math — pure
+          # integer packing, no cfg gates; the policy test's
+          # draw-call model gains the Indirect mode's cases within
+          # its existing count). Linux 1146 = 1142 + the same 4;
+          # Windows 1095 = 1091 + the same 4.
+          expected=1146
+          if [ "$(uname -s)" != "Linux" ]; then expected=1095; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -348,8 +357,11 @@ jobs:
           # 52 -> 61 (the same +9 proxy unit tests).
           # Cycle 6-E implementation: 61 -> 65 (the same +4 repack/
           # policy tests as the main shard, platform-uniform).
-          echo "renderer release: $passed passed, $results test-result lines (expected 65 / 2)"
-          [ "$passed" -eq 65 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 65"; exit 1; }
+          # Cycle 6-E2 indirect draws: 65 -> 69 (the same +4
+          # proxy_indirect command-core tests as the main shard,
+          # platform-uniform).
+          echo "renderer release: $passed passed, $results test-result lines (expected 69 / 2)"
+          [ "$passed" -eq 69 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 69"; exit 1; }
           [ "$results" -eq 2 ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != 2"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production
@@ -505,6 +517,14 @@ jobs:
       # warmed-allocation constancy). The binary's two SDL tests
       # serialize on its sdl_lock (the engine-shell test pattern);
       # this step's command is unchanged.
+      # (Cycle 6-E2) The indirect-submission proof: the same shipped
+      # table through ONE vkCmdDrawIndirect per kind with GPU-side
+      # counts — byte-equal to BOTH the direct instanced and the
+      # per-object frames, the one-time command-buffer allocation
+      # pinned (+1 device_memory), an oracle wall through the
+      # indirect submission, and the replacement lifecycle. Three
+      # SDL tests now serialize on the same sdl_lock; the command
+      # stays unchanged.
       - name: Instanced-proxy equivalence gate (lavapipe)
         if: runner.os == 'Linux'
         shell: bash
@@ -534,13 +554,19 @@ jobs:
           # (lavapipe is a software rasterizer: correctness and
           # steady-state evidence, NOT performance evidence — the
           # rig measurement commands live in the package's PR).
+          # (Cycle 6-E2) The populated route's DEFAULT submission is
+          # now the indirect path (one vkCmdDrawIndirect per kind,
+          # GPU-side counts — the mechanism exercised at route
+          # scale); --proxy-instanced selects the direct 6-E
+          # submission and --proxy-reference the per-object shape
+          # for the rig's before/after runs.
           cargo run -q -p engine-slice -- --corner --populated --fps uncapped --validation on | tee corner-populated.log
           for regime in live exact; do
             for series in 'CPU frame work' 'frame interval' 'GPU render pass'; do
               grep -Eq "^$regime $series .*n=601" corner-populated.log
             done
           done
-          grep -Eq 'proxy population: [1-9][0-9]* instances \([0-9]+ npc \+ [0-9]+ vehicle\), 2 draw calls per frame \(instanced mode\)' corner-populated.log
+          grep -Eq 'proxy population: [1-9][0-9]* instances \([0-9]+ npc \+ [0-9]+ vehicle\), 2 draw calls per frame \(indirect mode\)' corner-populated.log
           grep -Eq 'validation warnings/errors 0/0' corner-populated.log
       - name: Encounter and legacy scene framebuffer regressions (Linux Vulkan)
         if: runner.os == 'Linux'
@@ -1007,14 +1033,24 @@ jobs:
           # pin is pure-IEEE packing — to be confirmed by this
           # candidate's CI run; a mismatch is corrected from
           # actuals, never by weakening a test).
+          # Cycle 6-E2 indirect draws (2026-11-23): the THIRD
+          # #[ignore]d render_instanced gate (the indirect
+          # submission's three-way byte-equality with the direct
+          # and per-object paths, the one-time command-buffer
+          # allocation pin, the oracle wall through the indirect
+          # submission) adds +1 ignored (11 -> 12) in the same
+          # binary, passed counts and result lines unchanged.
+          # Linux 576/12/58 MEASURED locally with this step's own
+          # awk; Windows 575/12/58 = the same platform-uniform +1
+          # ignored.
           expected=576
           if [ "$(uname -s)" != "Linux" ]; then expected=575; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 11 / 58)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 12 / 58)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
-          [ "$ignored" -eq 11 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 11"; exit 1; }
+          [ "$ignored" -eq 12 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 12"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
@@ -1043,6 +1079,8 @@ jobs:
           # this step's local twin (the second render_instanced gate
           # lives in the existing binary; the six placement tests
           # live in the existing lib binary).
+          # Cycle 6-E2 indirect draws: 58 unchanged (the third
+          # render_instanced gate lives in the same binary).
           [ "$results" -eq 58 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 58"; exit 1; }
       # (F-06, the 2026-11-12 quality audit — Agent C) The release-mode
       # render-path CPU canary: the comparative microbenchmark in

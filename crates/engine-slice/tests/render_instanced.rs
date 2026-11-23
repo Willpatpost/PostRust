@@ -18,6 +18,16 @@
 //! wrong matrix/turn/scale convention would move the proxy's screen
 //! rectangle and fail the position and color pins together).
 //!
+//! The 6-E2 gate (the third test below) extends the same discipline
+//! to the indirect submission: `ProxyDrawMode::Indirect` — one
+//! `vkCmdDrawIndirect` per kind, the instance counts read from GPU
+//! memory — must be byte-equal to BOTH the direct instanced and the
+//! per-object frames, with the lazy indirect command buffer's
+//! one-time allocation pinned (the direct path's counters untouched)
+//! and a single-instance oracle wall run THROUGH the indirect
+//! submission (the independent CPU-reference pin, not just A/B
+//! equality).
+//!
 //! `#[ignore]`d like the other lavapipe smokes: it requires
 //! `SDL_VIDEODRIVER=offscreen` plus a software Vulkan ICD (lavapipe)
 //! and the validation layer. The dev pod needs the user-local ICD
@@ -733,5 +743,326 @@ fn full_corner_population_matches_per_object_pixels() {
         "population gate: {total} instances, per-object {reference_calls} draws == instanced \
          {instanced_calls} draws, byte-equal frames, zero per-frame allocation across \
          warmed frames"
+    );
+}
+
+/// The Cycle 6-E2 indirect-draw gate (the ladder's stretch package):
+/// the shipped 24-NPC + 2-vehicle population submitted THREE ways —
+/// N single-instance draws, one direct instanced draw per kind, and
+/// one `vkCmdDrawIndirect` per kind with the instance counts read
+/// from GPU memory — must produce BYTE-EQUAL captured frames. The
+/// indirect submission's draw-call count is pinned (26 instances
+/// stay 2 draws: the GPU-side count changes where N lives, never
+/// the submission count), the lazy indirect command buffer's
+/// one-time +1 device_memory allocation is pinned (the direct
+/// path's counters untouched — the 6-E gates' pins hold exactly),
+/// warmed indirect frames hold the counters constant (zero
+/// per-frame allocation), the pipeline-replacement lifecycle
+/// re-ensures the command buffer (the finding-A discipline), and a
+/// single-instance oracle wall runs THROUGH the indirect submission
+/// (the CPU-reference pin, closing the "both submissions identically
+/// wrong" hole independently of the 6-E gates).
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
+fn indirect_draws_match_direct_and_per_object_pixels() {
+    let _guard = sdl_lock();
+    let mut app = ShellApp::new(ShellConfig {
+        title: "Cycle 6-E2 indirect draws".into(),
+        width: 256,
+        height: 256,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    })
+    .unwrap();
+    let mut renderer = Renderer::new(
+        app.window(),
+        RenderConfig {
+            demo_scene: DemoScenePreference::Corner,
+            validation: ValidationPreference::On,
+            replace_pipelines: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let size = app.window().size_in_pixels();
+    assert_eq!(size, (256, 256));
+    assert!(renderer.stats().validation_active);
+    let _ = app.frame();
+
+    // The population gate's stand: every placement group inside the
+    // frustum, no building mass between.
+    let (matrix, eye) = {
+        let matrix = engine_slice::corner_demo::view_projection(
+            engine_renderer::lit_scene::RouteWaypoint {
+                position: [-3.5, 18.0, -3.5],
+                look_at: [0.5, 0.0, 0.5],
+            },
+            1.0,
+        );
+        (matrix, [-3.5, 18.0, -3.5])
+    };
+    let light = day_preset();
+    let (npc, vehicle) = engine_slice::corner_population::corner_population();
+    let total = npc.len() + vehicle.len();
+    assert_eq!((npc.len(), vehicle.len(), total), (24, 2, 26));
+    let population = populated(&npc, &vehicle, 1, 2);
+
+    // THE THREE-WAY EQUIVALENCE: per-object (26 draws) vs direct
+    // instanced (2) vs indirect (2) — byte-equal frames.
+    let (reference, reference_calls) = capture_populated(
+        &mut renderer,
+        ProxyDrawMode::PerInstance,
+        &matrix,
+        eye,
+        light,
+        &population,
+        size,
+    );
+    assert_eq!(reference_calls, 26, "the reference: one draw per instance");
+    let direct_warm = renderer.allocations();
+    let (instanced, instanced_calls) = capture_populated(
+        &mut renderer,
+        ProxyDrawMode::Instanced,
+        &matrix,
+        eye,
+        light,
+        &population,
+        size,
+    );
+    assert_eq!(instanced_calls, 2, "the direct path: one draw per kind");
+    assert_frames_equal(&reference, &instanced, "26 draws vs 2 direct instanced");
+    // The direct path's warmed counters are the 6-E pins, untouched
+    // by the indirect mechanism (the lazy discipline: nothing
+    // indirect exists yet).
+    assert_eq!(
+        renderer.allocations(),
+        direct_warm,
+        "the direct path's counters are the 6-E pins exactly"
+    );
+    let (indirect, indirect_calls) = capture_populated(
+        &mut renderer,
+        ProxyDrawMode::Indirect,
+        &matrix,
+        eye,
+        light,
+        &population,
+        size,
+    );
+    assert_eq!(
+        indirect_calls, 2,
+        "the indirect path: still one draw per populated kind"
+    );
+    assert_frames_equal(&instanced, &indirect, "2 direct draws vs 2 indirect draws");
+    assert_frames_equal(&reference, &indirect, "26 draws vs 2 indirect draws");
+    // The indirect capture is itself deterministic.
+    let (repeat, repeat_calls) = capture_populated(
+        &mut renderer,
+        ProxyDrawMode::Indirect,
+        &matrix,
+        eye,
+        light,
+        &population,
+        size,
+    );
+    assert_eq!(repeat_calls, 2);
+    assert_frames_equal(&indirect, &repeat, "indirect repeat capture");
+
+    // THE LAZY INDIRECT ALLOCATION PIN: the first indirect frame
+    // paid EXACTLY ONE device_memory allocation (the persistently
+    // mapped command buffer — 32 bytes per frame slot); every
+    // counter else is the direct path's. This is the measured
+    // mechanism cost, pinned.
+    let indirect_warm = renderer.allocations();
+    assert_eq!(
+        indirect_warm.device_memory,
+        direct_warm.device_memory + 1,
+        "the indirect command buffer: exactly one new device memory"
+    );
+    assert_eq!(indirect_warm.descriptor_pools, direct_warm.descriptor_pools);
+    assert_eq!(indirect_warm.descriptor_sets, direct_warm.descriptor_sets);
+    assert_eq!(indirect_warm.texture_memory, direct_warm.texture_memory);
+    assert_eq!(indirect_warm.samplers, direct_warm.samplers);
+    println!(
+        "indirect mechanism cost: device_memory {} -> {} (the command buffer's one \
+         host-visible memory; every other counter unchanged)",
+        direct_warm.device_memory, indirect_warm.device_memory
+    );
+
+    // The ink control (the glyph-atlas discipline): the population
+    // reaches the framebuffer through the indirect path too.
+    let base = capture_base(&mut renderer, &matrix, eye, light, size);
+    let mut ink = 0;
+    for y in 0..size.1 {
+        for x in 0..size.0 {
+            ink += usize::from(indirect.pixel_rgba(x, y) != base.pixel_rgba(x, y));
+        }
+    }
+    println!(
+        "corner population through the indirect path: {total} instances, 2 indirect \
+         draws, {ink} of {} pixels changed by the population",
+        size.0 * size.1
+    );
+    assert!(
+        ink > 1_300,
+        "visible indirect-path coverage: {ink} changed pixels"
+    );
+
+    // THE ZERO-PER-FRAME-ALLOCATION GATE (all three modes, both
+    // frame slots): the command bytes are repacked into the same
+    // mapped slot every frame — no per-frame allocation anywhere.
+    for mode in [
+        ProxyDrawMode::Indirect,
+        ProxyDrawMode::Instanced,
+        ProxyDrawMode::PerInstance,
+    ] {
+        for _ in 0..2 {
+            let (image, calls) =
+                capture_populated(&mut renderer, mode, &matrix, eye, light, &population, size);
+            assert_eq!(
+                calls,
+                match mode {
+                    ProxyDrawMode::PerInstance => 26,
+                    ProxyDrawMode::Instanced | ProxyDrawMode::Indirect => 2,
+                }
+            );
+            assert_frames_equal(&indirect, &image, "warmed mode stability");
+            assert_eq!(
+                renderer.allocations(),
+                indirect_warm,
+                "warmed allocations constant"
+            );
+        }
+    }
+    println!("warmed indirect-path populated allocations: {indirect_warm:?}");
+
+    // The pipeline-replacement lifecycle (the finding-A re-ensure):
+    // a forced recreation replaces the pipelines AND the proxy
+    // resources — including the indirect command buffer, whose
+    // draws the replacement records. Populated indirect frames
+    // continue drawing byte-identically; the corner's static
+    // allocations survive; the counters resume constant.
+    renderer.set_proxy_draw_mode(ProxyDrawMode::Indirect);
+    let replacement = renderer
+        .render_corner_populated(&matrix, eye, light, &population, (size.0 + 8, size.1 + 8))
+        .unwrap();
+    assert!(replacement.recreated, "the resize forced a recreation");
+    let (after, calls) = capture_populated(
+        &mut renderer,
+        ProxyDrawMode::Indirect,
+        &matrix,
+        eye,
+        light,
+        &population,
+        size,
+    );
+    assert_eq!(calls, 2);
+    assert_frames_equal(&indirect, &after, "the re-ensured indirect path");
+    let after_stats = renderer.allocations();
+    assert_eq!(
+        (
+            after_stats.texture_memory,
+            after_stats.descriptor_pools,
+            after_stats.descriptor_sets,
+            after_stats.samplers
+        ),
+        (
+            indirect_warm.texture_memory,
+            indirect_warm.descriptor_pools,
+            indirect_warm.descriptor_sets,
+            indirect_warm.samplers
+        ),
+        "the corner's static allocations survived the replacement"
+    );
+    println!(
+        "after pipeline replacement: {after_stats:?} (device_memory delta {})",
+        after_stats.device_memory - indirect_warm.device_memory
+    );
+    for _ in 0..2 {
+        let (image, calls) = capture_populated(
+            &mut renderer,
+            ProxyDrawMode::Indirect,
+            &matrix,
+            eye,
+            light,
+            &population,
+            size,
+        );
+        assert_eq!(calls, 2);
+        assert_frames_equal(&after, &image, "post-replacement stability");
+        assert_eq!(renderer.allocations(), after_stats);
+    }
+
+    // THE INDEPENDENT ORACLE PIN THROUGH THE INDIRECT PATH: one NPC,
+    // orthographic camera dead-on its torso +Z wall, per-pixel
+    // against the 6-B CPU reference — the indirect submission
+    // checked against the math, not just against the other
+    // submissions (a submission bug shared by all three modes
+    // cannot pass this).
+    let npc_wall = OracleWall {
+        instance: ProxyInstance {
+            transform: InstanceTransform {
+                pos: [0.0, 0.02, 0.0],
+                turn: 0,
+                scale: 1.0,
+            },
+            tint: [0.9, 0.7, 0.6],
+        },
+        material: 1,
+        half_width: 0.24,
+        y_local: [0.85, 1.45],
+        eye: [0.0, 1.17, 4.0],
+    };
+    let single_npc = [npc_wall.instance];
+    renderer.set_proxy_draw_mode(ProxyDrawMode::Indirect);
+    check_single_instance_oracle(
+        &mut renderer,
+        size,
+        &npc_wall,
+        &populated(&single_npc, &[], 1, 0),
+    );
+
+    // The typed refusals reach the caller through the indirect path
+    // too (nothing rendered, no frame state touched): 4097 NPCs is
+    // one past MAX_INSTANCES (the TOTAL-population bound).
+    let over: Vec<_> = vec![single_npc[0]; 4097];
+    let refused = renderer
+        .render_corner_populated(&matrix, eye, light, &populated(&over, &[], 1, 0), size)
+        .unwrap_err();
+    assert!(matches!(
+        refused,
+        engine_renderer::RendererError::ProxyPack(_)
+    ));
+    // A subsequent healthy indirect frame still presents, byte-equal
+    // (no poisoned state).
+    renderer.set_proxy_draw_mode(ProxyDrawMode::Indirect);
+    let (healthy, calls) = capture_populated(
+        &mut renderer,
+        ProxyDrawMode::Indirect,
+        &matrix,
+        eye,
+        light,
+        &population,
+        size,
+    );
+    assert_eq!(calls, 2);
+    assert_frames_equal(&after, &healthy, "post-refusal stability");
+
+    assert_eq!(
+        renderer.stats().validation_errors,
+        0,
+        "{:?}",
+        renderer.stats().recent_validation
+    );
+    // The command-block contract the submission relies on (defense
+    // in depth for the buffer math this test exercised end to end —
+    // the pure core's own unit battery pins the same numbers).
+    let commands = engine_renderer::proxy_indirect::indirect_slot_commands(24, 2);
+    let word = |at: usize| u32::from_le_bytes(commands[at..at + 4].try_into().unwrap());
+    assert_eq!(engine_renderer::proxy_indirect::INDIRECT_SLOT_BYTES, 32);
+    assert_eq!((word(0), word(4), word(16), word(20)), (108, 24, 72, 2));
+    println!(
+        "indirect gate: {total} instances, per-object 26 == direct 2 == indirect 2 draws, \
+         byte-equal frames, oracle wall within 2/255 through the indirect submission, \
+         one-time command-buffer allocation, zero per-frame allocation across warmed frames"
     );
 }

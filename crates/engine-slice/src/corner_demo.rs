@@ -117,6 +117,7 @@ pub fn run(
     validation: ValidationPreference,
     populated: bool,
     proxy_reference: bool,
+    proxy_instanced: bool,
 ) -> Result<(), String> {
     let mut app = ShellApp::new(ShellConfig {
         title: "One Corner of the City".into(),
@@ -150,14 +151,24 @@ pub fn run(
     } else {
         None
     };
-    // The equivalence gate's reference mode (one draw per instance —
-    // the pre-6-E submission shape), for before/after measurement;
-    // production never sets it.
-    renderer.set_proxy_draw_mode(if proxy_reference {
+    // The submission mode, in evidence order: the per-object
+    // reference (one draw per instance — the pre-6-E shape, the
+    // before/after measurement mode), the direct 6-E instanced
+    // submission (--proxy-instanced, the indirect path's A/B
+    // partner), and — the populated route's DEFAULT since 6-E2 —
+    // the indirect submission (one vkCmdDrawIndirect per kind, the
+    // instance counts read from GPU memory; the mechanism the
+    // deferred GPU-culling package builds on). The default exercises
+    // the shipped mechanism at route scale; the renderer API's own
+    // default remains the direct instanced mode (the 6-E contract).
+    let proxy_mode = if proxy_reference {
         ProxyDrawMode::PerInstance
-    } else {
+    } else if proxy_instanced {
         ProxyDrawMode::Instanced
-    });
+    } else {
+        ProxyDrawMode::Indirect
+    };
+    renderer.set_proxy_draw_mode(proxy_mode);
     let stats = renderer.stats();
     let size = stats.extent;
     let preset = if night { "night" } else { "day" };
@@ -174,6 +185,11 @@ pub fn run(
         cfg!(debug_assertions)
     );
     if populated {
+        let mode_label = match proxy_mode {
+            ProxyDrawMode::PerInstance => "per-object reference mode",
+            ProxyDrawMode::Instanced => "instanced mode",
+            ProxyDrawMode::Indirect => "indirect mode",
+        };
         println!(
             "proxy population: {} instances ({} npc + {} vehicle), {} draw calls per frame ({})",
             npc.len() + vehicle.len(),
@@ -184,11 +200,7 @@ pub fn run(
             } else {
                 u32::from(!npc.is_empty()) + u32::from(!vehicle.is_empty())
             },
-            if proxy_reference {
-                "per-object reference mode"
-            } else {
-                "instanced mode"
-            }
+            mode_label
         );
     }
     if validation == ValidationPreference::On && !stats.validation_active {

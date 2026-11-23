@@ -64,8 +64,10 @@ Interactive modes
   --render [--regions]               Vulkan scene and optional region LOD
   --corner [--night]                 Full lit city route (day by default)
   --corner --populated               Route with the deterministic 24-NPC + 2-vehicle population
-                                    (--proxy-reference: one draw per instance, the
-                                    pre-6-E submission shape for before/after runs)
+                                    (default: the 6-E2 indirect submission, one vkCmdDrawIndirect
+                                    per kind with GPU-side counts; --proxy-instanced: the direct
+                                    6-E submission; --proxy-reference: one draw per instance, the
+                                    pre-6-E shape for before/after runs)
   --player | --playable              Movement and gatehouse demos
   --combat | --encounter             Combat and courtyard demos
   --demo-persist <campaign-dir>      Persistent campaign
@@ -519,6 +521,7 @@ fn main() {
             let mut night = false;
             let mut populated = false;
             let mut proxy_reference = false;
+            let mut proxy_instanced = false;
             let mut fps = 60;
             let mut present = engine_renderer::PresentModePreference::Auto;
             let mut validation = engine_renderer::ValidationPreference::Auto;
@@ -532,6 +535,11 @@ fn main() {
                     // population one draw per instance (the pre-6-E
                     // shape) — the before/after measurement mode.
                     "--proxy-reference" => proxy_reference = true,
+                    // The direct-instanced route (the 6-E production
+                    // shape) — the indirect submission's A/B partner;
+                    // the populated route defaults to the 6-E2
+                    // indirect submission.
+                    "--proxy-instanced" => proxy_instanced = true,
                     "--fps" => {
                         fps = parse_fps(options.next().ok_or("--fps requires a value")?)?
                             .ok_or("--fps requires 1-1000 or uncapped")?;
@@ -558,6 +566,7 @@ fn main() {
                 validation,
                 populated,
                 proxy_reference,
+                proxy_instanced,
             )
         };
         if let Err(e) = run() {
