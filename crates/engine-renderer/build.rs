@@ -53,6 +53,9 @@ fn main() {
     // creates the two shader modules from these same bytes, naming the
     // entry points.
     compile_wgsl("overlay_atlas.wgsl", "overlay_atlas.spv");
+    // The Cycle 6-B lit-scene shaders (see docs/CYCLE6-6B-BRIEF.md):
+    // the same one-module/both-entry-points form.
+    compile_wgsl("lit_scene.wgsl", "lit_scene.spv");
 }
 
 /// The WGSL path (Cycle 6-A): parse + validate + emit ONE SPIR-V
@@ -79,7 +82,7 @@ fn compile_wgsl(file: &str, out_name: &str) {
         fake_missing_bindings: false,
         ..Default::default()
     };
-    for binding in [0, 1] {
+    for binding in [0, 1, 2, 3] {
         options.binding_map.insert(
             naga::ResourceBinding { group: 0, binding },
             naga::back::spv::BindingInfo::default(),

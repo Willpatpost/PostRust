@@ -43,7 +43,9 @@
 pub mod config;
 pub use vulkan::{descriptors, textures};
 pub mod glyph_atlas;
+pub mod lit_scene;
 pub mod overlay;
+pub mod proc_texture;
 pub mod scene;
 
 mod renderer;
