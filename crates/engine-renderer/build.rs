@@ -60,6 +60,12 @@ fn main() {
     // docs/CYCLE6-6E-BRIEF.md): the same one-module/both-entry-
     // points form, the same binding set as lit_scene (0-3).
     compile_wgsl("instanced_proxy.wgsl", "instanced_proxy.spv");
+    // The Cycle 6-F shadow shaders (see
+    // docs/AUTONOMOUS-CYCLE-PROTOCOL.md §2 item 2): the depth-only
+    // pass (one uniform: the light matrix) and the shadowed lit
+    // variant (lit_scene's bindings plus the depth map at 4).
+    compile_wgsl("shadow_depth.wgsl", "shadow_depth.spv");
+    compile_wgsl("lit_scene_shadowed.wgsl", "lit_scene_shadowed.spv");
 }
 
 /// The WGSL path (Cycle 6-A): parse + validate + emit ONE SPIR-V
@@ -86,12 +92,14 @@ fn compile_wgsl(file: &str, out_name: &str) {
         fake_missing_bindings: false,
         ..Default::default()
     };
-    for binding in [0, 1, 2, 3] {
+    for binding in [0, 1, 2, 3, 4] {
         options.binding_map.insert(
             naga::ResourceBinding { group: 0, binding },
             naga::back::spv::BindingInfo {
                 // Texture + sampler share descriptor 0. The two uniform
                 // blocks must retain their distinct SPIR-V decorations.
+                // Binding 4 (the 6-F shadow map, a texture_depth_2d read
+                // with textureLoad) keeps its own descriptor.
                 binding: if binding == 1 { 0 } else { binding },
                 ..Default::default()
             },

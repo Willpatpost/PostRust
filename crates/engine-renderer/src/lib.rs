@@ -51,6 +51,7 @@ pub mod proxy_indirect;
 pub mod proxy_instances;
 pub mod proxy_mesh;
 pub mod scene;
+pub mod shadows;
 
 mod renderer;
 mod vulkan;
@@ -58,6 +59,6 @@ mod vulkan;
 pub use config::{DemoScenePreference, PresentModePreference, RenderConfig, ValidationPreference};
 pub use renderer::{
     AllocationStats, FrameResult, GeometryStats, ProxyDrawMode, ProxyPopulation, RenderStats,
-    Renderer, SceneLayer,
+    Renderer, SceneLayer, ShadowMapReadback,
 };
 pub use vulkan::{CaptureFormat, CapturedFrame, RendererError};

@@ -68,6 +68,8 @@ Interactive modes
                                     per kind with GPU-side counts; --proxy-instanced: the direct
                                     6-E submission; --proxy-reference: one draw per instance, the
                                     pre-6-E shape for before/after runs)
+  --corner --shadows                 The route with directional shadows (one
+                                    cascade, the deterministic core's oracle)
   --player | --playable              Movement and gatehouse demos
   --combat | --encounter             Combat and courtyard demos
   --demo-persist <campaign-dir>      Persistent campaign
@@ -522,6 +524,7 @@ fn main() {
             let mut populated = false;
             let mut proxy_reference = false;
             let mut proxy_instanced = false;
+            let mut shadows = false;
             let mut fps = 60;
             let mut present = engine_renderer::PresentModePreference::Auto;
             let mut validation = engine_renderer::ValidationPreference::Auto;
@@ -540,6 +543,7 @@ fn main() {
                     // the populated route defaults to the 6-E2
                     // indirect submission.
                     "--proxy-instanced" => proxy_instanced = true,
+                    "--shadows" => shadows = true,
                     "--fps" => {
                         fps = parse_fps(options.next().ok_or("--fps requires a value")?)?
                             .ok_or("--fps requires 1-1000 or uncapped")?;
@@ -567,6 +571,7 @@ fn main() {
                 populated,
                 proxy_reference,
                 proxy_instanced,
+                shadows,
             )
         };
         if let Err(e) = run() {

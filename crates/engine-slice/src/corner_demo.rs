@@ -110,6 +110,27 @@ fn peak_resident_kib() -> Option<u64> {
     None
 }
 
+/// The demo's shadow-bias policy (documented per the API contract):
+/// roughly two texel quanta of constant floor plus a slope term —
+/// the corner scene's axis-aligned faces under the day/night lights
+/// stay acne-free at the 1024² cascade while the peter-panning stays
+/// under one texel on the ground (the equivalence gate's margins
+/// measure both).
+pub fn demo_bias() -> engine_renderer::shadows::ShadowBias {
+    engine_renderer::shadows::ShadowBias {
+        constant: 0.0015,
+        slope_scale: 0.002,
+    }
+}
+
+// The four-way union's arg arithmetic: each branch's run() stayed at
+// or under clippy's 7 (the 6-E stack's 7 with the 6-E2 proxy-instanced
+// flag; 6-F's 5); the UNION carries both feature axes and crosses to
+// 8. The flat flag list is the CLI's own shape (one bool per demo
+// mode, main.rs passes them straight through); grouping them into a
+// config struct would restructure both packages' code inside a merge
+// resolution — the render_frame precedent (vulkan.rs) is the allow.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     night: bool,
     fps: u32,
@@ -118,6 +139,7 @@ pub fn run(
     populated: bool,
     proxy_reference: bool,
     proxy_instanced: bool,
+    shadows: bool,
 ) -> Result<(), String> {
     let mut app = ShellApp::new(ShellConfig {
         title: "One Corner of the City".into(),
@@ -169,6 +191,17 @@ pub fn run(
         ProxyDrawMode::Indirect
     };
     renderer.set_proxy_draw_mode(proxy_mode);
+    // The combination refusal (the union's policy, from the verified
+    // three-way resolution): proxy shadows (a populated scene drawn
+    // through the shadowed path) are a deferred package on both the
+    // population and the 6-F deferral lists, so asking for both is a
+    // typed upfront refusal — never a silent mode drop.
+    if populated && shadows {
+        return Err(
+            "--populated and --shadows together is not implemented (proxy shadows are a deferred package)"
+                .into(),
+        );
+    }
     let stats = renderer.stats();
     let size = stats.extent;
     let preset = if night { "night" } else { "day" };
@@ -206,8 +239,18 @@ pub fn run(
     if validation == ValidationPreference::On && !stats.validation_active {
         return Err("requested validation layer is unavailable".into());
     }
+    if shadows {
+        let bias = demo_bias();
+        println!(
+            "directional shadows: one cascade ({} texels), bias constant {:.4} / slope {:.4}",
+            engine_renderer::shadows::SHADOW_MAP_EXTENT,
+            bias.constant,
+            bias.slope_scale
+        );
+    }
     let aspect = size.0 as f32 / size.1 as f32;
     let light = if night { night_preset() } else { day_preset() };
+    let bias = demo_bias();
     let pace = (fps > 0).then(|| Duration::from_secs_f64(1. / f64::from(fps)));
     let mut poses = route_poses().peekable();
     let count = poses.len();
@@ -228,11 +271,16 @@ pub fn run(
             pose = poses.next().unwrap();
         }
         let matrix = view_projection(pose, aspect);
-        let frame = match population.as_ref() {
-            Some(population) => {
-                renderer.render_corner_populated(&matrix, pose.position, light, population, size)
-            }
-            None => renderer.render_corner(&matrix, pose.position, light, size),
+        // Submission selection: the shadowed route (6-F) or the
+        // populated route (6-E/6-E2, the mode set above); the
+        // combination was refused above (proxy shadows are the
+        // deferred package).
+        let frame = if shadows {
+            renderer.render_corner_shadowed(&matrix, pose.position, light, bias, size)
+        } else if let Some(population) = population.as_ref() {
+            renderer.render_corner_populated(&matrix, pose.position, light, population, size)
+        } else {
+            renderer.render_corner(&matrix, pose.position, light, size)
         }
         .map_err(|e| e.to_string())?;
         let end = Instant::now();

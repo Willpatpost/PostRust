@@ -107,6 +107,8 @@ pub(crate) mod corner;
 pub mod descriptors;
 #[path = "proxy_draw.rs"]
 pub(crate) mod proxy_draw;
+#[path = "shadow_draw.rs"]
+pub(crate) mod shadow_draw;
 #[path = "textures.rs"]
 pub mod textures;
 
@@ -1409,6 +1411,14 @@ pub(crate) struct PipelineState {
     /// proxy pipeline reading it does); a replacement re-ensures an
     /// identical set before installation (finding A).
     pub proxy: Option<proxy_draw::ProxyResources>,
+    /// The Cycle 6-F shadow state (the per-slot shadow maps, the
+    /// depth-only pass, the shadowed lit pipeline, and the readback
+    /// path), created LAZILY at the first shadowed corner frame —
+    /// the region-buffer precedent: the unshadowed corner path pays
+    /// nothing and its allocation pins are untouched. Dies with this
+    /// state (the pipelines reading it do); a replacement re-ensures
+    /// an identical set before installation (finding A).
+    pub shadows: Option<shadow_draw::ShadowResources>,
     /// Per-slot vertex capacity of the dynamic region-scene buffer
     /// (Stage 4 graphical integration — the same disjoint per-slot
     /// pattern as the overlay).
@@ -1454,6 +1464,7 @@ impl PipelineState {
             region_slot_bytes: 0,
             region_mapped: core::ptr::null_mut(),
             proxy: None,
+            shadows: None,
         };
         if let Err(error) = state.build(ctx, color_format, depth_format, demo_scene) {
             state.destroy(ctx);
@@ -1547,6 +1558,29 @@ impl PipelineState {
             return Ok(());
         }
         self.proxy = Some(proxy_draw::ProxyResources::new(ctx)?);
+        Ok(())
+    }
+
+    /// Allocates the Cycle 6-F shadow state on the first shadowed
+    /// corner frame (the same lazy discipline: the unshadowed corner
+    /// path pays nothing — its allocation pins are untouched). The
+    /// shadowed lit pipeline renders inside THIS state's render pass,
+    /// so the ensure carries it; a no-op once allocated.
+    pub(crate) fn ensure_shadow_resources(
+        &mut self,
+        ctx: &VulkanContext,
+    ) -> Result<(), RendererError> {
+        if self.shadows.is_some() {
+            return Ok(());
+        }
+        let corner = ctx.corner.as_ref().ok_or_else(|| {
+            RendererError::Vulkan("shadows require the Corner scene preference".into())
+        })?;
+        self.shadows = Some(shadow_draw::ShadowResources::new(
+            ctx,
+            self.render_pass,
+            corner,
+        )?);
         Ok(())
     }
 
@@ -2004,6 +2038,9 @@ impl PipelineState {
         unsafe {
             if let Some(proxy) = self.proxy.take() {
                 proxy.destroy(ctx);
+            }
+            if let Some(shadows) = self.shadows.take() {
+                shadows.destroy(ctx);
             }
             if !self.region_mapped.is_null() {
                 ctx.device.unmap_memory(self.region_vbo_memory);
@@ -2513,6 +2550,50 @@ pub(crate) fn request_capture(frames: &mut FrameState) -> Result<(), RendererErr
     Ok(())
 }
 
+/// Requests the NEXT shadowed frame's shadow-map readback (the 6-F
+/// known-answer path): the depth-only pass's map is copied to a host
+/// buffer inside that frame's command buffer. Single-flight like the
+/// color capture. The handshake lives in the frame state, so the
+/// request survives pipeline replacements; the shadow STATE itself
+/// must exist (the renderer's request path ensures it).
+pub(crate) fn request_shadow_readback(frames: &mut FrameState) -> Result<(), RendererError> {
+    if frames.shadow_readback.pending || frames.shadow_readback.ready {
+        return Err(RendererError::CaptureOutstanding);
+    }
+    frames.shadow_readback.pending = true;
+    Ok(())
+}
+
+/// Takes the completed shadow-map readback, if one is ready: waits
+/// the recording slot's fence (the color capture's take discipline)
+/// and returns the map's depths (row-major, row 0 first, one f32 per
+/// texel — the D32_SFLOAT bits as written by the depth-only pass).
+pub(crate) fn take_shadow_readback(
+    ctx: &VulkanContext,
+    pipes: &mut PipelineState,
+    frames: &mut FrameState,
+) -> Result<Option<Vec<f32>>, RendererError> {
+    if !frames.shadow_readback.ready {
+        return Ok(None);
+    }
+    let Some(shadows) = pipes.shadows.as_ref() else {
+        // The state was replaced after the readback recorded: the
+        // buffer holding the copy is gone — a typed drop (the color
+        // capture's mismatch path), reported rather than silently
+        // empty.
+        frames.shadow_readback.ready = false;
+        return Err(RendererError::CaptureDropped(
+            "the shadow state was replaced before the readback was taken".into(),
+        ));
+    };
+    let slot = frames.shadow_readback.slot;
+    // SAFETY: the fence is the recording frame's own — the same
+    // fence the next frame on that slot waits.
+    let depths = unsafe { shadows.readback_depths(ctx, frames.in_flight[slot]) };
+    frames.shadow_readback.ready = false;
+    Ok(depths)
+}
+
 /// The most recent capture refusal or drop, if any — observable for
 /// diagnosis; a refused capture never poisons frame synchronization.
 pub(crate) fn last_capture_refusal(frames: &FrameState) -> Option<&RendererError> {
@@ -2617,6 +2698,17 @@ impl OverlaySlot {
     }
 }
 
+/// The shadow-map readback's single-flight handshake (the color
+/// capture's shape; lives in `FrameState` so a request survives
+/// pipeline replacements — the shadow STATE is rebuilt, the request
+/// is not).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShadowReadbackState {
+    pending: bool,
+    ready: bool,
+    slot: usize,
+}
+
 /// Sync objects, command buffers, and the timestamp pool, per frames-in-
 /// flight slot, plus per-swapchain-image state.
 pub(crate) struct FrameState {
@@ -2647,6 +2739,9 @@ pub(crate) struct FrameState {
     pub timestamps_written: [bool; FRAMES_IN_FLIGHT as usize],
     /// A present reported suboptimal — recreate before the next frame.
     pub needs_recreate: bool,
+    /// The 6-F shadow-map readback handshake (single-flight, like
+    /// the color capture; survives pipeline replacements).
+    pub(crate) shadow_readback: ShadowReadbackState,
     /// Hint-gated surface probing (perf batch 3): true while the
     /// surface's drawable is believed unavailable (the previous frame
     /// deferred), so minimized/transitional surfaces keep probing
@@ -2679,6 +2774,7 @@ impl FrameState {
             timestamps_written: [false; FRAMES_IN_FLIGHT as usize],
             needs_recreate: false,
             surface_probe_pending: false,
+            shadow_readback: ShadowReadbackState::default(),
             frame_slot: 0,
             image_index: 0,
             capture: CaptureState::dead(),
@@ -2887,6 +2983,7 @@ pub(crate) fn render_frame(
     debug_overlay: &[OverlayVertex],
     corner_params: Option<&corner::FrameParams>,
     proxy: Option<&proxy_draw::ProxyFrameUpload<'_>>,
+    shadowed: Option<&shadow_draw::ShadowFrameParams>,
 ) -> Result<FrameOutcome, RendererError> {
     let mut outcome = FrameOutcome::default();
     let slot = frames.frame_slot;
@@ -2982,6 +3079,15 @@ pub(crate) fn render_frame(
         {
             proxy_state.ensure_indirect(ctx)?;
         }
+    }
+
+    // The 6-F lazy shadow state (the same discipline): created at
+    // the first shadowed frame only, outside command recording — the
+    // unshadowed corner path pays nothing. Structural invariant: a
+    // shadowed frame implies corner resources (the safe layer's
+    // scene-preference gate), which the ensure itself re-checks.
+    if shadowed.is_some() {
+        pipes.ensure_shadow_resources(ctx)?;
     }
 
     // A previous present reported suboptimal — recreate before drawing
@@ -3146,8 +3252,10 @@ pub(crate) fn render_frame(
     let clear_values = [
         vk::ClearValue {
             color: vk::ClearColorValue {
-                float32: corner_params
-                    .map_or([0.02, 0.02, 0.04, 1.0], corner::FrameParams::clear_color),
+                float32: corner_params.map_or_else(
+                    || shadowed.map_or([0.02, 0.02, 0.04, 1.0], |params| params.clear_color()),
+                    corner::FrameParams::clear_color,
+                ),
             },
         },
         vk::ClearValue {
@@ -3257,6 +3365,18 @@ pub(crate) fn render_frame(
             );
         }
 
+        // The 6-F shadow depth pass — recorded BEFORE the main render
+        // pass (the pass's final subpass dependency orders the map's
+        // writes before the main pass's fragment reads). The extended
+        // FrameParams + light matrix are written into this slot's
+        // mapped region first (the fence wait above owns the slot).
+        if let (Some(corner), Some(shadow_state), Some(params)) =
+            (&ctx.corner, &pipes.shadows, shadowed)
+        {
+            shadow_state.write_frame(slot, params);
+            shadow_state.record_depth_pass(ctx, command, corner, slot);
+        }
+
         ctx.device.cmd_begin_render_pass(
             command,
             &vk::RenderPassBeginInfo::default()
@@ -3268,13 +3388,40 @@ pub(crate) fn render_frame(
         );
         ctx.device.cmd_set_viewport(command, 0, &[viewport]);
         ctx.device.cmd_set_scissor(command, 0, &[scissor]);
-        if let (Some(resources), Some(params)) = (&ctx.corner, corner_params) {
+        if shadowed.is_some()
+            && let (Some(resources), Some(shadow_state)) = (&ctx.corner, &pipes.shadows)
+        {
+            // The 6-F shadowed corner draws: the shadowed lit
+            // pipeline inside the main render pass, binding the
+            // shadow state's per-material sets for this slot (the
+            // map view rides binding 4; the FrameParams dynamic
+            // offset selects this slot's extended region — written
+            // before the depth pass above). The ensure above
+            // guaranteed the shadow state whenever `shadowed` is
+            // Some; the belt check keeps an unshadowed frame on the
+            // unshadowed path even if a prior shadowed frame created
+            // the state.
+            let (pipeline, layout, sets, frame_offset) = shadow_state.shadowed(slot);
+            ctx.device
+                .cmd_bind_pipeline(command, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            resources.draw(ctx, command, layout, &sets, frame_offset);
+        } else if let (Some(resources), Some(params)) = (&ctx.corner, corner_params) {
             ctx.device.cmd_bind_pipeline(
                 command,
                 vk::PipelineBindPoint::GRAPHICS,
                 pipes.lit_pipeline,
             );
-            resources.draw(ctx, command, pipes.lit_layout, slot, params);
+            // The slot's fence wait passed above; the coherent frame
+            // regions do not overlap other slots or the immutable
+            // material tail.
+            resources.write_frame(slot, params);
+            resources.draw(
+                ctx,
+                command,
+                pipes.lit_layout,
+                resources.sets(),
+                slot as u32 * resources.frame_stride(),
+            );
             // The 6-E instanced-proxy draws (same render pass, after
             // the static corner mesh — the corner ground plane wins
             // the coplanar depth at proxy footprints deterministically
@@ -3400,6 +3547,20 @@ pub(crate) fn render_frame(
         }
 
         ctx.device.cmd_end_render_pass(command);
+        // The 6-F known-answer readback: after the main pass the
+        // shadow map sits in SHADER_READ — transition to TRANSFER_SRC
+        // and copy the recording slot's map into the mapped buffer
+        // (the submission fence proves the copy complete before
+        // `take_shadow_map_capture` reads it). The handshake lives in
+        // the frame state (replacement-safe).
+        if frames.shadow_readback.pending
+            && let Some(shadow_state) = &pipes.shadows
+        {
+            shadow_state.record_readback(ctx, command, slot);
+            frames.shadow_readback.pending = false;
+            frames.shadow_readback.ready = true;
+            frames.shadow_readback.slot = slot;
+        }
         if frames.timestamps_supported {
             ctx.device.cmd_write_timestamp(
                 command,
@@ -3689,6 +3850,17 @@ fn recreate_swapchain(
                 replacement.destroy(ctx);
                 return Err(error);
             }
+        }
+        // The 6-F companion: a shadowed renderer's shadow state must
+        // likewise exist on the replacement BEFORE installation (the
+        // same finding-A discipline — the replacement's shadowed
+        // pipeline renders inside the replacement's own render pass,
+        // against the replacement's own maps).
+        if pipes.shadows.is_some()
+            && let Err(error) = replacement.ensure_shadow_resources(ctx)
+        {
+            replacement.destroy(ctx);
+            return Err(error);
         }
         Some(replacement)
     } else {
