@@ -47,6 +47,8 @@ mod lit_mesh;
 pub mod lit_scene;
 pub mod overlay;
 pub mod proc_texture;
+pub mod proxy_instances;
+pub mod proxy_mesh;
 pub mod scene;
 
 mod renderer;

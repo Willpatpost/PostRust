@@ -304,16 +304,15 @@ jobs:
           # Cycle 6-A: the three platform-uniform atlas layout/UV/metric
           # pins add three passes; ignored and result-line counts stay fixed.
           # Cycle 6-B: eight platform-uniform scene/oracle and texture tests.
-          # Cycle 6-C (the F4 closure): +3 engine-core integration
-          # tests (spine_bookkeeping — the structural linearity pins)
-          # and +1 result line (the new binary: 32 -> 33). Windows
-          # 1078/2/33 MEASURED locally; Linux 1129 = 1126 + the same
-          # 3. The result-line count 33 confirmed by this run's
-          # actuals (the commit message's "32" was the projection
-          # error — corrected from actuals, never by weakening a
-          # test).
-          expected=1129
-          if [ "$(uname -s)" != "Linux" ]; then expected=1078; fi
+          # Cycle 6-E scaffold: +9 engine-renderer unit tests
+          # (proxy_instances: the turn-fraction sin/cos, the column
+          # convention, the packing determinism, the typed refusals,
+          # the FNV cross-platform byte pin; proxy_mesh: the pinned
+          # counts and validity). Windows 1087/2/33 MEASURED
+          # locally; Linux 1138 = 1129 + the same 9, platform-
+          # uniform (the new core is pure IEEE arithmetic).
+          expected=1138
+          if [ "$(uname -s)" != "Linux" ]; then expected=1087; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -338,8 +337,10 @@ jobs:
           cargo test -p engine-renderer --release 2>&1 | tee tests-renderer-release.log
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-renderer-release.log)
           results=$(grep -c 'test result:' tests-renderer-release.log || true)
-          echo "renderer release: $passed passed, $results test-result lines (expected 52 / 2)"
-          [ "$passed" -eq 52 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 52"; exit 1; }
+          # Cycle 6-E scaffold: the renderer release battery
+          # 52 -> 61 (the same +9 proxy unit tests).
+          echo "renderer release: $passed passed, $results test-result lines (expected 61 / 2)"
+          [ "$passed" -eq 61 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 61"; exit 1; }
           [ "$results" -eq 2 ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != 2"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production

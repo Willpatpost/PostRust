@@ -1,0 +1,429 @@
+//! The instanced-draw deterministic core (the Cycle 6-E scaffold —
+//! see `docs/CYCLE6-6E-BRIEF.md`): the per-instance transform math,
+//! the byte-exact instance-buffer packing, and the capacity
+//! discipline for proxy instancing — ONE draw call for N proxies
+//! instead of N vertex rebuilds (the O(entities) CPU ceiling from
+//! the original renderer audit).
+//!
+//! THE 6-A PATTERN, APPLIED AGAIN: everything deterministic and pure
+//! lives here, fully tested — the transform model, the packing
+//! format, and the overflow refusal. The implementer wires the GPU
+//! side (the instance-rate vertex input, the instance buffer, the
+//! single indexed/instanced draw) and proves output equivalence
+//! against the un-instanced path through the capture harness.
+//!
+//! DETERMINISM CONTRACT: the packed instance bytes are byte-identical
+//! on every platform. This is why orientation is a `u16` TURN FRACTION
+//! (1/65536 of a full rotation) through [`sin_cos_turn`] — a
+//! fixed-order fixed-constant Taylor series over pure IEEE f32
+//! arithmetic — and NOT an `f32` radian through `f32::sin`/`cos`:
+//! the system libm's trig bits vary across platforms (the repo's
+//! standing libm-free discipline), which would make the packed bytes
+//! platform-dependent. All packing uses `f32::to_bits` — the exact
+//! IEEE bit patterns, little-endian, in a FIXED field order.
+//!
+//! CAPACITY DISCIPLINE (the D2 ratified policy applied to instances):
+//! no partial instance buffers — an over-capacity pack is a TYPED
+//! refusal produced BEFORE any byte exists, never a truncated write.
+
+/// The per-draw instance bound. The sustained-load matrix's
+/// demonstrated entity range is 1,000–5,000; 4,096 is the initial
+/// per-draw bound (one power-of-two above the demonstrated midpoint).
+/// Revisitable only with rig evidence, never silently.
+pub const MAX_INSTANCES: usize = 4096;
+
+/// One instance's packed size: 24 little-endian f32s — four matrix
+/// columns (64 B), one tint vec4 (16 B), one reserved params vec4
+/// (16 B, zeros — the forward-compatibility slot; a future field
+/// claims it with a versioned layout change, never a silent reuse).
+pub const INSTANCE_STRIDE: usize = 96;
+
+/// One proxy's placement: a world position, a yaw as a turn fraction
+/// (`turn` = units of 1/65536 of a full rotation; 0 faces +X, 16384
+/// faces −Z per the pinned convention below), and a uniform scale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InstanceTransform {
+    /// The instance origin in world space (the proxy mesh's local
+    /// origin — the feet for the humanoid proxy, the ground-center
+    /// for the vehicle proxy).
+    pub pos: [f32; 3],
+    /// The yaw as a turn fraction (see the struct docs).
+    pub turn: u16,
+    /// The uniform scale (must be finite and strictly positive — a
+    /// degenerate zero-scale instance is a validation refusal, not a
+    /// silently invisible proxy).
+    pub scale: f32,
+}
+
+/// One drawable proxy instance: the transform plus a per-instance
+/// albedo tint (multiplied into the sampled albedo BEFORE the
+/// lighting equation — the composition that keeps the 6-B CPU
+/// oracle [`crate::lit_scene::lit_surface_color`] directly
+/// applicable with `albedo * tint` as its albedo argument).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProxyInstance {
+    pub transform: InstanceTransform,
+    /// The per-instance albedo tint, each channel in [0, 1].
+    pub tint: [f32; 3],
+}
+
+/// The typed pack refusal (the D2 no-partial-overflow discipline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstancePackError {
+    /// More instances than the capacity allows. No bytes were
+    /// produced.
+    Capacity { capacity: usize, requested: usize },
+    /// An instance failed validation at `index`. No bytes were
+    /// produced. `field` names the refusing field.
+    Invalid { index: usize, field: &'static str },
+}
+
+/// The fixed half-turn constant (the nearest f32 to π/2 — a fixed
+/// bit pattern, identical on every platform).
+const FRAC_PI_2: f32 = core::f32::consts::FRAC_PI_2;
+
+/// The deterministic sine/cosine of a turn fraction. Quadrant
+/// reduction plus fixed-order fixed-constant Taylor series (Horner
+/// evaluation, pure IEEE f32 arithmetic — no libm, no platform
+/// variation). Documented precision: absolute error ≤ 2e-6 over the
+/// full turn — ample for proxy orientation, where the contract is
+/// BIT-IDENTITY across platforms, not libm-grade accuracy.
+pub fn sin_cos_turn(turn: u16) -> (f32, f32) {
+    let quadrant = (turn >> 14) & 3;
+    // The within-quadrant angle: [0, π/2).
+    let x = (turn & 0x3FFF) as f32 * (FRAC_PI_2 / 16384.0);
+    let x2 = x * x;
+    // sin(x): x − x³/3! + x⁵/5! − x⁷/7! + x⁹/9! − x¹¹/11! (Horner).
+    let sin_x = x
+        * (1.0
+            + x2 * (-1.0 / 6.0
+                + x2 * (1.0 / 120.0
+                    + x2 * (-1.0 / 5040.0 + x2 * (1.0 / 362880.0 + x2 * (-1.0 / 39916800.0))))));
+    // cos(x): 1 − x²/2! + x⁴/4! − x⁶/6! + x⁸/8! − x¹⁰/10! (Horner).
+    let cos_x = 1.0
+        + x2 * (-1.0 / 2.0
+            + x2 * (1.0 / 24.0
+                + x2 * (-1.0 / 720.0 + x2 * (1.0 / 40320.0 + x2 * (-1.0 / 3628800.0)))));
+    match quadrant {
+        0 => (sin_x, cos_x),
+        1 => (cos_x, -sin_x),
+        2 => (-sin_x, -cos_x),
+        _ => (-cos_x, sin_x),
+    }
+}
+
+/// The instance transform as four COLUMN-MAJOR matrix columns (the
+/// WGSL `mat4x4` constructor's order — the same convention the
+/// shader's `mat4x4<f32>(i_col0, i_col1, i_col2, i_col3)` consumes).
+/// The composition is T·R·S: scale first, then the yaw about +Y,
+/// then the translation. THE PINNED CONVENTION: at a quarter turn
+/// (turn = 16384), +X maps to −Z (right-handed, Y-up; the known-
+/// answer test pins it).
+pub fn instance_columns(transform: &InstanceTransform) -> [[f32; 4]; 4] {
+    // sin_cos_turn returns (sin, cos) — mind the binding order.
+    let (s, c) = sin_cos_turn(transform.turn);
+    let k = transform.scale;
+    [
+        [c * k, 0.0, -s * k, 0.0],
+        [0.0, k, 0.0, 0.0],
+        [s * k, 0.0, c * k, 0.0],
+        [transform.pos[0], transform.pos[1], transform.pos[2], 1.0],
+    ]
+}
+
+impl ProxyInstance {
+    /// The R4-style input contract: finite position/scale, strictly
+    /// positive scale, tint channels in [0, 1]. Returns the refusing
+    /// field name, or `None` when valid.
+    pub fn validate(&self) -> Option<&'static str> {
+        let t = &self.transform;
+        if !t.pos.iter().all(|v| v.is_finite()) {
+            return Some("pos");
+        }
+        if !t.scale.is_finite() || t.scale <= 0.0 {
+            return Some("scale");
+        }
+        if !self
+            .tint
+            .iter()
+            .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        {
+            return Some("tint");
+        }
+        None
+    }
+}
+
+/// Packs `instances` into the instance-buffer bytes (little-endian
+/// f32 bit patterns, the fixed field order: column 0, 1, 2, 3, tint
+/// rgb + 1.0 alpha, four reserved zero f32s). Byte-identical on
+/// every platform for the same input — the packing is pure IEEE
+/// arithmetic and `to_bits`. Validation and capacity refusal happen
+/// BEFORE any byte exists (no partial buffers, ever).
+pub fn pack_instances(instances: &[ProxyInstance]) -> Result<Vec<u8>, InstancePackError> {
+    pack_instances_bounded(instances, MAX_INSTANCES)
+}
+
+/// The bounded form: the caller-supplied capacity is the draw's
+/// instance-buffer capacity (a typed refusal above it, never a
+/// truncation).
+pub fn pack_instances_bounded(
+    instances: &[ProxyInstance],
+    capacity: usize,
+) -> Result<Vec<u8>, InstancePackError> {
+    if instances.len() > capacity {
+        return Err(InstancePackError::Capacity {
+            capacity,
+            requested: instances.len(),
+        });
+    }
+    for (index, instance) in instances.iter().enumerate() {
+        if let Some(field) = instance.validate() {
+            return Err(InstancePackError::Invalid { index, field });
+        }
+    }
+    let mut bytes = Vec::with_capacity(instances.len() * INSTANCE_STRIDE);
+    for instance in instances {
+        for column in instance_columns(&instance.transform) {
+            for value in column {
+                bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+        }
+        for value in [instance.tint[0], instance.tint[1], instance.tint[2], 1.0] {
+            bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0u8; 16]);
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The known answers at the cardinal turns. Tolerance 1e-5
+    /// covers the documented Taylor truncation (≤ 2e-6) with margin.
+    #[test]
+    fn sin_cos_turn_known_answers() {
+        let (s, c) = sin_cos_turn(0);
+        assert!(
+            (s - 0.0).abs() < 1e-5 && (c - 1.0).abs() < 1e-5,
+            "zero turn: ({s}, {c})"
+        );
+        let (s, c) = sin_cos_turn(16384);
+        assert!(
+            (s - 1.0).abs() < 1e-5 && c.abs() < 1e-5,
+            "quarter: ({s}, {c})"
+        );
+        let (s, c) = sin_cos_turn(32768);
+        assert!(s.abs() < 1e-5 && (c + 1.0).abs() < 1e-5, "half: ({s}, {c})");
+        let (s, c) = sin_cos_turn(49152);
+        assert!(
+            (s + 1.0).abs() < 1e-5 && c.abs() < 1e-5,
+            "three-quarter: ({s}, {c})"
+        );
+    }
+
+    /// Opposite turns negate both components (the half-turn
+    /// symmetry), and every output stays within [-1, 1] + tolerance.
+    #[test]
+    fn sin_cos_turn_half_turn_symmetry_and_range() {
+        for turn in [
+            0u16, 1, 8191, 8192, 8193, 16383, 16384, 30000, 32767, 49151, 60000,
+        ] {
+            let (s, c) = sin_cos_turn(turn);
+            let (s_opp, c_opp) = sin_cos_turn(turn.wrapping_add(32768));
+            assert!((s + s_opp).abs() < 2e-5, "turn {turn}: {s} vs {s_opp}");
+            assert!((c + c_opp).abs() < 2e-5, "turn {turn}: {c} vs {c_opp}");
+            assert!((-1.0 - 1e-5..=1.0 + 1e-5).contains(&s));
+            assert!((-1.0 - 1e-5..=1.0 + 1e-5).contains(&c));
+        }
+    }
+
+    /// The pinned matrix convention: identity at zero turn/scale 1;
+    /// the quarter turn maps +X to −Z (the documented right-handed
+    /// Y-up convention); scale multiplies; translation adds.
+    #[test]
+    fn instance_columns_identity_quarter_scale_translate() {
+        let identity = InstanceTransform {
+            pos: [0.0, 0.0, 0.0],
+            turn: 0,
+            scale: 1.0,
+        };
+        let cols = instance_columns(&identity);
+        assert_eq!(cols[0], [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(cols[1], [0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(cols[2], [0.0, 0.0, 1.0, 0.0]);
+        assert_eq!(cols[3], [0.0, 0.0, 0.0, 1.0]);
+
+        // The quarter turn: +X -> -Z, +Z -> +X (columns are the
+        // basis images; tolerance covers the Taylor truncation).
+        let quarter = InstanceTransform {
+            pos: [0.0; 3],
+            turn: 16384,
+            scale: 1.0,
+        };
+        let cols = instance_columns(&quarter);
+        assert!(cols[0][0].abs() < 1e-5, "col0.x ~ 0");
+        assert!(
+            (cols[0][2] + 1.0).abs() < 1e-5,
+            "+X maps to -Z: {:?}",
+            cols[0]
+        );
+        assert!(
+            (cols[2][0] - 1.0).abs() < 1e-5,
+            "+Z maps to +X: {:?}",
+            cols[2]
+        );
+
+        // Scale doubles the basis columns; translation lands in
+        // column 3 untouched.
+        let scaled = InstanceTransform {
+            pos: [10.0, 20.0, 30.0],
+            turn: 0,
+            scale: 2.0,
+        };
+        let cols = instance_columns(&scaled);
+        assert_eq!(cols[0], [2.0, 0.0, 0.0, 0.0]);
+        assert_eq!(cols[3], [10.0, 20.0, 30.0, 1.0]);
+    }
+
+    /// Determinism and order sensitivity: the same list packs
+    /// byte-identically; a reordered list packs differently (the
+    /// buffer order IS the draw order — caller-owned, documented).
+    #[test]
+    fn pack_instances_deterministic_and_order_sensitive() {
+        let a = ProxyInstance {
+            transform: InstanceTransform {
+                pos: [1.0, 0.0, 2.0],
+                turn: 1000,
+                scale: 1.0,
+            },
+            tint: [0.5, 0.5, 0.5],
+        };
+        let b = ProxyInstance {
+            transform: InstanceTransform {
+                pos: [-3.0, 0.0, 4.0],
+                turn: 40000,
+                scale: 2.0,
+            },
+            tint: [1.0, 0.0, 0.0],
+        };
+        let first = pack_instances(&[a, b]).unwrap();
+        let second = pack_instances(&[a, b]).unwrap();
+        assert_eq!(first, second, "byte-identical across calls");
+        assert_eq!(first.len(), 2 * INSTANCE_STRIDE);
+        let reordered = pack_instances(&[b, a]).unwrap();
+        assert_ne!(first, reordered, "the instance order is significant");
+    }
+
+    /// The capacity discipline: at-capacity packs; over-capacity is
+    /// the TYPED refusal (never truncation); an invalid instance is
+    /// the typed per-field refusal. Both refusals produce zero bytes.
+    #[test]
+    fn pack_instances_bounded_typed_refusals() {
+        let valid = ProxyInstance {
+            transform: InstanceTransform {
+                pos: [0.0; 3],
+                turn: 0,
+                scale: 1.0,
+            },
+            tint: [1.0; 3],
+        };
+        let at_capacity: Vec<_> = vec![valid; 8];
+        assert!(pack_instances_bounded(&at_capacity, 8).is_ok());
+        let over: Vec<_> = vec![valid; 9];
+        assert_eq!(
+            pack_instances_bounded(&over, 8),
+            Err(InstancePackError::Capacity {
+                capacity: 8,
+                requested: 9
+            })
+        );
+        let mut invalid = valid;
+        invalid.tint = [f32::NAN, 0.0, 0.0];
+        assert_eq!(
+            pack_instances(&[valid, invalid]),
+            Err(InstancePackError::Invalid {
+                index: 1,
+                field: "tint"
+            })
+        );
+        let mut zero_scale = valid;
+        zero_scale.transform.scale = 0.0;
+        assert_eq!(
+            pack_instances(&[zero_scale]),
+            Err(InstancePackError::Invalid {
+                index: 0,
+                field: "scale"
+            })
+        );
+    }
+
+    /// THE CROSS-PLATFORM BYTE PIN: a fixed instance list packs to a
+    /// byte sequence whose FNV-1a hash is this pinned u64 (measured
+    /// actual; Linux/macOS CI asserting the same value IS the
+    /// cross-platform determinism proof — the fingerprint-pin
+    /// discipline applied to the instance buffer). Spot-bytes pin
+    /// the field layout for diagnosability.
+    #[test]
+    fn packed_bytes_fnv_pin() {
+        let instances = [
+            ProxyInstance {
+                transform: InstanceTransform {
+                    pos: [12.5, 0.0, -7.25],
+                    turn: 16384,
+                    scale: 1.0,
+                },
+                tint: [0.9, 0.8, 0.7],
+            },
+            ProxyInstance {
+                transform: InstanceTransform {
+                    pos: [-1.0, 0.0, 3.0],
+                    turn: 49152,
+                    scale: 2.0,
+                },
+                tint: [0.1, 0.2, 0.3],
+            },
+            ProxyInstance {
+                transform: InstanceTransform {
+                    pos: [0.0, 0.0, 0.0],
+                    turn: 0,
+                    scale: 0.5,
+                },
+                tint: [1.0, 1.0, 1.0],
+            },
+        ];
+        let bytes = pack_instances(&instances).unwrap();
+        // FNV-1a over the packed bytes.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for &byte in &bytes {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        assert_eq!(
+            hash, PINNED_FNV,
+            "the packed-bytes hash moved: a packing or math change — an \
+             investigation, never a silent repin"
+        );
+        // The layout spot-check: instance 0's column 3 (translation)
+        // sits at offset 48..60; the tint alpha is 1.0 at offset
+        // 76..80 (tint rgb + alpha occupy 64..80); the reserved
+        // slot is zeros at 80..96.
+        let pos_x = f32::from_le_bytes(bytes[48..52].try_into().unwrap());
+        assert_eq!(pos_x, 12.5);
+        let alpha = f32::from_le_bytes(bytes[76..80].try_into().unwrap());
+        assert_eq!(alpha, 1.0);
+        assert!(
+            bytes[80..96].iter().all(|&b| b == 0),
+            "the reserved slot is zeros"
+        );
+    }
+
+    /// The measured-actual FNV-1a of the pinned instance list above
+    /// (re-measured after the quadrant-1 sign fix — the original
+    /// placeholder-pin run caught the swapped sin/cos binding and the
+    /// sign bug before any of it landed: the pin discipline working
+    /// as designed).
+    const PINNED_FNV: u64 = 14524014449239426066;
+}
