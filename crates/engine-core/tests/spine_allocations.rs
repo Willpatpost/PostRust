@@ -33,6 +33,27 @@
 //! allocation BYTES are pinned: the event count alone could hide
 //! larger allocations behind an unchanged count.
 //!
+//! THREAD ATTRIBUTION (the 2026-11-23 CI-flake corrective): the
+//! counting hook is process-wide, but a measured window is
+//! microseconds of ONE thread's execution. On 2026-11-23 the pin
+//! flaked twice with no runtime change on the tree — macos-15 ARM64
+//! on main (run 45097154875: run-1 COLD inflated +3 events/+208
+//! bytes) and windows-latest locally (reproduced once in 1000 runs:
+//! run-1 WARM inflated +4 events/+900 bytes). Both times the
+//! compared runs are byte-identical code on byte-identical fresh
+//! state, so deterministic engine code cannot be the difference;
+//! the signature (random window, random count, first-scenario only)
+//! is FOREIGN-thread runtime activity landing inside the open
+//! process-wide window. The corrective: the hook counts only
+//! allocations made by the thread that opened the window (a
+//! const-init thread-local flag — allocation-free to read, no lazy
+//! machinery). This extends the attribution discipline above from
+//! "every counted allocation is engine-side" to "every counted
+//! allocation is engine-side AND on the executing thread". The pin
+//! values are UNCHANGED — the attributed baseline measures the same
+//! (18, 6880) / (9, 3024), because engine-side work all runs on
+//! the measuring thread.
+//!
 //! WAVE EQUIVALENCE (the review's first correction): every wave is
 //! scheduled CLOCK-RELATIVE (offsets +1 and +5 from
 //! `spine.clock()`), so the warm wave — an identical second wave on
@@ -56,6 +77,7 @@
 //! or the pins are meaningless.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use engine_core::{
@@ -66,6 +88,29 @@ use engine_core::{
 /// Process-wide allocation-event and allocation-byte counters.
 static ALLOCATION_COUNT: AtomicUsize = AtomicUsize::new(0);
 static ALLOCATION_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+// The measuring thread's window flag (the 2026-11-23 thread-
+// attribution corrective — see the module docs). Const-init
+// thread-local: allocation-free to read, no destructor, no lazy
+// machinery — the hook can query it on every allocation without
+// perturbing the counts. Only the thread running `run_wave` ever
+// sets it, so the hook attributes counted events to the engine's
+// executing thread and excludes foreign-thread runtime activity
+// (the observed CI flake's cause).
+thread_local! {
+    static IN_WINDOW: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Counts one allocation event of `size` bytes IF the allocating
+/// thread is inside a measured window (thread attribution).
+fn count_measured(size: usize) {
+    IN_WINDOW.with(|measured| {
+        if measured.get() {
+            ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+            ALLOCATION_BYTES.fetch_add(size, Ordering::Relaxed);
+        }
+    });
+}
 
 /// Forwarding allocator that only counts allocation events and the
 /// requested byte sizes. The counter increments are atomic and
@@ -87,22 +132,19 @@ struct CountingAllocator;
 // only relaxed atomic increments that cannot reenter allocation.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
-        ALLOCATION_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        count_measured(layout.size());
         // SAFETY: forwarded unchanged to the system allocator.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
-        ALLOCATION_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        count_measured(layout.size());
         // SAFETY: forwarded unchanged to the system allocator.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
-        ALLOCATION_BYTES.fetch_add(new_size, Ordering::Relaxed);
+        count_measured(new_size);
         // SAFETY: forwarded unchanged to the system allocator.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -212,6 +254,9 @@ fn run_wave(spine: &mut Spine<ScenarioWorld>) -> (usize, usize) {
 
     ALLOCATION_COUNT.store(0, Ordering::Relaxed);
     ALLOCATION_BYTES.store(0, Ordering::Relaxed);
+    // The window opens ON THIS THREAD (thread attribution — see the
+    // module docs): only this thread's allocations count from here.
+    IN_WINDOW.with(|measured| measured.set(true));
     for index in 0..4u64 {
         spine
             .schedule(
@@ -229,6 +274,8 @@ fn run_wave(spine: &mut Spine<ScenarioWorld>) -> (usize, usize) {
         .schedule(blocked_spec)
         .expect("blocked scheduling is valid");
     spine.run_ticks(40);
+    // The window closes on this thread before the counters are read.
+    IN_WINDOW.with(|measured| measured.set(false));
     let measured = (
         ALLOCATION_COUNT.load(Ordering::Relaxed),
         ALLOCATION_BYTES.load(Ordering::Relaxed),
