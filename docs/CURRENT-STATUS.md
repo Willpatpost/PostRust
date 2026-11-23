@@ -89,7 +89,13 @@ ARM64) with a five-job CI:
   (zero per-frame allocation — the counters stay constant across
   warmed populated frames), one draw call per populated proxy kind,
   and the per-object reference submission mode kept as the
-  equivalence gate's N-draws side.
+  equivalence gate's N-draws side; the Cycle 6-E2 **indirect
+  submission** on the same path: one `vkCmdDrawIndirect` per
+  populated kind with the instance counts read from GPU memory
+  (the lazily-created per-frame-slot mapped command buffer, the
+  byte-pinned pure command packing, byte-identical output to the
+  direct instanced draw — the mechanism the deferred GPU-culling
+  package authors counts through).
 - **`engine-shell`** — the SDL3 application shell (statically-linked vendored
   SDL 3.4.18; real window + offscreen/dummy modes).
 - **`engine-slice`** — the integration/demo driver: the stdin CLI, `--window`,
@@ -154,7 +160,7 @@ for the combined candidate.
 | **Combined** | **1718** | **1666** |
 
 The macOS job has its own partition. Main has two ignored tests and 33
-result lines. Heavy has eleven ignored tests and 58 result lines. The
+result lines. Heavy has twelve ignored tests and 58 result lines. The
 Cycle 6-E implementation candidate's Linux counts were MEASURED
 locally with the workflow's own awk (1142 main = the 6-E scaffold's
 1138 + 4 platform-uniform engine-renderer tests; heavy passed counts
@@ -173,6 +179,19 @@ prior 569 + the same 6 (platform-uniform inference: the battery's
 pins are margin-based comparisons and the byte pin is pure-IEEE
 packing — to be confirmed by the candidate's CI run). Main is
 untouched (engine-renderer untouched). The
+Cycle 6-E2 indirect-draws package (2026-11-23, riding the population
+branch) grew the main shard 1142 -> 1146 and the renderer release
+battery 65 -> 69 (the `proxy_indirect` command core's four
+platform-uniform tests: the packing determinism/wire layout, the
+command-bytes FNV cross-platform pin, the empty-kind zero counts,
+the slot-region math — pure integer packing, no cfg gates) and the
+heavy shard's ignored count 11 -> 12 (the third `render_instanced`
+gate — the indirect submission's three-way byte-equality, the
+one-time command-buffer allocation pin, an oracle wall through the
+indirect submission — in the same binary); Linux 1146/69 and
+576/12/58 MEASURED locally with the workflow's own awk, Windows
+1095/69 and 575/12/58 = the same platform-uniform deltas (to be
+confirmed by the candidate's CI run). The
 pre-6-E-implementation workflow pins (1138/1087 main, 570/569 heavy
 with 9 ignored / 57 lines) carried the 6-A/6-B/6-E-scaffold history;
 the workflow's comment chains remain the per-batch measurement record.
@@ -655,7 +674,7 @@ not implemented** / **not yet designed**.
 | Rendering (Vulkan presentation) | Partially implemented (prototype-class design) | `engine-renderer`; lavapipe + rig validation; F-03 Step 1 delivered (fail-visible truncation counters), Step-2 policy + F-04 open |
 | Shader/material architecture | Prototype only | Hand-written build-time naga shaders; no material system |
 | GPU resource streaming | Not yet designed | F-04 deferred; host-visible copies only |
-| Instanced/indirect draws | **Implemented (6-E), indirect deferred (6-E2)** | The Cycle 6-E implementation landed 2026-11-23 on the scaffold's deterministic core (the libm-free turn-fraction transforms, the byte-pinned packing, the proxy meshes, the `instanced_proxy.wgsl` shader): the instance-rate vertex input, the lazily-created zero-per-frame-allocation instance buffer (allocations constant across warmed populated frames), one draw call per populated kind (the populated corner route: **26 instances — the full 24-NPC + 2-vehicle placement table, the ladder's population package `corner_population`, pure data with a placement-validity battery and its own packed-bytes FNV pin — in 2 calls**), the N-vs-1 pixel-equivalence gate (`tests/render_instanced.rs`, byte-equal frames for BOTH the 13-instance fixture and the shipped 24+2 table, per-pixel 6-B oracle checks at 0/255 max error on lavapipe), the draw-call pins, and the `--corner --populated` demo mode — see `docs/CYCLE6-6E-BRIEF.md`. The rig measurement commands live in the 6-E PR (lavapipe is correctness evidence only). Indirect draws (`vkCmdDrawIndirect`) are the separate 6-E2 package |
+| Instanced/indirect draws | **Implemented (6-E + 6-E2)** | The Cycle 6-E implementation landed 2026-11-23 on the scaffold's deterministic core (the libm-free turn-fraction transforms, the byte-pinned packing, the proxy meshes, the `instanced_proxy.wgsl` shader): the instance-rate vertex input, the lazily-created zero-per-frame-allocation instance buffer (allocations constant across warmed populated frames), one draw call per populated kind (the populated corner route: **26 instances — the full 24-NPC + 2-vehicle placement table, the ladder's population package `corner_population`, pure data with a placement-validity battery and its own packed-bytes FNV pin — in 2 calls**), the N-vs-1 pixel-equivalence gate (`tests/render_instanced.rs`, byte-equal frames for BOTH the 13-instance fixture and the shipped 24+2 table, per-pixel 6-B oracle checks at 0/255 max error on lavapipe), the draw-call pins, and the `--corner --populated` demo mode — see `docs/CYCLE6-6E-BRIEF.md`. The Cycle 6-E2 package (2026-11-23, riding the population branch) added the indirect submission: `ProxyDrawMode::Indirect` — one `vkCmdDrawIndirect` per populated kind with the counts read from GPU memory, the pure byte-pinned `proxy_indirect` command core (FNV cross-platform pin, `firstVertex`/`firstInstance` pinned zero — no `drawIndirectFirstInstance` feature), a lazily-created per-frame-slot mapped command buffer (one-time +1 device_memory, pinned; the direct path's counters untouched), byte-equal frames across per-object/direct/indirect submissions (the third `render_instanced` gate, with an oracle wall through the indirect path), and the populated route's default submission now indirect (`--proxy-instanced` selects the direct 6-E shape). GPU-side count AUTHORSHIP (compute/culling writing the counts) remains deferred to the GPU-culling package. The rig measurement commands live in the 6-E/6-E2 PRs (lavapipe is correctness evidence only) |
 | NPC/world representation (LOD) | Partially implemented | The region director, four LOD levels, activation/reconstruction — validated at 1000 NPCs / 8 regions; game-scale behaviors undesigned |
 | Physics and collision | Prototype only | The Cycle-1 kinematic player prototype (`engine-core` player module: swept-AABB collision, fixed-step movement, FP/TP cameras) — headless/offscreen validated, collide-what-you-see; reversible and explicitly NOT a ratified production physics backend (§8) |
 | Combat and gameplay systems | Partially implemented (demo-scale prototype, validated) | The Cycle 2–5 line: `engine-core` combat resolution (`resolve_attack`, pure, allocation-free) + the adversary cadence model + the encounter composition with cover/HUD/cues in `engine-slice` — pinned by the combat_world (21) and encounter_world (30) batteries with byte-identical scenario traces; game-scale gameplay systems (progression, economy, AI beyond the cadence prototype) remain undesigned |

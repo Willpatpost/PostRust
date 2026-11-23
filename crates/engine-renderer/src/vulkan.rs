@@ -60,6 +60,22 @@
 //! destroyed by the proxy state), bound with the corner's per-slot FrameParams
 //! dynamic offset.
 //!
+//! **Indirect proxy commands (6-E2)** — the proxy state's OPTIONAL indirect
+//! member (one level lazier: created at the first INDIRECT-mode populated
+//! frame only, so the direct path's allocation pins pay nothing) is one
+//! persistently mapped host-visible INDIRECT_BUFFER with one 32-byte command
+//! block per frame slot (npc command at +0, vehicle at +16 — the repack's
+//! fixed kind order; the bytes are the pure `proxy_indirect` packing with
+//! `firstVertex`/`firstInstance` pinned zero, so no `drawIndirectFirstInstance`
+//! feature is required). The write discipline is the instance buffer's own:
+//! slot S's block is written only inside the frame flow that first waited
+//! slot S's fence, immediately before recording the `vkCmdDrawIndirect`
+//! (drawCount 1 per kind) that reads it; the HOST_COHERENT write is visible
+//! to that submission's draws by queue-submit ordering. A pipeline
+//! replacement re-ensures the command buffer with the same resources
+//! (finding A). The buffer is destroyed only while the device is idle,
+//! after the draws reading it.
+//!
 //! **Destruction order** — `device_wait_idle` → command buffers/pool,
 //! present semaphores, acquire semaphores, fences, query pool → swapchain
 //! framebuffers, views, per-image depth views/images/memories, swapchain
@@ -2955,8 +2971,17 @@ pub(crate) fn render_frame(
     // the unpopulated corner path pays nothing. Structural invariant:
     // a proxy upload implies corner resources (the safe layer's
     // scene-preference gate), hence `ctx.corner` in the pattern.
+    // The 6-E2 indirect command state is one level lazier still:
+    // created at the first INDIRECT-mode populated frame only, so
+    // the direct instanced path's allocation pins (the 6-E gates)
+    // pay nothing for the mechanism they never touch.
     if proxy.is_some() && ctx.corner.is_some() {
         pipes.ensure_proxy_resources(ctx)?;
+        if proxy.is_some_and(|upload| matches!(upload.mode, crate::ProxyDrawMode::Indirect))
+            && let Some(proxy_state) = pipes.proxy.as_mut()
+        {
+            proxy_state.ensure_indirect(ctx)?;
+        }
     }
 
     // A previous present reported suboptimal — recreate before drawing
@@ -3168,9 +3193,20 @@ pub(crate) fn render_frame(
     // region/overlay discipline — the previous submission through
     // this slot, which read this region, has completed). The bytes
     // are the safe layer's repacked population (≤ the region's
-    // bound by the repack's validated capacity).
+    // bound by the repack's validated capacity). The 6-E2 indirect
+    // command block follows the identical discipline in the same
+    // place: this slot's 32 command bytes (the pure proxy_indirect
+    // packing of the pinned mesh vertex counts and this frame's
+    // per-kind counts), written only in the indirect mode (the
+    // state exists — the frame flow's ensure ran before the fence
+    // wait, outside command recording).
     if let (Some(proxy_state), Some(upload)) = (&pipes.proxy, proxy) {
         unsafe { proxy_state.write_slot(slot, upload.bytes) };
+        if let Some(indirect) = proxy_state.indirect.as_ref()
+            && matches!(upload.mode, crate::ProxyDrawMode::Indirect)
+        {
+            unsafe { indirect.write_slot(slot, upload.npc_count, upload.vehicle_count) };
+        }
     }
 
     // Disjoint window-depth intervals allow self-occlusion in both layers
@@ -3271,7 +3307,7 @@ pub(crate) fn render_frame(
                 debug_assert_eq!(
                     recorded,
                     proxy_draw::proxy_draw_call_count(
-                        upload.per_instance,
+                        upload.mode,
                         upload.npc_count,
                         upload.vehicle_count
                     )
@@ -3634,12 +3670,25 @@ fn recreate_swapchain(
         // (the same finding-A discipline — the replacement pipeline
         // reads the same lazily-created mesh VBOs and instance
         // buffer, so a half-installed state must never draw through
-        // null handles).
-        if pipes.proxy.is_some()
-            && let Err(error) = replacement.ensure_proxy_resources(ctx)
-        {
-            replacement.destroy(ctx);
-            return Err(error);
+        // null handles). The 6-E2 indirect command state re-ensures
+        // the same way when the outgoing state owned one: the
+        // replacement's indirect draws read the same lazily-created
+        // command buffer.
+        if pipes.proxy.is_some() {
+            if let Err(error) = replacement.ensure_proxy_resources(ctx) {
+                replacement.destroy(ctx);
+                return Err(error);
+            }
+            if pipes
+                .proxy
+                .as_ref()
+                .is_some_and(|state| state.indirect.is_some())
+                && let Some(state) = replacement.proxy.as_mut()
+                && let Err(error) = state.ensure_indirect(ctx)
+            {
+                replacement.destroy(ctx);
+                return Err(error);
+            }
         }
         Some(replacement)
     } else {
@@ -3732,6 +3781,7 @@ mod policy_tests {
     /// per-object reference.
     #[test]
     fn proxy_kind_ranges_and_draw_call_counts() {
+        use crate::ProxyDrawMode;
         use proxy_draw::{ProxyKind, kind_instance_range, proxy_draw_call_count};
 
         let stride = crate::proxy_instances::INSTANCE_STRIDE as u64;
@@ -3747,16 +3797,36 @@ mod policy_tests {
         assert_eq!(vehicle.start * stride, 3 * stride);
 
         // The pinned integers: the populated corner scene's proxy
-        // submission count under each mode.
-        assert_eq!(proxy_draw_call_count(false, 24, 2), 2, "one per kind");
-        assert_eq!(proxy_draw_call_count(true, 24, 2), 26, "one per instance");
+        // submission count under each mode. The 6-E2 indirect mode
+        // records the SAME count as the direct instanced mode — the
+        // GPU-side count changes where N lives, never how many draws
+        // submit (the headline must not regress).
         assert_eq!(
-            proxy_draw_call_count(false, 0, 2),
+            proxy_draw_call_count(ProxyDrawMode::Instanced, 24, 2),
+            2,
+            "one per kind"
+        );
+        assert_eq!(
+            proxy_draw_call_count(ProxyDrawMode::Indirect, 24, 2),
+            2,
+            "the indirect mode: still one per kind"
+        );
+        assert_eq!(
+            proxy_draw_call_count(ProxyDrawMode::PerInstance, 24, 2),
+            26,
+            "one per instance"
+        );
+        assert_eq!(
+            proxy_draw_call_count(ProxyDrawMode::Indirect, 0, 2),
             1,
             "empty kind draws nothing"
         );
-        assert_eq!(proxy_draw_call_count(true, 0, 0), 0);
-        assert_eq!(proxy_draw_call_count(false, 0, 0), 0, "empty population");
+        assert_eq!(proxy_draw_call_count(ProxyDrawMode::PerInstance, 0, 0), 0);
+        assert_eq!(
+            proxy_draw_call_count(ProxyDrawMode::Indirect, 0, 0),
+            0,
+            "empty population"
+        );
     }
 
     #[test]

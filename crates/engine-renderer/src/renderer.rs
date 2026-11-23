@@ -45,12 +45,18 @@ pub struct ProxyPopulation<'a> {
 /// draw per INSTANCE through the same shader, bytes, and descriptor
 /// sets (the pre-6-E per-object submission shape, kept as the
 /// N-draws reference for the pixel-equivalence gate and the
-/// before/after draw-call evidence — production paths never set it).
+/// before/after draw-call evidence — production paths never set it);
+/// `Indirect` — the 6-E2 mechanism: one `vkCmdDrawIndirect` per
+/// populated kind with the instance count read from GPU memory at
+/// draw time (the packed [`crate::proxy_indirect`] command block),
+/// byte-identical output to `Instanced` — the submission stops
+/// carrying the count so a later GPU pass can author it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProxyDrawMode {
     #[default]
     Instanced,
     PerInstance,
+    Indirect,
 }
 
 /// Actual dynamic uploads and draws recorded in this frame.
@@ -66,8 +72,10 @@ pub struct GeometryStats {
     pub overlay_omitted: u32,
     pub dynamic_draw_calls: u32,
     /// Proxy draw calls recorded this frame (the 6-E headline: one
-    /// per populated kind in [`ProxyDrawMode::Instanced`], one per
-    /// instance in [`ProxyDrawMode::PerInstance`]). Counts proxy
+    /// per populated kind in [`ProxyDrawMode::Instanced`] and
+    /// [`ProxyDrawMode::Indirect`] alike — the GPU-side count
+    /// changes where N lives, never the draw-call count — and one
+    /// per instance in [`ProxyDrawMode::PerInstance`]). Counts proxy
     /// submission only — the corner mesh's own material draws are
     /// not included. Zero on unpopulated frames.
     pub proxy_draw_calls: u32,
@@ -413,7 +421,10 @@ impl Renderer {
     /// Cycle 6-E path: the instances are repacked into the retained
     /// buffer (zero per-frame allocation after the first populated
     /// frames) and submitted per [`ProxyDrawMode`] — one draw call
-    /// per populated kind in the production `Instanced` mode. The
+    /// per populated kind in the production `Instanced` mode and the
+    /// 6-E2 `Indirect` mode alike (the latter reads the instance
+    /// counts from the GPU-side command block — see
+    /// [`crate::proxy_indirect`]). The
     /// population is validated BEFORE any frame state is touched: a
     /// typed refusal (over-capacity total, invalid field, or a
     /// material index outside the corner table) renders nothing and
@@ -454,7 +465,7 @@ impl Renderer {
             vehicle_count: population.vehicle.len() as u32,
             npc_material: population.npc_material,
             vehicle_material: population.vehicle_material,
-            per_instance: matches!(self.proxy_draw_mode, ProxyDrawMode::PerInstance),
+            mode: self.proxy_draw_mode,
         };
         let outcome = vulkan::render_frame(
             &mut self.ctx,
