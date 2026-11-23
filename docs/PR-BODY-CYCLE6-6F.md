@@ -317,3 +317,46 @@ Every commit beyond `96dee7c` is documentation only — `git diff
 --name-only 96dee7c..HEAD` lists only
 `docs/OVERNIGHT-HANDOFF-2026-11-23.md` and this file; no code, no
 workflow, no pins.
+
+---
+
+### Session 7 — the linchpin gate's third direct run (2026-11-23, the ~11:54 UTC session)
+
+The evidence table's one remaining asymmetry after session 6: this
+branch's graphical linchpin (`render_shadows`, the known-answer +
+pixel-equivalence gate) had two direct measurements (session 3's
+final-tree run, session 4's tip re-run) while the population
+branch's linchpin carried three. Session 7 closed the asymmetry —
+the gate run a third time, directly on this branch's tip (`e858f40`
+at run time; the code tree is exactly `96dee7c`'s — every commit
+above the package commit is documentation only), in the scoped
+environment (the lavapipe variables on the gate command only, per
+session 4's operational lesson — the lesson this branch's own lane
+established):
+
+| Assertion (MEASURED this session, this tip) | Result |
+|---|---|
+| `render_shadows --ignored` | **1 passed, rc=0 — every pinned evidence line reproduced exactly** |
+| the map known-answer | 1048576 texels, 1006779 compared, 41797 edge-skipped (3.99%), **0 mismatches, max \|Δdepth\| 2.68e-7** — against the CPU raycaster |
+| the pixel oracles | ground patch [0.0, 0.0] (shadowed): 57600 pixels, max RGB error 0/255; ground patch [12.0, 3.0] (lit): 57600 pixels, max RGB error 1/255 |
+| the visible-change guard | 65536 of 65536 frame pixels changed by the shadow (both directions guarded) |
+| the allocation gate | warmed `AllocationStats { device_memory: 17, … }` constant across warmed frames |
+| the replacement lifecycle | the known-answer re-verified after pipeline replacement: 1006779 / 41797 / 0 / 2.68e-7, identical |
+
+Raw log: `/tmp/opencode/session7-6f-gate.log` on the pod (a /tmp
+path — may not survive a pod restart; the numbers here are the
+durable record). The watcher payload and its `~/push-handoff` twin
+were regenerated from this file byte-for-byte after this section
+landed. The linchpin now holds three direct measurements on this
+branch's code tree, matching the population branch's count.
+
+**The tip statement (supersedes the one above):** the pushed tip is
+this branch's head = the package commit `96dee7c` + the run-wide
+handoff doc (`4b5b228`) + session 4's addendum (`1b05252`) +
+session 5's payload-sync commit (`d53fa2e`) + session 6's
+heavy-shard verification addendum + session 7's linchpin
+verification addendum (the commit adding this section). Every
+commit beyond `96dee7c` is documentation only — `git diff
+--name-only 96dee7c..HEAD` lists only
+`docs/OVERNIGHT-HANDOFF-2026-11-23.md` and this file; no code, no
+workflow, no pins.

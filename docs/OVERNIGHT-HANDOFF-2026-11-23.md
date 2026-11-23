@@ -479,3 +479,33 @@
 //! commit. (The population branch's larger gap — main AND heavy —
 //! and the 6-E heavy gap were closed earlier this session; the
 //! 6-E2 heavy gap follows in this session's next commit.)
+
+//! ---
+
+//! ## SESSION 7 ADDENDUM — the linchpin gate's third direct run
+//! (2026-11-23, ~11:54 UTC)
+//!
+//! The blocker, re-probed first: unchanged (dead askpass sockets,
+//! no write credentials, `git push --dry-run` exit 128; anonymous
+//! read still works — `origin/main` still `1fe89b7`, the merge
+//! base, so nothing has drifted underneath the branches). The
+//! delivery machinery verified healthy and then HARDENED (see the
+//! population branch's session-7 note for the run-wide record).
+//! This branch's evidence asymmetry — its graphical linchpin had
+//! two direct measurements (sessions 3, 4) vs the population
+//! branch's three — closed this session: `render_shadows
+//! --ignored` run a THIRD time directly on this tip (`e858f40` at
+//! run time; the code tree exactly `96dee7c`'s), lavapipe
+//! variables scoped to the gate command only (the discipline this
+//! lane's own polluted-env FAIL established): **1 passed, rc=0,
+//! every pinned line reproduced — the map known-answer 1006779
+//! compared / 41797 edge-skipped (3.99%) / 0 mismatches / max
+//! |Δdepth| 2.68e-7 against the CPU raycaster; the pixel oracles
+//! 0/255 (shadowed patch) and 1/255 (lit patch); 65536/65536 frame
+//! pixels changed; warmed device_memory 17 constant; the
+//! replacement lifecycle re-verified with the identical
+//! known-answer.** fmt `--check` and clippy `-D warnings` (release
+//! form) clean on the committed tip. Raw log:
+//! `/tmp/opencode/session7-6f-gate.log`; the PR body's Session 7
+//! section carries the table, and the watcher payload + twin were
+//! regenerated from it byte-for-byte after the commit.
