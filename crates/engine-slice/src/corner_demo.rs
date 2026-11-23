@@ -274,7 +274,10 @@ pub fn demo_bias() -> engine_renderer::shadows::ShadowBias {
 // config struct would restructure both packages' code inside a merge
 // resolution — the render_frame precedent (vulkan.rs) is the allow.
 // Era 1's free-look grows the list by ONE parameter (its options
-// struct — the mode's two CLI fields grouped — not two flat flags).
+// struct — the mode's two CLI fields grouped — not two flat flags),
+// the sky layer by one bool, the day/night cycle by one Option, and
+// the post chain by one bool (its own setting is data-free — the
+// sticky renderer flag is the whole mode).
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     night: bool,
@@ -288,6 +291,7 @@ pub fn run(
     free_look: Option<FreeLookOptions>,
     sky: bool,
     day_night: Option<f32>,
+    post: bool,
 ) -> Result<(), String> {
     let mut app = ShellApp::new(ShellConfig {
         title: "One Corner of the City".into(),
@@ -339,6 +343,21 @@ pub fn run(
         ProxyDrawMode::Indirect
     };
     renderer.set_proxy_draw_mode(proxy_mode);
+    // Era 1 package 6: the post chain (the sticky renderer setting
+    // — the HDR render-target chain + the bloom mips + the ACES
+    // composite, post.rs's equations through the real render path).
+    // Composes with EVERY corner flag (the sky's disc is the bloom
+    // feeder the gate pins); the region path stays postless (the
+    // setting's documented scope).
+    renderer.set_post(post);
+    if post {
+        println!(
+            "post: the HDR chain (R16G16B16A16_SFLOAT scene target -> 1/{} bloom mips -> the \
+             ACES composite, bloom strength {})",
+            engine_renderer::post::BLOOM_DOWNSAMPLE,
+            engine_renderer::post::BLOOM_STRENGTH
+        );
+    }
     // Era 1 package 3: the sky layer, driven from atmosphere_at's
     // palettes (the endpoints are BIT-EQUAL to the day/night
     // presets — the pinned special case; the day/night cycle

@@ -114,15 +114,32 @@ ARM64) with a five-job CI:
   sticky `set_sky` setting): the fullscreen-triangle sky pass drawn
   first behind the scene with no depth interaction (`sky.wgsl`
   mirroring `sky.rs`'s equation; the palette and disc direction from
-  `atmosphere_at`; the CPU-computed inverse view-projection driving
-  the ray reconstruction) — lazily created, and a fully-covered
-  frame stays byte-identical with the sky on and off. The Era-1
-  **day/night cycle** (`--corner --day-night <seconds>`): the
-  triangle-wave clock (`sky::cycle_position`) advances the
-  atmosphere with the demo clock — the lit scene's light parameters
-  and the sky layer ride the same `atmosphere_at` frame each frame
-  (the free-look path uses the wall clock; the scripted route the
-  presented-frame count at its reference 60 Hz, deterministic).
+  `atmosphere_at`; the ray reconstructed PER-FRAGMENT from the
+  CPU-computed inverse view-projection — the package-6 first-run
+  correction: the original per-vertex form affine-interpolated
+  denormalized directions and never rendered the disc) — lazily
+  created, and a fully-covered frame stays byte-identical with the
+  sky on and off. The Era-1 **day/night cycle** (`--corner
+  --day-night <seconds>`): the triangle-wave clock
+  (`sky::cycle_position`) advances the atmosphere with the demo
+  clock — the lit scene's light parameters and the sky layer ride
+  the same `atmosphere_at` frame each frame (the free-look path
+  uses the wall clock; the scripted route the presented-frame count
+  at its reference 60 Hz, deterministic). The Era-1 **post chain**
+  (`--corner --post`, the sticky `set_post` setting; package 6, the
+  ladder's architectural step): the HDR render-target chain — the
+  scene pass into an offscreen R16G16B16A16_SFLOAT target (+ its
+  depth attachment, per frame slot), the 1/4-res bloom mip chain
+  (the bright-passed 2×2 bilinear-footprint box downsample, then
+  the separable [1,4,6,4,1]/16 blur, `bloom.wgsl` mirroring
+  `post.rs`'s chain), and the composite pass (post.wgsl's ACES
+  tonemap + the bloom add-back at `post.rs::BLOOM_STRENGTH`) into
+  the swapchain — textureLoad-exact through the whole chain (the
+  lavapipe gate pins presented pixels against post.rs's reference
+  at 0/255 measured), lazily created with per-frame-slot
+  ping-pong images (the shadow-map discipline) and NO per-frame
+  uniforms (the PostParams block is extent-static), composes with
+  every corner flag, and the postless path stays byte-identical.
 - **`engine-shell`** — the SDL3 application shell (statically-linked vendored
   SDL 3.4.18; real window + offscreen/dummy modes).
 - **`engine-slice`** — the integration/demo driver: the stdin CLI, `--window`,
@@ -231,6 +248,43 @@ at 552) become the population path's shipped meshes; the
 re-measured for the new counts and the three stroller placements
 nudged for the true 0.36 m footprint (every count UNCHANGED — the
 repins are values inside existing tests, no new test anywhere).
+  The Era-1 post package (2026-11-23): the main shard grew 1179 ->
+  1187 and the renderer release battery 102 -> 110 (post.rs's chain
+  reference - eight platform-uniform tests: the exactly-zero bright
+  pass below one, the floor-division mip extent, the bilinear-
+  footprint downsample box, the per-channel knee feed, the clamped
+  blur taps and uniform-field preservation, the bilinear upsample's
+  exact weights and border clamp, the composite equation, and the
+  full-chain hand-computed 8x8 scene); the heavy shard's ignored
+  count 15 -> 16 and result lines 60 -> 61 (the new
+  tests/render_post.rs binary's ONE #[ignore]d gate - the
+  known-answer pixels vs post.rs's chain at 0/255 MEASURED on
+  lavapipe, the bloom-ring lift, the postless byte-identity, the
+  one-time allocation delta, the composition smokes). The Era-1
+  gates' FIRST-RUN CORRECTIONS (2026-11-23, the post package's
+  session): every Era-1 lavapipe gate (soft shadows, sky,
+  population-v2's re-pins) had never executed anywhere - their CI
+  steps live in the parked workflow commits and the prior sessions
+  measured shard counts only. First execution on the re-provisioned
+  pod exposed and fixed: the sky pass's affine-interpolated
+  per-vertex rays (the disc never rendered; now reconstructed
+  per-fragment, 0/255 against the CPU rays), the sky gate's
+  occluded sun/moon poses (the street-level origin aims the sun
+  INTO the southwest building's silhouette; the poses moved above
+  the masses), atmosphere_at's unnormalized night disc direction
+  (0.9055 long, violating the documented unit contract - the moon
+  never met the disc threshold), the sky gate's capture-buffer
+  allocation pin (+1 memory, the first capture's lazy destination),
+  the two render_shadows tests' parallel SDL init race (the
+  sdl_lock serialization, render_instanced's pattern),
+  population-v2's MISSED re-pins in the integration battery (the
+  indirect oracle wall still carried the v1 rectangle 0.24 x
+  [0.85, 1.45] - its frame includes the v2 pelvis/torso dead zone;
+  the command-word defense-in-depth copy still carried the v1
+  108/72 mesh counts), and post.wgsl's binding-1 mip aliasing the
+  scene target through the build's atlas-share binding map (moved
+  to binding 4, the 6-F shadow map's convention). Every Era-1
+  graphical gate now executes and passes on the pod's lavapipe.
 Cycle 6-F candidate's Linux counts were MEASURED locally with the
 workflow's own awk (1146 main = the pre-6-F 1138 + 8 platform-uniform
 engine-renderer tests — the shadow core's full battery; heavy passed
