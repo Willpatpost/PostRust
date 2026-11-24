@@ -42,6 +42,7 @@
 //! ```
 
 use engine_renderer::lit_scene::{LightParams, day_preset, lit_surface_color, materials};
+use engine_renderer::populated_meshes::{WHEEL_SEGMENTS, sedan_mesh};
 use engine_renderer::proc_texture::{TEXTURE_SIZE, procedural_texture};
 use engine_renderer::proxy_instances::{INSTANCE_STRIDE, InstanceTransform, ProxyInstance};
 use engine_renderer::{
@@ -162,6 +163,7 @@ fn capture_populated(
         .unwrap();
     assert!(frame.presented, "the populated frame presented");
     let image = renderer.take_frame_capture().unwrap().unwrap();
+
     assert_eq!((image.width, image.height), size);
     (image, frame.geometry.proxy_draw_calls)
 }
@@ -1384,5 +1386,451 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
         "indirect gate: {total} instances, per-object 26 == direct 2 == indirect 2 draws, \
          byte-equal frames, oracle wall within 2/255 through the indirect submission, \
          one-time command-buffer allocation, zero per-frame allocation across warmed frames"
+    );
+}
+
+/// FINDING 11'S OBLIQUE WHEEL FIXTURE — the review's check: "Include
+/// an oblique view that exposes the outside tire and both axle
+/// orientations." The winding fix (commit 13bd6a0) made every wheel
+/// triangle CCW from the outside; the geometric proof is
+/// `wheel_normals_agree_with_winding` (populated_meshes' own unit
+/// battery). THIS fixture is the pixel half: an oblique dead-on view
+/// of the tread's outside band, plus dead-on views of BOTH cap faces
+/// (the ±X axle orientations), each probed against the CPU oracle at
+/// the actual surface.
+///
+/// Why it discriminates the historic bug without a full-scene
+/// raster: the historic scaffold wound the side quads so their
+/// geometric normals pointed INWARD — an outside view culled the
+/// NEAR surface and drew the FAR one — and gave both caps one rim
+/// traversal, so one cap's geometric normal opposed its authored
+/// ±X normal (that cap culled from its own outside). Under
+/// `day_preset` (dir_toward_light has +0.707 Y, −0.5 X) the near and
+/// far surfaces of the probed regions sit on OPPOSITE sides of the
+/// light: the tread's top-outside band has N·L ≈ +0.52 while its
+/// antipodal (bottom) quad clamps to 0; the −X cap has N·L = +0.5
+/// while the +X orientation clamps to 0. A regression to the
+/// historic winding would put the FAR surface's color (or whatever
+/// is behind a culled cap) at these probes and fail the equality
+/// below — the self-discrimination controls assert exactly that
+/// separation, so the fixture can never silently degrade into an
+/// ambient-only pass.
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
+fn oblique_wheel_views_expose_the_outside_tire_and_both_cap_orientations() {
+    let _guard = sdl_lock();
+
+    // --- the sedan's wheel geometry, derived through the mesh's own
+    // primitives (sin_cos_turn — the same libm-free circle wheel()
+    // uses), then PINNED against sedan_mesh()'s actual vertices: the
+    // derivation must match the mesh exactly, never trust its own
+    // arithmetic.
+    const R: f32 = 0.35;
+    const W: f32 = 0.25;
+    let wheel = [0.85, 0.35, 1.45]; // the +X/+Z wheel (local = world: the identity instance below)
+    let x_lo = wheel[0] - W / 2.0;
+    let x_hi = wheel[0] + W / 2.0;
+    let turn_of = |i: u16| (u32::from(i) * 65_536 / u32::from(WHEEL_SEGMENTS)) as u16;
+    // One ring point's (y, z) offsets and radial normal, exactly as
+    // wheel() emits them: ring_point = [R·c, R·s], normal = [0, c, s].
+    let ring = |i: u16| -> ([f32; 2], [f32; 2]) {
+        let (s, c) = engine_renderer::proxy_instances::sin_cos_turn(turn_of(i));
+        ([R * c, R * s], [c, s])
+    };
+    let ([y0, z0], [ny0, nz0]) = ring(0); // the tread segment at the top rim
+    let ([y1, z1], [ny1, nz1]) = ring(1);
+    let ([_, _], [nyf0, nzf0]) = ring(5); // the ANTIPODAL segment (the historic far surface)
+    let ([_, _], [nyf1, nzf1]) = ring(6);
+
+    // The derivation pin: every distinct corner of the tread segment
+    // (the mesh emits a, d, c, b — these four) and both caps' center
+    // vertices exist in sedan_mesh() with exactly these positions
+    // and normals.
+    let mesh = sedan_mesh();
+    let in_mesh = |pos: [f32; 3], normal: [f32; 3], what: &str| {
+        assert!(
+            mesh.iter().any(|v| v.pos == pos && v.normal == normal),
+            "the derived {what} (pos {pos:?}, normal {normal:?}) is not in sedan_mesh() — \
+             the derivation is wrong, never the mesh"
+        );
+    };
+    in_mesh(
+        [x_lo, wheel[1] + y0, wheel[2] + z0],
+        [0.0, ny0, nz0],
+        "tread corner a",
+    );
+    in_mesh(
+        [x_lo, wheel[1] + y1, wheel[2] + z1],
+        [0.0, ny1, nz1],
+        "tread corner d",
+    );
+    in_mesh(
+        [x_hi, wheel[1] + y1, wheel[2] + z1],
+        [0.0, ny1, nz1],
+        "tread corner c",
+    );
+    in_mesh(
+        [x_hi, wheel[1] + y0, wheel[2] + z0],
+        [0.0, ny0, nz0],
+        "tread corner b",
+    );
+    // The caps' authored ±X normals — the fixture's premise (the −X
+    // cap declares −X; the historic shared traversal broke exactly this).
+    in_mesh([x_hi, wheel[1], wheel[2]], [1.0, 0.0, 0.0], "+X cap center");
+    let minus_wheel = [-0.85, 0.35, 1.45]; // the −X-side wheel
+    in_mesh(
+        [minus_wheel[0] - W / 2.0, minus_wheel[1], minus_wheel[2]],
+        [-1.0, 0.0, 0.0],
+        "−X cap center",
+    );
+
+    // --- the renderer: one sedan at the identity pose (turn 0, scale
+    // 1, origin at the intersection center — local space IS world
+    // space for the derivation), three dead-on captures.
+    let mut app = ShellApp::new(ShellConfig {
+        title: "finding-11 oblique wheel".into(),
+        width: 256,
+        height: 256,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    })
+    .unwrap();
+    let mut renderer = Renderer::new(
+        app.window(),
+        RenderConfig {
+            demo_scene: DemoScenePreference::Corner,
+            validation: ValidationPreference::On,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let size = app.window().size_in_pixels();
+    assert_eq!(size, (256, 256));
+    assert!(renderer.stats().validation_active);
+    let _ = app.frame();
+
+    let sedan = [ProxyInstance {
+        transform: InstanceTransform {
+            pos: [0.0, 0.0, 0.0],
+            turn: 0,
+            scale: 1.0,
+        },
+        tint: [1.0, 1.0, 1.0],
+    }];
+    let population = populated(&[], &sedan, 1, 0);
+    let light = day_preset();
+    let mat = materials()[0]; // the population's vehicle material (asphalt: tires sit on it)
+    let texture = procedural_texture(mat.texture);
+    let texels = TEXTURE_SIZE as usize;
+    let albedo_at = |uv: [f32; 2]| -> [f32; 3] {
+        let [tx, ty] = [
+            (uv[0] / 4.0).rem_euclid(1.0) * TEXTURE_SIZE as f32,
+            (uv[1] / 4.0).rem_euclid(1.0) * TEXTURE_SIZE as f32,
+        ]
+        .map(|m| m.floor() as usize);
+        let index = 4 * (ty * texels + tx);
+        std::array::from_fn(|ch| texture[index + ch] as f32 / 255.0)
+    };
+    let quantized =
+        |rgb: [f32; 3]| -> [u8; 3] { rgb.map(|ch| (255.0 * ch.clamp(0.0, 1.0)).round() as u8) };
+
+    /// The dead-on orthographic camera (the finding-13 fixture's
+    /// pinned layout: matrix[COLUMN][row]; NDC.x = (P−C)·R̂/hw,
+    /// NDC.y = (P−C)·Û/hh, depth = 0.25 − 0.0625·((P−C)·N̂); the eye
+    /// 4 units out along N̂). `right` and `up` name the screen axes.
+    fn dead_on(
+        center: [f32; 3],
+        normal: [f32; 3],
+        right: [f32; 3],
+        up: [f32; 3],
+        hw: f32,
+        hh: f32,
+    ) -> ([[f32; 4]; 4], [f32; 3]) {
+        let len = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        let n = std::array::from_fn(|i| normal[i] / len(normal));
+        let r = std::array::from_fn(|i| right[i] / len(right));
+        let u = std::array::from_fn(|i| up[i] / len(up));
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let matrix = [
+            [r[0] / hw, u[0] / hh, -0.0625 * n[0], 0.0],
+            [r[1] / hw, u[1] / hh, -0.0625 * n[1], 0.0],
+            [r[2] / hw, u[2] / hh, -0.0625 * n[2], 0.0],
+            [
+                -dot(center, r) / hw,
+                -dot(center, u) / hh,
+                0.25 + 0.0625 * dot(center, n),
+                1.0,
+            ],
+        ];
+        let eye = std::array::from_fn(|i| center[i] + 4.0 * n[i]);
+        (matrix, eye)
+    }
+    let dot3 = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let len3 = |v: [f32; 3]| (dot3(v, v)).sqrt();
+
+    // ================= PROBE 1: the +X cap (one axle orientation).
+    // Dead-on along +X from outside the sedan; the cap's authored
+    // normal is +X (N·L = −0.5 → the diffuse clamps to 0, the
+    // ambient floor). N·L = +0.5 is the probe's own control.
+    let cap_c = [x_hi, wheel[1], wheel[2]];
+    // The screen basis must be RIGHT-handed (right x up = the view
+    // normal, toward the viewer — the finding-13 fixture's
+    // discipline): a left-handed basis MIRRORS the scene and flips
+    // every triangle's apparent winding, culling the very faces the
+    // probe targets (this fixture's first version had right = +Z
+    // here, Z x Y = -X away from the viewer, and the +X cap
+    // disappeared behind the mirrored winding). For the +X view:
+    // right = -Z.
+    let (matrix, eye) = dead_on(
+        cap_c,
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0],
+        [0.0, 1.0, 0.0],
+        0.36,
+        0.36,
+    );
+    renderer.request_frame_capture().unwrap();
+    let frame = renderer
+        .render_corner_populated(&matrix, eye, light, &population, size)
+        .unwrap();
+    assert!(frame.presented && frame.geometry.proxy_draw_calls == 1);
+    let image = renderer.take_frame_capture().unwrap().unwrap();
+    let mut stats = (0usize, 0u8, u8::MAX);
+    for y in 0..size.1 {
+        for x in 0..size.0 {
+            let fx = (x as f32 + 0.5) * 2.0 / size.0 as f32 - 1.0;
+            let fy = 1.0 - (y as f32 + 0.5) * 2.0 / size.1 as f32;
+            let off = [fx * 0.36, fy * 0.36];
+            if (off[0] * off[0] + off[1] * off[1]).sqrt() > 0.9 * R {
+                continue; // inside the cap disc only (margin off the rim)
+            }
+            let world = [cap_c[0], cap_c[1] + off[1], cap_c[2] - off[0]];
+            // The cap's uv: [ring z offset, ring y offset] over 4.
+            let albedo = albedo_at([world[2] - wheel[2], world[1] - wheel[1]]);
+            let view = std::array::from_fn(|i| eye[i] - world[i]);
+            let expected = quantized(lit_surface_color(albedo, [1.0, 0.0, 0.0], view, mat, light));
+            let control = quantized(lit_surface_color(
+                albedo,
+                [-1.0, 0.0, 0.0],
+                view,
+                mat,
+                light,
+            ));
+            let pixel = image.pixel_rgba(x, y);
+            let error = expected
+                .iter()
+                .zip(pixel)
+                .map(|(e, a)| e.abs_diff(a))
+                .max()
+                .unwrap();
+            assert!(
+                error <= 2,
+                "+X cap pixel ({x},{y}) world {world:?}: expected {expected:?}, got {pixel:?}"
+            );
+            assert_eq!(pixel[3], 255);
+            let delta = expected
+                .iter()
+                .zip(control)
+                .map(|(e, c)| e.abs_diff(c))
+                .max()
+                .unwrap();
+            assert!(
+                delta > 2,
+                "+X cap pixel ({x},{y}): the −X-orientation control {control:?} is within \
+                 tolerance of the +X prediction {expected:?} — the fixture no longer \
+                 discriminates the cap orientation"
+            );
+            stats.0 += 1;
+            stats.1 = stats.1.max(error);
+            stats.2 = stats.2.min(delta);
+        }
+    }
+    assert!(stats.0 > 0, "the +X cap probe selected pixels");
+    println!(
+        "+X cap (one axle orientation): {} probe pixels, max error {}/255, min orientation-control \
+         delta {}/255",
+        stats.0, stats.1, stats.2
+    );
+
+    // ================= PROBE 2: the −X cap (the other axle
+    // orientation — the historic bug's broken cap). Dead-on along −X
+    // at the −X-side wheel; the authored −X normal has N·L = +0.5
+    // (lit) — under the historic shared traversal this cap's
+    // geometric normal was +X and the cap CULLED from this side.
+    let cap_c = [minus_wheel[0] - W / 2.0, minus_wheel[1], minus_wheel[2]];
+    let (matrix, eye) = dead_on(
+        cap_c,
+        [-1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+        0.36,
+        0.36,
+    );
+    renderer.request_frame_capture().unwrap();
+    let frame = renderer
+        .render_corner_populated(&matrix, eye, light, &population, size)
+        .unwrap();
+    assert!(frame.presented && frame.geometry.proxy_draw_calls == 1);
+    let image = renderer.take_frame_capture().unwrap().unwrap();
+    let mut stats = (0usize, 0u8, u8::MAX);
+    for y in 0..size.1 {
+        for x in 0..size.0 {
+            let fx = (x as f32 + 0.5) * 2.0 / size.0 as f32 - 1.0;
+            let fy = 1.0 - (y as f32 + 0.5) * 2.0 / size.1 as f32;
+            let off = [fx * 0.36, fy * 0.36];
+            if (off[0] * off[0] + off[1] * off[1]).sqrt() > 0.9 * R {
+                continue;
+            }
+            let world = [cap_c[0], cap_c[1] + off[1], cap_c[2] + off[0]];
+            let albedo = albedo_at([world[2] - minus_wheel[2], world[1] - minus_wheel[1]]);
+            let view = std::array::from_fn(|i| eye[i] - world[i]);
+            let expected = quantized(lit_surface_color(
+                albedo,
+                [-1.0, 0.0, 0.0],
+                view,
+                mat,
+                light,
+            ));
+            let control = quantized(lit_surface_color(albedo, [1.0, 0.0, 0.0], view, mat, light));
+            let pixel = image.pixel_rgba(x, y);
+            let error = expected
+                .iter()
+                .zip(pixel)
+                .map(|(e, a)| e.abs_diff(a))
+                .max()
+                .unwrap();
+            assert!(
+                error <= 2,
+                "−X cap pixel ({x},{y}) world {world:?}: expected {expected:?}, got {pixel:?} \
+                 (the historic shared-traversal bug culled this cap from its own outside — \
+                 the pixel would be the body or scene behind it, not this lit face)"
+            );
+            assert_eq!(pixel[3], 255);
+            let delta = expected
+                .iter()
+                .zip(control)
+                .map(|(e, c)| e.abs_diff(c))
+                .max()
+                .unwrap();
+            assert!(
+                delta > 2,
+                "−X cap pixel ({x},{y}): control {control:?} ≈ prediction {expected:?}"
+            );
+            stats.0 += 1;
+            stats.1 = stats.1.max(error);
+            stats.2 = stats.2.min(delta);
+        }
+    }
+    assert!(stats.0 > 0, "the −X cap probe selected pixels");
+    println!(
+        "−X cap (the historic bug's broken face, now lit at N·L = +0.5): {} probe pixels, max \
+         error {}/255, min orientation-control delta {}/255",
+        stats.0, stats.1, stats.2
+    );
+
+    // ================= PROBE 3: the tread's OUTSIDE band, oblique.
+    // Dead-on along the top segment's mid radial (18° off vertical —
+    // the oblique view), probing the OUTER strip of the tread that
+    // clears the body (x ∈ [0.955, 0.970]; the body's +X face is at
+    // 0.95). The near surface's interpolated radial normals have
+    // N·L ≈ +0.52; the antipodal (bottom) segment — the FAR surface
+    // the historic inward winding drew instead — clamps to 0.
+    let chord = [y0 - y1, z0 - z1]; // from the θ1 edge toward the θ0 (top) edge
+    let chord_len = len3([0.0, chord[0], chord[1]]);
+    let quad_c = [
+        wheel[0],
+        wheel[1] + (y0 + y1) / 2.0,
+        wheel[2] + (z0 + z1) / 2.0,
+    ];
+    let radial_mid = [0.0, (ny0 + ny1) / 2.0, (nz0 + nz1) / 2.0]; // ≈ radial(18°)
+    let up_hat = [0.0, chord[0] / chord_len, chord[1] / chord_len]; // toward the θ0 edge
+    let (matrix, eye) = dead_on(
+        quad_c,
+        radial_mid,
+        [1.0, 0.0, 0.0],
+        up_hat,
+        W / 2.0,
+        chord_len / 2.0,
+    );
+    renderer.request_frame_capture().unwrap();
+    let frame = renderer
+        .render_corner_populated(&matrix, eye, light, &population, size)
+        .unwrap();
+    assert!(frame.presented && frame.geometry.proxy_draw_calls == 1);
+    let image = renderer.take_frame_capture().unwrap().unwrap();
+    let mut stats = (0usize, 0u8, u8::MAX);
+    for y in 0..size.1 {
+        for x in 0..size.0 {
+            let fx = (x as f32 + 0.5) * 2.0 / size.0 as f32 - 1.0;
+            let fy = 1.0 - (y as f32 + 0.5) * 2.0 / size.1 as f32;
+            // The world position on the quad's plane (dead-on inverse).
+            let world = [
+                quad_c[0] + fx * (W / 2.0),
+                quad_c[1] + fy * (chord_len / 2.0) * up_hat[1],
+                quad_c[2] + fy * (chord_len / 2.0) * up_hat[2],
+            ];
+            // Only the OUTER strip (clear of the body's occlusion)
+            // and the interior of the segment (off both rim edges).
+            if !(0.955..0.970).contains(&world[0]) || fy.abs() > 0.9 {
+                continue;
+            }
+            // The interpolated radial normal: fy = +1 is the θ0 edge
+            // (n0), fy = −1 the θ1 edge (n1) — the same linear
+            // interpolation the rasterizer performs on the flat quad.
+            let f = (1.0 - fy) / 2.0;
+            let near_normal = [0.0, ny0 * (1.0 - f) + ny1 * f, nz0 * (1.0 - f) + nz1 * f];
+            let far_normal = [
+                0.0,
+                nyf0 * (1.0 - f) + nyf1 * f,
+                nzf0 * (1.0 - f) + nzf1 * f,
+            ];
+            // The side quad's uv: [ring z offset, local x] over 4.
+            let albedo = albedo_at([world[2] - wheel[2], world[0]]);
+            let view = std::array::from_fn(|i| eye[i] - world[i]);
+            let expected = quantized(lit_surface_color(albedo, near_normal, view, mat, light));
+            let control = quantized(lit_surface_color(albedo, far_normal, view, mat, light));
+            let pixel = image.pixel_rgba(x, y);
+            let error = expected
+                .iter()
+                .zip(pixel)
+                .map(|(e, a)| e.abs_diff(a))
+                .max()
+                .unwrap();
+            assert!(
+                error <= 2,
+                "tread pixel ({x},{y}) world {world:?}: expected {expected:?}, got {pixel:?} \
+                 (the historic inward winding drew the FAR surface here — its color is the \
+                 control below, beyond tolerance from this expectation)"
+            );
+            assert_eq!(pixel[3], 255);
+            let delta = expected
+                .iter()
+                .zip(control)
+                .map(|(e, c)| e.abs_diff(c))
+                .max()
+                .unwrap();
+            assert!(
+                delta > 2,
+                "tread pixel ({x},{y}): the far-surface control {control:?} is within tolerance \
+                 of the near prediction {expected:?} — the fixture no longer discriminates the \
+                 historic winding"
+            );
+            stats.0 += 1;
+            stats.1 = stats.1.max(error);
+            stats.2 = stats.2.min(delta);
+        }
+    }
+    assert!(stats.0 > 0, "the tread probe selected pixels");
+    println!(
+        "tread outside band (the oblique view, 18° off vertical): {} probe pixels on the \
+         body-clearing strip, max error {}/255, min near-vs-far delta {}/255",
+        stats.0, stats.1, stats.2
+    );
+
+    assert_eq!(
+        renderer.stats().validation_errors,
+        0,
+        "validation: {:?}",
+        renderer.stats().recent_validation
     );
 }
