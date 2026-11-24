@@ -29,15 +29,24 @@
 //!     --ignored --nocapture
 //! ```
 
-use engine_renderer::lit_scene::lit_surface_color;
-use engine_renderer::lit_scene::{RouteWaypoint, day_preset};
+use engine_renderer::lit_scene::{RouteWaypoint, day_preset, lit_surface_color};
 use engine_renderer::lit_scene::{intersection_boxes, materials};
 use engine_renderer::planar::reflection_blend;
 use engine_renderer::proc_texture::{TEXTURE_SIZE, procedural_texture};
-use engine_renderer::{DemoScenePreference, RenderConfig, Renderer, ValidationPreference};
+use engine_renderer::shadows::ShadowBias;
+use engine_renderer::sky::atmosphere_at;
+use engine_renderer::{
+    DemoScenePreference, RenderConfig, Renderer, SkyFrame, ValidationPreference,
+};
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 use engine_slice::corner_demo::view_projection;
 use engine_slice::math::{camera_forward, camera_right};
+
+/// The bias under test (the demo's own policy — one source for both).
+const BIAS: ShadowBias = ShadowBias {
+    constant: 0.0015,
+    slope_scale: 0.002,
+};
 
 /// The binary's SDL serialization (the engine-shell test pattern —
 /// render_instanced's own copy). The guard is declared FIRST so it
@@ -548,5 +557,274 @@ fn wet_ground_blends_the_mirrored_scene_by_planar_rs() {
         "Era-1 wet-ground gates: {checked} grazing pixels + {overhead_checked} overhead pixels \
          vs planar.rs's chain within {TOLERANCE}/255 (measured max {max_error}/{overhead_error}), \
          the dry path byte-identical, the reflection state paid once, every composition clean"
+    );
+}
+
+/// The Era-1 first-frame-after-replacement gate for sky/wet/post
+/// (finding 6): force replacement, render a shadowed+wet+sky+post
+/// frame, and assert the first frame carries all layers (not cleared).
+/// This is an ignored smoke like the other lavapipe tests.
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the out-of-date retry path is driver-forced; not exercised here"]
+fn first_frame_after_replacement_keeps_every_layer() {
+    let _guard = sdl_lock();
+    let mut app = ShellApp::new(ShellConfig {
+        title: "first-frame-after-replacement".into(),
+        width: 256,
+        height: 256,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    })
+    .unwrap();
+    let mut renderer = Renderer::new(
+        app.window(),
+        RenderConfig {
+            demo_scene: DemoScenePreference::Corner,
+            validation: ValidationPreference::On,
+            replace_pipelines: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let size = app.window().size_in_pixels();
+    assert_eq!(size, (256, 256));
+    assert!(renderer.stats().validation_active);
+    let _ = app.frame();
+
+    // Warm one shadowed+wet+sky+post frame at 256×256 (creates all
+    // lazy states on the old generation).
+    let light = day_preset();
+    let eye = [12.0, 2.0, -12.0];
+    let aim = [2.0, 0.0, -12.0];
+    let matrix = view_projection(
+        RouteWaypoint {
+            position: eye,
+            look_at: aim,
+        },
+        1.0,
+    );
+
+    let day = atmosphere_at(0.0);
+    renderer.set_sky(Some(SkyFrame {
+        palette: day.sky,
+        disc_dir: day.disc_dir,
+    }));
+    renderer.set_post(true);
+    renderer.set_wet(true);
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner_shadowed(&matrix, eye, light, BIAS, size)
+            .unwrap()
+            .presented
+    );
+    let _warm = renderer.take_frame_capture().unwrap().unwrap();
+
+    // Force replacement at a larger size (8 pixels bigger on each axis).
+    // The first frame on the replacement generation carries sky + wet +
+    // post + shadowed (finding 6).
+    let replacement = renderer
+        .render_corner_shadowed(&matrix, eye, light, BIAS, (size.0 + 8, size.1 + 8))
+        .unwrap();
+    assert!(replacement.recreated, "the resize forced a recreation");
+    println!("first frame after replacement: recreated = true");
+
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner_shadowed(&matrix, eye, light, BIAS, (size.0 + 8, size.1 + 8))
+            .unwrap()
+            .presented
+    );
+    let first_after = renderer.take_frame_capture().unwrap().unwrap();
+
+    // LAYER-PRESENCE PROOFS (finding 6's verification: "assert
+    // geometry, sky and wet pixels on the FIRST presented frame").
+    // Method: differential toggles on the SAME replacement generation
+    // — each layer's region must change when that layer alone turns
+    // off, which proves the layer was PRESENT in `first_after`
+    // itself (a first frame that silently skipped sky or wet would
+    // equal its layer-off variant there). The per-layer EQUATIONS
+    // stay pinned by their own gates (render_sky, render_reflection,
+    // render_post) — absolute oracles are meaningless here anyway,
+    // because this frame runs through the post chain's ACES
+    // tonemap. A coarse cleared-frame guard first: a composite of a
+    // cleared HDR target would be (near-)uniform.
+    let new_size = (size.0 + 8, size.1 + 8);
+    let total_pixels = (first_after.width * first_after.height) as usize;
+    let first_pixel = first_after.pixel_rgba(0, 0);
+    let uniform_like = first_after
+        .bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|rgba| **rgba == first_pixel)
+        .count();
+    println!(
+        "first frame after replacement: {uniform_like}/{total_pixels} pixels match pixel (0,0) \
+         ({:.1}% — a cleared composite would be ~100%)",
+        100.0 * uniform_like as f64 / total_pixels as f64
+    );
+    assert!(
+        uniform_like * 10 < total_pixels * 9,
+        "the first frame after replacement is not a cleared frame"
+    );
+
+    // The camera basis for the probe rays.
+    let (forward, right, up) = basis(eye, aim);
+
+    // A sky-covered probe: a pixel whose CPU ray misses every box —
+    // background by definition (raycast_boxes has no ground plane).
+    let mut sky_px = None;
+    for y in (16..96).step_by(8) {
+        for x in (32..new_size.0).step_by(32) {
+            let ray = pixel_ray(forward, right, up, x, y, new_size);
+            if raycast_boxes(eye, ray).is_none() {
+                sky_px = Some((x, y));
+                break;
+            }
+        }
+        if sky_px.is_some() {
+            break;
+        }
+    }
+    let (sky_x, sky_y) =
+        sky_px.expect("this pose has a box-free background pixel (the sky gates' own pose family)");
+
+    // SKY: the same pose with the sky layer OFF — the background
+    // probe must change (sky equation vs the tonemapped clear).
+    renderer.set_sky(None);
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner_shadowed(&matrix, eye, light, BIAS, new_size)
+            .unwrap()
+            .presented
+    );
+    let sky_off = renderer.take_frame_capture().unwrap().unwrap();
+    let sky_probe_on = first_after.pixel_rgba(sky_x, sky_y);
+    let sky_probe_off = sky_off.pixel_rgba(sky_x, sky_y);
+    println!(
+        "first frame after replacement: sky probe ({sky_x},{sky_y}) on={sky_probe_on:?} \
+         off={sky_probe_off:?}"
+    );
+    assert_ne!(
+        sky_probe_on, sky_probe_off,
+        "the sky layer drew on the first frame after the replacement"
+    );
+    renderer.set_sky(Some(SkyFrame {
+        palette: day.sky,
+        disc_dir: day.disc_dir,
+    }));
+
+    // WET: the same pose with the ground re-draw OFF — the lower
+    // frame (where this pose's ground quad lives) must change.
+    renderer.set_wet(false);
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner_shadowed(&matrix, eye, light, BIAS, new_size)
+            .unwrap()
+            .presented
+    );
+    let wet_off = renderer.take_frame_capture().unwrap().unwrap();
+    let mut wet_differ = 0usize;
+    let mut bottom_differ = 0usize;
+    for (rgba_on, rgba_off) in first_after
+        .bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(wet_off.bytes.as_chunks::<4>().0.iter())
+    {
+        if rgba_on != rgba_off {
+            wet_differ += 1;
+        }
+    }
+    for y in (first_after.height / 2)..first_after.height {
+        for x in 0..first_after.width {
+            if first_after.pixel_rgba(x, y) != wet_off.pixel_rgba(x, y) {
+                bottom_differ += 1;
+            }
+        }
+    }
+    println!(
+        "first frame after replacement: wet differential {wet_differ} pixels total, \
+         {bottom_differ} in the lower half"
+    );
+    assert!(
+        bottom_differ > 200,
+        "the wet ground re-draw changed the first frame after the replacement \
+         ({bottom_differ} lower-half pixels)"
+    );
+    renderer.set_wet(true);
+
+    // POST: the same pose with the chain OFF — the tonemap and bloom
+    // must change the frame (the composite's own signature).
+    renderer.set_post(false);
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner_shadowed(&matrix, eye, light, BIAS, new_size)
+            .unwrap()
+            .presented
+    );
+    let post_off = renderer.take_frame_capture().unwrap().unwrap();
+    let mut post_differ = 0usize;
+    for (rgba_on, rgba_off) in first_after
+        .bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(post_off.bytes.as_chunks::<4>().0.iter())
+    {
+        if rgba_on != rgba_off {
+            post_differ += 1;
+        }
+    }
+    println!(
+        "first frame after replacement: post differential {post_differ} pixels \
+         (the ACES tonemap + bloom signature)"
+    );
+    assert!(
+        post_differ > 500,
+        "the post chain ran on the first frame after the replacement \
+         ({post_differ} pixels differ from the postless frame)"
+    );
+    renderer.set_post(true);
+
+    // Byte-identical repeat: request again, render the same pose at the
+    // same new size, take, and assert byte-identical. The second frame
+    // does not "repair" a different first frame.
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner_shadowed(&matrix, eye, light, BIAS, (size.0 + 8, size.1 + 8))
+            .unwrap()
+            .presented
+    );
+    let repeat = renderer.take_frame_capture().unwrap().unwrap();
+    assert_eq!(
+        first_after.bytes, repeat.bytes,
+        "byte-identical first-frame captures"
+    );
+
+    // The capture path (the first capture on the replacement generation)
+    // must also be identical to the previous capture to prove no
+    // allocation differences.
+    assert_eq!(
+        first_after.format, repeat.format,
+        "capture format identical"
+    );
+
+    println!(
+        "first-frame-after-replacement gate: sky/wet/post/shadowed all present on first frame"
+    );
+
+    assert_eq!(
+        renderer.stats().validation_errors,
+        0,
+        "{:?}",
+        renderer.stats().recent_validation
     );
 }

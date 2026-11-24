@@ -1695,6 +1695,109 @@ impl PipelineState {
         Ok(())
     }
 
+    /// Ensures every state the CURRENT frame's active layers need,
+    /// against the live swapchain generation — idempotent (each
+    /// ensure_* is an existence check), called BEFORE the recreation
+    /// decision (so the replacement knows which lazy states to
+    /// replicate — the finding-A discipline) and AGAIN after any
+    /// recreation (so the generation that draws carries every active
+    /// variant — review finding 6: the replacement replicates only
+    /// proxy/indirect/shadow/post, never sky, reflection, or the HDR
+    /// variants).
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_frame_targets_and_resources(
+        &mut self,
+        ctx: &mut VulkanContext,
+        swapchain: &SwapchainState,
+        slot: usize,
+        proxy: Option<&proxy_draw::ProxyFrameUpload<'_>>,
+        shadowed: Option<&shadow_draw::ShadowFrameParams>,
+        sky: Option<&sky_draw::SkyFrameParams>,
+        post: bool,
+        wet: Option<&reflection_draw::WetCamera>,
+        region_vertices: &[SceneVertex],
+        foreground_vertices: &[SceneVertex],
+    ) -> Result<(), RendererError> {
+        // Lazy region-scene buffer (Stage 4 final-verification finding):
+        // allocated on first use only, outside command recording — the
+        // default renderer path (no dynamic region geometry) pays no
+        // allocation, mapping, or memory cost.
+        if !region_vertices.is_empty() || !foreground_vertices.is_empty() {
+            self.ensure_region_capacity(ctx)?;
+        }
+
+        // The 6-E lazy proxy resources (the same discipline): created at
+        // the first populated frame only, outside command recording —
+        // the unpopulated corner path pays nothing. Structural invariant:
+        // a proxy upload implies corner resources (the safe layer's
+        // scene-preference gate), hence `ctx.corner` in the pattern.
+        // The 6-E2 indirect command state is one level lazier still:
+        // created at the first INDIRECT-mode populated frame only, so
+        // the direct instanced path's allocation pins (the 6-E gates)
+        // pay nothing for the mechanism they never touch.
+        if proxy.is_some() && ctx.corner.is_some() {
+            self.ensure_proxy_resources(ctx)?;
+            if proxy.is_some_and(|upload| matches!(upload.mode, crate::ProxyDrawMode::Indirect))
+                && let Some(proxy_state) = self.proxy.as_mut()
+            {
+                proxy_state.ensure_indirect(ctx)?;
+            }
+        }
+
+        // The 6-F lazy shadow state (the same discipline): created at
+        // the first shadowed frame only, outside command recording — the
+        // unshadowed corner path pays nothing. Structural invariant: a
+        // shadowed frame implies corner resources (the safe layer's
+        // scene-preference gate), which the ensure itself re-checks.
+        if shadowed.is_some() {
+            self.ensure_shadow_resources(ctx)?;
+        }
+
+        // The Era-1 lazy sky state (the same discipline): created at the
+        // first sky frame only, outside command recording — the skyless
+        // path pays nothing, and a pipeline replacement re-ensures an
+        // identical set at the next sky frame (the 6-F finding-A shape).
+        if sky.is_some() {
+            self.ensure_sky_resources(ctx)?;
+        }
+
+        // The Era-1 lazy post state (the same discipline): created at
+        // the first post frame only, outside command recording — the
+        // postless path pays nothing and stays byte-identical. The
+        // family pipelines that depend on LAZY states (the shadowed
+        // and sky HDR variants) are ensured in the same order the
+        // frame flow ensures their states (shadows, then sky, then
+        // post — so the layouts exist by the time the variant
+        // pipelines bind them).
+        if post {
+            self.ensure_post_resources(ctx, swapchain.format, swapchain.depth_format)?;
+            if shadowed.is_some()
+                && let (Some(post_state), Some(shadow_state)) = (&mut self.post, &self.shadows)
+            {
+                let layout = shadow_state.shadowed(slot).1;
+                post_state.ensure_shadowed_hdr(ctx, layout)?;
+            }
+            if sky.is_some()
+                && let (Some(post_state), Some(sky_state)) = (&mut self.post, &self.sky)
+            {
+                let layout = sky_state.set_and_layout().1;
+                post_state.ensure_sky_hdr(ctx, layout)?;
+            }
+        }
+
+        // The Era-1 lazy wet-reflection state (the same discipline): a
+        // wet renderer always carries the post state (the reflection
+        // pass rides its HDR render pass object) — ensured ABOVE the
+        // post chain's own ensure so the pass exists; the chain itself
+        // stays optional.
+        if wet.is_some() {
+            self.ensure_post_resources(ctx, swapchain.format, swapchain.depth_format)?;
+            self.ensure_reflection_resources(ctx)?;
+        }
+
+        Ok(())
+    }
+
     /// Builds the render pass + pipelines for a (possibly new) swapchain
     /// format into `out`. Handles are assigned as they are created
     /// (corrective finding G): a mid-build failure leaves them owned by
@@ -3183,83 +3286,24 @@ pub(crate) fn render_frame(
         frames.needs_recreate |= size_changed || extent != Some(swapchain.extent);
     }
 
-    // Lazy region-scene buffer (Stage 4 final-verification finding):
-    // allocated on first use only, outside command recording — the
-    // default renderer path (no dynamic region geometry) pays no
-    // allocation, mapping, or memory cost.
+    // Ensure all lazy frame state before any acquire or recreation
+    // decision — the pre-acquire preparation discipline (finding 3's
+    // stranded-frame corrective, and finding 6's replacement-variant
+    // completeness). Each ensure_* is idempotent (an existence check),
+    // so calling it twice (before and after recreation) is safe.
     let foreground_vertices = foreground.map_or(&[][..], |layer| layer.vertices);
-    if !region_vertices.is_empty() || !foreground_vertices.is_empty() {
-        pipes.ensure_region_capacity(ctx)?;
-    }
-
-    // The 6-E lazy proxy resources (the same discipline): created at
-    // the first populated frame only, outside command recording —
-    // the unpopulated corner path pays nothing. Structural invariant:
-    // a proxy upload implies corner resources (the safe layer's
-    // scene-preference gate), hence `ctx.corner` in the pattern.
-    // The 6-E2 indirect command state is one level lazier still:
-    // created at the first INDIRECT-mode populated frame only, so
-    // the direct instanced path's allocation pins (the 6-E gates)
-    // pay nothing for the mechanism they never touch.
-    if proxy.is_some() && ctx.corner.is_some() {
-        pipes.ensure_proxy_resources(ctx)?;
-        if proxy.is_some_and(|upload| matches!(upload.mode, crate::ProxyDrawMode::Indirect))
-            && let Some(proxy_state) = pipes.proxy.as_mut()
-        {
-            proxy_state.ensure_indirect(ctx)?;
-        }
-    }
-
-    // The 6-F lazy shadow state (the same discipline): created at
-    // the first shadowed frame only, outside command recording — the
-    // unshadowed corner path pays nothing. Structural invariant: a
-    // shadowed frame implies corner resources (the safe layer's
-    // scene-preference gate), which the ensure itself re-checks.
-    if shadowed.is_some() {
-        pipes.ensure_shadow_resources(ctx)?;
-    }
-
-    // The Era-1 lazy sky state (the same discipline): created at the
-    // first sky frame only, outside command recording — the skyless
-    // path pays nothing, and a pipeline replacement re-ensures an
-    // identical set at the next sky frame (the 6-F finding-A shape).
-    if sky.is_some() {
-        pipes.ensure_sky_resources(ctx)?;
-    }
-
-    // The Era-1 lazy post state (the same discipline): created at
-    // the first post frame only, outside command recording — the
-    // postless path pays nothing and stays byte-identical. The
-    // family pipelines that depend on LAZY states (the shadowed
-    // and sky HDR variants) are ensured in the same order the
-    // frame flow ensures their states (shadows, then sky, then
-    // post — so the layouts exist by the time the variant
-    // pipelines bind them).
-    if post {
-        pipes.ensure_post_resources(ctx, swapchain.format, swapchain.depth_format)?;
-        if shadowed.is_some()
-            && let (Some(post_state), Some(shadow_state)) = (&mut pipes.post, &pipes.shadows)
-        {
-            let layout = shadow_state.shadowed(slot).1;
-            post_state.ensure_shadowed_hdr(ctx, layout)?;
-        }
-        if sky.is_some()
-            && let (Some(post_state), Some(sky_state)) = (&mut pipes.post, &pipes.sky)
-        {
-            let layout = sky_state.set_and_layout().1;
-            post_state.ensure_sky_hdr(ctx, layout)?;
-        }
-    }
-
-    // The Era-1 lazy wet-reflection state (the same discipline): a
-    // wet renderer always carries the post state (the reflection
-    // pass rides its HDR render pass object) — ensured ABOVE the
-    // post chain's own ensure so the pass exists; the chain itself
-    // stays optional.
-    if wet.is_some() {
-        pipes.ensure_post_resources(ctx, swapchain.format, swapchain.depth_format)?;
-        pipes.ensure_reflection_resources(ctx)?;
-    }
+    pipes.ensure_frame_targets_and_resources(
+        ctx,
+        swapchain,
+        slot,
+        proxy,
+        shadowed,
+        sky,
+        post,
+        wet,
+        region_vertices,
+        foreground_vertices,
+    )?;
 
     // A previous present reported suboptimal — recreate before drawing
     // (verification requirement: suboptimal must eventually trigger
@@ -3276,6 +3320,22 @@ pub(crate) fn render_frame(
             demo_scene,
         )?;
         outcome.recreated = true;
+        // The generation that draws carries every active variant —
+        // calling the helper here ensures sky, reflection, and HDR
+        // variant pipelines exist on the new generation (finding 6).
+        let foreground_vertices = foreground.map_or(&[][..], |layer| layer.vertices);
+        pipes.ensure_frame_targets_and_resources(
+            ctx,
+            swapchain,
+            slot,
+            proxy,
+            shadowed,
+            sky,
+            post,
+            wet,
+            region_vertices,
+            foreground_vertices,
+        )?;
     }
 
     // The capture readback's destination buffer, prepared BEFORE any
@@ -3293,6 +3353,34 @@ pub(crate) fn render_frame(
     {
         frames.capture.pending = false;
         frames.capture.last_refusal = Some(error);
+    }
+
+    // The Era-1 post chain's and the wet reflection's extent-bound
+    // targets: prepared HERE — BEFORE the slot-fence wait, the fence
+    // reset, and the acquire (finding 3's stranded-frame corrective,
+    // the capture-ensure discipline above): the swapchain's extent
+    // and views are equally live at this point (only a recreation
+    // can change them, and every recreation site precedes this
+    // block), so a target-creation failure returns with every sync
+    // object untouched — no reset-but-unsignaled fence, no signaled
+    // acquire semaphore left unconsumed. A rebuild releases the old
+    // bundle only when the extent or view set changed, which only a
+    // recreation (already device-idle) can cause — the rebuild-safety
+    // proof in post_draw's module header.
+    if post && let Some(post_state) = &mut pipes.post {
+        post_state.ensure_targets(ctx, swapchain.extent, &swapchain.views)?;
+    }
+    if wet.is_some()
+        && let (Some(post_state), Some(reflection_state), Some(corner)) =
+            (&pipes.post, &mut pipes.reflection, ctx.corner.as_ref())
+    {
+        reflection_state.ensure_targets(
+            ctx,
+            swapchain.extent,
+            corner,
+            post_state.hdr_render_pass(),
+            swapchain.views.first().copied().unwrap_or_default(),
+        )?;
     }
 
     // Wait for this slot's previous submission. The fence is reset only
@@ -3354,6 +3442,53 @@ pub(crate) fn render_frame(
             demo_scene,
         )?;
         outcome.recreated = true;
+        // The generation that draws carries every active variant —
+        // re-running the state-ensure helper here creates sky,
+        // reflection, and the HDR variant pipelines on the new
+        // generation (finding 6: the replacement replicates only
+        // proxy/indirect/shadow/post; without this call the first
+        // frame after THIS recreation silently skips sky and wet
+        // passes).
+        pipes.ensure_frame_targets_and_resources(
+            ctx,
+            swapchain,
+            slot,
+            proxy,
+            shadowed,
+            sky,
+            post,
+            wet,
+            region_vertices,
+            foreground_vertices,
+        )?;
+        // The targets were ensured pre-acquire against the OLD
+        // generation — repeat preparation against the replacement
+        // before retrying the out-of-date acquire (finding 3's
+        // stranded-frame corrective; the same frame-sync discipline,
+        // still before any acquire of the new chain).
+        if post && let Some(post_state) = &mut pipes.post {
+            post_state.ensure_targets(ctx, swapchain.extent, &swapchain.views)?;
+        }
+        if wet.is_some()
+            && let (Some(post_state), Some(reflection_state), Some(corner)) =
+                (&pipes.post, &mut pipes.reflection, ctx.corner.as_ref())
+        {
+            reflection_state.ensure_targets(
+                ctx,
+                swapchain.extent,
+                corner,
+                post_state.hdr_render_pass(),
+                swapchain.views.first().copied().unwrap_or_default(),
+            )?;
+        }
+        // The capture ensure is repeated here too (the same frame-sync
+        // discipline: a failure here cannot strand a frame).
+        if frames.capture.pending
+            && let Err(error) = frames.capture.ensure(ctx, swapchain)
+        {
+            frames.capture.pending = false;
+            frames.capture.last_refusal = Some(error);
+        }
         acquire_result = unsafe {
             ctx.swapchain_ext.acquire_next_image(
                 swapchain.swapchain,
@@ -3520,33 +3655,8 @@ pub(crate) fn render_frame(
     // (corrective finding C).
     let present_semaphore = frames.present_semaphore_for(ctx, image_index)?;
 
-    // The Era-1 post chain's extent-bound targets: ensured HERE —
-    // after the acquire settled the live swapchain (its extent and
-    // views are what the framebuffers bind), still outside command
-    // recording. A rebuild releases the old bundle only when the
-    // extent or view set changed, which only a recreation (already
-    // device-idle) can cause — the rebuild-safety proof in
-    // post_draw's module header.
-    if post && let Some(post_state) = &mut pipes.post {
-        post_state.ensure_targets(ctx, extent, &swapchain.views)?;
-    }
-
-    // The wet reflection's extent-bound targets: ensured beside the
-    // post targets (the same post-acquire point — the live extent
-    // and the HDR pass object; the corner preference is structural
-    // for a wet frame).
-    if wet.is_some()
-        && let (Some(post_state), Some(reflection_state), Some(corner)) =
-            (&pipes.post, &mut pipes.reflection, ctx.corner.as_ref())
-    {
-        reflection_state.ensure_targets(
-            ctx,
-            extent,
-            corner,
-            post_state.hdr_render_pass(),
-            swapchain.views.first().copied().unwrap_or_default(),
-        )?;
-    }
+    // The targets were ensured pre-acquire — finding 3's stranded-frame
+    // corrective. This comment marks the original call sites (removed).
 
     unsafe {
         ctx.device
