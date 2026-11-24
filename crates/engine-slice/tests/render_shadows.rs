@@ -1163,7 +1163,7 @@ fn shadow_readback_belongs_to_the_shadowed_frame_and_its_buffer() {
         map.depths.len()
     );
     let (compared, skipped, mismatches, _, _, _, _) =
-        compare_map(&second_cascade, &boxes, &map.depths, map.extent, 1e-4, 1.5);
+        compare_map(&second_cascade, boxes, &map.depths, map.extent, 1e-4, 1.5);
     println!(
         "shadow map known-answer: {compared} compared, {skipped} skipped, {mismatches} mismatches"
     );
@@ -1202,7 +1202,7 @@ fn shadow_readback_belongs_to_the_shadowed_frame_and_its_buffer() {
         );
         let map_a = renderer.take_shadow_map_capture().unwrap().unwrap();
         let (compared_a, _, mismatches_a, _, _, _, _) =
-            compare_map(&cascade, &boxes, &map_a.depths, map_a.extent, 1e-4, 1.5);
+            compare_map(&cascade, boxes, &map_a.depths, map_a.extent, 1e-4, 1.5);
         println!("slot capture A: {compared_a} compared, {mismatches_a} mismatches");
         assert_eq!(mismatches_a, 0, "first light map matches cascade");
 
@@ -1216,7 +1216,7 @@ fn shadow_readback_belongs_to_the_shadowed_frame_and_its_buffer() {
         let map_b = renderer.take_shadow_map_capture().unwrap().unwrap();
         let (compared_b, _, mismatches_b, _, _, _, _) = compare_map(
             &second_cascade,
-            &boxes,
+            boxes,
             &map_b.depths,
             map_b.extent,
             1e-4,
@@ -1303,7 +1303,7 @@ fn shadow_readback_belongs_to_the_shadowed_frame_and_its_buffer() {
     let map_after = renderer.take_shadow_map_capture().unwrap().unwrap();
     let (compared_after, _, mismatches_after, _, _, _, _) = compare_map(
         &cascade,
-        &boxes,
+        boxes,
         &map_after.depths,
         map_after.extent,
         1e-4,
