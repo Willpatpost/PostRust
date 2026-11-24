@@ -750,6 +750,35 @@ fn factored_ground_color(
     })
 }
 
+/// Finding 15's reachable-anchor enumeration — the gate's own
+/// acceptance policy, factored out so its discipline is testable
+/// against the exact list this gate accepts: a one-texel shift is
+/// admissible only along an axis actually at its texel boundary,
+/// in the direction the projection truncated (the signed distance
+/// `fx - fx.round()`); the diagonal alternative is reachable only
+/// when BOTH axes are exposed. At most four anchors, in fixed
+/// order: base, the X shift, the Y shift, the diagonal.
+fn pcf_reachable_anchors(
+    anchor: (u32, u32),
+    exposed_x: Option<f32>,
+    exposed_y: Option<f32>,
+) -> Vec<(i32, i32)> {
+    let (tx, ty) = (anchor.0 as i32, anchor.1 as i32);
+    let dir = |shift: f32| if shift < 0.0 { -1 } else { 1 };
+    let mut anchors = Vec::with_capacity(4);
+    anchors.push((tx, ty));
+    if let Some(shift_x) = exposed_x {
+        anchors.push((tx + dir(shift_x), ty));
+    }
+    if let Some(shift_y) = exposed_y {
+        anchors.push((tx, ty + dir(shift_y)));
+    }
+    if let (Some(shift_x), Some(shift_y)) = (exposed_x, exposed_y) {
+        anchors.push((tx + dir(shift_x), ty + dir(shift_y)));
+    }
+    anchors
+}
+
 /// The Era-1 SOFT-SHADOW gate (the brief's PCF contract): the
 /// shadowed shader's filtered factor vs the CPU filter
 /// (`pcf_at_point`) over the SAME captured map bytes, per pixel, on
@@ -768,8 +797,10 @@ fn factored_ground_color(
 /// exposure epsilon, so one tap at a time): the pixel must match the
 /// equation at the CPU factor OR at factor ± 1/9. Texel-exposed
 /// pixels may have truncated to the neighboring anchor: the pixel
-/// must match the equation at ANY of the five candidate anchors'
-/// factors. Every class is counted and printed — the CI log's
+/// must match the equation at any of the REACHABLE anchors' factors
+/// (`pcf_reachable_anchors`: the base, one signed shift per exposed
+/// axis, and the diagonal only when both axes are exposed — at most
+/// four). Every class is counted and printed — the CI log's
 /// evidence.
 #[test]
 #[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
@@ -927,41 +958,13 @@ fn pcf_penumbra_pixels_match_the_cpu_filter_over_the_same_map_bytes() {
                     + cascade.matrix[2][2] * pos[2]
                     + cascade.matrix[3][2];
                 let reference = clip_z / 1.0;
-                let (tx, ty) = diag.anchor;
                 let mut matched = false;
 
-                // Build the list of reachable anchors based on which axes are exposed
-                // and their signs (which direction they truncated)
-                let mut anchors = vec![(tx as i32, ty as i32)]; // the base anchor
-
-                // If X is exposed, we can shift in the direction it truncated
-                if let Some(shift_x) = diag.texel_exposed_x {
-                    if shift_x < 0.0 {
-                        // Truncated up (toward lower texel), can try -1
-                        anchors.push((tx as i32 - 1, ty as i32));
-                    } else {
-                        // Truncated down (toward higher texel), can try +1
-                        anchors.push((tx as i32 + 1, ty as i32));
-                    }
-                }
-                // If Y is exposed, we can shift in the direction it truncated
-                if let Some(shift_y) = diag.texel_exposed_y {
-                    if shift_y < 0.0 {
-                        // Truncated up (toward lower texel), can try -1
-                        anchors.push((tx as i32, ty as i32 - 1));
-                    } else {
-                        // Truncated down (toward higher texel), can try +1
-                        anchors.push((tx as i32, ty as i32 + 1));
-                    }
-                }
-
-                // Also try the diagonal if BOTH axes are exposed (the actual alternative)
-                if let (Some(shift_x), Some(shift_y)) = (diag.texel_exposed_x, diag.texel_exposed_y)
-                {
-                    let dx = if shift_x < 0.0 { -1 } else { 1 };
-                    let dy = if shift_y < 0.0 { -1 } else { 1 };
-                    anchors.push((tx as i32 + dx, ty as i32 + dy));
-                }
+                // The reachable anchors (finding 15's discipline,
+                // factored so its own tests exercise the exact
+                // enumeration this gate accepts).
+                let anchors =
+                    pcf_reachable_anchors(diag.anchor, diag.texel_exposed_x, diag.texel_exposed_y);
 
                 for (ax, ay) in anchors {
                     let anchor_x = ax.clamp(0, map.extent as i32 - 1) as u32;
@@ -1070,6 +1073,16 @@ fn pcf_penumbra_pixels_match_the_cpu_filter_over_the_same_map_bytes() {
          exposure classes bounded by their documented one-tap/one-anchor slacks"
     );
 }
+
+// ------------------------------------- findings 14+15: the damaged-map negative
+// controls (the review's check, landed for real: "Feed the
+// comparator one damaged interior ground depth and one NaN from
+// each class and require failure"; "A kernel shifted across an
+// unexposed axis should fail even when the other axis is within
+// epsilon"). The comparator under test is THE gates' own
+// `compare_map` and THE gate's own anchor enumeration — not
+// restatements of their arithmetic. Pure CPU (no SDL, no GPU):
+// these run in the heavy shard's plain pass.
 
 /// The 6-F buffer handshake and buffer-generation pin: the shadow
 /// readback records with the producing frame's buffer handle, and
@@ -1328,126 +1341,227 @@ fn shadow_readback_belongs_to_the_shadowed_frame_and_its_buffer() {
 // The depth-map comparator must reject nonfinite or out-of-range depths.
 // Run headless without GPU to prove the rejection logic works.
 
-/// Pure-CPU unit test: the comparator rejects a NaN depth value.
+/// The CPU-synthesized corner map: the deterministic core's own
+/// `map_texel_depth` over every texel — the same oracle
+/// `compare_map` recomputes internally, so the undamaged control
+/// run is exact by construction and every mismatch in the damaged
+/// runs below is attributable to the planted damage alone. Built
+/// once per process (1,048,576 raycasts; the `intersection_boxes`
+/// OnceLock discipline).
+struct CpuCornerMap {
+    cascade: ShadowCascade,
+    depths: Vec<f32>,
+    /// (texel index, expected depth) of every DEEP-INTERIOR
+    /// ground-hit texel — the damage targets. The ground plate in
+    /// `compare_map` is the ±40 m scene ground, so border hits
+    /// within its 1.5-texel perimeter margin (and the corner-graze
+    /// arm's 1e-3 band) are edge-skipped; the cache keeps only
+    /// hits a full 4 texels clear of ±40 on BOTH X and Z, so every
+    /// cached texel is compared — that is what makes the damaged-
+    /// input tests' exact-count assertions (exactly 1, exactly 2)
+    /// sound rather than best-effort.
+    ground_texels: Vec<(usize, f32)>,
+}
+
+fn cpu_corner_map() -> &'static CpuCornerMap {
+    static MAP: std::sync::OnceLock<CpuCornerMap> = std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        let light = day_preset();
+        let boxes = intersection_boxes();
+        let cascade = corner_cascade(light);
+        let extent = shadows::SHADOW_MAP_EXTENT;
+        // `compare_map`'s own texel-world metric (the larger cascade
+        // span over the extent — the one its 1.5-texel ground
+        // perimeter margin uses).
+        let texel_world = (cascade.max_right - cascade.min_right)
+            .max(cascade.max_up - cascade.min_up)
+            / extent as f32;
+        let clearance = 4.0 * texel_world;
+        let mut depths = Vec::with_capacity(extent as usize * extent as usize);
+        let mut ground_texels = Vec::new();
+        for y in 0..extent {
+            for x in 0..extent {
+                let expectation = map_texel_depth(&cascade, boxes, x, y, extent);
+                let index = (y * extent + x) as usize;
+                depths.push(expectation.depth);
+                if let Some(hit) = expectation.hit
+                    && expectation.box_index.is_none()
+                    && hit[0].abs() <= 40.0 - clearance
+                    && hit[2].abs() <= 40.0 - clearance
+                {
+                    ground_texels.push((index, expectation.depth));
+                }
+            }
+        }
+        CpuCornerMap {
+            cascade,
+            depths,
+            ground_texels,
+        }
+    })
+}
+
+/// Finding 14's check, landed for real: "one NaN from each class".
+/// The undamaged control run proves zero mismatches on the clean
+/// CPU map; then a NaN planted in every texel of every class must
+/// be rejected in every compared texel — the original defect (NaN
+/// makes `abs(error) > tolerance` false, so a NaN was counted as a
+/// comparison WITHOUT a mismatch) would report zero mismatches
+/// here.
 #[test]
 fn depth_comparator_rejects_nan() {
-    // Construct a scenario that would use abs(error) > tolerance
-    // A NaN makes this comparison FALSE, which was the bug
-    let nan_depth: f32 = f32::NAN;
-
-    // Clear check: (gpu - 1.0).abs() > tolerance with gpu = NaN
-    let clear_error = (nan_depth - 1.0).abs();
-    assert!(
-        !clear_error.is_finite(),
-        "abs(NAN - 1.0) must be nonfinite, got {clear_error}"
+    let map = cpu_corner_map();
+    let boxes = intersection_boxes();
+    let extent = shadows::SHADOW_MAP_EXTENT;
+    let (compared, _, mismatches, max_error, clear, ground, building) =
+        compare_map(&map.cascade, boxes, &map.depths, extent, 1e-4, 1.5);
+    assert_eq!(
+        mismatches, 0,
+        "the undamaged CPU map is exact (the comparator's own oracle)"
     );
-    // The original check was: if (gpu - 1.0).abs() > tolerance { mismatches += 1 }
-    // With NaN, this comparison is FALSE, so it wouldn't increment mismatches.
-    // We verify that our fix rejects NaN explicitly first.
-    assert!(!nan_depth.is_finite(), "NaN must be nonfinite");
+    assert_eq!(max_error, 0.0);
+    assert!(
+        clear > 0 && ground > 0 && building > 0,
+        "all three classes present: {clear} clear / {ground} ground / {building} building"
+    );
+
+    // One NaN from EACH class — planted in every texel, which
+    // subsumes one-per-class and makes the required coverage exact.
+    let mut damaged = map.depths.clone();
+    damaged.fill(f32::NAN);
+    let (compared_d, _, mismatches_d, max_error_d, clear_d, ground_d, building_d) =
+        compare_map(&map.cascade, boxes, &damaged, extent, 1e-4, 1.5);
+    println!(
+        "NaN feed: {mismatches_d} of {compared_d} compared texels rejected \
+         ({clear_d} clear / {ground_d} ground / {building_d} building)"
+    );
+    // The census classifies by EXPECTED class, so it is
+    // damage-invariant — the same texels are compared.
+    assert_eq!(
+        (compared_d, clear_d, ground_d, building_d),
+        (compared, clear, ground, building)
+    );
+    assert_eq!(
+        mismatches_d, compared_d,
+        "every NaN-fed texel is rejected as a mismatch, in every class"
+    );
+    assert_eq!(
+        max_error_d, 0.0,
+        "a rejected NaN never poisons the error metric"
+    );
 }
 
-/// Pure-CPU unit test: the comparator rejects an out-of-range depth value.
+/// Finding 14's check: out-of-range depths (above the
+/// [0, 1 + 1e-6] ceiling, below zero) are rejected through the
+/// reject-first range check, not the tolerance comparison. Two
+/// interior ground texels — one planted above the ceiling, one
+/// below zero — must produce exactly two mismatches.
 #[test]
 fn depth_comparator_rejects_out_of_range() {
-    // Depth > 1.0 + epsilon (GPU depth must be in [0, 1])
-    let too_deep: f32 = 1.0 + 2.0 * 1e-6;
-    // This SHOULD be caught by the new check: gpu > 1.0 + 1e-6
-    assert!(
-        too_deep > 1.0 + 1e-6,
-        "out-of-range depth must exceed 1.0 + epsilon"
-    );
+    let map = cpu_corner_map();
+    let boxes = intersection_boxes();
+    let extent = shadows::SHADOW_MAP_EXTENT;
+    let (compared, _, mismatches, _, _, ground, _) =
+        compare_map(&map.cascade, boxes, &map.depths, extent, 1e-4, 1.5);
+    assert_eq!(mismatches, 0, "the undamaged control");
+    assert!(ground > 0, "ground texels present: {ground}");
 
-    // Depth < 0.0
-    let negative: f32 = -1e-6;
-    assert!(negative < 0.0, "negative depth must be below zero");
+    assert!(
+        map.ground_texels.len() >= 2,
+        "two interior ground texels exist (the gate's census floor pins >= 1000)"
+    );
+    let above = map.ground_texels[map.ground_texels.len() / 3].0;
+    let below = map.ground_texels[2 * map.ground_texels.len() / 3].0;
+    assert_ne!(above, below);
+    let mut damaged = map.depths.clone();
+    damaged[above] = 1.0 + 2.0 * 1e-6; // finite, positive, above the ceiling
+    damaged[below] = -1e-6; // finite, negative, below zero
+    let (compared_d, _, mismatches_d, _, _, ground_d, _) =
+        compare_map(&map.cascade, boxes, &damaged, extent, 1e-4, 1.5);
+    assert_eq!((compared_d, ground_d), (compared, ground));
+    assert_eq!(
+        mismatches_d, 2,
+        "both out-of-range plants rejected (exactly two)"
+    );
 }
 
-/// Pure-CPU unit test: the comparator rejects a damaged interior ground depth.
+/// Finding 14's check: "one damaged interior ground depth" — a
+/// WRONG but finite, in-range value (half the expected depth) at
+/// one interior ground texel must fail through the tolerance
+/// comparison (|gpu − expected| > tolerance), the path a NaN
+/// silently passed before the fix. Exactly one mismatch, and the
+/// reported max error is the planted damage.
 #[test]
 fn depth_comparator_rejects_damaged_ground_depth() {
-    // Simulate a ground depth that is clearly wrong (e.g., a building depth in ground territory)
-    // or a depth that's clearly corrupted (e.g., negative or > 1)
-    let damaged_ground_depth: f32 = -0.1; // Clearly wrong for ground
+    let map = cpu_corner_map();
+    let boxes = intersection_boxes();
+    let extent = shadows::SHADOW_MAP_EXTENT;
+    let (_, _, mismatches, _, _, ground, _) =
+        compare_map(&map.cascade, boxes, &map.depths, extent, 1e-4, 1.5);
+    assert_eq!(mismatches, 0, "the undamaged control");
+    assert!(ground > 0, "ground texels present: {ground}");
 
-    // The fix adds explicit checks for is_finite() and range [0, 1+eps]
+    // One deep-interior ground texel (the cache's 4-texel clearance
+    // guarantees it is compared — see `cpu_corner_map`).
+    let &(target, expected) = map
+        .ground_texels
+        .iter()
+        .find(|&&(_, depth)| depth > 0.05)
+        .expect("a deep-interior ground texel with depth > 0.05 exists (the compared ground census alone is >= 1000)");
+    let mut damaged = map.depths.clone();
+    damaged[target] = expected * 0.5;
+    let (_, _, mismatches_d, max_error_d, _, _, _) =
+        compare_map(&map.cascade, boxes, &damaged, extent, 1e-4, 1.5);
+    assert_eq!(
+        mismatches_d, 1,
+        "the wrong-but-in-range ground depth fails the tolerance check (exactly one)"
+    );
     assert!(
-        !damaged_ground_depth.is_finite()
-            || damaged_ground_depth < 0.0
-            || damaged_ground_depth > 1.0 + 1e-6,
-        "damaged depth {damaged_ground_depth} should be rejected"
+        (max_error_d - expected * 0.5).abs() <= 1e-6,
+        "the reported max error is the planted damage: {max_error_d} vs {}",
+        expected * 0.5
     );
 }
 
-// ------------------------------------------------------- finding 15 CPU self-check
-// The PCF boundary logic must reject shifts on unexposed axes.
-// Run headless without GPU to prove the anchor enumeration logic works.
-
-/// Pure-CPU unit test: a kernel shifted across an unexposed axis must fail.
+/// Finding 15's check: "A kernel shifted across an unexposed axis
+/// should fail even when the other axis is within epsilon." The
+/// gate's acceptance loop can only try anchors this enumeration
+/// returns, so the property is structural: with X interior (None)
+/// and Y within epsilon of its boundary, the enumeration offers NO
+/// X-shifted anchor — either sign — and no diagonal.
 #[test]
 fn pcf_boundary_rejects_unexposed_axis_shift() {
-    // Construct a scenario where only Y is at boundary (X is interior)
-    // The old logic would accept shifts on X even though only Y is exposed
-    // The new logic only allows shifts on the exposed axis
-
-    // Simulate texel_exposed_x = None, texel_exposed_y = Some(shift)
-    // This means: X is interior, Y is at boundary
-
-    // In the test's anchor enumeration, we only add the Y-shift anchor
-    // The diagonal (X+1, Y-1) should NOT be tried because X is not exposed
-    let texel_exposed_x: Option<f32> = None;
-    let texel_exposed_y = Some(0.5); // Y truncated down (positive = toward higher)
-
-    // Build anchors based on the new logic
-    let mut anchors = vec![(0i32, 0i32)]; // base anchor
-
-    if texel_exposed_x.is_some() {
-        // Would add X shift, but it's not exposed
-    }
-
-    if texel_exposed_y.is_some() {
-        // Y is exposed, shift toward higher texel
-        anchors.push((0i32, 1i32));
-    }
-
-    // If BOTH axes were exposed, we'd also try the diagonal
-    let has_diagonal = texel_exposed_x.is_some() && texel_exposed_y.is_some();
-    assert!(!has_diagonal, "diagonal only when both axes exposed");
-
-    // Verify we have exactly 2 anchors: (0,0) and (0,1)
-    assert_eq!(anchors.len(), 2, "only base and Y-shift anchors");
-    assert_eq!(anchors[0], (0, 0));
-    assert_eq!(anchors[1], (0, 1));
-
-    // This proves: when X is NOT exposed, we never try (1,0) or (-1,0)
-    // The unexposed axis never admits a shift
+    // Y exposed within epsilon (truncated down, +), X interior.
+    let anchors = pcf_reachable_anchors((10, 10), None, Some(0.5));
+    assert_eq!(
+        anchors,
+        vec![(10, 10), (10, 11)],
+        "base + the signed Y shift only"
+    );
+    assert!(
+        anchors.iter().all(|&(ax, _)| ax == 10),
+        "no X shift on an X-unexposed texel (either sign)"
+    );
+    // The Y shift follows the truncation direction: -0.3 truncated up.
+    assert_eq!(
+        pcf_reachable_anchors((10, 10), None, Some(-0.3)),
+        vec![(10, 10), (10, 9)]
+    );
+    // Neither axis exposed: the base anchor alone.
+    assert_eq!(pcf_reachable_anchors((10, 10), None, None), vec![(10, 10)]);
 }
 
-/// Pure-CPU unit test: both axes exposed allows diagonal shift.
+/// Finding 15's check: at a true two-axis boundary the actual
+/// diagonal alternative is reachable — base, both SIGNED axial
+/// shifts, and the signed diagonal, in the fixed order.
 #[test]
 fn pcf_boundary_allows_diagonal_when_both_exposed() {
-    // When both X and Y are at boundary, the diagonal alternative IS reachable
-    let texel_exposed_x: f32 = 0.5; // X truncated down
-    let texel_exposed_y: f32 = -0.3; // Y truncated up
-
-    let mut anchors = vec![(0i32, 0i32)];
-
-    // If X is exposed, we can shift in the direction it truncated
-    // X truncated down (positive), so we add +1
-    anchors.push((1i32, 0i32));
-
-    // If Y is exposed, we can shift in the direction it truncated
-    // Y truncated up (negative), so we add -1
-    anchors.push((0i32, -1i32));
-
-    // Diagonal only if both exposed
-    let dx = if texel_exposed_x < 0.0 { -1 } else { 1 };
-    let dy = if texel_exposed_y < 0.0 { -1 } else { 1 };
-    anchors.push((dx, dy));
-
-    // Verify we have 4 anchors: base, X-shift, Y-shift, diagonal
-    assert_eq!(anchors.len(), 4, "base + X + Y + diagonal");
-
-    // The diagonal must be (1, -1) for our example
-    assert!(anchors.contains(&(1, -1)), "diagonal anchor present");
+    // X truncated down (+1), Y truncated up (-1).
+    let anchors = pcf_reachable_anchors((10, 10), Some(0.5), Some(-0.3));
+    assert_eq!(anchors, vec![(10, 10), (11, 10), (10, 9), (11, 9)]);
+    // The opposite truncation signs give the mirrored diagonal.
+    assert_eq!(
+        pcf_reachable_anchors((10, 10), Some(-0.2), Some(0.4)),
+        vec![(10, 10), (9, 10), (10, 11), (9, 11)]
+    );
 }
