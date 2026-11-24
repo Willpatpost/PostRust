@@ -1280,7 +1280,7 @@ jobs:
           # are engine-renderer lib tests — the main shard's).
           # Linux 582/14/59 MEASURED locally with this step's own
           # awk; Windows 581/14/59 platform-uniform.
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 17 / 62)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 18 / 62)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           # Era 1 package 3 (the sky, 2026-11-23): the NEW
           # tests/render_sky.rs binary carries ONE #[ignore]d
@@ -1309,7 +1309,18 @@ jobs:
           # (16 -> 17) AND +1 result line (61 -> 62); passed counts
           # unchanged. Linux 582/17/62 MEASURED locally with this
           # step's own awk.
-          [ "$ignored" -eq 17 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 17"; exit 1; }
+          # Era 1 corrective/capture-trust (2026-11-24): the THIRD
+          # #[ignore]d render_shadows gate (the review's finding-1/2
+          # verification — the shadow readback belongs to the
+          # shadowed frame and its buffer generation; executed by the
+          # unchanged Directional-shadow-gates Linux Vulkan step
+          # below) adds +1 ignored (17 -> 18) in the SAME binary;
+          # passed counts and result lines unchanged. 582/18/62
+          # MEASURED by this run's own awk on both platforms (run
+          # 45315072299 — the failed candidate that caught the
+          # missed pin update; every test passed, only the count
+          # moved).
+          [ "$ignored" -eq 18 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 18"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
