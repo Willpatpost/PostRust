@@ -73,6 +73,27 @@ const SLOT_STRIDE: u64 = MAX_POSE_BLOCKS as u64 * POSE_STRIDE as u64;
 /// count — one set per material, `corner.rs`'s own three).
 const MATERIAL_COUNT: usize = 3;
 
+/// The proxy vertex form a pipeline reads. The two kinds' mesh
+/// bindings differ: the npc kind's 64-byte
+/// [`crate::animation::SkinnedVertex`] (locations 0-2 plus the
+/// skinning tail 8-9 and the instance params' pose index at 10), the
+/// vehicle kind's 32-byte [`ProxyVertex`] (locations 0-2 and the
+/// instance columns 3-7 — the 6-E plain proxy pipeline's own input).
+/// A pipeline assembled for the wrong form reads the wrong stride
+/// against the kind's VBO — the vehicle stream is 32-byte, so a
+/// skinned-stride pipeline fetches past its end (the first 4b draft's
+/// plain pipelines carried the skinned input; the vertex-form
+/// parameter makes that mistake unexpressible).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProxyVertexForm {
+    /// The npc kind: [`crate::animation::SkinnedVertex`], locations
+    /// 0-2 + 8-9 at binding 0, 3-7 + 10 at binding 1.
+    Skinned,
+    /// The vehicle kind: [`ProxyVertex`], locations 0-2 at binding 0,
+    /// 3-7 at binding 1.
+    Plain,
+}
+
 /// Device-lifetime skinned proxy resources. Owned by
 /// [`super::PipelineState`] (dies with the pipelines that read it; a
 /// pipeline replacement re-ensures an identical set before
@@ -291,7 +312,14 @@ impl SkinnedProxyResources {
             ctx,
             include_bytes!(concat!(env!("OUT_DIR"), "/instanced_proxy_skinned.spv")),
         )?;
-        let result = self.pipeline_from_module(ctx, module, render_pass, what);
+        let result = self.pipeline_from_module(
+            ctx,
+            module,
+            self.pipeline_layout,
+            render_pass,
+            ProxyVertexForm::Skinned,
+            what,
+        );
         // SAFETY: consumed by the pipeline above (or the build failed
         // with none alive); destroyed exactly once.
         unsafe { ctx.device.destroy_shader_module(module, None) };
@@ -300,12 +328,25 @@ impl SkinnedProxyResources {
 
     /// The pipeline assembly proper (the module is the caller's to
     /// destroy — this shape lets a failed build release exactly the
-    /// module it created, the assemble_pipelines discipline).
+    /// module it created, the assemble_pipelines discipline). The
+    /// pipeline is created on `layout` — the CALLER's set layout for
+    /// the family this pipeline belongs to (the unshadowed skinned
+    /// path passes its own; the shadowed-populated builders pass
+    /// their per-family layouts; the plain vehicle depth cast passes
+    /// the shadow state's own 6-F depth layout). `form` selects the
+    /// vertex input — see [`ProxyVertexForm`]. The first device
+    /// execution (CI run 45485839516) is on record for why both are
+    /// parameters and never defaults: a pipeline silently built on
+    /// the wrong layout or the wrong vertex form passes every
+    /// CPU-side gate and fails only where the validation layer can
+    /// see it.
     fn pipeline_from_module(
         &self,
         ctx: &VulkanContext,
         module: vk::ShaderModule,
+        layout: vk::PipelineLayout,
         render_pass: vk::RenderPass,
+        form: ProxyVertexForm,
         what: &str,
     ) -> Result<vk::Pipeline, RendererError> {
         let stages = [
@@ -318,15 +359,19 @@ impl SkinnedProxyResources {
                 .module(module)
                 .name(c"fs_main"),
         ];
-        // Binding 0: the skinned mesh at VERTEX rate — the 64-byte
-        // SkinnedVertex (pos/normal/uv at the ProxyVertex offsets,
-        // joints R32G32B32A32_UINT at 32, weights at 48). Binding 1:
-        // the packed instance bytes at INSTANCE rate — the plain
-        // pipeline's locations 3-7 PLUS location 10 (the params
-        // vec4's x, the pose block index) at byte offset 80.
+        // Binding 0: the proxy mesh at VERTEX rate — the form's own
+        // stride (the 64-byte SkinnedVertex for the npc kind, the
+        // 32-byte ProxyVertex for the vehicle kind). Binding 1: the
+        // packed instance bytes at INSTANCE rate (stride
+        // INSTANCE_STRIDE; the skinned form's location 10 reads the
+        // params vec4's pose index at byte offset 80, the plain form
+        // stops at the tint's 64).
         let mesh_binding = vk::VertexInputBindingDescription {
             binding: 0,
-            stride: std::mem::size_of::<crate::animation::SkinnedVertex>() as u32,
+            stride: match form {
+                ProxyVertexForm::Skinned => std::mem::size_of::<crate::animation::SkinnedVertex>(),
+                ProxyVertexForm::Plain => std::mem::size_of::<ProxyVertex>(),
+            } as u32,
             input_rate: vk::VertexInputRate::VERTEX,
         };
         let instance_binding = vk::VertexInputBindingDescription {
@@ -336,7 +381,17 @@ impl SkinnedProxyResources {
         };
         let bindings = [mesh_binding, instance_binding];
         let vec4 = vk::Format::R32G32B32A32_SFLOAT;
-        let attributes = [
+        // The shared prefix: the mesh's pos/normal/uv at locations
+        // 0-2 and the instance columns at 3-7 — every form's input.
+        // The skinned form extends it with the skinning tail
+        // (joints R32G32B32A32_UINT at byte 32, weights at 48 — the
+        // SkinnedVertex bytes past the ProxyVertex prefix) and the
+        // params vec4's pose index at location 10 (byte 80 of the
+        // instance stride); the plain form's slice STOPS at the
+        // prefix — its 32-byte mesh stride cannot carry the tail
+        // (offsets 32/48 would read the next vertex, past the buffer
+        // at the last one).
+        let all_attributes = [
             vk::VertexInputAttributeDescription {
                 location: 0,
                 binding: 0,
@@ -355,21 +410,6 @@ impl SkinnedProxyResources {
                 format: vk::Format::R32G32_SFLOAT,
                 offset: std::mem::offset_of!(ProxyVertex, uv) as u32,
             },
-            // The skinning inputs (the SkinnedVertex tail).
-            vk::VertexInputAttributeDescription {
-                location: 8,
-                binding: 0,
-                format: vk::Format::R32G32B32A32_UINT,
-                offset: 32,
-            },
-            vk::VertexInputAttributeDescription {
-                location: 9,
-                binding: 0,
-                format: vec4,
-                offset: 48,
-            },
-            // The instance-rate locations (the plain pipeline's own
-            // 3-7, plus the params vec4's pose index at 10).
             vk::VertexInputAttributeDescription {
                 location: 3,
                 binding: 1,
@@ -401,15 +441,31 @@ impl SkinnedProxyResources {
                 offset: 64,
             },
             vk::VertexInputAttributeDescription {
+                location: 8,
+                binding: 0,
+                format: vk::Format::R32G32B32A32_UINT,
+                offset: 32,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 9,
+                binding: 0,
+                format: vec4,
+                offset: 48,
+            },
+            vk::VertexInputAttributeDescription {
                 location: 10,
                 binding: 1,
                 format: vec4,
                 offset: 80,
             },
         ];
+        let attributes = &all_attributes[..match form {
+            ProxyVertexForm::Skinned => 11,
+            ProxyVertexForm::Plain => 8,
+        }];
         let inputs = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&bindings)
-            .vertex_attribute_descriptions(&attributes);
+            .vertex_attribute_descriptions(attributes);
         // The plain proxy pipeline's own states: CCW winding, FILL,
         // back-cull, LESS depth with write, one sample, RGBA write,
         // dynamic viewport/scissor.
@@ -446,13 +502,13 @@ impl SkinnedProxyResources {
             .depth_stencil_state(&depth)
             .color_blend_state(&color_blend)
             .dynamic_state(&dynamic_state)
-            .layout(self.pipeline_layout)
+            .layout(layout)
             .render_pass(render_pass)
             .subpass(0);
         // SAFETY: the module/layout/render pass are live (the caller
-        // owns the module; this state owns the layout; the pass is
-        // the ensure's); the returned pipeline is owned by this
-        // state.
+        // owns the module; the layout belongs to the family's state
+        // and outlives this pipeline; the pass is the ensure's); the
+        // returned pipeline is owned by the caller's state.
         unsafe {
             ctx.device
                 .create_graphics_pipelines(ctx.pipeline_cache, &[info], None)
@@ -543,65 +599,105 @@ impl SkinnedProxyResources {
     }
 
     /// Builds the skinned depth pipeline (the NPC cast through the
-    /// shadow state's depth pass).
+    /// shadow state's depth pass) on `layout` — the skinned depth
+    /// family's OWN layout (its set carries the light matrix at
+    /// binding 0 and the pose region at binding 5; a pipeline built
+    /// on any other layout mismatches the shader's declarations at
+    /// the first device draw).
     pub(super) fn build_skinned_depth_pipeline(
         &self,
         ctx: &VulkanContext,
         spv: &[u8],
         depth_render_pass: vk::RenderPass,
-        _layout: vk::PipelineLayout,
+        layout: vk::PipelineLayout,
         what: &str,
     ) -> Result<vk::Pipeline, RendererError> {
         let module = create_shader_module(ctx, spv)?;
-        let result = self.pipeline_from_module(ctx, module, depth_render_pass, what);
+        let result = self.pipeline_from_module(
+            ctx,
+            module,
+            layout,
+            depth_render_pass,
+            ProxyVertexForm::Skinned,
+            what,
+        );
         unsafe { ctx.device.destroy_shader_module(module, None) };
         result
     }
 
     /// Builds the plain depth pipeline (the vehicle cast through the
-    /// shadow state's depth pass).
+    /// shadow state's depth pass) on `layout` — the SHADOW state's
+    /// own 6-F depth layout (its set carries the light matrix; the
+    /// recording binds that very set) — with the PLAIN vertex form
+    /// (the vehicle mesh's 32-byte stream).
     pub(super) fn build_plain_depth_pipeline(
         &self,
         ctx: &VulkanContext,
         spv: &[u8],
         depth_render_pass: vk::RenderPass,
-        _layout: vk::PipelineLayout,
+        layout: vk::PipelineLayout,
         what: &str,
     ) -> Result<vk::Pipeline, RendererError> {
         let module = create_shader_module(ctx, spv)?;
-        let result = self.pipeline_from_module(ctx, module, depth_render_pass, what);
+        let result = self.pipeline_from_module(
+            ctx,
+            module,
+            layout,
+            depth_render_pass,
+            ProxyVertexForm::Plain,
+            what,
+        );
         unsafe { ctx.device.destroy_shader_module(module, None) };
         result
     }
 
     /// Builds the skinned shadowed lit pipeline (the NPC receiving
-    /// shadows through the main pass).
+    /// shadows through the main pass) on `layout` — the skinned
+    /// shadowed family's own layout (bindings 0/2/3/4/5: the albedo,
+    /// the extended shadow FrameParams, the material tail, the slot's
+    /// map view, the pose region).
     pub(super) fn build_skinned_lit_pipeline(
         &self,
         ctx: &VulkanContext,
         spv: &[u8],
         render_pass: vk::RenderPass,
-        _layout: vk::PipelineLayout,
+        layout: vk::PipelineLayout,
         what: &str,
     ) -> Result<vk::Pipeline, RendererError> {
         let module = create_shader_module(ctx, spv)?;
-        let result = self.pipeline_from_module(ctx, module, render_pass, what);
+        let result = self.pipeline_from_module(
+            ctx,
+            module,
+            layout,
+            render_pass,
+            ProxyVertexForm::Skinned,
+            what,
+        );
         unsafe { ctx.device.destroy_shader_module(module, None) };
         result
     }
 
     /// Builds the plain shadowed lit pipeline (the vehicle receiving
-    /// shadows through the main pass).
+    /// shadows through the main pass) on `layout` — the plain
+    /// shadowed family's own layout (bindings 0/2/3/4, no pose) —
+    /// with the PLAIN vertex form.
     pub(super) fn build_plain_lit_pipeline(
         &self,
         ctx: &VulkanContext,
         spv: &[u8],
         render_pass: vk::RenderPass,
-        _layout: vk::PipelineLayout,
+        layout: vk::PipelineLayout,
         what: &str,
     ) -> Result<vk::Pipeline, RendererError> {
         let module = create_shader_module(ctx, spv)?;
-        let result = self.pipeline_from_module(ctx, module, render_pass, what);
+        let result = self.pipeline_from_module(
+            ctx,
+            module,
+            layout,
+            render_pass,
+            ProxyVertexForm::Plain,
+            what,
+        );
         unsafe { ctx.device.destroy_shader_module(module, None) };
         result
     }
