@@ -84,6 +84,34 @@ fn sdl_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap()
 }
 
+/// The Era-2 skinned family's per-replacement resource cost, pinned
+/// (the first device execution's finding, CI run 45488497488 on
+/// lavapipe): the pipeline-replacement lifecycle re-ensures every
+/// family the outgoing state owned (the finding-A discipline), and
+/// the skinned family's re-ensure re-creates its descriptor pool and
+/// its three per-material sets — the allocation counters are
+/// cumulative creation totals that never decrement, so each
+/// replacement adds exactly this once. The 6-E2-era pin held these
+/// counters FLAT across a replacement because no family on the
+/// populated path then owned descriptor-class resources (the proxy
+/// family's re-ensure grows only device_memory — the documented
+/// delta this test prints); the Era-2 skinned family legitimately
+/// extended that growth class, and the correction is this EXACT
+/// per-replacement pin — not a loosened assertion. The lifecycle
+/// blocks below force TWO replacements each (the resize out, then
+/// the capture back at the original extent). MEASURED: two
+/// replacements grew the tuple by exactly +2 pools / +6 sets.
+///
+/// The deeper fix — a pass-independent ownership transfer so the
+/// skinned pool/sets/pose-buffer survive replacements and only the
+/// render-pass-bound pipelines re-create — is the recorded
+/// renderer-architecture follow-up (it would also cover the
+/// shadowed-populated family, whose sets follow the re-created
+/// shadow state's map views and so cannot transfer as easily).
+const SKINNED_REPLACEMENT_POOLS: u64 = 1;
+const SKINNED_REPLACEMENT_SETS: u64 = 3;
+const LIFECYCLE_REPLACEMENTS: u64 = 2;
+
 /// The gate's fixed population: 10 NPCs + 3 vehicles (13 instances —
 /// the N in the N-vs-1 claim), placed in the intersection's
 /// road-cross frame. A depth STACK of three NPCs along the southwest
@@ -665,6 +693,11 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
     );
     assert_eq!(calls, 2);
     let after_stats = renderer.allocations();
+    // The Era-2 correction (run 45488497488's measurement): the
+    // tuple grows by the skinned family's PINNED per-replacement
+    // re-ensure cost (see the constants' derivation above) — exact
+    // equality against the derived expectation, never a loosened
+    // blanket match.
     assert_eq!(
         (
             after_stats.texture_memory,
@@ -674,11 +707,12 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
         ),
         (
             warm.texture_memory,
-            warm.descriptor_pools,
-            warm.descriptor_sets,
+            warm.descriptor_pools + SKINNED_REPLACEMENT_POOLS * LIFECYCLE_REPLACEMENTS,
+            warm.descriptor_sets + SKINNED_REPLACEMENT_SETS * LIFECYCLE_REPLACEMENTS,
             warm.samplers
         ),
-        "the corner's static allocations survived the replacement"
+        "the corner's static allocations plus the skinned family's pinned \
+         re-ensure cost survived the replacement"
     );
     println!(
         "after pipeline replacement: {after_stats:?} (device_memory delta {})",
@@ -1413,6 +1447,11 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
     assert_eq!(calls, 2);
     assert_frames_equal(&indirect, &after, "the re-ensured indirect path");
     let after_stats = renderer.allocations();
+    // The Era-2 correction (run 45488497488's measurement): the
+    // tuple grows by the skinned family's PINNED per-replacement
+    // re-ensure cost (the constants' derivation at the top of this
+    // file) — exact equality against the derived expectation, never
+    // a loosened blanket match.
     assert_eq!(
         (
             after_stats.texture_memory,
@@ -1422,11 +1461,12 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
         ),
         (
             indirect_warm.texture_memory,
-            indirect_warm.descriptor_pools,
-            indirect_warm.descriptor_sets,
+            indirect_warm.descriptor_pools + SKINNED_REPLACEMENT_POOLS * LIFECYCLE_REPLACEMENTS,
+            indirect_warm.descriptor_sets + SKINNED_REPLACEMENT_SETS * LIFECYCLE_REPLACEMENTS,
             indirect_warm.samplers
         ),
-        "the corner's static allocations survived the replacement"
+        "the corner's static allocations plus the skinned family's pinned \
+         re-ensure cost survived the replacement"
     );
     println!(
         "after pipeline replacement: {after_stats:?} (device_memory delta {})",
