@@ -348,9 +348,9 @@ jobs:
           # Era 1 package 3 (the sky, 2026-11-23): +2 platform-uniform
           # engine-renderer lib tests (the mat4_inverse contract and
           # ray property). Linux 1178/2/33 MEASURED locally with this
-          # step's own awk; Windows 1127 = 1125 + the same 2.
-          expected=1178
-          if [ "$(uname -s)" != "Linux" ]; then expected=1127; fi
+          # step's own awk; Windows 1128 = 1126 + the same 2 (the up-to-date merge of main brought the CI-fix series +1 renderer test beyond the parked pin view - corrected from the locally measured actuals).
+          expected=1179
+          if [ "$(uname -s)" != "Linux" ]; then expected=1128; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -395,8 +395,8 @@ jobs:
           # Era 1 package 3 (the sky): +2 (the mat4_inverse pair, the
           # same +2 as the main shard) — 99 -> 101. MEASURED locally
           # with this step's own awk (101/0 failures/2 result lines).
-          echo "renderer release: $passed passed, $results test-result lines (expected 101 / 2)"
-          [ "$passed" -eq 101 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 101"; exit 1; }
+          echo "renderer release: $passed passed, $results test-result lines (expected 102 / 2)"
+          [ "$passed" -eq 102 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 102"; exit 1; }
           [ "$results" -eq 2 ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != 2"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production
