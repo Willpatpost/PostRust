@@ -25,7 +25,9 @@
 //!     --ignored --nocapture
 //! ```
 
-use engine_renderer::post::{bloom_at_pixel, bloom_mip_from_hdr, post_pixel, tonemap_rgb};
+use engine_renderer::post::{
+    bloom_at_pixel, bloom_mip_from_hdr, bright_pass, post_pixel, tonemap, tonemap_rgb,
+};
 use engine_renderer::sky::{atmosphere_at, sky_color};
 use engine_renderer::{
     DemoScenePreference, RenderConfig, Renderer, SkyFrame, ValidationPreference,
@@ -261,6 +263,7 @@ fn post_pixels_match_post_rs_and_the_disc_blooms() {
     //    computes, and measurably ABOVE the no-bloom tonemap (the
     //    directional form of the gate).
     let mut ring_lift = 0i32;
+    let mut last_predicted_lift = 0i32; // captured for summary print
     for (dx, dy) in [(11i32, 0), (-11, 0), (0, 11), (0, -11)] {
         let (x, y) = ((center as i32 + dx) as u32, (center as i32 + dy) as u32);
         let expected = oracle(x, y);
@@ -280,22 +283,36 @@ fn post_pixels_match_post_rs_and_the_disc_blooms() {
         // The directional check: the presented pixel exceeds the
         // no-bloom tonemap of its own HDR value (the bloom's lift,
         // channel-wise on the strongest channel).
+        // Findings 16 correction: use captured RGB minus no-bloom
+        // baseline for the directional assertion and diagnostics;
+        // keep the independent full-chain error check unchanged.
         let ray = pixel_ray(forward, right, up, x, y, size);
         let no_bloom = quantized(tonemap_rgb(sky_color(ray, &day.sky, sun_dir)));
-        let lift = expected
+        // Measured lift: the captured (presented) pixel minus no-bloom.
+        let captured_lift = pixel
             .iter()
             .zip(no_bloom)
             .map(|(e, n)| (*e as i32) - (n as i32))
             .max()
             .unwrap();
-        ring_lift = ring_lift.max(lift);
+        // Predicted lift: expected minus no-bloom (the oracle's prediction).
+        let predicted_lift = expected
+            .iter()
+            .zip(no_bloom)
+            .map(|(e, n)| (*e as i32) - (n as i32))
+            .max()
+            .unwrap();
+        ring_lift = ring_lift.max(captured_lift);
         assert!(
-            lift >= 2,
-            "bloom-ring pixel ({x},{y}): the bloom lifts it ({lift}/255): {expected:?} vs {no_bloom:?}"
+            captured_lift >= 2,
+            "bloom-ring pixel ({x},{y}): captured lift {captured_lift}/255 >= 2/255, predicted {predicted_lift}/255: pixel {pixel:?} vs no-bloom {no_bloom:?}"
         );
+        // Capture predicted_lift for the summary (all 4 pixels use the
+        // same no-bloom baseline since they're on the same ring).
+        last_predicted_lift = predicted_lift;
     }
     println!(
-        "bloom ring: 4 pixels vs the oracle within {TOLERANCE}/255, lifted ≥2/255 above the no-bloom tonemap (max lift {ring_lift}/255)"
+        "bloom ring: 4 pixels vs the oracle within {TOLERANCE}/255, captured lift ≥2/255 above the no-bloom tonemap (max captured lift {ring_lift}/255, predicted {last_predicted_lift}/255)"
     );
 
     // C. THE FAR CORNERS (the pure tonemap): bloom is EXACTLY zero
@@ -480,4 +497,18 @@ fn post_pixels_match_post_rs_and_the_disc_blooms() {
          the bloom ring lifted ≥2/255, the postless path byte-identical, the post state paid once, \
          every corner-family composition clean"
     );
+}
+
+/// Edge case test for tonemap and bright_pass: the shader's branch
+/// structure must match the CPU's (nonpositive → 0, positive → rational).
+#[test]
+fn tonemap_and_bright_pass_edge_cases() {
+    // Tonemap: negative/zero → 0, positive → rational.
+    assert_eq!(tonemap_rgb([-0.5, 0.0, 0.18]), [0.0, 0.0, tonemap(0.18)]);
+    // Bright pass: negative/zero/below threshold → 0, above → identity.
+    assert_eq!(bright_pass(-0.5), 0.0);
+    assert_eq!(bright_pass(0.0), 0.0);
+    assert_eq!(bright_pass(0.5), 0.0);
+    assert_eq!(bright_pass(1.0), 0.0);
+    assert!((bright_pass(2.0) - 2.0).abs() < 1e-6);
 }

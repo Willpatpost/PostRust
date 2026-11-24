@@ -30,9 +30,9 @@
 //! ```
 
 use engine_renderer::lit_scene::lit_surface_color;
-use engine_renderer::lit_scene::{RouteWaypoint, day_preset};
+use engine_renderer::lit_scene::{GROUND_Y, RouteWaypoint, day_preset};
 use engine_renderer::lit_scene::{intersection_boxes, materials};
-use engine_renderer::planar::reflection_blend;
+use engine_renderer::planar::{mirrored_eye, reflection_blend};
 use engine_renderer::proc_texture::{TEXTURE_SIZE, procedural_texture};
 use engine_renderer::{DemoScenePreference, RenderConfig, Renderer, ValidationPreference};
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
@@ -210,13 +210,21 @@ fn wet_ground_blends_the_mirrored_scene_by_planar_rs() {
         "the pre-wet corner pins (render_corner's own)"
     );
 
-    // THE GRAZING POSE: a street-level eye looking down-and-west
-    // across the open ground before the southwest mass — the
-    // checked pixels' reflected rays climb to its east face (the
-    // big flat wall at x=-6, normal +X, z ∈ [-40,-6]).
+    // THE GRAZING POSE (finding 18's corrective): a street-level eye
+    // looking down-and-east across the open ground before the
+    // southeast mass — the checked pixels' reflected rays climb to
+    // its WEST face (the big flat wall at x=6, normal −X, z ∈
+    // [−40,−6]) — a LIT face under the day light (normal −X against
+    // dir_toward_light (−0.5, 0.707, −0.5): N·L = +0.5, so the
+    // reflection term carries real diffuse AND specular; the former
+    // pose's east face (normal +X) clamped N·L to zero and the
+    // wrong-eye defect was invisible — the review's finding). The
+    // reflection term's view vector is the VIRTUAL (mirrored) eye
+    // (planar::mirrored_eye over the ground plane); the ground
+    // pixel's own Schlick blend keeps the real eye.
     let light = day_preset();
-    let eye = [12.0, 2.0, -12.0];
-    let aim = [2.0, 0.0, -12.0];
+    let eye = [-12.0, 2.0, 12.0];
+    let aim = [-2.0, 0.0, 2.0];
     let matrix = view_projection(
         RouteWaypoint {
             position: eye,
@@ -271,9 +279,12 @@ fn wet_ground_blends_the_mirrored_scene_by_planar_rs() {
                 continue; // the reflection is the clear color here —
                 // covered by the overhead check below.
             };
-            // The mirror invariance: the mirrored render's shading
-            // at the mirrored point IS the real equation at the
-            // real hit from the real eye.
+            // Finding 18 correction: the reflection term's view vector
+            // should use the virtual (mirrored) eye, not the real eye.
+            // The virtual eye = ground-plane reflection of real eye:
+            // virtual_eye = [eye[0], -eye[1], eye[2]] (ground plane y=0).
+            // The Fresnel blend at ground keeps the real eye (the
+            // Schlick n·v at the ground uses the actual view angle).
             let mat = materials()[hit.material];
             let texture = procedural_texture(mat.texture);
             let [tx, ty] = hit
@@ -281,9 +292,10 @@ fn wet_ground_blends_the_mirrored_scene_by_planar_rs() {
                 .map(|m| ((m / 4.).rem_euclid(1.) * TEXTURE_SIZE as f32).floor() as usize);
             let index = 4 * (ty * TEXTURE_SIZE as usize + tx);
             let albedo = std::array::from_fn(|c| texture[index + c] as f32 / 255.);
-            let view = std::array::from_fn(|i| eye[i] - hit.pos[i]);
-            let reflection = lit_surface_color(albedo, hit.normal, view, mat, light);
-            // The blend at this pixel's own view angle.
+            let virtual_eye = mirrored_eye(eye, GROUND_Y);
+            let view_virtual = std::array::from_fn(|i| virtual_eye[i] - hit.pos[i]);
+            let reflection = lit_surface_color(albedo, hit.normal, view_virtual, mat, light);
+            // The blend at this pixel's own view angle (real eye).
             let view_ground = [eye[0] - p[0], eye[1] - p[1], eye[2] - p[2]];
             let view_length = (view_ground[0] * view_ground[0]
                 + view_ground[1] * view_ground[1]
@@ -368,39 +380,51 @@ fn wet_ground_blends_the_mirrored_scene_by_planar_rs() {
         for x in 100..=156 {
             let ray = pixel_ray(hf, hr, hu, x, y, size);
             if ray[1] >= -1e-4 {
-                continue;
+                continue; // not looking at ground (horizon or above)
             }
+            // First intersect the camera ray with opaque geometry
+            // (only ground-visible rays qualify — a roof pixel must
+            // not be checked as ground). The ground is at y=0.
             let t_ground = -high_eye[1] / ray[1];
             let p = [
                 high_eye[0] + ray[0] * t_ground,
                 0.0,
                 high_eye[2] + ray[2] * t_ground,
             ];
-            let reflected = [ray[0], -ray[1], ray[2]];
-            // Over the open ground the reflected ray climbs into
-            // empty sky (no box overhead — the column is checked).
-            if raycast_boxes(p, reflected).is_some() {
-                continue;
+            // Check that the ground pixel is actually visible (no
+            // opaque geometry between camera and ground). The
+            // overhead check needs visible ground to have contrast
+            // between wet and dry.
+            let ground_hit = raycast_boxes(high_eye, ray);
+            if ground_hit.is_none() {
+                // The ray hits nothing before ground — it's visible.
+                // But the ground hit itself might not be ground —
+                // check it's not a roof pixel that just happens to
+                // have negative ray[1].
+                let reflected = [ray[0], -ray[1], ray[2]];
+                if raycast_boxes(p, reflected).is_some() {
+                    continue; // the reflection hits something — not open ground
+                }
+                let dry_pixel = high_dry.pixel_rgba(x, y);
+                let wet_pixel = high_wet.pixel_rgba(x, y);
+                // RGB only: the re-draw's alpha stage writes the Schlick
+                // factor itself into the destination alpha (a harmless,
+                // informative side effect — the swapchain composites
+                // opaque; the RGB channels carry the actual image).
+                let error = dry_pixel
+                    .iter()
+                    .take(3)
+                    .zip(wet_pixel.iter().take(3))
+                    .map(|(e, a)| e.abs_diff(*a))
+                    .max()
+                    .unwrap();
+                overhead_error = overhead_error.max(error);
+                assert!(
+                    error <= TOLERANCE,
+                    "overhead pixel ({x},{y}): dry {dry_pixel:?} vs wet {wet_pixel:?}"
+                );
+                overhead_checked += 1;
             }
-            let dry_pixel = high_dry.pixel_rgba(x, y);
-            let wet_pixel = high_wet.pixel_rgba(x, y);
-            // RGB only: the re-draw's alpha stage writes the Schlick
-            // factor itself into the destination alpha (a harmless,
-            // informative side effect — the swapchain composites
-            // opaque; the RGB channels carry the actual image).
-            let error = dry_pixel
-                .iter()
-                .take(3)
-                .zip(wet_pixel.iter().take(3))
-                .map(|(e, a)| e.abs_diff(*a))
-                .max()
-                .unwrap();
-            overhead_error = overhead_error.max(error);
-            assert!(
-                error <= TOLERANCE,
-                "overhead pixel ({x},{y}): dry {dry_pixel:?} vs wet {wet_pixel:?}"
-            );
-            overhead_checked += 1;
         }
     }
     println!(

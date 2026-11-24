@@ -45,6 +45,11 @@ fn bright_pass(x: f32) -> f32 {
 }
 
 fn tonemap(x: f32) -> f32 {
+    // Mirror post.rs tonemap branch structure: nonpositive inputs
+    // return exactly 0.0; positive inputs use the rational polynomial.
+    if x <= 0.0 {
+        return 0.0;
+    }
     let num = x * (2.51 * x + 0.03);
     let den = x * (2.43 * x + 0.59) + 0.14;
     return clamp(num / den, 0.0, 1.0);
