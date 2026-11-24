@@ -436,22 +436,35 @@ comment chains and the PR bodies):
   heavy 588/27/62 (ignored 26 → 27, the one new gate) — MEASURED
   with the workflow's own awk, the reflection battery 6/6 on the
   pod's lavapipe. At the full union the heavy ignored pin is 28
-  (#21's capture gate + 27 here) — the exact-count gate enforces
-  the actuals at the owner's merge sequence.
+  (#21's capture gate + 27 here) — MEASURED on the assembled
+  eight-PR union by the extended rehearsal (the paragraph below),
+  the exact-count gate enforcing it through CI on PR #29.
 
 The full union's counts are MEASURED (the 2026-11-24 union
-  rehearsal, branch `corrective/union-rehearsal` — seven `--no-ff`
-  merges in the ladder order over `main` @ `406aceb`, the full
-  local gate battery with the workflow's own awk): main
-  **1208/2/33** (Windows 1157), renderer release **131/2**, heavy
-  **588/27/62** (Windows 587 — #27's 26 plus #21's capture gate,
-  which #26/#27's trees never contained); draft PR #29 (the
+  rehearsal, branch `corrective/union-rehearsal` — EIGHT `--no-ff`
+  merges in the ladder order over `main` @ `406aceb`: #21–#27,
+  then #30's acquire-out-of-date gate as the eighth, the end state
+  the owner's merge sequence produces — the full local gate battery
+  with the workflow's own awk): main **1208/2/33** (Windows 1157),
+  renderer release **131/2**, heavy **588/28/62** (Windows 587 —
+  the seven-PR union's measured 27 plus #30's one gate, the
+  arithmetic #30's body documented, MEASURED on the assembled
+  tree). The eighth merge is the one the seven-PR rehearsal could
+  not cover (#30 stacks on #27's tip, so its one-shot injection
+  consume site — vulkan.rs's first acquire — had never met #24's
+  `prepare_after_recreation` restructure of that exact region):
+  its ONE conflict was the workflow's heavy-ignored pin block,
+  resolved additively, and the linchpin gate re-fired on the merged
+  tree with every measured line identical (the injection survived
+  the split — re-verified on the pod's lavapipe AND in CI's own
+  Reflection-gates step); draft PR #29 (the
   rehearsal's DO-NOT-MERGE verification PR — GitHub's
   `pull_request` CI is the only mechanism that runs the exact-count
   gates on the union tree, the push trigger being branch-filtered)
-  carries it through the five-job CI, and the workflow's
-  exact-count gate enforces the actuals at the owner's merge,
-  never a guess. The rehearsal also caught the union's two
+  carries it through the five-job CI — run `45392386762` green on
+  the seven-PR tree, run `45406550126` green on the eight-PR tree
+  (the Windows 1157/587/28 exact-count pins' first execution on
+  the end state). The rehearsal also caught the union's two
   merge-time obligations — both at the #21×#23 seam, correct on
   every branch's own tree and invisible to GitHub's conflict
   detection: `compare_map`'s 4→7-tuple (four destructure sites in
