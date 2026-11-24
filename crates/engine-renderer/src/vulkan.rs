@@ -375,6 +375,13 @@ pub(crate) struct VulkanContext {
     /// builders (e.g., shadow's per-slot loop). The plan is NEVER
     /// touched by real device calls — it is test-only and diagnostic.
     target_fault: Cell<Option<(TargetFaultSite, TargetFaultStage, u32)>>,
+    /// The one-shot acquire-out-of-date injection (finding 6's
+    /// verification knob — the driver-forced
+    /// `VK_ERROR_OUT_OF_DATE_KHR` acquire path, unreachable from the
+    /// test API otherwise). Diagnostic-only, test-only: consumed at
+    /// the FIRST acquire site of the next frame so the retry acquire
+    /// inside the out-of-date arm is structurally real.
+    acquire_out_of_date_armed: Cell<bool>,
     /// Creation counts for Era-1 target builders' Vulkan objects (the
     /// review's finding 8 acquisitions: image, memory, view, framebuffer
     /// — post chain, wet chain, shadow chain). These are monotonic
@@ -726,6 +733,7 @@ impl VulkanContext {
             sampler_creations: Cell::new(0),
             indirect_draws_issued: Cell::new(0),
             target_fault: Cell::new(None),
+            acquire_out_of_date_armed: Cell::new(false),
             target_images: Cell::new(0),
             target_image_views: Cell::new(0),
             target_framebuffers: Cell::new(0),
@@ -842,6 +850,25 @@ impl VulkanContext {
                 Ok(())
             }
         }
+    }
+
+    /// Arms a one-shot acquire-out-of-date injection (finding 6's
+    /// verification knob — the driver-forced
+    /// `VK_ERROR_OUT_OF_DATE_KHR` acquire path, unreachable from the
+    /// test API otherwise). Diagnostic-only, test-only: the plan is
+    /// consumed at the first acquire site of the next frame so the
+    /// retry acquire inside the out-of-date arm is structurally
+    /// real.
+    pub(crate) fn set_acquire_out_of_date(&self) {
+        self.acquire_out_of_date_armed.set(true);
+    }
+
+    /// Returns and disarms the one-shot acquire-out-of-date plan.
+    /// `true` exactly once after `set_acquire_out_of_date`, then
+    /// `false` until the next arm. The `Cell::replace(false)` pattern
+    /// ensures consumption in a single frame.
+    pub(crate) fn take_acquire_out_of_date(&self) -> bool {
+        self.acquire_out_of_date_armed.replace(false)
     }
 
     /// Create a target image, incrementing the creation counter on
@@ -3769,13 +3796,25 @@ pub(crate) fn render_frame(
 
     // OUT_OF_DATE retries once. The fence stays signaled until an image
     // has actually been acquired, including when both attempts defer.
-    let mut acquire_result = unsafe {
-        ctx.swapchain_ext.acquire_next_image(
-            swapchain.swapchain,
-            100_000_000,
-            frames.image_available[slot],
-            vk::Fence::null(),
-        )
+    // If the acquire-out-of-date plan is armed, inject the error at the
+    // FIRST acquire site only (the retry acquire inside the out-of-date
+    // arm is NEVER injected — the plan is consumed at the first site
+    // only, so the retry remains structurally real). The injected result
+    // models the driver contract exactly (ERROR_OUT_OF_DATE_KHR means no
+    // image was acquired and the semaphore is untouched — precisely the
+    // state the out-of-date arm below already handles; skipping the real
+    // call is therefore the faithful simulation, not an approximation).
+    let mut acquire_result = if ctx.take_acquire_out_of_date() {
+        Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
+    } else {
+        unsafe {
+            ctx.swapchain_ext.acquire_next_image(
+                swapchain.swapchain,
+                100_000_000,
+                frames.image_available[slot],
+                vk::Fence::null(),
+            )
+        }
     };
     if let Err(vk::Result::ERROR_OUT_OF_DATE_KHR) = acquire_result {
         // The out-of-date inline recreation ALSO probes first (the

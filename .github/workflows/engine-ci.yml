@@ -1420,7 +1420,7 @@ jobs:
           # are engine-renderer lib tests — the main shard's).
           # Linux 582/14/59 MEASURED locally with this step's own
           # awk; Windows 581/14/59 platform-uniform.
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 26 / 62)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 27 / 62)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           # Era 1 package 3 (the sky, 2026-11-23): the NEW
           # tests/render_sky.rs binary carries ONE #[ignore]d
@@ -1492,7 +1492,22 @@ jobs:
           # existing reflection gate). MEASURED locally on this
           # branch's tree with this step's own awk (588/26/62, zero
           # failures); platform-uniform (no cfg gates).
-          [ "$ignored" -eq 26 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 26"; exit 1; }
+          # Era-1 corrective recursive phase, acquire-out-of-date
+          # (2026-11-24): finding 6's out-of-date half — the ONE
+          # #[ignore]d render_reflection gate
+          # first_frame_after_out_of_date_recreation_keeps_every_layer
+          # (the driver-forced VK_ERROR_OUT_OF_DATE_KHR acquire path
+          # exercised through the one-shot diagnostic injection; the
+          # first presented frame after that recreation proven to
+          # carry sky/wet/post by the same differential presence
+          # proofs as the pending-recreate sibling, plus the one-shot
+          # consumption proof) — executed by the unchanged
+          # reflection-gates Linux Vulkan step below; ignored in this
+          # plain run: 26 -> 27. Passed counts and result lines
+          # unchanged. MEASURED locally on this branch's tree with
+          # this step's own awk (588/27/62, zero failures);
+          # platform-uniform (no cfg gates).
+          [ "$ignored" -eq 27 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 27"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
