@@ -325,7 +325,7 @@ mod tests {
     #[test]
     fn corner_pcf_holds_the_bias_discipline_at_the_real_extent() {
         let boxes = intersection_boxes();
-        let (min, max) = scene_bounds(&boxes);
+        let (min, max) = scene_bounds(boxes);
         let cascade = cascade_for(day_preset().dir_toward_light, min, max);
         let extent = SHADOW_MAP_EXTENT;
         let bias = ShadowBias {
@@ -333,7 +333,7 @@ mod tests {
             slope_scale: 0.002,
         };
         let ground = [0.0, 1.0, 0.0];
-        let modeled = |x: u32, y: u32| map_texel_depth(&cascade, &boxes, x, y, extent).depth;
+        let modeled = |x: u32, y: u32| map_texel_depth(&cascade, boxes, x, y, extent).depth;
         let factor_at =
             |point: [f32; 3]| pcf_at_point(&cascade, extent, point, ground, bias, modeled);
 
@@ -360,7 +360,7 @@ mod tests {
                         && b.min[2] < point[2]
                         && point[2] < b.max[2]
                 });
-                if inside || is_shadowed(point, &cascade, &boxes) {
+                if inside || is_shadowed(point, &cascade, boxes) {
                     continue;
                 }
                 let factor = factor_at(point);
@@ -391,7 +391,7 @@ mod tests {
                     if x < 0 || y < 0 || x >= extent as i32 || y >= extent as i32 {
                         continue; // the clear value passes by construction
                     }
-                    let texel = map_texel_depth(&cascade, &boxes, x as u32, y as u32, extent);
+                    let texel = map_texel_depth(&cascade, boxes, x as u32, y as u32, extent);
                     if ndc[2] > texel.depth + bias_value && texel.box_index.is_none() {
                         failing_ground_taps += 1;
                     }
@@ -421,13 +421,13 @@ mod tests {
         for (x, z) in [(-5.7, -20.0), (-5.7, -12.0), (-20.0, -5.7), (-12.0, -5.7)] {
             let deep = [x, 0.0, z];
             assert!(
-                is_shadowed(deep, &cascade, &boxes),
+                is_shadowed(deep, &cascade, boxes),
                 "the probe at ({x}, {z}) sits in the wall's umbra"
             );
             assert_eq!(factor_at(deep), 0.0, "full shadow at the caster's base");
         }
         let adjacent = [-5.95, 0.0, -16.0];
-        assert!(is_shadowed(adjacent, &cascade, &boxes));
+        assert!(is_shadowed(adjacent, &cascade, boxes));
         let adjacent_factor = factor_at(adjacent);
         assert!(
             adjacent_factor < 1.0,

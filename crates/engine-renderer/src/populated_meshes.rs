@@ -101,6 +101,8 @@ fn wheel(
         ring_point(radius, (u32::from(i) * 65_536 / u32::from(segments)) as u16)
     };
     // The side quads: per-vertex radial normals (smooth shading).
+    // The winding is counter-clockwise from the OUTSIDE of the wheel,
+    // matching the outward-pointing radial normals.
     for i in 0..segments {
         let [y0, z0] = ring(i);
         let [y1, z1] = ring(i + 1);
@@ -113,19 +115,32 @@ fn wheel(
         };
         let n0 = [ry0 / radius, rz0 / radius];
         let n1 = [ry1 / radius, rz1 / radius];
+        // CCW from outside: a→d→c→b (reversed from inside-out winding)
+        // The outward normal at a/d is n0, at b/c is n1.
         let a = corner(x_lo, y0, z0, n0[0], n0[1]);
-        let b = corner(x_hi, y0, z0, n0[0], n0[1]);
-        let c = corner(x_hi, y1, z1, n1[0], n1[1]);
         let d = corner(x_lo, y1, z1, n1[0], n1[1]);
-        // Two triangles, the corner order the box walls use.
-        vertices.extend_from_slice(&[a, b, c, a, c, d]);
+        let c = corner(x_hi, y1, z1, n1[0], n1[1]);
+        let b = corner(x_hi, y0, z0, n0[0], n0[1]);
+        // Two triangles, CCW from outside: a→d→c and a→c→b
+        vertices.extend_from_slice(&[a, d, c, a, c, b]);
     }
-    // The caps: flat fans, center vertex + rim, ±X normals.
+    // The caps: flat fans, center vertex + rim, ±X normals. The
+    // winding is CCW from the OUTSIDE of EACH face, which means the
+    // two faces traverse the rim in OPPOSITE orders: viewed from
+    // +X, center→ring(i)→ring(i+1) is counter-clockwise (its
+    // geometric normal is +X — the cross product's X component is
+    // r²·sin(Δθ) > 0), so the HIGH-X cap uses that order; viewed
+    // from −X the same order is clockwise, so the LOW-X cap
+    // reverses it (center→ring(i+1)→ring(i), geometric normal −X).
+    // (corrective finding 11: both caps previously shared one
+    // traversal, so one cap's geometric normal always opposed its
+    // authored ±X normal — the far surface showed through the near
+    // one under back-face culling.)
     for (x, normal_x) in [(x_lo, -1.0), (x_hi, 1.0)] {
         for i in 0..segments {
             let [y0, z0] = ring(i);
             let [y1, z1] = ring(i + 1);
-            let v = |y: f32, z: f32| ProxyVertex {
+            let rim = |y: f32, z: f32| ProxyVertex {
                 pos: [x, center[1] + y, center[2] + z],
                 normal: [normal_x, 0.0, 0.0],
                 uv: [z / 4.0, y / 4.0],
@@ -135,7 +150,16 @@ fn wheel(
                 normal: [normal_x, 0.0, 0.0],
                 uv: [0.0, 0.0],
             };
-            vertices.extend_from_slice(&[center_v, v(y0, z0), v(y1, z1)]);
+            let first = rim(y0, z0);
+            let second = rim(y1, z1);
+            // CCW from this face's outside: +X face keeps
+            // ring(i)→ring(i+1); the −X face reverses it.
+            let (first, second) = if normal_x > 0.0 {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            vertices.extend_from_slice(&[center_v, first, second]);
         }
     }
 }
@@ -269,5 +293,86 @@ mod tests {
         let (s, c) = crate::proxy_instances::sin_cos_turn((65_536 / 10) as u16);
         assert_eq!(seg, [c, s]);
         assert!(expected_angle.is_finite());
+    }
+
+    /// (corrective finding 11) Every wheel triangle's geometric
+    /// normal must agree with its authored normals: the side quads'
+    /// cross product points outward radially (the smooth-shading
+    /// normals' direction), and each cap fan's cross product points
+    /// along its declared ±X face normal. The check runs on the
+    /// wheel()'s OWN emission — every sedan wheel is a translation
+    /// of the same emission (translation cannot change normals), so
+    /// this covers all four wheels without reverse-engineering the
+    /// sedan's vertex layout.
+    #[test]
+    fn wheel_normals_agree_with_winding() {
+        let mut scratch = Vec::new();
+        wheel(&mut scratch, [0.0, 0.35, 0.0], 0.35, 0.25, WHEEL_SEGMENTS);
+        let segments = usize::from(WHEEL_SEGMENTS);
+        // The emission layout: `segments` side quads of 6 vertices
+        // (two triangles a,d,c / a,c,b), then two caps of `segments`
+        // triangles of 3 vertices each.
+        assert_eq!(
+            scratch.len(),
+            segments * 6 + 2 * segments * 3,
+            "the wheel emission layout this test walks"
+        );
+        let mut checked = 0usize;
+        let mut min_dot = f32::INFINITY;
+        let mut check = |tri: (&ProxyVertex, &ProxyVertex, &ProxyVertex)| {
+            let (v0, v1, v2) = tri;
+            let e1 = [
+                v1.pos[0] - v0.pos[0],
+                v1.pos[1] - v0.pos[1],
+                v1.pos[2] - v0.pos[2],
+            ];
+            let e2 = [
+                v2.pos[0] - v0.pos[0],
+                v2.pos[1] - v0.pos[1],
+                v2.pos[2] - v0.pos[2],
+            ];
+            let geometric = [
+                e1[1] * e2[2] - e1[2] * e2[1],
+                e1[2] * e2[0] - e1[0] * e2[2],
+                e1[0] * e2[1] - e1[1] * e2[0],
+            ];
+            let authored = [
+                (v0.normal[0] + v1.normal[0] + v2.normal[0]) / 3.0,
+                (v0.normal[1] + v1.normal[1] + v2.normal[1]) / 3.0,
+                (v0.normal[2] + v1.normal[2] + v2.normal[2]) / 3.0,
+            ];
+            let dot = geometric[0] * authored[0]
+                + geometric[1] * authored[1]
+                + geometric[2] * authored[2];
+            min_dot = min_dot.min(dot);
+            checked += 1;
+            assert!(
+                dot > 0.0,
+                "a wheel triangle's geometric normal opposes its authored normals                  (dot {dot}): vertices {:?} {:?} {:?}",
+                v0.pos,
+                v1.pos,
+                v2.pos
+            );
+        };
+        // The side quads: two triangles per 6-vertex group.
+        for quad in 0..segments {
+            let base = quad * 6;
+            check((&scratch[base], &scratch[base + 1], &scratch[base + 2]));
+            check((&scratch[base + 3], &scratch[base + 4], &scratch[base + 5]));
+        }
+        // The caps: 3-vertex triangles after the side block.
+        let caps = segments * 6;
+        for cap in 0..2 {
+            let base = caps + cap * segments * 3;
+            for tri in 0..segments {
+                let t = base + tri * 3;
+                check((&scratch[t], &scratch[t + 1], &scratch[t + 2]));
+            }
+        }
+        println!(
+            "wheel normal agreement: {checked} triangles, minimum geometric×authored dot {min_dot:.6}"
+        );
+        assert_eq!(checked, segments * 4, "every wheel triangle was checked");
+        assert!(min_dot > 0.0);
     }
 }

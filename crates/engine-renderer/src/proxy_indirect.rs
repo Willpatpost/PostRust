@@ -43,8 +43,6 @@
 //! slot S's fence). The block is small enough to live in a stack
 //! array — no per-frame Vec, no allocation at all.
 
-use crate::populated_meshes::{humanoid_mesh, sedan_mesh};
-
 /// One `VkDrawIndirectCommand`'s byte size: four u32 fields
 /// (vertexCount, instanceCount, firstVertex, firstInstance).
 pub const INDIRECT_COMMAND_BYTES: usize = 16;
@@ -79,13 +77,12 @@ pub fn append_indirect_command(bytes: &mut [u8], vertex_count: u32, instance_cou
     write(12, 0);
 }
 
-/// One frame slot's full command block for a population: the NPC
-/// command at offset 0, the vehicle command at offset 16 — each
-/// kind's mesh vertex count (the pinned proxy-mesh constants: NPC
-/// 396, vehicle 552 — the Era-1 v2 silhouettes) paired with its
-/// instance count. Empty kinds
-/// pack `instanceCount = 0` commands (the draw loop never submits
-/// them; the block's shape stays fixed regardless).
+/// Packs one indirect command block for a population: the NPC command
+/// at offset 0, the vehicle command at offset 16 — each kind's mesh
+/// vertex count (the pinned proxy-mesh constants: NPC 396, vehicle
+/// 552 — the Era-1 v2 silhouettes) paired with its instance count.
+/// Empty kinds pack `instanceCount = 0` commands (the draw loop never
+/// submits them; the block's shape stays fixed regardless).
 ///
 /// Pure — byte-identical on every platform; the FNV-1a pin below
 /// pins the shipped population's actual block. The draw-CALL model
@@ -93,16 +90,21 @@ pub fn append_indirect_command(bytes: &mut [u8], vertex_count: u32, instance_cou
 /// direct instanced mode records) stays with the submission model
 /// it extends in the vulkan module's `proxy_draw_call_count`, the
 /// single source of truth.
-pub fn indirect_slot_commands(npc_count: u32, vehicle_count: u32) -> [u8; INDIRECT_SLOT_BYTES] {
+pub fn pack_indirect_block(
+    npc_vertices: u32,
+    npc_count: u32,
+    vehicle_vertices: u32,
+    vehicle_count: u32,
+) -> [u8; INDIRECT_SLOT_BYTES] {
     let mut block = [0u8; INDIRECT_SLOT_BYTES];
     append_indirect_command(
         &mut block[indirect_kind_offset(0)..],
-        humanoid_mesh().len() as u32,
+        npc_vertices,
         npc_count,
     );
     append_indirect_command(
         &mut block[indirect_kind_offset(1)..],
-        sedan_mesh().len() as u32,
+        vehicle_vertices,
         vehicle_count,
     );
     block
@@ -127,12 +129,12 @@ mod tests {
     /// identical bytes.
     #[test]
     fn commands_packed_deterministically_with_pinned_layout() {
-        let a = indirect_slot_commands(24, 2);
-        let b = indirect_slot_commands(24, 2);
+        // The mesh vertex counts are pinned by populated_meshes's
+        // own tests (396/552 — the Era-1 v2 silhouettes); the
+        // command bytes carry the same numbers.
+        let a = pack_indirect_block(396, 24, 552, 2);
+        let b = pack_indirect_block(396, 24, 552, 2);
         assert_eq!(a, b, "double-packing reproduces the identical bytes");
-        // The proxy-mesh vertex pins (populated_meshes's own tests
-        // pin 396/552 — the Era-1 v2 silhouettes; the command bytes
-        // carry the same numbers).
         assert_eq!(word(&a, 0), 396, "npc vertexCount = the mesh's 396");
         assert_eq!(word(&a, 4), 24, "npc instanceCount = the population");
         assert_eq!(word(&a, 16), 552, "vehicle vertexCount = the mesh's 552");
@@ -147,11 +149,8 @@ mod tests {
         // draw it replaces: cmd_draw(vertex_count, instance_count,
         // 0, 0) and the packed words agree by construction —
         // asserted so a field swap cannot pass silently.
-        assert_eq!(
-            (word(&a, 0), word(&a, 4)),
-            (humanoid_mesh().len() as u32, 24)
-        );
-        assert_eq!((word(&a, 16), word(&a, 20)), (sedan_mesh().len() as u32, 2));
+        assert_eq!((word(&a, 0), word(&a, 4)), (396, 24));
+        assert_eq!((word(&a, 16), word(&a, 20)), (552, 2));
     }
 
     /// THE CROSS-PLATFORM BYTE PIN (the fingerprint-pin discipline
@@ -162,7 +161,9 @@ mod tests {
     /// the determinism proof.
     #[test]
     fn slot_commands_fnv_pin() {
-        let bytes = indirect_slot_commands(24, 2);
+        // The mesh vertex counts are pinned by populated_meshes's
+        // own tests (396/552 — the Era-1 v2 silhouettes).
+        let bytes = pack_indirect_block(396, 24, 552, 2);
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for &byte in &bytes {
             hash ^= byte as u64;
@@ -193,14 +194,14 @@ mod tests {
     /// deterministic).
     #[test]
     fn empty_kinds_pack_zero_instance_counts() {
-        let empty = indirect_slot_commands(0, 0);
+        let empty = pack_indirect_block(396, 0, 552, 0);
         assert_eq!(word(&empty, 0), 396, "the npc command stays present");
         assert_eq!(word(&empty, 4), 0, "npc instanceCount zero");
         assert_eq!(word(&empty, 16), 552, "the vehicle command stays present");
         assert_eq!(word(&empty, 20), 0, "vehicle instanceCount zero");
         // Half-populated: the empty kind's command is zeroed, the
         // populated kind's carries its count.
-        let npc_only = indirect_slot_commands(7, 0);
+        let npc_only = pack_indirect_block(396, 7, 552, 0);
         assert_eq!(word(&npc_only, 4), 7);
         assert_eq!(word(&npc_only, 20), 0);
     }

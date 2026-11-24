@@ -590,7 +590,7 @@ impl Renderer {
             ));
         }
         let boxes = crate::lit_scene::intersection_boxes();
-        let (min, max) = crate::shadows::scene_bounds(&boxes);
+        let (min, max) = crate::shadows::scene_bounds(boxes);
         let cascade = crate::shadows::cascade_for(light.dir_toward_light, min, max);
         let [r, g, b] = light.ambient;
         let params = vulkan::shadow_draw::ShadowFrameParams {

@@ -50,6 +50,10 @@ use engine_renderer::{
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 
+// The host allocation counter test-support module (finding 10's
+// missing gate; tests/common/ — not a standalone test target).
+mod common;
+
 /// SDL's initialization is process-global (the sdl3 crate declares
 /// one main thread per process; a second init while another test's
 /// SDL is alive fails the main-thread check — the engine-shell test
@@ -914,6 +918,10 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
     // THE ZERO-PER-FRAME-ALLOCATION GATE (all three modes, both
     // frame slots): the command bytes are repacked into the same
     // mapped slot every frame — no per-frame allocation anywhere.
+    // The host allocation counter (finding 10, the missing gate):
+    // wrap the measurement to exclude capture extraction, take calls,
+    // and test assertions (request the capture BEFORE entering the
+    // scope or AFTER — the review's explicit instruction).
     for mode in [
         ProxyDrawMode::Indirect,
         ProxyDrawMode::Instanced,
@@ -937,6 +945,33 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
             );
         }
     }
+
+    // THE HOST-ALLOCATION GATE (finding 10 — the counter the review
+    // says was missing beside renderer.allocations()): one warmed
+    // render per submission mode, measured between scope entry and
+    // count — zero heap allocations. Capture extraction, assertions,
+    // and startup stay OUTSIDE the scope (the review's explicit
+    // instruction); the measured call is the render alone.
+    for mode in [
+        ProxyDrawMode::Indirect,
+        ProxyDrawMode::Instanced,
+        ProxyDrawMode::PerInstance,
+    ] {
+        renderer.set_proxy_draw_mode(mode);
+        let scope = common::HostAllocScope::new();
+        let outcome = renderer
+            .render_corner_populated(&matrix, eye, light, &population, size)
+            .unwrap();
+        let allocs = scope.count();
+        drop(scope);
+        assert!(outcome.presented);
+        println!("host allocations in warmed {mode:?} populated frame: {allocs} (expected 0)");
+        assert_eq!(
+            allocs, 0,
+            "no host allocations in the warmed {mode:?} populated render path"
+        );
+    }
+
     println!("warmed indirect-path populated allocations: {indirect_warm:?}");
 
     // The pipeline-replacement lifecycle (the finding-A re-ensure):
@@ -1070,7 +1105,10 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
     // vertex counts — 396/552, the values the core's own battery
     // was re-pinned to; this copy still carried the v1 108/72 when
     // the gate first executed.)
-    let commands = engine_renderer::proxy_indirect::indirect_slot_commands(24, 2);
+    // (corrective finding 10: the block is packed through
+    // pack_indirect_block with explicit counts — the legacy wrapper
+    // that reconstructed both meshes per call is gone.)
+    let commands = engine_renderer::proxy_indirect::pack_indirect_block(396, 24, 552, 2);
     let word = |at: usize| u32::from_le_bytes(commands[at..at + 4].try_into().unwrap());
     assert_eq!(engine_renderer::proxy_indirect::INDIRECT_SLOT_BYTES, 32);
     assert_eq!((word(0), word(4), word(16), word(20)), (396, 24, 552, 2));

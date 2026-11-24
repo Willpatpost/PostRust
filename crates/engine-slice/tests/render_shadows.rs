@@ -38,6 +38,10 @@ use engine_renderer::{
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 
+// The host allocation counter test-support module (finding 10's
+// missing gate; tests/common/ — not a standalone test target).
+mod common;
+
 /// The binary's SDL serialization (the engine-shell test pattern —
 /// render_instanced's own copy, applied to this binary now that
 /// the PCF package grew it to TWO SDL-touching gates; found when
@@ -62,7 +66,7 @@ const BIAS: ShadowBias = ShadowBias {
 
 fn corner_cascade(light: LightParams) -> ShadowCascade {
     let boxes = intersection_boxes();
-    let (min, max) = scene_bounds(&boxes);
+    let (min, max) = scene_bounds(boxes);
     shadows::cascade_for(light.dir_toward_light, min, max)
 }
 
@@ -248,7 +252,7 @@ fn check_ground_patch(
     ] {
         let probe = [center[0] + dx * half, 0.0, center[1] + dz * half];
         assert_eq!(
-            is_shadowed(probe, cascade, &boxes),
+            is_shadowed(probe, cascade, boxes),
             shadowed,
             "the patch at {center:?} must be uniformly {} ({probe:?})",
             if shadowed { "shadowed" } else { "lit" }
@@ -379,7 +383,7 @@ fn shadow_map_depths_match_the_raycaster_and_pixels_gate() {
     let boxes = intersection_boxes();
     let cascade = corner_cascade(light);
     let (compared, skipped, mismatches, max_error) =
-        compare_map(&cascade, &boxes, &map.depths, map.extent, 1e-4, 1.5);
+        compare_map(&cascade, boxes, &map.depths, map.extent, 1e-4, 1.5);
     let total = map.extent as usize * map.extent as usize;
     println!(
         "shadow map known-answer: {total} texels, {compared} compared, {skipped} edge-skipped \
@@ -443,6 +447,27 @@ fn shadow_map_depths_match_the_raycaster_and_pixels_gate() {
     }
     println!("warmed shadowed allocations: {warm:?}");
 
+    // THE HOST-ALLOCATION GATE (finding 10 — the counter the review
+    // says was missing beside renderer.allocations()): one warmed
+    // SHADOWED render, measured between scope entry and count — zero
+    // heap allocations (the per-frame Vec<SceneBox> is gone; the
+    // scene bounds are a OnceLock table now). Capture extraction,
+    // assertions, and startup stay OUTSIDE the scope.
+    {
+        let scope = common::HostAllocScope::new();
+        let outcome = renderer
+            .render_corner_shadowed(&matrix, eye, light, BIAS, size)
+            .unwrap();
+        let allocs = scope.count();
+        drop(scope);
+        assert!(outcome.presented);
+        println!("host allocations in warmed shadowed frame: {allocs} (expected 0)");
+        assert_eq!(
+            allocs, 0,
+            "no host allocations in the warmed shadowed render path"
+        );
+    }
+
     // THE REPLACEMENT LIFECYCLE (finding A): the forced recreation
     // rebuilds the shadow state; the map known-answer holds on the
     // replacement, and the counters resume constant.
@@ -460,7 +485,7 @@ fn shadow_map_depths_match_the_raycaster_and_pixels_gate() {
     let map_after = renderer.take_shadow_map_capture().unwrap().unwrap();
     let (compared_after, skipped_after, mismatches_after, max_error_after) = compare_map(
         &cascade,
-        &boxes,
+        boxes,
         &map_after.depths,
         map_after.extent,
         1e-4,
@@ -714,7 +739,7 @@ fn pcf_penumbra_pixels_match_the_cpu_filter_over_the_same_map_bytes() {
     for step in 1..=1240 {
         let t = step as f32 * 0.01;
         let point = [ux * t, 0.0, uz * t];
-        if !is_shadowed(point, &cascade, &boxes) {
+        if !is_shadowed(point, &cascade, boxes) {
             flip = Some(point);
             break;
         }
