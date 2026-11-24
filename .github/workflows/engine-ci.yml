@@ -367,8 +367,17 @@ jobs:
           # property: the ground plane fixed bit-equal). Linux
           # 1188/2/33 MEASURED locally; Windows 1137 = 1136 + the
           # same 1.
-          expected=1188
-          if [ "$(uname -s)" != "Linux" ]; then expected=1137; fi
+          # Era 1 corrective/frame-preparation (2026-11-24, findings
+          # 4+7+8): +7 platform-uniform engine-renderer lib tests
+          # (the depth_aspect aspect-mask contract ×4 — D32/D16
+          # DEPTH, D24_S8 DEPTH|STENCIL, color COLOR; the
+          # resolve_depth_format battery ×3 — Auto always the
+          # negotiated pick, forced-honored, forced-unsupported
+          # fallback — pure f32-free enum logic, no cfg gates).
+          # Linux 1195/2/33 MEASURED locally with this step's own
+          # awk; Windows 1144 = 1137 + the same 7.
+          expected=1195
+          if [ "$(uname -s)" != "Linux" ]; then expected=1144; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -427,8 +436,13 @@ jobs:
           # property contract, the same +1 as the main shard) —
           # 110 -> 111. MEASURED locally (111/0 failures/2 result
           # lines).
-          echo "renderer release: $passed passed, $results test-result lines (expected 111 / 2)"
-          [ "$passed" -eq 111 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 111"; exit 1; }
+          # Era 1 corrective/frame-preparation (2026-11-24, findings
+          # 4+7+8): +7 (the depth_aspect and resolve_depth_format
+          # batteries, the same +7 as the main shard,
+          # platform-uniform) — 111 -> 118. MEASURED locally with
+          # this step's own awk (118/0 failures/2 result lines).
+          echo "renderer release: $passed passed, $results test-result lines (expected 118 / 2)"
+          [ "$passed" -eq 118 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 118"; exit 1; }
           [ "$results" -eq 2 ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != 2"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production

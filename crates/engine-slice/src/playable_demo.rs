@@ -39,7 +39,8 @@ use engine_core::{
 };
 use engine_renderer::scene::SceneVertex;
 use engine_renderer::{
-    DemoScenePreference, PresentModePreference, RenderConfig, Renderer, ValidationPreference,
+    DemoScenePreference, DepthFormatPreference, PresentModePreference, RenderConfig, Renderer,
+    ValidationPreference,
 };
 use engine_shell::{DriverPreference, InputSnapshot, Keycode, ShellApp, ShellConfig};
 
@@ -1045,6 +1046,7 @@ pub fn run_playable_demo(options: PlayableOptions) -> Result<(), String> {
         validation: options.validation,
         replace_pipelines: false,
         demo_scene: DemoScenePreference::Omitted,
+        depth_format: DepthFormatPreference::Auto,
     };
     let mut renderer =
         Renderer::new(app.window(), render_config).map_err(|error| error.to_string())?;

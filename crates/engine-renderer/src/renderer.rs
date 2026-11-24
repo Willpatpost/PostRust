@@ -160,6 +160,10 @@ pub struct RenderStats {
     pub overlay_supplied_peak_vertices: u32,
     pub overlay_capacity_vertices: u32,
     gpu_timing: TimingSamples,
+    /// The negotiated depth format (corrective finding 4, F):
+    /// the renderer's chosen depth format, reported so tests can
+    /// verify fallbacks and the DepthFormatPreference knob.
+    pub depth_format: String,
 }
 
 impl RenderStats {
@@ -270,7 +274,8 @@ impl Renderer {
         };
         // The depth format is chosen once and shared by the render pass
         // and every depth attachment (corrective finding F).
-        let depth_format = pick_depth_format(&ctx.instance, ctx.physical_device);
+        let depth_format =
+            pick_depth_format(&ctx.instance, ctx.physical_device, config.depth_format);
         // The demo-scene preference is fixed at construction (P3): the
         // static Stage-2 demonstration scene uploads only on the
         // explicit opt-in, and every later pipeline replacement is
@@ -336,6 +341,7 @@ impl Renderer {
             overlay_supplied_peak_vertices: 0,
             overlay_capacity_vertices: 0,
             gpu_timing: TimingSamples::default(),
+            depth_format: format!("{:?}", depth_format),
         };
         Ok(Renderer {
             ctx,

@@ -21,8 +21,8 @@
 
 use engine_renderer::scene::push_box;
 use engine_renderer::{
-    CaptureFormat, DemoScenePreference, PresentModePreference, RenderConfig, Renderer,
-    ValidationPreference,
+    CaptureFormat, DemoScenePreference, DepthFormatPreference, PresentModePreference, RenderConfig,
+    Renderer, ValidationPreference,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 use engine_slice::math;
@@ -108,6 +108,7 @@ fn world_renders_right_side_up_offscreen() {
         validation: ValidationPreference::On,
         replace_pipelines: false,
         demo_scene: DemoScenePreference::Included,
+        depth_format: DepthFormatPreference::Auto,
     };
     let mut app = ShellApp::new(ShellConfig {
         title: "Sektor7 orientation smoke".to_string(),

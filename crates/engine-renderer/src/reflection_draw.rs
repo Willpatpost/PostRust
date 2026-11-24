@@ -103,7 +103,11 @@ pub(crate) struct WetCamera {
 /// same rebuild proof).
 struct ReflectionTargets {
     extent: (u32, u32),
-    swapchain_view0: vk::ImageView,
+    /// The swapchain generation when this bundle was created — the
+    /// view set's identity (recreation produces a new generation;
+    /// Vulkan permits handle reuse, so a numerical view handle could
+    /// recur after destruction). (corrective finding 7)
+    swapchain_generation: u64,
     color_images: Vec<vk::Image>,
     color_memories: Vec<vk::DeviceMemory>,
     color_views: Vec<vk::ImageView>,
@@ -614,18 +618,25 @@ impl ReflectionResources {
     /// Builds (or rebuilds) the extent-bound target bundle — a
     /// no-op when the extent and view set match. The rebuild-safety
     /// proof is the post package's (only a recreation — already
-    /// device-idle — can change either).
+    /// device-idle — can change either). The cache key is the extent
+    /// plus the swapchain GENERATION (corrective finding 7): a
+    /// retired chain's numerical view handle could recur after
+    /// destruction (Vulkan permits handle reuse), but a generation
+    /// never repeats, and a larger image count on the new chain
+    /// forces a rebuild instead of indexing past the bundle's
+    /// framebuffers.
     pub(super) fn ensure_targets(
         &mut self,
         ctx: &VulkanContext,
         extent: vk::Extent2D,
         corner: &CornerResources,
         hdr_pass: vk::RenderPass,
-        swapchain_view0: vk::ImageView,
+        swapchain_generation: u64,
+        depth_format: vk::Format,
     ) -> Result<(), RendererError> {
         if let Some(targets) = &self.targets
             && targets.extent == (extent.width, extent.height)
-            && targets.swapchain_view0 == swapchain_view0
+            && targets.swapchain_generation == swapchain_generation
         {
             return Ok(());
         }
@@ -638,13 +649,14 @@ impl ReflectionResources {
             extent,
             corner,
             hdr_pass,
-            swapchain_view0,
+            swapchain_generation,
             self.reflected_layout,
             self.ground_layout,
             self.linear_sampler,
             self.params_buffer,
             self.params_stride,
             self.tail_stride,
+            depth_format,
         )?);
         Ok(())
     }
@@ -928,17 +940,18 @@ impl ReflectionTargets {
         extent: vk::Extent2D,
         corner: &CornerResources,
         hdr_pass: vk::RenderPass,
-        swapchain_view0: vk::ImageView,
+        swapchain_generation: u64,
         reflected_layout: vk::DescriptorSetLayout,
         ground_layout: vk::DescriptorSetLayout,
         linear_sampler: vk::Sampler,
         params_buffer: vk::Buffer,
         params_stride: u32,
         tail_stride: u32,
+        depth_format: vk::Format,
     ) -> Result<ReflectionTargets, RendererError> {
         let mut partial = ReflectionTargets {
             extent: (extent.width, extent.height),
-            swapchain_view0,
+            swapchain_generation,
             color_images: Vec::new(),
             color_memories: Vec::new(),
             color_views: Vec::new(),
@@ -962,6 +975,8 @@ impl ReflectionTargets {
             params_buffer,
             params_stride,
             tail_stride,
+            swapchain_generation,
+            depth_format,
         ) {
             partial.release(ctx);
             return Err(error);
@@ -982,86 +997,104 @@ impl ReflectionTargets {
         params_buffer: vk::Buffer,
         params_stride: u32,
         tail_stride: u32,
+        _swapchain_generation: u64,
+        depth_format: vk::Format,
     ) -> Result<(), RendererError> {
         let slots = FRAMES_IN_FLIGHT as usize;
 
         // --- the per-slot reflection targets (RGBA16F color + the
         // renderer's depth format — the HDR pass's attachments).
-        let create_image =
-            |format: vk::Format,
-             usage: vk::ImageUsageFlags,
-             what: &str|
-             -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), RendererError> {
-                let image_info = vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(format)
-                    .extent(vk::Extent3D {
-                        width: extent.width,
-                        height: extent.height,
-                        depth: 1,
-                    })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(usage)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE);
-                // SAFETY: fresh object; the partial state owns it from
-                // creation.
-                let image = unsafe { ctx.device.create_image(&image_info, None) }
-                    .map_err(|error| RendererError::vk(error, what))?;
-                let requirements = unsafe { ctx.device.get_image_memory_requirements(image) };
-                let memory_index = find_memory_type(
-                    ctx,
-                    requirements.memory_type_bits,
-                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                )
-                .ok_or_else(|| RendererError::NoDevice("no DEVICE_LOCAL memory".into()))?;
-                let memory_info = vk::MemoryAllocateInfo::default()
-                    .allocation_size(requirements.size)
-                    .memory_type_index(memory_index);
-                // SAFETY: the requirement query is for this live image;
-                // the partial state owns both handles.
-                let memory = unsafe { ctx.allocate_memory(&memory_info) }
-                    .map_err(|error| RendererError::vk(error, what))?;
-                // SAFETY: as above.
-                unsafe { ctx.device.bind_image_memory(image, memory, 0) }
-                    .map_err(|error| RendererError::vk(error, what))?;
-                let subresource = vk::ImageSubresourceRange {
-                    aspect_mask: if format == vk::Format::D32_SFLOAT {
-                        vk::ImageAspectFlags::DEPTH
-                    } else {
-                        vk::ImageAspectFlags::COLOR
-                    },
-                    level_count: 1,
-                    layer_count: 1,
-                    ..Default::default()
-                };
-                let view_info = vk::ImageViewCreateInfo::default()
-                    .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(format)
-                    .subresource_range(subresource);
-                // SAFETY: as above.
-                let view = unsafe { ctx.device.create_image_view(&view_info, None) }
-                    .map_err(|error| RendererError::vk(error, what))?;
-                Ok((image, memory, view))
+        //
+        // The create_image closure takes an explicit aspect mask so it
+        // can handle depth formats correctly (corrective finding 4).
+        // It pushes each handle immediately after successful creation
+        // to the partial bundle's vectors (corrective finding 8:
+        // immediate registration to avoid leaks on partial failure).
+        let create_image = |format: vk::Format,
+                            usage: vk::ImageUsageFlags,
+                            aspect: vk::ImageAspectFlags,
+                            images: &mut Vec<vk::Image>,
+                            memories: &mut Vec<vk::DeviceMemory>,
+                            views: &mut Vec<vk::ImageView>,
+                            what: &str|
+         -> Result<(), RendererError> {
+            let image_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(vk::Extent3D {
+                    width: extent.width,
+                    height: extent.height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            // SAFETY: fresh object; push it to the partial bundle's
+            // image vector immediately so release() can free it on error.
+            let image = unsafe { ctx.device.create_image(&image_info, None) }
+                .map_err(|error| RendererError::vk(error, what))?;
+            images.push(image);
+            let requirements = unsafe { ctx.device.get_image_memory_requirements(image) };
+            let memory_index = find_memory_type(
+                ctx,
+                requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+            .ok_or_else(|| RendererError::NoDevice("no DEVICE_LOCAL memory".into()))?;
+            let memory_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(memory_index);
+            // SAFETY: push the memory immediately after allocation
+            // (it's bound to the image we just pushed).
+            let memory = unsafe { ctx.allocate_memory(&memory_info) }
+                .map_err(|error| RendererError::vk(error, what))?;
+            memories.push(memory);
+            unsafe { ctx.device.bind_image_memory(image, memory, 0) }
+                .map_err(|error| RendererError::vk(error, what))?;
+            let subresource = vk::ImageSubresourceRange {
+                aspect_mask: aspect,
+                level_count: 1,
+                layer_count: 1,
+                ..Default::default()
             };
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .subresource_range(subresource);
+            // SAFETY: push the view immediately after creation.
+            let view = unsafe { ctx.device.create_image_view(&view_info, None) }
+                .map_err(|error| RendererError::vk(error, what))?;
+            views.push(view);
+            Ok(())
+        };
         let color_usage = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED;
         for _slot in 0..slots {
-            let (image, memory, view) =
-                create_image(REFLECTION_FORMAT, color_usage, "reflection color image")?;
-            self.color_images.push(image);
-            self.color_memories.push(memory);
-            self.color_views.push(view);
-            let (image, memory, view) = create_image(
-                vk::Format::D32_SFLOAT,
+            // Color images: aspect is COLOR.
+            create_image(
+                REFLECTION_FORMAT,
+                color_usage,
+                vk::ImageAspectFlags::COLOR,
+                &mut self.color_images,
+                &mut self.color_memories,
+                &mut self.color_views,
+                "reflection color image",
+            )?;
+            // The HDR depth attachment's format is the renderer's
+            // negotiated depth format (corrective finding 4), passed
+            // as `depth_format`.
+            create_image(
+                depth_format,
                 vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                super::depth_aspect(depth_format),
+                &mut self.depth_images,
+                &mut self.depth_memories,
+                &mut self.depth_views,
                 "reflection depth image",
             )?;
-            self.depth_images.push(image);
-            self.depth_memories.push(memory);
-            self.depth_views.push(view);
         }
         for slot in 0..slots {
             let attachments = [self.color_views[slot], self.depth_views[slot]];

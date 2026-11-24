@@ -28,7 +28,8 @@
 use engine_renderer::post::{bloom_at_pixel, bloom_mip_from_hdr, post_pixel, tonemap_rgb};
 use engine_renderer::sky::{atmosphere_at, sky_color};
 use engine_renderer::{
-    DemoScenePreference, RenderConfig, Renderer, SkyFrame, ValidationPreference,
+    DemoScenePreference, DepthFormatPreference, RenderConfig, Renderer, SkyFrame,
+    ValidationPreference,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 
@@ -479,5 +480,342 @@ fn post_pixels_match_post_rs_and_the_disc_blooms() {
         "Era-1 post gates: {checked} pixels vs post.rs's chain within {TOLERANCE}/255 (measured max {max_error}), \
          the bloom ring lifted ≥2/255, the postless path byte-identical, the post state paid once, \
          every corner-family composition clean"
+    );
+}
+
+/// (corrective/frame-preparation, findings 4 + 7) The depth-format
+/// fallback matrix and the post lifecycle across swapchain
+/// recreations. Finding 4: with each forced fallback depth format
+/// (the `DepthFormatPreference` knob — the `replace_pipelines`
+/// precedent), the post chain renders the SAME pure-sky oracle the
+/// package's own gate pins (create, render, resize, capture — the
+/// review's check), because the negotiated format reaches the HDR
+/// depth attachment's view aspect and the reflection-free post path
+/// cleanly. Finding 7: post on → post off → TWO recreations (resize
+/// away, resize back to the ORIGINAL extent) → post on — the chain
+/// renders the oracle again at the original extent (a retired
+/// framebuffer set cached on a recycled view handle would not), the
+/// warmed allocation set is unchanged (no leak growth from the
+/// rebuild), and a repeat capture is byte-identical. The knob's
+/// outcome is read from the renderer's reported depth format — the
+/// skip condition is the REPORT, never a guess.
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
+fn depth_fallbacks_and_the_post_lifecycle() {
+    /// The full presented image the pure-sky CPU chain computes for
+    /// an already-built HDR texel field (the first gate's own
+    /// arithmetic, materialized for probe reuse).
+    fn presented_from_hdr(hdr: &[[f32; 3]], size: (u32, u32)) -> Vec<[u8; 4]> {
+        let mip = bloom_mip_from_hdr(hdr, size);
+        let mut image = Vec::with_capacity((size.0 * size.1) as usize);
+        for y in 0..size.1 {
+            for x in 0..size.0 {
+                let bloom = bloom_at_pixel(&mip, size, (x, y));
+                let presented = quantized(post_pixel(hdr[(y * size.0 + x) as usize], bloom));
+                image.push([presented[0], presented[1], presented[2], 255]);
+            }
+        }
+        image
+    }
+
+    /// The first gate's probe set — the disc-center 5×5 patch (the
+    /// bloom feeder) and the four far-corner 3×3 patches (the pure
+    /// ACES tonemap, the orientation detector) — against a presented
+    /// oracle image.
+    fn check_probes(image: &[[u8; 4]], oracle: &[[u8; 4]], size: (u32, u32), what: &str) {
+        let center = size.0 / 2;
+        let mut max_error = 0u8;
+        let mut checked = 0usize;
+        for y in center - 2..=center + 2 {
+            for x in center - 2..=center + 2 {
+                let expected = oracle[(y * size.0 + x) as usize];
+                let actual = image[(y * size.0 + x) as usize];
+                let error = expected
+                    .iter()
+                    .zip(actual)
+                    .map(|(e, a)| e.abs_diff(a))
+                    .max()
+                    .unwrap();
+                max_error = max_error.max(error);
+                assert!(
+                    error <= TOLERANCE,
+                    "{what} disc-center pixel ({x},{y}): expected {expected:?}, got {actual:?}"
+                );
+                checked += 1;
+            }
+        }
+        for (cx, cy) in [
+            (2, 2),
+            (2, size.1 - 5),
+            (size.0 - 5, 2),
+            (size.0 - 5, size.1 - 5),
+        ] {
+            for y in cy..cy + 3 {
+                for x in cx..cx + 3 {
+                    let expected = oracle[(y * size.0 + x) as usize];
+                    let actual = image[(y * size.0 + x) as usize];
+                    let error = expected
+                        .iter()
+                        .zip(actual)
+                        .map(|(e, a)| e.abs_diff(a))
+                        .max()
+                        .unwrap();
+                    max_error = max_error.max(error);
+                    assert!(
+                        error <= TOLERANCE,
+                        "{what} far-corner pixel ({x},{y}): expected {expected:?}, got {actual:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        println!("{what}: {checked} probe pixels vs the chain oracle, max error {max_error}/255");
+    }
+
+    let day = atmosphere_at(0.0);
+    let sun_dir = day.disc_dir;
+    let high_eye = [0.0, 25.0, 0.0];
+    let toward_sun = std::array::from_fn(|i| high_eye[i] + sun_dir[i]);
+    let matrix = aimed(high_eye, toward_sun);
+
+    // --- FINDING 4: the forced-fallback matrix (the post-only cell
+    // of the review's post-only / wet-only / combined matrix; the wet
+    // cell is render_reflection's own gate, the combined cell is
+    // render_reflection's first-frame gate).
+    for (preference, forced_name) in [
+        (DepthFormatPreference::ForceD24S8, "D24_UNORM_S8_UINT"),
+        (DepthFormatPreference::ForceD16, "D16_UNORM"),
+    ] {
+        let app = ShellApp::new(ShellConfig {
+            title: "post-depth-fallback".into(),
+            width: 256,
+            height: 256,
+            target_fps: 60,
+            driver: DriverPreference::Real,
+        })
+        .unwrap();
+        let mut renderer = Renderer::new(
+            app.window(),
+            RenderConfig {
+                demo_scene: DemoScenePreference::Corner,
+                validation: ValidationPreference::On,
+                depth_format: preference,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let reported = renderer.stats().depth_format.clone();
+        if reported != forced_name {
+            println!(
+                "post fallback {forced_name}: the device lacks it (reported {reported}); the \
+                 knob fell back to the negotiated pick — variant skipped"
+            );
+            drop(renderer);
+            drop(app);
+            continue;
+        }
+        println!("post fallback: forced {forced_name} honored");
+        renderer.set_sky(Some(SkyFrame {
+            palette: day.sky,
+            disc_dir: sun_dir,
+        }));
+        renderer.set_post(true);
+
+        // Create, render, capture — the oracle at the original size.
+        let size = app.window().size_in_pixels();
+        renderer.request_frame_capture().unwrap();
+        assert!(
+            renderer
+                .render_corner(&matrix, high_eye, day_preset(), size)
+                .unwrap()
+                .presented
+        );
+        let posted = renderer.take_frame_capture().unwrap().unwrap();
+        let (forward, right, up) = basis(high_eye, toward_sun);
+        let hdr = (0..size.1)
+            .flat_map(|y| (0..size.0).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let ray = pixel_ray(forward, right, up, x, y, size);
+                sky_color(ray, &day.sky, sun_dir)
+            })
+            .collect::<Vec<_>>();
+        check_probes(
+            posted.bytes.as_chunks::<4>().0,
+            &presented_from_hdr(&hdr, size),
+            size,
+            &format!("post fallback {forced_name} at 256"),
+        );
+
+        // Resize (a forced recreation), render, capture — the SAME
+        // oracle recomputed at the new extent.
+        let resized = (size.0 + 8, size.1 + 8);
+        renderer.request_frame_capture().unwrap();
+        assert!(
+            renderer
+                .render_corner(&matrix, high_eye, day_preset(), resized)
+                .unwrap()
+                .presented
+        );
+        let resized_capture = renderer.take_frame_capture().unwrap().unwrap();
+        let hdr_resized = (0..resized.1)
+            .flat_map(|y| (0..resized.0).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let ray = pixel_ray(forward, right, up, x, y, resized);
+                sky_color(ray, &day.sky, sun_dir)
+            })
+            .collect::<Vec<_>>();
+        check_probes(
+            resized_capture.bytes.as_chunks::<4>().0,
+            &presented_from_hdr(&hdr_resized, resized),
+            resized,
+            &format!("post fallback {forced_name} after resize"),
+        );
+
+        // Warmed constancy on the replacement generation.
+        let warm = renderer.allocations();
+        renderer.request_frame_capture().unwrap();
+        assert!(
+            renderer
+                .render_corner(&matrix, high_eye, day_preset(), resized)
+                .unwrap()
+                .presented
+        );
+        let repeat = renderer.take_frame_capture().unwrap().unwrap();
+        assert_eq!(
+            renderer.allocations(),
+            warm,
+            "warmed fallback allocations constant"
+        );
+        assert_eq!(
+            repeat.bytes, resized_capture.bytes,
+            "byte-identical fallback frames"
+        );
+        assert_eq!(
+            renderer.stats().validation_errors,
+            0,
+            "{:?}",
+            renderer.stats().recent_validation
+        );
+        println!("post fallback {forced_name}: warmed allocations constant, validation clean");
+        drop(renderer);
+        drop(app);
+    }
+
+    // --- FINDING 7: the post lifecycle across two recreations,
+    // returning to the ORIGINAL extent (the retired-handle cache-hit
+    // shape; the generation key makes it structurally impossible —
+    // this pins the rebuild behavior it replaces).
+    let app = ShellApp::new(ShellConfig {
+        title: "post-lifecycle".into(),
+        width: 256,
+        height: 256,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    })
+    .unwrap();
+    let mut renderer = Renderer::new(
+        app.window(),
+        RenderConfig {
+            demo_scene: DemoScenePreference::Corner,
+            validation: ValidationPreference::On,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let size = app.window().size_in_pixels();
+    renderer.set_sky(Some(SkyFrame {
+        palette: day.sky,
+        disc_dir: sun_dir,
+    }));
+    renderer.set_post(true);
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner(&matrix, high_eye, day_preset(), size)
+            .unwrap()
+            .presented
+    );
+    let reference = renderer.take_frame_capture().unwrap().unwrap();
+    let (forward, right, up) = basis(high_eye, toward_sun);
+    let hdr = (0..size.1)
+        .flat_map(|y| (0..size.0).map(move |x| (x, y)))
+        .map(|(x, y)| {
+            let ray = pixel_ray(forward, right, up, x, y, size);
+            sky_color(ray, &day.sky, sun_dir)
+        })
+        .collect::<Vec<_>>();
+    let reference_oracle = presented_from_hdr(&hdr, size);
+    check_probes(
+        reference.bytes.as_chunks::<4>().0,
+        &reference_oracle,
+        size,
+        "post lifecycle reference",
+    );
+    let warm = renderer.allocations();
+
+    // Post OFF, then two recreations — away and BACK to the original
+    // extent — then post ON again.
+    renderer.set_post(false);
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner(&matrix, high_eye, day_preset(), size)
+            .unwrap()
+            .presented
+    );
+    let _ = renderer.take_frame_capture().unwrap().unwrap();
+    let away = (size.0 + 8, size.1 + 8);
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner(&matrix, high_eye, day_preset(), away)
+            .unwrap()
+            .presented
+    );
+    let _ = renderer.take_frame_capture().unwrap().unwrap();
+    renderer.set_post(true);
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner(&matrix, high_eye, day_preset(), size)
+            .unwrap()
+            .presented
+    );
+    let restored = renderer.take_frame_capture().unwrap().unwrap();
+    check_probes(
+        restored.bytes.as_chunks::<4>().0,
+        &reference_oracle,
+        size,
+        "post lifecycle restored at the original extent",
+    );
+
+    // Determinism at the final state, no leak growth across the
+    // recreations, and a clean validation record.
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner(&matrix, high_eye, day_preset(), size)
+            .unwrap()
+            .presented
+    );
+    let repeat = renderer.take_frame_capture().unwrap().unwrap();
+    assert_eq!(
+        repeat.bytes, restored.bytes,
+        "byte-identical restored frames"
+    );
+    assert_eq!(
+        renderer.allocations(),
+        warm,
+        "the post lifecycle grew no allocations across two recreations"
+    );
+    assert_eq!(
+        renderer.stats().validation_errors,
+        0,
+        "{:?}",
+        renderer.stats().recent_validation
+    );
+    println!(
+        "post lifecycle: restored at the original extent through the oracle, allocations \
+         unchanged, validation clean"
     );
 }

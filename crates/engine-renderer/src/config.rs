@@ -82,6 +82,20 @@ pub enum DemoScenePreference {
     Corner,
 }
 
+/// Verification scenario for depth format fallback testing
+/// (corrective finding 4): override the negotiated depth format.
+/// Never set by normal operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DepthFormatPreference {
+    /// Use the device's optimal negotiated depth format (the default).
+    #[default]
+    Auto,
+    /// Force D24_UNORM_S8_UINT if supported; fall back to negotiated pick.
+    ForceD24S8,
+    /// Force D16_UNORM if supported; fall back to negotiated pick.
+    ForceD16,
+}
+
 /// Renderer configuration. Presentation *pacing* (frame-rate targets,
 /// uncapped measurement) stays in the application — the renderer never
 /// imposes an engine-wide frame-rate ceiling, and rendering cadence is
@@ -104,11 +118,45 @@ pub struct RenderConfig {
     /// default omits it: a game's scene is the dynamic geometry the
     /// application supplies, never content the renderer imposes.
     pub demo_scene: DemoScenePreference,
+    /// Verification scenario for depth format fallback testing
+    /// (corrective finding 4): override the negotiated depth format.
+    /// Never set by normal operation — use `Auto` to allow the
+    /// renderer to pick the device's optimal format. `ForceD24S8`
+    /// and `ForceD16` select the named format ONLY if the device's
+    /// optimal tiling supports DEPTH_STENCIL_ATTACHMENT (else the
+    /// negotiated pick is used, never creating an invalid device
+    /// state). The chosen depth format is reported in the renderer's
+    /// stats.
+    pub depth_format: DepthFormatPreference,
 }
 
 /// Frames simultaneously in flight (sync objects per slot). Fixed at 2 for
 /// Stage 2; the value is a classic double-buffer CPU/GPU overlap.
 pub const FRAMES_IN_FLIGHT: u32 = 2;
+
+/// Resolves the depth format preference against the device's optimal tiling
+/// features. `Auto` ALWAYS returns the negotiated pick (the default path is
+/// byte-identical to the pre-knob renderer); a forced preference returns its
+/// format only when the device's optimal tiling supports
+/// DEPTH_STENCIL_ATTACHMENT, else the negotiated pick — never an invalid
+/// device state. Pure function — unit-testable without a GPU.
+/// (corrective finding 4)
+pub(crate) fn resolve_depth_format(
+    preference: DepthFormatPreference,
+    supports_d24_s8: bool,
+    supports_d16: bool,
+    negotiated: vk::Format,
+) -> vk::Format {
+    use vk::Format as F;
+    match preference {
+        DepthFormatPreference::Auto => negotiated,
+        DepthFormatPreference::ForceD24S8 if supports_d24_s8 => F::D24_UNORM_S8_UINT,
+        DepthFormatPreference::ForceD16 if supports_d16 => F::D16_UNORM,
+        // The forced format is unsupported on this device — the
+        // negotiated pick, never an invalid device state.
+        DepthFormatPreference::ForceD24S8 | DepthFormatPreference::ForceD16 => negotiated,
+    }
+}
 
 /// Resolves the present mode against the device's supported set. `FIFO`
 /// is guaranteed by the Vulkan spec, so every fallback lands on a valid
@@ -383,5 +431,65 @@ mod tests {
         assert_eq!((empty.drawn, empty.truncated), (0, 0));
         let unallocated = dynamic_geometry_clamp(1_000, 0);
         assert_eq!((unallocated.drawn, unallocated.truncated), (0, 1_000));
+    }
+
+    #[test]
+    fn depth_format_preference_defaults_to_auto() {
+        assert_eq!(
+            DepthFormatPreference::default(),
+            DepthFormatPreference::Auto
+        );
+    }
+
+    #[test]
+    fn auto_depth_format_is_always_the_negotiated_pick() {
+        use ash::vk;
+        // The finding-4 contract's sharpest edge: Auto must never
+        // drift off the negotiated pick, even when the device also
+        // supports the forced formats (a resolver that returned
+        // D24_S8 for Auto would change the DEFAULT for every
+        // existing renderer on a D24-capable device).
+        assert_eq!(
+            resolve_depth_format(
+                DepthFormatPreference::Auto,
+                true,
+                true,
+                vk::Format::D32_SFLOAT
+            ),
+            vk::Format::D32_SFLOAT
+        );
+        assert_eq!(
+            resolve_depth_format(
+                DepthFormatPreference::Auto,
+                false,
+                false,
+                vk::Format::D16_UNORM
+            ),
+            vk::Format::D16_UNORM
+        );
+    }
+
+    #[test]
+    fn forced_depth_format_honors_support_and_falls_back_cleanly() {
+        use ash::vk;
+        let negotiated = vk::Format::D32_SFLOAT;
+        assert_eq!(
+            resolve_depth_format(DepthFormatPreference::ForceD24S8, true, true, negotiated),
+            vk::Format::D24_UNORM_S8_UINT
+        );
+        assert_eq!(
+            resolve_depth_format(DepthFormatPreference::ForceD16, true, true, negotiated),
+            vk::Format::D16_UNORM
+        );
+        // Unsupported on the device: the negotiated pick, never an
+        // invalid device state.
+        assert_eq!(
+            resolve_depth_format(DepthFormatPreference::ForceD24S8, false, true, negotiated),
+            negotiated
+        );
+        assert_eq!(
+            resolve_depth_format(DepthFormatPreference::ForceD16, true, false, negotiated),
+            negotiated
+        );
     }
 }

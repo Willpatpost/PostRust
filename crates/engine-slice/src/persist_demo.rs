@@ -82,7 +82,8 @@ use engine_persist::{
     T1Journal, UnknownReason,
 };
 use engine_renderer::{
-    DemoScenePreference, PresentModePreference, RenderConfig, Renderer, ValidationPreference,
+    DemoScenePreference, DepthFormatPreference, PresentModePreference, RenderConfig, Renderer,
+    ValidationPreference,
 };
 use engine_shell::{
     DriverPreference, InputSnapshot, Keycode, ShellApp, ShellConfig, resident_set_kib,
@@ -2553,6 +2554,7 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         validation: options.validation,
         replace_pipelines: false,
         demo_scene: DemoScenePreference::Included,
+        depth_format: DepthFormatPreference::Auto,
     };
     let mut renderer =
         Renderer::new(app.window(), render_config).map_err(|error| error.to_string())?;

@@ -248,6 +248,11 @@ impl ShadowResources {
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
             let image = unsafe { ctx.device.create_image(&image_info, None) }
                 .map_err(|error| RendererError::vk(error, "shadow image"))?;
+            // Immediate registration (corrective finding 8): the
+            // handle is owned from creation, so any later failure in
+            // this slot's construction unwinds through `release` —
+            // the post/reflection target builders' pattern.
+            self.images.push(image);
             let requirements = unsafe { ctx.device.get_image_memory_requirements(image) };
             let memory_index = super::find_memory_type(
                 ctx,
@@ -259,9 +264,12 @@ impl ShadowResources {
                 .allocation_size(requirements.size)
                 .memory_type_index(memory_index);
             // SAFETY: the requirement query is for this live image;
-            // the partial state owns both handles.
+            // the partial state owns both handles (the image is
+            // registered above; the memory registers on the next
+            // line).
             let memory = unsafe { ctx.allocate_memory(&memory_info) }
                 .map_err(|error| RendererError::vk(error, "shadow image memory"))?;
+            self.memories.push(memory);
             unsafe { ctx.device.bind_image_memory(image, memory, 0) }
                 .map_err(|error| RendererError::vk(error, "bind shadow image"))?;
             let subresource = vk::ImageSubresourceRange {
@@ -277,6 +285,7 @@ impl ShadowResources {
                 .subresource_range(subresource);
             let view = unsafe { ctx.device.create_image_view(&view_info, None) }
                 .map_err(|error| RendererError::vk(error, "shadow image view"))?;
+            self.views.push(view);
             let framebuffer_attachments = [view];
             let framebuffer_info = vk::FramebufferCreateInfo::default()
                 .render_pass(self.depth_pass)
@@ -286,9 +295,6 @@ impl ShadowResources {
                 .layers(1);
             let framebuffer = unsafe { ctx.device.create_framebuffer(&framebuffer_info, None) }
                 .map_err(|error| RendererError::vk(error, "shadow framebuffer"))?;
-            self.images.push(image);
-            self.memories.push(memory);
-            self.views.push(view);
             self.framebuffers.push(framebuffer);
         }
 

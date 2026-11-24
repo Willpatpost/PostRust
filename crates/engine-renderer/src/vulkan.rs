@@ -101,6 +101,8 @@ use ash::khr;
 use ash::vk;
 use ash::{Device, Entry, Instance};
 
+use crate::config::DepthFormatPreference;
+
 #[path = "corner.rs"]
 pub(crate) mod corner;
 #[path = "descriptors.rs"]
@@ -981,6 +983,11 @@ pub(crate) struct SwapchainState {
     /// usage (the frame-capture readback path; requested at creation
     /// whenever supported).
     pub transfer_src_supported: bool,
+    /// Monotonic generation for cache invalidation (corrective finding 7).
+    /// Vulkan permits handle reuse, so a numerical view handle could
+    /// recur after destruction. The generation increases forever so
+    /// retired generations' keys can never recur.
+    pub generation: u64,
 }
 
 /// Picks the surface format (BGRA8_UNORM + sRGB non-linear preferred — the
@@ -1049,6 +1056,7 @@ impl SwapchainState {
             image_count: 0,
             depth_format,
             transfer_src_supported: false,
+            generation: next_swapchain_generation(),
         };
         if let Err(error) = state.build(
             ctx,
@@ -1351,28 +1359,120 @@ pub(crate) fn surface_probe_decision(
     }
 }
 
+/// Depth format aspect flags for a given Vulkan format.
+///
+/// D32_SFLOAT and D16_UNORM → `DEPTH`
+/// D24_UNORM_S8_UINT → `DEPTH | STENCIL`
+/// Other formats → `COLOR` (only valid where the caller knows the format
+/// is a depth format and the caller is responsible for ensuring this).
+///
+/// Pure function — unit-testable without a GPU.
+pub(crate) fn depth_aspect(format: vk::Format) -> vk::ImageAspectFlags {
+    match format {
+        vk::Format::D32_SFLOAT | vk::Format::D16_UNORM => vk::ImageAspectFlags::DEPTH,
+        vk::Format::D24_UNORM_S8_UINT => {
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+        }
+        // For color images and depth formats we don't explicitly handle,
+        // COLOR is the safe default (the caller must not pass a depth
+        // format this doesn't cover).
+        _ => vk::ImageAspectFlags::COLOR,
+    }
+}
+
+#[cfg(test)]
+mod depth_format_tests {
+    use super::depth_aspect;
+    use ash::vk;
+
+    #[test]
+    fn d32_sfloat_uses_depth_aspect() {
+        assert_eq!(
+            depth_aspect(vk::Format::D32_SFLOAT),
+            vk::ImageAspectFlags::DEPTH
+        );
+    }
+
+    #[test]
+    fn d24_unorm_s8_uint_uses_depth_stencil_aspect() {
+        assert_eq!(
+            depth_aspect(vk::Format::D24_UNORM_S8_UINT),
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+        );
+    }
+
+    #[test]
+    fn d16_unorm_uses_depth_aspect() {
+        assert_eq!(
+            depth_aspect(vk::Format::D16_UNORM),
+            vk::ImageAspectFlags::DEPTH
+        );
+    }
+
+    #[test]
+    fn color_formats_use_color_aspect() {
+        assert_eq!(
+            depth_aspect(vk::Format::B8G8R8A8_UNORM),
+            vk::ImageAspectFlags::COLOR
+        );
+    }
+}
+
 /// Depth format for the graphics device; chosen **once per renderer** and
 /// shared by the render pass and every depth attachment, so they cannot
 /// drift apart (corrective finding F).
+///
+/// Uses the preference to override the negotiated pick only if the device's
+/// optimal tiling supports the forced format; otherwise falls back to the
+/// negotiated pick. Never creates an invalid device state.
 pub(crate) fn pick_depth_format(
     instance: &Instance,
     physical_device: vk::PhysicalDevice,
+    preference: DepthFormatPreference,
 ) -> vk::Format {
-    for format in [
-        vk::Format::D32_SFLOAT,
-        vk::Format::D24_UNORM_S8_UINT,
-        vk::Format::D16_UNORM,
-    ] {
-        let properties =
-            unsafe { instance.get_physical_device_format_properties(physical_device, format) };
-        if properties
+    // Query support for each format once for the fallback logic.
+    let supports_d32 = unsafe {
+        instance
+            .get_physical_device_format_properties(physical_device, vk::Format::D32_SFLOAT)
             .optimal_tiling_features
             .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
-        {
-            return format;
+    };
+    let supports_d24_s8 = unsafe {
+        instance
+            .get_physical_device_format_properties(physical_device, vk::Format::D24_UNORM_S8_UINT)
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+    };
+    let supports_d16 = unsafe {
+        instance
+            .get_physical_device_format_properties(physical_device, vk::Format::D16_UNORM)
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+    };
+
+    // Resolve the preference: use the forced format only if supported.
+    crate::config::resolve_depth_format(preference, supports_d24_s8, supports_d16, {
+        // The default negotiated pick (D32 > D24_S8 > D16).
+        if supports_d32 {
+            vk::Format::D32_SFLOAT
+        } else if supports_d24_s8 {
+            vk::Format::D24_UNORM_S8_UINT
+        } else {
+            vk::Format::D16_UNORM
         }
-    }
-    vk::Format::D16_UNORM
+    })
+}
+
+/// Monotonic swapchain generation counter for cache invalidation.
+/// Vulkan permits handle reuse, so a numerical view handle could recur
+/// after destruction. The generation is host-side bookkeeping only,
+/// never packed into any deterministic byte path; it increases forever
+/// so retired generations' keys can never recur. (corrective finding 7)
+pub(crate) static SWAPCHAIN_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn next_swapchain_generation() -> u64 {
+    SWAPCHAIN_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn find_memory_type(
@@ -3366,9 +3466,17 @@ pub(crate) fn render_frame(
     // acquire semaphore left unconsumed. A rebuild releases the old
     // bundle only when the extent or view set changed, which only a
     // recreation (already device-idle) can cause — the rebuild-safety
-    // proof in post_draw's module header.
+    // proof in post_draw's module header. The swapchain generation
+    // replaces the view handle for cache invalidation (corrective
+    // finding 7): Vulkan permits handle reuse, so a numerical view
+    // handle could recur after destruction.
     if post && let Some(post_state) = &mut pipes.post {
-        post_state.ensure_targets(ctx, swapchain.extent, &swapchain.views)?;
+        post_state.ensure_targets(
+            ctx,
+            swapchain.extent,
+            &swapchain.views,
+            swapchain.generation,
+        )?;
     }
     if wet.is_some()
         && let (Some(post_state), Some(reflection_state), Some(corner)) =
@@ -3379,7 +3487,8 @@ pub(crate) fn render_frame(
             swapchain.extent,
             corner,
             post_state.hdr_render_pass(),
-            swapchain.views.first().copied().unwrap_or_default(),
+            swapchain.generation,
+            swapchain.depth_format,
         )?;
     }
 
@@ -3465,9 +3574,16 @@ pub(crate) fn render_frame(
         // generation — repeat preparation against the replacement
         // before retrying the out-of-date acquire (finding 3's
         // stranded-frame corrective; the same frame-sync discipline,
-        // still before any acquire of the new chain).
+        // still before any acquire of the new chain). The swapchain
+        // generation replaces the view handle for cache invalidation
+        // (corrective finding 7).
         if post && let Some(post_state) = &mut pipes.post {
-            post_state.ensure_targets(ctx, swapchain.extent, &swapchain.views)?;
+            post_state.ensure_targets(
+                ctx,
+                swapchain.extent,
+                &swapchain.views,
+                swapchain.generation,
+            )?;
         }
         if wet.is_some()
             && let (Some(post_state), Some(reflection_state), Some(corner)) =
@@ -3478,7 +3594,8 @@ pub(crate) fn render_frame(
                 swapchain.extent,
                 corner,
                 post_state.hdr_render_pass(),
-                swapchain.views.first().copied().unwrap_or_default(),
+                swapchain.generation,
+                swapchain.depth_format,
             )?;
         }
         // The capture ensure is repeated here too (the same frame-sync

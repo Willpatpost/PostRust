@@ -36,7 +36,8 @@ use engine_renderer::proc_texture::{TEXTURE_SIZE, procedural_texture};
 use engine_renderer::shadows::ShadowBias;
 use engine_renderer::sky::atmosphere_at;
 use engine_renderer::{
-    DemoScenePreference, RenderConfig, Renderer, SkyFrame, ValidationPreference,
+    DemoScenePreference, DepthFormatPreference, RenderConfig, Renderer, SkyFrame,
+    ValidationPreference,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 use engine_slice::corner_demo::view_projection;
@@ -827,4 +828,104 @@ fn first_frame_after_replacement_keeps_every_layer() {
         "{:?}",
         renderer.stats().recent_validation
     );
+}
+
+/// Finding 4 verification (the wet-only cell of the review's
+/// post-only / wet-only / combined matrix): the wet reflection's
+/// extent-bound targets honor the NEGOTIATED depth format. The
+/// renderer is built with `ForceD24S8`; if the device lacks the
+/// format the knob falls back to the negotiated pick — the test
+/// prints the skip and returns (the skip condition is the REPORTED
+/// format, never a guess). Wet ON, post chain OFF; one shadowed wet
+/// frame, capture, assert a clean validation record (the aspect and
+/// attachment mismatches this finding describes are validation
+/// errors first) and a non-uniform frame (the wet ground drew).
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
+fn wet_targets_honor_the_negotiated_depth_format() {
+    let _guard = sdl_lock();
+    let app = ShellApp::new(ShellConfig {
+        title: "wet-depth-format".into(),
+        width: 256,
+        height: 256,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    })
+    .unwrap();
+    let mut renderer = Renderer::new(
+        app.window(),
+        RenderConfig {
+            demo_scene: DemoScenePreference::Corner,
+            validation: ValidationPreference::On,
+            depth_format: DepthFormatPreference::ForceD24S8,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(renderer.stats().validation_active);
+
+    // The knob's outcome, from the renderer's own report: the forced
+    // format, or the negotiated pick when the device lacks it.
+    let reported = renderer.stats().depth_format.clone();
+    if reported != "D24_UNORM_S8_UINT" {
+        println!(
+            "wet depth-format gate: the device lacks D24_UNORM_S8_UINT (reported {reported}); \
+             the knob fell back to the negotiated pick — skipped"
+        );
+        return;
+    }
+    println!("wet depth-format gate: forced D24_UNORM_S8_UINT honored");
+
+    // Wet ON, post chain OFF (the matrix's wet-only cell); sky off to
+    // keep the frame's variables minimal.
+    renderer.set_post(false);
+    renderer.set_wet(true);
+    let light = day_preset();
+    let eye = [12.0, 2.0, -12.0];
+    let aim = [2.0, 0.0, -12.0];
+    let matrix = view_projection(
+        RouteWaypoint {
+            position: eye,
+            look_at: aim,
+        },
+        1.0,
+    );
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner_shadowed(&matrix, eye, light, BIAS, (256, 256))
+            .unwrap()
+            .presented
+    );
+    let capture = renderer.take_frame_capture().unwrap().unwrap();
+
+    // Not uniform: the wet ground and the corner geometry drew (a
+    // failed depth attachment shows as a cleared or validation-broken
+    // frame, not this).
+    let first_pixel = capture.pixel_rgba(0, 0);
+    let uniform_like = capture
+        .bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|rgba| **rgba == first_pixel)
+        .count();
+    let total_pixels = (capture.width * capture.height) as usize;
+    println!(
+        "wet depth-format gate: {uniform_like}/{total_pixels} pixels match pixel (0,0) \
+         ({:.1}%)",
+        100.0 * uniform_like as f64 / total_pixels as f64
+    );
+    assert!(
+        uniform_like * 10 < total_pixels * 9,
+        "the wet frame is not uniform (the wet ground and corner geometry drew)"
+    );
+
+    assert_eq!(
+        renderer.stats().validation_errors,
+        0,
+        "{:?}",
+        renderer.stats().recent_validation
+    );
+    println!("wet depth-format gate: D24_UNORM_S8_UINT wet frame clean under validation");
 }
