@@ -135,6 +135,15 @@ fn sky_pixels_match_sky_color_and_never_touch_covered_geometry() {
     // ray (the saturated regions make the sun/zenith poses robust;
     // the horizon pose exercises the mid-ramp through the per-pixel
     // rays). The day palette with the day disc.
+    // THE SUN POSE SITS ABOVE THE MASSES (the package-6 first-run
+    // correction): from the street-level origin the sun at 45°
+    // elevation toward the SOUTHWEST lands INSIDE the southwest
+    // building's silhouette (the ray enters its column at 10.2 m <
+    // the 22 m top — occluded on ANY correct renderer), so the disc
+    // center is checked from an eye above the tallest mass instead
+    // (25 m > 22 m: the whole frame is pure sky, the disc dead
+    // center). The gradient poses (zenith, horizon) look along the
+    // OPEN road axes and stay at the street-level eye.
     let day = atmosphere_at(0.0);
     let sun_dir = day.disc_dir;
     renderer.set_sky(Some(SkyFrame {
@@ -142,11 +151,12 @@ fn sky_pixels_match_sky_color_and_never_touch_covered_geometry() {
         disc_dir: sun_dir,
     }));
     let eye = [0.0, 1.7, 0.0];
+    let high_eye = [0.0, 25.0, 0.0];
     let poses = [
         (
             "at the sun",
-            eye,
-            std::array::from_fn(|i| eye[i] + sun_dir[i]),
+            high_eye,
+            std::array::from_fn(|i| high_eye[i] + sun_dir[i]),
         ),
         // Steeply up (~63° elevation): the gradient's ramp saturates
         // — the pure zenith extreme (the sun sits off this axis, no
@@ -195,23 +205,26 @@ fn sky_pixels_match_sky_color_and_never_touch_covered_geometry() {
     }
 
     // THE NIGHT DISC: the moon through the night palette (the same
-    // center-pose discipline; the cool moon over the dark zenith).
+    // high-eye discipline — the moon at ~61° elevation toward the
+    // northeast sits inside the northeast mass's silhouette from
+    // the street-level origin, so the check rides the above-mass
+    // eye like the sun pose).
     let night = atmosphere_at(1.0);
     renderer.set_sky(Some(SkyFrame {
         palette: night.sky,
         disc_dir: night.disc_dir,
     }));
-    let toward = std::array::from_fn(|i| eye[i] + night.disc_dir[i]);
-    let matrix = aimed(eye, toward);
+    let toward = std::array::from_fn(|i| high_eye[i] + night.disc_dir[i]);
+    let matrix = aimed(high_eye, toward);
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, eye, night_preset(), size)
+            .render_corner(&matrix, high_eye, night_preset(), size)
             .unwrap()
             .presented
     );
     let image = renderer.take_frame_capture().unwrap().unwrap();
-    let (forward, right, up) = basis(eye, toward);
+    let (forward, right, up) = basis(high_eye, toward);
     let center = size.0 / 2;
     let ray = pixel_ray(forward, right, up, center, center, size);
     let expected = quantized(sky_color(ray, &night.sky, night.disc_dir));
@@ -300,8 +313,17 @@ fn sky_pixels_match_sky_color_and_never_touch_covered_geometry() {
 
     // THE ALLOCATION DELTA (the lazily-created sky state): exactly
     // one mapped uniform (buffer + memory), one pool, one set —
-    // no textures, no samplers; then WARMED CONSTANCY across
-    // repeated sky frames (byte-identical captures with them).
+    // no textures, no samplers. The device_memory delta is TWO on
+    // the first execution (found when the gate finally ran): the
+    // sky state's uniform AND the frame-capture machinery's
+    // destination buffer, which allocates lazily at THIS test's
+    // first capture request (the snapshot above precedes any
+    // capture — the skyless corner run never requested one). The
+    // capture buffer is the orientation package's own one-time
+    // cost, not the sky state's — documented here because this
+    // test is the first in the line to snapshot before capturing.
+    // Then WARMED CONSTANCY across repeated sky frames
+    // (byte-identical captures with them).
     let warm = renderer.allocations();
     assert_eq!(
         (
@@ -311,8 +333,8 @@ fn sky_pixels_match_sky_color_and_never_touch_covered_geometry() {
             warm.samplers - skyless.samplers,
             warm.texture_memory - skyless.texture_memory
         ),
-        (1, 1, 1, 0, 0),
-        "the sky state's one-time allocation delta"
+        (2, 1, 1, 0, 0),
+        "the sky state's and the capture buffer's one-time allocation deltas"
     );
     renderer.set_sky(Some(SkyFrame {
         palette: day.sky,
@@ -334,7 +356,9 @@ fn sky_pixels_match_sky_color_and_never_touch_covered_geometry() {
         );
         assert_eq!(repeat.bytes, sky_visible.bytes, "byte-identical sky frames");
     }
-    println!("warmed sky allocations: {warm:?} (delta over skyless: +1 memory, +1 pool, +1 set)");
+    println!(
+        "warmed sky allocations: {warm:?} (delta over skyless: +2 memory counting the capture buffer, +1 pool, +1 set)"
+    );
 
     // The shadowed path composes with the sky (one presented frame,
     // clean validation — the full shadow gates are the shadow
