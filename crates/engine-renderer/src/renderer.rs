@@ -624,6 +624,10 @@ impl Renderer {
         };
         let sky = self.sky_params(view_proj);
         let wet = self.wet_camera(view_proj, eye, light);
+        // The ground re-draw (finding 5) needs the current camera in the
+        // corner buffer regardless of the lighting branch. Build the
+        // ordinary FrameParams and pass it in corner_params.
+        let corner_params = vulkan::corner::FrameParams::new(*view_proj, eye, light);
         let outcome = vulkan::render_frame(
             &mut self.ctx,
             &mut self.swapchain,
@@ -638,7 +642,7 @@ impl Renderer {
             None,
             &[],
             &[],
-            None,
+            Some(&corner_params),
             None,
             Some(&params),
             sky.as_ref(),

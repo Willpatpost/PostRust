@@ -399,8 +399,20 @@ impl PostResources {
                 vk::AccessFlags::COLOR_ATTACHMENT_WRITE
                     | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
             );
+        // The ordering the bloom and composite passes rely on (finding 9):
+        // the color writes (and final transition to SHADER_READ) happen
+        // before the bloom pass's fragment reads and the composite's
+        // final fragment reads. Vulkan orders the final transition before
+        // the visibility operations of outgoing external dependencies.
+        let outgoing_dependency = vk::SubpassDependency::default()
+            .src_subpass(0)
+            .dst_subpass(vk::SUBPASS_EXTERNAL)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
         let subpasses = [subpass];
-        let dependencies = [dependency];
+        let dependencies = [dependency, outgoing_dependency];
         let render_pass_info = vk::RenderPassCreateInfo::default()
             .attachments(&attachments)
             .subpasses(&subpasses)
@@ -448,8 +460,20 @@ impl PostResources {
             .src_access_mask(vk::AccessFlags::SHADER_READ)
             .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
             .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+        // The ordering the composite pass relies on (finding 9): the
+        // bloom pass's color writes (and final transition to SHADER_READ)
+        // happen before the composite's fragment reads. Vulkan orders
+        // the final transition before the visibility operations of
+        // outgoing external dependencies.
+        let outgoing_dependency = vk::SubpassDependency::default()
+            .src_subpass(0)
+            .dst_subpass(vk::SUBPASS_EXTERNAL)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
         let bloom_subpasses = [bloom_subpass];
-        let bloom_dependencies = [read_dependency, write_dependency];
+        let bloom_dependencies = [read_dependency, write_dependency, outgoing_dependency];
         let bloom_pass_info = vk::RenderPassCreateInfo::default()
             .attachments(&bloom_attachments)
             .subpasses(&bloom_subpasses)
@@ -1126,6 +1150,17 @@ impl PostResources {
                 );
                 ctx.device.cmd_draw(cmd, 3, 1, 0, 0);
             }
+            // The corner buffer must be written before the HDR scene
+            // pass for both the shadowed and ordinary paths (finding 5:
+            // the wet ground re-draw reads this camera block; the
+            // ordinary branch used to write it, the shadowed branch
+            // now depends on it).
+            if let (Some(resources), Some(params)) = (&ctx.corner, inputs.corner_params) {
+                // SAFETY: this slot's fence wait passed above; the
+                // coherent frame regions do not overlap other slots
+                // or the immutable material tail.
+                resources.write_frame(slot, params);
+            }
             if inputs.shadowed.is_some()
                 && let (Some(resources), Some(shadow_state), Some(pipeline)) =
                     (&ctx.corner, &pipes.shadows, self.shadowed_hdr)
@@ -1138,13 +1173,15 @@ impl PostResources {
                 ctx.device
                     .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
                 resources.draw(ctx, cmd, layout, &sets, frame_offset);
-            } else if let (Some(resources), Some(params)) = (&ctx.corner, inputs.corner_params) {
+            } else if let (Some(resources), Some(_params)) = (&ctx.corner, inputs.corner_params) {
                 ctx.device
                     .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.lit_hdr);
                 // SAFETY: this slot's fence wait passed above; the
                 // coherent frame regions do not overlap other slots
                 // or the immutable material tail.
-                resources.write_frame(slot, params);
+                // The corner buffer was written above (the 6-F
+                // shadowed path now supplies the camera, so the
+                // ordinary branch no longer writes).
                 resources.draw(
                     ctx,
                     cmd,

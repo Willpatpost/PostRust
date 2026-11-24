@@ -929,3 +929,264 @@ fn wet_targets_honor_the_negotiated_depth_format() {
     );
     println!("wet depth-format gate: D24_UNORM_S8_UINT wet frame clean under validation");
 }
+
+/// Finding 5 verification (the shadowed wet ground's camera): the
+/// ground re-draw binds the CORNER buffer's slot region — a block
+/// only the ordinary lighting branch ever wrote. On a shadowed+wet
+/// frame the corner region held a previous pose's camera (or
+/// uninitialized bytes on the very first frame): the EQUAL depth
+/// test and the Schlick Fresnel both read a stale camera. The fix
+/// populates the corner block before either lighting branch on
+/// every shadowed frame.
+///
+/// The gate: the renderer's FIRST corner frame is SHADOWED+wet
+/// (the uninitialized-camera window), then four wet captures
+/// alternate two distinct poses across both frame slots (A, B, A,
+/// B — each slot's corner region receives a different camera), and
+/// each capture is checked against the file's own MEASURED mirror
+/// chain oracle (the grazing gate's model — the ground hit, the
+/// reflected ray, the lit equation, the Schlick blend) over a
+/// probe patch, against THAT pose's own shadowed dry capture (the
+/// blend's matte term is the shadowed scene pass's ground pixel).
+/// A stale camera on either slot shifts the blend factor and the
+/// EQUAL-depth footprint — both fail loudly at the patch. The
+/// review's post-enabled variant is covered by a differential: the
+/// HDR scene pass's wet-vs-dry pixels at the same patch (through
+/// the ACES tonemap the blend is not directly oracle-comparable;
+/// a stale camera would reject the EQUAL-depth redraw entirely and
+/// the wet frame would equal the dry one).
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
+fn shadowed_wet_ground_reads_the_current_camera() {
+    let _guard = sdl_lock();
+    let mut app = ShellApp::new(ShellConfig {
+        title: "shadowed wet camera".into(),
+        width: 256,
+        height: 256,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    })
+    .unwrap();
+    let mut renderer = Renderer::new(
+        app.window(),
+        RenderConfig {
+            demo_scene: DemoScenePreference::Corner,
+            validation: ValidationPreference::On,
+            replace_pipelines: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let size = app.window().size_in_pixels();
+    assert_eq!(size, (256, 256));
+    assert!(renderer.stats().validation_active);
+    let _ = app.frame();
+
+    // The two poses: the grazing gate's own pose (street level,
+    // looking down-and-west — the reflected rays climb to the
+    // southwest mass's east face), and a second camera at a
+    // different height and lateral offset aiming at the same ground
+    // region (a measurably different view angle — a different Schlick
+    // factor — and different ground hits, so each slot's corner
+    // region receives a distinguishable camera).
+    let light = day_preset();
+    let poses = [
+        (
+            [12.0, 2.0, -12.0],
+            [2.0, 0.0, -12.0],
+            "grazing street level",
+        ),
+        (
+            [12.0, 3.5, -9.0],
+            [2.0, 0.0, -12.0],
+            "raised lateral offset",
+        ),
+    ];
+    let matrices = poses.map(|(eye, aim, _)| {
+        view_projection(
+            RouteWaypoint {
+                position: eye,
+                look_at: aim,
+            },
+            1.0,
+        )
+    });
+
+    // Wet ON, post OFF, sky OFF — the finding's scope. The FIRST
+    // corner frame this renderer draws is SHADOWED+wet: the corner
+    // region's uninitialized-camera window.
+    renderer.set_wet(true);
+    renderer.set_post(false);
+    renderer.set_sky(None);
+
+    // Four wet captures alternating the poses across both frame
+    // slots (A, B, A, B — the capture-only renders alternate slots
+    // naturally; no dry render interleaves to disturb them).
+    let wet_captures: Vec<_> = ["A", "B", "A", "B"]
+        .iter()
+        .map(|&pose| {
+            let index = usize::from(pose == "B");
+            let (eye, _aim, _) = poses[index];
+            renderer.request_frame_capture().unwrap();
+            assert!(
+                renderer
+                    .render_corner_shadowed(&matrices[index], eye, light, BIAS, size)
+                    .unwrap()
+                    .presented
+            );
+            (pose, renderer.take_frame_capture().unwrap().unwrap())
+        })
+        .collect();
+
+    // The dry term per pose: the SAME shadowed scene pass with the
+    // ground re-draw OFF (the blend's matte term is whatever the
+    // shadowed scene pass rendered there — lit or shadowed ground,
+    // the captured term keeps the model valid either way).
+    renderer.set_wet(false);
+    let dry_captures: Vec<_> = poses
+        .iter()
+        .map(|(eye, _aim, _)| {
+            let index = poses.iter().position(|p| p.0 == *eye).unwrap();
+            renderer.request_frame_capture().unwrap();
+            assert!(
+                renderer
+                    .render_corner_shadowed(&matrices[index], *eye, light, BIAS, size)
+                    .unwrap()
+                    .presented
+            );
+            renderer.take_frame_capture().unwrap().unwrap()
+        })
+        .collect();
+
+    // The grazing gate's own oracle, per pose, over a probe patch:
+    // the ground hit → the reflected ray → the box hit → the lit
+    // equation → the Schlick blend over the pose's own dry pixel.
+    let mut grand_max_error = 0u8;
+    for (index, (eye, aim, what)) in poses.iter().enumerate() {
+        let (forward, right, up) = basis(*eye, *aim);
+        let wet = wet_captures
+            .iter()
+            .filter(|(pose, _)| usize::from(*pose == "B") == index)
+            .map(|(_, capture)| capture)
+            .collect::<Vec<_>>();
+        let dry = &dry_captures[index];
+        let mut max_error = 0u8;
+        let mut checked = 0usize;
+        let mut b_max = f32::NEG_INFINITY;
+        'pixel: for y in 108..=148 {
+            for x in 108..=148 {
+                let ray = pixel_ray(forward, right, up, x, y, size);
+                if ray[1] >= -1e-4 {
+                    continue; // not a ground pixel
+                }
+                let t_ground = -eye[1] / ray[1];
+                let p = [eye[0] + ray[0] * t_ground, 0.0, eye[2] + ray[2] * t_ground];
+                let reflected = [ray[0], -ray[1], ray[2]];
+                let Some(hit) = raycast_boxes(p, reflected) else {
+                    continue; // the reflection is the clear color here
+                };
+                let mat = materials()[hit.material];
+                let texture = procedural_texture(mat.texture);
+                let [tx, ty] = hit
+                    .uv_axes
+                    .map(|m| ((m / 4.).rem_euclid(1.) * TEXTURE_SIZE as f32).floor() as usize);
+                let index = 4 * (ty * TEXTURE_SIZE as usize + tx);
+                let albedo = std::array::from_fn(|c| texture[index + c] as f32 / 255.);
+                let view = std::array::from_fn(|i| eye[i] - hit.pos[i]);
+                let reflection = lit_surface_color(albedo, hit.normal, view, mat, light);
+                let view_ground = [eye[0] - p[0], eye[1] - p[1], eye[2] - p[2]];
+                let view_length = (view_ground[0] * view_ground[0]
+                    + view_ground[1] * view_ground[1]
+                    + view_ground[2] * view_ground[2])
+                    .sqrt();
+                let n_dot_v = (view_ground[1] / view_length).clamp(0.0, 1.0);
+                let b = reflection_blend(n_dot_v);
+                b_max = b_max.max(b);
+                let dry_pixel = dry.pixel_rgba(x, y);
+                let expected: [u8; 3] = std::array::from_fn(|c| {
+                    (dry_pixel[c] as f32 * (1.0 - b) + 255.0 * reflection[c].clamp(0.0, 1.0) * b)
+                        .round() as u8
+                });
+                for capture in &wet {
+                    let pixel = capture.pixel_rgba(x, y);
+                    let error = expected
+                        .iter()
+                        .zip(pixel)
+                        .map(|(e, a)| e.abs_diff(a))
+                        .max()
+                        .unwrap();
+                    max_error = max_error.max(error);
+                    assert!(
+                        error <= TOLERANCE,
+                        "pose {what} ({x},{y}) ground {p:?} blend {b:.4}: expected {expected:?}, \
+                         got {pixel:?} (reflection {reflection:?}, dry {dry_pixel:?})"
+                    );
+                    checked += 1;
+                }
+                if checked >= 40 {
+                    break 'pixel;
+                }
+            }
+        }
+        println!(
+            "shadowed+wet pose {what}: {checked} probe comparisons vs the mirror-chain oracle, \
+             max error {max_error}/255, max blend {b_max:.3}"
+        );
+        assert!(
+            checked >= 20,
+            "pose {what} checked {checked} reflected pixels — the patch went vacuous"
+        );
+        assert!(
+            b_max > 0.1,
+            "pose {what} reflects visibly (b_max {b_max:.3})"
+        );
+        grand_max_error = grand_max_error.max(max_error);
+    }
+
+    // The post-enabled variant (the HDR scene pass): a differential —
+    // the wet frame must differ from the dry frame at the probe
+    // patch (through the ACES tonemap the blend is not directly
+    // oracle-comparable, but a stale camera would reject the
+    // EQUAL-depth ground redraw entirely and the two would match).
+    renderer.set_post(true);
+    renderer.set_wet(true);
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner_shadowed(&matrices[0], poses[0].0, light, BIAS, size)
+            .unwrap()
+            .presented
+    );
+    let hdr_wet = renderer.take_frame_capture().unwrap().unwrap();
+    renderer.set_wet(false);
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner_shadowed(&matrices[0], poses[0].0, light, BIAS, size)
+            .unwrap()
+            .presented
+    );
+    let hdr_dry = renderer.take_frame_capture().unwrap().unwrap();
+    let mut hdr_differ = 0usize;
+    for y in 108..=148 {
+        for x in 108..=148 {
+            hdr_differ += usize::from(hdr_wet.pixel_rgba(x, y) != hdr_dry.pixel_rgba(x, y));
+        }
+    }
+    println!("shadowed+wet HDR variant: {hdr_differ} patch pixels differ wet-vs-dry");
+    assert!(
+        hdr_differ >= 20,
+        "the HDR scene pass's ground re-draw blended ({hdr_differ} patch pixels differ)"
+    );
+
+    assert_eq!(
+        renderer.stats().validation_errors,
+        0,
+        "{:?}",
+        renderer.stats().recent_validation
+    );
+    println!(
+        "shadowed+wet camera gate: both slots' ground re-draws read the CURRENT camera — \
+         {grand_max_error}/255 max against the measured oracle, the HDR variant blended"
+    );
+}

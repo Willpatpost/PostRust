@@ -794,7 +794,9 @@ impl ReflectionResources {
     /// The barrier ordering the reflection pass's writes before the
     /// ground re-draw's fragment reads (the shadow-map readback's
     /// pattern — the pass's final SHADER_READ transition plus the
-    /// execution dependency).
+    /// execution dependency). The mirrored-scene pass's own outgoing
+    /// dependency (finding 9) provides the producer-side scope for
+    /// the final transition, making the barrier belt-and-suspenders.
     ///
     /// # Safety
     /// `cmd` must be recording, between the reflection pass and the

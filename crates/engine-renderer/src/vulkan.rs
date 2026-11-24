@@ -3895,6 +3895,16 @@ pub(crate) fn render_frame(
                 sky_state.write_frame(slot, params);
                 sky_state.record(ctx, command, slot);
             }
+            // The corner buffer must be written before the scene pass for
+            // both the shadowed and ordinary paths (finding 5: the wet
+            // ground re-draw reads this camera block; the ordinary branch
+            // used to write it, the shadowed branch now depends on it).
+            if let (Some(resources), Some(params)) = (&ctx.corner, corner_params) {
+                // SAFETY: the slot's fence wait passed above; the coherent
+                // frame regions do not overlap other slots or the immutable
+                // material tail.
+                resources.write_frame(slot, params);
+            }
             if shadowed.is_some()
                 && let (Some(resources), Some(shadow_state)) = (&ctx.corner, &pipes.shadows)
             {
@@ -3903,7 +3913,10 @@ pub(crate) fn render_frame(
                 // shadow state's per-material sets for this slot (the
                 // map view rides binding 4; the FrameParams dynamic
                 // offset selects this slot's extended region — written
-                // before the depth pass above). The ensure above
+                // before the depth pass above). The corner buffer
+                // was written before this branch (the 6-F correction
+                // to finding 5: both shadowed and ordinary branches
+                // now supply the true camera). The ensure above
                 // guaranteed the shadow state whenever `shadowed` is
                 // Some; the belt check keeps an unshadowed frame on the
                 // unshadowed path even if a prior shadowed frame created
@@ -3912,16 +3925,18 @@ pub(crate) fn render_frame(
                 ctx.device
                     .cmd_bind_pipeline(command, vk::PipelineBindPoint::GRAPHICS, pipeline);
                 resources.draw(ctx, command, layout, &sets, frame_offset);
-            } else if let (Some(resources), Some(params)) = (&ctx.corner, corner_params) {
+            } else if let (Some(resources), Some(_params)) = (&ctx.corner, corner_params) {
                 ctx.device.cmd_bind_pipeline(
                     command,
                     vk::PipelineBindPoint::GRAPHICS,
                     pipes.lit_pipeline,
                 );
-                // The slot's fence wait passed above; the coherent frame
-                // regions do not overlap other slots or the immutable
-                // material tail.
-                resources.write_frame(slot, params);
+                // The corner buffer was written above (the 6-F
+                // shadowed path now supplies the camera, so the
+                // ordinary branch no longer writes). The slot's
+                // fence wait passed; the coherent frame regions do
+                // not overlap other slots or the immutable material
+                // tail.
                 resources.draw(
                     ctx,
                     command,
