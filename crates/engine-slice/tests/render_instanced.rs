@@ -40,6 +40,19 @@
 //! SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_instanced -- \
 //!     --ignored --nocapture
 //! ```
+//!
+//! The Era-2 gates (the animation + skinning + proxy-shadows
+//! package, stage 5): `skinned_pose_matches_the_cpu_oracle` — one
+//! WALKING npc's torso front face per-pixel against the CPU
+//! skinning equation (`skin_vertex` composed with the instance
+//! transform) through a dead-on camera derived from the SKINNED
+//! rectangle; `animated_population_matches_per_object_pixels` — the
+//! N-vs-1 submission equivalence UNDER MOTION (frame-33 walk blocks
+//! through the per-object and instanced paths, byte-equal); and the
+//! animated regime inside the full-table gate below — the
+//! allocation counters (Vulkan AND host) constant across warmed
+//! WALKING frames with the per-frame pose digests proving the crowd
+//! moves.
 
 use engine_renderer::lit_scene::{LightParams, day_preset, lit_surface_color, materials};
 use engine_renderer::populated_meshes::{WHEEL_SEGMENTS, sedan_mesh};
@@ -1035,6 +1048,102 @@ fn full_corner_population_matches_per_object_pixels() {
     }
     println!("warmed full-table populated allocations: {warm:?}");
 
+    // THE ANIMATED REGIME (the Era-2 stage-5 allocation gate — the
+    // battery's third): the shipped population's OWN phase column
+    // drives the walk. Every warmed frame evaluates the pose blocks
+    // for presented frame k (advancing — `evaluate_population_poses`,
+    // the demo's own per-frame path), repacks, and renders; BOTH
+    // allocation counters hold exactly across the warmed window —
+    // the renderer's Vulkan objects (`allocations()`) AND the
+    // host-allocation counter (finding 10's `HostAllocScope`,
+    // wrapping the evaluation AND the render together: the walk
+    // evaluation reuses its retained buffer and the renderer's
+    // instance/pose repacks reuse theirs, so a warmed animated frame
+    // allocates nothing on either side). And the frames GENUINELY
+    // DIFFER: the packed pose bytes' FNV-1a digest per frame — at
+    // least 3 distinct among the measured window (MEASURED
+    // CPU-side at this tree: frames 0..16 give 16 distinct digests;
+    // the 16 walkers' hand-spread phases never coincide).
+    {
+        let phases = engine_slice::corner_population::corner_population_phases();
+        let mut blocks = Vec::new();
+        // The warmup: the first evaluation grows the retained block
+        // buffer (24 blocks × 704 bytes) and the first frames pay
+        // any first-touch costs — all BEFORE the snapshot.
+        for k in 0..4u64 {
+            engine_slice::corner_population::evaluate_population_poses(k, &phases, &mut blocks);
+            let animated = ProxyPopulation {
+                npc: &npc,
+                npc_poses: &blocks,
+                npc_material: 1,
+                vehicle: &vehicle,
+                vehicle_material: 2,
+            };
+            assert!(
+                renderer
+                    .render_corner_populated(&matrix, eye, light, &animated, size)
+                    .unwrap()
+                    .presented
+            );
+        }
+        let animated_warm = renderer.allocations();
+        assert_eq!(
+            animated_warm, warm,
+            "the animated regime pays nothing the rest regime did not \
+             (the same populated path, different pose bytes)"
+        );
+        let mut digests = std::collections::BTreeSet::new();
+        for k in 4..12u64 {
+            engine_slice::corner_population::evaluate_population_poses(k, &phases, &mut blocks);
+            // The frame's pose digest (the FNV-1a form the lib
+            // battery's byte pins use).
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for block in &blocks {
+                let bytes = engine_renderer::animation::pack_pose_bytes(block);
+                for &byte in bytes.iter() {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            digests.insert(hash);
+            let animated = ProxyPopulation {
+                npc: &npc,
+                npc_poses: &blocks,
+                npc_material: 1,
+                vehicle: &vehicle,
+                vehicle_material: 2,
+            };
+            let scope = common::HostAllocScope::new();
+            let outcome = renderer
+                .render_corner_populated(&matrix, eye, light, &animated, size)
+                .unwrap();
+            let allocs = scope.count();
+            drop(scope);
+            assert!(outcome.presented);
+            assert_eq!(
+                allocs, 0,
+                "no host allocations in the warmed animated frame {k} \
+                 (the evaluation reuses its buffer; the renderer's repack too)"
+            );
+            assert_eq!(
+                renderer.allocations(),
+                animated_warm,
+                "warmed animated allocations constant at frame {k}"
+            );
+        }
+        println!(
+            "animated regime: {} distinct pose digests across the 8 measured \
+             frames (floor 3), renderer allocations {animated_warm:?}, host \
+             allocations 0 per frame",
+            digests.len()
+        );
+        assert!(
+            digests.len() >= 3,
+            "the walk moves the crowd: {} distinct frame digests",
+            digests.len()
+        );
+    }
+
     assert_eq!(
         renderer.stats().validation_errors,
         0,
@@ -1914,5 +2023,635 @@ fn oblique_wheel_views_expose_the_outside_tire_and_both_cap_orientations() {
         0,
         "validation: {:?}",
         renderer.stats().recent_validation
+    );
+}
+
+/// THE ERA-2 SKINNING ORACLE GATE (stage 5, gate 1): one WALKING
+/// npc's TORSO front face, per-pixel against the CPU skinning
+/// equation — `skin_vertex` (the implementation the WGSL mirrors
+/// term-for-term) composed with the instance transform, through a
+/// dead-on orthographic camera DERIVED from the skinned rectangle
+/// (the `check_rotated_instance_oracle` discipline extended through
+/// the pose: at frame 33 the torso carries the walk cycle's
+/// counter-lean pitch — turn_i16(0.01) = 655 u16 units = 655/65536
+/// of a full rotation ≈ 3.598° — so the face is NOT world-axis-
+/// aligned; the camera aims at the skinned rectangle's center along
+/// its rotated normal, exactly as the rotated-wall fixture aims at
+/// the yawed wall's rectangle).
+///
+/// THE FIXTURE (every number derived, none guessed):
+/// - the pose: `evaluate_population_poses(33, &[Phase::Walk(0)])` —
+///   frame 33 at the 60 Hz reference is t = 0.55 s = EXACTLY the
+///   walk clip's keyframe 4 (φ = 180°, the right leg's heel strike:
+///   the pelvis at its double-support low Δy = −0.02, the torso at
+///   its counter-lean extreme +0.01 turn, arms and legs at their
+///   zero crossings, both elbows flexed +0.03 turn ≈ 10.8°); the
+///   phase-0 walker's clip time is 33 mod 66 = 33 → 33/60 = 0.55.
+/// - the instance: turn 40_960 (225° — the finding-13 fixture's own
+///   discriminator: the yawed local +Z faces the day light, so the
+///   skinned surface is LIT, N·L ≈ 0.66, and a dropped or unskinned
+///   normal changes the color by far more than the tolerance; at
+///   turn 0 the day light's −Z component clamps N·L to 0 for BOTH
+///   the rest and pitched normals — the ambient-only mode that
+///   fixture exists to avoid), pos [0, 0.02, 0], scale 1, tint
+///   [0.9, 0.7, 0.6], material 1 (the facade set — the demo's npc
+///   choice).
+/// - the surface: the torso (emission box 1, bounds
+///   [-0.21, 1.06, -0.12]..[0.21, 1.60, 0.12], bound rigidly to
+///   joint `BOX_JOINT[1]` = 1 with weights [1, 0, 0, 0]); the four
+///   front-face corners (local z = +0.12) skinned through
+///   `skin_vertex`, then the instance yaw + translation applied —
+///   the rigid binding makes the skinned face a true rotated
+///   rectangle (hw 0.21, hh 0.27 — measured: the edges preserve
+///   their authored lengths to 1e-5), so the dead-on camera frames
+///   it exactly as the axis-aligned rest wall's fixture does.
+/// - the UV: the shader skins position AND normal but the UV is
+///   AUTHORED (instanced_proxy_skinned.wgsl passes `uv` through
+///   untouched — verified in the module), so the expected texel
+///   comes from the pixel's AUTHORED local coordinates recovered
+///   through the affine map's basis dots.
+///
+/// THE NEIGHBOR CLEARANCE (why the probe region sees only the
+/// torso face): at keyframe 4 every joint rotation is a pitch
+/// (about local +X) or a translation — the pelvis yaw is exactly 0
+/// at φ = 180° — so every box's x-extent is UNCHANGED from rest:
+/// the arms sit at |x| ∈ [0.21, 0.33] (sharing the torso's edge
+/// plane), the head above y = 1.60, the pelvis below y = 1.06; the
+/// 8-pixel probe margin (0.013 m in x, 0.017 m in y at this
+/// framing) keeps the checked pixels clear of all shared
+/// boundaries, and the arms/elbows sit BEHIND the face plane (their
+/// local z ≤ 0.06 < 0.12; the elbow's +10.8° pitch swings the lower
+/// arms further BACKWARD), so nothing occludes the framed
+/// rectangle.
+///
+/// THE DIFFERENTIAL PIN: the same camera with the REST pose blocks
+/// must be pixel-DIFFERENT — the pose moves the rectangle (measured
+/// CPU-side: the center shifts (−0.0118, −0.0281, −0.0118) m and
+/// tilts 3.598°) AND the lit color (measured CPU-side: the pitched
+/// normal's N·L = 0.6613 vs the rest normal's 0.7071 moves the
+/// facade-material mid-face color by ≈ 10.9/255 — the specular term
+/// alone, which is albedo-independent, carries ≈ 5/255 of it — so
+/// every overlapping pixel differs, not just the silhouette edges).
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
+fn skinned_pose_matches_the_cpu_oracle() {
+    let _guard = sdl_lock();
+    let mut app = ShellApp::new(ShellConfig {
+        title: "Era-2 skinning oracle".into(),
+        width: 256,
+        height: 256,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    })
+    .unwrap();
+    let mut renderer = Renderer::new(
+        app.window(),
+        RenderConfig {
+            demo_scene: DemoScenePreference::Corner,
+            validation: ValidationPreference::On,
+            replace_pipelines: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let size = app.window().size_in_pixels();
+    assert_eq!(size, (256, 256));
+    assert!(renderer.stats().validation_active);
+    let _ = app.frame();
+
+    // --- THE POSE: frame 33, one phase-0 walker (the pure
+    // evaluation — the demo's own per-frame path, MEASURED CPU-side:
+    // the block differs from rest, the torso matrix's +Z image is
+    // [0, -0.0628, 0.9980] — the 3.598° counter-lean — and its
+    // translation [0, -0.0179, -0.0665]).
+    let mut blocks = Vec::new();
+    engine_slice::corner_population::evaluate_population_poses(
+        33,
+        &[engine_slice::corner_population::Phase::Walk(0)],
+        &mut blocks,
+    );
+    let block = &blocks[0];
+    let rest_block = engine_renderer::animation::rest_pose_block();
+    assert_ne!(*block, rest_block, "frame 33 is off the rest pose");
+
+    // --- THE SURFACE: the torso's front face through skin_vertex.
+    let (lo, hi) = engine_renderer::animation::HUMANOID_BOXES[1];
+    assert_eq!((lo, hi), ([-0.21, 1.06, -0.12], [0.21, 1.60, 0.12]));
+    let joint = engine_renderer::animation::BOX_JOINT[1];
+    assert_eq!(joint, 1, "the torso box binds to the torso joint");
+    // The four front-face corners, in authored order: bottom-left,
+    // bottom-right, top-right, top-left (local z = hi[2]).
+    let corners = [
+        [lo[0], lo[1], hi[2]],
+        [hi[0], lo[1], hi[2]],
+        [hi[0], hi[1], hi[2]],
+        [lo[0], hi[1], hi[2]],
+    ];
+    let skin_at = |pos: [f32; 3], normal: [f32; 3]| {
+        engine_renderer::animation::skin_vertex(
+            &engine_renderer::animation::SkinnedVertex {
+                pos,
+                normal,
+                uv: [0.0, 0.0],
+                joints: [joint as u32, 0, 0, 0],
+                weights: [1.0, 0.0, 0.0, 0.0],
+            },
+            block,
+        )
+    };
+    let skinned: Vec<_> = corners
+        .iter()
+        .map(|c| skin_at(*c, [0.0, 0.0, 1.0]).0)
+        .collect();
+    let skinned_normal = skin_at(corners[0], [0.0, 0.0, 1.0]).1;
+    // The rigid binding makes the normal identical at every corner.
+    for corner in &corners[1..] {
+        assert_eq!(skin_at(*corner, [0.0, 0.0, 1.0]).1, skinned_normal);
+    }
+    // The pose reality, pinned from the measured actuals: the
+    // counter-lean pitch tips the authored +Z normal to
+    // [0, -0.0628, 0.9980] (655 u16 units = 3.598°; the sin_cos_turn
+    // Taylor's asin(0.0628) — derived, never guessed).
+    assert!(
+        (skinned_normal[1] + 0.0628).abs() < 1e-3,
+        "{skinned_normal:?}"
+    );
+    assert!(skinned_normal[0].abs() < 1e-6 && (skinned_normal[2] - 0.9980).abs() < 1e-3);
+
+    // --- THE INSTANCE: turn 40_960 (225°), the identity-scale
+    // placement at the origin. The yaw's basis images from the SAME
+    // sin_cos_turn the packed instance bytes carry (normalized as
+    // the shader does).
+    let instance = ProxyInstance {
+        transform: InstanceTransform {
+            pos: [0.0, 0.02, 0.0],
+            turn: 40_960,
+            scale: 1.0,
+        },
+        tint: [0.9, 0.7, 0.6],
+        pose_index: 0,
+    };
+    let (s, c) = engine_renderer::proxy_instances::sin_cos_turn(instance.transform.turn);
+    let basis_len = (s * s + c * c).sqrt();
+    let x_image = [c / basis_len, 0.0, -s / basis_len]; // local +X → world
+    let z_image = [s / basis_len, 0.0, c / basis_len]; // local +Z → world
+    let world_of = |skinned_point: [f32; 3]| {
+        [
+            instance.transform.pos[0]
+                + x_image[0] * skinned_point[0]
+                + z_image[0] * skinned_point[2],
+            instance.transform.pos[1] + skinned_point[1],
+            instance.transform.pos[2]
+                + x_image[2] * skinned_point[0]
+                + z_image[2] * skinned_point[2],
+        ]
+    };
+    let world: Vec<_> = skinned.iter().map(|p| world_of(*p)).collect();
+
+    // --- THE DERIVATION CROSSES (the oblique-wheel fixture's
+    // discipline: the derivation must agree with the implementation,
+    // never trust its own arithmetic):
+    // (a) the world rectangle's edge lengths are the AUTHORED box's
+    //     (the rigid rotation preserves them to the Taylor's ~2e-6);
+    // (b) the affine map of the authored face center equals the
+    //     corner midpoint (the rigid-binding affine model);
+    // (c) the basis is right-handed and the skinned normal (through
+    //     the yaw) is its +Z image.
+    let edge_r = [
+        world[1][0] - world[0][0],
+        world[1][1] - world[0][1],
+        world[1][2] - world[0][2],
+    ];
+    let edge_u = [
+        world[3][0] - world[0][0],
+        world[3][1] - world[0][1],
+        world[3][2] - world[0][2],
+    ];
+    let norm3 = |v: [f32; 3]| {
+        let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        [v[0] / len, v[1] / len, v[2] / len]
+    };
+    let dot3 = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let r_hat = norm3(edge_r);
+    let u_hat = norm3(edge_u);
+    let hw = dot3(edge_r, r_hat) / 2.0;
+    let hh = dot3(edge_u, u_hat) / 2.0;
+    assert!(
+        (hw - (hi[0] - lo[0]) / 2.0).abs() < 1e-4 && (hh - (hi[1] - lo[1]) / 2.0).abs() < 1e-4,
+        "the skinned rectangle preserves the authored extents: {hw} x {hh}"
+    );
+    let face_center_local = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, hi[2]];
+    let affine_center = world_of(skin_at(face_center_local, [0.0, 0.0, 1.0]).0);
+    let midpoint = [
+        (world[0][0] + world[2][0]) / 2.0,
+        (world[0][1] + world[2][1]) / 2.0,
+        (world[0][2] + world[2][2]) / 2.0,
+    ];
+    for axis in 0..3 {
+        assert!(
+            (affine_center[axis] - midpoint[axis]).abs() < 1e-5,
+            "the affine model agrees with skin_vertex on axis {axis}"
+        );
+    }
+    let world_normal = norm3([
+        x_image[0] * skinned_normal[0] + z_image[0] * skinned_normal[2],
+        skinned_normal[1],
+        x_image[2] * skinned_normal[0] + z_image[2] * skinned_normal[2],
+    ]);
+    let cross_ru = [
+        r_hat[1] * u_hat[2] - r_hat[2] * u_hat[1],
+        r_hat[2] * u_hat[0] - r_hat[0] * u_hat[2],
+        r_hat[0] * u_hat[1] - r_hat[1] * u_hat[0],
+    ];
+    assert!(
+        dot3(cross_ru, world_normal) > 0.99,
+        "the (r, u, n) basis is right-handed (a transposed derivation \
+         mirrors the scene and culls the face)"
+    );
+    let center = midpoint;
+
+    // --- THE DEAD-ON CAMERA (the finding-13 fixture's pinned
+    // layout — the same form `check_rotated_instance_oracle` and the
+    // oblique wheel fixture derive): matrix[COLUMN][row], NDC.x =
+    // (P−C)·r̂/hw, NDC.y = (P−C)·û/hh, depth = 0.25 − 0.0625·((P−C)·n̂);
+    // the eye 4 units out along n̂ (measured: the eye lands at
+    // (−2.92, 1.07, −2.92) — inside the road cross, clear of every
+    // building mass; the NE mass sits ~6 units BEHIND the face,
+    // inside the depth range but outside the framed rectangle).
+    let matrix = [
+        [r_hat[0] / hw, u_hat[0] / hh, -0.0625 * world_normal[0], 0.0],
+        [r_hat[1] / hw, u_hat[1] / hh, -0.0625 * world_normal[1], 0.0],
+        [r_hat[2] / hw, u_hat[2] / hh, -0.0625 * world_normal[2], 0.0],
+        [
+            -dot3(center, r_hat) / hw,
+            -dot3(center, u_hat) / hh,
+            0.25 + 0.0625 * dot3(center, world_normal),
+            1.0,
+        ],
+    ];
+    let eye = [
+        center[0] + 4.0 * world_normal[0],
+        center[1] + 4.0 * world_normal[1],
+        center[2] + 4.0 * world_normal[2],
+    ];
+
+    // --- THE SELF-DISCRIMINATION CONTROL (CPU-side, the finding-13
+    // fixture's discipline — proven BEFORE any pixel is asserted):
+    // the skinned normal vs the UN-SKINNED authored normal (what a
+    // shader that drops the pose's normal skinning would use), both
+    // through the instance yaw, at the dead-on view. MEASURED at
+    // this fixture: N·L 0.7071 → 0.6613 and the facade-material
+    // color moves ≈ 10.9/255 (the albedo-independent specular term
+    // alone ≈ 5/255) — a dropped skinning cannot pass the 2/255
+    // pixel checks, and neither fixture is ambient-only.
+    {
+        let light = day_preset();
+        let mat = materials()[1];
+        let l = norm3(light.dir_toward_light);
+        let n_dot_l_skinned = dot3(world_normal, l);
+        let n_dot_l_rest = dot3(z_image, l);
+        assert!(
+            n_dot_l_skinned > 0.5,
+            "the skinned face is strongly lit, not ambient-only (N·L {n_dot_l_skinned:.4})"
+        );
+        let albedo = [0.5f32; 3];
+        let view = [
+            4.0 * world_normal[0],
+            4.0 * world_normal[1],
+            4.0 * world_normal[2],
+        ];
+        let correct = lit_surface_color(albedo, world_normal, view, mat, light);
+        let unskinned = lit_surface_color(albedo, z_image, view, mat, light);
+        let delta = correct[0] - unskinned[0];
+        println!(
+            "skinning-oracle fixture: N·L skinned {n_dot_l_skinned:.4} vs un-skinned \
+             {n_dot_l_rest:.4}, mid-face color delta {:.1}/255",
+            delta * 255.0
+        );
+        assert!(
+            delta.abs() > 2.0 / 255.0,
+            "the fixture discriminates a dropped normal skinning (delta {delta:.4})"
+        );
+    }
+
+    // --- THE CAPTURE: one npc, the walked blocks, the dead-on
+    // camera. The population borrows the evaluated blocks (the
+    // fixture discipline: the blocks outlive the population).
+    let single = [instance];
+    let population = ProxyPopulation {
+        npc: &single,
+        npc_poses: &blocks,
+        npc_material: 1,
+        vehicle: &[],
+        vehicle_material: 0,
+    };
+    renderer.request_frame_capture().unwrap();
+    let frame = renderer
+        .render_corner_populated(&matrix, eye, day_preset(), &population, size)
+        .unwrap();
+    assert!(frame.presented);
+    assert_eq!(
+        frame.geometry.proxy_draw_calls, 1,
+        "the single walking npc draws once"
+    );
+    let image = renderer.take_frame_capture().unwrap().unwrap();
+
+    // --- THE PER-PIXEL ORACLE: every interior pixel's expected
+    // color through the 6-B equation with the SKINNED normal, the
+    // albedo sampled at the AUTHORED uv (the shader's uv is
+    // unskinned — the authored local coordinates recovered through
+    // the affine map's basis dots: the rigid binding preserves the
+    // rectangle's parameterization, so (world − world_bl)·r̂ IS the
+    // authored x-offset from the box's left edge).
+    let mat = materials()[1];
+    let texture = procedural_texture(mat.texture);
+    let light = day_preset();
+    let mut largest_error = 0u8;
+    let mut checked = 0usize;
+    for y in 8..size.1 - 8 {
+        for x in 8..size.0 - 8 {
+            let dx = (x as f32 + 0.5) * 2. / size.0 as f32 - 1.;
+            let dy = (y as f32 + 0.5) * 2. / size.1 as f32 - 1.;
+            // Screen → world (the dead-on inverse; pixel-down is
+            // world-down along −u — the raster convention).
+            let world_point = [
+                center[0] + dx * hw * r_hat[0] - dy * hh * u_hat[0],
+                center[1] + dx * hw * r_hat[1] - dy * hh * u_hat[1],
+                center[2] + dx * hw * r_hat[2] - dy * hh * u_hat[2],
+            ];
+            // World → AUTHORED local (the UV's source).
+            let offset = [
+                world_point[0] - world[0][0],
+                world_point[1] - world[0][1],
+                world_point[2] - world[0][2],
+            ];
+            let local_x = lo[0] + dot3(offset, r_hat);
+            let local_y = lo[1] + dot3(offset, u_hat);
+            // The front face's authored uv: [pos.x/4, pos.y/4]
+            // (box_faces' [0, 1] axes for the +Z face).
+            let [tx, ty] = [(local_x / 4.), (local_y / 4.)]
+                .map(|m| (m.rem_euclid(1.) * TEXTURE_SIZE as f32).floor() as usize);
+            let index = 4 * (ty * TEXTURE_SIZE as usize + tx);
+            let albedo =
+                std::array::from_fn(|ch| texture[index + ch] as f32 / 255. * instance.tint[ch]);
+            let view = std::array::from_fn(|i| eye[i] - world_point[i]);
+            let expected = lit_surface_color(albedo, world_normal, view, mat, light)
+                .map(|ch| (255. * ch.clamp(0., 1.)).round() as u8);
+            let pixel = image.pixel_rgba(x, y);
+            let error = expected
+                .iter()
+                .zip(pixel)
+                .map(|(e, a)| e.abs_diff(a))
+                .max()
+                .unwrap();
+            largest_error = largest_error.max(error);
+            assert!(
+                error <= 2,
+                "skinned-pose pixel ({x},{y}) world {world_point:?}: expected {expected:?}, \
+                 got {pixel:?} (a dropped or transposed pose rotation, or a pose-block \
+                 addressing error, moves this pixel off its expected value)"
+            );
+            assert_eq!(pixel[3], 255);
+            checked += 1;
+        }
+    }
+    assert!(checked > 0);
+    println!(
+        "skinning oracle (frame 33, turn 40960): {checked} framebuffer pixels, max RGB error \
+         {largest_error}/255 — the torso face through skin_vertex + the instance transform"
+    );
+
+    // --- THE REPEAT DETERMINISM (the capture reproduces the
+    // identical bytes).
+    renderer.request_frame_capture().unwrap();
+    let repeat_frame = renderer
+        .render_corner_populated(&matrix, eye, day_preset(), &population, size)
+        .unwrap();
+    assert!(repeat_frame.presented);
+    let repeat = renderer.take_frame_capture().unwrap().unwrap();
+    assert_frames_equal(&image, &repeat, "the skinned capture is deterministic");
+
+    // --- THE DIFFERENTIAL PIN: the REST pose through the SAME
+    // camera must be pixel-different (the pose visibly moves the
+    // silhouette AND the lit color — the measured ≈10.9/255 color
+    // delta covers the whole rectangle overlap ≈ 55k probe pixels;
+    // the floor 1000 carries 50× of margin over that derivation).
+    let rest_blocks = [rest_block];
+    let rest_population = ProxyPopulation {
+        npc: &single,
+        npc_poses: &rest_blocks,
+        npc_material: 1,
+        vehicle: &[],
+        vehicle_material: 0,
+    };
+    renderer.request_frame_capture().unwrap();
+    let rest_frame = renderer
+        .render_corner_populated(&matrix, eye, day_preset(), &rest_population, size)
+        .unwrap();
+    assert!(rest_frame.presented);
+    let rest_image = renderer.take_frame_capture().unwrap().unwrap();
+    let mut differ = 0usize;
+    for y in 0..size.1 {
+        for x in 0..size.0 {
+            differ += usize::from(image.pixel_rgba(x, y) != rest_image.pixel_rgba(x, y));
+        }
+    }
+    println!(
+        "rest-vs-frame-33 differential: {differ} of {} pixels differ (the pose moves \
+         the silhouette and the lit color)",
+        size.0 * size.1
+    );
+    assert!(
+        differ > 1_000,
+        "the frame-33 pose visibly changes the render: {differ} differing pixels"
+    );
+
+    assert_eq!(
+        renderer.stats().validation_errors,
+        0,
+        "validation: {:?}",
+        renderer.stats().recent_validation
+    );
+}
+
+/// THE ERA-2 ANIMATED N-VS-1 GATE (stage 5, gate 4): the 6-E
+/// equivalence proof UNDER MOTION — the gate fixture population
+/// (10 NPCs + 3 vehicles, the same placements/turns/scales/tints as
+/// `instanced_draws_match_per_object_pixels_and_pin_counts`) with
+/// the npcs WALKING: pose blocks evaluated at frame 33 through the
+/// demo's own `evaluate_population_poses`, submitted as N
+/// single-instance draws (13) versus ONE instanced draw per kind
+/// (2) — byte-equal captured frames (the `assert_frames_equal`
+/// discipline). This proves the SKINNED path's submission
+/// equivalence under motion: the per-object mode binds each draw's
+/// pose slot from its own instance row while the instanced mode
+/// reads the pose index from the packed instance bytes, so a
+/// submission bug that addresses poses by anything but the row's
+/// own `pose_index` moves pixels here.
+///
+/// THE POSE COLUMN (a conscious extension of the rest fixture):
+/// every fixture npc carries a DISTINCT pose index (its list
+/// position — the shipped table's own identity mapping) and a
+/// DISTINCT walk phase (i·6554/65536 of the stride, ten spread
+/// phases, min gap 6554 > 1024 — the placement table's own 1/64
+/// spread discipline). At the rest pose all blocks are bit-exact
+/// identity so the index is invisible; UNDER MOTION distinct blocks
+/// make the pose-slot addressing load-bearing — a shared block 0
+/// (the rest fixture's shape) would leave a pose-addressing bug
+/// byte-equal in both modes and pass vacuously.
+///
+/// THE MOTION CONTROL: the same population at the REST pose through
+/// the same camera must be pixel-different (at frame 33 — the walk
+/// clip's keyframe 4 — both elbows flex +0.03 turn ≈ 10.8°, swinging
+/// the lower-arm silhouettes multiple pixels at this framing, and
+/// the lit surfaces' normals rotate with the pose; a walk that
+/// silently evaluated to rest would render byte-identical and fail
+/// here).
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
+fn animated_population_matches_per_object_pixels() {
+    let _guard = sdl_lock();
+    let mut app = ShellApp::new(ShellConfig {
+        title: "Era-2 animated N-vs-1".into(),
+        width: 256,
+        height: 256,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    })
+    .unwrap();
+    let mut renderer = Renderer::new(
+        app.window(),
+        RenderConfig {
+            demo_scene: DemoScenePreference::Corner,
+            validation: ValidationPreference::On,
+            replace_pipelines: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let size = app.window().size_in_pixels();
+    assert_eq!(size, (256, 256));
+    assert!(renderer.stats().validation_active);
+    let _ = app.frame();
+
+    let (matrix, eye) = gate_camera(1.0);
+    let light = day_preset();
+    let (mut npc, vehicle) = gate_population();
+    let total = npc.len() + vehicle.len();
+    // The pose column: npc i walks at phase i·6554 with block i.
+    for (index, instance) in npc.iter_mut().enumerate() {
+        instance.pose_index = index as u32;
+    }
+    let phases: Vec<_> = (0..npc.len())
+        .map(|index| engine_slice::corner_population::Phase::Walk((index * 6554) as u16))
+        .collect();
+    let mut blocks = Vec::new();
+    engine_slice::corner_population::evaluate_population_poses(33, &phases, &mut blocks);
+    assert_eq!(blocks.len(), npc.len());
+    // The walk is real: the blocks differ pairwise (the spread
+    // phases) and from rest.
+    let rest_block = engine_renderer::animation::rest_pose_block();
+    assert!(
+        blocks.iter().any(|b| *b != rest_block),
+        "frame 33 is off the rest pose"
+    );
+    for (a, b) in blocks.iter().zip(blocks.iter().skip(1)) {
+        assert_ne!(a, b, "the fixture's walk phases are distinct");
+    }
+    let walked = ProxyPopulation {
+        npc: &npc,
+        npc_poses: &blocks,
+        npc_material: 1,
+        vehicle: &vehicle,
+        vehicle_material: 2,
+    };
+
+    // THE EQUIVALENCE UNDER MOTION: 13 single-instance draws vs one
+    // instanced draw per kind — byte-equal frames.
+    let (reference, reference_calls) = capture_populated(
+        &mut renderer,
+        ProxyDrawMode::PerInstance,
+        &matrix,
+        eye,
+        light,
+        &walked,
+        size,
+    );
+    assert_eq!(
+        reference_calls, total as u32,
+        "the per-object reference submits one draw per walking instance"
+    );
+    let (instanced, instanced_calls) = capture_populated(
+        &mut renderer,
+        ProxyDrawMode::Instanced,
+        &matrix,
+        eye,
+        light,
+        &walked,
+        size,
+    );
+    assert_eq!(
+        instanced_calls, 2,
+        "the instanced path submits one draw per populated kind"
+    );
+    assert_frames_equal(&reference, &instanced, "13 draws vs 2 instanced, walking");
+    // The animated capture is itself deterministic.
+    let (repeat, repeat_calls) = capture_populated(
+        &mut renderer,
+        ProxyDrawMode::Instanced,
+        &matrix,
+        eye,
+        light,
+        &walked,
+        size,
+    );
+    assert_eq!(repeat_calls, 2);
+    assert_frames_equal(&instanced, &repeat, "animated instanced repeat capture");
+
+    // THE MOTION CONTROL: the same placements at the REST pose
+    // through the same camera — the walk must visibly move the
+    // frame (the elbows' 10.8° flex and the lit normals' rotation).
+    let rest_blocks: Vec<_> = (0..npc.len())
+        .map(|_| engine_renderer::animation::rest_pose_block())
+        .collect();
+    let at_rest = ProxyPopulation {
+        npc: &npc,
+        npc_poses: &rest_blocks,
+        npc_material: 1,
+        vehicle: &vehicle,
+        vehicle_material: 2,
+    };
+    renderer.request_frame_capture().unwrap();
+    let rest_frame = renderer
+        .render_corner_populated(&matrix, eye, light, &at_rest, size)
+        .unwrap();
+    assert!(rest_frame.presented);
+    let rest_image = renderer.take_frame_capture().unwrap().unwrap();
+    let mut differ = 0usize;
+    for y in 0..size.1 {
+        for x in 0..size.0 {
+            differ += usize::from(instanced.pixel_rgba(x, y) != rest_image.pixel_rgba(x, y));
+        }
+    }
+    println!(
+        "rest-vs-walking differential: {differ} of {} pixels differ (the walk moves \
+         the crowd's silhouettes and lit colors)",
+        size.0 * size.1
+    );
+    assert!(
+        differ > 0,
+        "the frame-33 walk visibly changes the render: {differ} differing pixels"
+    );
+
+    assert_eq!(
+        renderer.stats().validation_errors,
+        0,
+        "validation: {:?}",
+        renderer.stats().recent_validation
+    );
+    println!(
+        "animated N-vs-1: {total} instances walking at frame 33, per-object \
+         {reference_calls} draws == instanced {instanced_calls} draws, byte-equal frames, \
+         {differ} pixels moved by the walk"
     );
 }

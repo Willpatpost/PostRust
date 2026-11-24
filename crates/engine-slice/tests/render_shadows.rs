@@ -23,6 +23,17 @@
 //! SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_shadows -- \
 //!     --ignored --nocapture
 //! ```
+//!
+//! The Era-2 populated gate (the animation + skinning + proxy-
+//! shadows package, stage 5): `populated_shadow_map_matches_the_
+//! raycaster` — the POPULATED shadow map (the corner population
+//! casting through the shadowed depth pass) against the populated
+//! raycaster (`map_texel_depth_populated`, the stage-4a oracle),
+//! texel by texel under the 6-F discipline, at REST and at frame-33
+//! WALK (the oracle is pose-agnostic: the occluders are built from
+//! the same evaluated blocks the renderer draws from), with the
+//! rest-vs-walked differential proving the shadows move with the
+//! crowd.
 
 use engine_renderer::lit_scene::{
     LightParams, Material, day_preset, intersection_boxes, lit_surface_color, materials,
@@ -33,7 +44,7 @@ use engine_renderer::shadows::{
     self, ShadowBias, ShadowCascade, is_shadowed, map_texel_depth, scene_bounds,
 };
 use engine_renderer::{
-    CapturedFrame, DemoScenePreference, RenderConfig, Renderer, ShadowMapReadback,
+    CapturedFrame, DemoScenePreference, ProxyPopulation, RenderConfig, Renderer, ShadowMapReadback,
     ValidationPreference,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
@@ -277,6 +288,208 @@ fn compare_map(
         ground_count,
         building_count,
     )
+}
+
+// ---------------------------------------------------- the Era-2 populated
+// comparator (stage 5, gate 2's own compare_map: the 6-F discipline
+// extended over the OccluderSurface classes — the same reject-first
+// range check, the same edge-margin skip with each class's own
+// bounds, and the per-class census the first device run prints as
+// the tolerance pin's evidence).
+
+/// The populated map gate's depth tolerance: the 6-F gate's MEASURED
+/// max |Δdepth| on the static scene (2.68e-7 — float epsilon at
+/// depth ~0.5, the PR-body record's value). THIS POD HAS NO VULKAN
+/// LOADER, so the populated classes' (npc/vehicle) first execution
+/// is CI's: the comparator prints the max error per class, and if
+/// the instance classes exceed this value that is an INVESTIGATION —
+/// the pin is corrected from THAT run's measured actual with the
+/// delta documented (the placeholder-pin discipline, never a silent
+/// widening). The expectation is the epsilon class holds: the
+/// instance surfaces' CPU oracle walks a different float path than
+/// the skinned depth pipeline (the analytic authored-frame slab test
+/// vs the shader's mat4 products), but both end in the same light
+/// matrix and the same [0, 1] depth quantization the static boxes
+/// measured 2.68e-7 under.
+const POPULATED_MAP_TOLERANCE: f32 = 2.68e-7;
+
+/// One class's comparison census (the investigation's evidence: the
+/// compared and mismatched counts and the max error, per class).
+#[derive(Debug, Default, Clone, Copy)]
+struct ClassCensus {
+    compared: usize,
+    mismatched: usize,
+    max_error: f32,
+}
+
+/// The full populated-map comparison census (all five surface
+/// classes plus the edge-skip accounting).
+#[derive(Debug, Default, Clone, Copy)]
+struct PopulatedCensus {
+    compared: usize,
+    skipped: usize,
+    clear: ClassCensus,
+    ground: ClassCensus,
+    building: ClassCensus,
+    npc: ClassCensus,
+    vehicle: ClassCensus,
+}
+
+impl PopulatedCensus {
+    fn mismatches(&self) -> usize {
+        self.clear.mismatched
+            + self.ground.mismatched
+            + self.building.mismatched
+            + self.npc.mismatched
+            + self.vehicle.mismatched
+    }
+    fn max_error(&self) -> f32 {
+        self.clear
+            .max_error
+            .max(self.ground.max_error)
+            .max(self.building.max_error)
+            .max(self.npc.max_error)
+            .max(self.vehicle.max_error)
+    }
+}
+
+/// One hit's distance to its surface's PERIMETER in the surface's
+/// own frame (the edge-margin computation's core, shared by every
+/// hit class): `None` for a corner-edge graze (the hit touches
+/// bounds on two axes — a roof/wall edge — genuinely ambiguous
+/// between the meeting surfaces; implementation territory, skipped).
+fn hit_min_edge(hit: [f32; 3], lo: [f32; 3], hi: [f32; 3]) -> Option<f32> {
+    let mut tangential = [true; 3];
+    let mut on_face = 0;
+    for axis in 0..3 {
+        if (lo[axis] - hit[axis]).abs() < 1e-3 || (hi[axis] - hit[axis]).abs() < 1e-3 {
+            tangential[axis] = false;
+            on_face += 1;
+        }
+    }
+    if on_face >= 2 {
+        return None;
+    }
+    let mut min_edge = f32::MAX;
+    for axis in 0..3 {
+        if !tangential[axis] {
+            continue;
+        }
+        let l = (lo[axis] - hit[axis]).abs();
+        let h = (hi[axis] - hit[axis]).abs();
+        min_edge = min_edge.min(l).min(h);
+    }
+    // A hit touching no bound (numerically interior to all three
+    // axes — the ray entered through a face it has already left
+    // behind, or a wheel's curved tread mid-band): the conservative
+    // full-margin form.
+    if min_edge == f32::MAX {
+        for axis in 0..3 {
+            let l = (lo[axis] - hit[axis]).abs();
+            let h = (hi[axis] - hit[axis]).abs();
+            min_edge = min_edge.min(l).min(h);
+        }
+    }
+    Some(min_edge)
+}
+
+/// The populated known-answer comparison (compare_map's discipline
+/// over `map_texel_depth_populated`): every texel's GPU depth vs the
+/// populated raycaster's, skipping (and counting) texels whose hit
+/// sits within `margin_texels` of its surface's edges — Building
+/// hits through the static box table's bounds (compare_map's own
+/// logic), Ground through the ±SCENE_EXTENT plate's X/Z axes, and
+/// the instance classes (NpcBox/VehiclePart) through the
+/// expectation's AUTHORED-frame local hit and bounds (the same
+/// min-edge form; wheel hits carry the wheel's bounding box — a
+/// conservative margin that skips slightly more than exact,
+/// documented at the oracle). Nonfinite or out-of-range GPU depths
+/// are rejected FIRST (finding 14's correction — a NaN must count as
+/// a mismatch, never pass through).
+fn compare_map_populated(
+    cascade: &ShadowCascade,
+    boxes: &[engine_renderer::lit_scene::SceneBox],
+    npcs: &[shadows::NpcOccluder<'_>],
+    vehicles: &[shadows::VehicleOccluder<'_>],
+    map: &ShadowMapReadback,
+    tolerance: f32,
+    margin_texels: f32,
+) -> PopulatedCensus {
+    let extent = map.extent;
+    let texel_world = (cascade.max_right - cascade.min_right).max(cascade.max_up - cascade.min_up)
+        / extent as f32;
+    let margin = margin_texels * texel_world;
+    let mut census = PopulatedCensus::default();
+    for y in 0..extent {
+        for x in 0..extent {
+            let expected =
+                shadows::map_texel_depth_populated(cascade, boxes, npcs, vehicles, x, y, extent);
+            // The edge margin, per surface class (clear texels have
+            // no surface to be near the edge of).
+            let skip = match expected.surface {
+                shadows::OccluderSurface::None => false,
+                shadows::OccluderSurface::Ground => {
+                    // The ground plate (compare_map's ±40 form,
+                    // named): the hit's y = 0 touches the plate's
+                    // y bounds, so the tangential axes are X and Z
+                    // — hit_min_edge's own face detection.
+                    let hit = expected.hit.expect("ground hits carry the world hit");
+                    let extent_m = engine_renderer::lit_scene::SCENE_EXTENT;
+                    hit_min_edge(hit, [-extent_m, 0.0, -extent_m], [extent_m, 0.0, extent_m])
+                        .is_none_or(|min_edge| min_edge < margin)
+                }
+                shadows::OccluderSurface::Building(index) => {
+                    let hit = expected.hit.expect("building hits carry the world hit");
+                    let box_ = &boxes[index];
+                    hit_min_edge(hit, box_.min, box_.max).is_none_or(|min_edge| min_edge < margin)
+                }
+                shadows::OccluderSurface::NpcBox(..)
+                | shadows::OccluderSurface::VehiclePart(..) => {
+                    let (local_hit, lo, hi) =
+                        expected.local.expect("instance hits carry local inputs");
+                    hit_min_edge(local_hit, lo, hi).is_none_or(|min_edge| min_edge < margin)
+                }
+            };
+            if skip {
+                census.skipped += 1;
+                continue;
+            }
+            let bucket = match expected.surface {
+                shadows::OccluderSurface::None => &mut census.clear,
+                shadows::OccluderSurface::Ground => &mut census.ground,
+                shadows::OccluderSurface::Building(_) => &mut census.building,
+                shadows::OccluderSurface::NpcBox(..) => &mut census.npc,
+                shadows::OccluderSurface::VehiclePart(..) => &mut census.vehicle,
+            };
+            census.compared += 1;
+            bucket.compared += 1;
+            let gpu = map.depths[(y * extent + x) as usize];
+            // Finding 14's correction (b): reject nonfinite or
+            // out-of-range GPU depth FIRST.
+            if !gpu.is_finite() || gpu < 0.0 || gpu > 1.0 + 1e-6 {
+                bucket.mismatched += 1;
+                if bucket.mismatched <= 5 {
+                    println!(
+                        "MISMATCH texel ({x},{y}): nonfinite/out-of-range gpu {gpu} ({:?})",
+                        expected.surface
+                    );
+                }
+                continue;
+            }
+            let error = (gpu - expected.depth).abs();
+            bucket.max_error = bucket.max_error.max(error);
+            if error > tolerance {
+                bucket.mismatched += 1;
+                if bucket.mismatched <= 5 {
+                    println!(
+                        "MISMATCH texel ({x},{y}): gpu {gpu:.6} vs cpu {:.6} ({:?})",
+                        expected.depth, expected.surface
+                    );
+                }
+            }
+        }
+    }
+    census
 }
 
 /// The per-pixel ground oracle for one patch (the check_patch
@@ -584,6 +797,326 @@ fn shadow_map_depths_match_the_raycaster_and_pixels_gate() {
     println!(
         "6-F gates: map known-answer exact on {compared} texels, both pixel oracles within \
          2/255, {differ} frame pixels changed by the shadow, zero per-frame allocation"
+    );
+}
+
+/// THE ERA-2 POPULATED SHADOW-MAP GATE (stage 5, gate 2 — the 6-F
+/// discipline over the populated scene): the corner population
+/// (24 NPCs + 2 vehicles) CASTING through the shadowed depth pass,
+/// the captured map compared texel-by-texel against the populated
+/// raycaster (`map_texel_depth_populated`, the stage-4a oracle)
+/// with the occluders built from the SAME population the renderer
+/// draws from — `NpcOccluder::new` per npc with the pose blocks
+/// supplied to the render, `VehicleOccluder::new` per vehicle (the
+/// oracle is pose-agnostic: it reads whatever blocks the renderer
+/// read). Two regimes:
+///
+/// - REST: every npc at the bit-exact rest block. MEASURED
+///   CPU-side at this tree (the stage-5 census, the expectation
+///   walk over the same 1,048,576 texels with this comparator's own
+///   post-skip bucketing): compared clear 511,688 / ground 28,758 /
+///   building 495,081 / npc 1 / vehicle 442, with 12,606 texels
+///   edge-skipped (1.20% — 116 of the 117 npc-class texels among
+///   them).
+/// - WALK (frame 33): the population's own phase column through
+///   `evaluate_population_poses(33, ...)` — the waiters stand, the
+///   16 walkers walk; MEASURED: ground 28,761 / building 495,080 /
+///   npc 1 (the walkers' boxes move; the class totals shift by a
+///   few texels), and the rest-vs-walked EXPECTATION maps differ at
+///   73 texels — the shadows move with the crowd.
+///
+/// THE NPC CLASS'S DENSITY LESSON (measured, recorded — the
+/// stage-4a census's own tradition): the cascade's texel is
+/// 0.110 m over the ~80 m span, so a 0.42 m-wide figure spans
+/// ≈4 texels, and the 1.5-texel edge margin (the 6-F discipline)
+/// leaves ≈1 unambiguous interior texel per directly-lit figure —
+/// the sweep's npc bucket is a PRESENCE proof, not a coverage
+/// proof. The npc casts' depth equality is carried where the
+/// resolution exists: the 73-texel rest-vs-walked differential
+/// (those differing map VALUES are the npc depth casts' output,
+/// matching the CPU-side expectation census) and the skinning
+/// oracle gate at pixel scale; the vehicle class (442 compared
+/// texels — the sedan's 1.9×4.4 m body) carries the populated
+/// depth pipeline's submission at map scale.
+///
+/// THE TOLERANCE: `POPULATED_MAP_TOLERANCE` (2.68e-7, the 6-F
+/// measured value) — see its comment for the first-run discipline
+/// (this pod has no Vulkan loader; CI's execution is the
+/// measurement, and the per-class census prints are the evidence).
+///
+/// THE COMPARISON SKIPS (and counts) texels whose hit sits within
+/// 1.5 texels of its surface's edges — Buildings and Ground through
+/// compare_map's own bounds logic, the instance classes through
+/// the expectation's AUTHORED-frame local hit and bounds (the same
+/// min-edge form; wheel hits carry the bounding box, the oracle's
+/// documented conservative margin).
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
+fn populated_shadow_map_matches_the_raycaster() {
+    let _guard = sdl_lock();
+    let mut app = ShellApp::new(ShellConfig {
+        title: "Era-2 populated shadow map".into(),
+        width: 256,
+        height: 256,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    })
+    .unwrap();
+    let mut renderer = Renderer::new(
+        app.window(),
+        RenderConfig {
+            demo_scene: DemoScenePreference::Corner,
+            validation: ValidationPreference::On,
+            replace_pipelines: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let size = app.window().size_in_pixels();
+    assert_eq!(size, (256, 256));
+    assert!(renderer.stats().validation_active);
+    let _ = app.frame();
+
+    let light = day_preset();
+    let boxes = intersection_boxes();
+    let cascade = corner_cascade(light);
+    let (npc, vehicle) = engine_slice::corner_population::corner_population();
+    assert_eq!((npc.len(), vehicle.len()), (24, 2));
+    // The camera is arbitrary for the MAP (the cascade is the
+    // light's, not the camera's) — the 6-F gate's own ground probe.
+    let (matrix, eye) = ground_camera([0.0, 0.0], 1.0);
+
+    // ================= THE REST-POSE MAP.
+    let rest_blocks: Vec<_> = (0..npc.len())
+        .map(|_| engine_renderer::animation::rest_pose_block())
+        .collect();
+    let at_rest = ProxyPopulation {
+        npc: &npc,
+        npc_poses: &rest_blocks,
+        npc_material: 1,
+        vehicle: &vehicle,
+        vehicle_material: 2,
+    };
+    renderer.request_shadow_map_capture().unwrap();
+    let frame = renderer
+        .render_corner_populated_shadowed(&matrix, eye, light, BIAS, &at_rest, size)
+        .unwrap();
+    assert!(frame.presented);
+    assert_eq!(
+        frame.geometry.proxy_draw_calls, 2,
+        "the populated shadowed frame's lit submission (the depth casts are the \
+         shadow map's own, uncounted here)"
+    );
+    let map = renderer.take_shadow_map_capture().unwrap().unwrap();
+    assert_eq!(map.extent, shadows::SHADOW_MAP_EXTENT);
+    assert_eq!(map.depths.len(), map.extent as usize * map.extent as usize);
+    let rest_occluders: Vec<_> = npc
+        .iter()
+        .map(|instance| shadows::NpcOccluder::new(instance, &rest_blocks))
+        .collect();
+    let vehicle_occluders: Vec<_> = vehicle.iter().map(shadows::VehicleOccluder::new).collect();
+    let rest_census = compare_map_populated(
+        &cascade,
+        boxes,
+        &rest_occluders,
+        &vehicle_occluders,
+        &map,
+        POPULATED_MAP_TOLERANCE,
+        1.5,
+    );
+    let total = map.extent as usize * map.extent as usize;
+    println!(
+        "populated map (rest): {} compared, {} edge-skipped ({:.2}%), {} mismatches, max \
+         |Δdepth| {:.2e} — clear {}, ground {}, building {}, npc {}, vehicle {}",
+        rest_census.compared,
+        rest_census.skipped,
+        100.0 * rest_census.skipped as f32 / total as f32,
+        rest_census.mismatches(),
+        rest_census.max_error(),
+        rest_census.clear.compared,
+        rest_census.ground.compared,
+        rest_census.building.compared,
+        rest_census.npc.compared,
+        rest_census.vehicle.compared
+    );
+    assert_census(&rest_census, "rest");
+
+    // ================= THE ANIMATED MAP (frame 33 — the population's
+    // own phases; the oracle reads the SAME walked blocks).
+    let phases = engine_slice::corner_population::corner_population_phases();
+    let mut walked_blocks = Vec::new();
+    engine_slice::corner_population::evaluate_population_poses(33, &phases, &mut walked_blocks);
+    assert_eq!(walked_blocks.len(), npc.len());
+    // The walk is real: the 16 walkers are off rest (MEASURED: 16 of
+    // 24 blocks differ from the rest block).
+    assert!(
+        walked_blocks
+            .iter()
+            .filter(|b| **b != rest_blocks[0])
+            .count()
+            >= 16,
+        "the frame-33 walkers are off the rest pose"
+    );
+    let walking = ProxyPopulation {
+        npc: &npc,
+        npc_poses: &walked_blocks,
+        npc_material: 1,
+        vehicle: &vehicle,
+        vehicle_material: 2,
+    };
+    renderer.request_shadow_map_capture().unwrap();
+    let walked_frame = renderer
+        .render_corner_populated_shadowed(&matrix, eye, light, BIAS, &walking, size)
+        .unwrap();
+    assert!(walked_frame.presented);
+    let walked_map = renderer.take_shadow_map_capture().unwrap().unwrap();
+    assert_eq!(walked_map.extent, shadows::SHADOW_MAP_EXTENT);
+    let walked_occluders: Vec<_> = npc
+        .iter()
+        .map(|instance| shadows::NpcOccluder::new(instance, &walked_blocks))
+        .collect();
+    let walked_census = compare_map_populated(
+        &cascade,
+        boxes,
+        &walked_occluders,
+        &vehicle_occluders,
+        &walked_map,
+        POPULATED_MAP_TOLERANCE,
+        1.5,
+    );
+    println!(
+        "populated map (frame-33 walk): {} compared, {} edge-skipped ({:.2}%), {} mismatches, \
+         max |Δdepth| {:.2e} — clear {}, ground {}, building {}, npc {}, vehicle {}",
+        walked_census.compared,
+        walked_census.skipped,
+        100.0 * walked_census.skipped as f32 / total as f32,
+        walked_census.mismatches(),
+        walked_census.max_error(),
+        walked_census.clear.compared,
+        walked_census.ground.compared,
+        walked_census.building.compared,
+        walked_census.npc.compared,
+        walked_census.vehicle.compared
+    );
+    assert_census(&walked_census, "frame-33 walk");
+
+    // ================= THE DIFFERENTIAL: the shadows move with the
+    // crowd (MEASURED CPU-side: the expectation maps differ at 73
+    // texels — the walkers' boxes vacate and cover map texels; the
+    // captured maps carry those differences plus any edge-band
+    // movement).
+    let differ = map
+        .depths
+        .iter()
+        .zip(walked_map.depths.iter())
+        .filter(|(a, b)| (**a - **b).abs() > 1e-4)
+        .count();
+    println!(
+        "rest-vs-walked map differential: {differ} texels differ (the CPU-side \
+         expectation census: 73)"
+    );
+    assert!(
+        differ > 0,
+        "the walked crowd's shadows move the shadow map: {differ} differing texels"
+    );
+
+    // ================= THE WARMED CONSTANCY (the 6-F gate's own
+    // discipline, compact): the shadowed populated path's lazy
+    // ShadowedProxyResources are paid at the first frame above;
+    // warmed repeats hold the allocation counters exactly and
+    // reproduce the identical map bytes.
+    let warm = renderer.allocations();
+    for _ in 0..2 {
+        renderer.request_shadow_map_capture().unwrap();
+        let repeat_frame = renderer
+            .render_corner_populated_shadowed(&matrix, eye, light, BIAS, &walking, size)
+            .unwrap();
+        assert!(repeat_frame.presented);
+        let repeat_map = renderer.take_shadow_map_capture().unwrap().unwrap();
+        assert_eq!(
+            renderer.allocations(),
+            warm,
+            "warmed populated-shadowed allocations constant"
+        );
+        assert_eq!(
+            repeat_map.depths, walked_map.depths,
+            "the walked map is deterministic across repeats"
+        );
+    }
+    println!("warmed populated-shadowed allocations: {warm:?}");
+
+    assert_eq!(
+        renderer.stats().validation_errors,
+        0,
+        "validation: {:?}",
+        renderer.stats().recent_validation
+    );
+    println!(
+        "populated shadow-map gate: rest and frame-33 walk both match the populated \
+         raycaster within {:.2e} ({} + {} compared texels), the walk moves {differ} map texels",
+        POPULATED_MAP_TOLERANCE, rest_census.compared, walked_census.compared
+    );
+}
+
+/// The populated gate's census floors (the vacuous-gate guard, per
+/// class): every class must be compared — the floors carry wide
+/// margins under the MEASURED CPU-side census (compared, post-skip:
+/// clear 511,688 / ground 28,758 / building 495,081 / npc 1 /
+/// vehicle 442 at rest; npc 1, ground 28,761, building 495,080 at
+/// frame-33 walk). They exist to fail a gate whose oracle stopped
+/// seeing a class, never to pin the census itself. The NPC floor is
+/// 1 — the density lesson (the gate doc above): a 0.42 m figure
+/// spans ≈4 texels of the 0.110 m map and the 1.5-texel edge margin
+/// leaves ≈1 interior texel; the floor proves the class is present
+/// and correctly compared, with the differential carrying the npc
+/// casts' coverage.
+fn assert_census(census: &PopulatedCensus, regime: &str) {
+    assert!(
+        census.clear.compared >= 5_000,
+        "{regime}: clear texels compared: {} (floor 5000)",
+        census.clear.compared
+    );
+    assert!(
+        census.ground.compared >= 1_000,
+        "{regime}: ground texels compared: {} (floor 1000)",
+        census.ground.compared
+    );
+    assert!(
+        census.building.compared >= 500,
+        "{regime}: building texels compared: {} (floor 500)",
+        census.building.compared
+    );
+    assert!(
+        census.npc.compared >= 1,
+        "{regime}: npc texels compared: {} (floor 1 — the density lesson: \
+         ≈4-texel figures under a 1.5-texel edge margin; the measured \
+         census is 1 at rest and 1 walked)",
+        census.npc.compared
+    );
+    assert!(
+        census.vehicle.compared >= 200,
+        "{regime}: vehicle texels compared: {} (floor 200)",
+        census.vehicle.compared
+    );
+    let total = census.compared + census.skipped;
+    assert!(
+        census.skipped * 20 < total,
+        "{regime}: the edge skip stays under 5% of the map ({} of {})",
+        census.skipped,
+        total
+    );
+    assert_eq!(
+        census.mismatches(),
+        0,
+        "{regime}: every compared texel matches the populated raycaster (max |Δdepth| \
+         {:.2e}, per class clear {:.2e} / ground {:.2e} / building {:.2e} / npc {:.2e} \
+         / vehicle {:.2e})",
+        census.max_error(),
+        census.clear.max_error,
+        census.ground.max_error,
+        census.building.max_error,
+        census.npc.max_error,
+        census.vehicle.max_error
     );
 }
 

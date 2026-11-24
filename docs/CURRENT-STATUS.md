@@ -140,6 +140,48 @@ ARM64) with a five-job CI:
   ping-pong images (the shadow-map discipline) and NO per-frame
   uniforms (the PostParams block is extent-static), composes with
   every corner flag, and the postless path stays byte-identical.
+  The Era-2 **animation + skinning + proxy-shadows package**
+  (branch `era2/animation-skinning-proxy-shadows`, awaiting the
+  owner's GO): the **deterministic animation core** (`animation.rs`
+  — the pure-data clip model, joint rotations through the existing
+  libm-free `sin_cos_turn` machinery, signed i16 turn
+  interpolation, the column-major hierarchy composition, and the
+  skinning equation `skin_vertex` with its bit-exact rest-identity
+  proof; a fixed clip's poses pinned by FNV-1a byte digests — the
+  walk clip at 64 samples hashes to 2694074108253436588); the
+  **skinning equation's WGSL mirror** (five modules — the
+  unshadowed and shadowed npc lit paths, the shadowed vehicle lit
+  path, and the two depth-cast paths — mirroring `skin_vertex`
+  term-for-term, the UV passing through UNSKINNED as authored); the
+  **pose storage buffer and the per-kind draw split** (the
+  lazily-created per-frame-slot mapped pose buffer at binding 5,
+  `POSE_STRIDE` 704 bytes with the alignment proof, the npc kind
+  through the skinned pipeline with two dynamic offsets and the
+  vehicle kind unchanged, the pose-index claim on the instance
+  params vec4's x — a versioned layout change both packed-bytes
+  FNV pins fired on and were repinned from); the **shadowed
+  populated path** (stage 4b: both kinds CAST — the npc kind
+  through the skinned depth pipeline, the vehicle kind through the
+  plain one — and both RECEIVE through their shadowed lit
+  pipelines, the lazily-created `ShadowedProxyResources` with
+  caller-supplied per-family bind structs so the binding-2
+  dynamic-offset stride is never derived inside the draw;
+  `--corner --populated --shadows` works, the Era-1 typed refusal
+  retired); and the **populated raycaster oracle** (`shadows.rs` —
+  the structured Frame3 with the exact transpose inverse,
+  `NpcOccluder`/`VehicleOccluder` with per-instance world-AABB
+  bounds culling measured at ≈8 skips per texel,
+  `map_texel_depth_populated` and `is_shadowed_populated`). The
+  stage-5 **gates**: the skinning CPU-vs-GPU oracle (one walking
+  npc's torso face, per-pixel against `skin_vertex` through a
+  dead-on camera derived from the skinned rectangle, with the
+  rest-pose differential), the populated shadow map vs the
+  raycaster at rest and at frame-33 walk under the 6-F discipline
+  (the per-class census printed for the tolerance's first
+  device-measured evidence), the allocation counters (Vulkan AND
+  host) constant across warmed WALKING frames with per-frame pose
+  digests proving the crowd moves, and the animated N-vs-1
+  submission equivalence.
 - **`engine-shell`** — the SDL3 application shell (statically-linked vendored
   SDL 3.4.18; real window + offscreen/dummy modes).
 - **`engine-slice`** — the integration/demo driver: the stdin CLI, `--window`,
@@ -159,7 +201,19 @@ ARM64) with a five-job CI:
   wired to the shell's input intents, clamped to the corner scene's world
   AABB — presentation only: the interactive camera never enters the spine,
   a fingerprint, or any measured claim, and the scripted route's
-  measurement series print only with the mode off).
+  measurement series print only with the mode off), and the Era-2
+  **animated population** (the same branch as the renderer's Era-2
+  paragraph above): the placement table's PHASE column (the 8
+  crosswalk waiters stand, the 16 crossers and strollers walk at
+  hand-spread u16 phase fractions of the 1.1 s stride — no
+  lockstep marching), the per-frame walk evaluation
+  (`corner_population::evaluate_population_poses` — the frame
+  counter reduces modulo 66 IN INTEGERS before any float forms, so
+  the walk loop closes bit-exactly at stride boundaries, pinned),
+  writing into a retained buffer the renderer repacks per frame
+  (zero per-frame allocation on both sides), and the walking
+  `--corner --populated` route (plus `--populated --shadows`
+  together through the shadowed populated path).
 
 The **integrated campaign demo** (`--demo-persist`) is the vertical slice:
 one authoritative, persistently-orchestrated 1000-NPC / 8-region campaign
@@ -204,13 +258,13 @@ for the combined candidate.
 
 | CI partition | Linux | Windows |
 |---|---:|---:|
-| Main shard (`--workspace --exclude engine-slice`) | 1188 | 1137 |
-| Heavy shard (`-p engine-slice --features crash-test-seams`) | 582 | 581 |
-| **Combined** | **1770** | **1718** |
+| Main shard (`--workspace --exclude engine-slice`) | 1237 | 1186 |
+| Heavy shard (`-p engine-slice --features crash-test-seams`) | 591 | 590 |
+| **Combined** | **1828** | **1776** |
 
 The macOS job has its own partition. Main has two ignored tests and 33
-result lines. Heavy has seventeen ignored tests and 62 result lines. The
-table is settled at `main` @ `406aceb` (2026-11-24): it carries the Era-1
+result lines. Heavy has thirty-one ignored tests and 62 result lines. The
+Era-1 table row was settled at `main` @ `406aceb` (2026-11-24): it carries the Era-1
 ladder's merged endpoint (PRs #13–#19; #20 was docs-only), matching the
 workflow's enforced pins at that exact tree — main 1188 Linux / 1137
 Windows with 2 ignored / 33 result lines, renderer release 111/2, heavy
@@ -491,6 +545,53 @@ check #22 had documented as not exercisable — landed as #30 above
 limitation). The queue is empty again: every remaining clause is
 either landed with a CI-visible gate or documented as rig-pending
 in the PR bodies.
+
+**The Era-2 package 1 record (2026-11-24, branch
+`era2/animation-skinning-proxy-shadows` — the animation + skinning +
+proxy-shadows ladder, all five stages on one branch, awaiting the
+owner's GO; every count below MEASURED on the branch's stage-5 tree
+with the workflow's own awk, cross-checked against CI runs
+45471375791 / 45472428113 / 45478600773 on the staged tips):** the
+count arithmetic, stage by stage — stage 1 (the deterministic
+animation core, `b675377` + the `6b95875` verification repair) adds
+22 platform-uniform engine-renderer lib tests (main AND renderer
+release); stages 2a+2b (the pose-index claim + the five WGSL
+modules, `862e003`) add NO tests (the packed-bytes pins are value
+repins inside existing tests); stages 2c+4a (the skinned pipeline
+wiring + the populated raycaster oracle, `036d88a`) add 7
+platform-uniform engine-renderer lib tests (main AND renderer
+release); stage 3 (the animated population, `16ec1a5`) adds 3
+engine-slice lib tests (the HEAVY shard's passed count, within the
+existing lib result line); stage 4b (the shadowed populated path,
+`ba58c96`) adds no tests (wiring); stage 5 (the gates + the pin
+reconciliation) adds 3 `#[ignore]`d lavapipe gates in existing
+binaries (the heavy shard's IGNORED count only). The reconciled
+pins: main 1208+29 = **1237 Linux / 1186 Windows** (2 ignored / 33
+result lines), renderer release 131+29 = **160/2**, heavy
+588+3 = **591 Linux / 590 Windows** with **31 ignored / 62 result
+lines** — the union's 28 ignored plus stage 5's three gates
+(render_instanced 4→6: the skinning oracle and the animated N-vs-1;
+render_shadows 3→4: the populated shadow-map gate; the full-table
+gate's animated allocation regime extends an existing test, no
+count). The stage-5 gates' first device execution is the push's own
+CI run (the dev pod carries no Vulkan loader): the skinning
+oracle's per-pixel expectations, the populated map's 2.68e-7
+tolerance, and the differentials are all CPU-derived in the gates'
+comments, with the per-class census prints as the first run's
+measured evidence (the CPU-side expectation census at rest, the
+comparator's own post-skip bucketing: clear 511,688 / ground
+28,758 / building 495,081 / npc 1 / vehicle 442 compared, 12,606
+edge-skipped at the 1.5-texel margin; at frame-33 walk: npc 1,
+and 73 texels differ between the two expectation maps — the
+recorded density lesson: a 0.42 m figure spans ≈4 texels of the
+0.110 m map, so the npc class is a presence proof with the
+73-texel differential carrying the casts' coverage). One pre-existing macOS-only failure surfaced in
+the same runs (CI run 45478600773:
+`s6_soak::deterministic_late_window_hard_exit_control_recovers` —
+the in-flight fsync commits before the hard exit on the M1 runner,
+so the relaunch recovers at tick 3300 where the test pins 3054;
+the soak machinery is untouched by this branch) — reported to the
+supervisor, outside this package's scope.
 
 (At `a4eb372`, Windows counts were measured before landing; Linux
 counts were inferred at landing and subsequently confirmed by GitHub
