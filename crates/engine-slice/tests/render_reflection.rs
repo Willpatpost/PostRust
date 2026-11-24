@@ -1683,104 +1683,400 @@ fn first_frame_after_out_of_date_recreation_keeps_every_layer() {
     );
 }
 
-/// Finding 4 verification (the wet-only cell of the review's
-/// post-only / wet-only / combined matrix): the wet reflection's
-/// extent-bound targets honor the NEGOTIATED depth format. The
-/// renderer is built with `ForceD24S8`; if the device lacks the
-/// format the knob falls back to the negotiated pick — the test
-/// prints the skip and returns (the skip condition is the REPORTED
-/// format, never a guess). Wet ON, post chain OFF; one shadowed wet
-/// frame, capture, assert a clean validation record (the aspect and
-/// attachment mismatches this finding describes are validation
-/// errors first) and a non-uniform frame (the wet ground drew).
+/// Finding 4 verification (the wet-only and combined cells of the
+/// review's post-only / wet-only / combined matrix, extending
+/// render_post's `depth_fallbacks_and_the_post_lifecycle`): the
+/// extent-bound wet and post+wet targets honor EACH SUPPORTED
+/// fallback depth format (D24_S8 and D16), INCLUDING the forced
+/// recreation (resize) that triggers a wet-target rebuild. A wet-target
+/// rebuild that regressed to a D32 assumption would only be caught
+/// here — the post-only cell with resize is render_post's own gate,
+/// and the negotiated-format combined cell is the first-frame gate.
+///
+/// For each fallback [D24_S8, D16]:
+/// 1. WET-ONLY at original 256×256 (existing body)
+/// 2. WET-ONLY at 264×264 (resize, verify recreation + format + wet redrew)
+/// 3. WARMED CONSTANCY + BYTE STABILITY at 264×264
+/// 4. COMBINED (post+wet) at 264×264, then a second resize to 272×272,
+///    then prove both layers with differentials
+/// 5. Drop renderer and app
 #[test]
 #[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
 fn wet_targets_honor_the_negotiated_depth_format() {
     let _guard = sdl_lock();
-    let app = ShellApp::new(ShellConfig {
-        title: "wet-depth-format".into(),
-        width: 256,
-        height: 256,
-        target_fps: 60,
-        driver: DriverPreference::Real,
-    })
-    .unwrap();
-    let mut renderer = Renderer::new(
-        app.window(),
-        RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
-            validation: ValidationPreference::On,
-            depth_format: DepthFormatPreference::ForceD24S8,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert!(renderer.stats().validation_active);
-
-    // The knob's outcome, from the renderer's own report: the forced
-    // format, or the negotiated pick when the device lacks it.
-    let reported = renderer.stats().depth_format.clone();
-    if reported != "D24_UNORM_S8_UINT" {
-        println!(
-            "wet depth-format gate: the device lacks D24_UNORM_S8_UINT (reported {reported}); \
-             the knob fell back to the negotiated pick — skipped"
-        );
-        return;
-    }
-    println!("wet depth-format gate: forced D24_UNORM_S8_UINT honored");
-
-    // Wet ON, post chain OFF (the matrix's wet-only cell); sky off to
-    // keep the frame's variables minimal.
-    renderer.set_post(false);
-    renderer.set_wet(true);
     let light = day_preset();
     let eye = [12.0, 2.0, -12.0];
     let aim = [2.0, 0.0, -12.0];
-    let matrix = view_projection(
-        RouteWaypoint {
-            position: eye,
-            look_at: aim,
-        },
-        1.0,
-    );
-    renderer.request_frame_capture().unwrap();
-    assert!(
-        renderer
-            .render_corner_shadowed(&matrix, eye, light, BIAS, (256, 256))
-            .unwrap()
-            .presented
-    );
-    let capture = renderer.take_frame_capture().unwrap().unwrap();
 
-    // Not uniform: the wet ground and the corner geometry drew (a
-    // failed depth attachment shows as a cleared or validation-broken
-    // frame, not this).
-    let first_pixel = capture.pixel_rgba(0, 0);
-    let uniform_like = capture
-        .bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .filter(|rgba| **rgba == first_pixel)
-        .count();
-    let total_pixels = (capture.width * capture.height) as usize;
-    println!(
-        "wet depth-format gate: {uniform_like}/{total_pixels} pixels match pixel (0,0) \
-         ({:.1}%)",
-        100.0 * uniform_like as f64 / total_pixels as f64
-    );
-    assert!(
-        uniform_like * 10 < total_pixels * 9,
-        "the wet frame is not uniform (the wet ground and corner geometry drew)"
-    );
+    for (preference, forced_name) in [
+        (DepthFormatPreference::ForceD24S8, "D24_UNORM_S8_UINT"),
+        (DepthFormatPreference::ForceD16, "D16_UNORM"),
+    ] {
+        let app = ShellApp::new(ShellConfig {
+            title: format!("wet-depth-fallback-{forced_name}"),
+            width: 256,
+            height: 256,
+            target_fps: 60,
+            driver: DriverPreference::Real,
+        })
+        .unwrap();
+        let mut renderer = Renderer::new(
+            app.window(),
+            RenderConfig {
+                demo_scene: DemoScenePreference::Corner,
+                validation: ValidationPreference::On,
+                replace_pipelines: true,
+                depth_format: preference,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let reported = renderer.stats().depth_format.clone();
+        assert!(
+            renderer.stats().validation_active,
+            "the validation layer must be active (VK_LAYER_PATH) or every \
+             validation_errors == 0 assert below is vacuous"
+        );
+        if reported != forced_name {
+            println!(
+                "wet fallback {forced_name}: the device lacks it (reported {reported}); the \
+                 knob fell back to the negotiated pick — variant skipped"
+            );
+            drop(renderer);
+            drop(app);
+            continue;
+        }
+        println!("wet fallback {forced_name}: forced {forced_name} honored");
 
-    assert_eq!(
-        renderer.stats().validation_errors,
-        0,
-        "{:?}",
-        renderer.stats().recent_validation
-    );
-    println!("wet depth-format gate: D24_UNORM_S8_UINT wet frame clean under validation");
+        // Step 1: WET-ONLY at original 256×256 (the existing body kept)
+        {
+            let size = app.window().size_in_pixels();
+            assert_eq!(size, (256, 256));
+
+            renderer.set_post(false);
+            renderer.set_wet(true);
+            let matrix = view_projection(
+                RouteWaypoint {
+                    position: eye,
+                    look_at: aim,
+                },
+                1.0,
+            );
+            renderer.request_frame_capture().unwrap();
+            assert!(
+                renderer
+                    .render_corner_shadowed(&matrix, eye, light, BIAS, size)
+                    .unwrap()
+                    .presented
+            );
+            let capture = renderer.take_frame_capture().unwrap().unwrap();
+
+            // Not uniform: the wet ground and corner geometry drew
+            let first_pixel = capture.pixel_rgba(0, 0);
+            let uniform_like = capture
+                .bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|rgba| **rgba == first_pixel)
+                .count();
+            let total_pixels = (capture.width * capture.height) as usize;
+            println!(
+                "wet fallback {forced_name} at 256: {uniform_like}/{total_pixels} pixels match pixel (0,0) ({:.1}%)",
+                100.0 * uniform_like as f64 / total_pixels as f64
+            );
+            assert!(
+                uniform_like * 10 < total_pixels * 9,
+                "the wet frame is not uniform (the wet ground and corner geometry drew)"
+            );
+
+            assert_eq!(
+                renderer.stats().validation_errors,
+                0,
+                "{:?}",
+                renderer.stats().recent_validation
+            );
+            println!("wet fallback {forced_name}: wet frame clean under validation");
+        }
+
+        // Step 2: WET-ONLY RESIZE to 264×264
+        {
+            let new_size = (256 + 8, 256 + 8);
+            let matrix = view_projection(
+                RouteWaypoint {
+                    position: eye,
+                    look_at: aim,
+                },
+                1.0,
+            );
+            // Render at the new size (this forces recreation)
+            let outcome = renderer
+                .render_corner_shadowed(&matrix, eye, light, BIAS, new_size)
+                .unwrap();
+            assert!(outcome.recreated, "the resize forced a recreation");
+            println!("wet fallback {forced_name} at 264: recreated = true");
+
+            // Verify the depth format is still the forced name
+            assert_eq!(
+                renderer.stats().depth_format,
+                forced_name,
+                "the rebuild carried the negotiated {forced_name} format"
+            );
+            println!("wet fallback {forced_name} at 264: depth format still {forced_name}");
+
+            renderer.request_frame_capture().unwrap();
+            assert!(
+                renderer
+                    .render_corner_shadowed(&matrix, eye, light, BIAS, new_size)
+                    .unwrap()
+                    .presented
+            );
+            let capture_new = renderer.take_frame_capture().unwrap().unwrap();
+
+            // Assert non-uniform at new size
+            let first_pixel = capture_new.pixel_rgba(0, 0);
+            let uniform_like = capture_new
+                .bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|rgba| **rgba == first_pixel)
+                .count();
+            let total_pixels = (capture_new.width * capture_new.height) as usize;
+            println!(
+                "wet fallback {forced_name} at 264: {uniform_like}/{total_pixels} pixels match pixel (0,0) ({:.1}%)",
+                100.0 * uniform_like as f64 / total_pixels as f64
+            );
+            assert!(
+                uniform_like * 10 < total_pixels * 9,
+                "the resized wet frame is not uniform"
+            );
+
+            // Prove the wet layer actually redrew on the replacement
+            // generation: toggle wet OFF, render same pose+size, toggle ON
+            // and assert lower half differs by more than measured floor
+            renderer.set_wet(false);
+            renderer.request_frame_capture().unwrap();
+            assert!(
+                renderer
+                    .render_corner_shadowed(&matrix, eye, light, BIAS, new_size)
+                    .unwrap()
+                    .presented
+            );
+            let wet_off = renderer.take_frame_capture().unwrap().unwrap();
+            renderer.set_wet(true);
+
+            // MEASURED: on the 2026-11-24 lavapipe run, wet_differ =
+            // 34848 of 34848 lower-half pixels (264x132 — the wet
+            // redraw changes every lower-half pixel at this pose;
+            // the first-frame gates' own D32 differential at this
+            // extent is 34190 — same magnitude, sky+post content)
+            let mut wet_differ = 0usize;
+            for y in new_size.1 / 2..new_size.1 {
+                for x in 0..new_size.0 {
+                    wet_differ +=
+                        usize::from(capture_new.pixel_rgba(x, y) != wet_off.pixel_rgba(x, y));
+                }
+            }
+            println!(
+                "wet fallback {forced_name} at 264: {wet_differ} lower-half pixels differ wet-vs-off (resize rebuild)"
+            );
+            assert!(
+                wet_differ >= 8000,
+                "the wet layer redrew on the replacement generation ({wet_differ} lower-half pixels differ)"
+            );
+
+            // Byte stability: two more renders at new size
+            let warm = renderer.allocations();
+            renderer.request_frame_capture().unwrap();
+            assert!(
+                renderer
+                    .render_corner_shadowed(&matrix, eye, light, BIAS, new_size)
+                    .unwrap()
+                    .presented
+            );
+            let repeat1 = renderer.take_frame_capture().unwrap().unwrap();
+            renderer.request_frame_capture().unwrap();
+            assert!(
+                renderer
+                    .render_corner_shadowed(&matrix, eye, light, BIAS, new_size)
+                    .unwrap()
+                    .presented
+            );
+            let repeat2 = renderer.take_frame_capture().unwrap().unwrap();
+
+            assert_eq!(
+                renderer.allocations(),
+                warm,
+                "wet fallback {forced_name} at 264: warmed allocations constant"
+            );
+            assert_eq!(
+                repeat1.bytes, repeat2.bytes,
+                "wet fallback {forced_name} at 264: byte-identical wet frames"
+            );
+        }
+
+        // Step 3: COMBINED cell (post+wet) at the fallback WITH a second recreation
+        {
+            let new_size = (256 + 8, 256 + 8);
+            let matrix = view_projection(
+                RouteWaypoint {
+                    position: eye,
+                    look_at: aim,
+                },
+                1.0,
+            );
+
+            // Set post ON (wet stays on from step 2)
+            renderer.set_post(true);
+            renderer.request_frame_capture().unwrap();
+            assert!(
+                renderer
+                    .render_corner_shadowed(&matrix, eye, light, BIAS, new_size)
+                    .unwrap()
+                    .presented
+            );
+            let combined = renderer.take_frame_capture().unwrap().unwrap();
+
+            // Assert non-uniform
+            let first_pixel = combined.pixel_rgba(0, 0);
+            let uniform_like = combined
+                .bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|rgba| **rgba == first_pixel)
+                .count();
+            let total_pixels = (combined.width * combined.height) as usize;
+            println!(
+                "wet fallback {forced_name} combined at 264: {uniform_like}/{total_pixels} pixels match pixel (0,0) ({:.1}%)",
+                100.0 * uniform_like as f64 / total_pixels as f64
+            );
+            assert!(
+                uniform_like * 10 < total_pixels * 9,
+                "the combined (post+wet) frame at 264 is not uniform"
+            );
+
+            // Resize AGAIN to 272×272
+            let larger_size = (256 + 16, 256 + 16);
+            let outcome = renderer
+                .render_corner_shadowed(&matrix, eye, light, BIAS, larger_size)
+                .unwrap();
+            assert!(outcome.recreated, "the second resize forced a recreation");
+            println!("wet fallback {forced_name} combined at 272: recreated = true");
+
+            // Verify the depth format is still the forced name
+            assert_eq!(
+                renderer.stats().depth_format,
+                forced_name,
+                "the second rebuild carried the negotiated {forced_name} format"
+            );
+            println!(
+                "wet fallback {forced_name} combined at 272: depth format still {forced_name}"
+            );
+
+            renderer.request_frame_capture().unwrap();
+            assert!(
+                renderer
+                    .render_corner_shadowed(&matrix, eye, light, BIAS, larger_size)
+                    .unwrap()
+                    .presented
+            );
+            let combined_large = renderer.take_frame_capture().unwrap().unwrap();
+
+            // Assert non-uniform at larger size
+            let first_pixel = combined_large.pixel_rgba(0, 0);
+            let uniform_like = combined_large
+                .bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|rgba| **rgba == first_pixel)
+                .count();
+            let total_pixels = (combined_large.width * combined_large.height) as usize;
+            println!(
+                "wet fallback {forced_name} combined at 272: {uniform_like}/{total_pixels} pixels match pixel (0,0) ({:.1}%)",
+                100.0 * uniform_like as f64 / total_pixels as f64
+            );
+            assert!(
+                uniform_like * 10 < total_pixels * 9,
+                "the combined (post+wet) frame at 272 is not uniform"
+            );
+
+            // Prove both layers with differentials at the final extent
+            // (a) post differential — set_post(false), render+capture, set_post(true)
+            renderer.set_post(false);
+            renderer.request_frame_capture().unwrap();
+            assert!(
+                renderer
+                    .render_corner_shadowed(&matrix, eye, light, BIAS, larger_size)
+                    .unwrap()
+                    .presented
+            );
+            let no_post = renderer.take_frame_capture().unwrap().unwrap();
+            renderer.set_post(true);
+
+            // MEASURED: on the 2026-11-24 lavapipe run, post_differ =
+            // 73984 of 73984 pixels (272x272 — the ACES tonemap +
+            // bloom signature changes every pixel; the first-frame
+            // gate's own post differential at 264 is 69696 = all)
+            let mut post_differ = 0usize;
+            for y in 0..larger_size.1 {
+                for x in 0..larger_size.0 {
+                    post_differ +=
+                        usize::from(combined_large.pixel_rgba(x, y) != no_post.pixel_rgba(x, y));
+                }
+            }
+            println!(
+                "wet fallback {forced_name} combined at 272: {post_differ} pixels differ post-vs-full"
+            );
+            assert!(
+                post_differ >= 10000,
+                "the post layer redraw on the combined frame ({post_differ} pixels differ)"
+            );
+
+            // (b) wet differential — set_wet(false), render+capture, set_wet(true)
+            renderer.set_wet(false);
+            renderer.request_frame_capture().unwrap();
+            assert!(
+                renderer
+                    .render_corner_shadowed(&matrix, eye, light, BIAS, larger_size)
+                    .unwrap()
+                    .presented
+            );
+            let no_wet = renderer.take_frame_capture().unwrap().unwrap();
+            renderer.set_wet(true);
+
+            // MEASURED: on the 2026-11-24 lavapipe run, wet_differ =
+            // 36251 of 36960 lower-half pixels (the 709 unchanged are
+            // opaque building pixels the wet redraw never touches)
+            let mut wet_differ = 0usize;
+            for y in larger_size.1 / 2..larger_size.1 {
+                for x in 0..larger_size.0 {
+                    wet_differ +=
+                        usize::from(combined_large.pixel_rgba(x, y) != no_wet.pixel_rgba(x, y));
+                }
+            }
+            println!(
+                "wet fallback {forced_name} combined at 272: {wet_differ} lower-half pixels differ wet-vs-full"
+            );
+            assert!(
+                wet_differ >= 8000,
+                "the wet layer redraw on the combined frame ({wet_differ} lower-half pixels differ)"
+            );
+
+            assert_eq!(
+                renderer.stats().validation_errors,
+                0,
+                "wet fallback {forced_name} combined validation: {:?}",
+                renderer.stats().recent_validation
+            );
+        }
+
+        // Step 4: Drop renderer and app at the end of each loop iteration
+        drop(renderer);
+        drop(app);
+    }
 }
 
 /// Finding 5 verification (the shadowed wet ground's camera): the

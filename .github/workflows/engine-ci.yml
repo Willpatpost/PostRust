@@ -1422,6 +1422,35 @@ jobs:
           # and exercised by the two boundary tests. Linux
           # 588/27/62 MEASURED locally with this step's own awk;
           # Windows 587/27 unchanged (platform-uniform — pure CPU).
+          # Run 7 (2026-11-24, the next re-check cycle's package,
+          # corrective/wet-fallback-recreate-coverage): NO count
+          # change — finding 4's check distributes create/render/
+          # RESIZE/capture over post-only, wet-only, and combined
+          # cells; the post-only cell already resized at both
+          # fallbacks (render_post's lifecycle gate) but the
+          # wet-only cells never recreated and the combined cell
+          # recreated only at the negotiated format — no gate
+          # anywhere exercised a WET-TARGET REBUILD at a forced
+          # fallback (wet targets are prepared lazily only when a
+          # wet camera is supplied, so the post cells' fallback
+          # resizes never built one; a rebuild regressing to a D32
+          # assumption is finding 4's own defect class). The
+          # existing wet depth-format gate is EXTENDED IN PLACE
+          # (same name, same result line): per fallback [D24_S8,
+          # D16] — wet-only render+capture at 256; resize to 264
+          # (recreated, the reported format STILL the forced name);
+          # the wet-redrew differential (34848 lower-half pixels,
+          # the whole half at this pose); warmed constancy +
+          # byte-identical repeats; then the COMBINED (post+wet)
+          # cell with a second resize to 272 and both layer
+          # differentials (post 73984 = every pixel; wet 36251) —
+          # all under ValidationPreference::On with
+          # validation_active asserted. Executed by the unchanged
+          # reflection-gates Linux Vulkan step below. Linux
+          # 588/27/62 MEASURED locally with this step's own awk;
+          # Windows 587/27 unchanged (the gate runs only in the
+          # Linux Vulkan step; the plain-run counts are
+          # platform-uniform).
           expected=588
           if [ "$(uname -s)" != "Linux" ]; then expected=587; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
