@@ -418,6 +418,26 @@ comment chains and the PR bodies):
   1157 Windows (2/33), renderer release 131/2, heavy 588 Linux /
   587 Windows (26 ignored / 62 result lines) — MEASURED with the
   workflow's own awk, Windows confirmed by the exact-count CI gate.
+- **#30 `corrective/acquire-out-of-date-coverage`** (the recursive
+  phase's next item, 2026-11-24) — finding 6's out-of-date half: the
+  acquire-out-of-date recreation path's first-frame verification,
+  the one review-proposed check #22 had honestly documented as
+  driver-forced and not exercisable from the test API. A one-shot
+  diagnostic injection (the `inject_target_fault` seam precedent)
+  replaces the first `vkAcquireNextImageKHR` with the injected
+  `ERROR_OUT_OF_DATE_KHR` — the driver contract modeled exactly (no
+  image, semaphore untouched), the arm's retry acquire structurally
+  real — and the new `#[ignore]d` render_reflection gate
+  (`first_frame_after_out_of_date_recreation_keeps_every_layer`)
+  proves the FIRST presented frame after that recreation carries
+  sky/wet/post by the pending-recreate sibling's own differential
+  method, plus the one-shot consumption proof. Stacks on #27's tip;
+  at its tree: main 1208/2/33 and renderer release 131/2 unchanged,
+  heavy 588/27/62 (ignored 26 → 27, the one new gate) — MEASURED
+  with the workflow's own awk, the reflection battery 6/6 on the
+  pod's lavapipe. At the full union the heavy ignored pin is 28
+  (#21's capture gate + 27 here) — the exact-count gate enforces
+  the actuals at the owner's merge sequence.
 
 The full union's counts are MEASURED (the 2026-11-24 union
   rehearsal, branch `corrective/union-rehearsal` — seven `--no-ff`
@@ -449,6 +469,15 @@ RTX 5070 Ti procedure — never presented as measured. The cycle's own
 closing re-audit (2026-11-24, independently re-verified against
 source) found the recursive queue empty: no unlanded correction, no
 unlanded verification test, no NOTE/IMPROVEMENT finding uncovered.
+The NEXT cycle's re-check (2026-11-24, the supervisor cycling the
+agent as the protocol directs) re-audited that emptiness claim
+against the source with a second independent read-only pass and
+found exactly one remainder: finding 6's out-of-date half, the
+check #22 had documented as not exercisable — landed as #30 above
+(the cycle's own 5/3 seam precedent applied to its last documented
+limitation). The queue is empty again: every remaining clause is
+either landed with a CI-visible gate or documented as rig-pending
+in the PR bodies.
 
 (At `a4eb372`, Windows counts were measured before landing; Linux
 counts were inferred at landing and subsequently confirmed by GitHub
