@@ -1830,6 +1830,15 @@ pub(crate) struct PipelineState {
     /// do); a replacement re-ensures an identical set before
     /// installation (finding A).
     pub skinned: Option<skinned_draw::SkinnedProxyResources>,
+    /// The shadowed-populated proxy state (the NPC and vehicle
+    /// casting/receiving paths through the shadow family), created
+    /// LAZILY at the first SHADOWED POPULATED corner frame — one
+    /// level deeper than the skinned state (the indirect-command
+    /// precedent): the unshadowed populated path pays nothing for a
+    /// mechanism it never draws through. Dies with this state (the
+    /// pipelines reading it do); a replacement re-ensures an
+    /// identical set before installation (finding A).
+    pub shadowed_proxy: Option<skinned_draw::ShadowedProxyResources>,
     /// Per-slot vertex capacity of the dynamic region-scene buffer
     /// (Stage 4 graphical integration — the same disjoint per-slot
     /// pattern as the overlay).
@@ -1880,6 +1889,7 @@ impl PipelineState {
             post: None,
             reflection: None,
             skinned: None,
+            shadowed_proxy: None,
         };
         if let Err(error) = state.build(ctx, color_format, depth_format, demo_scene) {
             state.destroy(ctx);
@@ -2018,6 +2028,42 @@ impl PipelineState {
             ctx,
             self.render_pass,
             corner,
+        )?);
+        Ok(())
+    }
+
+    /// Allocates the shadowed-populated proxy state on the first
+    /// shadowed populated corner frame (one level deeper than the
+    /// skinned state — the indirect-command precedent: the
+    /// unshadowed populated path pays nothing for a mechanism it
+    /// never draws through). The state needs shadows, skinned, AND
+    /// a corner — a no-op once allocated.
+    pub(crate) fn ensure_shadowed_proxy_resources(
+        &mut self,
+        ctx: &VulkanContext,
+    ) -> Result<(), RendererError> {
+        if self.shadowed_proxy.is_some() {
+            return Ok(());
+        }
+        let corner = ctx.corner.as_ref().ok_or_else(|| {
+            RendererError::Vulkan("shadowed proxy requires the Corner scene preference".into())
+        })?;
+        let shadows = self.shadows.as_ref().ok_or_else(|| {
+            RendererError::Vulkan(
+                "shadowed proxy needs shadows (ensure_shadow_resources first)".into(),
+            )
+        })?;
+        let skinned = self.skinned.as_ref().ok_or_else(|| {
+            RendererError::Vulkan(
+                "shadowed proxy needs skinned (ensure_skinned_resources first)".into(),
+            )
+        })?;
+        self.shadowed_proxy = Some(skinned_draw::ShadowedProxyResources::new(
+            ctx,
+            shadows,
+            skinned,
+            corner,
+            self.render_pass,
         )?);
         Ok(())
     }
@@ -2162,6 +2208,14 @@ impl PipelineState {
         // scene-preference gate), which the ensure itself re-checks.
         if shadowed.is_some() {
             self.ensure_shadow_resources(ctx)?;
+        }
+        // The shadowed-populated proxy state: one level deeper than the
+        // skinned state (the indirect-command precedent). The frame
+        // flow's ensure discipline guarantees shadows AND skinned exist
+        // before the shadowed populated path is reached (shadows and
+        // skinned are ensured above, so this is safe).
+        if shadowed.is_some() && proxy.is_some() && self.skinned.is_some() {
+            self.ensure_shadowed_proxy_resources(ctx)?;
         }
 
         // The Era-1 lazy sky state (the same discipline): created at the
@@ -2703,6 +2757,9 @@ impl PipelineState {
             }
             if let Some(mut skinned) = self.skinned.take() {
                 skinned.release(ctx);
+            }
+            if let Some(mut shadowed_proxy) = self.shadowed_proxy.take() {
+                shadowed_proxy.release(ctx);
             }
             if !self.region_mapped.is_null() {
                 ctx.device.unmap_memory(self.region_vbo_memory);
@@ -4088,7 +4145,16 @@ pub(crate) fn render_frame(
             (&ctx.corner, &pipes.shadows, shadowed)
         {
             shadow_state.write_frame(slot, params);
-            shadow_state.record_depth_pass(ctx, command, corner, slot);
+            shadow_state.record_depth_pass(
+                ctx,
+                command,
+                corner,
+                slot,
+                pipes.shadowed_proxy.as_ref(),
+                pipes.proxy.as_ref(),
+                pipes.skinned.as_ref(),
+                proxy,
+            );
         }
 
         // The Era-1 wet reflection's mirrored-scene pass (package 7)
@@ -4174,6 +4240,14 @@ pub(crate) fn render_frame(
                 shadowed: pipes.shadows.as_ref().map(|s| s.shadowed(slot).0),
                 proxy: Some(pipes.proxy_pipeline),
                 proxy_skinned: pipes.skinned.as_ref().map(|s| s.pipeline()),
+                shadowed_proxy_skinned: pipes
+                    .shadowed_proxy
+                    .as_ref()
+                    .map(|s| s.skinned_shadowed_pipeline()),
+                shadowed_proxy_vehicle: pipes
+                    .shadowed_proxy
+                    .as_ref()
+                    .map(|s| s.plain_shadowed_pipeline()),
             };
             match scene_record::record_corner_scene(
                 ctx,
@@ -4668,6 +4742,20 @@ fn recreate_swapchain(
         // through null handles).
         if pipes.skinned.is_some()
             && let Err(error) = replacement.ensure_skinned_resources(ctx)
+        {
+            replacement.destroy(ctx);
+            return Err(error);
+        }
+        // The shadowed-populated companion: the replacement's
+        // shadowed-proxy state must exist before installation (the
+        // same finding-A discipline — the replacement's shadowed
+        // pipelines render inside the replacement's own render pass,
+        // and its draws read the same lazily-created state). The
+        // frame flow's ensure discipline guarantees shadows AND
+        // skinned exist on the replacement (they're ensured above),
+        // so this can safely access them.
+        if pipes.shadowed_proxy.is_some()
+            && let Err(error) = replacement.ensure_shadowed_proxy_resources(ctx)
         {
             replacement.destroy(ctx);
             return Err(error);

@@ -398,17 +398,6 @@ pub fn run(
             atmosphere.disc_dir
         );
     }
-    // The combination refusal (the union's policy, from the verified
-    // three-way resolution): proxy shadows (a populated scene drawn
-    // through the shadowed path) are a deferred package on both the
-    // population and the 6-F deferral lists, so asking for both is a
-    // typed upfront refusal — never a silent mode drop.
-    if populated && shadows {
-        return Err(
-            "--populated and --shadows together is not implemented (proxy shadows are a deferred package)"
-                .into(),
-        );
-    }
     // Era 1 package 4: the day/night cycle drives the atmosphere
     // (the light AND the sky) from the day endpoint — a static
     // --night start alongside it is contradictory, refused upfront.
@@ -446,10 +435,7 @@ pub fn run(
                 .iter()
                 .filter(|p| matches!(p, Phase::Walk(_)))
                 .count(),
-            phases
-                .iter()
-                .filter(|p| matches!(p, Phase::Stand))
-                .count(),
+            phases.iter().filter(|p| matches!(p, Phase::Stand)).count(),
             crate::corner_population::WALK_STRIDE_SECONDS,
             crate::corner_population::DEMO_CLOCK_HZ
         );
@@ -564,11 +550,18 @@ pub fn run(
             vehicle_material: VEHICLE_MATERIAL,
         });
         let matrix = view_projection(pose, aspect);
-        // Submission selection: the shadowed route (6-F) or the
-        // populated route (6-E/6-E2, the mode set above); the
-        // combination was refused above (proxy shadows are the
-        // deferred package).
-        let frame = if shadows {
+        // Submission selection: the four-way union
+        // (--populated --shadows together is the Era-2 stage 4b path).
+        let frame = if shadows && populated {
+            renderer.render_corner_populated_shadowed(
+                &matrix,
+                pose.position,
+                light,
+                bias,
+                frame_population.as_ref().unwrap(),
+                size,
+            )
+        } else if shadows {
             renderer.render_corner_shadowed(&matrix, pose.position, light, bias, size)
         } else if let Some(population) = frame_population.as_ref() {
             renderer.render_corner_populated(&matrix, pose.position, light, population, size)
@@ -743,7 +736,16 @@ fn run_free_look(
             }
         });
         let matrix = camera.view_projection(aspect);
-        let frame = if shadows {
+        let frame = if shadows && let Some(population) = &frame_population {
+            renderer.render_corner_populated_shadowed(
+                &matrix,
+                camera.position,
+                light,
+                bias,
+                population,
+                size,
+            )
+        } else if shadows {
             renderer.render_corner_shadowed(&matrix, camera.position, light, bias, size)
         } else if let Some(population) = frame_population.as_ref() {
             renderer.render_corner_populated(&matrix, camera.position, light, population, size)

@@ -510,10 +510,80 @@ impl SkinnedProxyResources {
         self.sets.get(material as usize).copied()
     }
 
+    /// The per-slot region size (bytes).
+    #[allow(dead_code)]
+    pub(super) fn slot_bytes(&self) -> u64 {
+        self.slot_stride
+    }
+
     /// The pose dynamic offset for `slot`'s region (the second
     /// dynamic offset in the skinned set binds).
     pub(super) fn pose_offset(&self, slot: usize) -> u32 {
         (slot as u64 * self.slot_stride) as u32
+    }
+
+    /// Builds the skinned depth pipeline (the NPC cast through the
+    /// shadow state's depth pass).
+    pub(super) fn build_skinned_depth_pipeline(
+        &self,
+        ctx: &VulkanContext,
+        spv: &[u8],
+        depth_render_pass: vk::RenderPass,
+        _layout: vk::PipelineLayout,
+        what: &str,
+    ) -> Result<vk::Pipeline, RendererError> {
+        let module = create_shader_module(ctx, spv)?;
+        let result = self.pipeline_from_module(ctx, module, depth_render_pass, what);
+        unsafe { ctx.device.destroy_shader_module(module, None) };
+        result
+    }
+
+    /// Builds the plain depth pipeline (the vehicle cast through the
+    /// shadow state's depth pass).
+    pub(super) fn build_plain_depth_pipeline(
+        &self,
+        ctx: &VulkanContext,
+        spv: &[u8],
+        depth_render_pass: vk::RenderPass,
+        _layout: vk::PipelineLayout,
+        what: &str,
+    ) -> Result<vk::Pipeline, RendererError> {
+        let module = create_shader_module(ctx, spv)?;
+        let result = self.pipeline_from_module(ctx, module, depth_render_pass, what);
+        unsafe { ctx.device.destroy_shader_module(module, None) };
+        result
+    }
+
+    /// Builds the skinned shadowed lit pipeline (the NPC receiving
+    /// shadows through the main pass).
+    pub(super) fn build_skinned_lit_pipeline(
+        &self,
+        ctx: &VulkanContext,
+        spv: &[u8],
+        render_pass: vk::RenderPass,
+        _layout: vk::PipelineLayout,
+        what: &str,
+    ) -> Result<vk::Pipeline, RendererError> {
+        let module = create_shader_module(ctx, spv)?;
+        let result = self.pipeline_from_module(ctx, module, render_pass, what);
+        unsafe { ctx.device.destroy_shader_module(module, None) };
+        result
+    }
+
+    /// Builds the plain shadowed lit pipeline (the vehicle receiving
+    /// shadows through the main pass).
+    pub(super) fn build_plain_lit_pipeline(
+        &self,
+        ctx: &VulkanContext,
+        spv: &[u8],
+        render_pass: vk::RenderPass,
+        _layout: vk::PipelineLayout,
+        what: &str,
+    ) -> Result<vk::Pipeline, RendererError> {
+        let module = create_shader_module(ctx, spv)?;
+        let result = self.pipeline_from_module(ctx, module, render_pass, what);
+        unsafe { ctx.device.destroy_shader_module(module, None) };
+        result
     }
 
     /// Releases every handle exactly once; valid for both the
@@ -558,5 +628,540 @@ impl SkinnedProxyResources {
             self.buffer = vk::Buffer::null();
             self.memory = vk::DeviceMemory::null();
         }
+    }
+}
+
+/// The shadowed-populated proxy state (Era-2 stage 4b — the NPC and vehicle
+/// casting/receiving paths through the shadow family), created LAZILY at the
+/// first SHADOWED POPULATED corner frame — one level deeper than the skinned
+/// state (the indirect-command precedent).
+pub(crate) struct ShadowedProxyResources {
+    /// The npc cast pipeline (the shadow state's depth pass).
+    skinned_depth_pipeline: vk::Pipeline,
+    skinned_depth_layout: vk::PipelineLayout,
+    skinned_depth_set: vk::DescriptorSet,
+    skinned_depth_pool: vk::DescriptorPool,
+    skinned_depth_set_layout: vk::DescriptorSetLayout,
+    /// The vehicle cast pipeline (reuses the shadow state's own
+    /// depth set at record time — no descriptors here).
+    plain_depth_pipeline: vk::Pipeline,
+    /// The npc receiving pipeline (the main render pass).
+    skinned_shadowed_pipeline: vk::Pipeline,
+    skinned_shadowed_layout: vk::PipelineLayout,
+    skinned_shadowed_sets: [vk::DescriptorSet; MATERIAL_COUNT * 2],
+    skinned_shadowed_pool: vk::DescriptorPool,
+    skinned_shadowed_set_layout: vk::DescriptorSetLayout,
+    /// The vehicle receiving pipeline (the main render pass).
+    plain_shadowed_pipeline: vk::Pipeline,
+    plain_shadowed_layout: vk::PipelineLayout,
+    plain_shadowed_sets: [vk::DescriptorSet; MATERIAL_COUNT * 2],
+    plain_shadowed_pool: vk::DescriptorPool,
+    plain_shadowed_set_layout: vk::DescriptorSetLayout,
+}
+
+impl ShadowedProxyResources {
+    /// Builds the shadowed-populated proxy state against the shadow
+    /// state's depth pass, its extended uniform, its per-slot map
+    /// views, and the skinned state's pose buffer. Partial-
+    /// construction safe (the release discipline).
+    pub(super) fn new(
+        ctx: &VulkanContext,
+        shadows: &super::shadow_draw::ShadowResources,
+        skinned: &SkinnedProxyResources,
+        corner: &CornerResources,
+        main_render_pass: vk::RenderPass,
+    ) -> Result<Self, RendererError> {
+        let _slots = FRAMES_IN_FLIGHT as usize;
+        let mut partial = ShadowedProxyResources {
+            skinned_depth_pipeline: vk::Pipeline::null(),
+            skinned_depth_layout: vk::PipelineLayout::null(),
+            skinned_depth_set: vk::DescriptorSet::null(),
+            skinned_depth_pool: vk::DescriptorPool::null(),
+            skinned_depth_set_layout: vk::DescriptorSetLayout::null(),
+            plain_depth_pipeline: vk::Pipeline::null(),
+            skinned_shadowed_pipeline: vk::Pipeline::null(),
+            skinned_shadowed_layout: vk::PipelineLayout::null(),
+            skinned_shadowed_sets: [vk::DescriptorSet::null(); MATERIAL_COUNT * 2],
+            skinned_shadowed_pool: vk::DescriptorPool::null(),
+            skinned_shadowed_set_layout: vk::DescriptorSetLayout::null(),
+            plain_shadowed_pipeline: vk::Pipeline::null(),
+            plain_shadowed_layout: vk::PipelineLayout::null(),
+            plain_shadowed_sets: [vk::DescriptorSet::null(); MATERIAL_COUNT * 2],
+            plain_shadowed_pool: vk::DescriptorPool::null(),
+            plain_shadowed_set_layout: vk::DescriptorSetLayout::null(),
+        };
+        if let Err(error) = partial.build(ctx, shadows, skinned, corner, main_render_pass) {
+            partial.release(ctx);
+            return Err(error);
+        }
+        Ok(partial)
+    }
+
+    fn build(
+        &mut self,
+        ctx: &VulkanContext,
+        shadows: &super::shadow_draw::ShadowResources,
+        skinned: &SkinnedProxyResources,
+        corner: &CornerResources,
+        main_render_pass: vk::RenderPass,
+    ) -> Result<(), RendererError> {
+        let frag = vk::ShaderStageFlags::FRAGMENT;
+        let vert = vk::ShaderStageFlags::VERTEX;
+        let both = vert | frag;
+        let combined = vk::DescriptorType::COMBINED_IMAGE_SAMPLER;
+        let uniform_dynamic = vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC;
+        let uniform = vk::DescriptorType::UNIFORM_BUFFER;
+        let sampled = vk::DescriptorType::SAMPLED_IMAGE;
+        let storage_dynamic = vk::DescriptorType::STORAGE_BUFFER_DYNAMIC;
+
+        // --- The NPC CAST pipeline: the shadow state's depth pass,
+        // the skinned vertex input (the same skinning matrices the
+        // skinned lit pipeline reads through binding 5).
+        let binding = |index: u32, ty: vk::DescriptorType, stages: vk::ShaderStageFlags| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(index)
+                .descriptor_type(ty)
+                .descriptor_count(1)
+                .stage_flags(stages)
+        };
+        let depth_bindings = [
+            binding(0, combined, frag),
+            binding(2, uniform_dynamic, both),
+        ];
+        let depth_sizes = [combined, uniform_dynamic].map(|ty| vk::DescriptorPoolSize {
+            ty,
+            descriptor_count: 1,
+        });
+        let (pool, layout, [set]) =
+            super::descriptors::create_sets::<1>(ctx, &depth_bindings, &depth_sizes, 1)?;
+        self.skinned_depth_pool = pool;
+        self.skinned_depth_set_layout = layout;
+        self.skinned_depth_set = set;
+
+        let samplers = [corner.nearest_sampler()];
+
+        for slot in 0..FRAMES_IN_FLIGHT as usize {
+            let _map_info = [vk::DescriptorImageInfo::default()
+                .image_view(shadows.map_view(slot))
+                .image_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)];
+            let frame = [vk::DescriptorBufferInfo::default().buffer(shadows.frame_buffer())];
+            let frame_write = vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(2)
+                .descriptor_type(uniform_dynamic)
+                .buffer_info(&frame);
+            unsafe {
+                ctx.device.update_descriptor_sets(&[frame_write], &[]);
+            }
+        }
+
+        self.skinned_depth_layout = unsafe {
+            ctx.device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&[self.skinned_depth_set_layout])
+                    .push_constant_ranges(&[]),
+                None,
+            )
+        }
+        .map_err(|e| RendererError::vk(e, "skinned shadow depth layout"))?;
+
+        self.skinned_depth_pipeline = skinned.build_skinned_depth_pipeline(
+            ctx,
+            include_bytes!(concat!(env!("OUT_DIR"), "/shadow_depth_skinned.spv")),
+            shadows.depth_render_pass(),
+            self.skinned_depth_layout,
+            "skinned shadow depth pipeline",
+        )?;
+
+        // --- The VEHICLE CAST pipeline: the PLAIN vertex input
+        // (locations 0-7) against the shadow state's depth pass,
+        // laid out for the shadow state's OWN depth set/layout (the
+        // recording binds them — no descriptors of ours).
+        self.plain_depth_pipeline = skinned.build_plain_depth_pipeline(
+            ctx,
+            include_bytes!(concat!(env!("OUT_DIR"), "/shadow_depth_instanced.spv")),
+            shadows.depth_render_pass(),
+            shadows.depth_layout(),
+            "plain shadow depth pipeline",
+        )?;
+
+        // --- The SHADOWED skinned lit sets: per material × slot.
+        let skinned_bindings = [
+            binding(0, combined, frag).immutable_samplers(&samplers),
+            binding(2, uniform_dynamic, both),
+            binding(3, uniform, frag),
+            binding(4, sampled, frag),
+            binding(5, storage_dynamic, vert),
+        ];
+        let set_count = (MATERIAL_COUNT * 2) as u32;
+        let skinned_sizes =
+            [combined, uniform_dynamic, uniform, sampled, storage_dynamic].map(|ty| {
+                vk::DescriptorPoolSize {
+                    ty,
+                    descriptor_count: set_count,
+                }
+            });
+        let (pool, layout, sets) = super::descriptors::create_sets::<{ MATERIAL_COUNT * 2 }>(
+            ctx,
+            &skinned_bindings,
+            &skinned_sizes,
+            set_count,
+        )?;
+        self.skinned_shadowed_pool = pool;
+        self.skinned_shadowed_set_layout = layout;
+        self.skinned_shadowed_sets = sets;
+        self.skinned_shadowed_layout = unsafe {
+            ctx.device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&[layout]),
+                None,
+            )
+        }
+        .map_err(|e| RendererError::vk(e, "skinned shadowed proxy layout"))?;
+
+        self.skinned_shadowed_pipeline = skinned.build_skinned_lit_pipeline(
+            ctx,
+            include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/instanced_proxy_skinned_shadowed.spv"
+            )),
+            main_render_pass,
+            self.skinned_shadowed_layout,
+            "skinned shadowed proxy pipeline",
+        )?;
+
+        // --- The SHADOWED plain lit sets: per material × slot.
+        let plain_bindings = [
+            binding(0, combined, frag).immutable_samplers(&samplers),
+            binding(2, uniform_dynamic, both),
+            binding(3, uniform, frag),
+            binding(4, sampled, frag),
+        ];
+        let plain_sizes =
+            [combined, uniform_dynamic, uniform, sampled].map(|ty| vk::DescriptorPoolSize {
+                ty,
+                descriptor_count: set_count,
+            });
+        let (pool, layout, sets) = super::descriptors::create_sets::<{ MATERIAL_COUNT * 2 }>(
+            ctx,
+            &plain_bindings,
+            &plain_sizes,
+            set_count,
+        )?;
+        self.plain_shadowed_pool = pool;
+        self.plain_shadowed_set_layout = layout;
+        self.plain_shadowed_sets = sets;
+        self.plain_shadowed_layout = unsafe {
+            ctx.device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&[layout]),
+                None,
+            )
+        }
+        .map_err(|e| RendererError::vk(e, "plain shadowed proxy layout"))?;
+
+        self.plain_shadowed_pipeline = skinned.build_plain_lit_pipeline(
+            ctx,
+            include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/instanced_proxy_skinned_shadowed.spv"
+            )),
+            main_render_pass,
+            self.plain_shadowed_layout,
+            "plain shadowed proxy pipeline",
+        )?;
+
+        Ok(())
+    }
+
+    /// The npc kind's skinned shadowed pipeline layout and set for
+    /// `material` and `slot`, plus the dynamic offsets ([frame,
+    /// pose]). The caller must validate `material < MATERIAL_COUNT`.
+    /// Note: the pose offset comes from the external `skinned` state
+    /// passed to `record_depth_casts`, not stored in this structure.
+    pub(super) fn skinned_shadowed_bind(
+        &self,
+        material: u32,
+        slot: usize,
+        shadows_frame_stride: u32,
+        skinned_pose_offset: u32,
+    ) -> (vk::PipelineLayout, vk::DescriptorSet, [u32; 2]) {
+        let set = self.skinned_shadowed_sets[material as usize * 2 + slot];
+        (
+            self.skinned_shadowed_layout,
+            set,
+            [slot as u32 * shadows_frame_stride, skinned_pose_offset],
+        )
+    }
+
+    /// The vehicle kind's plain shadowed pipeline layout and set for
+    /// `material` and `slot`, plus the dynamic offset ([frame]).
+    pub(super) fn plain_shadowed_bind(
+        &self,
+        material: u32,
+        slot: usize,
+        shadows_frame_stride: u32,
+    ) -> (vk::PipelineLayout, vk::DescriptorSet, u32) {
+        let set = self.plain_shadowed_sets[material as usize * 2 + slot];
+        (
+            self.plain_shadowed_layout,
+            set,
+            slot as u32 * shadows_frame_stride,
+        )
+    }
+
+    /// The main-pass skinned shadowed pipeline handle.
+    pub(super) fn skinned_shadowed_pipeline(&self) -> vk::Pipeline {
+        self.skinned_shadowed_pipeline
+    }
+
+    /// The main-pass plain shadowed pipeline handle.
+    pub(super) fn plain_shadowed_pipeline(&self) -> vk::Pipeline {
+        self.plain_shadowed_pipeline
+    }
+
+    /// Releases every handle exactly once; valid for both the
+    /// fully-built and the partial state (null handles denote
+    /// partial construction).
+    pub(super) fn release(&mut self, ctx: &VulkanContext) {
+        // SAFETY: owned by this state; the owning PipelineState is
+        // destroyed only while the device is idle (replacement waits;
+        // teardown waits), after the pipelines reading the
+        // shadow state's depth pass and the skinned state's pose
+        // buffer.
+        unsafe {
+            for pipeline in [
+                self.skinned_depth_pipeline,
+                self.plain_depth_pipeline,
+                self.skinned_shadowed_pipeline,
+                self.plain_shadowed_pipeline,
+            ] {
+                if pipeline != vk::Pipeline::null() {
+                    ctx.device.destroy_pipeline(pipeline, None);
+                }
+            }
+            for layout in [
+                self.skinned_depth_layout,
+                self.skinned_shadowed_layout,
+                self.plain_shadowed_layout,
+            ] {
+                if layout != vk::PipelineLayout::null() {
+                    ctx.device.destroy_pipeline_layout(layout, None);
+                }
+            }
+            for pool in [
+                self.skinned_depth_pool,
+                self.skinned_shadowed_pool,
+                self.plain_shadowed_pool,
+            ] {
+                if pool != vk::DescriptorPool::null() {
+                    ctx.device.destroy_descriptor_pool(pool, None);
+                }
+            }
+            for layout in [
+                self.skinned_depth_set_layout,
+                self.skinned_shadowed_set_layout,
+                self.plain_shadowed_set_layout,
+            ] {
+                if layout != vk::DescriptorSetLayout::null() {
+                    ctx.device.destroy_descriptor_set_layout(layout, None);
+                }
+            }
+            self.skinned_depth_pipeline = vk::Pipeline::null();
+            self.plain_depth_pipeline = vk::Pipeline::null();
+            self.skinned_shadowed_pipeline = vk::Pipeline::null();
+            self.plain_shadowed_pipeline = vk::Pipeline::null();
+            self.skinned_depth_layout = vk::PipelineLayout::null();
+            self.skinned_shadowed_layout = vk::PipelineLayout::null();
+            self.plain_shadowed_layout = vk::PipelineLayout::null();
+            self.skinned_depth_pool = vk::DescriptorPool::null();
+            self.skinned_shadowed_pool = vk::DescriptorPool::null();
+            self.plain_shadowed_pool = vk::DescriptorPool::null();
+            self.skinned_depth_set_layout = vk::DescriptorSetLayout::null();
+            self.skinned_shadowed_set_layout = vk::DescriptorSetLayout::null();
+            self.plain_shadowed_set_layout = vk::DescriptorSetLayout::null();
+        }
+    }
+
+    /// Records the proxy casts into this slot's shadow map, INSIDE
+    /// the depth pass's render pass (the caller has begun it and
+    /// drawn the corner mesh; this binds each populated kind's depth
+    /// pipeline and draws the same instance ranges the lit pass will
+    /// draw). Returns the recorded draw-call count.
+    ///
+    /// # Safety
+    /// `cmd` is recording INSIDE the depth pass; the slot's instance
+    /// and pose regions hold this frame's bytes (written after the
+    /// fence wait, before the pass began).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn record_depth_casts(
+        &self,
+        ctx: &VulkanContext,
+        cmd: vk::CommandBuffer,
+        _corner: &CornerResources,
+        shadows: &super::shadow_draw::ShadowResources,
+        skinned: &SkinnedProxyResources,
+        slot: usize,
+        upload: &super::proxy_draw::ProxyFrameUpload<'_>,
+        proxy: &super::proxy_draw::ProxyResources,
+    ) -> u32 {
+        let frame_offset = slot as u32 * shadows.frame_stride();
+        let pose_offset = skinned.pose_offset(slot);
+        let mut calls = 0;
+
+        // NPC kind (the skinned depth pipeline)
+        if upload.npc_count > 0 {
+            unsafe {
+                ctx.device.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.skinned_depth_pipeline,
+                );
+                ctx.device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.skinned_depth_layout,
+                    0,
+                    &[self.skinned_depth_set],
+                    &[frame_offset, pose_offset],
+                );
+            }
+            proxy.bind_kind_buffers(ctx, cmd, super::proxy_draw::ProxyKind::Npc, slot, upload);
+            match upload.mode {
+                crate::ProxyDrawMode::PerInstance => {
+                    let range = super::proxy_draw::kind_instance_range(
+                        upload.npc_count,
+                        upload.vehicle_count,
+                        super::proxy_draw::ProxyKind::Npc,
+                    );
+                    let base =
+                        proxy.slot_bytes() * slot as u64 + range.start * INSTANCE_STRIDE as u64;
+                    for index in 0..upload.npc_count as u64 {
+                        unsafe {
+                            ctx.device.cmd_bind_vertex_buffers(
+                                cmd,
+                                1,
+                                &[proxy.instances()],
+                                &[base + index * INSTANCE_STRIDE as u64],
+                            );
+                        }
+                        unsafe {
+                            ctx.device.cmd_draw(cmd, proxy.npc_vertices(), 1, 0, 0);
+                        }
+                        calls += 1;
+                    }
+                }
+                crate::ProxyDrawMode::Instanced => {
+                    unsafe {
+                        ctx.device
+                            .cmd_draw(cmd, proxy.npc_vertices(), upload.npc_count, 0, 0);
+                    }
+                    calls += 1;
+                }
+                crate::ProxyDrawMode::Indirect => {
+                    let indirect = proxy.indirect.as_ref().expect(
+                        "the indirect ensure discipline makes a missing \
+                         command buffer unreachable",
+                    );
+                    let offset = (slot * crate::proxy_indirect::INDIRECT_SLOT_BYTES) as u64;
+                    unsafe {
+                        ctx.device.cmd_draw_indirect(
+                            cmd,
+                            indirect.buffer(),
+                            offset,
+                            1,
+                            crate::proxy_indirect::INDIRECT_COMMAND_BYTES as u32,
+                        );
+                    }
+                    ctx.indirect_draws_issued
+                        .set(ctx.indirect_draws_issued.get() + 1);
+                    calls += 1;
+                }
+            }
+        }
+
+        // Vehicle kind (the plain depth pipeline)
+        if upload.vehicle_count > 0 {
+            unsafe {
+                ctx.device.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.plain_depth_pipeline,
+                );
+                ctx.device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    shadows.depth_layout(),
+                    0,
+                    &[shadows.depth_set()],
+                    &[frame_offset],
+                );
+            }
+            proxy.bind_kind_buffers(
+                ctx,
+                cmd,
+                super::proxy_draw::ProxyKind::Vehicle,
+                slot,
+                upload,
+            );
+            match upload.mode {
+                crate::ProxyDrawMode::PerInstance => {
+                    let range = super::proxy_draw::kind_instance_range(
+                        upload.npc_count,
+                        upload.vehicle_count,
+                        super::proxy_draw::ProxyKind::Vehicle,
+                    );
+                    let base =
+                        proxy.slot_bytes() * slot as u64 + range.start * INSTANCE_STRIDE as u64;
+                    for index in 0..upload.vehicle_count as u64 {
+                        unsafe {
+                            ctx.device.cmd_bind_vertex_buffers(
+                                cmd,
+                                1,
+                                &[proxy.instances()],
+                                &[base + index * INSTANCE_STRIDE as u64],
+                            );
+                        }
+                        unsafe {
+                            ctx.device.cmd_draw(cmd, proxy.vehicle_vertices(), 1, 0, 0);
+                        }
+                        calls += 1;
+                    }
+                }
+                crate::ProxyDrawMode::Instanced => {
+                    unsafe {
+                        ctx.device.cmd_draw(
+                            cmd,
+                            proxy.vehicle_vertices(),
+                            upload.vehicle_count,
+                            0,
+                            0,
+                        );
+                    }
+                    calls += 1;
+                }
+                crate::ProxyDrawMode::Indirect => {
+                    let indirect = proxy.indirect.as_ref().expect(
+                        "the indirect ensure discipline makes a missing \
+                         command buffer unreachable",
+                    );
+                    let offset = (slot * crate::proxy_indirect::INDIRECT_SLOT_BYTES
+                        + crate::proxy_indirect::INDIRECT_COMMAND_BYTES)
+                        as u64;
+                    unsafe {
+                        ctx.device.cmd_draw_indirect(
+                            cmd,
+                            indirect.buffer(),
+                            offset,
+                            1,
+                            crate::proxy_indirect::INDIRECT_COMMAND_BYTES as u32,
+                        );
+                    }
+                    ctx.indirect_draws_issued
+                        .set(ctx.indirect_draws_issued.get() + 1);
+                    calls += 1;
+                }
+            }
+        }
+
+        calls
     }
 }

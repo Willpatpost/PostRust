@@ -36,6 +36,19 @@ use ash::vk;
 ///
 /// Both arms now have identical guards in the recorder, and un-ensured variants
 /// (e.g. `sky_hdr` not yet created) silently skip that draw.
+///
+/// # Shadowed arm proxy support
+///
+/// The shadowed arm's proxy draws use the shadowed-populated state's
+/// own pipelines and sets (the npc kind's `skinned_shadowed` set with
+/// the skinned shadowed pipeline, the vehicle kind's `plain_shadowed`
+/// set with the plain shadowed pipeline). The HDR arm's shadowed
+/// variant (the follow-up, the ensure_shadowed_hdr precedent) would
+/// need separate shadowed-HDR pipelines — for THIS stage, the HDR arm
+/// passes `None` for `shadowed_proxy_skinned` and `shadowed_proxy_vehicle`,
+/// so the shadowed arm's belt-check skips proxy draws when HDR is
+/// active (--populated --shadows --post together draws the proxies
+/// unshadowed-in-HDR until the shadowed HDR variants land).
 #[derive(Clone, Copy)]
 pub(crate) struct SceneTargetPipelines {
     /// The sky pipeline handle — `Option` for belt-check style guards.
@@ -57,6 +70,13 @@ pub(crate) struct SceneTargetPipelines {
     /// HDR pass: the skinned state's `skinned_hdr` (ensured at the
     /// first populated post frame).
     pub proxy_skinned: Option<vk::Pipeline>,
+    /// The shadowed-populated npc kind pipeline (the main pass's
+    /// skinned shadowed pipeline). HDR passes `None` (see the struct
+    /// doc above: the shadowed HDR variant is a follow-up).
+    pub shadowed_proxy_skinned: Option<vk::Pipeline>,
+    /// The shadowed-populated vehicle kind pipeline (the main pass's
+    /// plain shadowed pipeline). HDR passes `None`.
+    pub shadowed_proxy_vehicle: Option<vk::Pipeline>,
 }
 
 /// Records the unified corner scene sequence: sky (if present), corner
@@ -187,10 +207,82 @@ pub(crate) unsafe fn record_corner_scene(
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, shadowed_pipeline);
             corner_resources.draw(ctx, cmd, layout, &sets, frame_offset);
         }
-        // The shadowed arm never draws proxies (the original's shape —
-        // the populated shadowed frames draw through the ordinary
-        // branch's proxy section only in the unshadowed family).
-        return Some(0);
+        // The shadowed arm draws proxies only on the main pass (the
+        // HDR arm's shadowed variant is a follow-up — see the struct
+        // doc: the HDR arm passes None for `shadowed_proxy_skinned`
+        // and `shadowed_proxy_vehicle`, so this belt-check skips).
+        if targets.shadowed_proxy_skinned.is_none() || targets.shadowed_proxy_vehicle.is_none() {
+            return Some(0);
+        }
+        let shadowed_proxy = pipes.shadowed_proxy.as_ref().expect(
+            "the shadowed-proxy ensure discipline makes a populated shadowed frame's \
+             missing shadowed-proxy state unreachable",
+        );
+        let skinned = pipes.skinned.as_ref().expect(
+            "the skinned ensure discipline makes a populated frame's \
+             missing skinned state unreachable",
+        );
+        let proxy_state = pipes.proxy.as_ref().expect(
+            "the proxy ensure discipline makes a populated shadowed frame's \
+             missing proxy state unreachable",
+        );
+        let calls = if let Some(upload) = proxy {
+            // The per-kind proxy draws through the SHADOWED family's
+            // own pipelines and sets — the npc kind's skinned-shadowed
+            // set (binding 2 = the shadow state's EXTENDED FrameParams
+            // at the shadow uniform's stride, binding 4 = this slot's
+            // map view, binding 5 = the pose slot) and the vehicle
+            // kind's plain-shadowed set. NEVER the unshadowed sets:
+            // their binding 2 points at the corner's 112-byte PLAIN
+            // block, which the 192-byte shadowed shader would read
+            // past (the first wiring draft made exactly that mistake
+            // — the discarded-bind bug this repair exists to fix).
+            let (skinned_layout, skinned_set, [skinned_frame, skinned_pose]) = shadowed_proxy
+                .skinned_shadowed_bind(
+                    upload.npc_material,
+                    slot,
+                    shadow_state.frame_stride(),
+                    skinned.pose_offset(slot),
+                );
+            let skinned_bind = crate::vulkan::proxy_draw::SkinnedSetBind {
+                layout: skinned_layout,
+                set: skinned_set,
+                frame_offset: skinned_frame,
+                pose_offset: skinned_pose,
+            };
+            let (vehicle_layout, vehicle_set, vehicle_frame) = shadowed_proxy.plain_shadowed_bind(
+                upload.vehicle_material,
+                slot,
+                shadow_state.frame_stride(),
+            );
+            let vehicle_bind = crate::vulkan::proxy_draw::VehicleSetBind {
+                layout: vehicle_layout,
+                set: vehicle_set,
+                frame_offset: vehicle_frame,
+            };
+            let pipelines = crate::vulkan::proxy_draw::ProxyPipelines {
+                vehicle: targets.shadowed_proxy_vehicle.unwrap(),
+                npc: targets.shadowed_proxy_skinned.unwrap(),
+            };
+            // SAFETY: the per-kind pipelines are bound with their own
+            // layouts inside their render pass (the draw does the
+            // binding); the sets are the shadowed-populated state's
+            // own (material-validated at the safe layer); this slot's
+            // instance AND pose regions hold this frame's bytes
+            // (written above, after the fence wait).
+            proxy_state.draw(
+                ctx,
+                cmd,
+                slot,
+                upload,
+                &pipelines,
+                &skinned_bind,
+                &vehicle_bind,
+            )
+        } else {
+            0
+        };
+        return Some(calls);
     }
     if let (Some(_params), Some(lit_pipeline)) = (corner_params, targets.lit) {
         // Ordinary branch: bind the lit pipeline, draw the corner mesh.
@@ -243,11 +335,16 @@ pub(crate) unsafe fn record_corner_scene(
                 set: skinned_state
                     .set(upload.npc_material)
                     .unwrap_or(vk::DescriptorSet::null()),
+                frame_offset: slot as u32 * corner_resources.dynamic_stride(),
                 pose_offset: skinned_state.pose_offset(slot),
+            };
+            let vehicle_bind = crate::vulkan::proxy_draw::VehicleSetBind {
+                layout: pipes.proxy_layout,
+                set: sets[1],
+                frame_offset: slot as u32 * corner_resources.dynamic_stride(),
             };
             let pipelines = crate::vulkan::proxy_draw::ProxyPipelines {
                 vehicle: proxy_pipeline,
-                vehicle_layout: pipes.proxy_layout,
                 npc: skinned_pipeline,
             };
             // SAFETY: the per-kind pipelines are bound with their own
@@ -258,12 +355,11 @@ pub(crate) unsafe fn record_corner_scene(
             let recorded = proxy_state.draw(
                 ctx,
                 cmd,
-                corner_resources,
                 slot,
                 upload,
-                sets,
                 &pipelines,
                 &skinned_bind,
+                &vehicle_bind,
             );
             // The recorded count and the pure submission model must
             // agree (the unit test pins the model; this co-pins the

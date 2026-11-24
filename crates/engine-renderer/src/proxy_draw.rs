@@ -66,7 +66,6 @@
 //! of pipeline assembly with the SAME descriptor set layout as the
 //! lit pipeline (the 6-B foundation; no new bindings).
 
-use super::corner::CornerResources;
 use super::{
     RendererError, VulkanContext, create_device_local_buffer_with_data, create_mapped_buffer,
 };
@@ -126,7 +125,6 @@ pub(crate) struct ProxyFrameUpload<'a> {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ProxyPipelines {
     pub vehicle: vk::Pipeline,
-    pub vehicle_layout: vk::PipelineLayout,
     pub npc: vk::Pipeline,
 }
 
@@ -138,7 +136,22 @@ pub(crate) struct ProxyPipelines {
 pub(crate) struct SkinnedSetBind {
     pub layout: vk::PipelineLayout,
     pub set: vk::DescriptorSet,
+    /// The binding-2 dynamic offset (the FrameParams slot region —
+    /// the CORNER uniform's stride for the unshadowed family, the
+    /// SHADOW uniform's for the shadowed family; the caller supplies
+    /// the right one, NEVER derived here).
+    pub frame_offset: u32,
     pub pose_offset: u32,
+}
+
+/// The vehicle kind's set bind (the plain proxy set — the corner
+/// material set for the unshadowed family, the plain-shadowed set
+/// for the shadowed family; one dynamic offset at binding 2).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VehicleSetBind {
+    pub layout: vk::PipelineLayout,
+    pub set: vk::DescriptorSet,
+    pub frame_offset: u32,
 }
 
 /// The per-kind instance range within one slot's packed bytes (the
@@ -197,6 +210,12 @@ pub(crate) struct IndirectResources {
 }
 
 impl IndirectResources {
+    /// The indirect command buffer handle (Era-2 stage 4b: the
+    /// shadowed depth pass needs access to this buffer).
+    pub(super) fn buffer(&self) -> vk::Buffer {
+        self.buffer
+    }
+
     fn new(
         ctx: &VulkanContext,
         npc_vertices: u32,
@@ -423,17 +442,15 @@ impl ProxyResources {
         &self,
         ctx: &VulkanContext,
         cmd: vk::CommandBuffer,
-        corner: &CornerResources,
         slot: usize,
         upload: &ProxyFrameUpload<'_>,
-        sets: [vk::DescriptorSet; 2],
         pipelines: &ProxyPipelines,
         skinned: &SkinnedSetBind,
+        vehicle: &VehicleSetBind,
     ) -> u32 {
-        let frame_offset = slot as u32 * corner.dynamic_stride();
         let slot_start = self.slot_bytes * slot as u64;
         let mut calls = 0;
-        for (kind, set) in [ProxyKind::Npc, ProxyKind::Vehicle].into_iter().zip(sets) {
+        for kind in [ProxyKind::Npc, ProxyKind::Vehicle] {
             let (vbo, vertex_count, count, kind_index) = match kind {
                 ProxyKind::Npc => (self.npc_vbo, self.npc_vertices, upload.npc_count, 0),
                 ProxyKind::Vehicle => (
@@ -471,7 +488,7 @@ impl ProxyResources {
                             skinned.layout,
                             0,
                             &[skinned.set],
-                            &[frame_offset, skinned.pose_offset],
+                            &[skinned.frame_offset, skinned.pose_offset],
                         );
                     }
                     ProxyKind::Vehicle => {
@@ -484,10 +501,10 @@ impl ProxyResources {
                         ctx.device.cmd_bind_descriptor_sets(
                             cmd,
                             vk::PipelineBindPoint::GRAPHICS,
-                            pipelines.vehicle_layout,
+                            vehicle.layout,
                             0,
-                            &[set],
-                            &[frame_offset],
+                            &[vehicle.set],
+                            &[vehicle.frame_offset],
                         );
                     }
                 }
@@ -579,8 +596,55 @@ impl ProxyResources {
         calls
     }
 
+    /// Binds the per-kind VBO for `kind` at binding 0, and the
+    /// instance range for `slot` at binding 1. Used by the shadowed
+    /// depth pass (the proxy-cast path — the npc kind skins, the
+    /// vehicle kind is plain). The instance range starts at `slot`'s
+    /// region plus the kind's offset within that region (the fixed
+    /// npc-then-vehicle order).
+    pub(super) fn bind_kind_buffers(
+        &self,
+        ctx: &VulkanContext,
+        cmd: vk::CommandBuffer,
+        kind: ProxyKind,
+        slot: usize,
+        upload: &ProxyFrameUpload<'_>,
+    ) {
+        let (vbo, _count) = match kind {
+            ProxyKind::Npc => (self.npc_vbo, upload.npc_count),
+            ProxyKind::Vehicle => (self.vehicle_vbo, upload.vehicle_count),
+        };
+        let range = kind_instance_range(upload.npc_count, upload.vehicle_count, kind);
+        let base = self.slot_bytes * slot as u64 + range.start * INSTANCE_STRIDE as u64;
+        unsafe {
+            ctx.device.cmd_bind_vertex_buffers(cmd, 0, &[vbo], &[0]);
+            ctx.device
+                .cmd_bind_vertex_buffers(cmd, 1, &[self.instances], &[base]);
+        }
+    }
+
     pub(super) fn destroy(mut self, ctx: &VulkanContext) {
         self.release(ctx);
+    }
+
+    /// The per-slot region size (bytes).
+    pub(super) fn slot_bytes(&self) -> u64 {
+        self.slot_bytes
+    }
+
+    /// The NPC mesh's vertex count.
+    pub(super) fn npc_vertices(&self) -> u32 {
+        self.npc_vertices
+    }
+
+    /// The vehicle mesh's vertex count.
+    pub(super) fn vehicle_vertices(&self) -> u32 {
+        self.vehicle_vertices
+    }
+
+    /// The mapped instance buffer handle.
+    pub(super) fn instances(&self) -> vk::Buffer {
+        self.instances
     }
 
     /// Releases every handle exactly once; valid for both the

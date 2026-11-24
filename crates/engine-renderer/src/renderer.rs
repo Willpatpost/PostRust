@@ -738,6 +738,140 @@ impl Renderer {
         Ok(self.finish_frame(outcome))
     }
 
+    /// Draws the corner scene with DIRECTIONAL SHADOWS PLUS a proxy
+    /// population (Era-2 stage 4b — the --populated --shadows
+    /// together path): the proxy instances CAST their shadows
+    /// through the shadowed depth pass AND receive shadows through
+    /// the shadowed lit pipeline, all through the same one-cascade
+    /// cascade (the deterministic core's `cascade_for`). The safe
+    /// layer's repacked instance and pose blocks are uploaded after
+    /// the slot's fence wait, before the command recording begins —
+    /// the proxy_instances and animation patterns. The proxy
+    /// population is validated BEFORE any frame state is touched: a
+    /// typed refusal (over-capacity total, invalid field, or a
+    /// material index outside the corner table) renders nothing and
+    /// leaves the frame flow untouched.
+    pub fn render_corner_populated_shadowed(
+        &mut self,
+        view_proj: &[[f32; 4]; 4],
+        eye: [f32; 3],
+        light: crate::lit_scene::LightParams,
+        bias: crate::shadows::ShadowBias,
+        population: &ProxyPopulation<'_>,
+        size: (u32, u32),
+    ) -> Result<FrameResult, RendererError> {
+        if self.config.demo_scene != crate::DemoScenePreference::Corner {
+            return Err(RendererError::Vulkan(
+                "render_corner_populated_shadowed requires the Corner scene preference".into(),
+            ));
+        }
+        let material_table = crate::lit_scene::materials().len() as u32;
+        if population.npc_material >= material_table
+            || population.vehicle_material >= material_table
+        {
+            return Err(RendererError::Vulkan(format!(
+                "proxy material index outside the corner material table \
+                 ({} materials, npc {}, vehicle {})",
+                material_table, population.npc_material, population.vehicle_material
+            )));
+        }
+        crate::proxy_instances::repack_populations(
+            &mut self.instance_bytes,
+            population.npc,
+            population.vehicle,
+        )
+        .map_err(RendererError::ProxyPack)?;
+        // The pose contract, validated BEFORE any frame state is
+        // touched (the capture-refusal discipline): every POPULATED
+        // npc's pose index must select a supplied block, and the
+        // block count is bounded (the repack's own typed refusal
+        // below enforces MAX_POSE_BLOCKS — this check is the
+        // index-vs-count half the repack cannot see).
+        if population
+            .npc
+            .iter()
+            .any(|instance| instance.pose_index as usize >= population.npc_poses.len())
+        {
+            return Err(RendererError::Vulkan(format!(
+                "a npc pose index falls outside the supplied pose blocks \
+                 ({} blocks, highest index {})",
+                population.npc_poses.len(),
+                population
+                    .npc
+                    .iter()
+                    .map(|instance| instance.pose_index)
+                    .max()
+                    .unwrap_or(0)
+            )));
+        }
+        crate::animation::repack_poses(&mut self.pose_bytes, population.npc_poses)
+            .map_err(RendererError::PosePack)?;
+        let boxes = crate::lit_scene::intersection_boxes();
+        let (min, max) = crate::shadows::scene_bounds(boxes);
+        let cascade = crate::shadows::cascade_for(light.dir_toward_light, min, max);
+        let [r, g, b] = light.ambient;
+        let params = vulkan::shadow_draw::ShadowFrameParams {
+            view_proj: *view_proj,
+            light_dir: [
+                light.dir_toward_light[0],
+                light.dir_toward_light[1],
+                light.dir_toward_light[2],
+                eye[0],
+            ],
+            light_color: [
+                light.light_color[0],
+                light.light_color[1],
+                light.light_color[2],
+                eye[1],
+            ],
+            ambient: [r, g, b, eye[2]],
+            light_view_proj: cascade.matrix,
+            shadow_control: [
+                crate::shadows::SHADOW_MAP_EXTENT as f32,
+                bias.constant,
+                bias.slope_scale,
+                0.0,
+            ],
+        };
+        let sky = self.sky_params(view_proj);
+        let wet = self.wet_camera(view_proj, eye, light);
+        // The ground re-draw (finding 5) needs the current camera in the
+        // corner buffer regardless of the lighting branch. Build the
+        // ordinary FrameParams and pass it in corner_params.
+        let corner_params = vulkan::corner::FrameParams::new(*view_proj, eye, light);
+        let upload = vulkan::proxy_draw::ProxyFrameUpload {
+            bytes: &self.instance_bytes,
+            pose_bytes: &self.pose_bytes,
+            npc_count: population.npc.len() as u32,
+            vehicle_count: population.vehicle.len() as u32,
+            npc_material: population.npc_material,
+            vehicle_material: population.vehicle_material,
+            mode: self.proxy_draw_mode,
+        };
+        let outcome = vulkan::render_frame(
+            &mut self.ctx,
+            &mut self.swapchain,
+            &mut self.pipes,
+            &mut self.frames,
+            size,
+            self.config.present_mode,
+            self.config.replace_pipelines,
+            self.config.demo_scene,
+            view_proj,
+            &[],
+            None,
+            &[],
+            &[],
+            Some(&corner_params),
+            Some(&upload),
+            Some(&params),
+            sky.as_ref(),
+            self.post,
+            wet.as_ref(),
+        )?;
+        Ok(self.finish_frame(outcome))
+    }
+
     /// Sets the proxy submission mode (the equivalence gate's axis —
     /// see [`ProxyDrawMode`]; the default is the production
     /// `Instanced` mode).
