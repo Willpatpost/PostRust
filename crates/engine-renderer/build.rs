@@ -70,6 +70,10 @@ fn main() {
     // the sky (equation-mirroring sky.rs) and the post pass (post.rs).
     compile_wgsl("sky.wgsl", "sky.spv");
     compile_wgsl("post.wgsl", "post.spv");
+    // The Era-1 package 6 bloom chain (see docs/CYCLE6-ERA1-BRIEF.md):
+    // the bright-passed 1/4 downsample + the separable blur feeding
+    // post.wgsl's composite — post.rs's chain, mirrored term-for-term.
+    compile_wgsl("bloom.wgsl", "bloom.spv");
 }
 
 /// The WGSL path (Cycle 6-A): parse + validate + emit ONE SPIR-V

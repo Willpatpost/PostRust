@@ -13,14 +13,17 @@
 //                the bright-passed downsample, composited additively
 //                before the tonemap.
 //
-// BINDINGS: 0 = the HDR scene color target (sampled), 1 = the
-// downsampled bloom mip (sampled), 2 = a small uniform (the texel
-// sizes). The implementer documents the final layout; the binding
-// map in build.rs covers 0-3.
+// BINDINGS: 0 = the HDR scene color target (sampled), 4 = the
+// downsampled bloom mip (sampled), 2 = the sampler, 3 = the
+// PostParams uniform. Binding 4 — NOT 1 — for the mip: the build's
+// pinned naga binding map remaps WGSL binding 1 onto descriptor 0
+// (the 6-A atlas texture+sampler share), so a binding-1 texture
+// would alias the scene target; binding 4 keeps its own descriptor
+// (the 6-F shadow map's own convention, see build.rs's map).
 
 @group(0) @binding(0)
 var scene_color: texture_2d<f32>;
-@group(0) @binding(1)
+@group(0) @binding(4)
 var bloom_mip: texture_2d<f32>;
 @group(0) @binding(2)
 var scene_sampler: sampler;

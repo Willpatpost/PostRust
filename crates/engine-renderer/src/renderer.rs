@@ -218,6 +218,15 @@ pub struct Renderer {
     /// draw the sky pass first; `None` keeps the skyless byte-identical
     /// path.
     sky: Option<SkyFrame>,
+    /// The Era-1 post chain's sticky setting (the same precedent):
+    /// `true` makes every subsequent corner-family frame render
+    /// through the HDR chain (the scene pass into the R16G16B16A16
+    /// target, the bloom mips, the composite + tonemap into the
+    /// swapchain); `false` keeps the postless byte-identical path.
+    /// The region path (`render_layers`) stays postless regardless —
+    /// the chain is a corner-family feature (the brief's reference
+    /// scene), documented like the sky's scope.
+    post: bool,
 }
 
 /// The Era-1 sky layer's frame description (the sticky `set_sky`
@@ -333,6 +342,7 @@ impl Renderer {
             instance_bytes: Vec::new(),
             proxy_draw_mode: ProxyDrawMode::default(),
             sky: None,
+            post: false,
         })
     }
 
@@ -420,6 +430,9 @@ impl Renderer {
             // setting's documented scope); the general region path
             // stays skyless.
             None,
+            // The post chain likewise (the region path stays
+            // postless — the setting's documented scope).
+            false,
         )?;
         Ok(self.finish_frame(outcome))
     }
@@ -457,6 +470,7 @@ impl Renderer {
             None,
             None,
             sky.as_ref(),
+            self.post,
         )?;
         Ok(self.finish_frame(outcome))
     }
@@ -530,6 +544,7 @@ impl Renderer {
             Some(&upload),
             None,
             sky.as_ref(),
+            self.post,
         )?;
         Ok(self.finish_frame(outcome))
     }
@@ -604,6 +619,7 @@ impl Renderer {
             None,
             Some(&params),
             sky.as_ref(),
+            self.post,
         )?;
         Ok(self.finish_frame(outcome))
     }
@@ -635,6 +651,25 @@ impl Renderer {
     /// The current sky setting.
     pub fn sky(&self) -> Option<SkyFrame> {
         self.sky
+    }
+
+    /// Sets the Era-1 post chain (the set_sky precedent: a sticky
+    /// per-renderer setting). `true` makes every subsequent
+    /// corner-family frame render through the HDR chain — the
+    /// scene pass into the offscreen R16G16B16A16 target, the
+    /// bloom mips, and the composite + ACES tonemap into the
+    /// swapchain (`post.rs`'s equations, the shader chain's
+    /// mirrors). `false` restores the postless path
+    /// (byte-identical to the pre-package renderer; the post
+    /// state, once created, stays allocated — the lazy
+    /// discipline's either-way rule).
+    pub fn set_post(&mut self, post: bool) {
+        self.post = post;
+    }
+
+    /// The current post setting.
+    pub fn post(&self) -> bool {
+        self.post
     }
 
     /// The sky pass's per-frame parameters from the sticky setting

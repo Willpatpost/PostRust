@@ -273,6 +273,20 @@ impl SkyResources {
         }
     }
 
+    /// The sky draw's descriptor set and pipeline layout (the
+    /// Era-1 post chain's HDR sky pass binds ITS OWN pipeline
+    /// against the same set — the state, uniform, and layout are
+    /// shared, only the render pass differs).
+    pub(super) fn set_and_layout(&self) -> (vk::DescriptorSet, vk::PipelineLayout) {
+        (self.sky_set, self.sky_layout)
+    }
+
+    /// The sky params' per-slot dynamic-uniform stride (the HDR sky
+    /// pass binds the same per-slot offsets the main one does).
+    pub(super) fn frame_stride(&self) -> u32 {
+        self.frame_stride
+    }
+
     /// Records the sky draw — FIRST inside the main render pass
     /// (before every scene draw), one fullscreen triangle, no depth
     /// interaction.

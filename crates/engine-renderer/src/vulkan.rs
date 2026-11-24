@@ -105,6 +105,8 @@ use ash::{Device, Entry, Instance};
 pub(crate) mod corner;
 #[path = "descriptors.rs"]
 pub mod descriptors;
+#[path = "post_draw.rs"]
+pub(crate) mod post_draw;
 #[path = "proxy_draw.rs"]
 pub(crate) mod proxy_draw;
 #[path = "shadow_draw.rs"]
@@ -1428,6 +1430,15 @@ pub(crate) struct PipelineState {
     /// with this state (the pipeline reading it does); a replacement
     /// re-ensures an identical set before installation (finding A).
     pub sky: Option<sky_draw::SkyResources>,
+    /// The Era-1 post state (the HDR render-target chain: the HDR
+    /// scene pass, the bloom mip chain, and the composite pass),
+    /// created LAZILY at the first post frame — the region-buffer
+    /// precedent: the postless path pays nothing and its allocation
+    /// pins are untouched (a postless frame's bytes are identical
+    /// to the pre-package renderer's). Dies with this state; a
+    /// replacement re-ensures an identical set before installation
+    /// (finding A).
+    pub post: Option<post_draw::PostResources>,
     /// Per-slot vertex capacity of the dynamic region-scene buffer
     /// (Stage 4 graphical integration — the same disjoint per-slot
     /// pattern as the overlay).
@@ -1475,6 +1486,7 @@ impl PipelineState {
             proxy: None,
             shadows: None,
             sky: None,
+            post: None,
         };
         if let Err(error) = state.build(ctx, color_format, depth_format, demo_scene) {
             state.destroy(ctx);
@@ -1607,6 +1619,37 @@ impl PipelineState {
             return Ok(());
         }
         self.sky = Some(sky_draw::SkyResources::new(ctx, self.render_pass)?);
+        Ok(())
+    }
+
+    /// Allocates the Era-1 post state on the first post frame (the
+    /// same lazy discipline: the postless path pays nothing — its
+    /// allocation pins are untouched, and a postless frame's bytes
+    /// are identical to the pre-package renderer's). The state's
+    /// extent-bound targets are NOT built here (they need the
+    /// live swapchain's extent and views — the frame flow ensures
+    /// them after the acquire); a no-op once allocated.
+    pub(crate) fn ensure_post_resources(
+        &mut self,
+        ctx: &VulkanContext,
+        swapchain_format: vk::Format,
+        depth_format: vk::Format,
+    ) -> Result<(), RendererError> {
+        if self.post.is_some() {
+            return Ok(());
+        }
+        if ctx.corner.is_none() {
+            return Err(RendererError::Vulkan(
+                "the post chain requires the Corner scene preference".into(),
+            ));
+        }
+        self.post = Some(post_draw::PostResources::new(
+            ctx,
+            swapchain_format,
+            depth_format,
+            self.lit_layout,
+            self.proxy_layout,
+        )?);
         Ok(())
     }
 
@@ -2070,6 +2113,9 @@ impl PipelineState {
             }
             if let Some(sky) = self.sky.take() {
                 sky.destroy(ctx);
+            }
+            if let Some(post) = self.post.take() {
+                post.destroy(ctx);
             }
             if !self.region_mapped.is_null() {
                 ctx.device.unmap_memory(self.region_vbo_memory);
@@ -2997,7 +3043,8 @@ pub(crate) struct FrameOutcome {
 // needs; bundling them would hide the ownership story for no gain.
 // The Era-1 sky pass rides the same flat list (the one-Option-per-layer
 // shape; the sky is a layer like the shadowed one, drawn first when
-// present).
+// present). The Era-1 post chain rides it as ONE bool (the chain has no
+// per-frame data at all — its only uniform is extent-static).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_frame(
     ctx: &mut VulkanContext,
@@ -3017,6 +3064,7 @@ pub(crate) fn render_frame(
     proxy: Option<&proxy_draw::ProxyFrameUpload<'_>>,
     shadowed: Option<&shadow_draw::ShadowFrameParams>,
     sky: Option<&sky_draw::SkyFrameParams>,
+    post: bool,
 ) -> Result<FrameOutcome, RendererError> {
     let mut outcome = FrameOutcome::default();
     let slot = frames.frame_slot;
@@ -3129,6 +3177,30 @@ pub(crate) fn render_frame(
     // identical set at the next sky frame (the 6-F finding-A shape).
     if sky.is_some() {
         pipes.ensure_sky_resources(ctx)?;
+    }
+
+    // The Era-1 lazy post state (the same discipline): created at
+    // the first post frame only, outside command recording — the
+    // postless path pays nothing and stays byte-identical. The
+    // family pipelines that depend on LAZY states (the shadowed
+    // and sky HDR variants) are ensured in the same order the
+    // frame flow ensures their states (shadows, then sky, then
+    // post — so the layouts exist by the time the variant
+    // pipelines bind them).
+    if post {
+        pipes.ensure_post_resources(ctx, swapchain.format, swapchain.depth_format)?;
+        if shadowed.is_some()
+            && let (Some(post_state), Some(shadow_state)) = (&mut pipes.post, &pipes.shadows)
+        {
+            let layout = shadow_state.shadowed(slot).1;
+            post_state.ensure_shadowed_hdr(ctx, layout)?;
+        }
+        if sky.is_some()
+            && let (Some(post_state), Some(sky_state)) = (&mut pipes.post, &pipes.sky)
+        {
+            let layout = sky_state.set_and_layout().1;
+            post_state.ensure_sky_hdr(ctx, layout)?;
+        }
     }
 
     // A previous present reported suboptimal — recreate before drawing
@@ -3290,13 +3362,17 @@ pub(crate) fn render_frame(
     let command = frames.command_buffers[slot];
     let framebuffer = swapchain.framebuffers[image_index as usize];
     let extent = swapchain.extent;
+    // The clear color (hoisted: the Era-1 post chain's HDR scene
+    // pass clears the SAME color the main pass would — the value
+    // is identical, only the attachment's format differs).
+    let clear_color = corner_params.map_or_else(
+        || shadowed.map_or([0.02, 0.02, 0.04, 1.0], |params| params.clear_color()),
+        corner::FrameParams::clear_color,
+    );
     let clear_values = [
         vk::ClearValue {
             color: vk::ClearColorValue {
-                float32: corner_params.map_or_else(
-                    || shadowed.map_or([0.02, 0.02, 0.04, 1.0], |params| params.clear_color()),
-                    corner::FrameParams::clear_color,
-                ),
+                float32: clear_color,
             },
         },
         vk::ClearValue {
@@ -3386,6 +3462,17 @@ pub(crate) fn render_frame(
     // (corrective finding C).
     let present_semaphore = frames.present_semaphore_for(ctx, image_index)?;
 
+    // The Era-1 post chain's extent-bound targets: ensured HERE —
+    // after the acquire settled the live swapchain (its extent and
+    // views are what the framebuffers bind), still outside command
+    // recording. A rebuild releases the old bundle only when the
+    // extent or view set changed, which only a recreation (already
+    // device-idle) can cause — the rebuild-safety proof in
+    // post_draw's module header.
+    if post && let Some(post_state) = &mut pipes.post {
+        post_state.ensure_targets(ctx, extent, &swapchain.views)?;
+    }
+
     unsafe {
         ctx.device
             .begin_command_buffer(
@@ -3418,193 +3505,224 @@ pub(crate) fn render_frame(
             shadow_state.record_depth_pass(ctx, command, corner, slot);
         }
 
-        ctx.device.cmd_begin_render_pass(
-            command,
-            &vk::RenderPassBeginInfo::default()
-                .render_pass(pipes.render_pass)
-                .framebuffer(framebuffer)
-                .render_area(scissor)
-                .clear_values(&clear_values),
-            vk::SubpassContents::INLINE,
-        );
-        ctx.device.cmd_set_viewport(command, 0, &[viewport]);
-        ctx.device.cmd_set_scissor(command, 0, &[scissor]);
-        // The Era-1 sky draw: FIRST inside the main render pass —
-        // the fullscreen triangle replaces the clear-color
-        // background with the sky equation, with NO depth
-        // interaction (no test, no write), so every scene draw below
-        // behaves exactly as it did over the clear (the
-        // unchanged-path proof: only the uncovered background
-        // changes). The ensure above guaranteed the state whenever
-        // `sky` is Some; the belt check keeps a skyless frame on the
-        // skyless path even if a prior sky frame created the state.
-        if let (Some(sky_state), Some(params)) = (&pipes.sky, sky) {
-            // SAFETY (both calls): this slot's fence wait passed above
-            // (the uniform region is disjoint from every other
-            // slot); the recording command buffer is inside the main
-            // render pass, before the scene draws.
-            sky_state.write_frame(slot, params);
-            sky_state.record(ctx, command, slot);
-        }
-        if shadowed.is_some()
-            && let (Some(resources), Some(shadow_state)) = (&ctx.corner, &pipes.shadows)
-        {
-            // The 6-F shadowed corner draws: the shadowed lit
-            // pipeline inside the main render pass, binding the
-            // shadow state's per-material sets for this slot (the
-            // map view rides binding 4; the FrameParams dynamic
-            // offset selects this slot's extended region — written
-            // before the depth pass above). The ensure above
-            // guaranteed the shadow state whenever `shadowed` is
-            // Some; the belt check keeps an unshadowed frame on the
-            // unshadowed path even if a prior shadowed frame created
-            // the state.
-            let (pipeline, layout, sets, frame_offset) = shadow_state.shadowed(slot);
-            ctx.device
-                .cmd_bind_pipeline(command, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            resources.draw(ctx, command, layout, &sets, frame_offset);
-        } else if let (Some(resources), Some(params)) = (&ctx.corner, corner_params) {
-            ctx.device.cmd_bind_pipeline(
+        // The Era-1 post chain (package 6): a post frame REPLACES
+        // the main render pass with the HDR chain — the scene pass
+        // into the offscreen R16G16B16A16 target, the bloom mips,
+        // and the composite + tonemap into the acquired swapchain
+        // image (post_draw's module header documents the whole
+        // sequence and its synchronization). A postless frame takes
+        // the main pass below, byte-identical to the pre-package
+        // renderer (the post state may exist — the belt check
+        // keeps a postless frame off the chain regardless).
+        if let (Some(post_state), true) = (&pipes.post, post) {
+            let inputs = post_draw::PostFrameInputs {
+                slot,
+                image_index,
+                extent,
+                clear_color,
+                corner_params,
+                proxy,
+                proxy_sets,
+                shadowed,
+                sky,
+            };
+            // SAFETY: the command buffer is recording past the
+            // shadow depth pass; this slot's fence wait passed (the
+            // uniform writes inside are disjoint per slot); the
+            // targets were ensured against the live swapchain
+            // after the acquire; `image_index` is the acquired
+            // image.
+            outcome.proxy_draw_calls = post_state.record(ctx, pipes, command, &inputs);
+        } else {
+            ctx.device.cmd_begin_render_pass(
                 command,
-                vk::PipelineBindPoint::GRAPHICS,
-                pipes.lit_pipeline,
+                &vk::RenderPassBeginInfo::default()
+                    .render_pass(pipes.render_pass)
+                    .framebuffer(framebuffer)
+                    .render_area(scissor)
+                    .clear_values(&clear_values),
+                vk::SubpassContents::INLINE,
             );
-            // The slot's fence wait passed above; the coherent frame
-            // regions do not overlap other slots or the immutable
-            // material tail.
-            resources.write_frame(slot, params);
-            resources.draw(
-                ctx,
-                command,
-                pipes.lit_layout,
-                resources.sets(),
-                slot as u32 * resources.frame_stride(),
-            );
-            // The 6-E instanced-proxy draws (same render pass, after
-            // the static corner mesh — the corner ground plane wins
-            // the coplanar depth at proxy footprints deterministically
-            // in BOTH submission modes, since the corner mesh draws
-            // first and proxy order is the packed instance order).
-            if let (Some(proxy_state), Some(upload), Some(sets)) = (&pipes.proxy, proxy, proxy_sets)
+            ctx.device.cmd_set_viewport(command, 0, &[viewport]);
+            ctx.device.cmd_set_scissor(command, 0, &[scissor]);
+            // The Era-1 sky draw: FIRST inside the main render pass —
+            // the fullscreen triangle replaces the clear-color
+            // background with the sky equation, with NO depth
+            // interaction (no test, no write), so every scene draw below
+            // behaves exactly as it did over the clear (the
+            // unchanged-path proof: only the uncovered background
+            // changes). The ensure above guaranteed the state whenever
+            // `sky` is Some; the belt check keeps a skyless frame on the
+            // skyless path even if a prior sky frame created the state.
+            if let (Some(sky_state), Some(params)) = (&pipes.sky, sky) {
+                // SAFETY (both calls): this slot's fence wait passed above
+                // (the uniform region is disjoint from every other
+                // slot); the recording command buffer is inside the main
+                // render pass, before the scene draws.
+                sky_state.write_frame(slot, params);
+                sky_state.record(ctx, command, slot);
+            }
+            if shadowed.is_some()
+                && let (Some(resources), Some(shadow_state)) = (&ctx.corner, &pipes.shadows)
             {
+                // The 6-F shadowed corner draws: the shadowed lit
+                // pipeline inside the main render pass, binding the
+                // shadow state's per-material sets for this slot (the
+                // map view rides binding 4; the FrameParams dynamic
+                // offset selects this slot's extended region — written
+                // before the depth pass above). The ensure above
+                // guaranteed the shadow state whenever `shadowed` is
+                // Some; the belt check keeps an unshadowed frame on the
+                // unshadowed path even if a prior shadowed frame created
+                // the state.
+                let (pipeline, layout, sets, frame_offset) = shadow_state.shadowed(slot);
+                ctx.device
+                    .cmd_bind_pipeline(command, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                resources.draw(ctx, command, layout, &sets, frame_offset);
+            } else if let (Some(resources), Some(params)) = (&ctx.corner, corner_params) {
                 ctx.device.cmd_bind_pipeline(
                     command,
                     vk::PipelineBindPoint::GRAPHICS,
-                    pipes.proxy_pipeline,
+                    pipes.lit_pipeline,
                 );
-                // SAFETY: the proxy pipeline is bound with its own
-                // layout inside its render pass; `sets` were validated
-                // before recording; this slot's instance region holds
-                // this frame's bytes (written above, after the fence
-                // wait).
-                let recorded = proxy_state.draw(
+                // The slot's fence wait passed above; the coherent frame
+                // regions do not overlap other slots or the immutable
+                // material tail.
+                resources.write_frame(slot, params);
+                resources.draw(
                     ctx,
                     command,
-                    pipes.proxy_layout,
-                    resources,
-                    slot,
-                    upload,
-                    sets,
+                    pipes.lit_layout,
+                    resources.sets(),
+                    slot as u32 * resources.frame_stride(),
                 );
-                // The recorded count and the pure submission model must
-                // agree (the unit test pins the model; this co-pins the
-                // loop against it in debug builds).
-                debug_assert_eq!(
-                    recorded,
-                    proxy_draw::proxy_draw_call_count(
-                        upload.mode,
-                        upload.npc_count,
-                        upload.vehicle_count
-                    )
-                );
-                outcome.proxy_draw_calls = recorded;
-            }
-        } else {
-            ctx.device.cmd_bind_pipeline(
-                command,
-                vk::PipelineBindPoint::GRAPHICS,
-                pipes.scene_pipeline,
-            );
-            ctx.device.cmd_push_constants(
-                command,
-                pipes.scene_layout,
-                vk::ShaderStageFlags::VERTEX,
-                0,
-                bytemuck::bytes_of(view_proj),
-            );
-            // The static demonstration scene draws only when the explicit
-            // opt-in uploaded it (`scene_index_count > 0`, P3) — an
-            // omitted renderer binds nothing and draws nothing here; the
-            // scene pipeline below still draws the dynamic region
-            // geometry through the same bound state.
-            if pipes.scene_index_count > 0 {
-                ctx.device
-                    .cmd_bind_vertex_buffers(command, 0, &[pipes.scene_vbo], &[0]);
-                ctx.device.cmd_bind_index_buffer(
+                // The 6-E instanced-proxy draws (same render pass, after
+                // the static corner mesh — the corner ground plane wins
+                // the coplanar depth at proxy footprints deterministically
+                // in BOTH submission modes, since the corner mesh draws
+                // first and proxy order is the packed instance order).
+                if let (Some(proxy_state), Some(upload), Some(sets)) =
+                    (&pipes.proxy, proxy, proxy_sets)
+                {
+                    ctx.device.cmd_bind_pipeline(
+                        command,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        pipes.proxy_pipeline,
+                    );
+                    // SAFETY: the proxy pipeline is bound with its own
+                    // layout inside its render pass; `sets` were validated
+                    // before recording; this slot's instance region holds
+                    // this frame's bytes (written above, after the fence
+                    // wait).
+                    let recorded = proxy_state.draw(
+                        ctx,
+                        command,
+                        pipes.proxy_layout,
+                        resources,
+                        slot,
+                        upload,
+                        sets,
+                    );
+                    // The recorded count and the pure submission model must
+                    // agree (the unit test pins the model; this co-pins the
+                    // loop against it in debug builds).
+                    debug_assert_eq!(
+                        recorded,
+                        proxy_draw::proxy_draw_call_count(
+                            upload.mode,
+                            upload.npc_count,
+                            upload.vehicle_count
+                        )
+                    );
+                    outcome.proxy_draw_calls = recorded;
+                }
+            } else {
+                ctx.device.cmd_bind_pipeline(
                     command,
-                    pipes.scene_ibo,
-                    0,
-                    vk::IndexType::UINT32,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipes.scene_pipeline,
                 );
-                ctx.device
-                    .cmd_draw_indexed(command, pipes.scene_index_count, 1, 0, 0, 0);
+                ctx.device.cmd_push_constants(
+                    command,
+                    pipes.scene_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    bytemuck::bytes_of(view_proj),
+                );
+                // The static demonstration scene draws only when the explicit
+                // opt-in uploaded it (`scene_index_count > 0`, P3) — an
+                // omitted renderer binds nothing and draws nothing here; the
+                // scene pipeline below still draws the dynamic region
+                // geometry through the same bound state.
+                if pipes.scene_index_count > 0 {
+                    ctx.device
+                        .cmd_bind_vertex_buffers(command, 0, &[pipes.scene_vbo], &[0]);
+                    ctx.device.cmd_bind_index_buffer(
+                        command,
+                        pipes.scene_ibo,
+                        0,
+                        vk::IndexType::UINT32,
+                    );
+                    ctx.device
+                        .cmd_draw_indexed(command, pipes.scene_index_count, 1, 0, 0, 0);
+                }
+
+                if outcome.region.drawn > 0 {
+                    let region_offset = (slot as vk::DeviceSize) * pipes.region_slot_bytes;
+                    ctx.device.cmd_bind_vertex_buffers(
+                        command,
+                        0,
+                        &[pipes.region_vbo],
+                        &[region_offset],
+                    );
+                    if world_drawn > 0 {
+                        ctx.device.cmd_draw(command, world_drawn, 1, 0, 0);
+                    }
+                    if let Some(layer) = foreground.filter(|_| outcome.foreground_drawn > 0) {
+                        let near_viewport = vk::Viewport {
+                            min_depth: 0.0,
+                            max_depth: FOREGROUND_MAX_DEPTH,
+                            ..viewport
+                        };
+                        ctx.device.cmd_set_viewport(command, 0, &[near_viewport]);
+                        ctx.device.cmd_push_constants(
+                            command,
+                            pipes.scene_layout,
+                            vk::ShaderStageFlags::VERTEX,
+                            0,
+                            bytemuck::bytes_of(layer.view_proj),
+                        );
+                        ctx.device
+                            .cmd_draw(command, outcome.foreground_drawn, 1, world_drawn, 0);
+                    }
+                }
             }
 
-            if outcome.region.drawn > 0 {
-                let region_offset = (slot as vk::DeviceSize) * pipes.region_slot_bytes;
+            if outcome.overlay.drawn > 0 {
+                ctx.device.cmd_bind_pipeline(
+                    command,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipes.overlay_pipeline,
+                );
                 ctx.device.cmd_bind_vertex_buffers(
                     command,
                     0,
-                    &[pipes.region_vbo],
-                    &[region_offset],
+                    &[frames.overlay_slots[slot].buffer],
+                    &[0],
                 );
-                if world_drawn > 0 {
-                    ctx.device.cmd_draw(command, world_drawn, 1, 0, 0);
-                }
-                if let Some(layer) = foreground.filter(|_| outcome.foreground_drawn > 0) {
-                    let near_viewport = vk::Viewport {
-                        min_depth: 0.0,
-                        max_depth: FOREGROUND_MAX_DEPTH,
-                        ..viewport
-                    };
-                    ctx.device.cmd_set_viewport(command, 0, &[near_viewport]);
-                    ctx.device.cmd_push_constants(
-                        command,
-                        pipes.scene_layout,
-                        vk::ShaderStageFlags::VERTEX,
-                        0,
-                        bytemuck::bytes_of(layer.view_proj),
-                    );
-                    ctx.device
-                        .cmd_draw(command, outcome.foreground_drawn, 1, world_drawn, 0);
-                }
+                ctx.device.cmd_bind_descriptor_sets(
+                    command,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipes.overlay_layout,
+                    0,
+                    &[ctx.descriptors.set],
+                    &[],
+                );
+                ctx.device.cmd_draw(command, outcome.overlay.drawn, 1, 0, 0);
             }
-        }
 
-        if outcome.overlay.drawn > 0 {
-            ctx.device.cmd_bind_pipeline(
-                command,
-                vk::PipelineBindPoint::GRAPHICS,
-                pipes.overlay_pipeline,
-            );
-            ctx.device.cmd_bind_vertex_buffers(
-                command,
-                0,
-                &[frames.overlay_slots[slot].buffer],
-                &[0],
-            );
-            ctx.device.cmd_bind_descriptor_sets(
-                command,
-                vk::PipelineBindPoint::GRAPHICS,
-                pipes.overlay_layout,
-                0,
-                &[ctx.descriptors.set],
-                &[],
-            );
-            ctx.device.cmd_draw(command, outcome.overlay.drawn, 1, 0, 0);
+            ctx.device.cmd_end_render_pass(command);
         }
-
-        ctx.device.cmd_end_render_pass(command);
         // The 6-F known-answer readback: after the main pass the
         // shadow map sits in SHADER_READ — transition to TRANSFER_SRC
         // and copy the recording slot's map into the mapped buffer
@@ -3916,6 +4034,24 @@ fn recreate_swapchain(
         // against the replacement's own maps).
         if pipes.shadows.is_some()
             && let Err(error) = replacement.ensure_shadow_resources(ctx)
+        {
+            replacement.destroy(ctx);
+            return Err(error);
+        }
+        // The Era-1 post companion: a post renderer's post state
+        // must likewise exist on the replacement BEFORE
+        // installation (the same finding-A discipline — the
+        // replacement's post pass targets the NEW swapchain
+        // format, so the state is rebuilt against it here; the
+        // extent-bound targets build at the replacement's first
+        // frame, against the live views). The shadowed/sky HDR
+        // VARIANTS are NOT built here: they bind the shadow/sky
+        // states' OWN pipeline layouts, and the replacement's
+        // shadow/sky states may not exist yet — the frame flow's
+        // family-growth block creates them against the LIVE
+        // states' layouts at the first frame that needs them.
+        if pipes.post.is_some()
+            && let Err(error) = replacement.ensure_post_resources(ctx, new_format, depth_format)
         {
             replacement.destroy(ctx);
             return Err(error);
