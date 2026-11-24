@@ -107,12 +107,16 @@ use crate::config::DepthFormatPreference;
 pub(crate) mod corner;
 #[path = "descriptors.rs"]
 pub mod descriptors;
+#[path = "frame_prepare.rs"]
+pub(crate) mod frame_prepare;
 #[path = "post_draw.rs"]
 pub(crate) mod post_draw;
 #[path = "proxy_draw.rs"]
 pub(crate) mod proxy_draw;
 #[path = "reflection_draw.rs"]
 pub(crate) mod reflection_draw;
+#[path = "scene_record.rs"]
+pub(crate) mod scene_record;
 #[path = "shadow_draw.rs"]
 pub(crate) mod shadow_draw;
 #[path = "sky_draw.rs"]
@@ -128,6 +132,9 @@ use crate::config::{
 use crate::overlay::OverlayVertex;
 use crate::scene::SceneVertex;
 use descriptors::DescriptorFoundation;
+use frame_prepare::{FramePreparationResult, prepare_after_recreation, prepare_frame};
+#[allow(unused_imports)]
+use scene_record::record_corner_scene;
 use textures::{SamplerPool, Texture};
 
 use sdl3::video::Window as SdlWindow;
@@ -3637,51 +3644,18 @@ pub(crate) fn render_frame(
         (None, Some(_)) | (None, None) | (Some(_), None) => None,
     };
 
-    // Minimized windows report a zero extent — present nothing.
-    if window_size.0 == 0 || window_size.1 == 0 {
-        frames.surface_probe_pending = true;
-        outcome.deferred = true;
-        return Ok(outcome);
-    }
-
-    // A minimized or transitioning surface can report zero-sized
-    // capabilities while the application-side window size stays stale
-    // and nonzero (Win32: currentExtent and min/max all 0) — the
-    // drawable is temporarily unavailable. Defer the whole frame BEFORE
-    // any recreation trigger: no swapchain is created, destroyed, or
-    // retried and no error is raised; rendering resumes when the
-    // surface reports a valid extent again (correction of the 1×1
-    // fabrication defect, VUID-VkSwapchainCreateInfoKHR-pNext-07781,
-    // found on the rig 2026-10-20).
-    let size_changed = swapchain.requested_size != window_size;
-    if size_changed || frames.surface_probe_pending || frames.needs_recreate {
-        let extent = drawable_extent(ctx, window_size)?;
-        if surface_probe_decision(
-            frames.surface_probe_pending || size_changed,
-            frames.needs_recreate,
-            extent.is_some(),
-        ) == SurfaceProbeDecision::ProbeDeferred
-        {
-            frames.surface_probe_pending = true;
-            outcome.deferred = true;
-            return Ok(outcome);
-        }
-        frames.surface_probe_pending = false;
-        // A changed application request triggers one recreation even on a
-        // surface with a fixed extent. The new swapchain records that request.
-        frames.needs_recreate |= size_changed || extent != Some(swapchain.extent);
-    }
-
-    // Ensure all lazy frame state before any acquire or recreation
-    // decision — the pre-acquire preparation discipline (finding 3's
-    // stranded-frame corrective, and finding 6's replacement-variant
-    // completeness). Each ensure_* is idempotent (an existence check),
-    // so calling it twice (before and after recreation) is safe.
+    // Frame preparation: swapchain checks, lazy state, and target creation
+    // before acquire (finding 20, Phase A; findings 3-8).
     let foreground_vertices = foreground.map_or(&[][..], |layer| layer.vertices);
-    pipes.ensure_frame_targets_and_resources(
+    match prepare_frame(
         ctx,
         swapchain,
-        slot,
+        pipes,
+        frames,
+        window_size,
+        present_preference,
+        replace_pipelines,
+        demo_scene,
         proxy,
         shadowed,
         sky,
@@ -3689,93 +3663,48 @@ pub(crate) fn render_frame(
         wet,
         region_vertices,
         foreground_vertices,
-    )?;
-
-    // A previous present reported suboptimal — recreate before drawing
-    // (verification requirement: suboptimal must eventually trigger
-    // recreation).
-    if consume_recreate(&mut frames.needs_recreate) {
-        recreate_swapchain(
-            ctx,
-            swapchain,
-            pipes,
-            frames,
-            window_size,
-            present_preference,
-            replace_pipelines,
-            demo_scene,
-        )?;
-        outcome.recreated = true;
-        // The generation that draws carries every active variant —
-        // calling the helper here ensures sky, reflection, and HDR
-        // variant pipelines exist on the new generation (finding 6).
-        let foreground_vertices = foreground.map_or(&[][..], |layer| layer.vertices);
-        pipes.ensure_frame_targets_and_resources(
-            ctx,
-            swapchain,
-            slot,
-            proxy,
-            shadowed,
-            sky,
-            post,
-            wet,
-            region_vertices,
-            foreground_vertices,
-        )?;
-    }
-
-    // The capture readback's destination buffer, prepared BEFORE any
-    // acquire or fence reset (the post-orientation hardening's
-    // frame-sync rule): a refusal here touches no synchronization
-    // state, so it can never leave a fence reset-but-unsignaled or an
-    // acquired image's semaphore unconsumed. A refused capture
-    // (unsupported format, no TRANSFER_SRC, sizing overflow) is NOT a
-    // frame error — the request is dropped, recorded as the last
-    // refusal, and the frame renders normally; a later request can
-    // try again. Deferred frames keep the request alive for the next
-    // frame that records.
-    if frames.capture.pending
-        && let Err(error) = frames.capture.ensure(ctx, swapchain)
-    {
-        frames.capture.pending = false;
-        frames.capture.last_refusal = Some(error);
-    }
-
-    // The Era-1 post chain's and the wet reflection's extent-bound
-    // targets: prepared HERE — BEFORE the slot-fence wait, the fence
-    // reset, and the acquire (finding 3's stranded-frame corrective,
-    // the capture-ensure discipline above): the swapchain's extent
-    // and views are equally live at this point (only a recreation
-    // can change them, and every recreation site precedes this
-    // block), so a target-creation failure returns with every sync
-    // object untouched — no reset-but-unsignaled fence, no signaled
-    // acquire semaphore left unconsumed. A rebuild releases the old
-    // bundle only when the extent or view set changed, which only a
-    // recreation (already device-idle) can cause — the rebuild-safety
-    // proof in post_draw's module header. The swapchain generation
-    // replaces the view handle for cache invalidation (corrective
-    // finding 7): Vulkan permits handle reuse, so a numerical view
-    // handle could recur after destruction.
-    if post && let Some(post_state) = &mut pipes.post {
-        post_state.ensure_targets(
-            ctx,
-            swapchain.extent,
-            &swapchain.views,
-            swapchain.generation,
-        )?;
-    }
-    if wet.is_some()
-        && let (Some(post_state), Some(reflection_state), Some(corner)) =
-            (&pipes.post, &mut pipes.reflection, ctx.corner.as_ref())
-    {
-        reflection_state.ensure_targets(
-            ctx,
-            swapchain.extent,
-            corner,
-            post_state.hdr_render_pass(),
-            swapchain.generation,
-            swapchain.depth_format,
-        )?;
+        frames.capture.pending,
+    )? {
+        FramePreparationResult::Deferred => {
+            outcome.deferred = true;
+            return Ok(outcome);
+        }
+        FramePreparationResult::Recreated => {
+            outcome.recreated = true;
+            // Re-run preparation against the new generation.
+            match prepare_frame(
+                ctx,
+                swapchain,
+                pipes,
+                frames,
+                window_size,
+                present_preference,
+                replace_pipelines,
+                demo_scene,
+                proxy,
+                shadowed,
+                sky,
+                post,
+                wet,
+                region_vertices,
+                foreground_vertices,
+                frames.capture.pending,
+            )? {
+                FramePreparationResult::Deferred => {
+                    outcome.deferred = true;
+                    return Ok(outcome);
+                }
+                FramePreparationResult::Recreated => {
+                    // This should never happen - recreate once per frame.
+                    // If it does, we'll retry in the acquire loop.
+                    frames.needs_recreate = true;
+                    outcome.deferred = true;
+                    return Ok(outcome);
+                }
+                FramePreparationResult::Proceeded => {}
+            }
+        }
+        FramePreparationResult::Proceeded => {}
     }
 
     // Wait for this slot's previous submission. The fence is reset only
@@ -3805,28 +3734,10 @@ pub(crate) fn render_frame(
         )
     };
     if let Err(vk::Result::ERROR_OUT_OF_DATE_KHR) = acquire_result {
-        // The out-of-date inline recreation ALSO probes first (the
-        // batch-3 review's directive: every recreation path checks
-        // surface availability before recreating) — a mid-transition
-        // surface must not be recreated into. Unavailable: PRESERVE
-        // the already-signaled slot fence (vkWaitForFences does not
-        // consume a signaled fence — it stays signaled until the next
-        // submission's owner resets it, so the next frame's wait
-        // passes and every images_in_flight reference stays valid;
-        // destroying and recreating the fence here would leave
-        // per-image references to a dead handle — the review's fence
-        // finding), latch the deferral hint, PRESERVE the recreation
-        // intent, and defer. No image was acquired, so no semaphore
-        // waits.
-        if surface_probe_decision(false, true, drawable_extent(ctx, window_size)?.is_some())
-            == SurfaceProbeDecision::ProbeDeferred
-        {
-            mark_suboptimal(&mut frames.needs_recreate);
-            frames.surface_probe_pending = true;
-            outcome.deferred = true;
-            return Ok(outcome);
-        }
-        recreate_swapchain(
+        // The out-of-date inline recreation uses prepare_after_recreation
+        // to handle probe, recreate, state-ensure, target-ensure, capture-ensure,
+        // and retry acquire (finding 20, Phase A; findings 3-8).
+        match prepare_after_recreation(
             ctx,
             swapchain,
             pipes,
@@ -3835,19 +3746,6 @@ pub(crate) fn render_frame(
             present_preference,
             replace_pipelines,
             demo_scene,
-        )?;
-        outcome.recreated = true;
-        // The generation that draws carries every active variant —
-        // re-running the state-ensure helper here creates sky,
-        // reflection, and the HDR variant pipelines on the new
-        // generation (finding 6: the replacement replicates only
-        // proxy/indirect/shadow/post; without this call the first
-        // frame after THIS recreation silently skips sky and wet
-        // passes).
-        pipes.ensure_frame_targets_and_resources(
-            ctx,
-            swapchain,
-            slot,
             proxy,
             shadowed,
             sky,
@@ -3855,51 +3753,35 @@ pub(crate) fn render_frame(
             wet,
             region_vertices,
             foreground_vertices,
-        )?;
-        // The targets were ensured pre-acquire against the OLD
-        // generation — repeat preparation against the replacement
-        // before retrying the out-of-date acquire (finding 3's
-        // stranded-frame corrective; the same frame-sync discipline,
-        // still before any acquire of the new chain). The swapchain
-        // generation replaces the view handle for cache invalidation
-        // (corrective finding 7).
-        if post && let Some(post_state) = &mut pipes.post {
-            post_state.ensure_targets(
-                ctx,
-                swapchain.extent,
-                &swapchain.views,
-                swapchain.generation,
-            )?;
+            frames.capture.pending,
+        )? {
+            FramePreparationResult::Deferred => {
+                outcome.deferred = true;
+                return Ok(outcome);
+            }
+            FramePreparationResult::Recreated => {
+                // This should never happen - prepare_after_recreation already
+                // retried acquire. If it returns Recreated, something went wrong.
+                frames.needs_recreate = true;
+                outcome.deferred = true;
+                return Ok(outcome);
+            }
+            FramePreparationResult::Proceeded => {
+                // The inline recreation happened inside the helper — the
+                // original arm reported it on the outcome (the public
+                // recreated contract: callers learn the generation changed).
+                outcome.recreated = true;
+                // Retry acquire after preparation.
+                acquire_result = unsafe {
+                    ctx.swapchain_ext.acquire_next_image(
+                        swapchain.swapchain,
+                        100_000_000,
+                        frames.image_available[slot],
+                        vk::Fence::null(),
+                    )
+                };
+            }
         }
-        if wet.is_some()
-            && let (Some(post_state), Some(reflection_state), Some(corner)) =
-                (&pipes.post, &mut pipes.reflection, ctx.corner.as_ref())
-        {
-            reflection_state.ensure_targets(
-                ctx,
-                swapchain.extent,
-                corner,
-                post_state.hdr_render_pass(),
-                swapchain.generation,
-                swapchain.depth_format,
-            )?;
-        }
-        // The capture ensure is repeated here too (the same frame-sync
-        // discipline: a failure here cannot strand a frame).
-        if frames.capture.pending
-            && let Err(error) = frames.capture.ensure(ctx, swapchain)
-        {
-            frames.capture.pending = false;
-            frames.capture.last_refusal = Some(error);
-        }
-        acquire_result = unsafe {
-            ctx.swapchain_ext.acquire_next_image(
-                swapchain.swapchain,
-                100_000_000,
-                frames.image_available[slot],
-                vk::Fence::null(),
-            )
-        };
     }
     let (image_index, suboptimal) = match acquire_result {
         Ok((index, suboptimal)) => (index, suboptimal),
@@ -4119,6 +4001,7 @@ pub(crate) fn render_frame(
                 slot,
                 extent,
                 clear_color,
+                &corner.reflected_ranges(),
             );
             reflection_state.record_read_barrier(ctx, command, slot);
         }
@@ -4164,170 +4047,98 @@ pub(crate) fn render_frame(
             );
             ctx.device.cmd_set_viewport(command, 0, &[viewport]);
             ctx.device.cmd_set_scissor(command, 0, &[scissor]);
-            // The Era-1 sky draw: FIRST inside the main render pass —
-            // the fullscreen triangle replaces the clear-color
-            // background with the sky equation, with NO depth
-            // interaction (no test, no write), so every scene draw below
-            // behaves exactly as it did over the clear (the
-            // unchanged-path proof: only the uncovered background
-            // changes). The ensure above guaranteed the state whenever
-            // `sky` is Some; the belt check keeps a skyless frame on the
-            // skyless path even if a prior sky frame created the state.
-            if let (Some(sky_state), Some(params)) = (&pipes.sky, sky) {
-                // SAFETY (both calls): this slot's fence wait passed above
-                // (the uniform region is disjoint from every other
-                // slot); the recording command buffer is inside the main
-                // render pass, before the scene draws.
-                sky_state.write_frame(slot, params);
-                sky_state.record(ctx, command, slot);
-            }
-            // The corner buffer must be written before the scene pass for
-            // both the shadowed and ordinary paths (finding 5: the wet
-            // ground re-draw reads this camera block; the ordinary branch
-            // used to write it, the shadowed branch now depends on it).
-            if let (Some(resources), Some(params)) = (&ctx.corner, corner_params) {
-                // SAFETY: the slot's fence wait passed above; the coherent
-                // frame regions do not overlap other slots or the immutable
-                // material tail.
-                resources.write_frame(slot, params);
-            }
-            if shadowed.is_some()
-                && let (Some(resources), Some(shadow_state)) = (&ctx.corner, &pipes.shadows)
-            {
-                // The 6-F shadowed corner draws: the shadowed lit
-                // pipeline inside the main render pass, binding the
-                // shadow state's per-material sets for this slot (the
-                // map view rides binding 4; the FrameParams dynamic
-                // offset selects this slot's extended region — written
-                // before the depth pass above). The corner buffer
-                // was written before this branch (the 6-F correction
-                // to finding 5: both shadowed and ordinary branches
-                // now supply the true camera). The ensure above
-                // guaranteed the shadow state whenever `shadowed` is
-                // Some; the belt check keeps an unshadowed frame on the
-                // unshadowed path even if a prior shadowed frame created
-                // the state.
-                let (pipeline, layout, sets, frame_offset) = shadow_state.shadowed(slot);
-                ctx.device
-                    .cmd_bind_pipeline(command, vk::PipelineBindPoint::GRAPHICS, pipeline);
-                resources.draw(ctx, command, layout, &sets, frame_offset);
-            } else if let (Some(resources), Some(_params)) = (&ctx.corner, corner_params) {
-                ctx.device.cmd_bind_pipeline(
-                    command,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipes.lit_pipeline,
-                );
-                // The corner buffer was written above (the 6-F
-                // shadowed path now supplies the camera, so the
-                // ordinary branch no longer writes). The slot's
-                // fence wait passed; the coherent frame regions do
-                // not overlap other slots or the immutable material
-                // tail.
-                resources.draw(
-                    ctx,
-                    command,
-                    pipes.lit_layout,
-                    resources.sets(),
-                    slot as u32 * resources.frame_stride(),
-                );
-                // The 6-E instanced-proxy draws (same render pass, after
-                // the static corner mesh — the corner ground plane wins
-                // the coplanar depth at proxy footprints deterministically
-                // in BOTH submission modes, since the corner mesh draws
-                // first and proxy order is the packed instance order).
-                if let (Some(proxy_state), Some(upload), Some(sets)) =
-                    (&pipes.proxy, proxy, proxy_sets)
-                {
+            // The unified corner-scene recorder (finding 20, Phase B):
+            // extracts the shared sky/corner/shadowed-ordinary/proxy sequence
+            // from the main pass and HDR pass. Returns Some(proxy_calls) when
+            // corner-family (shadowed or ordinary) was recorded, None when
+            // neither occurred (the else-branch body runs below).
+            let targets = scene_record::SceneTargetPipelines {
+                sky: pipes.sky.as_ref().map(|s| s.pipeline()),
+                lit: Some(pipes.lit_pipeline),
+                shadowed: pipes.shadows.as_ref().map(|s| s.shadowed(slot).0),
+                proxy: Some(pipes.proxy_pipeline),
+            };
+            match scene_record::record_corner_scene(
+                ctx,
+                pipes,
+                command,
+                slot,
+                targets,
+                corner_params,
+                shadowed,
+                sky,
+                proxy,
+                proxy_sets,
+            ) {
+                Some(calls) => {
+                    outcome.proxy_draw_calls = calls;
+                }
+                None => {
+                    // The Stage-2 scene_pipeline/region/foreground else-branch body
+                    // (the non-corner path: static scene + dynamic region/foreground).
                     ctx.device.cmd_bind_pipeline(
                         command,
                         vk::PipelineBindPoint::GRAPHICS,
-                        pipes.proxy_pipeline,
+                        pipes.scene_pipeline,
                     );
-                    // SAFETY: the proxy pipeline is bound with its own
-                    // layout inside its render pass; `sets` were validated
-                    // before recording; this slot's instance region holds
-                    // this frame's bytes (written above, after the fence
-                    // wait).
-                    let recorded = proxy_state.draw(
-                        ctx,
+                    ctx.device.cmd_push_constants(
                         command,
-                        pipes.proxy_layout,
-                        resources,
-                        slot,
-                        upload,
-                        sets,
-                    );
-                    // The recorded count and the pure submission model must
-                    // agree (the unit test pins the model; this co-pins the
-                    // loop against it in debug builds).
-                    debug_assert_eq!(
-                        recorded,
-                        proxy_draw::proxy_draw_call_count(
-                            upload.mode,
-                            upload.npc_count,
-                            upload.vehicle_count
-                        )
-                    );
-                    outcome.proxy_draw_calls = recorded;
-                }
-            } else {
-                ctx.device.cmd_bind_pipeline(
-                    command,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipes.scene_pipeline,
-                );
-                ctx.device.cmd_push_constants(
-                    command,
-                    pipes.scene_layout,
-                    vk::ShaderStageFlags::VERTEX,
-                    0,
-                    bytemuck::bytes_of(view_proj),
-                );
-                // The static demonstration scene draws only when the explicit
-                // opt-in uploaded it (`scene_index_count > 0`, P3) — an
-                // omitted renderer binds nothing and draws nothing here; the
-                // scene pipeline below still draws the dynamic region
-                // geometry through the same bound state.
-                if pipes.scene_index_count > 0 {
-                    ctx.device
-                        .cmd_bind_vertex_buffers(command, 0, &[pipes.scene_vbo], &[0]);
-                    ctx.device.cmd_bind_index_buffer(
-                        command,
-                        pipes.scene_ibo,
+                        pipes.scene_layout,
+                        vk::ShaderStageFlags::VERTEX,
                         0,
-                        vk::IndexType::UINT32,
+                        bytemuck::bytes_of(view_proj),
                     );
-                    ctx.device
-                        .cmd_draw_indexed(command, pipes.scene_index_count, 1, 0, 0, 0);
-                }
-
-                if outcome.region.drawn > 0 {
-                    let region_offset = (slot as vk::DeviceSize) * pipes.region_slot_bytes;
-                    ctx.device.cmd_bind_vertex_buffers(
-                        command,
-                        0,
-                        &[pipes.region_vbo],
-                        &[region_offset],
-                    );
-                    if world_drawn > 0 {
-                        ctx.device.cmd_draw(command, world_drawn, 1, 0, 0);
-                    }
-                    if let Some(layer) = foreground.filter(|_| outcome.foreground_drawn > 0) {
-                        let near_viewport = vk::Viewport {
-                            min_depth: 0.0,
-                            max_depth: FOREGROUND_MAX_DEPTH,
-                            ..viewport
-                        };
-                        ctx.device.cmd_set_viewport(command, 0, &[near_viewport]);
-                        ctx.device.cmd_push_constants(
+                    // The static demonstration scene draws only when the explicit
+                    // opt-in uploaded it (`scene_index_count > 0`, P3) — an
+                    // omitted renderer binds nothing and draws nothing here; the
+                    // scene pipeline below still draws the dynamic region
+                    // geometry through the same bound state.
+                    if pipes.scene_index_count > 0 {
+                        ctx.device
+                            .cmd_bind_vertex_buffers(command, 0, &[pipes.scene_vbo], &[0]);
+                        ctx.device.cmd_bind_index_buffer(
                             command,
-                            pipes.scene_layout,
-                            vk::ShaderStageFlags::VERTEX,
+                            pipes.scene_ibo,
                             0,
-                            bytemuck::bytes_of(layer.view_proj),
+                            vk::IndexType::UINT32,
                         );
                         ctx.device
-                            .cmd_draw(command, outcome.foreground_drawn, 1, world_drawn, 0);
+                            .cmd_draw_indexed(command, pipes.scene_index_count, 1, 0, 0, 0);
+                    }
+
+                    if outcome.region.drawn > 0 {
+                        let region_offset = (slot as vk::DeviceSize) * pipes.region_slot_bytes;
+                        ctx.device.cmd_bind_vertex_buffers(
+                            command,
+                            0,
+                            &[pipes.region_vbo],
+                            &[region_offset],
+                        );
+                        if world_drawn > 0 {
+                            ctx.device.cmd_draw(command, world_drawn, 1, 0, 0);
+                        }
+                        if let Some(layer) = foreground.filter(|_| outcome.foreground_drawn > 0) {
+                            let near_viewport = vk::Viewport {
+                                min_depth: 0.0,
+                                max_depth: FOREGROUND_MAX_DEPTH,
+                                ..viewport
+                            };
+                            ctx.device.cmd_set_viewport(command, 0, &[near_viewport]);
+                            ctx.device.cmd_push_constants(
+                                command,
+                                pipes.scene_layout,
+                                vk::ShaderStageFlags::VERTEX,
+                                0,
+                                bytemuck::bytes_of(layer.view_proj),
+                            );
+                            ctx.device.cmd_draw(
+                                command,
+                                outcome.foreground_drawn,
+                                1,
+                                world_drawn,
+                                0,
+                            );
+                        }
                     }
                 }
             }
@@ -4372,7 +4183,14 @@ pub(crate) fn render_frame(
                 // SAFETY: the outer recording block's contract (the
                 // command buffer records inside the main render
                 // pass, past the mesh draws).
-                reflection_state.record_ground_redraw(ctx, corner, command, slot, false);
+                reflection_state.record_ground_redraw(
+                    ctx,
+                    corner,
+                    command,
+                    slot,
+                    false,
+                    corner.receiver_range(),
+                );
             }
 
             ctx.device.cmd_end_render_pass(command);
