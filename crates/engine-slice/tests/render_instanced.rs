@@ -81,6 +81,7 @@ fn gate_population() -> (Vec<ProxyInstance>, Vec<ProxyInstance>) {
     let npc = |pos: [f32; 3], turn: u16, scale: f32, tint: [f32; 3]| ProxyInstance {
         transform: InstanceTransform { pos, turn, scale },
         tint,
+        pose_index: 0,
     };
     let vehicle = |pos: [f32; 3], turn: u16, tint: [f32; 3]| ProxyInstance {
         transform: InstanceTransform {
@@ -89,6 +90,7 @@ fn gate_population() -> (Vec<ProxyInstance>, Vec<ProxyInstance>) {
             scale: 1.0,
         },
         tint,
+        pose_index: 0,
     };
     (
         vec![
@@ -132,18 +134,54 @@ fn gate_camera(aspect: f32) -> ([[f32; 4]; 4], [f32; 3]) {
     (matrix, [-3.5, 9.0, -3.5])
 }
 
+/// One populated capture's population with its OWNED rest-pose
+/// blocks (the Era-2 skinning input — every fixture of this gate
+/// runs at the rest pose, whose skin matrices are bit-exact identity,
+/// so the expected pixels are the authored-silhouette equation; the
+/// ANIMATED equivalence gates arrive with the animated-population
+/// stage). The blocks are owned alongside the population (the borrow
+/// discipline: `npc_poses` must outlive the `ProxyPopulation`).
+struct FixturePopulation<'a> {
+    population: ProxyPopulation<'a>,
+}
+
+impl<'a> FixturePopulation<'a> {
+    fn new(
+        npc: &'a [ProxyInstance],
+        vehicle: &'a [ProxyInstance],
+        npc_material: u32,
+        vehicle_material: u32,
+    ) -> Self {
+        // The rest blocks LEAK into the gate's lifetime (test-only,
+        // bounded by the fixture count — the same discipline the
+        // turn-interpolation keyframes use; the blocks are constant,
+        // so the leak is one identical block array per fixture).
+        let poses: &'a [[[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS]] =
+            Vec::leak(vec![
+                engine_renderer::animation::rest_pose_block();
+                npc.len()
+            ]);
+        FixturePopulation {
+            population: ProxyPopulation {
+                npc,
+                npc_poses: poses,
+                npc_material,
+                vehicle,
+                vehicle_material,
+            },
+        }
+    }
+}
+
+/// The shorthand the gates pass inline (the temporary lives through
+/// the call statement — the fixture's own field borrow).
 fn populated<'a>(
     npc: &'a [ProxyInstance],
     vehicle: &'a [ProxyInstance],
     npc_material: u32,
     vehicle_material: u32,
-) -> ProxyPopulation<'a> {
-    ProxyPopulation {
-        npc,
-        npc_material,
-        vehicle,
-        vehicle_material,
-    }
+) -> FixturePopulation<'a> {
+    FixturePopulation::new(npc, vehicle, npc_material, vehicle_material)
 }
 
 /// One populated capture in the given submission mode.
@@ -386,7 +424,7 @@ fn check_rotated_instance_oracle(
             &matrix,
             eye,
             day_preset(),
-            &populated(&single, &[], 1, 0),
+            &populated(&single, &[], 1, 0).population,
             size,
         )
         .unwrap();
@@ -488,7 +526,7 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
     let light = day_preset();
     let (npc, vehicle) = gate_population();
     let total = npc.len() + vehicle.len();
-    let population = populated(&npc, &vehicle, 1, 2);
+    let population = populated(&npc, &vehicle, 1, 2); // the fixture (owns its rest blocks)
 
     // THE EQUIVALENCE GATE: N single-instance draws (the pre-6-E
     // per-object submission shape) versus one instanced draw per
@@ -500,7 +538,7 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
         &matrix,
         eye,
         light,
-        &population,
+        &population.population,
         size,
     );
     assert_eq!(
@@ -513,7 +551,7 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
         &matrix,
         eye,
         light,
-        &population,
+        &population.population,
         size,
     );
     assert_eq!(
@@ -529,7 +567,7 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
         &matrix,
         eye,
         light,
-        &population,
+        &population.population,
         size,
     );
     assert_eq!(repeat_calls, 2);
@@ -561,8 +599,15 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
     let warm = renderer.allocations();
     for mode in [ProxyDrawMode::Instanced, ProxyDrawMode::PerInstance] {
         for _ in 0..2 {
-            let (image, calls) =
-                capture_populated(&mut renderer, mode, &matrix, eye, light, &population, size);
+            let (image, calls) = capture_populated(
+                &mut renderer,
+                mode,
+                &matrix,
+                eye,
+                light,
+                &population.population,
+                size,
+            );
             assert_eq!(
                 calls,
                 if matches!(mode, ProxyDrawMode::PerInstance) {
@@ -587,7 +632,13 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
     // two mesh memories, their staged uploads' staging memories, and
     // the instance memory; cumulative counters never decrement).
     let replacement = renderer
-        .render_corner_populated(&matrix, eye, light, &population, (size.0 + 8, size.1 + 8))
+        .render_corner_populated(
+            &matrix,
+            eye,
+            light,
+            &population.population,
+            (size.0 + 8, size.1 + 8),
+        )
         .unwrap();
     assert!(replacement.recreated, "the resize forced a recreation");
     let (after, calls) = capture_populated(
@@ -596,7 +647,7 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
         &matrix,
         eye,
         light,
-        &population,
+        &population.population,
         size,
     );
     assert_eq!(calls, 2);
@@ -627,7 +678,7 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
             &matrix,
             eye,
             light,
-            &population,
+            &population.population,
             size,
         );
         assert_eq!(calls, 2);
@@ -650,6 +701,7 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
                 scale: 1.0,
             },
             tint: [0.9, 0.7, 0.6],
+            pose_index: 0,
         },
         material: 1,
         half_width: 0.21,
@@ -661,7 +713,7 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
         &mut renderer,
         size,
         &npc_wall,
-        &populated(&single_npc, &[], 1, 0),
+        &populated(&single_npc, &[], 1, 0).population,
     );
     let vehicle_wall = OracleWall {
         instance: ProxyInstance {
@@ -671,6 +723,7 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
                 scale: 1.0,
             },
             tint: [0.75, 0.18, 0.15],
+            pose_index: 0,
         },
         material: 2,
         half_width: 0.95,
@@ -682,7 +735,7 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
         &mut renderer,
         size,
         &vehicle_wall,
-        &populated(&[], &single_vehicle, 0, 2),
+        &populated(&[], &single_vehicle, 0, 2).population,
     );
 
     // The typed refusals reach the caller (nothing rendered, no
@@ -694,7 +747,7 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
             &matrix,
             eye,
             light,
-            &populated(&over, &single_vehicle, 1, 2),
+            &populated(&over, &single_vehicle, 1, 2).population,
             size,
         )
         .unwrap_err();
@@ -707,7 +760,7 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
             &matrix,
             eye,
             light,
-            &populated(&single_npc, &[], 3, 0),
+            &populated(&single_npc, &[], 3, 0).population,
             size,
         )
         .unwrap_err();
@@ -719,7 +772,7 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
         &matrix,
         eye,
         light,
-        &population,
+        &population.population,
         size,
     );
     assert_eq!(calls, 2);
@@ -765,6 +818,7 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
                 scale: 2.0,
             },
             tint: [1.0, 1.0, 1.0],
+            pose_index: 0,
         },
         1,            // the building facade material
         0.21,         // the NPC torso's local half width
@@ -884,7 +938,7 @@ fn full_corner_population_matches_per_object_pixels() {
     assert_eq!((npc.len(), vehicle.len(), total), (24, 2, 26));
     // The demo's caller policy: NPCs with the facade set, vehicles
     // with the dark stone set (corner_demo's documented choice).
-    let population = populated(&npc, &vehicle, 1, 2);
+    let population = populated(&npc, &vehicle, 1, 2); // the fixture (owns its rest blocks)
 
     // THE FULL-TABLE EQUIVALENCE: 26 single-instance draws vs one
     // instanced draw per kind — byte-equal frames.
@@ -894,7 +948,7 @@ fn full_corner_population_matches_per_object_pixels() {
         &matrix,
         eye,
         light,
-        &population,
+        &population.population,
         size,
     );
     assert_eq!(
@@ -907,7 +961,7 @@ fn full_corner_population_matches_per_object_pixels() {
         &matrix,
         eye,
         light,
-        &population,
+        &population.population,
         size,
     );
     assert_eq!(
@@ -925,7 +979,7 @@ fn full_corner_population_matches_per_object_pixels() {
         &matrix,
         eye,
         light,
-        &population,
+        &population.population,
         size,
     );
     assert_eq!(repeat_calls, 2);
@@ -958,8 +1012,15 @@ fn full_corner_population_matches_per_object_pixels() {
     let warm = renderer.allocations();
     for mode in [ProxyDrawMode::Instanced, ProxyDrawMode::PerInstance] {
         for _ in 0..2 {
-            let (image, calls) =
-                capture_populated(&mut renderer, mode, &matrix, eye, light, &population, size);
+            let (image, calls) = capture_populated(
+                &mut renderer,
+                mode,
+                &matrix,
+                eye,
+                light,
+                &population.population,
+                size,
+            );
             assert_eq!(
                 calls,
                 if matches!(mode, ProxyDrawMode::PerInstance) {
@@ -1046,7 +1107,7 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
     let (npc, vehicle) = engine_slice::corner_population::corner_population();
     let total = npc.len() + vehicle.len();
     assert_eq!((npc.len(), vehicle.len(), total), (24, 2, 26));
-    let population = populated(&npc, &vehicle, 1, 2);
+    let population = populated(&npc, &vehicle, 1, 2); // the fixture (owns its rest blocks)
 
     // THE THREE-WAY EQUIVALENCE: per-object (26 draws) vs direct
     // instanced (2) vs indirect (2) — byte-equal frames.
@@ -1056,7 +1117,7 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
         &matrix,
         eye,
         light,
-        &population,
+        &population.population,
         size,
     );
     assert_eq!(reference_calls, 26, "the reference: one draw per instance");
@@ -1067,7 +1128,7 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
         &matrix,
         eye,
         light,
-        &population,
+        &population.population,
         size,
     );
     assert_eq!(instanced_calls, 2, "the direct path: one draw per kind");
@@ -1086,7 +1147,7 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
         &matrix,
         eye,
         light,
-        &population,
+        &population.population,
         size,
     );
     assert_eq!(
@@ -1102,7 +1163,7 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
         &matrix,
         eye,
         light,
-        &population,
+        &population.population,
         size,
     );
     assert_eq!(repeat_calls, 2);
@@ -1161,8 +1222,15 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
         ProxyDrawMode::PerInstance,
     ] {
         for _ in 0..2 {
-            let (image, calls) =
-                capture_populated(&mut renderer, mode, &matrix, eye, light, &population, size);
+            let (image, calls) = capture_populated(
+                &mut renderer,
+                mode,
+                &matrix,
+                eye,
+                light,
+                &population.population,
+                size,
+            );
             assert_eq!(
                 calls,
                 match mode {
@@ -1193,7 +1261,7 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
         renderer.set_proxy_draw_mode(mode);
         let scope = common::HostAllocScope::new();
         let outcome = renderer
-            .render_corner_populated(&matrix, eye, light, &population, size)
+            .render_corner_populated(&matrix, eye, light, &population.population, size)
             .unwrap();
         let allocs = scope.count();
         drop(scope);
@@ -1215,7 +1283,13 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
     // allocations survive; the counters resume constant.
     renderer.set_proxy_draw_mode(ProxyDrawMode::Indirect);
     let replacement = renderer
-        .render_corner_populated(&matrix, eye, light, &population, (size.0 + 8, size.1 + 8))
+        .render_corner_populated(
+            &matrix,
+            eye,
+            light,
+            &population.population,
+            (size.0 + 8, size.1 + 8),
+        )
         .unwrap();
     assert!(replacement.recreated, "the resize forced a recreation");
     let (after, calls) = capture_populated(
@@ -1224,7 +1298,7 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
         &matrix,
         eye,
         light,
-        &population,
+        &population.population,
         size,
     );
     assert_eq!(calls, 2);
@@ -1256,7 +1330,7 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
             &matrix,
             eye,
             light,
-            &population,
+            &population.population,
             size,
         );
         assert_eq!(calls, 2);
@@ -1284,6 +1358,7 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
                 scale: 1.0,
             },
             tint: [0.9, 0.7, 0.6],
+            pose_index: 0,
         },
         material: 1,
         half_width: 0.21,
@@ -1296,7 +1371,7 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
         &mut renderer,
         size,
         &npc_wall,
-        &populated(&single_npc, &[], 1, 0),
+        &populated(&single_npc, &[], 1, 0).population,
     );
 
     // The typed refusals reach the caller through the indirect path
@@ -1304,7 +1379,13 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
     // one past MAX_INSTANCES (the TOTAL-population bound).
     let over: Vec<_> = vec![single_npc[0]; 4097];
     let refused = renderer
-        .render_corner_populated(&matrix, eye, light, &populated(&over, &[], 1, 0), size)
+        .render_corner_populated(
+            &matrix,
+            eye,
+            light,
+            &populated(&over, &[], 1, 0).population,
+            size,
+        )
         .unwrap_err();
     assert!(matches!(
         refused,
@@ -1319,7 +1400,7 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
         &matrix,
         eye,
         light,
-        &population,
+        &population.population,
         size,
     );
     assert_eq!(calls, 2);
@@ -1364,7 +1445,7 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
         renderer.set_proxy_draw_mode(mode);
         renderer.request_frame_capture().unwrap();
         let frame = renderer
-            .render_corner_populated(&matrix, eye, light, &population, size)
+            .render_corner_populated(&matrix, eye, light, &population.population, size)
             .unwrap();
         assert!(frame.presented);
         assert_eq!(
@@ -1516,6 +1597,7 @@ fn oblique_wheel_views_expose_the_outside_tire_and_both_cap_orientations() {
             scale: 1.0,
         },
         tint: [1.0, 1.0, 1.0],
+        pose_index: 0,
     }];
     let population = populated(&[], &sedan, 1, 0);
     let light = day_preset();
@@ -1591,7 +1673,7 @@ fn oblique_wheel_views_expose_the_outside_tire_and_both_cap_orientations() {
     );
     renderer.request_frame_capture().unwrap();
     let frame = renderer
-        .render_corner_populated(&matrix, eye, light, &population, size)
+        .render_corner_populated(&matrix, eye, light, &population.population, size)
         .unwrap();
     assert!(frame.presented && frame.geometry.proxy_draw_calls == 1);
     let image = renderer.take_frame_capture().unwrap().unwrap();
@@ -1668,7 +1750,7 @@ fn oblique_wheel_views_expose_the_outside_tire_and_both_cap_orientations() {
     );
     renderer.request_frame_capture().unwrap();
     let frame = renderer
-        .render_corner_populated(&matrix, eye, light, &population, size)
+        .render_corner_populated(&matrix, eye, light, &population.population, size)
         .unwrap();
     assert!(frame.presented && frame.geometry.proxy_draw_calls == 1);
     let image = renderer.take_frame_capture().unwrap().unwrap();
@@ -1754,7 +1836,7 @@ fn oblique_wheel_views_expose_the_outside_tire_and_both_cap_orientations() {
     );
     renderer.request_frame_capture().unwrap();
     let frame = renderer
-        .render_corner_populated(&matrix, eye, light, &population, size)
+        .render_corner_populated(&matrix, eye, light, &population.population, size)
         .unwrap();
     assert!(frame.presented && frame.geometry.proxy_draw_calls == 1);
     let image = renderer.take_frame_capture().unwrap().unwrap();

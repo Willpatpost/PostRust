@@ -39,15 +39,26 @@ pub struct SceneLayer<'a> {
 }
 
 /// One proxy population for a populated corner frame: the NPC and
-/// vehicle instance lists plus the per-kind material indices into the
+/// vehicle instance lists, the npc kind's evaluated POSE BLOCKS (the
+/// Era-2 skinning input), and the per-kind material indices into the
 /// corner scene's material table (which specular/shininess set each
 /// kind draws with — CALLER policy, not engine policy; the demo and
 /// the equivalence gate document their choices). The renderer packs
 /// both lists into its retained instance buffer in the fixed
-/// npc-then-vehicle order.
+/// npc-then-vehicle order, and the pose blocks into its retained
+/// pose byte buffer in POSE-INDEX order.
 #[derive(Debug, Clone, Copy)]
 pub struct ProxyPopulation<'a> {
     pub npc: &'a [crate::proxy_instances::ProxyInstance],
+    /// The npc kind's skin-matrix blocks, in POSE-INDEX order (block
+    /// i serves every npc whose `pose_index` is i — usually one
+    /// block per npc; fewer blocks than npcs is the dedup shape).
+    /// CALLER policy: the evaluated poses for this frame (the walk
+    /// cycle's sampled matrices) or the rest block repeated for a
+    /// static population. Validated: every populated npc's
+    /// `pose_index` must index into this list (a typed refusal), and
+    /// the list is bounded by [`crate::animation::MAX_POSE_BLOCKS`].
+    pub npc_poses: &'a [[[[f32; 4]; 4]; crate::animation::HUMANOID_JOINTS]],
     pub npc_material: u32,
     pub vehicle: &'a [crate::proxy_instances::ProxyInstance],
     pub vehicle_material: u32,
@@ -258,6 +269,10 @@ pub struct Renderer {
     /// populated frames is reused — no per-frame allocation or
     /// growth.
     instance_bytes: Vec<u8>,
+    /// The retained pose byte buffer (the F-05 discipline applied to
+    /// the pose blocks — repacked in place every populated frame,
+    /// its capacity from the first frames reused forever).
+    pose_bytes: Vec<u8>,
     proxy_draw_mode: ProxyDrawMode,
     /// The Era-1 sky layer's sticky setting (the set_overlay_enabled
     /// precedent): `Some` makes every subsequent corner-family frame
@@ -399,6 +414,7 @@ impl Renderer {
             overlay_vertices: Vec::new(),
             atlas_text,
             instance_bytes: Vec::new(),
+            pose_bytes: Vec::new(),
             proxy_draw_mode: ProxyDrawMode::default(),
             sky: None,
             post: false,
@@ -580,9 +596,35 @@ impl Renderer {
             population.vehicle,
         )
         .map_err(RendererError::ProxyPack)?;
+        // The pose contract, validated BEFORE any frame state is
+        // touched (the capture-refusal discipline): every POPULATED
+        // npc's pose index must select a supplied block, and the
+        // block count is bounded (the repack's own typed refusal
+        // below enforces MAX_POSE_BLOCKS — this check is the
+        // index-vs-count half the repack cannot see).
+        if population
+            .npc
+            .iter()
+            .any(|instance| instance.pose_index as usize >= population.npc_poses.len())
+        {
+            return Err(RendererError::Vulkan(format!(
+                "a npc pose index falls outside the supplied pose blocks \
+                 ({} blocks, highest index {})",
+                population.npc_poses.len(),
+                population
+                    .npc
+                    .iter()
+                    .map(|instance| instance.pose_index)
+                    .max()
+                    .unwrap_or(0)
+            )));
+        }
+        crate::animation::repack_poses(&mut self.pose_bytes, population.npc_poses)
+            .map_err(RendererError::PosePack)?;
         let params = vulkan::corner::FrameParams::new(*view_proj, eye, light);
         let upload = vulkan::proxy_draw::ProxyFrameUpload {
             bytes: &self.instance_bytes,
+            pose_bytes: &self.pose_bytes,
             npc_count: population.npc.len() as u32,
             vehicle_count: population.vehicle.len() as u32,
             npc_material: population.npc_material,

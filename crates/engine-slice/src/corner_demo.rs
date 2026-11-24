@@ -316,9 +316,24 @@ pub fn run(
     } else {
         (Vec::new(), Vec::new())
     };
+    // The Era-2 skinning input: the npc kind's pose blocks in
+    // POSE-INDEX order (sequential — one block per npc, the
+    // placement table's own pin). THIS stage carries the REST pose
+    // (bit-exact identity skin matrices — animation.rs's proof — so
+    // the populated route renders the authored silhouettes exactly
+    // as before); the animated-population stage replaces it with the
+    // walk cycle's evaluated matrices. Built ONCE per run (the
+    // table is static; the animated stage moves this into the frame
+    // loop with its retained evaluation buffer).
+    let npc_poses = if populated {
+        vec![engine_renderer::animation::rest_pose_block(); npc.len()]
+    } else {
+        Vec::new()
+    };
     let population = if populated {
         Some(ProxyPopulation {
             npc: &npc,
+            npc_poses: &npc_poses,
             npc_material: NPC_MATERIAL,
             vehicle: &vehicle,
             vehicle_material: VEHICLE_MATERIAL,

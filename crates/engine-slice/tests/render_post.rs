@@ -534,8 +534,13 @@ fn post_pixels_match_post_rs_and_the_disc_blooms() {
     // - the populated path through the chain (the v2 silhouettes'
     //   instanced draws inside the HDR pass).
     let (npc, vehicle) = engine_slice::corner_population::corner_population();
+    // The Era-2 rest-pose blocks (the skinning input at rest —
+    // bit-exact identity, so the composition's pixels are the
+    // authored-silhouette equation).
+    let npc_poses = vec![engine_renderer::animation::rest_pose_block(); npc.len()];
     let population = engine_renderer::ProxyPopulation {
         npc: &npc,
+        npc_poses: &npc_poses,
         npc_material: 1,
         vehicle: &vehicle,
         vehicle_material: 2,

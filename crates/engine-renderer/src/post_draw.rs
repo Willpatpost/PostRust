@@ -1144,6 +1144,12 @@ impl PostResources {
                 lit: Some(self.lit_hdr),
                 shadowed: self.shadowed_hdr,
                 proxy: Some(self.proxy_hdr),
+                // The npc kind's HDR skinned variant — ensured at the
+                // first populated post frame (the frame flow's
+                // family-growth block); a postless populated frame
+                // never reaches this pass, and an unpopulated one
+                // never draws proxies (the belt-check guard below).
+                proxy_skinned: pipes.skinned.as_ref().and_then(|s| s.skinned_hdr()),
             };
             match scene_record::record_corner_scene(
                 ctx,

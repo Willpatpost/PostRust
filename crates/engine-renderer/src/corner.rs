@@ -230,6 +230,34 @@ impl CornerResources {
         &self.sets
     }
 
+    /// The skinned proxy path's descriptor companions (the Era-2
+    /// sibling sets bind the corner's OWN uniform/texture/sampler
+    /// resources — the accessors skinned_draw's set writes need).
+    /// The uniform buffer handle (FrameParams regions + the material
+    /// tail).
+    pub(crate) fn uniform_buffer(&self) -> vk::Buffer {
+        self.uniforms
+    }
+    /// The plain FrameParams block's byte size (binding 2's range).
+    pub(crate) fn frame_params_size() -> u64 {
+        std::mem::size_of::<FrameParams>() as u64
+    }
+    /// Material `i`'s immutable tail offset in the uniform buffer
+    /// (binding 3's static offset — the same arithmetic the corner's
+    /// own set writes use).
+    pub(crate) fn material_offset(&self, material: usize) -> u64 {
+        (u64::from(FRAMES_IN_FLIGHT) + material as u64) * u64::from(self.stride)
+    }
+    /// Material `i`'s albedo texture view.
+    pub(crate) fn texture_view(&self, material: usize) -> vk::ImageView {
+        self.textures[material].view
+    }
+    /// The nearest-addressing sampler (binding 0's immutable
+    /// sampler — the corner sets' own choice).
+    pub(crate) fn nearest_sampler(&self) -> vk::Sampler {
+        self.sampler.nearest()
+    }
+
     /// The FrameParams dynamic-uniform stride (the unshadowed path's
     /// per-slot offsets).
     pub(crate) fn frame_stride(&self) -> u32 {

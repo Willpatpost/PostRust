@@ -288,8 +288,10 @@ fn rotation_matrix_for_axis(turn: u16, axis: usize) -> [f32; 9] {
 /// out[col·3 + row] = Σᵢ a[i·3 + row] · b[col·3 + i] — column `col`
 /// of the product is A applied to B's column `col` (the same
 /// column-image rule [`matrix_multiply_4x4`] pins at 4x4). Pure f32
-/// in the fixed i-then-row order.
-fn mat3_multiply(a: [f32; 9], b: [f32; 9]) -> [f32; 9] {
+/// in the fixed i-then-row order. Crate-visible: `shadows.rs`'s
+/// populated oracle composes the same-convention rotations through
+/// this ONE implementation (the convention exists exactly once).
+pub(crate) fn mat3_multiply(a: [f32; 9], b: [f32; 9]) -> [f32; 9] {
     let mut out = [0.0; 9];
     for col in 0..3 {
         for row in 0..3 {

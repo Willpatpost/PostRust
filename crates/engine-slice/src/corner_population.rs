@@ -76,30 +76,30 @@ const NPC_TABLE: [ProxyInstance; 24] = [
     //    crosswalks — the two crosswalks the camera route passes.
     // West crosswalk, south end (the south band at the crosswalk
     // line): facing north (turn 0), waiting to cross the west arm.
-    ProxyInstance { transform: InstanceTransform { pos: [-5.0, 0.02, -4.5], turn: 0, scale: 1.0 }, tint: [0.85, 0.70, 0.55] },
-    ProxyInstance { transform: InstanceTransform { pos: [-5.7, 0.02, -4.8], turn: 0, scale: 1.0 }, tint: [0.20, 0.45, 0.75] },
+    ProxyInstance { transform: InstanceTransform { pos: [-5.0, 0.02, -4.5], turn: 0, scale: 1.0 }, tint: [0.85, 0.70, 0.55] , pose_index: 0 },
+    ProxyInstance { transform: InstanceTransform { pos: [-5.7, 0.02, -4.8], turn: 0, scale: 1.0 }, tint: [0.20, 0.45, 0.75] , pose_index: 1 },
     // West crosswalk, north end (the north band at the crosswalk
     // line): facing south (turn 32768).
-    ProxyInstance { transform: InstanceTransform { pos: [-5.1, 0.02, 4.5], turn: 32768, scale: 1.0 }, tint: [0.90, 0.35, 0.20] },
-    ProxyInstance { transform: InstanceTransform { pos: [-5.7, 0.02, 4.9], turn: 32768, scale: 1.0 }, tint: [0.35, 0.75, 0.30] },
+    ProxyInstance { transform: InstanceTransform { pos: [-5.1, 0.02, 4.5], turn: 32768, scale: 1.0 }, tint: [0.90, 0.35, 0.20] , pose_index: 2 },
+    ProxyInstance { transform: InstanceTransform { pos: [-5.7, 0.02, 4.9], turn: 32768, scale: 1.0 }, tint: [0.35, 0.75, 0.30] , pose_index: 3 },
     // North crosswalk, west end (the west band at the crosswalk
     // line): facing east (turn 16384), waiting to cross the north
     // arm. The lead stands tight to the road edge, off the corner
     // the west crosswalk's north-end pair occupies.
-    ProxyInstance { transform: InstanceTransform { pos: [-4.5, 0.02, 5.1], turn: 16384, scale: 1.0 }, tint: [0.75, 0.30, 0.60] },
-    ProxyInstance { transform: InstanceTransform { pos: [-4.9, 0.02, 5.7], turn: 16384, scale: 1.0 }, tint: [0.95, 0.80, 0.40] },
+    ProxyInstance { transform: InstanceTransform { pos: [-4.5, 0.02, 5.1], turn: 16384, scale: 1.0 }, tint: [0.75, 0.30, 0.60] , pose_index: 4 },
+    ProxyInstance { transform: InstanceTransform { pos: [-4.9, 0.02, 5.7], turn: 16384, scale: 1.0 }, tint: [0.95, 0.80, 0.40] , pose_index: 5 },
     // North crosswalk, east end (the east band at the crosswalk
     // line): facing west (turn 49152).
-    ProxyInstance { transform: InstanceTransform { pos: [4.5, 0.02, 5.1], turn: 49152, scale: 1.0 }, tint: [0.15, 0.55, 0.85] },
-    ProxyInstance { transform: InstanceTransform { pos: [4.9, 0.02, 5.7], turn: 49152, scale: 1.0 }, tint: [0.60, 0.60, 0.65] },
+    ProxyInstance { transform: InstanceTransform { pos: [4.5, 0.02, 5.1], turn: 49152, scale: 1.0 }, tint: [0.15, 0.55, 0.85] , pose_index: 6 },
+    ProxyInstance { transform: InstanceTransform { pos: [4.9, 0.02, 5.7], turn: 49152, scale: 1.0 }, tint: [0.60, 0.60, 0.65] , pose_index: 7 },
     // -- Crossers (2): mid-crosswalk, the only pedestrians in the
     //    road. The west crosswalk is crossed northbound (turn 0),
     //    the north crosswalk eastbound (turn 16384); both hold
     //    >= 1.0 m of footprint-inclusive clearance from the camera
     //    route, which runs z~0 through the west arm and x~0 through
     //    the north arm.
-    ProxyInstance { transform: InstanceTransform { pos: [-5.0, 0.02, 1.5], turn: 0, scale: 1.0 }, tint: [0.45, 0.80, 0.75] },
-    ProxyInstance { transform: InstanceTransform { pos: [1.5, 0.02, 5.0], turn: 16384, scale: 1.0 }, tint: [0.70, 0.20, 0.20] },
+    ProxyInstance { transform: InstanceTransform { pos: [-5.0, 0.02, 1.5], turn: 0, scale: 1.0 }, tint: [0.45, 0.80, 0.75] , pose_index: 8 },
+    ProxyInstance { transform: InstanceTransform { pos: [1.5, 0.02, 5.0], turn: 16384, scale: 1.0 }, tint: [0.70, 0.20, 0.20] , pose_index: 9 },
     // -- Sidewalk strollers (14): walking along the bands (parallel
     //    to the road they border), both directions represented. The
     //    far south-east strip is deliberately empty — the route's
@@ -109,29 +109,29 @@ const NPC_TABLE: [ProxyInstance; 24] = [
     // south (turn 32768). The v2 footprint (0.36 m) moved the
     // band's building-clear line outward — the southbound stroller
     // stands at x -4.8 (the corner clearance 1.2 m).
-    ProxyInstance { transform: InstanceTransform { pos: [-5.0, 0.02, 7.5], turn: 0, scale: 1.0 }, tint: [0.55, 0.40, 0.30] },
-    ProxyInstance { transform: InstanceTransform { pos: [-4.8, 0.02, 10.0], turn: 32768, scale: 1.0 }, tint: [0.80, 0.50, 0.30] },
+    ProxyInstance { transform: InstanceTransform { pos: [-5.0, 0.02, 7.5], turn: 0, scale: 1.0 }, tint: [0.55, 0.40, 0.30] , pose_index: 10 },
+    ProxyInstance { transform: InstanceTransform { pos: [-4.8, 0.02, 10.0], turn: 32768, scale: 1.0 }, tint: [0.80, 0.50, 0.30] , pose_index: 11 },
     // West band, south of the E-W road.
-    ProxyInstance { transform: InstanceTransform { pos: [-5.1, 0.02, -7.5], turn: 32768, scale: 1.0 }, tint: [0.30, 0.30, 0.35] },
-    ProxyInstance { transform: InstanceTransform { pos: [-4.9, 0.02, -10.0], turn: 0, scale: 1.0 }, tint: [0.90, 0.75, 0.60] },
+    ProxyInstance { transform: InstanceTransform { pos: [-5.1, 0.02, -7.5], turn: 32768, scale: 1.0 }, tint: [0.30, 0.30, 0.35] , pose_index: 12 },
+    ProxyInstance { transform: InstanceTransform { pos: [-4.9, 0.02, -10.0], turn: 0, scale: 1.0 }, tint: [0.90, 0.75, 0.60] , pose_index: 13 },
     // East band, north of the E-W road. The southbound stroller
     // stands at x 4.8 for the v2 footprint's corner clearance.
-    ProxyInstance { transform: InstanceTransform { pos: [5.0, 0.02, 8.0], turn: 0, scale: 1.0 }, tint: [0.25, 0.60, 0.40] },
-    ProxyInstance { transform: InstanceTransform { pos: [4.8, 0.02, 10.5], turn: 32768, scale: 1.0 }, tint: [0.85, 0.60, 0.70] },
+    ProxyInstance { transform: InstanceTransform { pos: [5.0, 0.02, 8.0], turn: 0, scale: 1.0 }, tint: [0.25, 0.60, 0.40] , pose_index: 14 },
+    ProxyInstance { transform: InstanceTransform { pos: [4.8, 0.02, 10.5], turn: 32768, scale: 1.0 }, tint: [0.85, 0.60, 0.70] , pose_index: 15 },
     // East band, south of the E-W road.
-    ProxyInstance { transform: InstanceTransform { pos: [5.1, 0.02, -7.0], turn: 0, scale: 1.0 }, tint: [0.40, 0.40, 0.55] },
-    ProxyInstance { transform: InstanceTransform { pos: [4.9, 0.02, -9.5], turn: 32768, scale: 1.0 }, tint: [0.95, 0.55, 0.30] },
+    ProxyInstance { transform: InstanceTransform { pos: [5.1, 0.02, -7.0], turn: 0, scale: 1.0 }, tint: [0.40, 0.40, 0.55] , pose_index: 16 },
+    ProxyInstance { transform: InstanceTransform { pos: [4.9, 0.02, -9.5], turn: 32768, scale: 1.0 }, tint: [0.95, 0.55, 0.30] , pose_index: 17 },
     // North band, west of the N-S road: walking east (turn 16384)
     // and west (turn 49152). The westbound stroller stands at
     // z 4.8 for the v2 footprint's corner clearance.
-    ProxyInstance { transform: InstanceTransform { pos: [-7.5, 0.02, 5.0], turn: 16384, scale: 1.0 }, tint: [0.65, 0.75, 0.30] },
-    ProxyInstance { transform: InstanceTransform { pos: [-10.0, 0.02, 4.8], turn: 49152, scale: 1.0 }, tint: [0.50, 0.65, 0.80] },
+    ProxyInstance { transform: InstanceTransform { pos: [-7.5, 0.02, 5.0], turn: 16384, scale: 1.0 }, tint: [0.65, 0.75, 0.30] , pose_index: 18 },
+    ProxyInstance { transform: InstanceTransform { pos: [-10.0, 0.02, 4.8], turn: 49152, scale: 1.0 }, tint: [0.50, 0.65, 0.80] , pose_index: 19 },
     // North band, east of the N-S road.
-    ProxyInstance { transform: InstanceTransform { pos: [7.5, 0.02, 5.0], turn: 49152, scale: 1.0 }, tint: [0.80, 0.35, 0.45] },
-    ProxyInstance { transform: InstanceTransform { pos: [10.0, 0.02, 4.9], turn: 16384, scale: 1.0 }, tint: [0.30, 0.70, 0.55] },
+    ProxyInstance { transform: InstanceTransform { pos: [7.5, 0.02, 5.0], turn: 49152, scale: 1.0 }, tint: [0.80, 0.35, 0.45] , pose_index: 20 },
+    ProxyInstance { transform: InstanceTransform { pos: [10.0, 0.02, 4.9], turn: 16384, scale: 1.0 }, tint: [0.30, 0.70, 0.55] , pose_index: 21 },
     // South band, west of the N-S road.
-    ProxyInstance { transform: InstanceTransform { pos: [-7.0, 0.02, -5.0], turn: 16384, scale: 1.0 }, tint: [0.70, 0.65, 0.50] },
-    ProxyInstance { transform: InstanceTransform { pos: [-9.5, 0.02, -5.1], turn: 49152, scale: 1.0 }, tint: [0.55, 0.30, 0.65] },
+    ProxyInstance { transform: InstanceTransform { pos: [-7.0, 0.02, -5.0], turn: 16384, scale: 1.0 }, tint: [0.70, 0.65, 0.50] , pose_index: 22 },
+    ProxyInstance { transform: InstanceTransform { pos: [-9.5, 0.02, -5.1], turn: 49152, scale: 1.0 }, tint: [0.55, 0.30, 0.65] , pose_index: 23 },
 ];
 
 /// The 2 vehicle placements, in fixed order (westbound then
@@ -145,10 +145,10 @@ const NPC_TABLE: [ProxyInstance; 24] = [
 const VEHICLE_TABLE: [ProxyInstance; 2] = [
     // Westbound, the north lane (z = +2) of the E-W road's east arm:
     // nose west (turn 49152), stopped short east of the box.
-    ProxyInstance { transform: InstanceTransform { pos: [9.0, 0.0, 2.0], turn: 49152, scale: 1.0 }, tint: [0.75, 0.18, 0.15] },
+    ProxyInstance { transform: InstanceTransform { pos: [9.0, 0.0, 2.0], turn: 49152, scale: 1.0 }, tint: [0.75, 0.18, 0.15] , pose_index: 0 },
     // Northbound, the east lane (x = +2) of the N-S road's north
     // arm: nose north (turn 0), departed clear of the crosswalk.
-    ProxyInstance { transform: InstanceTransform { pos: [2.0, 0.0, 9.0], turn: 0, scale: 1.0 }, tint: [0.15, 0.25, 0.70] },
+    ProxyInstance { transform: InstanceTransform { pos: [2.0, 0.0, 9.0], turn: 0, scale: 1.0 }, tint: [0.15, 0.25, 0.70] , pose_index: 0 },
 ];
 
 /// The corner population: 24 NPCs then 2 vehicles, in the fixed
@@ -206,6 +206,17 @@ mod tests {
             );
             assert_eq!(instance.transform.scale, 1.0);
             assert_eq!(instance.transform.turn % 16384, 0, "axis-aligned lanes");
+            assert_eq!(instance.pose_index, 0, "vehicles never read the pose slot");
+        }
+        // THE POSE-INDEX PIN: every npc's block index is its list
+        // position — the identity mapping the renderer's pose repack
+        // and the demo's walk evaluation both rely on (a later
+        // dedup remaps these values consciously, never silently).
+        for (index, instance) in npc.iter().enumerate() {
+            assert_eq!(
+                instance.pose_index, index as u32,
+                "npc {index}'s pose block is its list position"
+            );
         }
     }
 
@@ -399,12 +410,14 @@ mod tests {
     /// The measured-actual FNV-1a of the pinned placement table
     /// above (the placeholder-pin discipline: the first run measures,
     /// the pin follows, and any later movement is an investigation).
-    /// Repinned in the Era-1 population-v2 package: the three
-    /// strollers nudged outward for the v2 silhouettes' true
-    /// footprint (the 0.36 m radius's 0.5 m building clearance —
-    /// the movement this pin exists to catch), from the
-    /// population-package value 9_133_392_768_426_866_649.
-    const PINNED_FNV: u64 = 4_298_571_200_219_075_995;
+    /// History: repinned in the Era-1 population-v2 package (the
+    /// three strollers nudged outward for the v2 footprint, from
+    /// 9_133_392_768_426_866_649 to 4_298_571_200_219_075_995);
+    /// repinned again in the Era-2 skinning package — the params
+    /// vec4's x now carries each npc's sequential pose block index
+    /// (the versioned claim; the pin fired on the change exactly as
+    /// designed and the cause is the claim, not an accident).
+    const PINNED_FNV: u64 = 16_877_662_039_878_331_722;
 
     // ------------------------------------------------------- helpers
     // (pure f32; the pins carry margins, so platform ulp differences

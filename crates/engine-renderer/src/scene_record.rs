@@ -50,7 +50,13 @@ pub(crate) struct SceneTargetPipelines {
     pub shadowed: Option<vk::Pipeline>,
     /// The proxy pipeline handle — `Option` for belt-check style.
     /// Main pass: `Some(pipes.proxy_pipeline)`; HDR pass: `Some(self.proxy_hdr)`.
+    /// (The VEHICLE kind's pipeline — the npc kind's is `proxy_skinned`.)
     pub proxy: Option<vk::Pipeline>,
+    /// The SKINNED proxy pipeline handle (the npc kind's — this
+    /// render pass's variant). Main pass: `pipes.skinned.map(|s| s.pipeline())`;
+    /// HDR pass: the skinned state's `skinned_hdr` (ensured at the
+    /// first populated post frame).
+    pub proxy_skinned: Option<vk::Pipeline>,
 }
 
 /// Records the unified corner scene sequence: sky (if present), corner
@@ -214,22 +220,50 @@ pub(crate) unsafe fn record_corner_scene(
         if let (Some(proxy_state), Some(upload), Some(sets), Some(proxy_pipeline)) =
             (&pipes.proxy, proxy, proxy_sets, targets.proxy)
         {
-            // SAFETY: the proxy pipeline is bound with its own layout
-            // inside its render pass; `sets` were validated before
-            // recording; this slot's instance region holds this frame's
+            // The Era-2 per-kind split: the npc kind's skinned
+            // pipeline for THIS pass (the skinned state exists — the
+            // frame flow's ensure ran before the fence wait), and its
+            // per-material skinned set + the pose slot's dynamic
+            // offset. The material index was validated against the
+            // corner table (the same 3 materials the skinned sets
+            // mirror), so a populated npc kind's set is Some.
+            let skinned_state = pipes.skinned.as_ref().expect(
+                "the skinned ensure discipline makes a populated frame's \
+                 missing skinned state unreachable",
+            );
+            let skinned_pipeline = targets.proxy_skinned.unwrap_or_else(|| {
+                debug_assert!(
+                    upload.npc_count == 0,
+                    "a populated npc kind needs this pass's skinned pipeline"
+                );
+                skinned_state.pipeline()
+            });
+            let skinned_bind = crate::vulkan::proxy_draw::SkinnedSetBind {
+                layout: skinned_state.pipeline_layout(),
+                set: skinned_state
+                    .set(upload.npc_material)
+                    .unwrap_or(vk::DescriptorSet::null()),
+                pose_offset: skinned_state.pose_offset(slot),
+            };
+            let pipelines = crate::vulkan::proxy_draw::ProxyPipelines {
+                vehicle: proxy_pipeline,
+                vehicle_layout: pipes.proxy_layout,
+                npc: skinned_pipeline,
+            };
+            // SAFETY: the per-kind pipelines are bound with their own
+            // layouts inside their render pass (the draw does the
+            // binding); `sets` were validated before recording; this
+            // slot's instance AND pose regions hold this frame's
             // bytes (written above, after the fence wait).
-            unsafe {
-                ctx.device
-                    .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, proxy_pipeline);
-            }
             let recorded = proxy_state.draw(
                 ctx,
                 cmd,
-                pipes.proxy_layout,
                 corner_resources,
                 slot,
                 upload,
                 sets,
+                &pipelines,
+                &skinned_bind,
             );
             // The recorded count and the pure submission model must
             // agree (the unit test pins the model; this co-pins the
