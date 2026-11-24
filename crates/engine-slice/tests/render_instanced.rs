@@ -344,14 +344,27 @@ fn check_rotated_instance_oracle(
     let hh = (y_local[1] - y_local[0]) / 2.0 * k;
     // The dead-on orthographic camera: right = tangent, up = +Y,
     // looking along −normal from eye = center + 4·normal (the
-    // axis-aligned fixture's own 4-unit standoff). Row-vector
-    // convention, the existing machinery's layout: NDC.x = ((P−C)·
-    // tangent)/hw, NDC.y = (Py−Cy)/hh, depth = 0.25 − 0.0625·((P−C)·
-    // normal) (the wall lands at 0.25, the existing fixture's depth).
+    // axis-aligned fixture's own 4-unit standoff). THE ENGINE'S
+    // PINNED LAYOUT (math.rs's mul/perspective/camera_view —
+    // matrix[COLUMN][row], translation in column 3 — and both
+    // vertex shaders' `frame.view_proj * world` column-vector
+    // product): each column below is the image of one world basis
+    // axis, NDC.x = ((P−C)·tangent)/hw, NDC.y = (Py−Cy)/hh, depth =
+    // 0.25 − 0.0625·((P−C)·normal) (the wall lands at 0.25, the
+    // existing fixture's depth). The axis-aligned fixture's matrix
+    // is transpose-invariant — its linear part is diagonal — which
+    // is exactly why a ROTATED camera is the convention gate: the
+    // first version of this fixture was authored row-form and the
+    // wall rendered at the transposed projection's off-center
+    // rectangle instead of dead-on.
     let matrix = [
-        [tangent[0] / hw, 0.0, tangent[2] / hw, 0.0],
+        // Column 0 — world +X's image.
+        [tangent[0] / hw, 0.0, -0.0625 * normal[0], 0.0],
+        // Column 1 — world +Y's image.
         [0.0, 1.0 / hh, 0.0, 0.0],
-        [-0.0625 * normal[0], 0.0, -0.0625 * normal[2], 0.0],
+        // Column 2 — world +Z's image.
+        [tangent[2] / hw, 0.0, -0.0625 * normal[2], 0.0],
+        // Column 3 — the translation.
         [
             -(center[0] * tangent[0] + center[2] * tangent[2]) / hw,
             -center[1] / hh,
@@ -753,7 +766,7 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
         },
         1,            // the building facade material
         0.21,         // the NPC torso's local half width
-        [0.54, 0.80], // the local y range the torso wall spans
+        [1.06, 1.60], // the torso wall's local y range (humanoid_mesh's own box)
     );
 
     // THE SELF-DISCRIMINATION CONTROL (the review's bar, proven
@@ -765,7 +778,10 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
     // fails the pixel checks above.
     {
         let (s, c) = engine_renderer::proxy_instances::sin_cos_turn(40_960);
-        let rotated = [-s, 0.0, -c]; // +Z under 225°: both components negative
+        // +Z under 225° (quadrant 2): sin_cos_turn's (s, c) is
+        // already both-negative — the pinned basis image, NOT its
+        // negation.
+        let rotated = [s, 0.0, c];
         let unrotated = [0.0, 0.0, 1.0];
         let light = day_preset();
         let mat = materials()[1];
@@ -776,7 +792,13 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
         let n_dot_l = (rotated[0] * light.dir_toward_light[0]
             + rotated[2] * light.dir_toward_light[2])
             .max(0.0);
-        let v = view;
+        // lit_surface_color's own convention (the shader's too): the
+        // view is NORMALIZED before the half vector — the dead-on
+        // standoff's length must not leak into N·H.
+        let v = {
+            let len = (view[0] * view[0] + view[1] * view[1] + view[2] * view[2]).sqrt();
+            [view[0] / len, view[1] / len, view[2] / len]
+        };
         let l = light.dir_toward_light;
         let h_len = ((l[0] + v[0]).powi(2) + (l[1] + v[1]).powi(2) + (l[2] + v[2]).powi(2)).sqrt();
         let n_dot_h = ((rotated[0] * (l[0] + v[0]) + rotated[2] * (l[2] + v[2])) / h_len).max(0.0);
