@@ -376,8 +376,14 @@ jobs:
           # fallback — pure f32-free enum logic, no cfg gates).
           # Linux 1195/2/33 MEASURED locally with this step's own
           # awk; Windows 1144 = 1137 + the same 7.
-          expected=1195
-          if [ "$(uname -s)" != "Linux" ]; then expected=1144; fi
+          # Era-1 corrective recursive phase (2026-11-24, findings 3+8
+          # on corrective/frame-preparation): +4 engine-renderer lib
+          # tests (the target-fault seam's plan-advance battery —
+          # fires-once, ordinal, the error variant, unarmed), the
+          # same +4 platform-uniform in the renderer-release step.
+          # MEASURED locally with this step's own awk.
+          expected=1199
+          if [ "$(uname -s)" != "Linux" ]; then expected=1148; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -441,8 +447,13 @@ jobs:
           # batteries, the same +7 as the main shard,
           # platform-uniform) — 111 -> 118. MEASURED locally with
           # this step's own awk (118/0 failures/2 result lines).
-          echo "renderer release: $passed passed, $results test-result lines (expected 118 / 2)"
-          [ "$passed" -eq 118 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 118"; exit 1; }
+          # Era-1 corrective recursive phase (2026-11-24, findings
+          # 3+8): +4 (the target-fault seam's plan-advance battery,
+          # the same +4 as the main shard, platform-uniform) —
+          # 118 -> 122. MEASURED locally with this step's own awk
+          # (122/0 failures/2 result lines).
+          echo "renderer release: $passed passed, $results test-result lines (expected 122 / 2)"
+          [ "$passed" -eq 122 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 122"; exit 1; }
           [ "$results" -eq 2 ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != 2"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production
@@ -656,6 +667,11 @@ jobs:
       # corner-family composition smokes. The per-stage println!
       # evidence (the max-error lines, the lift, the delta) is
       # what the CI log must show.
+      # (Era-1 corrective recursive phase, findings 3+8) The same
+      # step now also executes the fault-injection gate: every
+      # target-builder stage fault unwinds to the pre-attempt
+      # census, no slot strands, recoveries land (MEASURED on the
+      # pod's lavapipe — the full 21-cell matrix, 4.65 s).
       - name: Post gates (lavapipe)
         if: runner.os == 'Linux'
         shell: bash
@@ -1294,7 +1310,7 @@ jobs:
           # are engine-renderer lib tests — the main shard's).
           # Linux 582/14/59 MEASURED locally with this step's own
           # awk; Windows 581/14/59 platform-uniform.
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 21 / 62)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 22 / 62)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           # Era 1 package 3 (the sky, 2026-11-23): the NEW
           # tests/render_sky.rs binary carries ONE #[ignore]d
@@ -1338,7 +1354,16 @@ jobs:
           # 17 -> 18; with both landed the count is 22 (18 + these
           # 4) — whichever lands second re-measures with this awk
           # and takes the actuals, never a guess.
-          [ "$ignored" -eq 21 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 21"; exit 1; }
+          # Era-1 corrective recursive phase (2026-11-24, findings
+          # 3+8): the fault-injection gate adds ONE #[ignore]d
+          # engine-slice test (render_post's
+          # injected_target_failures... — executed by the unchanged
+          # post-gates Linux Vulkan step below; ignored in this plain
+          # run): 21 -> 22. Passed and result lines unchanged.
+          # MEASURED locally with this step's own awk (582/22/62).
+          # With #21 also landed the count is 23 — the merge-order
+          # note above applies unchanged.
+          [ "$ignored" -eq 22 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 22"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local

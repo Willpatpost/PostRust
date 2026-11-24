@@ -123,7 +123,7 @@ pub mod textures;
 use crate::SceneLayer;
 use crate::config::{
     DemoScenePreference, DynamicClamp, FRAMES_IN_FLIGHT, PresentModePreference, RenderConfig,
-    dynamic_geometry_clamp, resolve_present_mode,
+    TargetFaultSite, TargetFaultStage, dynamic_geometry_clamp, resolve_present_mode,
 };
 use crate::overlay::OverlayVertex;
 use crate::scene::SceneVertex;
@@ -246,6 +246,11 @@ pub enum RendererError {
     /// invalid per-field value. Nothing was rendered and no frame
     /// state was touched.
     ProxyPack(crate::proxy_instances::InstancePackError),
+    /// A fault deliberately injected through the renderer's diagnostic
+    /// seam (the corrective finding 3+8 verification knobs): never
+    /// produced by a real Vulkan call. Distinguishes an injected
+    /// recoverable construction failure from a genuine device error.
+    InjectedFault(String),
 }
 
 impl RendererError {
@@ -288,6 +293,10 @@ impl std::fmt::Display for RendererError {
             RendererError::ProxyPack(error) => write!(
                 f,
                 "proxy population refused (no partial buffer was produced): {error:?}"
+            ),
+            RendererError::InjectedFault(message) => write!(
+                f,
+                "injected fault: {message} (diagnostic-only, not a device error)"
             ),
         }
     }
@@ -342,6 +351,31 @@ pub(crate) struct VulkanContext {
     descriptor_pools: Cell<u64>,
     descriptor_sets: Cell<u64>,
     sampler_creations: Cell<u64>,
+    /// Diagnostic fault-injection seam: arms a one-shot plan for the
+    /// corrective finding 3+8 verification. The `u32` ordinal is
+    /// 1-based and decrements per MATCHING check across the renderer's
+    /// lifetime (the plan is NOT reset when consumed, only when the
+    /// ordinal reaches 0). This cumulative decrement allows the same
+    /// site/stage to fire multiple times across multiple target
+    /// builders (e.g., shadow's per-slot loop). The plan is NEVER
+    /// touched by real device calls — it is test-only and diagnostic.
+    target_fault: Cell<Option<(TargetFaultSite, TargetFaultStage, u32)>>,
+    /// Creation counts for Era-1 target builders' Vulkan objects (the
+    /// review's finding 8 acquisitions: image, memory, view, framebuffer
+    /// — post chain, wet chain, shadow chain). These are monotonic
+    /// counters, recorded only on success. (Destructions count every
+    /// call since release paths drain owned vectors exactly once.)
+    target_images: Cell<u64>,
+    target_image_views: Cell<u64>,
+    target_framebuffers: Cell<u64>,
+    target_memories: Cell<u64>,
+    /// Destruction counts for the same objects — recorded on every
+    /// destroy call (not just on success, since release paths always
+    /// free what they own).
+    target_image_frees: Cell<u64>,
+    target_view_frees: Cell<u64>,
+    target_framebuffer_frees: Cell<u64>,
+    target_memory_frees: Cell<u64>,
 }
 
 impl VulkanContext {
@@ -655,6 +689,15 @@ impl VulkanContext {
             descriptor_pools: Cell::new(0),
             descriptor_sets: Cell::new(0),
             sampler_creations: Cell::new(0),
+            target_fault: Cell::new(None),
+            target_images: Cell::new(0),
+            target_image_views: Cell::new(0),
+            target_framebuffers: Cell::new(0),
+            target_memories: Cell::new(0),
+            target_image_frees: Cell::new(0),
+            target_view_frees: Cell::new(0),
+            target_framebuffer_frees: Cell::new(0),
+            target_memory_frees: Cell::new(0),
         };
         if let Err(e) = context.init_atlas(atlas) {
             context.destroy();
@@ -711,7 +754,157 @@ impl VulkanContext {
             descriptor_pools: self.descriptor_pools.get(),
             descriptor_sets: self.descriptor_sets.get(),
             samplers: self.sampler_creations.get(),
+            target_images: self.target_images.get(),
+            target_image_views: self.target_image_views.get(),
+            target_framebuffers: self.target_framebuffers.get(),
+            target_memories: self.target_memories.get(),
+            target_image_frees: self.target_image_frees.get(),
+            target_view_frees: self.target_view_frees.get(),
+            target_framebuffer_frees: self.target_framebuffer_frees.get(),
+            target_memory_frees: self.target_memory_frees.get(),
         }
+    }
+
+    /// Arms a one-shot target-construction fault plan. The `ordinal`
+    /// is 1-based and decrements per MATCHING check across the
+    /// renderer's lifetime (cumulative, not per-builder). The plan
+    /// is consumed only when the ordinal reaches 0. Diagnostic-only,
+    /// test-only: never produced by real device calls.
+    pub(crate) fn set_target_fault(
+        &self,
+        site: TargetFaultSite,
+        stage: TargetFaultStage,
+        ordinal: u32,
+    ) {
+        // A zero ordinal can never fire (it would underflow below);
+        // clamp to 1 so an armed plan is always fireable by its first
+        // matching check.
+        self.target_fault.set(Some((site, stage, ordinal.max(1))));
+    }
+
+    /// Checks if a fault should be injected for the given site and
+    /// stage. Returns `Ok(())` immediately if no plan is armed or if
+    /// the site/stage don't match (branch-cheap; runs only during
+    /// construction, never per-frame). On match: decrements the
+    /// ordinal; when it reaches 0, consumes the plan and returns
+    /// `Err(RendererError::InjectedFault)`. The logic lives in
+    /// [`advance_target_fault_plan`] (pure, unit-tested without a
+    /// device — the mock-free seam tests below).
+    pub(crate) fn check_target_fault(
+        &self,
+        site: TargetFaultSite,
+        stage: TargetFaultStage,
+    ) -> Result<(), RendererError> {
+        let mut plan = self.target_fault.get();
+        match advance_target_fault_plan(&mut plan, site, stage) {
+            Some(error) => {
+                self.target_fault.set(plan);
+                Err(error)
+            }
+            None => {
+                self.target_fault.set(plan);
+                Ok(())
+            }
+        }
+    }
+
+    /// Create a target image, incrementing the creation counter on
+    /// success. The caller's `what` string is used for error
+    /// reporting. SAFETY: callers pass valid image create info for
+    /// this device and own the returned image.
+    unsafe fn create_target_image(
+        &self,
+        info: &vk::ImageCreateInfo,
+        what: &str,
+    ) -> Result<vk::Image, RendererError> {
+        // SAFETY: fresh object; the caller owns it from creation.
+        let image = unsafe { self.device.create_image(info, None) }
+            .map_err(|error| RendererError::vk(error, what))?;
+        self.target_images.set(self.target_images.get() + 1);
+        Ok(image)
+    }
+
+    /// Create a target image view, incrementing the creation counter
+    /// on success. SAFETY: callers pass valid view create info for
+    /// this device and own the returned view.
+    unsafe fn create_target_image_view(
+        &self,
+        info: &vk::ImageViewCreateInfo,
+        what: &str,
+    ) -> Result<vk::ImageView, RendererError> {
+        // SAFETY: fresh object; the caller owns it from creation.
+        let view = unsafe { self.device.create_image_view(info, None) }
+            .map_err(|error| RendererError::vk(error, what))?;
+        self.target_image_views
+            .set(self.target_image_views.get() + 1);
+        Ok(view)
+    }
+
+    /// Create a target framebuffer, incrementing the creation counter
+    /// on success. SAFETY: callers pass valid framebuffer create info
+    /// for this device and own the returned framebuffer.
+    unsafe fn create_target_framebuffer(
+        &self,
+        info: &vk::FramebufferCreateInfo,
+        what: &str,
+    ) -> Result<vk::Framebuffer, RendererError> {
+        // SAFETY: fresh object; the caller owns it from creation.
+        let framebuffer = unsafe { self.device.create_framebuffer(info, None) }
+            .map_err(|error| RendererError::vk(error, what))?;
+        self.target_framebuffers
+            .set(self.target_framebuffers.get() + 1);
+        Ok(framebuffer)
+    }
+
+    /// Allocate target memory, incrementing BOTH the target memory
+    /// counter AND the device_memory counter (so device_memory stays
+    /// complete renderer-wide). SAFETY: callers pass valid memory
+    /// allocate info for this device and own the returned memory.
+    unsafe fn allocate_target_memory(
+        &self,
+        info: &vk::MemoryAllocateInfo,
+        what: &str,
+    ) -> Result<vk::DeviceMemory, RendererError> {
+        // SAFETY: callers pass allocation info for this device and
+        // own the returned memory.
+        match unsafe { self.allocate_memory(info) } {
+            Ok(memory) => {
+                self.target_memories.set(self.target_memories.get() + 1);
+                Ok(memory)
+            }
+            Err(result) => Err(RendererError::vk(result, what)),
+        }
+    }
+
+    /// Destroy a target image, incrementing the destruction counter.
+    /// The caller must own the image. This is called on every
+    /// destruction path since release always drains owned vectors.
+    unsafe fn destroy_target_image(&self, image: vk::Image) {
+        unsafe { self.device.destroy_image(image, None) };
+        self.target_image_frees
+            .set(self.target_image_frees.get() + 1);
+    }
+
+    /// Destroy a target image view, incrementing the destruction
+    /// counter.
+    unsafe fn destroy_target_image_view(&self, view: vk::ImageView) {
+        unsafe { self.device.destroy_image_view(view, None) };
+        self.target_view_frees.set(self.target_view_frees.get() + 1);
+    }
+
+    /// Destroy a target framebuffer, incrementing the destruction
+    /// counter.
+    unsafe fn destroy_target_framebuffer(&self, framebuffer: vk::Framebuffer) {
+        unsafe { self.device.destroy_framebuffer(framebuffer, None) };
+        self.target_framebuffer_frees
+            .set(self.target_framebuffer_frees.get() + 1);
+    }
+
+    /// Free target memory, incrementing the destruction counter.
+    unsafe fn free_target_memory(&self, memory: vk::DeviceMemory) {
+        unsafe { self.device.free_memory(memory, None) };
+        self.target_memory_frees
+            .set(self.target_memory_frees.get() + 1);
     }
 
     /// Full teardown in manifest order (assumes swapchain/pipelines/frames
@@ -5335,5 +5528,136 @@ mod surface_probe_tests {
             surface_probe_decision(true, true, true),
             SurfaceProbeDecision::ProbeAvailable
         );
+    }
+}
+
+/// The fault plan's pure advance logic, extracted so the seam is
+/// unit-testable without a Vulkan device (the mock-free discipline:
+/// the tests below exercise THIS function, the one
+/// [`VulkanContext::check_target_fault`] actually runs).
+///
+/// A plan matches only when both the site and the stage equal the
+/// check's; a match decrements the ordinal, and the fault fires when
+/// it reaches zero (consuming the plan). Non-matching checks leave
+/// the plan untouched. The ordinal is 1-based; `set_target_fault`
+/// clamps it to at least 1.
+fn advance_target_fault_plan(
+    plan: &mut Option<(TargetFaultSite, TargetFaultStage, u32)>,
+    site: TargetFaultSite,
+    stage: TargetFaultStage,
+) -> Option<RendererError> {
+    let (plan_site, plan_stage, ordinal) = (*plan)?;
+    if plan_site != site || plan_stage != stage {
+        return None;
+    }
+    let remaining = ordinal - 1;
+    if remaining == 0 {
+        *plan = None;
+        Some(RendererError::InjectedFault(format!("{site:?} {stage:?}")))
+    } else {
+        *plan = Some((plan_site, plan_stage, remaining));
+        None
+    }
+}
+
+#[cfg(test)]
+mod target_fault_seam_tests {
+    use super::advance_target_fault_plan;
+    use crate::RendererError;
+    use crate::{TargetFaultSite, TargetFaultStage};
+
+    /// A fired plan is consumed: the second matching check passes.
+    #[test]
+    fn plan_fires_once_then_stays_consumed() {
+        let mut plan = Some((TargetFaultSite::Post, TargetFaultStage::Image, 1));
+        assert!(
+            advance_target_fault_plan(&mut plan, TargetFaultSite::Post, TargetFaultStage::Image)
+                .is_some()
+        );
+        assert_eq!(plan, None);
+        assert!(
+            advance_target_fault_plan(&mut plan, TargetFaultSite::Post, TargetFaultStage::Image)
+                .is_none()
+        );
+        assert_eq!(plan, None);
+    }
+
+    /// Only a matching site AND stage decrements the ordinal; every
+    /// other check combination leaves the plan untouched.
+    #[test]
+    fn ordinal_decrements_only_on_matching_site_and_stage() {
+        let mut plan = Some((TargetFaultSite::Post, TargetFaultStage::Image, 3));
+        for (site, stage) in [
+            (TargetFaultSite::Wet, TargetFaultStage::Image),
+            (TargetFaultSite::Shadow, TargetFaultStage::Image),
+            (TargetFaultSite::Post, TargetFaultStage::Memory),
+            (TargetFaultSite::Post, TargetFaultStage::Framebuffer),
+        ] {
+            assert!(advance_target_fault_plan(&mut plan, site, stage).is_none());
+            assert_eq!(
+                plan,
+                Some((TargetFaultSite::Post, TargetFaultStage::Image, 3))
+            );
+        }
+        // Three matching checks: the first two decrement, the third fires.
+        assert!(
+            advance_target_fault_plan(&mut plan, TargetFaultSite::Post, TargetFaultStage::Image)
+                .is_none()
+        );
+        assert_eq!(
+            plan,
+            Some((TargetFaultSite::Post, TargetFaultStage::Image, 2))
+        );
+        assert!(
+            advance_target_fault_plan(&mut plan, TargetFaultSite::Post, TargetFaultStage::Image)
+                .is_none()
+        );
+        assert_eq!(
+            plan,
+            Some((TargetFaultSite::Post, TargetFaultStage::Image, 1))
+        );
+        assert!(
+            advance_target_fault_plan(&mut plan, TargetFaultSite::Post, TargetFaultStage::Image)
+                .is_some()
+        );
+        assert_eq!(plan, None);
+    }
+
+    /// The fired error names the site and stage (the gate asserts the
+    /// variant; the message carries the cell for diagnostics).
+    #[test]
+    fn the_fired_fault_is_the_injected_variant_naming_its_cell() {
+        let mut plan = Some((TargetFaultSite::Shadow, TargetFaultStage::Bind, 1));
+        match advance_target_fault_plan(&mut plan, TargetFaultSite::Shadow, TargetFaultStage::Bind)
+        {
+            Some(RendererError::InjectedFault(message)) => {
+                assert!(message.contains("Shadow"), "message: {message}");
+                assert!(message.contains("Bind"), "message: {message}");
+            }
+            other => panic!("expected InjectedFault, got {other:?}"),
+        }
+    }
+
+    /// An unarmed plan (None) never fires and stays None.
+    #[test]
+    fn an_unarmed_plan_never_fires() {
+        let mut plan = None;
+        for site in [
+            TargetFaultSite::Post,
+            TargetFaultSite::Wet,
+            TargetFaultSite::Shadow,
+        ] {
+            for stage in [
+                TargetFaultStage::Image,
+                TargetFaultStage::MemoryLookup,
+                TargetFaultStage::Memory,
+                TargetFaultStage::Bind,
+                TargetFaultStage::View,
+                TargetFaultStage::Framebuffer,
+            ] {
+                assert!(advance_target_fault_plan(&mut plan, site, stage).is_none());
+            }
+        }
+        assert_eq!(plan, None);
     }
 }

@@ -80,7 +80,7 @@ use super::proxy_draw::ProxyFrameUpload;
 use super::shadow_draw::ShadowFrameParams;
 use super::sky_draw::SkyFrameParams;
 use super::{PipelineState, RendererError, VulkanContext, create_mapped_buffer, find_memory_type};
-use crate::config::FRAMES_IN_FLIGHT;
+use crate::config::{FRAMES_IN_FLIGHT, TargetFaultSite, TargetFaultStage};
 use crate::post::BLOOM_STRENGTH;
 use ash::vk;
 
@@ -1500,6 +1500,10 @@ impl PostTargets {
         // vectors as parameters, and pushes each handle immediately
         // after its successful creation (corrective finding 8:
         // immediate registration to avoid leaks on partial failure).
+        //
+        // The diagnostic fault-injection seam (corrective findings 3+8)
+        // checks before each fallible step. On the first matching fault,
+        // returns RendererError::InjectedFault instead of proceeding.
         let create_image = |format: vk::Format,
                             image_extent: (u32, u32),
                             usage: vk::ImageUsageFlags,
@@ -1525,10 +1529,13 @@ impl PostTargets {
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
             // SAFETY: fresh object; push it to the partial bundle's
             // image vector immediately so release() can free it on error.
-            let image = unsafe { ctx.device.create_image(&image_info, None) }
-                .map_err(|error| RendererError::vk(error, what))?;
+            // Fault check before image creation (site: Post, stage: Image)
+            ctx.check_target_fault(TargetFaultSite::Post, TargetFaultStage::Image)?;
+            let image = unsafe { ctx.create_target_image(&image_info, what) }?;
             images.push(image);
             let requirements = unsafe { ctx.device.get_image_memory_requirements(image) };
+            // Fault check before memory type lookup (site: Post, stage: MemoryLookup)
+            ctx.check_target_fault(TargetFaultSite::Post, TargetFaultStage::MemoryLookup)?;
             let memory_index = find_memory_type(
                 ctx,
                 requirements.memory_type_bits,
@@ -1540,9 +1547,12 @@ impl PostTargets {
                 .memory_type_index(memory_index);
             // SAFETY: push the memory immediately after allocation
             // (it's bound to the image we just pushed).
-            let memory = unsafe { ctx.allocate_memory(&memory_info) }
-                .map_err(|error| RendererError::vk(error, what))?;
+            // Fault check before memory allocation (site: Post, stage: Memory)
+            ctx.check_target_fault(TargetFaultSite::Post, TargetFaultStage::Memory)?;
+            let memory = unsafe { ctx.allocate_target_memory(&memory_info, what) }?;
             memories.push(memory);
+            // Fault check before memory binding (site: Post, stage: Bind)
+            ctx.check_target_fault(TargetFaultSite::Post, TargetFaultStage::Bind)?;
             unsafe { ctx.device.bind_image_memory(image, memory, 0) }
                 .map_err(|error| RendererError::vk(error, what))?;
             let subresource = vk::ImageSubresourceRange {
@@ -1557,8 +1567,9 @@ impl PostTargets {
                 .format(format)
                 .subresource_range(subresource);
             // SAFETY: push the view immediately after creation.
-            let view = unsafe { ctx.device.create_image_view(&view_info, None) }
-                .map_err(|error| RendererError::vk(error, what))?;
+            // Fault check before view creation (site: Post, stage: View)
+            ctx.check_target_fault(TargetFaultSite::Post, TargetFaultStage::View)?;
+            let view = unsafe { ctx.create_target_image_view(&view_info, what) }?;
             views.push(view);
             Ok(())
         };
@@ -1622,9 +1633,11 @@ impl PostTargets {
                 .width(extent.width)
                 .height(extent.height)
                 .layers(1);
+            // Fault check before framebuffer creation (site: Post, stage: Framebuffer)
+            ctx.check_target_fault(TargetFaultSite::Post, TargetFaultStage::Framebuffer)?;
             // SAFETY: fresh object; the partial state owns it.
-            let framebuffer = unsafe { ctx.device.create_framebuffer(&info, None) }
-                .map_err(|error| RendererError::vk(error, "post HDR framebuffer"))?;
+            let framebuffer =
+                unsafe { ctx.create_target_framebuffer(&info, "post HDR framebuffer") }?;
             self.hdr_framebuffers.push(framebuffer);
         }
         // The bloom framebuffers: one per mip target per slot
@@ -1642,9 +1655,10 @@ impl PostTargets {
                 .width(fb_extent.0)
                 .height(fb_extent.1)
                 .layers(1);
+            // Fault check before framebuffer creation (site: Post, stage: Framebuffer)
+            ctx.check_target_fault(TargetFaultSite::Post, TargetFaultStage::Framebuffer)?;
             // SAFETY: fresh object; the partial state owns it.
-            unsafe { ctx.device.create_framebuffer(&info, None) }
-                .map_err(|error| RendererError::vk(error, what))
+            unsafe { ctx.create_target_framebuffer(&info, what) }
         };
         for slot in 0..slots {
             let framebuffer = create_framebuffer(
@@ -1788,58 +1802,62 @@ impl PostTargets {
             // Framebuffers before the render passes they reference
             // (the passes themselves are the parent's).
             for framebuffer in self.post_framebuffers.drain(..) {
-                ctx.device.destroy_framebuffer(framebuffer, None);
+                ctx.destroy_target_framebuffer(framebuffer);
             }
             for framebuffer in self.bloom_b_framebuffers.drain(..) {
-                ctx.device.destroy_framebuffer(framebuffer, None);
+                ctx.destroy_target_framebuffer(framebuffer);
             }
             for framebuffer in self.bloom_a_framebuffers.drain(..) {
-                ctx.device.destroy_framebuffer(framebuffer, None);
+                ctx.destroy_target_framebuffer(framebuffer);
             }
             for framebuffer in self.hdr_framebuffers.drain(..) {
-                ctx.device.destroy_framebuffer(framebuffer, None);
+                ctx.destroy_target_framebuffer(framebuffer);
             }
             ctx.device.destroy_descriptor_pool(self.post_pool, None);
             ctx.device.destroy_descriptor_pool(self.bloom_pool, None);
-            for (image, memory) in self
-                .bloom_b_images
-                .drain(..)
-                .zip(self.bloom_b_memories.drain(..))
-            {
-                ctx.device.destroy_image(image, None);
-                ctx.device.free_memory(memory, None);
+            // The images and memories drain INDEPENDENTLY, not zipped:
+            // a partial construction (the finding-8 fault points —
+            // memory lookup, allocation, or bind failing after the
+            // image was registered) leaves the vectors unbalanced, and
+            // a zip would then destroy NEITHER side (the leak the
+            // fault gate caught: VUID-vkDestroyDevice-device-05137).
+            // For a fully-built bundle the vectors are balanced and
+            // this destroys exactly what the zip did.
+            for memory in self.bloom_b_memories.drain(..) {
+                ctx.free_target_memory(memory);
+            }
+            for image in self.bloom_b_images.drain(..) {
+                ctx.destroy_target_image(image);
             }
             for view in self.bloom_b_views.drain(..) {
-                ctx.device.destroy_image_view(view, None);
+                ctx.destroy_target_image_view(view);
             }
-            for (image, memory) in self
-                .bloom_a_images
-                .drain(..)
-                .zip(self.bloom_a_memories.drain(..))
-            {
-                ctx.device.destroy_image(image, None);
-                ctx.device.free_memory(memory, None);
+            for memory in self.bloom_a_memories.drain(..) {
+                ctx.free_target_memory(memory);
+            }
+            for image in self.bloom_a_images.drain(..) {
+                ctx.destroy_target_image(image);
             }
             for view in self.bloom_a_views.drain(..) {
-                ctx.device.destroy_image_view(view, None);
+                ctx.destroy_target_image_view(view);
             }
-            for (image, memory) in self
-                .hdr_depth_images
-                .drain(..)
-                .zip(self.hdr_depth_memories.drain(..))
-            {
-                ctx.device.destroy_image(image, None);
-                ctx.device.free_memory(memory, None);
+            for memory in self.hdr_depth_memories.drain(..) {
+                ctx.free_target_memory(memory);
+            }
+            for image in self.hdr_depth_images.drain(..) {
+                ctx.destroy_target_image(image);
             }
             for view in self.hdr_depth_views.drain(..) {
-                ctx.device.destroy_image_view(view, None);
+                ctx.destroy_target_image_view(view);
             }
-            for (image, memory) in self.hdr_images.drain(..).zip(self.hdr_memories.drain(..)) {
-                ctx.device.destroy_image(image, None);
-                ctx.device.free_memory(memory, None);
+            for memory in self.hdr_memories.drain(..) {
+                ctx.free_target_memory(memory);
+            }
+            for image in self.hdr_images.drain(..) {
+                ctx.destroy_target_image(image);
             }
             for view in self.hdr_views.drain(..) {
-                ctx.device.destroy_image_view(view, None);
+                ctx.destroy_target_image_view(view);
             }
         }
     }

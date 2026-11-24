@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use sdl3::video::Window as SdlWindow;
 
-use crate::config::{RenderConfig, present_mode_str};
+use crate::config::{RenderConfig, TargetFaultSite, TargetFaultStage, present_mode_str};
 use crate::overlay::{AtlasText, OverlayVertex};
 use crate::scene::SceneVertex;
 use crate::vulkan::{
@@ -112,6 +112,10 @@ pub struct FrameResult {
 
 /// Successful Vulkan allocation calls since renderer construction and the
 /// resident byte size of the texture allocations (including staging tails).
+/// The additional fields count only the Era-1 target builders' Vulkan
+/// objects (image, memory, view, framebuffer — post chain, wet chain,
+/// shadow chain). Texture/corner/overlay allocations stay outside this
+/// scope; the existing fields' semantics are unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AllocationStats {
     pub device_memory: u64,
@@ -120,6 +124,23 @@ pub struct AllocationStats {
     pub descriptor_pools: u64,
     pub descriptor_sets: u64,
     pub samplers: u64,
+    /// Monotonic creation count of Era-1 target builder images
+    /// (post, wet, shadow).
+    pub target_images: u64,
+    /// Monotonic creation count of Era-1 target builder image views.
+    pub target_image_views: u64,
+    /// Monotonic creation count of Era-1 target builder framebuffers.
+    pub target_framebuffers: u64,
+    /// Monotonic creation count of Era-1 target builder memory allocations.
+    pub target_memories: u64,
+    /// Monotonic destruction count of Era-1 target builder images.
+    pub target_image_frees: u64,
+    /// Monotonic destruction count of Era-1 target builder image views.
+    pub target_view_frees: u64,
+    /// Monotonic destruction count of Era-1 target builder framebuffers.
+    pub target_framebuffer_frees: u64,
+    /// Monotonic destruction count of Era-1 target builder memory allocations.
+    pub target_memory_frees: u64,
 }
 
 /// Long-lived renderer statistics (Stage 2 authorization, item 4).
@@ -870,6 +891,25 @@ impl Renderer {
     /// Reads cumulative allocation counters on demand.
     pub fn allocations(&self) -> AllocationStats {
         self.ctx.allocations()
+    }
+
+    /// Arms a one-shot target-construction fault (the corrective
+    /// finding 3+8 verification knob): the ordinal-th matching
+    /// fallible step in the named builder returns
+    /// [`RendererError::InjectedFault`]. The ordinal is 1-based and
+    /// decrements per MATCHING check (across all target builders of
+    /// the same site). The plan is consumed only when the ordinal
+    /// reaches 0. Diagnostic-only, test-only: never produced by real
+    /// device calls. The `&mut self` is intentional: the one-shot
+    /// intent is encoded in the type (a caller must mutably borrow to
+    /// arm it).
+    pub fn inject_target_fault(
+        &mut self,
+        site: TargetFaultSite,
+        stage: TargetFaultStage,
+        ordinal: u32,
+    ) {
+        self.ctx.set_target_fault(site, stage, ordinal);
     }
 
     pub fn stats(&self) -> &RenderStats {

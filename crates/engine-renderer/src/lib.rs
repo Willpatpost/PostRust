@@ -63,7 +63,7 @@ mod vulkan;
 
 pub use config::{
     DemoScenePreference, DepthFormatPreference, PresentModePreference, RenderConfig,
-    ValidationPreference,
+    TargetFaultSite, TargetFaultStage, ValidationPreference,
 };
 pub use renderer::{
     AllocationStats, FrameResult, GeometryStats, ProxyDrawMode, ProxyPopulation, RenderStats,

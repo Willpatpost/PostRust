@@ -96,6 +96,41 @@ pub enum DepthFormatPreference {
     ForceD16,
 }
 
+/// Diagnostic fault-injection site: which Era-1 target builder a
+/// [`Renderer::inject_target_fault`] plan targets. Test-only,
+/// diagnostic-only: never produced by real device calls, never
+/// consumed by real code. (corrective finding 3+8 verification knobs)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetFaultSite {
+    /// The post chain's post_draw::PostTargets
+    Post,
+    /// The reflection chain's reflection_draw::ReflectionTargets
+    Wet,
+    /// The shadow chain's shadow_draw::ShadowTargets
+    Shadow,
+}
+
+/// Diagnostic fault-injection stage: which fallible step inside a
+/// target builder's per-object construction sequence fires.
+/// Test-only, diagnostic-only: never produced by real device calls,
+/// never consumed by real code. (corrective finding 3+8 verification
+/// knobs)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetFaultStage {
+    /// The image creation step
+    Image,
+    /// The memory type lookup step
+    MemoryLookup,
+    /// The memory allocation step
+    Memory,
+    /// The memory binding step
+    Bind,
+    /// The image view creation step
+    View,
+    /// The framebuffer creation step
+    Framebuffer,
+}
+
 /// Renderer configuration. Presentation *pacing* (frame-rate targets,
 /// uncapped measurement) stays in the application — the renderer never
 /// imposes an engine-wide frame-rate ceiling, and rendering cadence is
