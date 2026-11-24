@@ -44,8 +44,8 @@
 use engine_core::MoveIntent;
 use engine_renderer::scene::SceneVertex;
 use engine_renderer::{
-    CaptureFormat, DemoScenePreference, PresentModePreference, RenderConfig, Renderer,
-    ValidationPreference,
+    CaptureFormat, DemoScenePreference, DepthFormatPreference, PresentModePreference, RenderConfig,
+    Renderer, ValidationPreference,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 use engine_slice::math;
@@ -297,6 +297,7 @@ fn the_default_omits_and_the_explicit_opt_in_preserves_the_demo_scene() {
         validation: ValidationPreference::On,
         replace_pipelines: true,
         demo_scene: DemoScenePreference::Included,
+        depth_format: DepthFormatPreference::Auto,
     };
     let mut opt_in_renderer = Renderer::new(app.window(), opt_in_config)
         .expect("the opt-in renderer constructs under the software ICD");

@@ -81,7 +81,8 @@ use engine_core::{
 };
 use engine_renderer::scene::SceneVertex;
 use engine_renderer::{
-    DemoScenePreference, PresentModePreference, RenderConfig, Renderer, ValidationPreference,
+    DemoScenePreference, DepthFormatPreference, PresentModePreference, RenderConfig, Renderer,
+    ValidationPreference,
 };
 use engine_shell::{
     Audio, AudioStatus, Cue, DriverPreference, InputSnapshot, Keycode, MouseButton, ShellApp,
@@ -1679,6 +1680,7 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
         // scene, so the legacy Stage-2 test scene stays omitted (the
         // playable_demo idiom).
         demo_scene: DemoScenePreference::Omitted,
+        depth_format: DepthFormatPreference::Auto,
     };
     let mut renderer =
         Renderer::new(app.window(), render_config).map_err(|error| error.to_string())?;

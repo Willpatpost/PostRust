@@ -101,6 +101,8 @@ use ash::khr;
 use ash::vk;
 use ash::{Device, Entry, Instance};
 
+use crate::config::DepthFormatPreference;
+
 #[path = "corner.rs"]
 pub(crate) mod corner;
 #[path = "descriptors.rs"]
@@ -121,7 +123,7 @@ pub mod textures;
 use crate::SceneLayer;
 use crate::config::{
     DemoScenePreference, DynamicClamp, FRAMES_IN_FLIGHT, PresentModePreference, RenderConfig,
-    dynamic_geometry_clamp, resolve_present_mode,
+    TargetFaultSite, TargetFaultStage, dynamic_geometry_clamp, resolve_present_mode,
 };
 use crate::overlay::OverlayVertex;
 use crate::scene::SceneVertex;
@@ -244,6 +246,11 @@ pub enum RendererError {
     /// invalid per-field value. Nothing was rendered and no frame
     /// state was touched.
     ProxyPack(crate::proxy_instances::InstancePackError),
+    /// A fault deliberately injected through the renderer's diagnostic
+    /// seam (the corrective finding 3+8 verification knobs): never
+    /// produced by a real Vulkan call. Distinguishes an injected
+    /// recoverable construction failure from a genuine device error.
+    InjectedFault(String),
 }
 
 impl RendererError {
@@ -286,6 +293,10 @@ impl std::fmt::Display for RendererError {
             RendererError::ProxyPack(error) => write!(
                 f,
                 "proxy population refused (no partial buffer was produced): {error:?}"
+            ),
+            RendererError::InjectedFault(message) => write!(
+                f,
+                "injected fault: {message} (diagnostic-only, not a device error)"
             ),
         }
     }
@@ -340,6 +351,31 @@ pub(crate) struct VulkanContext {
     descriptor_pools: Cell<u64>,
     descriptor_sets: Cell<u64>,
     sampler_creations: Cell<u64>,
+    /// Diagnostic fault-injection seam: arms a one-shot plan for the
+    /// corrective finding 3+8 verification. The `u32` ordinal is
+    /// 1-based and decrements per MATCHING check across the renderer's
+    /// lifetime (the plan is NOT reset when consumed, only when the
+    /// ordinal reaches 0). This cumulative decrement allows the same
+    /// site/stage to fire multiple times across multiple target
+    /// builders (e.g., shadow's per-slot loop). The plan is NEVER
+    /// touched by real device calls — it is test-only and diagnostic.
+    target_fault: Cell<Option<(TargetFaultSite, TargetFaultStage, u32)>>,
+    /// Creation counts for Era-1 target builders' Vulkan objects (the
+    /// review's finding 8 acquisitions: image, memory, view, framebuffer
+    /// — post chain, wet chain, shadow chain). These are monotonic
+    /// counters, recorded only on success. (Destructions count every
+    /// call since release paths drain owned vectors exactly once.)
+    target_images: Cell<u64>,
+    target_image_views: Cell<u64>,
+    target_framebuffers: Cell<u64>,
+    target_memories: Cell<u64>,
+    /// Destruction counts for the same objects — recorded on every
+    /// destroy call (not just on success, since release paths always
+    /// free what they own).
+    target_image_frees: Cell<u64>,
+    target_view_frees: Cell<u64>,
+    target_framebuffer_frees: Cell<u64>,
+    target_memory_frees: Cell<u64>,
 }
 
 impl VulkanContext {
@@ -347,7 +383,7 @@ impl VulkanContext {
         window: &SdlWindow,
         atlas: &crate::glyph_atlas::GlyphAtlas,
         config: &RenderConfig,
-    ) -> Result<(VulkanContext, bool), RendererError> {
+    ) -> Result<(VulkanContext, bool, bool), RendererError> {
         let entry = unsafe { Entry::load() }
             .map_err(|error| RendererError::NoLoader(format!("{error}")))?;
 
@@ -417,6 +453,7 @@ impl VulkanContext {
 
         let mut instance = None;
         let mut validation_active = false;
+        let mut sync_validation = false;
         if want_validation {
             // Try with validation; failure here is an environment
             // limitation (no layer installed), not an application error.
@@ -440,16 +477,35 @@ impl VulkanContext {
                         | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
                 )
                 .pfn_user_callback(Some(validation_callback));
+            // Finding 9's explicitly-enabled synchronization validation
+            // (the Era-1 review's check: the sync-proof gaps were
+            // exercised under core validation only — sync modeling was
+            // off). Chained ONLY on the validation attempt (never the
+            // fallback): VK_EXT_validation_features is a layer-side
+            // pNext — the loader passes it through and the KHRONOS
+            // layer activates its synchronization modeling (the
+            // negative-control proof: neutralizing the shadow pass's
+            // producer-side subpass dependency on this exact build
+            // fires SYNC-HAZARD-WRITE-AFTER-WRITE +
+            // SYNC-HAZARD-READ-AFTER-WRITE at the map's sampled reads,
+            // 44 errors the gates' validation_errors == 0 assertions
+            // catch). Auto (debug builds) keeps core validation only —
+            // no development-loop cost; On is the diagnostics arm.
+            let sync_enables = [vk::ValidationFeatureEnableEXT::SYNCHRONIZATION_VALIDATION];
+            let mut validation_features =
+                vk::ValidationFeaturesEXT::default().enabled_validation_features(&sync_enables);
             let create_info = vk::InstanceCreateInfo::default()
                 .application_info(&app_info)
                 .flags(plan.create_flags())
                 .enabled_extension_names(&extension_names)
                 .enabled_layer_names(&layer_names)
-                .push_next(&mut debug_info);
+                .push_next(&mut debug_info)
+                .push_next(&mut validation_features);
             match unsafe { entry.create_instance(&create_info, None) } {
                 Ok(created) => {
                     instance = Some(created);
                     validation_active = true;
+                    sync_validation = true;
                 }
                 Err(_) => {
                     plan = plan.without_validation();
@@ -653,6 +709,15 @@ impl VulkanContext {
             descriptor_pools: Cell::new(0),
             descriptor_sets: Cell::new(0),
             sampler_creations: Cell::new(0),
+            target_fault: Cell::new(None),
+            target_images: Cell::new(0),
+            target_image_views: Cell::new(0),
+            target_framebuffers: Cell::new(0),
+            target_memories: Cell::new(0),
+            target_image_frees: Cell::new(0),
+            target_view_frees: Cell::new(0),
+            target_framebuffer_frees: Cell::new(0),
+            target_memory_frees: Cell::new(0),
         };
         if let Err(e) = context.init_atlas(atlas) {
             context.destroy();
@@ -669,7 +734,7 @@ impl VulkanContext {
                 }
             }
         }
-        Ok((context, validation_active))
+        Ok((context, validation_active, sync_validation))
     }
 
     fn init_atlas(&mut self, atlas: &crate::glyph_atlas::GlyphAtlas) -> Result<(), RendererError> {
@@ -709,7 +774,157 @@ impl VulkanContext {
             descriptor_pools: self.descriptor_pools.get(),
             descriptor_sets: self.descriptor_sets.get(),
             samplers: self.sampler_creations.get(),
+            target_images: self.target_images.get(),
+            target_image_views: self.target_image_views.get(),
+            target_framebuffers: self.target_framebuffers.get(),
+            target_memories: self.target_memories.get(),
+            target_image_frees: self.target_image_frees.get(),
+            target_view_frees: self.target_view_frees.get(),
+            target_framebuffer_frees: self.target_framebuffer_frees.get(),
+            target_memory_frees: self.target_memory_frees.get(),
         }
+    }
+
+    /// Arms a one-shot target-construction fault plan. The `ordinal`
+    /// is 1-based and decrements per MATCHING check across the
+    /// renderer's lifetime (cumulative, not per-builder). The plan
+    /// is consumed only when the ordinal reaches 0. Diagnostic-only,
+    /// test-only: never produced by real device calls.
+    pub(crate) fn set_target_fault(
+        &self,
+        site: TargetFaultSite,
+        stage: TargetFaultStage,
+        ordinal: u32,
+    ) {
+        // A zero ordinal can never fire (it would underflow below);
+        // clamp to 1 so an armed plan is always fireable by its first
+        // matching check.
+        self.target_fault.set(Some((site, stage, ordinal.max(1))));
+    }
+
+    /// Checks if a fault should be injected for the given site and
+    /// stage. Returns `Ok(())` immediately if no plan is armed or if
+    /// the site/stage don't match (branch-cheap; runs only during
+    /// construction, never per-frame). On match: decrements the
+    /// ordinal; when it reaches 0, consumes the plan and returns
+    /// `Err(RendererError::InjectedFault)`. The logic lives in
+    /// [`advance_target_fault_plan`] (pure, unit-tested without a
+    /// device — the mock-free seam tests below).
+    pub(crate) fn check_target_fault(
+        &self,
+        site: TargetFaultSite,
+        stage: TargetFaultStage,
+    ) -> Result<(), RendererError> {
+        let mut plan = self.target_fault.get();
+        match advance_target_fault_plan(&mut plan, site, stage) {
+            Some(error) => {
+                self.target_fault.set(plan);
+                Err(error)
+            }
+            None => {
+                self.target_fault.set(plan);
+                Ok(())
+            }
+        }
+    }
+
+    /// Create a target image, incrementing the creation counter on
+    /// success. The caller's `what` string is used for error
+    /// reporting. SAFETY: callers pass valid image create info for
+    /// this device and own the returned image.
+    unsafe fn create_target_image(
+        &self,
+        info: &vk::ImageCreateInfo,
+        what: &str,
+    ) -> Result<vk::Image, RendererError> {
+        // SAFETY: fresh object; the caller owns it from creation.
+        let image = unsafe { self.device.create_image(info, None) }
+            .map_err(|error| RendererError::vk(error, what))?;
+        self.target_images.set(self.target_images.get() + 1);
+        Ok(image)
+    }
+
+    /// Create a target image view, incrementing the creation counter
+    /// on success. SAFETY: callers pass valid view create info for
+    /// this device and own the returned view.
+    unsafe fn create_target_image_view(
+        &self,
+        info: &vk::ImageViewCreateInfo,
+        what: &str,
+    ) -> Result<vk::ImageView, RendererError> {
+        // SAFETY: fresh object; the caller owns it from creation.
+        let view = unsafe { self.device.create_image_view(info, None) }
+            .map_err(|error| RendererError::vk(error, what))?;
+        self.target_image_views
+            .set(self.target_image_views.get() + 1);
+        Ok(view)
+    }
+
+    /// Create a target framebuffer, incrementing the creation counter
+    /// on success. SAFETY: callers pass valid framebuffer create info
+    /// for this device and own the returned framebuffer.
+    unsafe fn create_target_framebuffer(
+        &self,
+        info: &vk::FramebufferCreateInfo,
+        what: &str,
+    ) -> Result<vk::Framebuffer, RendererError> {
+        // SAFETY: fresh object; the caller owns it from creation.
+        let framebuffer = unsafe { self.device.create_framebuffer(info, None) }
+            .map_err(|error| RendererError::vk(error, what))?;
+        self.target_framebuffers
+            .set(self.target_framebuffers.get() + 1);
+        Ok(framebuffer)
+    }
+
+    /// Allocate target memory, incrementing BOTH the target memory
+    /// counter AND the device_memory counter (so device_memory stays
+    /// complete renderer-wide). SAFETY: callers pass valid memory
+    /// allocate info for this device and own the returned memory.
+    unsafe fn allocate_target_memory(
+        &self,
+        info: &vk::MemoryAllocateInfo,
+        what: &str,
+    ) -> Result<vk::DeviceMemory, RendererError> {
+        // SAFETY: callers pass allocation info for this device and
+        // own the returned memory.
+        match unsafe { self.allocate_memory(info) } {
+            Ok(memory) => {
+                self.target_memories.set(self.target_memories.get() + 1);
+                Ok(memory)
+            }
+            Err(result) => Err(RendererError::vk(result, what)),
+        }
+    }
+
+    /// Destroy a target image, incrementing the destruction counter.
+    /// The caller must own the image. This is called on every
+    /// destruction path since release always drains owned vectors.
+    unsafe fn destroy_target_image(&self, image: vk::Image) {
+        unsafe { self.device.destroy_image(image, None) };
+        self.target_image_frees
+            .set(self.target_image_frees.get() + 1);
+    }
+
+    /// Destroy a target image view, incrementing the destruction
+    /// counter.
+    unsafe fn destroy_target_image_view(&self, view: vk::ImageView) {
+        unsafe { self.device.destroy_image_view(view, None) };
+        self.target_view_frees.set(self.target_view_frees.get() + 1);
+    }
+
+    /// Destroy a target framebuffer, incrementing the destruction
+    /// counter.
+    unsafe fn destroy_target_framebuffer(&self, framebuffer: vk::Framebuffer) {
+        unsafe { self.device.destroy_framebuffer(framebuffer, None) };
+        self.target_framebuffer_frees
+            .set(self.target_framebuffer_frees.get() + 1);
+    }
+
+    /// Free target memory, incrementing the destruction counter.
+    unsafe fn free_target_memory(&self, memory: vk::DeviceMemory) {
+        unsafe { self.device.free_memory(memory, None) };
+        self.target_memory_frees
+            .set(self.target_memory_frees.get() + 1);
     }
 
     /// Full teardown in manifest order (assumes swapchain/pipelines/frames
@@ -981,6 +1196,11 @@ pub(crate) struct SwapchainState {
     /// usage (the frame-capture readback path; requested at creation
     /// whenever supported).
     pub transfer_src_supported: bool,
+    /// Monotonic generation for cache invalidation (corrective finding 7).
+    /// Vulkan permits handle reuse, so a numerical view handle could
+    /// recur after destruction. The generation increases forever so
+    /// retired generations' keys can never recur.
+    pub generation: u64,
 }
 
 /// Picks the surface format (BGRA8_UNORM + sRGB non-linear preferred — the
@@ -1049,6 +1269,7 @@ impl SwapchainState {
             image_count: 0,
             depth_format,
             transfer_src_supported: false,
+            generation: next_swapchain_generation(),
         };
         if let Err(error) = state.build(
             ctx,
@@ -1351,28 +1572,120 @@ pub(crate) fn surface_probe_decision(
     }
 }
 
+/// Depth format aspect flags for a given Vulkan format.
+///
+/// D32_SFLOAT and D16_UNORM → `DEPTH`
+/// D24_UNORM_S8_UINT → `DEPTH | STENCIL`
+/// Other formats → `COLOR` (only valid where the caller knows the format
+/// is a depth format and the caller is responsible for ensuring this).
+///
+/// Pure function — unit-testable without a GPU.
+pub(crate) fn depth_aspect(format: vk::Format) -> vk::ImageAspectFlags {
+    match format {
+        vk::Format::D32_SFLOAT | vk::Format::D16_UNORM => vk::ImageAspectFlags::DEPTH,
+        vk::Format::D24_UNORM_S8_UINT => {
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+        }
+        // For color images and depth formats we don't explicitly handle,
+        // COLOR is the safe default (the caller must not pass a depth
+        // format this doesn't cover).
+        _ => vk::ImageAspectFlags::COLOR,
+    }
+}
+
+#[cfg(test)]
+mod depth_format_tests {
+    use super::depth_aspect;
+    use ash::vk;
+
+    #[test]
+    fn d32_sfloat_uses_depth_aspect() {
+        assert_eq!(
+            depth_aspect(vk::Format::D32_SFLOAT),
+            vk::ImageAspectFlags::DEPTH
+        );
+    }
+
+    #[test]
+    fn d24_unorm_s8_uint_uses_depth_stencil_aspect() {
+        assert_eq!(
+            depth_aspect(vk::Format::D24_UNORM_S8_UINT),
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+        );
+    }
+
+    #[test]
+    fn d16_unorm_uses_depth_aspect() {
+        assert_eq!(
+            depth_aspect(vk::Format::D16_UNORM),
+            vk::ImageAspectFlags::DEPTH
+        );
+    }
+
+    #[test]
+    fn color_formats_use_color_aspect() {
+        assert_eq!(
+            depth_aspect(vk::Format::B8G8R8A8_UNORM),
+            vk::ImageAspectFlags::COLOR
+        );
+    }
+}
+
 /// Depth format for the graphics device; chosen **once per renderer** and
 /// shared by the render pass and every depth attachment, so they cannot
 /// drift apart (corrective finding F).
+///
+/// Uses the preference to override the negotiated pick only if the device's
+/// optimal tiling supports the forced format; otherwise falls back to the
+/// negotiated pick. Never creates an invalid device state.
 pub(crate) fn pick_depth_format(
     instance: &Instance,
     physical_device: vk::PhysicalDevice,
+    preference: DepthFormatPreference,
 ) -> vk::Format {
-    for format in [
-        vk::Format::D32_SFLOAT,
-        vk::Format::D24_UNORM_S8_UINT,
-        vk::Format::D16_UNORM,
-    ] {
-        let properties =
-            unsafe { instance.get_physical_device_format_properties(physical_device, format) };
-        if properties
+    // Query support for each format once for the fallback logic.
+    let supports_d32 = unsafe {
+        instance
+            .get_physical_device_format_properties(physical_device, vk::Format::D32_SFLOAT)
             .optimal_tiling_features
             .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
-        {
-            return format;
+    };
+    let supports_d24_s8 = unsafe {
+        instance
+            .get_physical_device_format_properties(physical_device, vk::Format::D24_UNORM_S8_UINT)
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+    };
+    let supports_d16 = unsafe {
+        instance
+            .get_physical_device_format_properties(physical_device, vk::Format::D16_UNORM)
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+    };
+
+    // Resolve the preference: use the forced format only if supported.
+    crate::config::resolve_depth_format(preference, supports_d24_s8, supports_d16, {
+        // The default negotiated pick (D32 > D24_S8 > D16).
+        if supports_d32 {
+            vk::Format::D32_SFLOAT
+        } else if supports_d24_s8 {
+            vk::Format::D24_UNORM_S8_UINT
+        } else {
+            vk::Format::D16_UNORM
         }
-    }
-    vk::Format::D16_UNORM
+    })
+}
+
+/// Monotonic swapchain generation counter for cache invalidation.
+/// Vulkan permits handle reuse, so a numerical view handle could recur
+/// after destruction. The generation is host-side bookkeeping only,
+/// never packed into any deterministic byte path; it increases forever
+/// so retired generations' keys can never recur. (corrective finding 7)
+pub(crate) static SWAPCHAIN_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn next_swapchain_generation() -> u64 {
+    SWAPCHAIN_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn find_memory_type(
@@ -1695,6 +2008,109 @@ impl PipelineState {
         Ok(())
     }
 
+    /// Ensures every state the CURRENT frame's active layers need,
+    /// against the live swapchain generation — idempotent (each
+    /// ensure_* is an existence check), called BEFORE the recreation
+    /// decision (so the replacement knows which lazy states to
+    /// replicate — the finding-A discipline) and AGAIN after any
+    /// recreation (so the generation that draws carries every active
+    /// variant — review finding 6: the replacement replicates only
+    /// proxy/indirect/shadow/post, never sky, reflection, or the HDR
+    /// variants).
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_frame_targets_and_resources(
+        &mut self,
+        ctx: &mut VulkanContext,
+        swapchain: &SwapchainState,
+        slot: usize,
+        proxy: Option<&proxy_draw::ProxyFrameUpload<'_>>,
+        shadowed: Option<&shadow_draw::ShadowFrameParams>,
+        sky: Option<&sky_draw::SkyFrameParams>,
+        post: bool,
+        wet: Option<&reflection_draw::WetCamera>,
+        region_vertices: &[SceneVertex],
+        foreground_vertices: &[SceneVertex],
+    ) -> Result<(), RendererError> {
+        // Lazy region-scene buffer (Stage 4 final-verification finding):
+        // allocated on first use only, outside command recording — the
+        // default renderer path (no dynamic region geometry) pays no
+        // allocation, mapping, or memory cost.
+        if !region_vertices.is_empty() || !foreground_vertices.is_empty() {
+            self.ensure_region_capacity(ctx)?;
+        }
+
+        // The 6-E lazy proxy resources (the same discipline): created at
+        // the first populated frame only, outside command recording —
+        // the unpopulated corner path pays nothing. Structural invariant:
+        // a proxy upload implies corner resources (the safe layer's
+        // scene-preference gate), hence `ctx.corner` in the pattern.
+        // The 6-E2 indirect command state is one level lazier still:
+        // created at the first INDIRECT-mode populated frame only, so
+        // the direct instanced path's allocation pins (the 6-E gates)
+        // pay nothing for the mechanism they never touch.
+        if proxy.is_some() && ctx.corner.is_some() {
+            self.ensure_proxy_resources(ctx)?;
+            if proxy.is_some_and(|upload| matches!(upload.mode, crate::ProxyDrawMode::Indirect))
+                && let Some(proxy_state) = self.proxy.as_mut()
+            {
+                proxy_state.ensure_indirect(ctx)?;
+            }
+        }
+
+        // The 6-F lazy shadow state (the same discipline): created at
+        // the first shadowed frame only, outside command recording — the
+        // unshadowed corner path pays nothing. Structural invariant: a
+        // shadowed frame implies corner resources (the safe layer's
+        // scene-preference gate), which the ensure itself re-checks.
+        if shadowed.is_some() {
+            self.ensure_shadow_resources(ctx)?;
+        }
+
+        // The Era-1 lazy sky state (the same discipline): created at the
+        // first sky frame only, outside command recording — the skyless
+        // path pays nothing, and a pipeline replacement re-ensures an
+        // identical set at the next sky frame (the 6-F finding-A shape).
+        if sky.is_some() {
+            self.ensure_sky_resources(ctx)?;
+        }
+
+        // The Era-1 lazy post state (the same discipline): created at
+        // the first post frame only, outside command recording — the
+        // postless path pays nothing and stays byte-identical. The
+        // family pipelines that depend on LAZY states (the shadowed
+        // and sky HDR variants) are ensured in the same order the
+        // frame flow ensures their states (shadows, then sky, then
+        // post — so the layouts exist by the time the variant
+        // pipelines bind them).
+        if post {
+            self.ensure_post_resources(ctx, swapchain.format, swapchain.depth_format)?;
+            if shadowed.is_some()
+                && let (Some(post_state), Some(shadow_state)) = (&mut self.post, &self.shadows)
+            {
+                let layout = shadow_state.shadowed(slot).1;
+                post_state.ensure_shadowed_hdr(ctx, layout)?;
+            }
+            if sky.is_some()
+                && let (Some(post_state), Some(sky_state)) = (&mut self.post, &self.sky)
+            {
+                let layout = sky_state.set_and_layout().1;
+                post_state.ensure_sky_hdr(ctx, layout)?;
+            }
+        }
+
+        // The Era-1 lazy wet-reflection state (the same discipline): a
+        // wet renderer always carries the post state (the reflection
+        // pass rides its HDR render pass object) — ensured ABOVE the
+        // post chain's own ensure so the pass exists; the chain itself
+        // stays optional.
+        if wet.is_some() {
+            self.ensure_post_resources(ctx, swapchain.format, swapchain.depth_format)?;
+            self.ensure_reflection_resources(ctx)?;
+        }
+
+        Ok(())
+    }
+
     /// Builds the render pass + pipelines for a (possibly new) swapchain
     /// format into `out`. Handles are assigned as they are created
     /// (corrective finding G): a mid-build failure leaves them owned by
@@ -1731,11 +2147,25 @@ impl PipelineState {
             .store_op(vk::AttachmentStoreOp::STORE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+        // The depth attachment's stencil ops are DONT_CARE for the
+        // same reason post_draw.rs and shadow_draw.rs state
+        // (corrective finding 4): no pipeline in this renderer
+        // performs stencil operations — the attachment is depth
+        // testing only. Explicit rather than defaulted: ash's
+        // AttachmentDescription::default() zero-fills, and
+        // stencil_load_op = 0 is LOAD, which the validation layer
+        // rejects for a stencil-capable format (the D24 fallback)
+        // with an UNDEFINED initialLayout — VUID-VkAttachmentDescription-
+        // format-06700 (the forced-D24 post-lifecycle gate caught
+        // exactly this: the pass was silent on D32 only because
+        // D32_SFLOAT has no stencil aspect).
         let depth_attachment = vk::AttachmentDescription::default()
             .format(depth_format)
             .samples(vk::SampleCountFlags::TYPE_1)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         let attachments = [color_attachment, depth_attachment];
@@ -3210,83 +3640,24 @@ pub(crate) fn render_frame(
         frames.needs_recreate |= size_changed || extent != Some(swapchain.extent);
     }
 
-    // Lazy region-scene buffer (Stage 4 final-verification finding):
-    // allocated on first use only, outside command recording — the
-    // default renderer path (no dynamic region geometry) pays no
-    // allocation, mapping, or memory cost.
+    // Ensure all lazy frame state before any acquire or recreation
+    // decision — the pre-acquire preparation discipline (finding 3's
+    // stranded-frame corrective, and finding 6's replacement-variant
+    // completeness). Each ensure_* is idempotent (an existence check),
+    // so calling it twice (before and after recreation) is safe.
     let foreground_vertices = foreground.map_or(&[][..], |layer| layer.vertices);
-    if !region_vertices.is_empty() || !foreground_vertices.is_empty() {
-        pipes.ensure_region_capacity(ctx)?;
-    }
-
-    // The 6-E lazy proxy resources (the same discipline): created at
-    // the first populated frame only, outside command recording —
-    // the unpopulated corner path pays nothing. Structural invariant:
-    // a proxy upload implies corner resources (the safe layer's
-    // scene-preference gate), hence `ctx.corner` in the pattern.
-    // The 6-E2 indirect command state is one level lazier still:
-    // created at the first INDIRECT-mode populated frame only, so
-    // the direct instanced path's allocation pins (the 6-E gates)
-    // pay nothing for the mechanism they never touch.
-    if proxy.is_some() && ctx.corner.is_some() {
-        pipes.ensure_proxy_resources(ctx)?;
-        if proxy.is_some_and(|upload| matches!(upload.mode, crate::ProxyDrawMode::Indirect))
-            && let Some(proxy_state) = pipes.proxy.as_mut()
-        {
-            proxy_state.ensure_indirect(ctx)?;
-        }
-    }
-
-    // The 6-F lazy shadow state (the same discipline): created at
-    // the first shadowed frame only, outside command recording — the
-    // unshadowed corner path pays nothing. Structural invariant: a
-    // shadowed frame implies corner resources (the safe layer's
-    // scene-preference gate), which the ensure itself re-checks.
-    if shadowed.is_some() {
-        pipes.ensure_shadow_resources(ctx)?;
-    }
-
-    // The Era-1 lazy sky state (the same discipline): created at the
-    // first sky frame only, outside command recording — the skyless
-    // path pays nothing, and a pipeline replacement re-ensures an
-    // identical set at the next sky frame (the 6-F finding-A shape).
-    if sky.is_some() {
-        pipes.ensure_sky_resources(ctx)?;
-    }
-
-    // The Era-1 lazy post state (the same discipline): created at
-    // the first post frame only, outside command recording — the
-    // postless path pays nothing and stays byte-identical. The
-    // family pipelines that depend on LAZY states (the shadowed
-    // and sky HDR variants) are ensured in the same order the
-    // frame flow ensures their states (shadows, then sky, then
-    // post — so the layouts exist by the time the variant
-    // pipelines bind them).
-    if post {
-        pipes.ensure_post_resources(ctx, swapchain.format, swapchain.depth_format)?;
-        if shadowed.is_some()
-            && let (Some(post_state), Some(shadow_state)) = (&mut pipes.post, &pipes.shadows)
-        {
-            let layout = shadow_state.shadowed(slot).1;
-            post_state.ensure_shadowed_hdr(ctx, layout)?;
-        }
-        if sky.is_some()
-            && let (Some(post_state), Some(sky_state)) = (&mut pipes.post, &pipes.sky)
-        {
-            let layout = sky_state.set_and_layout().1;
-            post_state.ensure_sky_hdr(ctx, layout)?;
-        }
-    }
-
-    // The Era-1 lazy wet-reflection state (the same discipline): a
-    // wet renderer always carries the post state (the reflection
-    // pass rides its HDR render pass object) — ensured ABOVE the
-    // post chain's own ensure so the pass exists; the chain itself
-    // stays optional.
-    if wet.is_some() {
-        pipes.ensure_post_resources(ctx, swapchain.format, swapchain.depth_format)?;
-        pipes.ensure_reflection_resources(ctx)?;
-    }
+    pipes.ensure_frame_targets_and_resources(
+        ctx,
+        swapchain,
+        slot,
+        proxy,
+        shadowed,
+        sky,
+        post,
+        wet,
+        region_vertices,
+        foreground_vertices,
+    )?;
 
     // A previous present reported suboptimal — recreate before drawing
     // (verification requirement: suboptimal must eventually trigger
@@ -3303,6 +3674,22 @@ pub(crate) fn render_frame(
             demo_scene,
         )?;
         outcome.recreated = true;
+        // The generation that draws carries every active variant —
+        // calling the helper here ensures sky, reflection, and HDR
+        // variant pipelines exist on the new generation (finding 6).
+        let foreground_vertices = foreground.map_or(&[][..], |layer| layer.vertices);
+        pipes.ensure_frame_targets_and_resources(
+            ctx,
+            swapchain,
+            slot,
+            proxy,
+            shadowed,
+            sky,
+            post,
+            wet,
+            region_vertices,
+            foreground_vertices,
+        )?;
     }
 
     // The capture readback's destination buffer, prepared BEFORE any
@@ -3320,6 +3707,43 @@ pub(crate) fn render_frame(
     {
         frames.capture.pending = false;
         frames.capture.last_refusal = Some(error);
+    }
+
+    // The Era-1 post chain's and the wet reflection's extent-bound
+    // targets: prepared HERE — BEFORE the slot-fence wait, the fence
+    // reset, and the acquire (finding 3's stranded-frame corrective,
+    // the capture-ensure discipline above): the swapchain's extent
+    // and views are equally live at this point (only a recreation
+    // can change them, and every recreation site precedes this
+    // block), so a target-creation failure returns with every sync
+    // object untouched — no reset-but-unsignaled fence, no signaled
+    // acquire semaphore left unconsumed. A rebuild releases the old
+    // bundle only when the extent or view set changed, which only a
+    // recreation (already device-idle) can cause — the rebuild-safety
+    // proof in post_draw's module header. The swapchain generation
+    // replaces the view handle for cache invalidation (corrective
+    // finding 7): Vulkan permits handle reuse, so a numerical view
+    // handle could recur after destruction.
+    if post && let Some(post_state) = &mut pipes.post {
+        post_state.ensure_targets(
+            ctx,
+            swapchain.extent,
+            &swapchain.views,
+            swapchain.generation,
+        )?;
+    }
+    if wet.is_some()
+        && let (Some(post_state), Some(reflection_state), Some(corner)) =
+            (&pipes.post, &mut pipes.reflection, ctx.corner.as_ref())
+    {
+        reflection_state.ensure_targets(
+            ctx,
+            swapchain.extent,
+            corner,
+            post_state.hdr_render_pass(),
+            swapchain.generation,
+            swapchain.depth_format,
+        )?;
     }
 
     // Wait for this slot's previous submission. The fence is reset only
@@ -3381,6 +3805,61 @@ pub(crate) fn render_frame(
             demo_scene,
         )?;
         outcome.recreated = true;
+        // The generation that draws carries every active variant —
+        // re-running the state-ensure helper here creates sky,
+        // reflection, and the HDR variant pipelines on the new
+        // generation (finding 6: the replacement replicates only
+        // proxy/indirect/shadow/post; without this call the first
+        // frame after THIS recreation silently skips sky and wet
+        // passes).
+        pipes.ensure_frame_targets_and_resources(
+            ctx,
+            swapchain,
+            slot,
+            proxy,
+            shadowed,
+            sky,
+            post,
+            wet,
+            region_vertices,
+            foreground_vertices,
+        )?;
+        // The targets were ensured pre-acquire against the OLD
+        // generation — repeat preparation against the replacement
+        // before retrying the out-of-date acquire (finding 3's
+        // stranded-frame corrective; the same frame-sync discipline,
+        // still before any acquire of the new chain). The swapchain
+        // generation replaces the view handle for cache invalidation
+        // (corrective finding 7).
+        if post && let Some(post_state) = &mut pipes.post {
+            post_state.ensure_targets(
+                ctx,
+                swapchain.extent,
+                &swapchain.views,
+                swapchain.generation,
+            )?;
+        }
+        if wet.is_some()
+            && let (Some(post_state), Some(reflection_state), Some(corner)) =
+                (&pipes.post, &mut pipes.reflection, ctx.corner.as_ref())
+        {
+            reflection_state.ensure_targets(
+                ctx,
+                swapchain.extent,
+                corner,
+                post_state.hdr_render_pass(),
+                swapchain.generation,
+                swapchain.depth_format,
+            )?;
+        }
+        // The capture ensure is repeated here too (the same frame-sync
+        // discipline: a failure here cannot strand a frame).
+        if frames.capture.pending
+            && let Err(error) = frames.capture.ensure(ctx, swapchain)
+        {
+            frames.capture.pending = false;
+            frames.capture.last_refusal = Some(error);
+        }
         acquire_result = unsafe {
             ctx.swapchain_ext.acquire_next_image(
                 swapchain.swapchain,
@@ -3547,33 +4026,8 @@ pub(crate) fn render_frame(
     // (corrective finding C).
     let present_semaphore = frames.present_semaphore_for(ctx, image_index)?;
 
-    // The Era-1 post chain's extent-bound targets: ensured HERE —
-    // after the acquire settled the live swapchain (its extent and
-    // views are what the framebuffers bind), still outside command
-    // recording. A rebuild releases the old bundle only when the
-    // extent or view set changed, which only a recreation (already
-    // device-idle) can cause — the rebuild-safety proof in
-    // post_draw's module header.
-    if post && let Some(post_state) = &mut pipes.post {
-        post_state.ensure_targets(ctx, extent, &swapchain.views)?;
-    }
-
-    // The wet reflection's extent-bound targets: ensured beside the
-    // post targets (the same post-acquire point — the live extent
-    // and the HDR pass object; the corner preference is structural
-    // for a wet frame).
-    if wet.is_some()
-        && let (Some(post_state), Some(reflection_state), Some(corner)) =
-            (&pipes.post, &mut pipes.reflection, ctx.corner.as_ref())
-    {
-        reflection_state.ensure_targets(
-            ctx,
-            extent,
-            corner,
-            post_state.hdr_render_pass(),
-            swapchain.views.first().copied().unwrap_or_default(),
-        )?;
-    }
+    // The targets were ensured pre-acquire — finding 3's stranded-frame
+    // corrective. This comment marks the original call sites (removed).
 
     unsafe {
         ctx.device
@@ -3695,6 +4149,16 @@ pub(crate) fn render_frame(
                 sky_state.write_frame(slot, params);
                 sky_state.record(ctx, command, slot);
             }
+            // The corner buffer must be written before the scene pass for
+            // both the shadowed and ordinary paths (finding 5: the wet
+            // ground re-draw reads this camera block; the ordinary branch
+            // used to write it, the shadowed branch now depends on it).
+            if let (Some(resources), Some(params)) = (&ctx.corner, corner_params) {
+                // SAFETY: the slot's fence wait passed above; the coherent
+                // frame regions do not overlap other slots or the immutable
+                // material tail.
+                resources.write_frame(slot, params);
+            }
             if shadowed.is_some()
                 && let (Some(resources), Some(shadow_state)) = (&ctx.corner, &pipes.shadows)
             {
@@ -3703,7 +4167,10 @@ pub(crate) fn render_frame(
                 // shadow state's per-material sets for this slot (the
                 // map view rides binding 4; the FrameParams dynamic
                 // offset selects this slot's extended region — written
-                // before the depth pass above). The ensure above
+                // before the depth pass above). The corner buffer
+                // was written before this branch (the 6-F correction
+                // to finding 5: both shadowed and ordinary branches
+                // now supply the true camera). The ensure above
                 // guaranteed the shadow state whenever `shadowed` is
                 // Some; the belt check keeps an unshadowed frame on the
                 // unshadowed path even if a prior shadowed frame created
@@ -3712,16 +4179,18 @@ pub(crate) fn render_frame(
                 ctx.device
                     .cmd_bind_pipeline(command, vk::PipelineBindPoint::GRAPHICS, pipeline);
                 resources.draw(ctx, command, layout, &sets, frame_offset);
-            } else if let (Some(resources), Some(params)) = (&ctx.corner, corner_params) {
+            } else if let (Some(resources), Some(_params)) = (&ctx.corner, corner_params) {
                 ctx.device.cmd_bind_pipeline(
                     command,
                     vk::PipelineBindPoint::GRAPHICS,
                     pipes.lit_pipeline,
                 );
-                // The slot's fence wait passed above; the coherent frame
-                // regions do not overlap other slots or the immutable
-                // material tail.
-                resources.write_frame(slot, params);
+                // The corner buffer was written above (the 6-F
+                // shadowed path now supplies the camera, so the
+                // ordinary branch no longer writes). The slot's
+                // fence wait passed; the coherent frame regions do
+                // not overlap other slots or the immutable material
+                // tail.
                 resources.draw(
                     ctx,
                     command,
@@ -5136,5 +5605,136 @@ mod surface_probe_tests {
             surface_probe_decision(true, true, true),
             SurfaceProbeDecision::ProbeAvailable
         );
+    }
+}
+
+/// The fault plan's pure advance logic, extracted so the seam is
+/// unit-testable without a Vulkan device (the mock-free discipline:
+/// the tests below exercise THIS function, the one
+/// [`VulkanContext::check_target_fault`] actually runs).
+///
+/// A plan matches only when both the site and the stage equal the
+/// check's; a match decrements the ordinal, and the fault fires when
+/// it reaches zero (consuming the plan). Non-matching checks leave
+/// the plan untouched. The ordinal is 1-based; `set_target_fault`
+/// clamps it to at least 1.
+fn advance_target_fault_plan(
+    plan: &mut Option<(TargetFaultSite, TargetFaultStage, u32)>,
+    site: TargetFaultSite,
+    stage: TargetFaultStage,
+) -> Option<RendererError> {
+    let (plan_site, plan_stage, ordinal) = (*plan)?;
+    if plan_site != site || plan_stage != stage {
+        return None;
+    }
+    let remaining = ordinal - 1;
+    if remaining == 0 {
+        *plan = None;
+        Some(RendererError::InjectedFault(format!("{site:?} {stage:?}")))
+    } else {
+        *plan = Some((plan_site, plan_stage, remaining));
+        None
+    }
+}
+
+#[cfg(test)]
+mod target_fault_seam_tests {
+    use super::advance_target_fault_plan;
+    use crate::RendererError;
+    use crate::{TargetFaultSite, TargetFaultStage};
+
+    /// A fired plan is consumed: the second matching check passes.
+    #[test]
+    fn plan_fires_once_then_stays_consumed() {
+        let mut plan = Some((TargetFaultSite::Post, TargetFaultStage::Image, 1));
+        assert!(
+            advance_target_fault_plan(&mut plan, TargetFaultSite::Post, TargetFaultStage::Image)
+                .is_some()
+        );
+        assert_eq!(plan, None);
+        assert!(
+            advance_target_fault_plan(&mut plan, TargetFaultSite::Post, TargetFaultStage::Image)
+                .is_none()
+        );
+        assert_eq!(plan, None);
+    }
+
+    /// Only a matching site AND stage decrements the ordinal; every
+    /// other check combination leaves the plan untouched.
+    #[test]
+    fn ordinal_decrements_only_on_matching_site_and_stage() {
+        let mut plan = Some((TargetFaultSite::Post, TargetFaultStage::Image, 3));
+        for (site, stage) in [
+            (TargetFaultSite::Wet, TargetFaultStage::Image),
+            (TargetFaultSite::Shadow, TargetFaultStage::Image),
+            (TargetFaultSite::Post, TargetFaultStage::Memory),
+            (TargetFaultSite::Post, TargetFaultStage::Framebuffer),
+        ] {
+            assert!(advance_target_fault_plan(&mut plan, site, stage).is_none());
+            assert_eq!(
+                plan,
+                Some((TargetFaultSite::Post, TargetFaultStage::Image, 3))
+            );
+        }
+        // Three matching checks: the first two decrement, the third fires.
+        assert!(
+            advance_target_fault_plan(&mut plan, TargetFaultSite::Post, TargetFaultStage::Image)
+                .is_none()
+        );
+        assert_eq!(
+            plan,
+            Some((TargetFaultSite::Post, TargetFaultStage::Image, 2))
+        );
+        assert!(
+            advance_target_fault_plan(&mut plan, TargetFaultSite::Post, TargetFaultStage::Image)
+                .is_none()
+        );
+        assert_eq!(
+            plan,
+            Some((TargetFaultSite::Post, TargetFaultStage::Image, 1))
+        );
+        assert!(
+            advance_target_fault_plan(&mut plan, TargetFaultSite::Post, TargetFaultStage::Image)
+                .is_some()
+        );
+        assert_eq!(plan, None);
+    }
+
+    /// The fired error names the site and stage (the gate asserts the
+    /// variant; the message carries the cell for diagnostics).
+    #[test]
+    fn the_fired_fault_is_the_injected_variant_naming_its_cell() {
+        let mut plan = Some((TargetFaultSite::Shadow, TargetFaultStage::Bind, 1));
+        match advance_target_fault_plan(&mut plan, TargetFaultSite::Shadow, TargetFaultStage::Bind)
+        {
+            Some(RendererError::InjectedFault(message)) => {
+                assert!(message.contains("Shadow"), "message: {message}");
+                assert!(message.contains("Bind"), "message: {message}");
+            }
+            other => panic!("expected InjectedFault, got {other:?}"),
+        }
+    }
+
+    /// An unarmed plan (None) never fires and stays None.
+    #[test]
+    fn an_unarmed_plan_never_fires() {
+        let mut plan = None;
+        for site in [
+            TargetFaultSite::Post,
+            TargetFaultSite::Wet,
+            TargetFaultSite::Shadow,
+        ] {
+            for stage in [
+                TargetFaultStage::Image,
+                TargetFaultStage::MemoryLookup,
+                TargetFaultStage::Memory,
+                TargetFaultStage::Bind,
+                TargetFaultStage::View,
+                TargetFaultStage::Framebuffer,
+            ] {
+                assert!(advance_target_fault_plan(&mut plan, site, stage).is_none());
+            }
+        }
+        assert_eq!(plan, None);
     }
 }

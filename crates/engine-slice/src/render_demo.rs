@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use engine_core::{LodLevel, REGION_COUNT};
 use engine_renderer::{
-    DemoScenePreference, PresentModePreference, RenderConfig, RenderStats, Renderer,
-    ValidationPreference,
+    DemoScenePreference, DepthFormatPreference, PresentModePreference, RenderConfig, RenderStats,
+    Renderer, ValidationPreference,
 };
 use engine_shell::{DriverPreference, InputSnapshot, Keycode, ShellApp, ShellConfig};
 
@@ -261,6 +261,7 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
         validation: options.validation,
         replace_pipelines: options.replace_pipelines,
         demo_scene: DemoScenePreference::Included,
+        depth_format: DepthFormatPreference::Auto,
     };
     let mut renderer =
         Renderer::new(app.window(), render_config).map_err(|error| error.to_string())?;
