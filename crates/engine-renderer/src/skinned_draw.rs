@@ -207,9 +207,23 @@ impl SkinnedProxyResources {
                 .buffer(corner.uniform_buffer())
                 .offset(corner.material_offset(material))
                 .range(std::mem::size_of::<[f32; 4]>() as u64)];
+            // The pose binding's range is the CONCRETE per-slot
+            // region (SLOT_STRIDE), NEVER VK_WHOLE_SIZE: Vulkan
+            // forbids a nonzero dynamic offset on a WHOLE_SIZE
+            // descriptor (VUID-vkCmdBindDescriptorSets-
+            // pDescriptorSets-06715) — slot 0's zero offset passes
+            // validation while slot 1's violates it, exactly the
+            // half-green trap the first CI run of the gates caught
+            // (the violation sat silently through the earlier
+            // stages because those gates never asserted
+            // validation_errors). With the concrete range the
+            // effective view is [pose_offset, pose_offset +
+            // SLOT_STRIDE) — exactly this slot's region, and tighter
+            // than WHOLE_SIZE (the shader cannot index past its
+            // slot's bound).
             let poses = [vk::DescriptorBufferInfo::default()
                 .buffer(self.buffer)
-                .range(vk::WHOLE_SIZE)];
+                .range(SLOT_STRIDE)];
             let write = vk::WriteDescriptorSet::default().dst_set(*set);
             // SAFETY: fresh sets; the corner resources and the pose
             // buffer outlive the pool (owned by this state / the
@@ -516,6 +530,12 @@ impl SkinnedProxyResources {
         self.slot_stride
     }
 
+    /// The pose storage buffer handle (the shadowed-populated
+    /// state's set writes bind it at binding 5).
+    pub(super) fn pose_buffer(&self) -> vk::Buffer {
+        self.buffer
+    }
+
     /// The pose dynamic offset for `slot`'s region (the second
     /// dynamic offset in the skinned set binds).
     pub(super) fn pose_offset(&self, slot: usize) -> u32 {
@@ -714,9 +734,14 @@ impl ShadowedProxyResources {
         let sampled = vk::DescriptorType::SAMPLED_IMAGE;
         let storage_dynamic = vk::DescriptorType::STORAGE_BUFFER_DYNAMIC;
 
-        // --- The NPC CAST pipeline: the shadow state's depth pass,
-        // the skinned vertex input (the same skinning matrices the
-        // skinned lit pipeline reads through binding 5).
+        // --- The skinned DEPTH set (the npc cast): binding 0 = the
+        // light matrix (the shadow uniform's light-matrix region at
+        // the static light_offset, the DYNAMIC offset selecting the
+        // slot — the corner depth set's own scheme), binding 5 = the
+        // pose buffer (the per-slot region range — NEVER
+        // VK_WHOLE_SIZE with a dynamic offset, VUID-06715). The
+        // shader's OWN declarations (shadow_depth_skinned.wgsl) are
+        // the layout's source of truth.
         let binding = |index: u32, ty: vk::DescriptorType, stages: vk::ShaderStageFlags| {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(index)
@@ -725,46 +750,51 @@ impl ShadowedProxyResources {
                 .stage_flags(stages)
         };
         let depth_bindings = [
-            binding(0, combined, frag),
-            binding(2, uniform_dynamic, both),
+            binding(0, uniform_dynamic, vert),
+            binding(5, storage_dynamic, vert),
         ];
-        let depth_sizes = [combined, uniform_dynamic].map(|ty| vk::DescriptorPoolSize {
+        let depth_sizes = [uniform_dynamic, storage_dynamic].map(|ty| vk::DescriptorPoolSize {
             ty,
             descriptor_count: 1,
         });
         let (pool, layout, [set]) =
             super::descriptors::create_sets::<1>(ctx, &depth_bindings, &depth_sizes, 1)?;
+        let light = [vk::DescriptorBufferInfo::default()
+            .buffer(shadows.frame_buffer())
+            .offset(u64::from(shadows.light_offset()))
+            .range(64)];
+        let poses = [vk::DescriptorBufferInfo::default()
+            .buffer(skinned.pose_buffer())
+            .range(SLOT_STRIDE)];
+        // SAFETY: a fresh set; the shadow uniform and pose buffer
+        // outlive this pool (their states own them).
+        unsafe {
+            ctx.device.update_descriptor_sets(
+                &[
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(0)
+                        .descriptor_type(uniform_dynamic)
+                        .buffer_info(&light),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(5)
+                        .descriptor_type(storage_dynamic)
+                        .buffer_info(&poses),
+                ],
+                &[],
+            );
+        }
         self.skinned_depth_pool = pool;
         self.skinned_depth_set_layout = layout;
         self.skinned_depth_set = set;
-
-        let samplers = [corner.nearest_sampler()];
-
-        for slot in 0..FRAMES_IN_FLIGHT as usize {
-            let _map_info = [vk::DescriptorImageInfo::default()
-                .image_view(shadows.map_view(slot))
-                .image_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)];
-            let frame = [vk::DescriptorBufferInfo::default().buffer(shadows.frame_buffer())];
-            let frame_write = vk::WriteDescriptorSet::default()
-                .dst_set(set)
-                .dst_binding(2)
-                .descriptor_type(uniform_dynamic)
-                .buffer_info(&frame);
-            unsafe {
-                ctx.device.update_descriptor_sets(&[frame_write], &[]);
-            }
-        }
-
         self.skinned_depth_layout = unsafe {
             ctx.device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default()
-                    .set_layouts(&[self.skinned_depth_set_layout])
-                    .push_constant_ranges(&[]),
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&[layout]),
                 None,
             )
         }
         .map_err(|e| RendererError::vk(e, "skinned shadow depth layout"))?;
-
         self.skinned_depth_pipeline = skinned.build_skinned_depth_pipeline(
             ctx,
             include_bytes!(concat!(env!("OUT_DIR"), "/shadow_depth_skinned.spv")),
@@ -772,11 +802,9 @@ impl ShadowedProxyResources {
             self.skinned_depth_layout,
             "skinned shadow depth pipeline",
         )?;
-
-        // --- The VEHICLE CAST pipeline: the PLAIN vertex input
-        // (locations 0-7) against the shadow state's depth pass,
-        // laid out for the shadow state's OWN depth set/layout (the
-        // recording binds them — no descriptors of ours).
+        // The vehicle cast: the PLAIN vertex input against the shadow
+        // state's depth pass, laid out for the shadow state's OWN
+        // depth set/layout (the recording binds them).
         self.plain_depth_pipeline = skinned.build_plain_depth_pipeline(
             ctx,
             include_bytes!(concat!(env!("OUT_DIR"), "/shadow_depth_instanced.spv")),
@@ -785,7 +813,17 @@ impl ShadowedProxyResources {
             "plain shadow depth pipeline",
         )?;
 
-        // --- The SHADOWED skinned lit sets: per material × slot.
+        // --- The SHADOWED skinned lit sets (the npc kind receiving,
+        // per material × slot — the map view differs per slot):
+        // binding 0 = the corner albedo view + immutable sampler,
+        // binding 2 = the shadow uniform's EXTENDED FrameParams
+        // (the 192-byte block, dynamic — the shadow stride's slot
+        // offset at bind time), binding 3 = the corner material
+        // tail, binding 4 = this slot's shadow map view, binding 5 =
+        // the pose buffer's per-slot region. The shaders' OWN
+        // declarations (instanced_proxy_skinned_shadowed.wgsl) are
+        // the layout's source of truth.
+        let samplers = [corner.nearest_sampler()];
         let skinned_bindings = [
             binding(0, combined, frag).immutable_samplers(&samplers),
             binding(2, uniform_dynamic, both),
@@ -794,6 +832,7 @@ impl ShadowedProxyResources {
             binding(5, storage_dynamic, vert),
         ];
         let set_count = (MATERIAL_COUNT * 2) as u32;
+        let slots = FRAMES_IN_FLIGHT as usize;
         let skinned_sizes =
             [combined, uniform_dynamic, uniform, sampled, storage_dynamic].map(|ty| {
                 vk::DescriptorPoolSize {
@@ -801,23 +840,75 @@ impl ShadowedProxyResources {
                     descriptor_count: set_count,
                 }
             });
-        let (pool, layout, sets) = super::descriptors::create_sets::<{ MATERIAL_COUNT * 2 }>(
-            ctx,
-            &skinned_bindings,
-            &skinned_sizes,
-            set_count,
-        )?;
-        self.skinned_shadowed_pool = pool;
-        self.skinned_shadowed_set_layout = layout;
-        self.skinned_shadowed_sets = sets;
+        let (skinned_pool, skinned_layout, skinned_sets) =
+            super::descriptors::create_sets::<{ MATERIAL_COUNT * 2 }>(
+                ctx,
+                &skinned_bindings,
+                &skinned_sizes,
+                set_count,
+            )?;
+        for material in 0..MATERIAL_COUNT {
+            let view = corner.texture_view(material);
+            let material_info = [vk::DescriptorBufferInfo::default()
+                .buffer(corner.uniform_buffer())
+                .offset(corner.material_offset(material))
+                .range(std::mem::size_of::<[f32; 4]>() as u64)];
+            for slot in 0..slots {
+                let set = skinned_sets[material * slots + slot];
+                let image = [vk::DescriptorImageInfo::default()
+                    .image_view(view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                let map = [vk::DescriptorImageInfo::default()
+                    .image_view(shadows.map_view(slot))
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                let frame = [vk::DescriptorBufferInfo::default()
+                    .buffer(shadows.frame_buffer())
+                    .range(super::shadow_draw::SHADOW_FRAME_PARAMS_SIZE)];
+                let poses = [vk::DescriptorBufferInfo::default()
+                    .buffer(skinned.pose_buffer())
+                    .range(SLOT_STRIDE)];
+                let write = vk::WriteDescriptorSet::default().dst_set(set);
+                // SAFETY: fresh sets; every resource outlives the
+                // pool (the states own them).
+                unsafe {
+                    ctx.device.update_descriptor_sets(
+                        &[
+                            write
+                                .dst_binding(0)
+                                .descriptor_type(combined)
+                                .image_info(&image),
+                            write
+                                .dst_binding(2)
+                                .descriptor_type(uniform_dynamic)
+                                .buffer_info(&frame),
+                            write
+                                .dst_binding(3)
+                                .descriptor_type(uniform)
+                                .buffer_info(&material_info),
+                            write
+                                .dst_binding(4)
+                                .descriptor_type(sampled)
+                                .image_info(&map),
+                            write
+                                .dst_binding(5)
+                                .descriptor_type(storage_dynamic)
+                                .buffer_info(&poses),
+                        ],
+                        &[],
+                    );
+                }
+            }
+        }
+        self.skinned_shadowed_pool = skinned_pool;
+        self.skinned_shadowed_set_layout = skinned_layout;
+        self.skinned_shadowed_sets = skinned_sets;
         self.skinned_shadowed_layout = unsafe {
             ctx.device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default().set_layouts(&[layout]),
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&[skinned_layout]),
                 None,
             )
         }
-        .map_err(|e| RendererError::vk(e, "skinned shadowed proxy layout"))?;
-
+        .map_err(|e| RendererError::vk(e, "skinned shadowed layout"))?;
         self.skinned_shadowed_pipeline = skinned.build_skinned_lit_pipeline(
             ctx,
             include_bytes!(concat!(
@@ -829,7 +920,10 @@ impl ShadowedProxyResources {
             "skinned shadowed proxy pipeline",
         )?;
 
-        // --- The SHADOWED plain lit sets: per material × slot.
+        // --- The SHADOWED plain lit sets (the vehicle kind
+        // receiving): the same shape without the pose binding — the
+        // PLAIN vehicle shader (instanced_proxy_shadowed.spv,
+        // locations 0-7) is the pipeline's own input.
         let plain_bindings = [
             binding(0, combined, frag).immutable_samplers(&samplers),
             binding(2, uniform_dynamic, both),
@@ -841,29 +935,76 @@ impl ShadowedProxyResources {
                 ty,
                 descriptor_count: set_count,
             });
-        let (pool, layout, sets) = super::descriptors::create_sets::<{ MATERIAL_COUNT * 2 }>(
-            ctx,
-            &plain_bindings,
-            &plain_sizes,
-            set_count,
-        )?;
-        self.plain_shadowed_pool = pool;
-        self.plain_shadowed_set_layout = layout;
-        self.plain_shadowed_sets = sets;
+        let (plain_pool, plain_layout, plain_sets) =
+            super::descriptors::create_sets::<{ MATERIAL_COUNT * 2 }>(
+                ctx,
+                &plain_bindings,
+                &plain_sizes,
+                set_count,
+            )?;
+        for material in 0..MATERIAL_COUNT {
+            let view = corner.texture_view(material);
+            let material_info = [vk::DescriptorBufferInfo::default()
+                .buffer(corner.uniform_buffer())
+                .offset(corner.material_offset(material))
+                .range(std::mem::size_of::<[f32; 4]>() as u64)];
+            for slot in 0..slots {
+                let set = plain_sets[material * slots + slot];
+                let image = [vk::DescriptorImageInfo::default()
+                    .image_view(view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                let map = [vk::DescriptorImageInfo::default()
+                    .image_view(shadows.map_view(slot))
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                let frame = [vk::DescriptorBufferInfo::default()
+                    .buffer(shadows.frame_buffer())
+                    .range(super::shadow_draw::SHADOW_FRAME_PARAMS_SIZE)];
+                let write = vk::WriteDescriptorSet::default().dst_set(set);
+                // SAFETY: fresh sets; every resource outlives the
+                // pool.
+                unsafe {
+                    ctx.device.update_descriptor_sets(
+                        &[
+                            write
+                                .dst_binding(0)
+                                .descriptor_type(combined)
+                                .image_info(&image),
+                            write
+                                .dst_binding(2)
+                                .descriptor_type(uniform_dynamic)
+                                .buffer_info(&frame),
+                            write
+                                .dst_binding(3)
+                                .descriptor_type(uniform)
+                                .buffer_info(&material_info),
+                            write
+                                .dst_binding(4)
+                                .descriptor_type(sampled)
+                                .image_info(&map),
+                        ],
+                        &[],
+                    );
+                }
+            }
+        }
+        self.plain_shadowed_pool = plain_pool;
+        self.plain_shadowed_set_layout = plain_layout;
+        self.plain_shadowed_sets = plain_sets;
         self.plain_shadowed_layout = unsafe {
             ctx.device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default().set_layouts(&[layout]),
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&[plain_layout]),
                 None,
             )
         }
         .map_err(|e| RendererError::vk(e, "plain shadowed proxy layout"))?;
-
+        // The VEHICLE kind's shader — instanced_proxy_shadowed.spv
+        // (the PLAIN vertex input), never the skinned variant: the
+        // skinned module's locations 8-10 do not exist in the
+        // 32-byte ProxyVertex stream (the first 4b draft built this
+        // pipeline from the skinned shader — caught in this repair).
         self.plain_shadowed_pipeline = skinned.build_plain_lit_pipeline(
             ctx,
-            include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/instanced_proxy_skinned_shadowed.spv"
-            )),
+            include_bytes!(concat!(env!("OUT_DIR"), "/instanced_proxy_shadowed.spv")),
             main_render_pass,
             self.plain_shadowed_layout,
             "plain shadowed proxy pipeline",
