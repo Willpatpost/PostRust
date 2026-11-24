@@ -476,7 +476,10 @@ impl ProxyResources {
                                 // no multiDrawIndirect feature, no
                                 // cross-kind state; firstInstance is
                                 // pinned zero in the packed bytes (the
-                                // portability contract).
+                                // portability contract). The issuance
+                                // is counted AT the call site (the
+                                // 6-E2 observation the render_instanced
+                                // gate asserts — see the field's doc).
                                 ctx.device.cmd_draw_indirect(
                                     cmd,
                                     indirect.buffer,
@@ -484,6 +487,8 @@ impl ProxyResources {
                                     1,
                                     INDIRECT_COMMAND_BYTES as u32,
                                 );
+                                ctx.indirect_draws_issued
+                                    .set(ctx.indirect_draws_issued.get() + 1);
                                 calls += 1;
                             }
                             None => {

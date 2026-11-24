@@ -1343,6 +1343,43 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
     let word = |at: usize| u32::from_le_bytes(commands[at..at + 4].try_into().unwrap());
     assert_eq!(engine_renderer::proxy_indirect::INDIRECT_SLOT_BYTES, 32);
     assert_eq!((word(0), word(4), word(16), word(20)), (396, 24, 552, 2));
+
+    // THE ISSUANCE OBSERVATION (the Era-1 review's gate-by-gate
+    // disposition for this gate: "one command trace or recording
+    // assertion that verifies vkCmdDrawIndirect was issued"). The
+    // draw-call count CANNOT verify it — the indirect and direct
+    // instanced submissions both count one per populated kind by
+    // design, and the release fallback silently submits the
+    // identical geometry through cmd_draw when the indirect state
+    // is somehow missing. geometry.indirect_draws_issued counts the
+    // actual vkCmdDrawIndirect calls at their site: exactly the
+    // populated kinds in the indirect mode, ZERO in every other.
+    for (mode, expected) in [
+        (ProxyDrawMode::Indirect, 2u32),
+        (ProxyDrawMode::Instanced, 0u32),
+        (ProxyDrawMode::PerInstance, 0u32),
+    ] {
+        renderer.set_proxy_draw_mode(mode);
+        renderer.request_frame_capture().unwrap();
+        let frame = renderer
+            .render_corner_populated(&matrix, eye, light, &population, size)
+            .unwrap();
+        assert!(frame.presented);
+        assert_eq!(
+            frame.geometry.indirect_draws_issued, expected,
+            "vkCmdDrawIndirect issued exactly {expected} times in {mode:?} — the indirect \
+             path's per-kind issuances (a zero here means the submission fell back to the \
+             direct draw or the mode never reached the recorder)"
+        );
+        assert_eq!(
+            frame.geometry.proxy_draw_calls,
+            match mode {
+                ProxyDrawMode::PerInstance => 26,
+                ProxyDrawMode::Instanced | ProxyDrawMode::Indirect => 2,
+            }
+        );
+        let _ = renderer.take_frame_capture().unwrap().unwrap();
+    }
     println!(
         "indirect gate: {total} instances, per-object 26 == direct 2 == indirect 2 draws, \
          byte-equal frames, oracle wall within 2/255 through the indirect submission, \

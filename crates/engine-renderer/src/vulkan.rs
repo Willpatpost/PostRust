@@ -340,6 +340,21 @@ pub(crate) struct VulkanContext {
     descriptor_pools: Cell<u64>,
     descriptor_sets: Cell<u64>,
     sampler_creations: Cell<u64>,
+    /// vkCmdDrawIndirect issuances since renderer construction —
+    /// the 6-E2 ISSUANCE observation (the Era-1 review's
+    /// gate-by-gate disposition for render_instanced: "one command
+    /// trace or recording assertion that verifies vkCmdDrawIndirect
+    /// was issued"). The proxy draw-call count cannot distinguish
+    /// the indirect submission from the direct one (both count one
+    /// per populated kind — by design, the headline), and the
+    /// release-build fallback silently submits the identical
+    /// geometry through cmd_draw when the indirect state is
+    /// somehow missing; this counter is incremented AT the
+    /// cmd_draw_indirect call site, so a frame that claims the
+    /// indirect path but fell back observes as zero. Monotonic
+    /// like the allocation counters (frame deltas, not live
+    /// counts; survives pipeline replacement).
+    indirect_draws_issued: Cell<u64>,
 }
 
 impl VulkanContext {
@@ -653,6 +668,7 @@ impl VulkanContext {
             descriptor_pools: Cell::new(0),
             descriptor_sets: Cell::new(0),
             sampler_creations: Cell::new(0),
+            indirect_draws_issued: Cell::new(0),
         };
         if let Err(e) = context.init_atlas(atlas) {
             context.destroy();
@@ -3079,6 +3095,16 @@ pub(crate) struct FrameOutcome {
     /// frames. The corner mesh's own material draws are NOT counted
     /// here — this counts proxy submission only.
     pub proxy_draw_calls: u32,
+    /// vkCmdDrawIndirect issuances THIS frame (the 6-E2 issuance
+    /// observation — the delta of the context's monotonic counter
+    /// across this frame's recording). One per populated kind in
+    /// the indirect mode and ZERO in every other mode; zero on a
+    /// deferred frame. Distinguishes the indirect submission from
+    /// the direct one, which the draw-call count deliberately
+    /// cannot (the release fallback draws the identical geometry
+    /// through cmd_draw — this field is what observes the
+    /// difference).
+    pub indirect_draws_issued: u32,
 }
 
 /// The full frame flow: wait → acquire → (recreate if needed) → record →
@@ -3116,6 +3142,12 @@ pub(crate) fn render_frame(
 ) -> Result<FrameOutcome, RendererError> {
     let mut outcome = FrameOutcome::default();
     let slot = frames.frame_slot;
+    // The 6-E2 issuance observation's frame baseline: the recording
+    // below (this frame's command buffer) increments the context's
+    // monotonic vkCmdDrawIndirect counter at each call site; the
+    // delta lands on the outcome after the submission. Deferred and
+    // refused frames record nothing, so their delta is zero.
+    let indirect_issued_before = ctx.indirect_draws_issued.get();
 
     // The proxy materials are validated before ANY synchronization
     // state is touched (the capture-refusal discipline: a refusal
@@ -4033,6 +4065,8 @@ pub(crate) fn render_frame(
     }
 
     outcome.gpu_render_ms = gpu_render_ms;
+    outcome.indirect_draws_issued =
+        (ctx.indirect_draws_issued.get() - indirect_issued_before) as u32;
     frames.frame_slot = (slot + 1) % FRAMES_IN_FLIGHT as usize;
     Ok(outcome)
 }
