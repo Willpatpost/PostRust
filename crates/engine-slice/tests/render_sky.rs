@@ -74,8 +74,16 @@ fn pixel_ray(
     // position — the A4 orientation pin's subject).
     let math_y = -ny;
     let tan_half = (65_f32.to_radians() / 2.0).tan();
+    // The horizontal tangent carries the ASPECT (perspective's
+    // matrix[0][0] = focal/aspect: a point at NDC nx lies at
+    // x/(−z) = nx·aspect·tan_half in view space — the vertical
+    // term needs no factor). The square-frame poses above pass
+    // aspect 1.0 where the factor is exactly one; the non-square
+    // off-axis disc-edge block is the coverage that distinguishes
+    // them (the review's own disposition note).
+    let aspect = size.0 as f32 / size.1 as f32;
     let mut ray = std::array::from_fn(|axis| {
-        forward[axis] + nx * tan_half * right[axis] + math_y * tan_half * up[axis]
+        forward[axis] + nx * tan_half * aspect * right[axis] + math_y * tan_half * up[axis]
     });
     let length = (ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]).sqrt();
     ray = ray.map(|component| component / length);
@@ -384,6 +392,171 @@ fn sky_pixels_match_sky_color_and_never_touch_covered_geometry() {
         "{:?}",
         renderer.stats().recent_validation
     );
+    // THE OFF-AXIS DISC EDGE AT A NON-SQUARE ASPECT (the Era-1
+    // review's gate-by-gate disposition: "An off-axis disc edge at
+    // a non-square aspect would extend the angular coverage" — the
+    // square-frame disc-center patches above cannot see an aspect
+    // error in the ray reconstruction: at 1.0 the x and y scalings
+    // are identical, so a swapped or miscomputed aspect cancels).
+    // A SECOND renderer at 264×200 (aspect 1.32), the view axis
+    // offset ~8° from the sun in a COMPOUND direction (both screen
+    // axes carry the offset — a single-axis offset could still
+    // cancel a one-axis reconstruction error), so the disc lands
+    // clearly off-center with its soft edge inside the probed
+    // patch; every patch pixel against sky_color of ITS OWN
+    // reconstructed ray at the non-square extent. (The first app
+    // is dropped first: SDL allows one EventPump alive at a time —
+    // the depth-fallback loop's own precedent. Everything on the
+    // first renderer is asserted by this point.)
+    drop(renderer);
+    drop(app);
+    {
+        let app2 = ShellApp::new(ShellConfig {
+            title: "Era 1 sky off-axis".into(),
+            width: 264,
+            height: 200,
+            target_fps: 60,
+            driver: DriverPreference::Real,
+        })
+        .unwrap();
+        let mut renderer2 = Renderer::new(
+            app2.window(),
+            RenderConfig {
+                demo_scene: DemoScenePreference::Corner,
+                validation: ValidationPreference::On,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let size2 = app2.window().size_in_pixels();
+        assert_eq!(size2, (264, 200));
+        // The aim: the sun direction perturbed ~8° toward a
+        // compound perpendicular (east-and-up in the sun's own
+        // frame — both tangent components nonzero).
+        let sun = day.disc_dir;
+        // A horizontal perpendicular to the sun direction (the
+        // world-up cross, normalized; nonzero for any non-vertical
+        // sun).
+        let east = {
+            let raw = [-sun[2], 0.0, sun[0]];
+            let len = (raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]).sqrt();
+            [raw[0] / len, raw[1] / len, raw[2] / len]
+        };
+        let north_of_east = [
+            sun[1] * east[2] - sun[2] * east[1],
+            sun[2] * east[0] - sun[0] * east[2],
+            sun[0] * east[1] - sun[1] * east[0],
+        ];
+        let offset_deg = 8_f32.to_radians();
+        let (sin_o, cos_o) = offset_deg.sin_cos();
+        let tangent = [
+            east[0] + north_of_east[0],
+            east[1] + north_of_east[1],
+            east[2] + north_of_east[2],
+        ];
+        let tangent_len =
+            (tangent[0] * tangent[0] + tangent[1] * tangent[1] + tangent[2] * tangent[2]).sqrt();
+        let aim_dir: [f32; 3] =
+            std::array::from_fn(|axis| sun[axis] * cos_o + (tangent[axis] / tangent_len) * sin_o);
+        let eye2 = [0.0, 25.0, 0.0];
+        let toward2 = std::array::from_fn(|i| eye2[i] + aim_dir[i]);
+        let matrix2 = view_projection(
+            RouteWaypoint {
+                position: eye2,
+                look_at: toward2,
+            },
+            size2.0 as f32 / size2.1 as f32,
+        );
+        renderer2.set_sky(Some(SkyFrame {
+            palette: day.sky,
+            disc_dir: sun,
+        }));
+        renderer2.request_frame_capture().unwrap();
+        assert!(
+            renderer2
+                .render_corner(&matrix2, eye2, day_preset(), size2)
+                .unwrap()
+                .presented
+        );
+        let image2 = renderer2.take_frame_capture().unwrap().unwrap();
+        let (forward2, right2, up2) = basis(eye2, toward2);
+        // The projected disc center: the pixel whose reconstructed
+        // ray dots highest with the sun direction (deterministic —
+        // the frame is pure sky around the disc).
+        let mut best = (0u32, 0u32, -1.0f32);
+        for y in 0..size2.1 {
+            for x in 0..size2.0 {
+                let ray = pixel_ray(forward2, right2, up2, x, y, size2);
+                let dot = ray[0] * sun[0] + ray[1] * sun[1] + ray[2] * sun[2];
+                if dot > best.2 {
+                    best = (x, y, dot);
+                }
+            }
+        }
+        let (cx, cy, _) = best;
+        assert!(
+            cx != size2.0 / 2 || cy != size2.1 / 2,
+            "the disc is genuinely off-axis (projected center ({cx},{cy}) vs the frame \
+             center ({},{}))",
+            size2.0 / 2,
+            size2.1 / 2
+        );
+        // The 13×13 patch around the projected center: the disc's
+        // interior, its full soft edge, and the sky beyond it — at
+        // the non-square extent, off-axis.
+        let mut edge_checked = 0usize;
+        let mut edge_worst = 0u8;
+        let mut ramp_pixels = 0usize;
+        for y in cy.saturating_sub(6)..=(cy + 6).min(size2.1 - 1) {
+            for x in cx.saturating_sub(6)..=(cx + 6).min(size2.0 - 1) {
+                let ray = pixel_ray(forward2, right2, up2, x, y, size2);
+                let expected = quantized(sky_color(ray, &day.sky, sun));
+                let pixel = image2.pixel_rgba(x, y);
+                let error = expected
+                    .iter()
+                    .zip(pixel)
+                    .map(|(e, a)| e.abs_diff(a))
+                    .max()
+                    .unwrap();
+                edge_worst = edge_worst.max(error);
+                assert!(
+                    error <= 2,
+                    "off-axis disc-edge pixel ({x},{y}) ray {ray:?}: expected {expected:?}, \
+                     got {pixel:?} (a non-square ray-reconstruction error moves the disc's \
+                     edge off its expected ramp position)"
+                );
+                assert_eq!(pixel[3], 255);
+                // The self-discrimination control: the patch must
+                // actually straddle the RAMP (pixels whose expected
+                // color is neither pure gradient nor saturated disc
+                // — the edge itself), or the check is vacuous for
+                // the finding it exists to catch.
+                let gradient = sky_color(ray, &day.sky, [0.0, 1.0, 0.0]);
+                let disc_delta = expected
+                    .iter()
+                    .zip(quantized(gradient))
+                    .map(|(e, g)| e.abs_diff(g))
+                    .max()
+                    .unwrap();
+                if (1..=254).contains(&disc_delta) {
+                    ramp_pixels += 1;
+                }
+                edge_checked += 1;
+            }
+        }
+        assert!(
+            ramp_pixels >= 8,
+            "the off-axis patch straddles the disc's soft edge ({ramp_pixels} ramp pixels \
+             of {edge_checked} checked)"
+        );
+        assert_eq!(renderer2.stats().validation_errors, 0);
+        println!(
+            "off-axis disc edge (264×200): {edge_checked} patch pixels around the projected \
+             center ({cx},{cy}), {ramp_pixels} on the soft ramp, max error {edge_worst}/255"
+        );
+        total_checked += edge_checked;
+    }
+
     println!(
         "Era-1 sky gates: {total_checked} day pixels + the night disc vs sky_color within 2/255, \
          the covered frame byte-identical, the background replaced, the sky state paid once"
