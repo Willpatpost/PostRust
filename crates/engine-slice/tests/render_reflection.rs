@@ -808,9 +808,14 @@ fn wet_ground_blends_the_mirrored_scene_by_planar_rs() {
     // The whole gate runs at BOTH: the negotiated pick (D32 on the
     // pod's lavapipe) and the forced D24_S8 fallback (the format with
     // the stencil aspect — the aspect/attachment class the D32 pass
-    // can never exercise).
+    // can never exercise). Finding 4's "Force each supported fallback"
+    // extends this to D16, so the wet path now runs all three cells
+    // (D32 negotiated, D24_S8, D16); note that D16's coarser 16-bit
+    // depth quantization makes the EQUAL-comparison invariance (finding 19)
+    // a DISTINCT cell from D32's.
     wet_ground_gate_at(DepthFormatPreference::Auto, "negotiated (D32)");
     wet_ground_gate_at(DepthFormatPreference::ForceD24S8, "forced D24_S8");
+    wet_ground_gate_at(DepthFormatPreference::ForceD16, "forced D16");
 }
 
 /// FINDING 18'S BEYOND-TOLERANCE DISCRIMINATION — the review's check:

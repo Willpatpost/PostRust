@@ -741,6 +741,19 @@ jobs:
       # target-builder stage fault unwinds to the pre-attempt
       # census, no slot strands, recoveries land (MEASURED on the
       # pod's lavapipe — the full 21-cell matrix, 4.65 s).
+      # (Era-1 corrective recursive phase, post-edge-coverage,
+      # findings 16+17) The same step now also executes the two
+      # check-half gates: the asymmetric off-center disc at the odd
+      # rectangular 121×75 extent under the frame's TRUE aspect
+      # (disc patch 0/255, corners 1/255, the bloom ring's measured
+      # lift ≥2/255 at the oracle-chosen distance — the
+      # horizontal-mirror discriminator the centered square fixture
+      # is provably blind to) and the tiny-extent + ambient cells
+      # (1×256 and 2×256 through the actual safe_load OOB guards,
+      # max 3-4/255 at each cell's single mid-ramp row; the
+      # negative/zero/midtone/over-one HDR through the real
+      # composite, the negative channels EXACT black — MEASURED on
+      # the pod's lavapipe).
       - name: Post gates (lavapipe)
         if: runner.os == 'Linux'
         shell: bash
@@ -754,6 +767,13 @@ jobs:
       # overhead matte anchor, the dry byte-identity, the
       # allocation delta, and the composition smokes. The
       # per-stage println! evidence is what the CI log must show.
+      # (Era-1 corrective recursive phase, post-edge-coverage,
+      # finding 4's wet half) The wet-band gate now runs ALL THREE
+      # depth-format cells — D32 negotiated, forced D24_S8, and
+      # forced D16 (the review's "force each supported fallback";
+      # D16's coarser 16-bit quantization makes the EQUAL-comparison
+      # invariance a DISTINCT cell — MEASURED honored and green on
+      # the pod's lavapipe).
       - name: Reflection gates (lavapipe)
         if: runner.os == 'Linux'
         shell: bash
@@ -1400,7 +1420,7 @@ jobs:
           # are engine-renderer lib tests — the main shard's).
           # Linux 582/14/59 MEASURED locally with this step's own
           # awk; Windows 581/14/59 platform-uniform.
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 24 / 62)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 26 / 62)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           # Era 1 package 3 (the sky, 2026-11-23): the NEW
           # tests/render_sky.rs binary carries ONE #[ignore]d
@@ -1458,7 +1478,21 @@ jobs:
           # locally on the merged tree (19 on allocations-geometry-
           # gates + the fault gate and capture gates from
           # frame-preparation) with this step's own awk.
-          [ "$ignored" -eq 24 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 24"; exit 1; }
+          # Era-1 corrective recursive phase, post-edge-coverage
+          # (2026-11-24): findings 16+17's check-halves add TWO
+          # #[ignore]d render_post gates (the asymmetric off-center
+          # disc at the odd rectangular 121×75 extent under the true
+          # aspect — the horizontal-mirror discriminator — and the
+          # tiny-extent + ambient-feed cells: 1×256, 2×256 through
+          # the actual safe_load guards, the negative/zero/midtone/
+          # over-one HDR through the real composite) — executed by
+          # the unchanged post-gates Linux Vulkan step below; ignored
+          # in this plain run: 24 -> 26. Passed counts and result
+          # lines unchanged (the wet D16 cell rides inside the
+          # existing reflection gate). MEASURED locally on this
+          # branch's tree with this step's own awk (588/26/62, zero
+          # failures); platform-uniform (no cfg gates).
+          [ "$ignored" -eq 26 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 26"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
