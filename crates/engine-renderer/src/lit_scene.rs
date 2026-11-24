@@ -18,6 +18,8 @@
 //! uses a documented small tolerance, not bit-exactness, because
 //! shader compilers may reassociate).
 
+use std::sync::OnceLock;
+
 /// The intersection's world extent: a 40 m x 40 m corner (the
 /// CUSTOM-ENGINE-RESEARCH scene definition §"One Corner of the City").
 pub const SCENE_EXTENT: f32 = 40.0;
@@ -112,40 +114,46 @@ pub fn materials() -> [Material; 3] {
 /// (two tall across the streets, two mid on the corner), leaving the
 /// 8 m road cross open. Pure data — the fixed layout, no seeding
 /// needed (the research spec's "repeatable" requirement).
-pub fn intersection_boxes() -> Vec<SceneBox> {
-    let e = SCENE_EXTENT;
-    let road = 8.0;
-    let half_road = road / 2.0;
-    let sidewalk = 2.0;
-    // The corner building masses sit outside the road cross; the
-    // layout is symmetric-quad with varied heights (the spec's
-    // recognizable corner).
-    vec![
-        // Northeast mass (tall): x in [half+sidewalk, e], z in [half+sidewalk, e].
-        SceneBox {
-            min: [half_road + sidewalk, GROUND_Y, half_road + sidewalk],
-            max: [e, 18.0, e],
-            material: 1,
-        },
-        // Southwest mass (tall): x in [-e, -(half+sidewalk)], z in [-e, -(half+sidewalk)].
-        SceneBox {
-            min: [-e, GROUND_Y, -e],
-            max: [-(half_road + sidewalk), 22.0, -(half_road + sidewalk)],
-            material: 1,
-        },
-        // Southeast mass (mid, dark base): x in [half+sidewalk, e], z in [-e, -(half+sidewalk)].
-        SceneBox {
-            min: [half_road + sidewalk, GROUND_Y, -e],
-            max: [e, 9.0, -(half_road + sidewalk)],
-            material: 2,
-        },
-        // Northwest mass (mid): x in [-e, -(half+sidewalk)], z in [half+sidewalk, e].
-        SceneBox {
-            min: [-e, GROUND_Y, half_road + sidewalk],
-            max: [-(half_road + sidewalk), 12.0, e],
-            material: 2,
-        },
-    ]
+///
+/// Returns a static slice — the table is computed once on first use
+/// and cached in a `OnceLock` to avoid per-frame heap allocation.
+pub fn intersection_boxes() -> &'static [SceneBox] {
+    static TABLE: OnceLock<Vec<SceneBox>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let e = SCENE_EXTENT;
+        let road = 8.0;
+        let half_road = road / 2.0;
+        let sidewalk = 2.0;
+        // The corner building masses sit outside the road cross; the
+        // layout is symmetric-quad with varied heights (the spec's
+        // recognizable corner).
+        vec![
+            // Northeast mass (tall): x in [half+sidewalk, e], z in [half+sidewalk, e].
+            SceneBox {
+                min: [half_road + sidewalk, GROUND_Y, half_road + sidewalk],
+                max: [e, 18.0, e],
+                material: 1,
+            },
+            // Southwest mass (tall): x in [-e, -(half+sidewalk)], z in [-e, -(half+sidewalk)].
+            SceneBox {
+                min: [-e, GROUND_Y, -e],
+                max: [-(half_road + sidewalk), 22.0, -(half_road + sidewalk)],
+                material: 1,
+            },
+            // Southeast mass (mid, dark base): x in [half+sidewalk, e], z in [-e, -(half+sidewalk)].
+            SceneBox {
+                min: [half_road + sidewalk, GROUND_Y, -e],
+                max: [e, 9.0, -(half_road + sidewalk)],
+                material: 2,
+            },
+            // Northwest mass (mid): x in [-e, -(half+sidewalk)], z in [half+sidewalk, e].
+            SceneBox {
+                min: [-e, GROUND_Y, half_road + sidewalk],
+                max: [-(half_road + sidewalk), 12.0, e],
+                material: 2,
+            },
+        ]
+    })
 }
 
 /// One camera-route waypoint: a position + a look-at target. The

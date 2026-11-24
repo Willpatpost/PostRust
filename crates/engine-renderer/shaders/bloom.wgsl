@@ -21,6 +21,10 @@
 // convention post.rs's blur_texel mirrors); the accumulation
 // order is fixed tap order (left to right), the CPU's order.
 //
+// FINDING 17(b) correction: For extents of 1 or 2 texels, the
+// 4i+1 / 4i+2 taps fall outside the image. The CPU zero-fills
+// OOB fetches; the shader now mirrors this explicitly.
+//
 // BINDINGS: 0 = the source image (the HDR scene target for the
 // downsample pass, the previous mip for the blur passes). No
 // sampler (nothing is filtered) and no uniforms (the extents come
@@ -65,17 +69,30 @@ fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
     return vec4<f32>(p, 0.0, 1.0);
 }
 
+// Safe textureLoad with explicit bounds check: returns zero if
+// the texel is outside the image, otherwise loads from texture.
+// This mirrors post.rs's downsample_texel zero-fill for OOB fetches.
+fn safe_load(src: texture_2d<f32>, pos: vec2<i32>, extent: vec2<i32>) -> vec3<f32> {
+    if (pos.x < 0 || pos.y < 0 || pos.x >= extent.x || pos.y >= extent.y) {
+        return vec3<f32>(0.0, 0.0, 0.0);
+    }
+    return textureLoad(src, pos, 0).rgb;
+}
+
 @fragment
 fn fs_bright(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let scene_extent = vec2<i32>(textureDimensions(src_tex));
     let texel = frag_texel(frag);
     // The 2×2 bilinear footprint in the scene image (the box a
     // linear-filtered 1/4 downsample would average).
+    // For an extent of 1 or 2, the 4i+1 / 4i+2 taps fall outside;
+    // the CPU zero-fills OOB fetches (post.rs :: downsample_texel).
+    // Use safe_load to explicitly check bounds.
     let base = texel * 4 + vec2<i32>(1, 1);
-    let a = textureLoad(src_tex, base, 0).rgb;
-    let b = textureLoad(src_tex, base + vec2<i32>(1, 0), 0).rgb;
-    let c = textureLoad(src_tex, base + vec2<i32>(0, 1), 0).rgb;
-    let d = textureLoad(src_tex, base + vec2<i32>(1, 1), 0).rgb;
+    let a = safe_load(src_tex, base, scene_extent);
+    let b = safe_load(src_tex, base + vec2<i32>(1, 0), scene_extent);
+    let c = safe_load(src_tex, base + vec2<i32>(0, 1), scene_extent);
+    let d = safe_load(src_tex, base + vec2<i32>(1, 1), scene_extent);
     // Fixed order: ((a + b) + c) + d, then the 0.25 scale.
     let avg = (a + b + c + d) * 0.25;
     return vec4<f32>(bright_pass(avg.r), bright_pass(avg.g), bright_pass(avg.b), 1.0);

@@ -351,6 +351,21 @@ pub(crate) struct VulkanContext {
     descriptor_pools: Cell<u64>,
     descriptor_sets: Cell<u64>,
     sampler_creations: Cell<u64>,
+    /// vkCmdDrawIndirect issuances since renderer construction —
+    /// the 6-E2 ISSUANCE observation (the Era-1 review's
+    /// gate-by-gate disposition for render_instanced: "one command
+    /// trace or recording assertion that verifies vkCmdDrawIndirect
+    /// was issued"). The proxy draw-call count cannot distinguish
+    /// the indirect submission from the direct one (both count one
+    /// per populated kind — by design, the headline), and the
+    /// release-build fallback silently submits the identical
+    /// geometry through cmd_draw when the indirect state is
+    /// somehow missing; this counter is incremented AT the
+    /// cmd_draw_indirect call site, so a frame that claims the
+    /// indirect path but fell back observes as zero. Monotonic
+    /// like the allocation counters (frame deltas, not live
+    /// counts; survives pipeline replacement).
+    indirect_draws_issued: Cell<u64>,
     /// Diagnostic fault-injection seam: arms a one-shot plan for the
     /// corrective finding 3+8 verification. The `u32` ordinal is
     /// 1-based and decrements per MATCHING check across the renderer's
@@ -709,6 +724,7 @@ impl VulkanContext {
             descriptor_pools: Cell::new(0),
             descriptor_sets: Cell::new(0),
             sampler_creations: Cell::new(0),
+            indirect_draws_issued: Cell::new(0),
             target_fault: Cell::new(None),
             target_images: Cell::new(0),
             target_image_views: Cell::new(0),
@@ -3536,6 +3552,16 @@ pub(crate) struct FrameOutcome {
     /// frames. The corner mesh's own material draws are NOT counted
     /// here — this counts proxy submission only.
     pub proxy_draw_calls: u32,
+    /// vkCmdDrawIndirect issuances THIS frame (the 6-E2 issuance
+    /// observation — the delta of the context's monotonic counter
+    /// across this frame's recording). One per populated kind in
+    /// the indirect mode and ZERO in every other mode; zero on a
+    /// deferred frame. Distinguishes the indirect submission from
+    /// the direct one, which the draw-call count deliberately
+    /// cannot (the release fallback draws the identical geometry
+    /// through cmd_draw — this field is what observes the
+    /// difference).
+    pub indirect_draws_issued: u32,
 }
 
 /// The full frame flow: wait → acquire → (recreate if needed) → record →
@@ -3573,6 +3599,12 @@ pub(crate) fn render_frame(
 ) -> Result<FrameOutcome, RendererError> {
     let mut outcome = FrameOutcome::default();
     let slot = frames.frame_slot;
+    // The 6-E2 issuance observation's frame baseline: the recording
+    // below (this frame's command buffer) increments the context's
+    // monotonic vkCmdDrawIndirect counter at each call site; the
+    // delta lands on the outcome after the submission. Deferred and
+    // refused frames record nothing, so their delta is zero.
+    let indirect_issued_before = ctx.indirect_draws_issued.get();
 
     // The proxy materials are validated before ANY synchronization
     // state is touched (the capture-refusal discipline: a refusal
@@ -4559,6 +4591,8 @@ pub(crate) fn render_frame(
     }
 
     outcome.gpu_render_ms = gpu_render_ms;
+    outcome.indirect_draws_issued =
+        (ctx.indirect_draws_issued.get() - indirect_issued_before) as u32;
     frames.frame_slot = (slot + 1) % FRAMES_IN_FLIGHT as usize;
     Ok(outcome)
 }
@@ -5533,6 +5567,191 @@ mod orientation {
         // With the capability present, the same match serves (the
         // positive control).
         assert!(cached.matches(1280, 720, vk::Format::B8G8R8A8_UNORM, true));
+    }
+}
+
+#[cfg(test)]
+mod position_invariance {
+    //! The Era-1 review's finding 19 pin: the three pipelines whose
+    //! vertex position outputs must be bit-identical across
+    //! separately compiled pipelines — the ordinary lit scene, the
+    //! shadowed lit scene, and the wet ground's EQUAL re-draw —
+    //! carry the SPIR-V `Invariant` decoration on their position
+    //! outputs, emitted by the SAME pinned naga (29.0.4) that
+    //! build.rs compiles them with. Equal inputs and operation
+    //! order do not establish bit-identical clip positions across
+    //! separately compiled pipelines (the Vulkan invariance rules);
+    //! the decoration is what constrains the driver, and this pin
+    //! is what observes it — if a future naga/toolchain change
+    //! stops emitting `Invariant` for `@invariant`, the wet
+    //! ground's EQUAL depth test loses its portability guarantee
+    //! and THIS test fails.
+    const LIT_SCENE_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lit_scene.spv"));
+    const LIT_SCENE_SHADOWED_SPV: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/lit_scene_shadowed.spv"));
+    const GROUND_REFLECT_SPV: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/ground_reflect.spv"));
+    // Negative controls: pipelines with position outputs that are
+    // NOT part of the wet ground's EQUAL contract — the instanced
+    // proxies (their instances never cover the ground quad the
+    // overlay re-draws) and the sky (drawn before the scene, never
+    // EQUAL-matched by the overlay). A match here means the matcher
+    // fires on structure that is not the decoration.
+    const INSTANCED_PROXY_SPV: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/instanced_proxy.spv"));
+    const SKY_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky.spv"));
+
+    /// Re-parses a build-emitted SPIR-V module through the pinned
+    /// naga (the orientation pin's own prelude — well-formedness of
+    /// the exact bytes the GPU receives, without the front end's
+    /// coordinate re-adjustment folding anything away).
+    fn parse_emitted(bytes: &[u8], name: &str) -> naga::Module {
+        let options = naga::front::spv::Options {
+            adjust_coordinate_space: false,
+            ..Default::default()
+        };
+        naga::front::spv::parse_u8_slice(bytes, &options).unwrap_or_else(|error| {
+            panic!("the build-emitted {name} re-parses through naga: {error:?}")
+        })
+    }
+
+    /// The emitted words as (opcode, operands) pairs in stream
+    /// order; `None` on a malformed stream (not a valid module).
+    fn instructions(bytes: &[u8]) -> Option<Vec<(u32, Vec<u32>)>> {
+        let words: Vec<u32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
+            .collect();
+        if words.len() < 5 || words[0] != 0x0723_0203 {
+            return None;
+        }
+        let mut parsed = Vec::new();
+        let mut cursor = 5;
+        while cursor < words.len() {
+            let head = words[cursor];
+            let count = (head >> 16) as usize;
+            if count == 0 || cursor + count > words.len() {
+                return None;
+            }
+            parsed.push((head & 0xffff, words[cursor + 1..cursor + count].to_vec()));
+            cursor += count;
+        }
+        Some(parsed)
+    }
+
+    // Stable SPIR-V core opcode and enum numbers (the orientation
+    // pin's own convention): OpMemberDecorate decorates a struct
+    // member, OpDecorate a whole object; the Decoration enum values
+    // BuiltIn = 11 and Invariant = 18; the BuiltIn enum value
+    // Position = 0.
+    const OP_DECORATE: u32 = 71;
+    const OP_MEMBER_DECORATE: u32 = 64;
+    const DECORATION_BUILTIN: u32 = 11;
+    const DECORATION_INVARIANT: u32 = 18;
+    const BUILTIN_POSITION: u32 = 0;
+
+    /// The (struct, member) pairs whose member decoration is
+    /// `decoration` (with the BuiltIn parameter when required).
+    fn member_pairs(
+        instructions: &[(u32, Vec<u32>)],
+        decoration: u32,
+        parameter: Option<u32>,
+    ) -> Vec<(u32, u32)> {
+        instructions
+            .iter()
+            .filter(|(opcode, operands)| {
+                *opcode == OP_MEMBER_DECORATE
+                    && operands.len() >= 3
+                    && operands[2] == decoration
+                    && parameter.is_none_or(|value| operands.get(3) == Some(&value))
+            })
+            .map(|(_, operands)| (operands[0], operands[1]))
+            .collect()
+    }
+
+    /// The object ids decorated `decoration` (with the BuiltIn
+    /// parameter when required).
+    fn decorated_ids(
+        instructions: &[(u32, Vec<u32>)],
+        decoration: u32,
+        parameter: Option<u32>,
+    ) -> Vec<u32> {
+        instructions
+            .iter()
+            .filter(|(opcode, operands)| {
+                *opcode == OP_DECORATE
+                    && operands.len() >= 2
+                    && operands[1] == decoration
+                    && parameter.is_none_or(|value| operands.get(2) == Some(&value))
+            })
+            .map(|(_, operands)| operands[0])
+            .collect()
+    }
+
+    /// The semantic pin: SOME position output — a struct member
+    /// carrying BOTH BuiltIn(Position) and Invariant, or a whole
+    /// object carrying both — exists in the emitted words. The
+    /// member form is what the pinned naga emits for a WGSL struct
+    /// output (`@invariant @builtin(position)`); the object form is
+    /// accepted too so the pin survives an equivalent-but-rearranged
+    /// emission (the orientation pin's representation-robustness
+    /// lesson).
+    fn marks_a_position_output_invariant(bytes: &[u8]) -> bool {
+        let Some(instructions) = instructions(bytes) else {
+            return false;
+        };
+        let position_members =
+            member_pairs(&instructions, DECORATION_BUILTIN, Some(BUILTIN_POSITION));
+        let invariant_members = member_pairs(&instructions, DECORATION_INVARIANT, None);
+        if position_members
+            .iter()
+            .any(|pair| invariant_members.contains(pair))
+        {
+            return true;
+        }
+        let position_ids = decorated_ids(&instructions, DECORATION_BUILTIN, Some(BUILTIN_POSITION));
+        let invariant_ids = decorated_ids(&instructions, DECORATION_INVARIANT, None);
+        position_ids.iter().any(|id| invariant_ids.contains(id))
+    }
+
+    #[test]
+    fn wet_equal_pipelines_mark_the_position_output_invariant() {
+        // Well-formedness prelude: the emitted bytes re-parse through
+        // the pinned naga before the raw matcher checks their words.
+        let _ = parse_emitted(LIT_SCENE_SPV, "lit_scene.spv");
+        let _ = parse_emitted(LIT_SCENE_SHADOWED_SPV, "lit_scene_shadowed.spv");
+        let _ = parse_emitted(GROUND_REFLECT_SPV, "ground_reflect.spv");
+        let _ = parse_emitted(INSTANCED_PROXY_SPV, "instanced_proxy.spv");
+        let _ = parse_emitted(SKY_SPV, "sky.spv");
+        // The semantic pin, one per EQUAL-contract pipeline.
+        assert!(
+            marks_a_position_output_invariant(LIT_SCENE_SPV),
+            "lit_scene.spv must decorate its position output Invariant (finding 19) — \
+             the wet ground's EQUAL depth test loses its cross-pipeline guarantee"
+        );
+        assert!(
+            marks_a_position_output_invariant(LIT_SCENE_SHADOWED_SPV),
+            "lit_scene_shadowed.spv must decorate its position output Invariant \
+             (finding 19) — the shadowed scene must write bit-identical ground depth"
+        );
+        assert!(
+            marks_a_position_output_invariant(GROUND_REFLECT_SPV),
+            "ground_reflect.spv must decorate its position output Invariant (finding \
+             19) — the EQUAL re-draw must reproduce the scene's clip positions"
+        );
+        // Negative controls: unmarked position outputs do not match.
+        assert!(
+            !marks_a_position_output_invariant(INSTANCED_PROXY_SPV),
+            "instanced_proxy.spv carries no @invariant — a match here means the \
+             matcher fires on structure that is not the decoration"
+        );
+        assert!(
+            !marks_a_position_output_invariant(SKY_SPV),
+            "sky.spv carries no @invariant — a match here means the matcher fires \
+             on structure that is not the decoration"
+        );
     }
 }
 

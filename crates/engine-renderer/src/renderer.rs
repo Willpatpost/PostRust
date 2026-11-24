@@ -93,6 +93,16 @@ pub struct GeometryStats {
     /// submission only — the corner mesh's own material draws are
     /// not included. Zero on unpopulated frames.
     pub proxy_draw_calls: u32,
+    /// vkCmdDrawIndirect issuances this frame (the 6-E2 issuance
+    /// observation the Era-1 review required of the instancing
+    /// gate: the draw-call count cannot distinguish the indirect
+    /// submission from the direct one — both are one per populated
+    /// kind — and the release fallback silently submits identical
+    /// geometry through cmd_draw; this counts the actual
+    /// vkCmdDrawIndirect calls at their site). One per populated
+    /// kind in [`ProxyDrawMode::Indirect`], zero in every other
+    /// mode.
+    pub indirect_draws_issued: u32,
     pub uploaded_bytes: u64,
 }
 
@@ -630,7 +640,7 @@ impl Renderer {
             ));
         }
         let boxes = crate::lit_scene::intersection_boxes();
-        let (min, max) = crate::shadows::scene_bounds(&boxes);
+        let (min, max) = crate::shadows::scene_bounds(boxes);
         let cascade = crate::shadows::cascade_for(light.dir_toward_light, min, max);
         let [r, g, b] = light.ambient;
         let params = vulkan::shadow_draw::ShadowFrameParams {
@@ -900,6 +910,7 @@ impl Renderer {
                     + u32::from(outcome.foreground_drawn > 0)
                     + u32::from(outcome.overlay.drawn > 0),
                 proxy_draw_calls: outcome.proxy_draw_calls,
+                indirect_draws_issued: outcome.indirect_draws_issued,
                 uploaded_bytes: u64::from(outcome.region.drawn) * size_of::<SceneVertex>() as u64
                     + u64::from(outcome.overlay.drawn) * size_of::<OverlayVertex>() as u64,
             },

@@ -382,8 +382,50 @@ jobs:
           # fires-once, ordinal, the error variant, unarmed), the
           # same +4 platform-uniform in the renderer-release step.
           # MEASURED locally with this step's own awk.
-          expected=1199
-          if [ "$(uname -s)" != "Linux" ]; then expected=1148; fi
+          # Era 1 corrective/allocations-geometry-gates (2026-11-24,
+          # findings 10+11): +1 platform-uniform engine-renderer lib
+          # test (the wheel normal-agreement contract — every wheel
+          # triangle's geometric normal dots positively with its
+          # authored normals; pure f32 arithmetic, no cfg gates).
+          # Linux 1189/2/33 MEASURED locally with this step's own
+          # awk; Windows 1138 = 1137 + the same 1. MERGE-ORDER
+          # ARITHMETIC: corrective/frame-preparation (#22)
+          # independently adds +7 — with both landed the count is
+          # 1196/1145; whichever lands second re-measures and takes
+          # the actuals.
+          # Era 1 corrective/allocations-geometry-gates run 2
+          # (2026-11-24, finding 12): +2 platform-uniform
+          # engine-renderer lib tests (the full-vertex FNV-1a digest
+          # pins, one per v2 mesh — pure f32-bit serialization).
+          # Linux 1191/2/33 MEASURED locally with this step's own
+          # awk; Windows 1140 = 1138 + the same 2. With #22 landed
+          # too: 1198/1147 — whichever lands last takes the actuals.
+          # Run 4 (findings 16+17+18): +5 platform-uniform
+          # engine-renderer lib tests (post.rs's edge-case battery —
+          # the tonemap nonpositive guard, the bright-pass zero
+          # contract, the OOB-tap zero-fill at 1×N/2×N extents).
+          # Linux 1196/2/33 MEASURED locally with this step's own
+          # awk; Windows 1145 = 1140 + the same 5.
+          # Run 5 (finding 19): +1 platform-uniform engine-renderer
+          # lib test (the wet-EQUAL pipelines' Invariant-decoration
+          # pin — the emitted SPIR-V words of lit_scene,
+          # lit_scene_shadowed, and ground_reflect re-parsed through
+          # the pinned naga and raw-matched for the Invariant
+          # decoration on the Position output, with the instanced
+          # proxy and sky as negative controls; pure CPU word
+          # matching, no cfg gates). Linux 1197/2/33 MEASURED
+          # locally with this step's own awk; Windows 1146 = 1145 +
+          # the same 1.
+          # UNION REHEARSAL (2026-11-24, the overnight session's
+          # seven-PR merge rehearsal): #21 + #22 + #23 landed
+          # together = 1188 + 11 (#22's 7 format + 4 seam) + 9
+          # (#23's 1 wheel + 2 digest + 5 edge-case + 1 invariant)
+          # = 1208 Linux / 1157 Windows — the same union value the
+          # wet-depth-coverage merge (#26) measured on its own
+          # #22+#23 tree. Confirmed below from this rehearsal's own
+          # measured actuals.
+          expected=1208
+          if [ "$(uname -s)" != "Linux" ]; then expected=1157; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -452,8 +494,31 @@ jobs:
           # the same +4 as the main shard, platform-uniform) —
           # 118 -> 122. MEASURED locally with this step's own awk
           # (122/0 failures/2 result lines).
-          echo "renderer release: $passed passed, $results test-result lines (expected 122 / 2)"
-          [ "$passed" -eq 122 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 122"; exit 1; }
+          # Era 1 corrective/allocations-geometry-gates (2026-11-24,
+          # findings 10+11): +1 (the wheel normal-agreement
+          # contract, the same +1 as the main shard,
+          # platform-uniform) — 111 -> 112. MEASURED locally with
+          # this step's own awk (112/0 failures/2 result lines).
+          # MERGE-ORDER ARITHMETIC: #22 independently adds +7 —
+          # with both landed 119; whichever lands second takes the
+          # actuals.
+          # Run 2 (finding 12): +2 (the digest pins, the same +2 as
+          # the main shard) — 112 -> 114, MEASURED locally (114/0
+          # failures/2 result lines).
+          # Run 4 (findings 16+17+18): +5 (the post.rs edge-case
+          # battery — the tonemap/bright-pass/mip unit pairs, the
+          # same +5 as the main shard) — 114 -> 119, MEASURED
+          # locally (119/0 failures/2 result lines).
+          # Run 5 (finding 19): +1 (the Invariant-decoration pin,
+          # the same +1 as the main shard, platform-uniform) —
+          # 119 -> 120, MEASURED locally with this step's own awk
+          # (120/0 failures/2 result lines).
+          # UNION REHEARSAL (2026-11-24): 111 + 11 (#22) + 9 (#23)
+          # = 131 — the same union value the wet-depth-coverage
+          # merge (#26) measured on its #22+#23 tree; confirmed
+          # below from this rehearsal's own measured actuals.
+          echo "renderer release: $passed passed, $results test-result lines (expected 131 / 2)"
+          [ "$passed" -eq 131 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 131"; exit 1; }
           [ "$results" -eq 2 ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != 2"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production
@@ -1295,8 +1360,29 @@ jobs:
           # prior 575 + the same 6 (platform-uniform — pure f32
           # arithmetic and struct equality, no cfg gates); ignored
           # and result lines unchanged.
-          expected=582
-          if [ "$(uname -s)" != "Linux" ]; then expected=581; fi
+          # Era 1 corrective/allocations-geometry-gates run 3
+          # (2026-11-24, findings 14+15): +5 NON-ignored CPU
+          # self-checks in the existing render_shadows binary (the
+          # comparator's NaN/out-of-range/damaged-depth rejection and
+          # the PCF boundary's unexposed-axis/diagonal discipline —
+          # pure CPU, headless, executed in THIS shard's plain run).
+          # Linux 587/17/62 MEASURED locally with this step's own
+          # awk; Windows 586 = 581 + the same 5. No ignored or
+          # result-line changes.
+          # Run 4 (findings 16+17+18): +1 non-ignored CPU test in
+          # render_post (the slice-side tonemap/bright-pass edge
+          # cases) — 587 -> 588 Linux MEASURED locally (Windows 587
+          # = 586 + 1).
+          # Run 5 (finding 19): NO count change — the near/far
+          # oblique wet-coverage bands extend the EXISTING
+          # #[ignore]d render_reflection gate (its result line and
+          # ignored count unchanged; the bands run only under the
+          # enforced Linux Vulkan step below, where the
+          # reflection-gates run measured them at 2619 far + 5551
+          # near known-answer pixels, 2594 of them self-
+          # discriminating against an EQUAL rejection).
+          expected=588
+          if [ "$(uname -s)" != "Linux" ]; then expected=587; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
@@ -1310,7 +1396,7 @@ jobs:
           # are engine-renderer lib tests — the main shard's).
           # Linux 582/14/59 MEASURED locally with this step's own
           # awk; Windows 581/14/59 platform-uniform.
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 23 / 62)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 25 / 62)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           # Era 1 package 3 (the sky, 2026-11-23): the NEW
           # tests/render_sky.rs binary carries ONE #[ignore]d
@@ -1374,14 +1460,25 @@ jobs:
           # MEASURED locally with this step's own awk (582/22/62).
           # With #21 also landed the count is 23 — the merge-order
           # note above applies unchanged.
+          # Era-1 corrective recursive phase (2026-11-24, findings
+          # 11+18, run 8/n): TWO new #[ignore]d engine-slice tests —
+          # render_instanced's oblique wheel fixture and
+          # render_reflection's specular-eye swing gate (both executed
+          # by the unchanged instanced/reflection Linux Vulkan steps
+          # below; ignored in this plain run): 17 -> 19. Passed and
+          # result lines unchanged. MEASURED locally with this step's
+          # own awk (588/19/62). MERGE-ORDER: #22 independently holds
+          # 22 and the wet-depth-coverage stack 24 — whichever lands
+          # last re-measures and takes the actuals.
           # UNION REHEARSAL (2026-11-24, the overnight session's
-          # seven-PR merge rehearsal): #21 + #22 landed together =
-          # 17 + 1 (capture-trust) + 4 (frame-preparation gates)
-          # + 1 (the fault gate) = 23. The pin below is the union
-          # value, to be confirmed from the rehearsal's own
-          # measured actuals (the awk below) — the established
-          # discipline, never a guess.
-          [ "$ignored" -eq 23 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 23"; exit 1; }
+          # seven-PR merge rehearsal): #21 + #22 + #23 landed
+          # together = 17 + 1 (capture-trust) + 4 (frame-preparation
+          # gates) + 1 (the fault gate) + 2 (the oblique wheel and
+          # specular-eye gates) = 25. The pin below is the union
+          # value, to be confirmed from the rehearsal's own measured
+          # actuals (the awk below) — the established discipline,
+          # never a guess.
+          [ "$ignored" -eq 25 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 25"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
