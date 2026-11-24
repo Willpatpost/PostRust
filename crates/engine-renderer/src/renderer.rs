@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use sdl3::video::Window as SdlWindow;
 
-use crate::config::{RenderConfig, present_mode_str};
+use crate::config::{RenderConfig, TargetFaultSite, TargetFaultStage, present_mode_str};
 use crate::overlay::{AtlasText, OverlayVertex};
 use crate::scene::SceneVertex;
 use crate::vulkan::{
@@ -122,6 +122,10 @@ pub struct FrameResult {
 
 /// Successful Vulkan allocation calls since renderer construction and the
 /// resident byte size of the texture allocations (including staging tails).
+/// The additional fields count only the Era-1 target builders' Vulkan
+/// objects (image, memory, view, framebuffer — post chain, wet chain,
+/// shadow chain). Texture/corner/overlay allocations stay outside this
+/// scope; the existing fields' semantics are unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AllocationStats {
     pub device_memory: u64,
@@ -130,6 +134,23 @@ pub struct AllocationStats {
     pub descriptor_pools: u64,
     pub descriptor_sets: u64,
     pub samplers: u64,
+    /// Monotonic creation count of Era-1 target builder images
+    /// (post, wet, shadow).
+    pub target_images: u64,
+    /// Monotonic creation count of Era-1 target builder image views.
+    pub target_image_views: u64,
+    /// Monotonic creation count of Era-1 target builder framebuffers.
+    pub target_framebuffers: u64,
+    /// Monotonic creation count of Era-1 target builder memory allocations.
+    pub target_memories: u64,
+    /// Monotonic destruction count of Era-1 target builder images.
+    pub target_image_frees: u64,
+    /// Monotonic destruction count of Era-1 target builder image views.
+    pub target_view_frees: u64,
+    /// Monotonic destruction count of Era-1 target builder framebuffers.
+    pub target_framebuffer_frees: u64,
+    /// Monotonic destruction count of Era-1 target builder memory allocations.
+    pub target_memory_frees: u64,
 }
 
 /// Long-lived renderer statistics (Stage 2 authorization, item 4).
@@ -150,6 +171,17 @@ pub struct RenderStats {
     pub frames_presented: u64,
     pub swapchain_recreations: u64,
     pub validation_active: bool,
+    /// Synchronization validation requested-and-accepted on the
+    /// validation instance (finding 9's explicit enablement: the
+    /// VK_EXT_validation_features pNext chained when
+    /// `ValidationPreference::On` and the layer accepted it — a
+    /// failed attempt falls back with this false alongside
+    /// `validation_active`). When true, the `validation_errors`
+    /// count includes the layer's synchronization-hazard findings
+    /// (SYNC-HAZARD-*), so every gate asserting
+    /// `validation_errors == 0` now also proves the render passes'
+    /// execution and memory dependencies.
+    pub sync_validation: bool,
     pub gpu_timestamps_supported: bool,
     pub validation_errors: u64,
     pub validation_warnings: u64,
@@ -170,6 +202,10 @@ pub struct RenderStats {
     pub overlay_supplied_peak_vertices: u32,
     pub overlay_capacity_vertices: u32,
     gpu_timing: TimingSamples,
+    /// The negotiated depth format (corrective finding 4, F):
+    /// the renderer's chosen depth format, reported so tests can
+    /// verify fallbacks and the DepthFormatPreference knob.
+    pub depth_format: String,
 }
 
 impl RenderStats {
@@ -267,7 +303,8 @@ pub struct SkyFrame {
 impl Renderer {
     pub fn new(window: &SdlWindow, config: RenderConfig) -> Result<Renderer, RendererError> {
         let atlas_text = AtlasText::default();
-        let (mut ctx, validation_active) = VulkanContext::new(window, atlas_text.atlas(), &config)?;
+        let (mut ctx, validation_active, sync_validation) =
+            VulkanContext::new(window, atlas_text.atlas(), &config)?;
         // Cross-stage cleanup (corrective finding G): each constructor
         // cleans up its own partials; this ladder releases completed
         // stages when a later stage fails.
@@ -280,7 +317,8 @@ impl Renderer {
         };
         // The depth format is chosen once and shared by the render pass
         // and every depth attachment (corrective finding F).
-        let depth_format = pick_depth_format(&ctx.instance, ctx.physical_device);
+        let depth_format =
+            pick_depth_format(&ctx.instance, ctx.physical_device, config.depth_format);
         // The demo-scene preference is fixed at construction (P3): the
         // static Stage-2 demonstration scene uploads only on the
         // explicit opt-in, and every later pipeline replacement is
@@ -335,6 +373,7 @@ impl Renderer {
             frames_presented: 0,
             swapchain_recreations: 0,
             validation_active,
+            sync_validation,
             gpu_timestamps_supported: frames.timestamps_supported,
             validation_errors: 0,
             validation_warnings: 0,
@@ -346,6 +385,7 @@ impl Renderer {
             overlay_supplied_peak_vertices: 0,
             overlay_capacity_vertices: 0,
             gpu_timing: TimingSamples::default(),
+            depth_format: format!("{:?}", depth_format),
         };
         Ok(Renderer {
             ctx,
@@ -628,6 +668,10 @@ impl Renderer {
         };
         let sky = self.sky_params(view_proj);
         let wet = self.wet_camera(view_proj, eye, light);
+        // The ground re-draw (finding 5) needs the current camera in the
+        // corner buffer regardless of the lighting branch. Build the
+        // ordinary FrameParams and pass it in corner_params.
+        let corner_params = vulkan::corner::FrameParams::new(*view_proj, eye, light);
         let outcome = vulkan::render_frame(
             &mut self.ctx,
             &mut self.swapchain,
@@ -642,7 +686,7 @@ impl Renderer {
             None,
             &[],
             &[],
-            None,
+            Some(&corner_params),
             None,
             Some(&params),
             sky.as_ref(),
@@ -871,6 +915,25 @@ impl Renderer {
     /// Reads cumulative allocation counters on demand.
     pub fn allocations(&self) -> AllocationStats {
         self.ctx.allocations()
+    }
+
+    /// Arms a one-shot target-construction fault (the corrective
+    /// finding 3+8 verification knob): the ordinal-th matching
+    /// fallible step in the named builder returns
+    /// [`RendererError::InjectedFault`]. The ordinal is 1-based and
+    /// decrements per MATCHING check (across all target builders of
+    /// the same site). The plan is consumed only when the ordinal
+    /// reaches 0. Diagnostic-only, test-only: never produced by real
+    /// device calls. The `&mut self` is intentional: the one-shot
+    /// intent is encoded in the type (a caller must mutably borrow to
+    /// arm it).
+    pub fn inject_target_fault(
+        &mut self,
+        site: TargetFaultSite,
+        stage: TargetFaultStage,
+        ordinal: u32,
+    ) {
+        self.ctx.set_target_fault(site, stage, ordinal);
     }
 
     pub fn stats(&self) -> &RenderStats {

@@ -401,8 +401,35 @@ jobs:
           # matching, no cfg gates). Linux 1197/2/33 MEASURED
           # locally with this step's own awk; Windows 1146 = 1145 +
           # the same 1.
-          expected=1197
-          if [ "$(uname -s)" != "Linux" ]; then expected=1146; fi
+          # Era 1 corrective/frame-preparation (2026-11-24, findings
+          # 4+7+8): +7 platform-uniform engine-renderer lib tests
+          # (the depth_aspect aspect-mask contract ×4 — D32/D16
+          # DEPTH, D24_S8 DEPTH|STENCIL, color COLOR; the
+          # resolve_depth_format battery ×3 — Auto always the
+          # negotiated pick, forced-honored, forced-unsupported
+          # fallback — pure f32-free enum logic, no cfg gates).
+          # Linux 1195/2/33 MEASURED locally with this step's own
+          # awk; Windows 1144 = 1137 + the same 7.
+          # Era-1 corrective recursive phase (2026-11-24, findings 3+8
+          # on corrective/frame-preparation): +4 engine-renderer lib
+          # tests (the target-fault seam's plan-advance battery —
+          # fires-once, ordinal, the error variant, unarmed), the
+          # same +4 platform-uniform in the renderer-release step.
+          # MEASURED locally with this step's own awk.
+          # Era-1 corrective recursive phase, the wet-depth-coverage
+          # stack (2026-11-24): this branch merges
+          # corrective/frame-preparation (db7ae45 - findings 3-9,
+          # +7 depth/format batteries, +4 target-fault seam tests)
+          # into corrective/allocations-geometry-gates (1e1ed00 -
+          # findings 10-19, its own engine-renderer additions), so
+          # the counts are the UNION: main 1208/2/33 (1197 + 11),
+          # renderer release 131/2 (120 + 11), heavy 588/24/62
+          # (ignored 19 + the fault gate's... see below) - ALL
+          # MEASURED locally on the merged tree with this step's
+          # own awk; Windows 1157 = 1146 + the same 11
+          # (platform-uniform).
+          expected=1208
+          if [ "$(uname -s)" != "Linux" ]; then expected=1157; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -482,6 +509,23 @@ jobs:
           # (120/0 failures/2 result lines).
           echo "renderer release: $passed passed, $results test-result lines (expected 120 / 2)"
           [ "$passed" -eq 120 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 120"; exit 1; }
+=======
+          # Era 1 corrective/frame-preparation (2026-11-24, findings
+          # 4+7+8): +7 (the depth_aspect and resolve_depth_format
+          # batteries, the same +7 as the main shard,
+          # platform-uniform) — 111 -> 118. MEASURED locally with
+          # this step's own awk (118/0 failures/2 result lines).
+          # Era-1 corrective recursive phase (2026-11-24, findings
+          # 3+8): +4 (the target-fault seam's plan-advance battery,
+          # the same +4 as the main shard, platform-uniform) —
+          # 118 -> 122. MEASURED locally with this step's own awk
+          # (122/0 failures/2 result lines).
+          # The wet-depth-coverage merge (see the main shard's note):
+          # the UNION of both branches' renderer additions - 131/2
+          # MEASURED locally on the merged tree with this step's
+          # own awk.
+          echo "renderer release: $passed passed, $results test-result lines (expected 131 / 2)"
+          [ "$passed" -eq 131 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 131"; exit 1; }
           [ "$results" -eq 2 ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != 2"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production
@@ -695,6 +739,11 @@ jobs:
       # corner-family composition smokes. The per-stage println!
       # evidence (the max-error lines, the lift, the delta) is
       # what the CI log must show.
+      # (Era-1 corrective recursive phase, findings 3+8) The same
+      # step now also executes the fault-injection gate: every
+      # target-builder stage fault unwinds to the pre-attempt
+      # census, no slot strands, recoveries land (MEASURED on the
+      # pod's lavapipe — the full 21-cell matrix, 4.65 s).
       - name: Post gates (lavapipe)
         if: runner.os == 'Linux'
         shell: bash
@@ -1354,7 +1403,7 @@ jobs:
           # are engine-renderer lib tests — the main shard's).
           # Linux 582/14/59 MEASURED locally with this step's own
           # awk; Windows 581/14/59 platform-uniform.
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 17 / 62)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 24 / 62)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           # Era 1 package 3 (the sky, 2026-11-23): the NEW
           # tests/render_sky.rs binary carries ONE #[ignore]d
@@ -1383,7 +1432,36 @@ jobs:
           # (16 -> 17) AND +1 result line (61 -> 62); passed counts
           # unchanged. Linux 582/17/62 MEASURED locally with this
           # step's own awk.
-          [ "$ignored" -eq 17 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 17"; exit 1; }
+          # Era 1 corrective/frame-preparation (2026-11-24, findings
+          # 3-9): FOUR new #[ignore]d lavapipe gates in EXISTING
+          # binaries — render_reflection carries three (the
+          # first-frame-after-replacement layer-presence gate, the
+          # wet-only negotiated-depth-format gate, and the
+          # shadowed+wet current-camera gate) and render_post one
+          # (the depth-fallback matrix + the post lifecycle); all
+          # executed by the unchanged reflection/post Linux Vulkan
+          # steps below: +4 ignored (17 -> 21) on THIS branch's base
+          # (main); passed counts and result lines unchanged (582/62
+          # MEASURED locally with this step's own awk). MERGE-ORDER
+          # NOTE: corrective/capture-trust (#21) independently moves
+          # 17 -> 18; with both landed the count is 22 (18 + these
+          # 4) — whichever lands second re-measures with this awk
+          # and takes the actuals, never a guess.
+          # Era-1 corrective recursive phase (2026-11-24, findings
+          # 3+8): the fault-injection gate adds ONE #[ignore]d
+          # engine-slice test (render_post's
+          # injected_target_failures... — executed by the unchanged
+          # post-gates Linux Vulkan step below; ignored in this plain
+          # run): 21 -> 22. Passed and result lines unchanged.
+          # MEASURED locally with this step's own awk (582/22/62).
+          # With #21 also landed the count is 23 — the merge-order
+          # note above applies unchanged.
+          # The wet-depth-coverage merge (see the main shard's note): the
+          # union of both branches' ignored gates - 24 MEASURED
+          # locally on the merged tree (19 on allocations-geometry-
+          # gates + the fault gate and capture gates from
+          # frame-preparation) with this step's own awk.
+          [ "$ignored" -eq 24 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 24"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
