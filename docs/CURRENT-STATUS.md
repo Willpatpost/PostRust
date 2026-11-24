@@ -425,8 +425,11 @@ The full union's counts are MEASURED (the 2026-11-24 union
   local gate battery with the workflow's own awk): main
   **1208/2/33** (Windows 1157), renderer release **131/2**, heavy
   **588/27/62** (Windows 587 — #27's 26 plus #21's capture gate,
-  which #26/#27's trees never contained); the push dispatches the
-  five-job CI on the exact union tree, and the workflow's
+  which #26/#27's trees never contained); draft PR #29 (the
+  rehearsal's DO-NOT-MERGE verification PR — GitHub's
+  `pull_request` CI is the only mechanism that runs the exact-count
+  gates on the union tree, the push trigger being branch-filtered)
+  carries it through the five-job CI, and the workflow's
   exact-count gate enforces the actuals at the owner's merge,
   never a guess. The rehearsal also caught the union's two
   merge-time obligations — both at the #21×#23 seam, correct on
