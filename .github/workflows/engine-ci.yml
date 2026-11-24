@@ -1405,6 +1405,23 @@ jobs:
           # reflection-gates run measured them at 2619 far + 5551
           # near known-answer pixels, 2594 of them self-
           # discriminating against an EQUAL rejection).
+          # Run 6 (2026-11-24, the ~15:00 re-check cycle's package,
+          # corrective/shadow-comparator-coverage): NO count change —
+          # the five run-3 CPU self-checks were VACUOUS (they never
+          # invoked the comparator or the gate's anchor enumeration;
+          # they asserted arithmetic facts about constants they
+          # constructed) and are replaced IN PLACE by real negative
+          # controls (the same five names, the same result line):
+          # compare_map fed a CPU-synthesized map with NaN in every
+          # texel of every class (mismatches == compared — the
+          # original NaN-passes-through defect reports 0 and fails),
+          # above-ceiling and below-zero plants (exactly 2), and a
+          # wrong-but-in-range half-depth at a deep-interior ground
+          # texel (exactly 1); the PCF gate's anchor enumeration
+          # factored to pcf_reachable_anchors (the gate calls it)
+          # and exercised by the two boundary tests. Linux
+          # 588/27/62 MEASURED locally with this step's own awk;
+          # Windows 587/27 unchanged (platform-uniform — pure CPU).
           expected=588
           if [ "$(uname -s)" != "Linux" ]; then expected=587; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
