@@ -204,13 +204,22 @@ for the combined candidate.
 
 | CI partition | Linux | Windows |
 |---|---:|---:|
-| Main shard (`--workspace --exclude engine-slice`) | 1154 | 1103 |
+| Main shard (`--workspace --exclude engine-slice`) | 1188 | 1137 |
 | Heavy shard (`-p engine-slice --features crash-test-seams`) | 582 | 581 |
-| **Combined** | **1736** | **1684** |
+| **Combined** | **1770** | **1718** |
 
 The macOS job has its own partition. Main has two ignored tests and 33
-result lines. Heavy has thirteen ignored tests and 59 result lines. The
-Cycle 6-E implementation candidate's Linux counts were MEASURED
+result lines. Heavy has seventeen ignored tests and 62 result lines. The
+table is settled at `main` @ `406aceb` (2026-11-24): it carries the Era-1
+ladder's merged endpoint (PRs #13–#19; #20 was docs-only), matching the
+workflow's enforced pins at that exact tree — main 1188 Linux / 1137
+Windows with 2 ignored / 33 result lines, renderer release 111/2, heavy
+582 Linux / 581 Windows with 17 ignored / 62 result lines — each value
+confirmed by the green five-job CI runs on that tree, never a guess.
+The per-package growth history that produced those endpoint counts
+(the 6-E scaffold through the Era-1 ladder, each measured at its own
+integrated tree): the Cycle 6-E implementation candidate's Linux
+counts were MEASURED
 locally with the workflow's own awk (1142 main = the 6-E scaffold's
 1138 + 4 platform-uniform engine-renderer tests; heavy passed counts
 unchanged, its new `render_instanced` binary contributing +1 ignored
@@ -351,12 +360,138 @@ pin — within the existing lib result line; ignored and result lines
 unchanged); Linux 582/13/59 MEASURED locally with the workflow's own
 awk, Windows 581 = the prior 575 + the same 6 (platform-uniform
 inference — pure f32 arithmetic and struct equality, no cfg gates; to
-be confirmed by the candidate's CI run). The main-shard row above
-still carries the pre-scaffold 1154/1103 — the Era-1 scaffold merge
-(PR #12) added its engine-renderer tests (workflow pin 1173/1122)
-without updating this table; that update belongs to the scaffold's
-own obligation, flagged for the auditor rather than silently folded
-into this package's diff.
+be confirmed by the candidate's CI run). The main-shard table row is
+settled above at `main` @ `406aceb` — the scaffold-era flag (the row
+carrying pre-scaffold 1154/1103 against the workflow's then-pin
+1173/1122, deferred to "the scaffold's own obligation" rather than
+folded into that package's diff) is discharged by this file's
+2026-11-24 reconciliation; the flag's history lives in git.
+
+**The Era-1 corrective cycle (2026-11-23/24, the overnight autonomous
+run; the spec is Astra's 20-finding review,
+`docs/ERA1-RENDERING-REVIEW-286d3e3.md`, merged as #20 — findings 1,
+10 and 11 pre-verified by the home team):** every one of the 20
+findings' corrections AND verification tests is landed across seven
+open, five-job CI-green, NEVER-merged PRs (the owner's GO is the only
+merge authority; the merge-order arithmetic lives in the workflow's
+comment chains and the PR bodies):
+
+- **#21 `corrective/capture-trust`** — findings 1+2: the
+  device-to-host visibility barrier and producing-submission/buffer-
+  generation binding on both capture paths; the third
+  `render_shadows` gate
+  (`shadow_readback_belongs_to_the_shadowed_frame_and_its_buffer`)
+  exercising interposition and replacement.
+  Heavy ignored 17→18 at its tip; no other count moves.
+- **#22 `corrective/frame-preparation`** — findings 3–9: pre-acquire
+  target preparation, the negotiated depth format (post fallbacks),
+  the current camera before either lighting branch, the generation
+  cache key, immediate handle registration, the fault-injection seam
+  with its count census, and explicitly-enabled synchronization
+  validation with a negative control. At its tip: main 1195 Linux /
+  1144 Windows, renderer release 118/2, heavy 582/21/62.
+- **#23 `corrective/allocations-geometry-gates`** — findings 10–19:
+  the host-allocation counter beside the Vulkan one (warmed direct,
+  indirect and shadowed frames all pinned at zero), the owned wheel
+  winding with the oblique-view gate, the full-vertex FNV digest pins,
+  the lit-transform oracle, the shadow-map ground/NaN hardening, the
+  reachable-anchor PCF boundaries, the captured-lift bloom
+  measurement, the shader guard mirrors, the virtual-eye reflection
+  oracle, and `@invariant` position outputs SPIR-V-verified with wet
+  coverage bands. At its tip: main 1197/2/33 Linux (1146 Windows),
+  renderer release 120/2, heavy 588/17/62 Linux (587 Windows).
+- **#24 `corrective/architecture-split`** — finding 20's phased
+  `frame_prepare` extraction and corner-scene recorder split (phases
+  A/B/C plus the coordinator flag contract at the phase-A seam): a
+  pure refactor, no test count moves.
+- **#25 `corrective/sky-offaxis-coverage`** — the gate-table's sky
+  extension: the off-axis disc edge at 264×200 (aspect 1.32) inside
+  the existing sky gate; no count moves.
+- **#26 `corrective/wet-depth-coverage`** — finding 19's
+  fallback-format half (D24_S8) on the #22+#23 union tree. At its
+  tip: main 1208/2/33, renderer release 131/2, heavy 588/24/62.
+- **#27 `corrective/post-edge-coverage`** — the cycle-closing audit's
+  three unlanded check-halves: findings 16+17's GPU-side
+  discriminators (the asymmetric-disc mirror discriminator, the
+  1×256/2×256 tiny-extent ambient feed) and finding 4's wet D16
+  cell. At its tip (the largest stacked tree): main 1208 Linux /
+  1157 Windows (2/33), renderer release 131/2, heavy 588 Linux /
+  587 Windows (26 ignored / 62 result lines) — MEASURED with the
+  workflow's own awk, Windows confirmed by the exact-count CI gate.
+- **#30 `corrective/acquire-out-of-date-coverage`** (the recursive
+  phase's next item, 2026-11-24) — finding 6's out-of-date half: the
+  acquire-out-of-date recreation path's first-frame verification,
+  the one review-proposed check #22 had honestly documented as
+  driver-forced and not exercisable from the test API. A one-shot
+  diagnostic injection (the `inject_target_fault` seam precedent)
+  replaces the first `vkAcquireNextImageKHR` with the injected
+  `ERROR_OUT_OF_DATE_KHR` — the driver contract modeled exactly (no
+  image, semaphore untouched), the arm's retry acquire structurally
+  real — and the new `#[ignore]d` render_reflection gate
+  (`first_frame_after_out_of_date_recreation_keeps_every_layer`)
+  proves the FIRST presented frame after that recreation carries
+  sky/wet/post by the pending-recreate sibling's own differential
+  method, plus the one-shot consumption proof. Stacks on #27's tip;
+  at its tree: main 1208/2/33 and renderer release 131/2 unchanged,
+  heavy 588/27/62 (ignored 26 → 27, the one new gate) — MEASURED
+  with the workflow's own awk, the reflection battery 6/6 on the
+  pod's lavapipe. At the full union the heavy ignored pin is 28
+  (#21's capture gate + 27 here) — MEASURED on the assembled
+  eight-PR union by the extended rehearsal (the paragraph below),
+  the exact-count gate enforcing it through CI on PR #29.
+
+The full union's counts are MEASURED (the 2026-11-24 union
+  rehearsal, branch `corrective/union-rehearsal` — EIGHT `--no-ff`
+  merges in the ladder order over `main` @ `406aceb`: #21–#27,
+  then #30's acquire-out-of-date gate as the eighth, the end state
+  the owner's merge sequence produces — the full local gate battery
+  with the workflow's own awk): main **1208/2/33** (Windows 1157),
+  renderer release **131/2**, heavy **588/28/62** (Windows 587 —
+  the seven-PR union's measured 27 plus #30's one gate, the
+  arithmetic #30's body documented, MEASURED on the assembled
+  tree). The eighth merge is the one the seven-PR rehearsal could
+  not cover (#30 stacks on #27's tip, so its one-shot injection
+  consume site — vulkan.rs's first acquire — had never met #24's
+  `prepare_after_recreation` restructure of that exact region):
+  its ONE conflict was the workflow's heavy-ignored pin block,
+  resolved additively, and the linchpin gate re-fired on the merged
+  tree with every measured line identical (the injection survived
+  the split — re-verified on the pod's lavapipe AND in CI's own
+  Reflection-gates step); draft PR #29 (the
+  rehearsal's DO-NOT-MERGE verification PR — GitHub's
+  `pull_request` CI is the only mechanism that runs the exact-count
+  gates on the union tree, the push trigger being branch-filtered)
+  carries it through the five-job CI — run `45392386762` green on
+  the seven-PR tree, run `45406550126` green on the eight-PR tree
+  (the Windows 1157/587/28 exact-count pins' first execution on
+  the end state). The rehearsal also caught the union's two
+  merge-time obligations — both at the #21×#23 seam, correct on
+  every branch's own tree and invisible to GitHub's conflict
+  detection: `compare_map`'s 4→7-tuple (four destructure sites in
+  #21's capture gate) and `intersection_boxes()`'s Vec→`&'static
+  [SceneBox]` slice change (the same four sites' `&boxes` becomes
+  a needless borrow under clippy `-D warnings`) — plus #22's
+  accidentally-committed `vulkan.rs.backup` (a stale 5083-line
+  copy of `vulkan.rs`, removed on that branch in `5a4cbd2` with a
+  diff-identity proof of gate inertness). The full record lives in
+  PR #28's comment trail; the fixes are carried verbatim on the
+  rehearsal branch for the owner's merge sequence. Every rig-dependent clause (the discrete-GPU
+capture-visibility behavior, driver-forced fallback paths) is
+documented as rig-pending in the PR bodies, awaiting the owner's
+RTX 5070 Ti procedure — never presented as measured. The cycle's own
+closing re-audit (2026-11-24, independently re-verified against
+source) found the recursive queue empty: no unlanded correction, no
+unlanded verification test, no NOTE/IMPROVEMENT finding uncovered.
+The NEXT cycle's re-check (2026-11-24, the supervisor cycling the
+agent as the protocol directs) re-audited that emptiness claim
+against the source with a second independent read-only pass and
+found exactly one remainder: finding 6's out-of-date half, the
+check #22 had documented as not exercisable — landed as #30 above
+(the cycle's own 5/3 seam precedent applied to its last documented
+limitation). The queue is empty again: every remaining clause is
+either landed with a CI-visible gate or documented as rig-pending
+in the PR bodies.
+
 (At `a4eb372`, Windows counts were measured before landing; Linux
 counts were inferred at landing and subsequently confirmed by GitHub
 run `44937616390`.)
@@ -796,6 +931,27 @@ B-seam swap), plus the orchestrator's composition fix (combat_demo's
 RenderConfig gained D's demo_scene field). The candidate CI at the
 exact SHA is the closing gate; the owner's playtest commands:
 `--combat` (the encounter) and `--playable` (the gatehouse, unchanged).
+
+**The Era-1 corrective cycle (2026-11-23/24, the overnight autonomous
+run).** The spec is Astra's 20-finding Era-1 rendering review
+(`docs/ERA1-RENDERING-REVIEW-286d3e3.md`, merged as #20; findings 1,
+10 and 11 pre-verified by the home team). The ladder's four packages
+landed first — capture-trust (#21), frame-preparation (#22),
+allocations-geometry-gates (#23), architecture-split (#24) — then the
+recursive phase per the owner's directive: the sky off-axis extension
+(#25), finding 19's fallback-format half (#26), and the closing
+check-halves audit (#27). All seven PRs are open and never merged
+(the owner's GO is the only merge authority; the count evidence and
+merge-order notes are in §4 and the PR bodies). The cycle's closing
+re-audit (2026-11-24, independently re-verified against source) found
+the recursive queue empty. What awaits the owner: the merge GOs (in
+the documented merge order — with the two #21×#23 merge-time fixes
+and the measured union counts from the 2026-11-24 union rehearsal,
+`corrective/union-rehearsal` / PR #28's comment trail), and the rig
+run for the rig-pending clauses (the discrete-GPU
+capture-visibility behavior and the driver-forced depth-fallback
+paths — the RTX 5070 Ti procedure,
+`docs/WINDOWS-GPU-PROFILING-KIT.md`).
 
 ## 10. The authoritative coordination ledger
 
