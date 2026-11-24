@@ -507,9 +507,6 @@ jobs:
           # the same +1 as the main shard, platform-uniform) —
           # 119 -> 120, MEASURED locally with this step's own awk
           # (120/0 failures/2 result lines).
-          echo "renderer release: $passed passed, $results test-result lines (expected 120 / 2)"
-          [ "$passed" -eq 120 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 120"; exit 1; }
-=======
           # Era 1 corrective/frame-preparation (2026-11-24, findings
           # 4+7+8): +7 (the depth_aspect and resolve_depth_format
           # batteries, the same +7 as the main shard,
