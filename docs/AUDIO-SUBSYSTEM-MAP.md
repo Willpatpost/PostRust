@@ -110,7 +110,8 @@ package should not add a dependency the binary already carries.
 ### 2.2 Decode/asset ingest (compressed → PCM)
 
 - **Symphonia** [DOCUMENTED — github.com/pdeljanov/Symphonia, fetched
-  2026-11-24]: pure 100%-safe Rust, MPL-2.0, 3.5k stars, MSRV 1.85; FLAC /
+  2026-11-24]: pure 100%-safe Rust, MPL-2.0, 3.5k stars, MSRV 1.53 (the
+  crate manifest's `rust-version`); FLAC /
   MP3 / PCM / Vorbis / WAV at "Excellent" status (compliance-tested or
   reference-matched over a large corpus), gapless playback supported,
   feature-flag codec selection (royalty-free defaults), fuzz-tested,
@@ -235,7 +236,8 @@ parameters are data, not code, is the forward-compatible shape — the same
   CoreAudio, AAudio, WASM); MSRV 1.85; the `realtime`/`realtime-dbus`
   features; the Linux sound-server pitfalls and buffer-size disciplines.
 - Symphonia: `https://github.com/pdeljanov/Symphonia` — MPL-2.0; pure
-  safe Rust; MSRV 1.85; the codec/format status tables (FLAC/MP3/PCM/
+  safe Rust; MSRV 1.53 (the crate manifest's `rust-version` — corrected
+  from this doc's first draft, which transposed cpal's 1.85); the codec/format status tables (FLAC/MP3/PCM/
   Vorbis/WAV Excellent, gapless); feature-flag codec selection; the
   fuzz/DoS safety aims; the ±15%-of-FFMpeg performance claim (theirs,
   [MEASURED-PENDING] if load-bearing).
