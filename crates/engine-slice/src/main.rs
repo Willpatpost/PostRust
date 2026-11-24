@@ -70,6 +70,13 @@ Interactive modes
                                     pre-6-E shape for before/after runs)
   --corner --shadows                 The route with directional shadows (one
                                     cascade, the deterministic core's oracle)
+  --corner --free-look               Interactive WASD + mouse camera (Era 1's
+                                    eyeball mode — presentation only, the camera
+                                    never enters a measured claim; starts on the
+                                    route's entry waypoint, clamped to the
+                                    scene's world AABB; R/F vertical, Shift
+                                    sprint, Esc quit; --frames <count> is the
+                                    smoke's bounded auto-quit)
   --player | --playable              Movement and gatehouse demos
   --combat | --encounter             Combat and courtyard demos
   --demo-persist <campaign-dir>      Persistent campaign
@@ -525,6 +532,8 @@ fn main() {
             let mut proxy_reference = false;
             let mut proxy_instanced = false;
             let mut shadows = false;
+            let mut free_look = false;
+            let mut free_look_frames: Option<u64> = None;
             let mut fps = 60;
             let mut present = engine_renderer::PresentModePreference::Auto;
             let mut validation = engine_renderer::ValidationPreference::Auto;
@@ -544,6 +553,26 @@ fn main() {
                     // indirect submission.
                     "--proxy-instanced" => proxy_instanced = true,
                     "--shadows" => shadows = true,
+                    // Era 1 package 1: the interactive eyeball
+                    // camera (presentation only; the scripted
+                    // measurement route is the default without it).
+                    "--free-look" => free_look = true,
+                    // The free-look smoke's bounded exit — auto-quit
+                    // after N presented frames. Free-look ONLY: the
+                    // scripted route has its own fixed 601-frame
+                    // length, and truncating it would silently
+                    // weaken the measurement greps (the upfront
+                    // refusal, never a silent mode drop).
+                    "--frames" => {
+                        free_look_frames = Some(
+                            options
+                                .next()
+                                .ok_or("--frames requires a value")?
+                                .parse::<u64>()
+                                .map_err(|_| "--frames requires an integer count")?
+                                .clamp(1, 1_000_000),
+                        );
+                    }
                     "--fps" => {
                         fps = parse_fps(options.next().ok_or("--fps requires a value")?)?
                             .ok_or("--fps requires 1-1000 or uncapped")?;
@@ -563,6 +592,13 @@ fn main() {
                     _ => return Err(format!("unrecognized corner option {arg}")),
                 }
             }
+            if free_look_frames.is_some() && !free_look {
+                return Err(
+                    "--frames requires --free-look (the scripted route has its own fixed \
+                     601-frame length; truncating it would silently weaken the measurement)"
+                        .into(),
+                );
+            }
             engine_slice::corner_demo::run(
                 night,
                 fps,
@@ -572,6 +608,9 @@ fn main() {
                 proxy_reference,
                 proxy_instanced,
                 shadows,
+                free_look.then_some(engine_slice::corner_demo::FreeLookOptions {
+                    frames: free_look_frames,
+                }),
             )
         };
         if let Err(e) = run() {

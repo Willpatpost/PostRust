@@ -118,7 +118,12 @@ ARM64) with a five-job CI:
   demonstration command) with **`--sustained-load-full-matrix`** (the full
   reference matrix; the raw evidence record is archived in the
   coordination ledger — §7) and **`--player` / `--player-headless`** (the
-  player prototype's interactive and deterministic paths).
+  player prototype's interactive and deterministic paths), and the Era-1
+  **`--corner --free-look`** eyeball camera (the Stage-2 6-DoF machinery
+  wired to the shell's input intents, clamped to the corner scene's world
+  AABB — presentation only: the interactive camera never enters the spine,
+  a fingerprint, or any measured claim, and the scripted route's
+  measurement series print only with the mode off).
 
 The **integrated campaign demo** (`--demo-persist`) is the vertical slice:
 one authoritative, persistently-orchestrated 1000-NPC / 8-region campaign
@@ -164,8 +169,8 @@ for the combined candidate.
 | CI partition | Linux | Windows |
 |---|---:|---:|
 | Main shard (`--workspace --exclude engine-slice`) | 1154 | 1103 |
-| Heavy shard (`-p engine-slice --features crash-test-seams`) | 576 | 575 |
-| **Combined** | **1730** | **1678** |
+| Heavy shard (`-p engine-slice --features crash-test-seams`) | 582 | 581 |
+| **Combined** | **1736** | **1684** |
 
 The macOS job has its own partition. Main has two ignored tests and 33
 result lines. Heavy has thirteen ignored tests and 59 result lines. The
@@ -218,6 +223,21 @@ the candidate's CI run). The
 pre-6-E-implementation workflow pins (1138/1087 main, 570/569 heavy
 with 9 ignored / 57 lines) carried the 6-A/6-B/6-E-scaffold history;
 the workflow's comment chains remain the per-batch measurement record.
+The Era-1 free-look package (2026-11-23) grew the heavy shard's passed
+count 576 -> 582 (the `corner_demo` camera battery's six
+platform-uniform tests — the route-entry matrix identity, the
+world-AABB/eye-band clamp, the Stage-2-speed basis movement, the
+runaway-input clamp, the shared look-mapping composition, the pitch
+pin — within the existing lib result line; ignored and result lines
+unchanged); Linux 582/13/59 MEASURED locally with the workflow's own
+awk, Windows 581 = the prior 575 + the same 6 (platform-uniform
+inference — pure f32 arithmetic and struct equality, no cfg gates; to
+be confirmed by the candidate's CI run). The main-shard row above
+still carries the pre-scaffold 1154/1103 — the Era-1 scaffold merge
+(PR #12) added its engine-renderer tests (workflow pin 1173/1122)
+without updating this table; that update belongs to the scaffold's
+own obligation, flagged for the auditor rather than silently folded
+into this package's diff.
 (At `a4eb372`, Windows counts were measured before landing; Linux
 counts were inferred at landing and subsequently confirmed by GitHub
 run `44937616390`.)

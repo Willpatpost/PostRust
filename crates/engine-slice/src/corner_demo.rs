@@ -1,14 +1,20 @@
-//! One Corner of the City. One deterministic pose per presented frame.
+//! One Corner of the City. One deterministic pose per presented frame
+//! — or, with `--free-look` (Era 1), the interactive eyeball camera:
+//! presentation only, never a measured claim.
 use crate::corner_population::corner_population;
-use crate::math::{Mat4, camera_view, mul, percentile, perspective};
+use crate::frame_timing::FrameTiming;
+use crate::math::{Mat4, camera_forward, camera_right, camera_view, mul, percentile, perspective};
+use crate::render_demo::free_flight_look_delta;
 use engine_core::timing::TimingSamples;
 use engine_renderer::config::FRAMES_IN_FLIGHT;
-use engine_renderer::lit_scene::{RouteWaypoint, camera_route, day_preset, night_preset};
-use engine_renderer::{
-    DemoScenePreference, PresentModePreference, ProxyDrawMode, ProxyPopulation, RenderConfig,
-    Renderer, ValidationPreference,
+use engine_renderer::lit_scene::{
+    LightParams, RouteWaypoint, SCENE_EXTENT, camera_route, day_preset, night_preset,
 };
-use engine_shell::{DriverPreference, ShellApp, ShellConfig, pace_until};
+use engine_renderer::{
+    AllocationStats, DemoScenePreference, PresentModePreference, ProxyDrawMode, ProxyPopulation,
+    RenderConfig, Renderer, ValidationPreference,
+};
+use engine_shell::{DriverPreference, Keycode, ShellApp, ShellConfig, pace_until};
 use std::time::{Duration, Instant};
 
 const STEPS: usize = 120;
@@ -40,10 +46,147 @@ pub fn route_poses() -> impl ExactSizeIterator<Item = RouteWaypoint> {
     })
 }
 
+/// The orientation (yaw, pitch) that aims the camera from a
+/// waypoint position at its look-at target — the EXACT expression
+/// the scripted route's view matrix evaluates, extracted into one
+/// tested place so the free-look camera can START on the route's
+/// entry waypoint (the mode's first presented frame is
+/// matrix-identical to the route's first frame; the two paths share
+/// the conversion, never re-derive it).
+pub fn waypoint_orientation(offset: [f32; 3]) -> (f32, f32) {
+    let [x, y, z] = offset;
+    ((-x).atan2(-z), y.atan2(x.hypot(z)))
+}
+
 pub fn view_projection(pose: RouteWaypoint, aspect: f32) -> Mat4 {
-    let [x, y, z] = std::array::from_fn(|i| pose.look_at[i] - pose.position[i]);
-    let view = camera_view(pose.position, (-x).atan2(-z), y.atan2(x.hypot(z)), 0.);
-    mul(&perspective(65_f32.to_radians(), aspect, 0.1, 150.), &view)
+    let offset = std::array::from_fn(|i| pose.look_at[i] - pose.position[i]);
+    let (yaw, pitch) = waypoint_orientation(offset);
+    mul(
+        &perspective(65_f32.to_radians(), aspect, 0.1, 150.),
+        &camera_view(pose.position, yaw, pitch, 0.),
+    )
+}
+
+/// The free-look mode's options; `None` in [`run`] keeps the
+/// scripted measurement route, `Some` replaces the route's pose
+/// with the interactive camera (presentation only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreeLookOptions {
+    /// Auto-quit after this many PRESENTED frames (the offscreen
+    /// smoke's bounded exit); `None` runs until Esc or window close.
+    pub frames: Option<u64>,
+}
+
+/// Mouse-look sensitivity (radians per pixel) — the Stage-2 render
+/// demo's own constant, reused verbatim so both free cameras feel
+/// identical (the shared `free_flight_look_delta` mapping over it).
+const FREE_LOOK_SENSITIVITY: f32 = 0.0025;
+/// Pitch clamp (radians) — the Stage-2 render demo's value: a hair
+/// under ±90°, so straight up/down stays reachable and the gimbal
+/// line is never crossed.
+const FREE_LOOK_PITCH_LIMIT: f32 = 1.54;
+/// Walk and sprint speeds (m/s) — the Stage-2 render demo's values.
+const FREE_LOOK_WALK_SPEED: f32 = 4.0;
+const FREE_LOOK_SPRINT_SPEED: f32 = 12.0;
+/// The eye-height floor: the scripted route's own eye height (the
+/// street-level viewing band — the eyeball camera never sinks into
+/// the ground plane it exists to look at).
+const FREE_LOOK_EYE_MIN_Y: f32 = 1.7;
+/// The eye ceiling: above the tallest building mass (22 m) for the
+/// bird's-eye view of the whole intersection.
+const FREE_LOOK_EYE_MAX_Y: f32 = 30.0;
+
+/// Clamps a free-look eye position to the corner scene's world AABB
+/// — ±[`SCENE_EXTENT`] horizontally, the eye band vertically. Pure
+/// demo-side policy (no collision: the camera may pass THROUGH the
+/// building masses; the clamp bounds the world, it does not navigate
+/// it — the brief's "clamp to the world AABB" exactly, nothing more).
+pub fn clamp_eye(position: [f32; 3]) -> [f32; 3] {
+    [
+        position[0].clamp(-SCENE_EXTENT, SCENE_EXTENT),
+        position[1].clamp(FREE_LOOK_EYE_MIN_Y, FREE_LOOK_EYE_MAX_Y),
+        position[2].clamp(-SCENE_EXTENT, SCENE_EXTENT),
+    ]
+}
+
+/// The corner demo's interactive camera (Era 1's `--free-look`): the
+/// Stage-2 6-DoF machinery (the shared, orientation-hardened look
+/// mapping over engine-slice's `camera_forward`/`camera_right`/
+/// `camera_view`) wired to the shell's input intents — position from
+/// WASD (+R/F vertical, Shift sprint), yaw/pitch from relative
+/// mouse — and clamped to the world AABB. PRESENTATION-ONLY by
+/// construction: the camera state never reaches the spine, a
+/// fingerprint, or any measured claim, and the scripted route's
+/// series print only when the mode is off. [`FreeLookCamera::step`]
+/// is pure input→state (deterministic; unit-tested with no window
+/// and no GPU).
+pub struct FreeLookCamera {
+    pub position: [f32; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
+impl FreeLookCamera {
+    /// Starts exactly on a route waypoint — the conversion the
+    /// scripted path uses, so the mode's first presented frame is
+    /// matrix-identical to the route's first (the eyeball session
+    /// begins where the measurement route begins).
+    pub fn at_waypoint(pose: RouteWaypoint) -> Self {
+        let offset = std::array::from_fn(|i| pose.look_at[i] - pose.position[i]);
+        let (yaw, pitch) = waypoint_orientation(offset);
+        FreeLookCamera {
+            position: pose.position,
+            yaw,
+            pitch,
+        }
+    }
+
+    /// Applies one frame of input. `look_delta` is the shell's
+    /// relative-mouse delta (pixels, collected only while captured);
+    /// the movement axes are the WASD intents (+1/−1/0) plus the R/F
+    /// vertical; `dt` is the frame's capped camera delta (see
+    /// [`FrameTiming`] — post-stall frames never teleport the view).
+    /// Roll is fixed at zero: the eyeball camera is the brief's
+    /// position/yaw/pitch (the Stage-2 roll axis is a flight-camera
+    /// feature a street-level scene has no use for).
+    pub fn step(
+        &mut self,
+        look_delta: (f32, f32),
+        forward: i8,
+        strafe: i8,
+        vertical: i8,
+        sprint: bool,
+        dt: f32,
+    ) {
+        let (yaw_delta, pitch_delta) = free_flight_look_delta(look_delta, FREE_LOOK_SENSITIVITY);
+        self.yaw += yaw_delta;
+        self.pitch =
+            (self.pitch + pitch_delta).clamp(-FREE_LOOK_PITCH_LIMIT, FREE_LOOK_PITCH_LIMIT);
+        let speed = if sprint {
+            FREE_LOOK_SPRINT_SPEED
+        } else {
+            FREE_LOOK_WALK_SPEED
+        };
+        let forward_dir = camera_forward(self.yaw, self.pitch, 0.);
+        let right_dir = camera_right(self.yaw, self.pitch, 0.);
+        for axis in 0..3 {
+            self.position[axis] += forward_dir[axis] * f32::from(forward) * speed * dt
+                + right_dir[axis] * f32::from(strafe) * speed * dt;
+        }
+        self.position[1] += f32::from(vertical) * speed * dt;
+        self.position = clamp_eye(self.position);
+    }
+
+    /// The view-projection for the CURRENT pose — the route's own
+    /// projection (65° Vulkan perspective, near 0.1 / far 150) over
+    /// the 6-DoF view matrix. Only the POSE differs from the
+    /// scripted path; the projection never does.
+    pub fn view_projection(&self, aspect: f32) -> Mat4 {
+        mul(
+            &perspective(65_f32.to_radians(), aspect, 0.1, 150.),
+            &camera_view(self.position, self.yaw, self.pitch, 0.),
+        )
+    }
 }
 
 struct Distribution {
@@ -130,6 +273,8 @@ pub fn demo_bias() -> engine_renderer::shadows::ShadowBias {
 // mode, main.rs passes them straight through); grouping them into a
 // config struct would restructure both packages' code inside a merge
 // resolution — the render_frame precedent (vulkan.rs) is the allow.
+// Era 1's free-look grows the list by ONE parameter (its options
+// struct — the mode's two CLI fields grouped — not two flat flags).
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     night: bool,
@@ -140,6 +285,7 @@ pub fn run(
     proxy_reference: bool,
     proxy_instanced: bool,
     shadows: bool,
+    free_look: Option<FreeLookOptions>,
 ) -> Result<(), String> {
     let mut app = ShellApp::new(ShellConfig {
         title: "One Corner of the City".into(),
@@ -252,6 +398,21 @@ pub fn run(
     let light = if night { night_preset() } else { day_preset() };
     let bias = demo_bias();
     let pace = (fps > 0).then(|| Duration::from_secs_f64(1. / f64::from(fps)));
+    // Era 1's free-look: the interactive eyeball camera returns its
+    // own presentation-only summary; the scripted measurement route
+    // below is untouched (its series print only when the mode is off).
+    if let Some(options) = free_look {
+        return run_free_look(
+            &mut app,
+            &mut renderer,
+            population.as_ref(),
+            shadows,
+            light,
+            bias,
+            options,
+            pace,
+        );
+    }
     let mut poses = route_poses().peekable();
     let count = poses.len();
     let mut pose = *poses.peek().unwrap();
@@ -336,9 +497,152 @@ pub fn run(
     Ok(())
 }
 
+/// The free-look loop (Era 1 package 1): the SAME renderer
+/// submission selection as the scripted route (plain / populated /
+/// shadowed), driven by the interactive camera instead of the route
+/// iterator. PRESENTATION-ONLY by construction: no timing
+/// distribution is recorded and no percentile series prints — the
+/// camera state (position/yaw/pitch, dt-scaled input) never touches
+/// a fingerprint or a measured claim. The exit summary carries the
+/// correctness lines only (presented count, validation, the
+/// warmed-allocation constancy when the session never recreated).
+#[allow(clippy::too_many_arguments)]
+fn run_free_look(
+    app: &mut ShellApp,
+    renderer: &mut Renderer,
+    population: Option<&ProxyPopulation<'_>>,
+    shadows: bool,
+    light: LightParams,
+    bias: engine_renderer::shadows::ShadowBias,
+    options: FreeLookOptions,
+    pace: Option<Duration>,
+) -> Result<(), String> {
+    // Relative mouse capture is the mouse-look contract: the shell
+    // collects deltas only while captured (and clears them on focus
+    // loss — its own anti-stuck discipline covers this camera too).
+    app.set_relative_mouse(true);
+    println!(
+        "free-look: presentation only — WASD move · mouse look · R/F up/down · Shift sprint · Esc quit; \
+         starts on the route's entry waypoint, clamped to the scene's world AABB; \
+         no measurement series (the scripted route's print without --free-look)"
+    );
+    let mut camera = FreeLookCamera::at_waypoint(camera_route()[0]);
+    let mut timing = FrameTiming::new();
+    let mut presented: u64 = 0;
+    // The standing warmed-allocations gate: snapshot after the
+    // route's own warmup count, assert at exit when no swapchain
+    // recreation intervened (a resize legitimately reallocates; the
+    // no-recreation regime — the offscreen smoke's own — is the
+    // gated one, and a resized session prints instead of asserting).
+    let mut warm: Option<AllocationStats> = None;
+    loop {
+        let frame_start = Instant::now();
+        let snapshot = app.frame();
+        if snapshot.quit_requested || snapshot.keys_pressed.contains(&Keycode::Escape) {
+            break;
+        }
+        // Frame-boundary timing: the camera step uses the capped
+        // frame delta (FrameTiming's 100 ms cap — a post-stall frame
+        // never teleports the view) and takes NO step on minimized
+        // frames (no presentation, no movement — the render-demo
+        // discipline).
+        let split = timing.begin_frame(frame_start, !snapshot.minimized);
+        if snapshot.minimized {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        let vertical = i8::from(app.is_held(Keycode::R)) - i8::from(app.is_held(Keycode::F));
+        let sprint = app.is_held(Keycode::LShift);
+        camera.step(
+            snapshot.look_delta,
+            snapshot.move_forward,
+            snapshot.move_strafe,
+            vertical,
+            sprint,
+            split
+                .camera_dt
+                .map(|delta| delta.as_secs_f32())
+                .unwrap_or_default(),
+        );
+        // The live window size: free-look TOLERATES resize (the
+        // renderer's recreation path is exercised by it, never an
+        // error — the scripted route refuses resize because it
+        // invalidates the fixed-cadence measurement, and this mode
+        // claims nothing).
+        let size = app.window().size_in_pixels();
+        let aspect = if size.1 == 0 {
+            16. / 9.
+        } else {
+            size.0 as f32 / size.1 as f32
+        };
+        let matrix = camera.view_projection(aspect);
+        let frame = if shadows {
+            renderer.render_corner_shadowed(&matrix, camera.position, light, bias, size)
+        } else if let Some(population) = population {
+            renderer.render_corner_populated(&matrix, camera.position, light, population, size)
+        } else {
+            renderer.render_corner(&matrix, camera.position, light, size)
+        }
+        .map_err(|e| e.to_string())?;
+        if frame.deferred {
+            // The drawable is temporarily unavailable (mid-transition):
+            // poll quietly, present nothing, retry — no recreation storm.
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        if !frame.presented {
+            return Err(format!("free-look presentation failed: {frame:?}"));
+        }
+        if population.is_some() && frame.geometry.proxy_draw_calls == 0 {
+            return Err("free-look populated session drew no proxy calls".into());
+        }
+        presented += 1;
+        if presented == WARMUP as u64 {
+            warm = Some(renderer.allocations());
+        }
+        if let Some(limit) = options.frames
+            && presented >= limit
+        {
+            break;
+        }
+        if let Some(period) = pace {
+            pace_until(frame_start + period);
+        }
+    }
+    let stats = renderer.stats();
+    if stats.validation_errors > 0 {
+        return Err(format!(
+            "{} validation errors: {:?}",
+            stats.validation_errors, stats.recent_validation
+        ));
+    }
+    println!(
+        "free-look: {presented} presented frames; validation warnings/errors {}/{}; swapchain recreations {}",
+        stats.validation_warnings, stats.validation_errors, stats.swapchain_recreations
+    );
+    match warm {
+        Some(warm) if stats.swapchain_recreations == 0 => {
+            if renderer.allocations() != warm {
+                return Err(format!(
+                    "free-look presentation changed the warmed allocation set: \
+                     {warm:?} -> {:?}",
+                    renderer.allocations()
+                ));
+            }
+            println!("warmed Vulkan allocations held across the session: {warm:?}");
+        }
+        _ => println!(
+            "Vulkan allocations: {:?} (no warmed-constancy claim: the session resized or never warmed)",
+            renderer.allocations()
+        ),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn route_visits_each_waypoint_and_keeps_its_target_in_frame() {
         let poses: Vec<_> = route_poses().collect();
@@ -356,5 +660,120 @@ mod tests {
             assert!(clip[3] > 0. && clip[2] > 0. && clip[2] < clip[3]);
             assert!(clip[0].abs() < 1e-4 && clip[1].abs() < 1e-4, "{clip:?}");
         }
+    }
+
+    /// The shared-paths property: the free-look camera STARTS on the
+    /// route's entry waypoint with the SAME orientation conversion,
+    /// so its first frame's matrix is identical to the scripted
+    /// route's first frame — exact equality, not a tolerance (the
+    /// two paths evaluate the same expressions).
+    #[test]
+    fn free_look_starts_matrix_identical_to_the_route_entry() {
+        let pose = camera_route()[0];
+        let camera = FreeLookCamera::at_waypoint(pose);
+        assert_eq!(camera.position, pose.position);
+        assert_eq!(
+            camera.view_projection(16. / 9.),
+            view_projection(pose, 16. / 9.)
+        );
+    }
+
+    /// The world-AABB clamp: an inside point is returned UNCHANGED
+    /// (exactly — no epsilon drift), each horizontal face pulls to
+    /// the ±SCENE_EXTENT boundary, and the vertical band is the eye
+    /// policy (the route's eye height at the floor, the bird's-eye
+    /// ceiling above the tallest mass).
+    #[test]
+    fn clamp_eye_holds_the_world_aabb_and_the_eye_band() {
+        let inside = [3.0, 5.0, -7.0];
+        assert_eq!(clamp_eye(inside), inside);
+        assert_eq!(clamp_eye([41.5, 5.0, 0.0])[0], SCENE_EXTENT);
+        assert_eq!(clamp_eye([-55.0, 5.0, 0.0])[0], -SCENE_EXTENT);
+        assert_eq!(clamp_eye([0.0, 5.0, 48.0])[2], SCENE_EXTENT);
+        assert_eq!(clamp_eye([0.0, 5.0, -44.0])[2], -SCENE_EXTENT);
+        assert_eq!(clamp_eye([0.0, -3.0, 0.0])[1], FREE_LOOK_EYE_MIN_Y);
+        assert_eq!(clamp_eye([0.0, 99.0, 0.0])[1], FREE_LOOK_EYE_MAX_Y);
+    }
+
+    /// The movement math at the Stage-2 machinery's exact speeds:
+    /// zero orientation looks down −Z with +X right, so forward
+    /// walks −Z, strafe walks +X, R climbs, and Shift sprints at
+    /// 12 m/s — all exact binary-arithmetic results (4.0 / 12.0 and
+    /// the dt values are exact in f32; the basis vectors at zero
+    /// angles are exact).
+    #[test]
+    fn free_look_step_moves_along_the_camera_basis_at_the_stage2_speeds() {
+        let mut camera = FreeLookCamera {
+            position: [0.0, 1.7, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        camera.step((0.0, 0.0), 1, 0, 0, false, 0.5);
+        assert_eq!(camera.position, [0.0, 1.7, -2.0]);
+        camera.step((0.0, 0.0), 0, 1, 0, false, 0.5);
+        assert_eq!(camera.position, [2.0, 1.7, -2.0]);
+        camera.step((0.0, 0.0), 0, 0, 1, false, 0.25);
+        assert_eq!(camera.position, [2.0, 2.7, -2.0]);
+        camera.step((0.0, 0.0), 1, 0, 0, true, 0.5);
+        assert_eq!(camera.position, [2.0, 2.7, -8.0]);
+    }
+
+    /// Runaway input stops at the world bounds: a long sprint frame
+    /// cannot carry the eye past the AABB, on either axis pair.
+    #[test]
+    fn free_look_step_clamps_runaway_input_to_the_aabb() {
+        let mut camera = FreeLookCamera {
+            position: [-38.0, 1.7, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        camera.step((0.0, 0.0), 0, -1, 0, true, 10.0);
+        assert_eq!(camera.position, [-SCENE_EXTENT, 1.7, 0.0]);
+        camera.step((0.0, 0.0), 0, 0, 1, true, 10.0);
+        assert_eq!(camera.position[1], FREE_LOOK_EYE_MAX_Y);
+    }
+
+    /// The look mapping composed with the step: mouse-right turns
+    /// the view toward world +X and mouse-up pitches it up — the
+    /// shared, orientation-hardened convention (free-flight and
+    /// player mappings agree; this pins the free-look composition).
+    #[test]
+    fn free_look_step_follows_the_shared_look_mapping() {
+        let mut camera = FreeLookCamera {
+            position: [0.0, 1.7, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        camera.step((100.0, 0.0), 0, 0, 0, false, 0.0);
+        assert_eq!(camera.position, [0.0, 1.7, 0.0], "no move input, no drift");
+        let look = camera_forward(camera.yaw, camera.pitch, 0.0);
+        assert!(look[0] > 0.2, "mouse-right turns toward +X: {look:?}");
+        assert!(look[2] < 0.8, "off the −Z axis: {look:?}");
+
+        let mut camera = FreeLookCamera {
+            position: [0.0, 1.7, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        camera.step((0.0, -100.0), 0, 0, 0, false, 0.0);
+        let look = camera_forward(camera.yaw, camera.pitch, 0.0);
+        assert!(look[1] > 0.2, "mouse-up pitches the view up: {look:?}");
+    }
+
+    /// The pitch pin: sustained upward mouse input parks the pitch
+    /// at the Stage-2 limit (a hair under straight-up) and holds it
+    /// there exactly — never past, never oscillating.
+    #[test]
+    fn free_look_pitch_pins_at_the_stage2_limit() {
+        let mut camera = FreeLookCamera {
+            position: [0.0, 1.7, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        for _ in 0..1000 {
+            camera.step((0.0, -1000.0), 0, 0, 0, false, 0.0);
+        }
+        assert_eq!(camera.pitch, FREE_LOOK_PITCH_LIMIT);
+        assert!(camera.pitch < std::f32::consts::FRAC_PI_2);
     }
 }
