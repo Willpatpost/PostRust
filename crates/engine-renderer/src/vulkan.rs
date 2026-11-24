@@ -3105,7 +3105,9 @@ pub(crate) fn request_capture(frames: &mut FrameState) -> Result<(), RendererErr
 /// buffer inside that frame's command buffer. Single-flight like the
 /// color capture. The handshake lives in the frame state, so the
 /// request survives pipeline replacements; the shadow STATE itself
-/// must exist (the renderer's request path ensures it).
+/// must exist (the renderer's request path ensures it). A plain frame
+/// (no `shadowed` params) does NOT consume the request — it survives
+/// until the next SHADOWED frame runs the depth pass.
 pub(crate) fn request_shadow_readback(frames: &mut FrameState) -> Result<(), RendererError> {
     if frames.shadow_readback.pending || frames.shadow_readback.ready {
         return Err(RendererError::CaptureOutstanding);
@@ -3118,6 +3120,11 @@ pub(crate) fn request_shadow_readback(frames: &mut FrameState) -> Result<(), Ren
 /// the recording slot's fence (the color capture's take discipline)
 /// and returns the map's depths (row-major, row 0 first, one f32 per
 /// texel — the D32_SFLOAT bits as written by the depth-only pass).
+/// Propagates fence-wait errors; on error `ready` stays true so the
+/// caller may retry (exactly `take_capture`'s discipline). Returns
+/// `CaptureDropped` if the shadow state (or its buffer) was replaced
+/// after the readback recorded — the recording buffer was destroyed
+/// with it.
 pub(crate) fn take_shadow_readback(
     ctx: &VulkanContext,
     pipes: &mut PipelineState,
@@ -3126,22 +3133,38 @@ pub(crate) fn take_shadow_readback(
     if !frames.shadow_readback.ready {
         return Ok(None);
     }
-    let Some(shadows) = pipes.shadows.as_ref() else {
-        // The state was replaced after the readback recorded: the
-        // buffer holding the copy is gone — a typed drop (the color
-        // capture's mismatch path), reported rather than silently
-        // empty.
-        frames.shadow_readback.ready = false;
-        return Err(RendererError::CaptureDropped(
-            "the shadow state was replaced before the readback was taken".into(),
-        ));
+    // If the shadow state was replaced after the readback recorded,
+    // the buffer handle changed — the old buffer is gone, and reading
+    // the new one's fresh allocation would return undefined data.
+    let shadows = match pipes.shadows.as_ref() {
+        Some(shadows) => {
+            if shadows.readback_buffer() != frames.shadow_readback.buffer {
+                frames.shadow_readback.ready = false;
+                return Err(RendererError::CaptureDropped(
+                    "the shadow state was replaced after the readback recorded — the recording buffer was destroyed with it".into(),
+                ));
+            }
+            shadows
+        }
+        None => {
+            // The state was replaced after the readback recorded: the
+            // buffer holding the copy is gone — a typed drop (the color
+            // capture's mismatch path), reported rather than silently
+            // empty.
+            frames.shadow_readback.ready = false;
+            return Err(RendererError::CaptureDropped(
+                "the shadow state was replaced before the readback was taken".into(),
+            ));
+        }
     };
     let slot = frames.shadow_readback.slot;
     // SAFETY: the fence is the recording frame's own — the same
     // fence the next frame on that slot waits.
-    let depths = unsafe { shadows.readback_depths(ctx, frames.in_flight[slot]) };
+    let depths = unsafe { shadows.readback_depths(ctx, frames.in_flight[slot]) }?;
+    // Only clear ready after a successful copy; on error the caller
+    // may retry.
     frames.shadow_readback.ready = false;
-    Ok(depths)
+    Ok(Some(depths))
 }
 
 /// The most recent capture refusal or drop, if any — observable for
@@ -3251,12 +3274,16 @@ impl OverlaySlot {
 /// The shadow-map readback's single-flight handshake (the color
 /// capture's shape; lives in `FrameState` so a request survives
 /// pipeline replacements — the shadow STATE is rebuilt, the request
-/// is not).
+/// is not). The buffer field pins the producing generation: the
+/// readback records with that buffer's handle; `take` returns
+/// `CaptureDropped` if the buffer was destroyed (a replacement
+/// installed after the recording but before the take).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ShadowReadbackState {
     pending: bool,
     ready: bool,
     slot: usize,
+    buffer: vk::Buffer,
 }
 
 /// Sync objects, command buffers, and the timestamp pool, per frames-in-
@@ -4323,14 +4350,23 @@ pub(crate) fn render_frame(
         // and copy the recording slot's map into the mapped buffer
         // (the submission fence proves the copy complete before
         // `take_shadow_map_capture` reads it). The handshake lives in
-        // the frame state (replacement-safe).
+        // the frame state (replacement-safe). The request is consumed
+        // ONLY when the frame actually ran the depth pass — the SAME
+        // triple the depth-pass block above requires (corner scene,
+        // shadow state, shadowed params) — so a plain frame leaves
+        // `pending` untouched and the next shadowed frame records it
+        // (the capture survives deferred frames until a frame
+        // actually produces the map; the old-layout declaration
+        // SHADER_READ below is then always the depth pass's final
+        // layout, never a stale one).
         if frames.shadow_readback.pending
-            && let Some(shadow_state) = &pipes.shadows
+            && let (Some(_), Some(shadow_state), Some(_)) = (&ctx.corner, &pipes.shadows, shadowed)
         {
             shadow_state.record_readback(ctx, command, slot);
             frames.shadow_readback.pending = false;
             frames.shadow_readback.ready = true;
             frames.shadow_readback.slot = slot;
+            frames.shadow_readback.buffer = shadow_state.readback_buffer();
         }
         if frames.timestamps_supported {
             ctx.device.cmd_write_timestamp(
@@ -4406,6 +4442,27 @@ pub(crate) fn render_frame(
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     frames.capture.buffer,
                     &[copy],
+                );
+                // The transfer write must be visible to the host reader.
+                // The buffer is HOST_VISIBLE|HOST_COHERENT (create_mapped_buffer),
+                // so no explicit invalidate is needed — the barrier establishes
+                // the availability/visibility dependency.
+                let buffer_barrier = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)
+                    .buffer(frames.capture.buffer)
+                    .offset(0)
+                    .size(frames.capture.byte_len as vk::DeviceSize)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED);
+                ctx.device.cmd_pipeline_barrier(
+                    command,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[buffer_barrier],
+                    &[],
                 );
                 let to_present = vk::ImageMemoryBarrier::default()
                     .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
