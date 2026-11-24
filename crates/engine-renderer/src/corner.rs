@@ -285,6 +285,44 @@ impl CornerResources {
         )
     }
 
+    /// The ground quad's draw range — the planar mirror's RECEIVER:
+    /// the quad the wet re-draw re-rasterizes (EQUAL depth) with the
+    /// mirrored scene sampled at the same screen position. This is
+    /// the authored corner scene's OWN planar intent, stated where
+    /// the scene is authored (finding 20, phase C: the recorder
+    /// assumed range zero was the reflector; now the corner caller
+    /// supplies the range and the recorder is a primitive over it).
+    pub(crate) fn receiver_range(&self) -> Range<u32> {
+        Range {
+            start: self.draws[0].start,
+            end: self.draws[0].end,
+        }
+    }
+
+    /// The reflected building masses' draw ranges, in MATERIAL
+    /// ORDER: position i is material 1+i (the recorder's reflected
+    /// descriptor sets are laid out per material — set index
+    /// material·slots + slot — so the order is the contract between
+    /// this accessor and the reflection state's own set layout).
+    /// The masses the planar mirror reflects toward the receiver —
+    /// the authored corner scene's planar intent, stated where the
+    /// scene is authored (finding 20, phase C: the recorder assumed
+    /// materials 1.. were the reflected buildings and skipped the
+    /// ground; now the corner caller supplies the ranges and the
+    /// recorder iterates exactly what it is given).
+    pub(crate) fn reflected_ranges(&self) -> [Range<u32>; 2] {
+        [
+            Range {
+                start: self.draws[1].start,
+                end: self.draws[1].end,
+            },
+            Range {
+                start: self.draws[2].start,
+                end: self.draws[2].end,
+            },
+        ]
+    }
+
     /// The albedo texture view for a material index (the shadowed
     /// sets bind the same textures the corner's own sets do).
     pub(crate) fn albedo_view(&self, material: u32) -> Option<vk::ImageView> {

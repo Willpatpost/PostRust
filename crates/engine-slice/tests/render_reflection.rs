@@ -30,9 +30,9 @@
 //! ```
 
 use engine_renderer::lit_scene::{
-    GROUND_Y, LightParams, RouteWaypoint, SCENE_EXTENT, day_preset, lit_surface_color,
+    GROUND_Y, LightParams, RouteWaypoint, SCENE_EXTENT, day_preset, intersection_boxes,
+    lit_surface_color, materials,
 };
-use engine_renderer::lit_scene::{intersection_boxes, materials};
 use engine_renderer::planar::{mirrored_eye, reflection_blend};
 use engine_renderer::proc_texture::{TEXTURE_SIZE, procedural_texture};
 use engine_renderer::shadows::ShadowBias;

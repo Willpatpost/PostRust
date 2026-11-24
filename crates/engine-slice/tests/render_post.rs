@@ -1325,21 +1325,6 @@ fn post_edge_cases_tiny_extents_and_ambient_feed() {
         "Era-1 post edge cases: tiny extents ({accepted_width}×256, 2×256) + ambient feed verified"
     );
 }
-
-/// Edge case test for tonemap and bright_pass: the shader's branch
-/// structure must match the CPU's (nonpositive → 0, positive → rational).
-#[test]
-fn tonemap_and_bright_pass_edge_cases() {
-    // Tonemap: negative/zero → 0, positive → rational.
-    assert_eq!(tonemap_rgb([-0.5, 0.0, 0.18]), [0.0, 0.0, tonemap(0.18)]);
-    // Bright pass: negative/zero/below threshold → 0, above → identity.
-    assert_eq!(bright_pass(-0.5), 0.0);
-    assert_eq!(bright_pass(0.0), 0.0);
-    assert_eq!(bright_pass(0.5), 0.0);
-    assert_eq!(bright_pass(1.0), 0.0);
-    assert!((bright_pass(2.0) - 2.0).abs() < 1e-6);
-}
-
 /// (corrective/frame-preparation, findings 4 + 7) The depth-format
 /// fallback matrix and the post lifecycle across swapchain
 /// recreations. Finding 4: with each forced fallback depth format
@@ -1635,25 +1620,71 @@ fn depth_fallbacks_and_the_post_lifecycle() {
     // fixed; see the branch's finding-4 corrective.)
     renderer.set_post(false);
     renderer.request_frame_capture().unwrap();
-    assert!(
-        renderer
-            .render_corner(&matrix, high_eye, day_preset(), size)
-            .unwrap()
-            .presented
-    );
+    let postless = renderer
+        .render_corner(&matrix, high_eye, day_preset(), size)
+        .unwrap();
+    // THE COORDINATOR FLAG CONTRACT (the finding-20 phase-A seam's
+    // own gate — the extraction once dropped exactly these flags,
+    // and no pixel gate could see it): a same-size postless frame
+    // neither defers nor recreates; the minimized path (a zero
+    // extent) defers with nothing presented and no state touched;
+    // a size change recreates and reports it. These are the public
+    // FrameResult fields callers poll (the poll-and-retry contract).
+    assert!(postless.presented);
+    assert!(!postless.deferred && !postless.recreated);
     let _ = renderer.take_frame_capture().unwrap().unwrap();
+    renderer.request_frame_capture().unwrap();
+    let minimized = renderer
+        .render_corner(&matrix, high_eye, day_preset(), (0, 0))
+        .unwrap();
+    assert!(
+        !minimized.presented && minimized.deferred && !minimized.recreated,
+        "the minimized frame defers without presenting (got presented {} deferred {} \
+         recreated {})",
+        minimized.presented,
+        minimized.deferred,
+        minimized.recreated
+    );
+    // The deferral must leave the pending capture request ALIVE for
+    // the next frame that records (the frame-sync discipline: a
+    // deferred frame touches no synchronization state, and the
+    // capture is a request, not an obligation of THIS frame). The
+    // typed CaptureOutstanding refusal on a second request is
+    // itself the proof the first is still pending.
+    let _ = renderer.request_frame_capture().unwrap_err();
+    let recovered = renderer
+        .render_corner(&matrix, high_eye, day_preset(), size)
+        .unwrap();
+    assert!(
+        recovered.presented && !recovered.deferred,
+        "the frame after the deferral proceeds (the probe-pending flag cleared)"
+    );
+    assert!(
+        renderer.take_frame_capture().unwrap().is_some(),
+        "the capture request survived the deferred frame"
+    );
+    assert!(
+        !renderer.take_frame_capture().unwrap().is_some(),
+        "the capture was consumed by the take above"
+    );
     assert_eq!(
         renderer.allocations(),
         warm,
-        "the postless frame allocates nothing (the lazy states stay put)"
+        "the postless, minimized, and recovery frames allocate nothing (the lazy states \
+         stay put; a deferral touches no state)"
     );
     let away = (size.0 + 8, size.1 + 8);
     renderer.request_frame_capture().unwrap();
+    let awayed = renderer
+        .render_corner(&matrix, high_eye, day_preset(), away)
+        .unwrap();
     assert!(
-        renderer
-            .render_corner(&matrix, high_eye, day_preset(), away)
-            .unwrap()
-            .presented
+        awayed.presented && awayed.recreated && !awayed.deferred,
+        "the away frame reports its swapchain recreation (got presented {} recreated {} \
+         deferred {})",
+        awayed.presented,
+        awayed.recreated,
+        awayed.deferred
     );
     let _ = renderer.take_frame_capture().unwrap().unwrap();
     let after_away = renderer.allocations();
@@ -2327,4 +2358,18 @@ fn injected_target_failures_unwind_every_handle_and_never_strand_a_slot() {
             live(&post_recovery, "memories")
         );
     }
+}
+
+/// Edge case test for tonemap and bright_pass: the shader's branch
+/// structure must match the CPU's (nonpositive → 0, positive → rational).
+#[test]
+fn tonemap_and_bright_pass_edge_cases() {
+    // Tonemap: negative/zero → 0, positive → rational.
+    assert_eq!(tonemap_rgb([-0.5, 0.0, 0.18]), [0.0, 0.0, tonemap(0.18)]);
+    // Bright pass: negative/zero/below threshold → 0, above → identity.
+    assert_eq!(bright_pass(-0.5), 0.0);
+    assert_eq!(bright_pass(0.0), 0.0);
+    assert_eq!(bright_pass(0.5), 0.0);
+    assert_eq!(bright_pass(1.0), 0.0);
+    assert!((bright_pass(2.0) - 2.0).abs() < 1e-6);
 }

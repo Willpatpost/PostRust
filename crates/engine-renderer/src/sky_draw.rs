@@ -287,32 +287,18 @@ impl SkyResources {
         self.frame_stride
     }
 
-    /// Records the sky draw — FIRST inside the main render pass
-    /// (before every scene draw), one fullscreen triangle, no depth
-    /// interaction.
-    ///
-    /// # Safety
-    /// `cmd` must be recording inside the main render pass, before
-    /// the scene draws; this slot's uniform region was written after
-    /// the slot's fence wait.
-    pub(super) unsafe fn record(&self, ctx: &VulkanContext, cmd: vk::CommandBuffer, slot: usize) {
-        // SAFETY: the pipeline and set are the sky state's own; this
-        // slot's region holds this frame's bytes (written above,
-        // after the fence wait).
-        unsafe {
-            ctx.device
-                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sky_pipeline);
-            ctx.device.cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.sky_layout,
-                0,
-                &[self.sky_set],
-                &[slot as u32 * self.frame_stride],
-            );
-            ctx.device.cmd_draw(cmd, 3, 1, 0, 0);
-        }
+    /// The target-compatible pipeline handle for the unified scene
+    /// recorder — the main pass's own; the HDR arm passes the state's
+    /// `sky_hdr` instead.
+    pub(super) fn pipeline(&self) -> vk::Pipeline {
+        self.sky_pipeline
     }
+
+    // (Finding 20, phase B) The main pass's own sky-record method is
+    // retired: the unified scene recorder (scene_record.rs) inlines
+    // this draw sequence with the target-compatible pipeline handle
+    // (the main pass passes this state's `pipeline()`, the HDR arm
+    // its `sky_hdr`), so the sequence exists exactly once.
 
     pub(super) fn destroy(mut self, ctx: &VulkanContext) {
         self.release(ctx);

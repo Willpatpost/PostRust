@@ -802,7 +802,9 @@ impl Renderer {
     /// per texel, row-major). Single-flight like the color capture.
     /// Ensures the shadow state if no shadowed frame has run yet
     /// (the lazy discipline's request-side completion — the request
-    /// precedes the frame it wants recorded).
+    /// precedes the frame it wants recorded). A plain frame does NOT
+    /// consume the request — it survives until the next SHADOWED
+    /// frame runs the depth pass.
     pub fn request_shadow_map_capture(&mut self) -> Result<(), RendererError> {
         if self.pipes.shadows.is_none() {
             if self.config.demo_scene != crate::DemoScenePreference::Corner {
@@ -818,7 +820,10 @@ impl Renderer {
     /// Takes the completed shadow-map readback, if one is ready (the
     /// recording slot's fence is waited — the color capture's take
     /// discipline). The depths are the UNBIASED light-space depths
-    /// the depth-only pass rasterized.
+    /// the depth-only pass rasterized. Propagates fence-wait errors
+    /// (timeout/device lost) so the caller may retry; returns
+    /// `CaptureDropped` if the shadow state was replaced after the
+    /// readback recorded (the recording buffer was destroyed with it).
     pub fn take_shadow_map_capture(&mut self) -> Result<Option<ShadowMapReadback>, RendererError> {
         let depths = vulkan::take_shadow_readback(&self.ctx, &mut self.pipes, &mut self.frames)?;
         Ok(depths.map(|depths| ShadowMapReadback {

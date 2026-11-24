@@ -1084,6 +1084,263 @@ fn pcf_penumbra_pixels_match_the_cpu_filter_over_the_same_map_bytes() {
 // restatements of their arithmetic. Pure CPU (no SDL, no GPU):
 // these run in the heavy shard's plain pass.
 
+/// The 6-F buffer handshake and buffer-generation pin: the shadow
+/// readback records with the producing frame's buffer handle, and
+/// `take` returns `CaptureDropped` if the shadow state (and thus its
+/// buffer) was replaced after the recording but before the take.
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
+fn shadow_readback_belongs_to_the_shadowed_frame_and_its_buffer() {
+    let _guard = sdl_lock();
+    let app = ShellApp::new(ShellConfig {
+        title: "shadow readback buffer pin".into(),
+        width: 256,
+        height: 256,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    })
+    .unwrap();
+    let mut renderer = Renderer::new(
+        app.window(),
+        RenderConfig {
+            demo_scene: DemoScenePreference::Corner,
+            validation: ValidationPreference::On,
+            replace_pipelines: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let size = app.window().size_in_pixels();
+    assert_eq!(size, (256, 256));
+
+    // One warm shadowed frame to ensure the shadow state exists.
+    let light = day_preset();
+    let boxes = intersection_boxes();
+    let cascade = corner_cascade(light);
+    let probe = ground_camera([0.0, 0.0], 1.0);
+    assert!(
+        renderer
+            .render_corner_shadowed(&probe.0, probe.1, light, BIAS, size)
+            .unwrap()
+            .presented
+    );
+
+    // REQUEST → PLAIN FRAME → SHADOWED FRAME: the request should NOT
+    // be consumed by the plain frame.
+    renderer.request_shadow_map_capture().unwrap();
+    let light_first = light;
+    assert!(
+        renderer
+            .render_corner(&probe.0, probe.1, light_first, size)
+            .unwrap()
+            .presented
+    );
+    let take_result = renderer.take_shadow_map_capture();
+    assert_eq!(
+        take_result.unwrap(),
+        None,
+        "plain frame leaves request pending"
+    );
+
+    // Now render a SHADOWED frame with a DIFFERENT light direction.
+    // Negate and swap x/z of day_preset's dir_toward_light to get a
+    // different cascade and map.
+    let second_light = LightParams {
+        dir_toward_light: [
+            -light.dir_toward_light[2],
+            light.dir_toward_light[1],
+            light.dir_toward_light[0],
+        ],
+        light_color: light.light_color,
+        ambient: light.ambient,
+    };
+    let second_cascade = corner_cascade(second_light);
+    println!("first light: {:?}", light.dir_toward_light);
+    println!("second light: {:?}", second_light.dir_toward_light);
+    assert_ne!(
+        cascade.matrix, second_cascade.matrix,
+        "the two lights produce different cascades"
+    );
+
+    // Render the shadowed frame with the second light and take.
+    assert!(
+        renderer
+            .render_corner_shadowed(&probe.0, probe.1, second_light, BIAS, size)
+            .unwrap()
+            .presented
+    );
+    let map = renderer.take_shadow_map_capture().unwrap().unwrap();
+    println!(
+        "shadow map captured: extent {}, texels {}",
+        map.extent,
+        map.depths.len()
+    );
+    let (compared, skipped, mismatches, _, _, _, _) =
+        compare_map(&second_cascade, boxes, &map.depths, map.extent, 1e-4, 1.5);
+    println!(
+        "shadow map known-answer: {compared} compared, {skipped} skipped, {mismatches} mismatches"
+    );
+    assert_eq!(mismatches, 0, "the map matches the second cascade");
+
+    // The two maps differ somewhere (prove distinguishable patterns).
+    renderer.request_shadow_map_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner_shadowed(&probe.0, probe.1, light_first, BIAS, size)
+            .unwrap()
+            .presented
+    );
+    let first_map = renderer.take_shadow_map_capture().unwrap().unwrap();
+    let first_map_second_light = renderer.take_shadow_map_capture().unwrap();
+    assert_eq!(first_map_second_light, None, "no second pending request");
+    let maps_differ = map
+        .depths
+        .iter()
+        .zip(first_map.depths.iter())
+        .any(|(a, b)| (a - b).abs() > 1e-4);
+    assert!(
+        maps_differ,
+        "the two light directions produce different maps"
+    );
+
+    // CONSECUTIVE CAPTURES ACROSS BOTH SLOTS: exercise both frame
+    // slots with alternating requests and shadowed frames.
+    for _ in 0..2 {
+        renderer.request_shadow_map_capture().unwrap();
+        assert!(
+            renderer
+                .render_corner_shadowed(&probe.0, probe.1, light_first, BIAS, size)
+                .unwrap()
+                .presented
+        );
+        let map_a = renderer.take_shadow_map_capture().unwrap().unwrap();
+        let (compared_a, _, mismatches_a, _, _, _, _) =
+            compare_map(&cascade, boxes, &map_a.depths, map_a.extent, 1e-4, 1.5);
+        println!("slot capture A: {compared_a} compared, {mismatches_a} mismatches");
+        assert_eq!(mismatches_a, 0, "first light map matches cascade");
+
+        renderer.request_shadow_map_capture().unwrap();
+        assert!(
+            renderer
+                .render_corner_shadowed(&probe.0, probe.1, second_light, BIAS, size)
+                .unwrap()
+                .presented
+        );
+        let map_b = renderer.take_shadow_map_capture().unwrap().unwrap();
+        let (compared_b, _, mismatches_b, _, _, _, _) = compare_map(
+            &second_cascade,
+            boxes,
+            &map_b.depths,
+            map_b.extent,
+            1e-4,
+            1.5,
+        );
+        println!("slot capture B: {compared_b} compared, {mismatches_b} mismatches");
+        assert_eq!(mismatches_b, 0, "second light map matches cascade");
+    }
+
+    // Two consecutive COLOR captures with distinguishable content.
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner_shadowed(&probe.0, probe.1, light_first, BIAS, size)
+            .unwrap()
+            .presented
+    );
+    let frame_a = renderer.take_frame_capture().unwrap().unwrap();
+
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner_shadowed(&probe.0, probe.1, second_light, BIAS, size)
+            .unwrap()
+            .presented
+    );
+    let frame_b = renderer.take_frame_capture().unwrap().unwrap();
+    println!(
+        "color capture A bytes: {}, B bytes: {}",
+        frame_a.bytes.len(),
+        frame_b.bytes.len()
+    );
+    assert_ne!(
+        frame_a.bytes, frame_b.bytes,
+        "different lights produce different frames"
+    );
+
+    // Determinism check: a fresh repeat of the same pose should match.
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner_shadowed(&probe.0, probe.1, light_first, BIAS, size)
+            .unwrap()
+            .presented
+    );
+    let frame_a_repeat = renderer.take_frame_capture().unwrap().unwrap();
+    assert_frames_equal_bytes(&frame_a, &frame_a_repeat);
+
+    // CAPTURE → PIPELINE REPLACEMENT → TAKE: the typed drop.
+    renderer.request_shadow_map_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner_shadowed(&probe.0, probe.1, light_first, BIAS, size)
+            .unwrap()
+            .presented
+    );
+    // Force the replacement: the resize forces recreation.
+    let replacement = renderer
+        .render_corner_shadowed(
+            &probe.0,
+            probe.1,
+            light_first,
+            BIAS,
+            (size.0 + 8, size.1 + 8),
+        )
+        .unwrap();
+    assert!(replacement.recreated, "the resize forced a recreation");
+    // Take after replacement must return the typed drop.
+    let take_result = renderer.take_shadow_map_capture();
+    match take_result {
+        Err(engine_renderer::RendererError::CaptureDropped(msg)) => {
+            println!("typed drop as expected: {msg}");
+        }
+        other => panic!("expected CaptureDropped, got: {other:?}"),
+    }
+    // After the drop, a fresh request → shadowed frame → take must succeed.
+    renderer.request_shadow_map_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner_shadowed(&probe.0, probe.1, light_first, BIAS, size)
+            .unwrap()
+            .presented
+    );
+    let map_after = renderer.take_shadow_map_capture().unwrap().unwrap();
+    let (compared_after, _, mismatches_after, _, _, _, _) = compare_map(
+        &cascade,
+        boxes,
+        &map_after.depths,
+        map_after.extent,
+        1e-4,
+        1.5,
+    );
+    println!("after-drop map: {compared_after} compared, {mismatches_after} mismatches");
+    assert_eq!(mismatches_after, 0, "handshake recovers after drop");
+
+    assert_eq!(
+        renderer.stats().validation_errors,
+        0,
+        "{:?}",
+        renderer.stats().recent_validation
+    );
+    println!(
+        "shadow readback buffer pin: the readback belongs to the shadowed frame's buffer \
+         generation, and the typed drop is returned when the state is replaced"
+    );
+}
+
+// ------------------------------------------------------- finding 14 CPU self-check
+// The depth-map comparator must reject nonfinite or out-of-range depths.
+// Run headless without GPU to prove the rejection logic works.
+
 /// The CPU-synthesized corner map: the deterministic core's own
 /// `map_texel_depth` over every texel — the same oracle
 /// `compare_map` recomputes internally, so the undamaged control

@@ -80,6 +80,8 @@ use crate::lit_scene::{GROUND_Y, LightParams};
 use crate::planar::{mirrored_eye, mirrored_view_projection};
 use ash::vk;
 
+use std::ops::Range;
+
 /// The reflection target's color format — the HDR pass's own
 /// (RGBA16F): the reflection samples carry scene-radiance values
 /// and the target is read back through the same SHADER_READ
@@ -715,6 +717,7 @@ impl ReflectionResources {
         slot: usize,
         extent: vk::Extent2D,
         clear_color: [f32; 4],
+        reflected: &[Range<u32>; 2],
     ) {
         let targets = self
             .targets
@@ -746,7 +749,7 @@ impl ReflectionResources {
             max_depth: 1.0,
         };
         let slots = FRAMES_IN_FLIGHT as usize;
-        let (vertices, ranges) = corner.mesh();
+        let (vertices, _) = corner.mesh();
         // SAFETY: this slot's reflection framebuffer and mirrored
         // params region (written above, after the fence wait); the
         // corner mesh's building ranges; the sets are this state's
@@ -769,13 +772,17 @@ impl ReflectionResources {
                 .cmd_bind_vertex_buffers(cmd, 0, &[vertices], &[0]);
             // The building ranges only (materials 1 and 2; material
             // 0 is the ground — the mirror's glass, never drawn).
-            for (material, range) in ranges.iter().enumerate().skip(1) {
+            // The descriptor set indexing is MATERIAL * slots + slot:
+            // position 0 in `reflected` → material 1, position 1 → material 2.
+            // This matches the current behavior: sets[1*slots+slot] and sets[2*slots+slot].
+            for (position, range) in reflected.iter().enumerate() {
+                let material = 1 + position as u32;
                 // The sets are laid out per MATERIAL (0-based:
                 // material·slots + slot) — the building material N
                 // binds its OWN set, not (N-1)'s (the first version
                 // handed the buildings the ground's asphalt texture —
                 // the mirror rendered dark asphalt walls).
-                let set = targets.reflected_sets[material * slots + slot];
+                let set = targets.reflected_sets[material as usize * slots + slot];
                 ctx.device.cmd_bind_descriptor_sets(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -863,6 +870,7 @@ impl ReflectionResources {
         cmd: vk::CommandBuffer,
         slot: usize,
         in_hdr: bool,
+        receiver: Range<u32>,
     ) {
         let targets = self
             .targets
@@ -873,8 +881,7 @@ impl ReflectionResources {
         } else {
             self.ground_main
         };
-        let (vertices, ranges) = corner.mesh();
-        let ground = &ranges[0];
+        let (vertices, _) = corner.mesh();
         // SAFETY: the pipeline matches the recording render pass
         // (the frame flow selects it); the set binds this slot's
         // reflection view and the corner's own frame region (the
@@ -895,7 +902,7 @@ impl ReflectionResources {
             ctx.device
                 .cmd_bind_vertex_buffers(cmd, 0, &[vertices], &[0]);
             ctx.device
-                .cmd_draw(cmd, ground.end - ground.start, 1, ground.start, 0);
+                .cmd_draw(cmd, receiver.end - receiver.start, 1, receiver.start, 0);
         }
     }
 
