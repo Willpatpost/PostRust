@@ -297,21 +297,27 @@ fn compare_map(
 // bounds, and the per-class census the first device run prints as
 // the tolerance pin's evidence).
 
-/// The populated map gate's depth tolerance: the 6-F gate's MEASURED
-/// max |Δdepth| on the static scene (2.68e-7 — float epsilon at
-/// depth ~0.5, the PR-body record's value). THIS POD HAS NO VULKAN
-/// LOADER, so the populated classes' (npc/vehicle) first execution
-/// is CI's: the comparator prints the max error per class, and if
-/// the instance classes exceed this value that is an INVESTIGATION —
-/// the pin is corrected from THAT run's measured actual with the
-/// delta documented (the placeholder-pin discipline, never a silent
-/// widening). The expectation is the epsilon class holds: the
-/// instance surfaces' CPU oracle walks a different float path than
-/// the skinned depth pipeline (the analytic authored-frame slab test
-/// vs the shader's mat4 products), but both end in the same light
-/// matrix and the same [0, 1] depth quantization the static boxes
-/// measured 2.68e-7 under.
-const POPULATED_MAP_TOLERANCE: f32 = 2.68e-7;
+/// The populated map gate's depth tolerance. THE FIRST DEVICE
+/// MEASUREMENT (CI run 45493567733, 2026-11-24 — the run this
+/// constant was corrected from, the placeholder-pin discipline this
+/// comment pre-committed to): 31 of 1,035,970 compared texels — all
+/// Building(3), a vertical edge line on one face, gpu == cpu to six
+/// printed digits — sit just past the placeholder 2.68e-7 (the 6-F
+/// gate's STATIC-scene measured max, carried in before any device
+/// execution; this pod has no Vulkan loader). The populated
+/// comparator's BUILDING expectation walks a different float path
+/// than the 6-F comparator's (the populated raycaster's own
+/// arithmetic), which shifts those same epsilon-tail edge texels
+/// past the 6-F-measured bound: the measured per-class maxima are
+/// clear 0.00e0 / ground 1.19e-7 / building ≈2.69e-7 / npc 5.96e-8 /
+/// vehicle 1.79e-7 — the instance classes (the ones this gate was
+/// written for) measure an ORDER under the bound. The corrected pin:
+/// 3.0e-7 — the measured tail plus ~12% margin, still ~300× tighter
+/// than the 6-F sibling gate's 1e-4 and five orders below any
+/// semantic divergence (a wrong matrix or box moves texels by
+/// 1e-2-scale, not 1e-7). A future exceed is an INVESTIGATION again:
+/// re-measure, document, correct — never a silent widening.
+const POPULATED_MAP_TOLERANCE: f32 = 3.0e-7;
 
 /// One class's comparison census (the investigation's evidence: the
 /// compared and mismatched counts and the max error, per class).
@@ -839,10 +845,9 @@ fn shadow_map_depths_match_the_raycaster_and_pixels_gate() {
 /// texels — the sedan's 1.9×4.4 m body) carries the populated
 /// depth pipeline's submission at map scale.
 ///
-/// THE TOLERANCE: `POPULATED_MAP_TOLERANCE` (2.68e-7, the 6-F
-/// measured value) — see its comment for the first-run discipline
-/// (this pod has no Vulkan loader; CI's execution is the
-/// measurement, and the per-class census prints are the evidence).
+/// THE TOLERANCE: `POPULATED_MAP_TOLERANCE` (3.0e-7, corrected from
+/// the first device measurement — see its comment for run
+/// 45493567733's per-class census and the placeholder-pin record).
 ///
 /// THE COMPARISON SKIPS (and counts) texels whose hit sits within
 /// 1.5 texels of its surface's edges — Buildings and Ground through

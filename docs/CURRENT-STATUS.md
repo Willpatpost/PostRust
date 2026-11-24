@@ -585,13 +585,49 @@ edge-skipped at the 1.5-texel margin; at frame-33 walk: npc 1,
 and 73 texels differ between the two expectation maps — the
 recorded density lesson: a 0.42 m figure spans ≈4 texels of the
 0.110 m map, so the npc class is a presence proof with the
-73-texel differential carrying the casts' coverage). One pre-existing macOS-only failure surfaced in
+73-texel differential carrying the casts' coverage). **The first
+device execution's corrective cycle (2026-11-24/25 overnight — three
+red runs, one repair in three commits, the full record in PR #33's
+comment trail):** run 45485839516 caught
+`VUID-vkCmdBindDescriptorSets-pDescriptorSets-06715` (the pose
+buffer's binding-5 descriptor written `range(VK_WHOLE_SIZE)` —
+illegal with any nonzero dynamic offset; slot 0's zero offset is
+legal, which is how it survived every CPU-side gate); run
+45488497488 then executed the indirect gate's replacement assertions
+for the first time on an Era-2 tree and measured the skinned
+family's per-replacement re-ensure churn (+1 pool / +3 sets per
+forced replacement — the counters are cumulative creation totals;
+the 6-E2-era pins held them flat because no populated-path family
+then owned descriptor-class resources); run 45491858460 reproduced
+those numbers digit-for-digit; run 45493567733 (the post-repair
+first-green attempt) passed the instanced gates and executed the
+shadowed-populated gates for real — the census exactly as pinned
+(1,035,970 compared / 12,606 edge-skipped, npc 1 / vehicle 442),
+with 31 of 1,035,970 building texels at the float-epsilon tail just
+past the placeholder tolerance (the placeholder-pin discipline's
+anticipated correction: `POPULATED_MAP_TOLERANCE` 2.68e-7 → 3.0e-7
+from that run's measured per-class census — the instance classes an
+order under at npc 5.96e-8 / vehicle 1.79e-7). The repair commits:
+the WHOLE_SIZE ranges (all three binding-5 writes → the concrete
+`SLOT_STRIDE`), the never-written shadowed sets (both families, per
+material × slot), the skinned depth set rebuilt to its shader's own
+declarations, the vehicle shadowed pipeline's wrong shader module,
+the four shadowed-family builders ignoring their `layout` parameter
+(now structural: `pipeline_from_module` takes the layout and a
+`ProxyVertexForm` as explicit parameters), the plain vehicle
+pipelines' skinned 64-byte vertex input against the 32-byte sedan
+VBO, and the replacement gates' exact per-replacement cost pin
+(measured twice digit-for-digit; the pass-independent ownership
+transfer that would restore the flat tuple is the recorded
+renderer-architecture follow-up). Every pinned count unchanged
+through the whole cycle. One pre-existing macOS-only failure surfaced in
 the same runs (CI run 45478600773:
 `s6_soak::deterministic_late_window_hard_exit_control_recovers` —
 the in-flight fsync commits before the hard exit on the M1 runner,
 so the relaunch recovers at tick 3300 where the test pins 3054;
-the soak machinery is untouched by this branch) — reported to the
-supervisor, outside this package's scope.
+the soak machinery is untouched by this branch; the §3.1 rerun
+PASSED — the documented fsync race, closed as a one-time flake) —
+reported to the supervisor, outside this package's scope.
 
 (At `a4eb372`, Windows counts were measured before landing; Linux
 counts were inferred at landing and subsequently confirmed by GitHub
