@@ -30,7 +30,7 @@
 //! ```
 
 use engine_renderer::lit_scene::lit_surface_color;
-use engine_renderer::lit_scene::{GROUND_Y, RouteWaypoint, day_preset};
+use engine_renderer::lit_scene::{GROUND_Y, RouteWaypoint, SCENE_EXTENT, day_preset};
 use engine_renderer::lit_scene::{intersection_boxes, materials};
 use engine_renderer::planar::{mirrored_eye, reflection_blend};
 use engine_renderer::proc_texture::{TEXTURE_SIZE, procedural_texture};
@@ -342,6 +342,191 @@ fn wet_ground_blends_the_mirrored_scene_by_planar_rs() {
     );
     assert!(b_max > 0.1, "the pose is grazing enough to reflect visibly");
 
+    // FINDING 19's coverage verification (the review's "wet coverage
+    // at near and far oblique ground pixels"): the EQUAL depth test
+    // must admit the re-drawn ground fragments across the whole
+    // obliquity range, not just the aim patch — a cross-pipeline
+    // position divergence (the finding's failure mode) silently
+    // rejects the overlay exactly where the ground is most oblique,
+    // and the aim patch alone cannot see it. Two bands on the SAME
+    // captures, each through the full known-answer chain, with two
+    // guards the aim patch never needed (its camera rays reach open
+    // road close-in): the FAR band's rays travel low enough to be
+    // blocked by building masses before the ground (the visibility
+    // guard — a downward ray from above ground can only meet a box
+    // BEFORE its ground hit, since the boxes rise from y=0), and
+    // both bands can project ground beyond the mesh's
+    // ±SCENE_EXTENT quad (the on-mesh guard). The reflection term
+    // extends the aim patch's chain with the mirror pass's CLEAR
+    // color — the ambient (corner.rs :: FrameParams::clear_color)
+    // — for the pixels whose reflected rays climb into open sky.
+    // Every checked pixel carries its own known answer, and each
+    // band must contain pixels whose expected wet−dry delta EXCEEDS
+    // the tolerance (the self-discrimination control, the finding-13
+    // discipline): an EQUAL rejection leaves the wet pixel at its
+    // dry value, and exactly those pixels fail.
+    #[derive(Default)]
+    struct BandCensus {
+        checked: usize,
+        box_reflections: usize,
+        clear_reflections: usize,
+        discriminating: usize,
+        b_sum: f32,
+        max_error: u8,
+    }
+    let mut far_band = BandCensus::default();
+    let mut near_band = BandCensus::default();
+    for (label, rows, columns, census) in [
+        ("far", (102u32, 156), (110u32, 170), &mut far_band),
+        ("near", (160u32, 250), (110u32, 170), &mut near_band),
+    ] {
+        for y in rows.0..=rows.1 {
+            for x in columns.0..=columns.1 {
+                let ray = pixel_ray(forward, right, up, x, y, size);
+                if ray[1] >= -1e-4 {
+                    continue; // the horizon or above
+                }
+                let t_ground = -eye[1] / ray[1];
+                // The visibility guard: a building mass between the
+                // eye and the ground point makes this pixel a wall
+                // pixel — the overlay never draws there.
+                if raycast_boxes(eye, ray).is_some() {
+                    continue;
+                }
+                let p = [
+                    eye[0] + ray[0] * t_ground,
+                    GROUND_Y,
+                    eye[2] + ray[2] * t_ground,
+                ];
+                // The on-mesh guard: the ground quad spans
+                // ±SCENE_EXTENT; beyond it there is no depth to
+                // EQUAL-match and no overlay.
+                if p[0].abs() > SCENE_EXTENT || p[2].abs() > SCENE_EXTENT {
+                    continue;
+                }
+                // The Schlick blend at this pixel's own view angle
+                // (the real eye — the ground term).
+                let view_ground = [eye[0] - p[0], eye[1] - p[1], eye[2] - p[2]];
+                let view_length = (view_ground[0] * view_ground[0]
+                    + view_ground[1] * view_ground[1]
+                    + view_ground[2] * view_ground[2])
+                    .sqrt();
+                let n_dot_v = (view_ground[1] / view_length).clamp(0.0, 1.0);
+                let b = reflection_blend(n_dot_v);
+                // The reflection term: the reflected ray's first box
+                // hit shaded from the VIRTUAL eye (the aim patch's
+                // own chain), or the mirror pass's clear color when
+                // it climbs into open sky.
+                let reflected = [ray[0], -ray[1], ray[2]];
+                let reflection: [f32; 3] = match raycast_boxes(p, reflected) {
+                    Some(hit) => {
+                        census.box_reflections += 1;
+                        let mat = materials()[hit.material];
+                        let texture = procedural_texture(mat.texture);
+                        let [tx, ty] = hit.uv_axes.map(|m| {
+                            ((m / 4.).rem_euclid(1.) * TEXTURE_SIZE as f32).floor() as usize
+                        });
+                        let index = 4 * (ty * TEXTURE_SIZE as usize + tx);
+                        let albedo = std::array::from_fn(|c| texture[index + c] as f32 / 255.);
+                        let virtual_eye = mirrored_eye(eye, GROUND_Y);
+                        let view_virtual = std::array::from_fn(|i| virtual_eye[i] - hit.pos[i]);
+                        lit_surface_color(albedo, hit.normal, view_virtual, mat, light)
+                    }
+                    None => {
+                        census.clear_reflections += 1;
+                        light.ambient
+                    }
+                };
+                // The composite over the dry pixel (the aim patch's
+                // own u8-space form).
+                let dry_pixel = dry.pixel_rgba(x, y);
+                let expected: [u8; 3] = std::array::from_fn(|c| {
+                    (dry_pixel[c] as f32 * (1.0 - b) + 255.0 * reflection[c].clamp(0.0, 1.0) * b)
+                        .round() as u8
+                });
+                let pixel = wet.pixel_rgba(x, y);
+                let error = expected
+                    .iter()
+                    .zip(pixel)
+                    .map(|(e, a)| e.abs_diff(a))
+                    .max()
+                    .unwrap();
+                census.max_error = census.max_error.max(error);
+                assert!(
+                    error <= TOLERANCE,
+                    "{label} pixel ({x},{y}) ground {p:?} blend {b:.4}: expected \
+                     {expected:?}, got {pixel:?} (reflection {reflection:?}, dry \
+                     {dry_pixel:?})"
+                );
+                census.checked += 1;
+                census.b_sum += b;
+                // Self-discrimination: this pixel's known answer
+                // must be ABLE to fail on an EQUAL rejection — the
+                // expected wet−dry delta has to exceed the
+                // tolerance, or the check is vacuous for the
+                // finding's failure mode.
+                let delta = expected
+                    .iter()
+                    .zip(dry_pixel)
+                    .map(|(e, d)| e.abs_diff(d))
+                    .max()
+                    .unwrap();
+                if delta > TOLERANCE {
+                    census.discriminating += 1;
+                }
+            }
+        }
+    }
+    for (label, band) in [("far", &far_band), ("near", &near_band)] {
+        println!(
+            "{label} band: {} ground pixels ({} box reflections, {} clear), \
+             {} discriminating, mean blend {:.3}, max error {}/255",
+            band.checked,
+            band.box_reflections,
+            band.clear_reflections,
+            band.discriminating,
+            band.b_sum / band.checked as f32,
+            band.max_error
+        );
+    }
+    assert!(
+        far_band.checked >= 2350,
+        "the far band checked {} ground pixels (measured 2619 on the \
+         2026-11-24 lavapipe run — the count is CPU-geometry-deterministic)",
+        far_band.checked
+    );
+    assert!(
+        far_band.discriminating >= 850,
+        "the far band's known answers must be able to fail on an EQUAL \
+         rejection — {} of {} pixels discriminate (measured 1086)",
+        far_band.discriminating,
+        far_band.checked
+    );
+    assert!(
+        near_band.checked >= 5000,
+        "the near band checked {} ground pixels (measured 5551 on the \
+         2026-11-24 lavapipe run — the count is CPU-geometry-deterministic)",
+        near_band.checked
+    );
+    assert!(
+        near_band.discriminating >= 1200,
+        "the near band's known answers must be able to fail on an EQUAL \
+         rejection — {} of {} pixels discriminate (measured 1508)",
+        near_band.discriminating,
+        near_band.checked
+    );
+    // The obliquity separation: the far band must be measurably MORE
+    // oblique than the near band (deeper mean Schlick blends) — two
+    // bands sampling the same regime would not verify "near and
+    // far" anything.
+    let far_mean_b = far_band.b_sum / far_band.checked as f32;
+    let near_mean_b = near_band.b_sum / near_band.checked as f32;
+    assert!(
+        far_mean_b > near_mean_b + 0.05,
+        "the far band's mean blend {far_mean_b:.3} must exceed the near \
+         band's {near_mean_b:.3} by a visible margin"
+    );
+
     // THE OVERHEAD CHECK (the brief's other anchor): a steeply-down
     // camera — the blend is ~r0 (matte) and the reflected rays from
     // the open ground climb into empty sky, so the wet frame is the
@@ -569,8 +754,12 @@ fn wet_ground_blends_the_mirrored_scene_by_planar_rs() {
         renderer.stats().recent_validation
     );
     println!(
-        "Era-1 wet-ground gates: {checked} grazing pixels + {overhead_checked} overhead pixels \
-         vs planar.rs's chain within {TOLERANCE}/255 (measured max {max_error}/{overhead_error}), \
-         the dry path byte-identical, the reflection state paid once, every composition clean"
+        "Era-1 wet-ground gates: {checked} grazing + {overhead_checked} overhead + {} far \
+         + {} near band pixels vs planar.rs's chain within {TOLERANCE}/255 (measured max \
+         {max_error}/{overhead_error}/{}), the dry path byte-identical, the reflection \
+         state paid once, every composition clean",
+        far_band.checked,
+        near_band.checked,
+        far_band.max_error.max(near_band.max_error)
     );
 }

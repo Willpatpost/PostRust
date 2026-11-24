@@ -391,8 +391,18 @@ jobs:
           # contract, the OOB-tap zero-fill at 1×N/2×N extents).
           # Linux 1196/2/33 MEASURED locally with this step's own
           # awk; Windows 1145 = 1140 + the same 5.
-          expected=1196
-          if [ "$(uname -s)" != "Linux" ]; then expected=1145; fi
+          # Run 5 (finding 19): +1 platform-uniform engine-renderer
+          # lib test (the wet-EQUAL pipelines' Invariant-decoration
+          # pin — the emitted SPIR-V words of lit_scene,
+          # lit_scene_shadowed, and ground_reflect re-parsed through
+          # the pinned naga and raw-matched for the Invariant
+          # decoration on the Position output, with the instanced
+          # proxy and sky as negative controls; pure CPU word
+          # matching, no cfg gates). Linux 1197/2/33 MEASURED
+          # locally with this step's own awk; Windows 1146 = 1145 +
+          # the same 1.
+          expected=1197
+          if [ "$(uname -s)" != "Linux" ]; then expected=1146; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -466,8 +476,12 @@ jobs:
           # battery — the tonemap/bright-pass/mip unit pairs, the
           # same +5 as the main shard) — 114 -> 119, MEASURED
           # locally (119/0 failures/2 result lines).
-          echo "renderer release: $passed passed, $results test-result lines (expected 119 / 2)"
-          [ "$passed" -eq 119 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 119"; exit 1; }
+          # Run 5 (finding 19): +1 (the Invariant-decoration pin,
+          # the same +1 as the main shard, platform-uniform) —
+          # 119 -> 120, MEASURED locally with this step's own awk
+          # (120/0 failures/2 result lines).
+          echo "renderer release: $passed passed, $results test-result lines (expected 120 / 2)"
+          [ "$passed" -eq 120 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 120"; exit 1; }
           [ "$results" -eq 2 ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != 2"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production
@@ -1317,6 +1331,14 @@ jobs:
           # render_post (the slice-side tonemap/bright-pass edge
           # cases) — 587 -> 588 Linux MEASURED locally (Windows 587
           # = 586 + 1).
+          # Run 5 (finding 19): NO count change — the near/far
+          # oblique wet-coverage bands extend the EXISTING
+          # #[ignore]d render_reflection gate (its result line and
+          # ignored count unchanged; the bands run only under the
+          # enforced Linux Vulkan step below, where the
+          # reflection-gates run measured them at 2619 far + 5551
+          # near known-answer pixels, 2594 of them self-
+          # discriminating against an EQUAL rejection).
           expected=588
           if [ "$(uname -s)" != "Linux" ]; then expected=587; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
