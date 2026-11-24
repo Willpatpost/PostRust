@@ -1,8 +1,9 @@
 //! The deterministic animation core (Stage 1, Era-2 package — the
 //! living world's skeletal foundation): the pure-data clip model, the
-//! libm-free rotation machinery (the existing [`crate::proxy_instances::sin_cos_turn`]
-//!]), the joint hierarchy's matrix composition, and the skinning
-//! equation — ALL pure, fully tested, NO Vulkan, NO new dependencies.
+//! libm-free rotation machinery (the existing
+//! [`crate::proxy_instances::sin_cos_turn`]), the joint hierarchy's
+//! matrix composition, and the skinning equation — ALL pure, fully
+//! tested, NO Vulkan, NO new dependencies.
 //!
 //! # DETERMINISM CONTRACT
 //! Every byte produced by this module is byte-identical on every
@@ -190,9 +191,18 @@ pub const HUMANOID_BOXES: [([f32; 3], [f32; 3]); HUMANOID_JOINTS] = [
 pub struct JointPose {
     /// Delta position from the rest pose, in mesh-local coordinates.
     pub delta_pos: [f32; 3],
-    /// Delta rotation as turn fractions (1/65536 of a full rotation):
-    /// pitch (about +X), yaw (about +Y), roll (about +Z).
-    pub delta_turns: [u16; 3],
+    /// Delta rotation as SIGNED turn fractions (1/65536 of a full
+    /// rotation, the unit [`crate::proxy_instances`] pins): pitch
+    /// (about +X), yaw (about +Y), roll (about +Z). SIGNED because
+    /// joint swings CROSS ZERO every half cycle — an unsigned wrap
+    /// would force keyframe interpolation the long way around the
+    /// turn circle (a half-rotation limb sweep between adjacent
+    /// keyframes; the zero-crossing pin in the tests exists to
+    /// catch exactly that). The [`sin_cos_turn`] boundary takes the
+    /// two's-complement `as u16` image — a negative turn and its
+    /// u16 wrap are the same angle modulo a full rotation, which is
+    /// all a rotation matrix ever sees.
+    pub delta_turns: [i16; 3],
 }
 
 /// One keyframe in a clip: a time in seconds and the full pose at that time.
@@ -274,29 +284,55 @@ fn rotation_matrix_for_axis(turn: u16, axis: usize) -> [f32; 9] {
     }
 }
 
-/// Composes a 4x4 matrix from a 3x3 rotation matrix and a translation.
-/// The matrix is COLUMN-MAJOR [[f32;4];4] represented as row-major array of rows.
-/// The WGSL mat4x4 constructor takes columns, so the layout is:
-/// matrix[row][col] where row and col are 0-indexed.
-/// For column-major storage in a flat array, element (row, col) is at index col*4 + row.
+/// Multiplies two column-major 3x3 matrices: out = A · B. The entry
+/// out[col·3 + row] = Σᵢ a[i·3 + row] · b[col·3 + i] — column `col`
+/// of the product is A applied to B's column `col` (the same
+/// column-image rule [`matrix_multiply_4x4`] pins at 4x4). Pure f32
+/// in the fixed i-then-row order.
+fn mat3_multiply(a: [f32; 9], b: [f32; 9]) -> [f32; 9] {
+    let mut out = [0.0; 9];
+    for col in 0..3 {
+        for row in 0..3 {
+            out[col * 3 + row] =
+                a[row] * b[col * 3] + a[3 + row] * b[col * 3 + 1] + a[6 + row] * b[col * 3 + 2];
+        }
+    }
+    out
+}
+
+/// Composes a 4x4 transform from a column-major 3x3 rotation and a
+/// translation, in THE REPO'S COLUMN-MAJOR [[f32; 4]; 4] CONVENTION
+/// (the one [`crate::proxy_instances::instance_columns`] pins and
+/// the WGSL `mat4x4<f32>(c0, c1, c2, c3)` constructor consumes):
+/// the outer index is the COLUMN, columns 0..2 are the rotation's
+/// basis images, and the translation is column 3's xyz with w = 1.
+/// A vector applies as clip = Σ columns[i] · p[i] (the form
+/// [`skin_vertex`] evaluates). Writing the rotation's rows as
+/// columns here is the transpose bug the 6-F build once shipped —
+/// the end-to-end quarter-pitch test below exists to catch it.
 fn compose_transform_matrix(rotation: [f32; 9], translation: [f32; 3]) -> [[f32; 4]; 4] {
-    // rotation is column-major: [c0r0, c0r1, c0r2, c1r0, c1r1, c1r2, c2r0, c2r1, c2r2]
-    // We construct a row-major matrix where matrix[row][col] = rotation[col*3 + row]
+    // rotation is column-major: rotation[col*3 + row].
     [
-        [rotation[0], rotation[3], rotation[6], 0.0], // row 0: c0r0, c1r0, c2r0
-        [rotation[1], rotation[4], rotation[7], 0.0], // row 1: c0r1, c1r1, c2r1
-        [rotation[2], rotation[5], rotation[8], 0.0], // row 2: c0r2, c1r2, c2r2
-        [translation[0], translation[1], translation[2], 1.0], // row 3: translation
+        [rotation[0], rotation[1], rotation[2], 0.0], // column 0: the X basis image
+        [rotation[3], rotation[4], rotation[5], 0.0], // column 1: the Y basis image
+        [rotation[6], rotation[7], rotation[8], 0.0], // column 2: the Z basis image
+        [translation[0], translation[1], translation[2], 1.0], // column 3: the translation
     ]
 }
 
 /// Composes a joint's local transform matrix from its pose.
 /// The local transform is: translate(bind_local_pivot_relative + delta_pos)
 /// then rotate (the fixed Euler order R = R_yaw · R_pitch · R_roll).
-fn compose_local_matrix(joint: &Joint, pose: &JointPose) -> [[f32; 4]; 4] {
+/// Takes the whole skeleton (the parent's pivot feeds the bind-local
+/// offset) — one pure walk per call, no per-joint reconstruction.
+fn compose_local_matrix(
+    skeleton: &[Joint; HUMANOID_JOINTS],
+    joint: &Joint,
+    pose: &JointPose,
+) -> [[f32; 4]; 4] {
     // Compute the local pivot (relative to parent for non-root, absolute for root).
     let bind_local_pivot = if let Some(parent_idx) = joint.parent {
-        let parent = &humanoid_skeleton()[parent_idx];
+        let parent = &skeleton[parent_idx];
         [
             joint.pivot[0] - parent.pivot[0],
             joint.pivot[1] - parent.pivot[1],
@@ -313,45 +349,16 @@ fn compose_local_matrix(joint: &Joint, pose: &JointPose) -> [[f32; 4]; 4] {
         bind_local_pivot[2] + pose.delta_pos[2],
     ];
 
-    // Compose the rotation: R = R_yaw · R_pitch · R_roll (fixed order).
-    // The rotation matrices are composed right-to-left in terms of application.
-    // We apply R_roll first, then R_pitch, then R_yaw.
-    // So the final matrix is R_yaw * (R_pitch * (R_roll * v)).
+    // Compose the rotation: R = R_yaw · R_pitch · R_roll (fixed order —
+    // the roll applies to the point first, the yaw last).
+    // The signed turns take their two's-complement u16 image at the
+    // sin_cos_turn boundary (the JointPose docs' angle equivalence).
+    let rot_roll = rotation_matrix_for_axis(pose.delta_turns[2] as u16, 2);
+    let rot_pitch = rotation_matrix_for_axis(pose.delta_turns[0] as u16, 0);
+    let rot_yaw = rotation_matrix_for_axis(pose.delta_turns[1] as u16, 1);
 
-    // Get the individual rotation matrices.
-    let rot_roll = rotation_matrix_for_axis(pose.delta_turns[2], 2); // R_roll
-    let rot_pitch = rotation_matrix_for_axis(pose.delta_turns[0], 0); // R_pitch
-    let rot_yaw = rotation_matrix_for_axis(pose.delta_turns[1], 1); // R_yaw
-
-    // Compose them: R = R_yaw · R_pitch · R_roll (matrix multiplication).
-    // Matrix multiplication: C = A · B means C[i] = sum_j A[j] * B[i/j] in column-major.
-    // Let's do it step by step: first R_temp = R_pitch · R_roll, then R = R_yaw · R_temp.
-
-    // R_temp = R_pitch · R_roll
-    let r_temp = [
-        rot_pitch[0] * rot_roll[0] + rot_pitch[1] * rot_roll[3] + rot_pitch[2] * rot_roll[6],
-        rot_pitch[0] * rot_roll[1] + rot_pitch[1] * rot_roll[4] + rot_pitch[2] * rot_roll[7],
-        rot_pitch[0] * rot_roll[2] + rot_pitch[1] * rot_roll[5] + rot_pitch[2] * rot_roll[8],
-        rot_pitch[3] * rot_roll[0] + rot_pitch[4] * rot_roll[3] + rot_pitch[5] * rot_roll[6],
-        rot_pitch[3] * rot_roll[1] + rot_pitch[4] * rot_roll[4] + rot_pitch[5] * rot_roll[7],
-        rot_pitch[3] * rot_roll[2] + rot_pitch[4] * rot_roll[5] + rot_pitch[5] * rot_roll[8],
-        rot_pitch[6] * rot_roll[0] + rot_pitch[7] * rot_roll[3] + rot_pitch[8] * rot_roll[6],
-        rot_pitch[6] * rot_roll[1] + rot_pitch[7] * rot_roll[4] + rot_pitch[8] * rot_roll[7],
-        rot_pitch[6] * rot_roll[2] + rot_pitch[7] * rot_roll[5] + rot_pitch[8] * rot_roll[8],
-    ];
-
-    // R = R_yaw · R_temp
-    let rotation = [
-        rot_yaw[0] * r_temp[0] + rot_yaw[1] * r_temp[3] + rot_yaw[2] * r_temp[6],
-        rot_yaw[0] * r_temp[1] + rot_yaw[1] * r_temp[4] + rot_yaw[2] * r_temp[7],
-        rot_yaw[0] * r_temp[2] + rot_yaw[1] * r_temp[5] + rot_yaw[2] * r_temp[8],
-        rot_yaw[3] * r_temp[0] + rot_yaw[4] * r_temp[3] + rot_yaw[5] * r_temp[6],
-        rot_yaw[3] * r_temp[1] + rot_yaw[4] * r_temp[4] + rot_yaw[5] * r_temp[7],
-        rot_yaw[3] * r_temp[2] + rot_yaw[4] * r_temp[5] + rot_yaw[5] * r_temp[8],
-        rot_yaw[6] * r_temp[0] + rot_yaw[7] * r_temp[3] + rot_yaw[8] * r_temp[6],
-        rot_yaw[6] * r_temp[1] + rot_yaw[7] * r_temp[4] + rot_yaw[8] * r_temp[7],
-        rot_yaw[6] * r_temp[2] + rot_yaw[7] * r_temp[5] + rot_yaw[8] * r_temp[8],
-    ];
+    // R = R_yaw · (R_pitch · R_roll), column-major 3x3s.
+    let rotation = mat3_multiply(rot_yaw, mat3_multiply(rot_pitch, rot_roll));
 
     compose_transform_matrix(rotation, translation)
 }
@@ -367,7 +374,7 @@ pub fn compose_joint_matrices(
     let mut result = [[[0.0; 4]; 4]; HUMANOID_JOINTS];
 
     for (idx, joint) in skeleton.iter().enumerate() {
-        let local_matrix = compose_local_matrix(joint, &pose[idx]);
+        let local_matrix = compose_local_matrix(skeleton, joint, &pose[idx]);
 
         if let Some(parent_idx) = joint.parent {
             // Chain-compose: world = parent_world · local
@@ -382,34 +389,25 @@ pub fn compose_joint_matrices(
     result
 }
 
-/// Multiplies two 4x4 matrices (COLUMN-MAJOR).
+/// Multiplies two 4x4 matrices in THE REPO'S COLUMN-MAJOR CONVENTION:
+/// out = A · B, where column `j` of the product is A applied to B's
+/// column `j` — out[j][row] = Σᵢ a[i][row] · b[j][i]. This is the
+/// form that composes `parent_world · local` correctly (the child's
+/// local space maps through the parent's full transform) and that
+/// [`skin_vertex`] applies to vectors. The transposed form (row
+/// images instead of column images) silently inverts every rotation
+/// — the end-to-end convention test exists to catch it.
 fn matrix_multiply_4x4(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
-    [
-        [
-            a[0][0] * b[0][0] + a[0][1] * b[1][0] + a[0][2] * b[2][0] + a[0][3] * b[3][0],
-            a[0][0] * b[0][1] + a[0][1] * b[1][1] + a[0][2] * b[2][1] + a[0][3] * b[3][1],
-            a[0][0] * b[0][2] + a[0][1] * b[1][2] + a[0][2] * b[2][2] + a[0][3] * b[3][2],
-            a[0][0] * b[0][3] + a[0][1] * b[1][3] + a[0][2] * b[2][3] + a[0][3] * b[3][3],
-        ],
-        [
-            a[1][0] * b[0][0] + a[1][1] * b[1][0] + a[1][2] * b[2][0] + a[1][3] * b[3][0],
-            a[1][0] * b[0][1] + a[1][1] * b[1][1] + a[1][2] * b[2][1] + a[1][3] * b[3][1],
-            a[1][0] * b[0][2] + a[1][1] * b[1][2] + a[1][2] * b[2][2] + a[1][3] * b[3][2],
-            a[1][0] * b[0][3] + a[1][1] * b[1][3] + a[1][2] * b[2][3] + a[1][3] * b[3][3],
-        ],
-        [
-            a[2][0] * b[0][0] + a[2][1] * b[1][0] + a[2][2] * b[2][0] + a[2][3] * b[3][0],
-            a[2][0] * b[0][1] + a[2][1] * b[1][1] + a[2][2] * b[2][1] + a[2][3] * b[3][1],
-            a[2][0] * b[0][2] + a[2][1] * b[1][2] + a[2][2] * b[2][2] + a[2][3] * b[3][2],
-            a[2][0] * b[0][3] + a[2][1] * b[1][3] + a[2][2] * b[2][3] + a[2][3] * b[3][3],
-        ],
-        [
-            a[3][0] * b[0][0] + a[3][1] * b[1][0] + a[3][2] * b[2][0] + a[3][3] * b[3][0],
-            a[3][0] * b[0][1] + a[3][1] * b[1][1] + a[3][2] * b[2][1] + a[3][3] * b[3][1],
-            a[3][0] * b[0][2] + a[3][1] * b[1][2] + a[3][2] * b[2][2] + a[3][3] * b[3][2],
-            a[3][0] * b[0][3] + a[3][1] * b[1][3] + a[3][2] * b[2][3] + a[3][3] * b[3][3],
-        ],
-    ]
+    let mut out = [[0.0; 4]; 4];
+    for col in 0..4 {
+        for row in 0..4 {
+            out[col][row] = a[0][row] * b[col][0]
+                + a[1][row] * b[col][1]
+                + a[2][row] * b[col][2]
+                + a[3][row] * b[col][3];
+        }
+    }
+    out
 }
 
 /// Computes the skin matrices from the joint world matrices and the skeleton.
@@ -640,9 +638,11 @@ pub fn pack_pose_bytes(mats: &[[[f32; 4]; 4]; HUMANOID_JOINTS]) -> [u8; POSE_STR
 
 /// Repacks multiple pose blocks into a retained buffer (clear + reserve + append).
 /// Capacity bound MAX_POSE_BLOCKS — typed refusal above, never truncation.
+/// Takes the blocks BY VALUE slice (no caller-side reference juggling —
+/// the demo's per-frame retained Vec of pose blocks feeds this directly).
 pub fn repack_poses(
     buffer: &mut Vec<u8>,
-    blocks: &[&[[[f32; 4]; 4]; HUMANOID_JOINTS]],
+    blocks: &[[[[f32; 4]; 4]; HUMANOID_JOINTS]],
 ) -> Result<(), PosePackError> {
     if blocks.len() > MAX_POSE_BLOCKS {
         return Err(PosePackError::Capacity {
@@ -746,18 +746,21 @@ pub fn sample_pose(clip: &Clip, t: f32) -> [JointPose; HUMANOID_JOINTS] {
             p0.delta_pos[2] + (p1.delta_pos[2] - p0.delta_pos[2]) * alpha,
         ];
 
-        // delta_turns: lerp as f32, then round to u32 with ties-away-from-zero.
-        // The turn values are u16, so we clamp to [0, 65535] after rounding.
+        // delta_turns: SIGNED lerp as f32 (crossing zero the short way
+        // — the JointPose docs' zero-crossing contract), then round to
+        // the nearest integer turn with ties away from zero (f32::
+        // round's documented semantics), clamped to the i16 range.
         for k in 0..3 {
             let v0: f32 = p0.delta_turns[k].into();
             let v1: f32 = p1.delta_turns[k].into();
             let lerped = v0 + (v1 - v0) * alpha;
-            let rounded = lerped.round() as u32;
-            // u32 is always >= 0, and we clamp to 65535
-            result_j.delta_turns[k] = if rounded > 65535 {
-                65535
+            let rounded = lerped.round();
+            result_j.delta_turns[k] = if rounded > 32767.0 {
+                32767
+            } else if rounded < -32768.0 {
+                -32768
             } else {
-                rounded as u16
+                rounded as i16
             };
         }
     }
@@ -795,534 +798,553 @@ pub fn pose_sequence_digest(
     hasher
 }
 
-/// The walk clip: one walking stride, duration 1.1 s, 8 keyframes.
-/// The keyframes are authored by hand to sample sinusoidal motion.
-/// The last keyframe is at 0.9625 s, and the wrap handles the seam to t=0.
+/// The walk clip: one walking stride, duration 1.1 s, 8 keyframes at
+/// t = k · 0.1375 (k = 0..7) — the stride phase φ = k · 45°. The
+/// sampler's seam interpolates keyframe 7 back to keyframe 0 over
+/// the remaining 0.1375 s, closing the loop.
+///
+/// AUTHORING METHOD: every field is a fixed sinusoid of the stride
+/// phase, SAMPLED at the eight 45° marks and frozen as integer turn
+/// data — the runtime path never evaluates a transcendental (the
+/// libm-free discipline; the values were computed offline from the
+/// formulas in each field's comment). The signed-turn helper
+/// truncates toward zero; the amplitude pins in the tests carry the
+/// ≤ 1-unit rounding slack.
+///
+/// THE GAIT MODEL (φ measured from the left leg's heel strike;
+/// "forward" is local +Z, so a FORWARD limb reach is NEGATIVE pitch
+/// — positive pitch swings a hanging limb backward, the pinned
+/// convention in this module's header):
+/// - upper_leg_l pitch = −0.055·sin(φ): the left leg swings FORWARD
+///   over φ ∈ (0°, 180°), trails over (180°, 360°); upper_leg_r is
+///   the exact anti-phase (+0.055·sin(φ)).
+/// - lower_leg_l (the knee) = +0.09·max(0, sin(φ)): the knee flexes
+///   ONLY during its own leg's forward swing (max flexion at
+///   mid-swing, φ = 90°), straight at heel strike and through
+///   stance — the knee never hyper-extends (positive-only).
+///   lower_leg_r mirrors it on the other half-stride.
+/// - upper_arm_l pitch = +0.045·sin(φ) — ANTI-PHASE to the same-side
+///   leg (the left arm reaches forward while the left leg trails).
+/// - lower arms: a slight standing elbow flexion (+0.03) modulated
+///   ±0.01 with the arm's swing (more flexion at the forward reach).
+/// - pelvis: Δy = −0.02·cos(2φ) — the body VAULTS over the stance
+///   leg: lowest at double support (the heel strikes, φ = 0°/180°),
+///   highest at mid-stance (φ = 90°/270°), two bobs per stride.
+///   Yaw sway +0.008·sin(φ): the left hip advances with the left
+///   leg's forward swing.
+/// - torso: +0.01·cos(2φ) counter-lean, paired with the bob (double
+///   frequency).
+/// - head: all zeros — the steady head (the documented choice).
 pub fn walk_clip() -> Clip {
-    // Keyframes at t = 0.0, 0.1375, 0.275, 0.4125, 0.55, 0.6875, 0.825, 0.9625
-    // (8 intervals of 0.1375 s each, total 1.1 s).
-    // The seam interpolates from keyframe 7 (t=0.9625) to keyframe 0 (t=0.0) over 0.1375 s.
+    // sin(45°) = √2/2 — the offline-sampled constant the 45°-mark
+    // keyframes carry (the only non-trivial sine the table needs).
+    const SIN_45: f32 = core::f32::consts::FRAC_1_SQRT_2;
 
-    // Authoring notes:
-    // - upper legs (joints 7,8): sagittal pitch swing ±0.055 turn, left and right anti-phase.
-    // - lower legs (9,10): knee flexion 0 to +0.09 turn POSITIVE only.
-    // - upper arms (3,4): sagittal pitch ±0.045 turn, anti-phase to same-side upper leg.
-    // - lower arms (5,6): slight fixed-ish bend +0.03 turn with ±0.01 modulation.
-    // - pelvis (0): delta_pos.y bob ±0.02 m at double frequency, tiny yaw sway ±0.008 turn.
-    // - torso (1): tiny counter-pitch ±0.01 turn (double frequency).
-    // - head (2): all zeros (steady head).
-
-    // The keyframes sample the motion at phases 0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°.
-    // sin(0) = 0, sin(45°) = √2/2 ≈ SQRT_2_OVER_2, sin(90°) = 1, sin(135°) = SQRT_2_OVER_2,
-    // sin(180°) = 0, sin(225°) = -SQRT_2_OVER_2, sin(270°) = -1, sin(315°) = -SQRT_2_OVER_2.
-
-    // Precomputed √2/2 for sin(45°) and cos(45°) to avoid runtime libm calls.
-    // This matches the walk clip's 45° phase keyframes.
-    const SQRT_2_OVER_2: f32 = std::f32::consts::FRAC_1_SQRT_2; // √2/2
-
-    // Helper to convert turn fraction to u16 (round to nearest, wrapping for negative values).
-    const fn turn_u16(t: f32) -> u16 {
-        // Convert to turn fraction [0, 1), wrapping negative values around.
-        let mut v = t * 65536.0;
-        // Handle wrapping for values outside [0, 65536)
-        if v < 0.0 {
-            v += 65536.0;
-        }
-        if v >= 65536.0 {
-            v -= 65536.0;
-        }
-        let clamped = if v > 65535.0 { 65535.0 } else { v };
-        clamped as u16
+    /// The authoring helper: a turn FRACTION of a full rotation to
+    /// its signed i16 units (truncation toward zero — deterministic,
+    /// and the amplitude pins carry the slack).
+    const fn turn_i16(fraction: f32) -> i16 {
+        (fraction * 65536.0) as i16
     }
 
-    // Static keyframes for the walk clip.
-    // Using a static array to satisfy the 'static lifetime requirement.
+    // The eight keyframes, phase k · 45°. Each field's comment is
+    // its formula AT that phase — the value is the frozen sample.
     const WALK_KEYFRAMES: [Keyframe; 8] = [
-        // Keyframe 0: t = 0.0 (phase 0°, right heel strike).
+        // Keyframe 0: t = 0.0 (φ = 0°, the left leg's heel strike —
+        // double support, the body at its lowest).
         Keyframe {
             time: 0.0,
             pose: [
-                // 0: pelvis
+                // 0: pelvis — Δy = −0.02·cos(0) = −0.02; yaw = 0.008·sin(0) = 0.
                 JointPose {
-                    delta_pos: [0.0, 0.02, 0.0],          // +0.02 bob at heel strike
-                    delta_turns: [0, turn_u16(0.008), 0], // tiny yaw
+                    delta_pos: [0.0, -0.02, 0.0],
+                    delta_turns: [0, 0, 0],
                 },
-                // 1: torso
+                // 1: torso — +0.01·cos(0) = +0.01.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.01), 0, 0], // counter-pitch, cos(0) = 1
+                    delta_turns: [turn_i16(0.01), 0, 0],
                 },
-                // 2: head (all zeros)
+                // 2: head — steady.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
                     delta_turns: [0, 0, 0],
                 },
-                // 3: upper_arm_l (left arm, anti-phase to left leg)
+                // 3: upper_arm_l — +0.045·sin(0) = 0.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(-0.045 * SQRT_2_OVER_2), 0, 0], // -0.045 * sin(45°)
+                    delta_turns: [0, 0, 0],
                 },
-                // 4: upper_arm_r (right arm, anti-phase to right leg)
+                // 4: upper_arm_r — −0.045·sin(0) = 0.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.045 * SQRT_2_OVER_2), 0, 0], // +0.045 * sin(45°)
+                    delta_turns: [0, 0, 0],
                 },
-                // 5: lower_arm_l
+                // 5: lower_arm_l — 0.03 − 0.01·sin(0) = 0.03.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.03 - 0.01 * SQRT_2_OVER_2), 0, 0], // +0.03 - 0.01*sin(45°)
+                    delta_turns: [turn_i16(0.03), 0, 0],
                 },
-                // 6: lower_arm_r
+                // 6: lower_arm_r — 0.03 + 0.01·sin(0) = 0.03.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.03 + 0.01 * SQRT_2_OVER_2), 0, 0], // +0.03 + 0.01*sin(45°)
+                    delta_turns: [turn_i16(0.03), 0, 0],
                 },
-                // 7: upper_leg_l (left leg, swing phase)
+                // 7: upper_leg_l — −0.055·sin(0) = 0.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.055 * SQRT_2_OVER_2), 0, 0], // +0.055 * sin(45°)
+                    delta_turns: [0, 0, 0],
                 },
-                // 8: upper_leg_r (right leg, stance phase, anti-phase)
+                // 8: upper_leg_r — +0.055·sin(0) = 0.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(-0.055 * SQRT_2_OVER_2), 0, 0], // -0.055 * sin(45°)
+                    delta_turns: [0, 0, 0],
                 },
-                // 9: lower_leg_l (left leg, bending starts)
+                // 9: lower_leg_l — 0.09·max(0, sin(0)) = 0.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.09 * SQRT_2_OVER_2), 0, 0], // 0.09 * sin(45°)
+                    delta_turns: [0, 0, 0],
                 },
-                // 10: lower_leg_r (right leg, straight)
+                // 10: lower_leg_r — 0.09·max(0, −sin(0)) = 0.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [0, 0, 0], // sin(0) = 0
+                    delta_turns: [0, 0, 0],
                 },
             ],
         },
-        // Keyframe 1: t = 0.1375 (phase 45°).
+        // Keyframe 1: t = 0.1375 (φ = 45° — the left leg's forward
+        // swing begins; the left knee starts to flex).
         Keyframe {
             time: 0.1375,
             pose: [
-                // 0: pelvis
-                JointPose {
-                    delta_pos: [0.0, 0.0, 0.0], // 0 at 45° phase
-                    delta_turns: [0, turn_u16(0.008), 0],
-                },
-                // 1: torso
+                // 0: pelvis — Δy = −0.02·cos(90°) = 0; yaw = 0.008·sin(45°).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.01 * SQRT_2_OVER_2), 0, 0], // cos(90°) = SQRT_2_OVER_2
+                    delta_turns: [0, turn_i16(0.008 * SIN_45), 0],
                 },
-                // 2: head
+                // 1: torso — +0.01·cos(90°) = 0.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
                     delta_turns: [0, 0, 0],
                 },
-                // 3: upper_arm_l
+                // 2: head — steady.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(-0.045), 0, 0], // -0.045 * sin(90°)
+                    delta_turns: [0, 0, 0],
                 },
-                // 4: upper_arm_r
+                // 3: upper_arm_l — +0.045·sin(45°).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.045), 0, 0], // +0.045 * sin(90°)
+                    delta_turns: [turn_i16(0.045 * SIN_45), 0, 0],
                 },
-                // 5: lower_arm_l
+                // 4: upper_arm_r — −0.045·sin(45°).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.03 - 0.01), 0, 0], // +0.03 - 0.01*sin(90°)
+                    delta_turns: [turn_i16(-0.045 * SIN_45), 0, 0],
                 },
-                // 6: lower_arm_r
+                // 5: lower_arm_l — 0.03 − 0.01·sin(45°).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.03 + 0.01), 0, 0], // +0.03 + 0.01*sin(90°)
+                    delta_turns: [turn_i16(0.03 - 0.01 * SIN_45), 0, 0],
                 },
-                // 7: upper_leg_l
+                // 6: lower_arm_r — 0.03 + 0.01·sin(45°).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.055), 0, 0], // +0.055 * sin(90°)
+                    delta_turns: [turn_i16(0.03 + 0.01 * SIN_45), 0, 0],
                 },
-                // 8: upper_leg_r
+                // 7: upper_leg_l — −0.055·sin(45°) (forward swing).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(-0.055), 0, 0], // -0.055 * sin(90°)
+                    delta_turns: [turn_i16(-0.055 * SIN_45), 0, 0],
                 },
-                // 9: lower_leg_l
+                // 8: upper_leg_r — +0.055·sin(45°) (trailing, stance).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.09), 0, 0], // 0.09 * sin(90°)
+                    delta_turns: [turn_i16(0.055 * SIN_45), 0, 0],
                 },
-                // 10: lower_leg_r
+                // 9: lower_leg_l — 0.09·sin(45°) (flexing).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [0, 0, 0], // sin(0) = 0
+                    delta_turns: [turn_i16(0.09 * SIN_45), 0, 0],
+                },
+                // 10: lower_leg_r — 0 (the right knee is straight in stance).
+                JointPose {
+                    delta_pos: [0.0, 0.0, 0.0],
+                    delta_turns: [0, 0, 0],
                 },
             ],
         },
-        // Keyframe 2: t = 0.275 (phase 90°).
+        // Keyframe 2: t = 0.275 (φ = 90° — mid-swing: the left leg at
+        // its forward reach, the left knee at max flexion, the body
+        // vaulting high over the straight right stance leg).
         Keyframe {
             time: 0.275,
             pose: [
-                // 0: pelvis (bob at peak)
+                // 0: pelvis — Δy = −0.02·cos(180°) = +0.02 (mid-stance
+                // high); yaw = 0.008·sin(90°) = +0.008.
                 JointPose {
-                    delta_pos: [0.0, -0.02, 0.0], // -0.02 at 90° phase
-                    delta_turns: [0, turn_u16(0.008), 0],
+                    delta_pos: [0.0, 0.02, 0.0],
+                    delta_turns: [0, turn_i16(0.008), 0],
                 },
-                // 1: torso (counter-pitch at peak)
+                // 1: torso — +0.01·cos(180°) = −0.01.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(-0.01), 0, 0], // cos(180°) = -1
+                    delta_turns: [turn_i16(-0.01), 0, 0],
                 },
-                // 2: head
+                // 2: head — steady.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
                     delta_turns: [0, 0, 0],
                 },
-                // 3: upper_arm_l
+                // 3: upper_arm_l — +0.045·sin(90°) = +0.045.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(-0.045), 0, 0], // -0.045 * sin(90°)
+                    delta_turns: [turn_i16(0.045), 0, 0],
                 },
-                // 4: upper_arm_r
+                // 4: upper_arm_r — −0.045.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.045), 0, 0], // +0.045 * sin(90°)
+                    delta_turns: [turn_i16(-0.045), 0, 0],
                 },
-                // 5: lower_arm_l
+                // 5: lower_arm_l — 0.03 − 0.01 = 0.02.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.03 - 0.01), 0, 0], // +0.03 - 0.01*sin(90°)
+                    delta_turns: [turn_i16(0.02), 0, 0],
                 },
-                // 6: lower_arm_r
+                // 6: lower_arm_r — 0.03 + 0.01 = 0.04.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.03 + 0.01), 0, 0], // +0.03 + 0.01*sin(90°)
+                    delta_turns: [turn_i16(0.04), 0, 0],
                 },
-                // 7: upper_leg_l
+                // 7: upper_leg_l — −0.055 (max forward reach).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.055), 0, 0], // +0.055 * sin(90°)
+                    delta_turns: [turn_i16(-0.055), 0, 0],
                 },
-                // 8: upper_leg_r
+                // 8: upper_leg_r — +0.055 (max trail, stance).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(-0.055), 0, 0], // -0.055 * sin(90°)
+                    delta_turns: [turn_i16(0.055), 0, 0],
                 },
-                // 9: lower_leg_l
+                // 9: lower_leg_l — 0.09 (max knee flexion).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.09), 0, 0], // 0.09 * sin(90°)
+                    delta_turns: [turn_i16(0.09), 0, 0],
                 },
-                // 10: lower_leg_r
+                // 10: lower_leg_r — 0.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [0, 0, 0], // sin(0) = 0
+                    delta_turns: [0, 0, 0],
                 },
             ],
         },
-        // Keyframe 3: t = 0.4125 (phase 135°).
+        // Keyframe 3: t = 0.4125 (φ = 135° — the swing decelerates;
+        // the knee extends toward heel strike).
         Keyframe {
             time: 0.4125,
             pose: [
-                // 0: pelvis
-                JointPose {
-                    delta_pos: [0.0, 0.0, 0.0], // 0 at 135° phase
-                    delta_turns: [0, turn_u16(0.008), 0],
-                },
-                // 1: torso
+                // 0: pelvis — Δy = −0.02·cos(270°) = 0; yaw = 0.008·sin(135°).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [0, 0, 0], // cos(270°) = 0
+                    delta_turns: [0, turn_i16(0.008 * SIN_45), 0],
                 },
-                // 2: head
+                // 1: torso — +0.01·cos(270°) = 0.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
                     delta_turns: [0, 0, 0],
                 },
-                // 3: upper_arm_l (sin(180°) = 0)
+                // 2: head — steady.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
                     delta_turns: [0, 0, 0],
                 },
-                // 4: upper_arm_r (-sin(180°) = 0)
+                // 3: upper_arm_l — +0.045·sin(135°) = +0.045·sin(45°).
+                JointPose {
+                    delta_pos: [0.0, 0.0, 0.0],
+                    delta_turns: [turn_i16(0.045 * SIN_45), 0, 0],
+                },
+                // 4: upper_arm_r — −0.045·sin(45°).
+                JointPose {
+                    delta_pos: [0.0, 0.0, 0.0],
+                    delta_turns: [turn_i16(-0.045 * SIN_45), 0, 0],
+                },
+                // 5: lower_arm_l — 0.03 − 0.01·sin(45°).
+                JointPose {
+                    delta_pos: [0.0, 0.0, 0.0],
+                    delta_turns: [turn_i16(0.03 - 0.01 * SIN_45), 0, 0],
+                },
+                // 6: lower_arm_r — 0.03 + 0.01·sin(45°).
+                JointPose {
+                    delta_pos: [0.0, 0.0, 0.0],
+                    delta_turns: [turn_i16(0.03 + 0.01 * SIN_45), 0, 0],
+                },
+                // 7: upper_leg_l — −0.055·sin(45°) (forward, settling).
+                JointPose {
+                    delta_pos: [0.0, 0.0, 0.0],
+                    delta_turns: [turn_i16(-0.055 * SIN_45), 0, 0],
+                },
+                // 8: upper_leg_r — +0.055·sin(45°).
+                JointPose {
+                    delta_pos: [0.0, 0.0, 0.0],
+                    delta_turns: [turn_i16(0.055 * SIN_45), 0, 0],
+                },
+                // 9: lower_leg_l — 0.09·sin(45°) (extending).
+                JointPose {
+                    delta_pos: [0.0, 0.0, 0.0],
+                    delta_turns: [turn_i16(0.09 * SIN_45), 0, 0],
+                },
+                // 10: lower_leg_r — 0.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
                     delta_turns: [0, 0, 0],
-                },
-                // 5: lower_arm_l
-                JointPose {
-                    delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.03), 0, 0], // +0.03 - 0.01*sin(180°)
-                },
-                // 6: lower_arm_r
-                JointPose {
-                    delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.03), 0, 0], // +0.03 + 0.01*sin(180°)
-                },
-                // 7: upper_leg_l (sin(180°) = 0)
-                JointPose {
-                    delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [0, 0, 0], // +0.055 * sin(180°)
-                },
-                // 8: upper_leg_r (-sin(180°) = 0)
-                JointPose {
-                    delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [0, 0, 0], // -0.055 * sin(180°)
-                },
-                // 9: lower_leg_l (sin(180°) = 0)
-                JointPose {
-                    delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [0, 0, 0], // 0.09 * sin(180°)
-                },
-                // 10: lower_leg_r
-                JointPose {
-                    delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [0, 0, 0], // sin(0) = 0
                 },
             ],
         },
-        // Keyframe 4: t = 0.55 (phase 180°, left heel strike).
+        // Keyframe 4: t = 0.55 (φ = 180° — the right leg's heel
+        // strike; double support, the body low again).
         Keyframe {
             time: 0.55,
             pose: [
-                // 0: pelvis (bob at valley)
+                // 0: pelvis — Δy = −0.02·cos(360°) = −0.02; yaw = 0.
                 JointPose {
-                    delta_pos: [0.0, 0.02, 0.0], // +0.02 at 180° phase (double freq)
-                    delta_turns: [0, turn_u16(0.008), 0],
+                    delta_pos: [0.0, -0.02, 0.0],
+                    delta_turns: [0, 0, 0],
                 },
-                // 1: torso (counter-pitch at valley)
+                // 1: torso — +0.01·cos(360°) = +0.01.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.01), 0, 0], // cos(360°) = 1
+                    delta_turns: [turn_i16(0.01), 0, 0],
                 },
-                // 2: head
+                // 2: head — steady.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
                     delta_turns: [0, 0, 0],
                 },
-                // 3: upper_arm_l (sin(180°) = 0)
+                // 3: upper_arm_l — 0.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
                     delta_turns: [0, 0, 0],
                 },
-                // 4: upper_arm_r (-sin(180°) = 0)
+                // 4: upper_arm_r — 0.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
                     delta_turns: [0, 0, 0],
                 },
-                // 5: lower_arm_l
+                // 5: lower_arm_l — 0.03.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.03), 0, 0],
+                    delta_turns: [turn_i16(0.03), 0, 0],
                 },
-                // 6: lower_arm_r
+                // 6: lower_arm_r — 0.03.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.03), 0, 0],
+                    delta_turns: [turn_i16(0.03), 0, 0],
                 },
-                // 7: upper_leg_l (sin(180°) = 0)
+                // 7: upper_leg_l — 0 (the left leg planted under the body).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [0, 0, 0], // +0.055 * sin(180°)
+                    delta_turns: [0, 0, 0],
                 },
-                // 8: upper_leg_r (-sin(180°) = 0)
+                // 8: upper_leg_r — 0 (the right leg at heel strike).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [0, 0, 0], // -0.055 * sin(180°)
+                    delta_turns: [0, 0, 0],
                 },
-                // 9: lower_leg_l (sin(180°) = 0)
+                // 9: lower_leg_l — 0.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [0, 0, 0], // 0.09 * sin(180°)
+                    delta_turns: [0, 0, 0],
                 },
-                // 10: lower_leg_r
+                // 10: lower_leg_r — 0.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [0, 0, 0], // sin(0) = 0
+                    delta_turns: [0, 0, 0],
                 },
             ],
         },
-        // Keyframe 5: t = 0.6875 (phase 225°).
+        // Keyframe 5: t = 0.6875 (φ = 225° — the right leg's forward
+        // swing begins; the right knee starts to flex).
         Keyframe {
             time: 0.6875,
             pose: [
-                // 0: pelvis
-                JointPose {
-                    delta_pos: [0.0, 0.0, 0.0], // 0 at 225° phase
-                    delta_turns: [0, turn_u16(0.008), 0],
-                },
-                // 1: torso
+                // 0: pelvis — Δy = 0; yaw = 0.008·sin(225°) = −0.008·sin(45°).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [0, 0, 0], // cos(450°) = 0
+                    delta_turns: [0, turn_i16(-0.008 * SIN_45), 0],
                 },
-                // 2: head
+                // 1: torso — 0.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
                     delta_turns: [0, 0, 0],
                 },
-                // 3: upper_arm_l (sin(225°) = -SQRT_2_OVER_2)
+                // 2: head — steady.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.045 * SQRT_2_OVER_2), 0, 0], // -0.045 * (-SQRT_2_OVER_2)
+                    delta_turns: [0, 0, 0],
                 },
-                // 4: upper_arm_r (-sin(225°) = +SQRT_2_OVER_2)
+                // 3: upper_arm_l — +0.045·sin(225°) = −0.045·sin(45°).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(-0.045 * SQRT_2_OVER_2), 0, 0], // +0.045 * (-SQRT_2_OVER_2)
+                    delta_turns: [turn_i16(-0.045 * SIN_45), 0, 0],
                 },
-                // 5: lower_arm_l
+                // 4: upper_arm_r — −0.045·sin(225°) = +0.045·sin(45°).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.03 + 0.01 * SQRT_2_OVER_2), 0, 0], // +0.03 - 0.01*sin(225°)
+                    delta_turns: [turn_i16(0.045 * SIN_45), 0, 0],
                 },
-                // 6: lower_arm_r
+                // 5: lower_arm_l — 0.03 − 0.01·sin(225°) = 0.03 + 0.01·sin(45°).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.03 - 0.01 * SQRT_2_OVER_2), 0, 0], // +0.03 + 0.01*sin(225°)
+                    delta_turns: [turn_i16(0.03 + 0.01 * SIN_45), 0, 0],
                 },
-                // 7: upper_leg_l (sin(225°) = -SQRT_2_OVER_2)
+                // 6: lower_arm_r — 0.03 + 0.01·sin(225°) = 0.03 − 0.01·sin(45°).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(-0.055 * SQRT_2_OVER_2), 0, 0], // +0.055 * (-SQRT_2_OVER_2)
+                    delta_turns: [turn_i16(0.03 - 0.01 * SIN_45), 0, 0],
                 },
-                // 8: upper_leg_r (-sin(225°) = +SQRT_2_OVER_2)
+                // 7: upper_leg_l — −0.055·sin(225°) = +0.055·sin(45°) (trailing, stance).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.055 * SQRT_2_OVER_2), 0, 0], // -0.055 * (-SQRT_2_OVER_2)
+                    delta_turns: [turn_i16(0.055 * SIN_45), 0, 0],
                 },
-                // 9: lower_leg_l (bending forward, always positive)
+                // 8: upper_leg_r — +0.055·sin(225°) = −0.055·sin(45°) (forward swing).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.09 * SQRT_2_OVER_2), 0, 0], // |0.09 * (-SQRT_2_OVER_2)|
+                    delta_turns: [turn_i16(-0.055 * SIN_45), 0, 0],
                 },
-                // 10: lower_leg_r (bending forward, always positive)
+                // 9: lower_leg_l — 0 (the left knee straight in stance).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.09 * SQRT_2_OVER_2), 0, 0], // |0.09 * SQRT_2_OVER_2|
+                    delta_turns: [0, 0, 0],
+                },
+                // 10: lower_leg_r — 0.09·sin(45°) (flexing).
+                JointPose {
+                    delta_pos: [0.0, 0.0, 0.0],
+                    delta_turns: [turn_i16(0.09 * SIN_45), 0, 0],
                 },
             ],
         },
-        // Keyframe 6: t = 0.825 (phase 270°).
+        // Keyframe 6: t = 0.825 (φ = 270° — the right leg's mid-swing;
+        // the body vaults high over the straight left stance leg).
         Keyframe {
             time: 0.825,
             pose: [
-                // 0: pelvis (bob at peak)
+                // 0: pelvis — Δy = +0.02 (mid-stance high); yaw = −0.008.
                 JointPose {
-                    delta_pos: [0.0, -0.02, 0.0], // -0.02 at 270° phase
-                    delta_turns: [0, turn_u16(0.008), 0],
+                    delta_pos: [0.0, 0.02, 0.0],
+                    delta_turns: [0, turn_i16(-0.008), 0],
                 },
-                // 1: torso (counter-pitch at peak)
+                // 1: torso — −0.01.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(-0.01), 0, 0], // cos(540°) = -1
+                    delta_turns: [turn_i16(-0.01), 0, 0],
                 },
-                // 2: head
+                // 2: head — steady.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
                     delta_turns: [0, 0, 0],
                 },
-                // 3: upper_arm_l (sin(270°) = -1)
+                // 3: upper_arm_l — −0.045.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.045), 0, 0], // -0.045 * (-1)
+                    delta_turns: [turn_i16(-0.045), 0, 0],
                 },
-                // 4: upper_arm_r (-sin(270°) = +1)
+                // 4: upper_arm_r — +0.045.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(-0.045), 0, 0], // +0.045 * (-1)
+                    delta_turns: [turn_i16(0.045), 0, 0],
                 },
-                // 5: lower_arm_l
+                // 5: lower_arm_l — 0.04.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.03 + 0.01), 0, 0], // +0.03 - 0.01*sin(270°)
+                    delta_turns: [turn_i16(0.04), 0, 0],
                 },
-                // 6: lower_arm_r
+                // 6: lower_arm_r — 0.02.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.03 - 0.01), 0, 0], // +0.03 + 0.01*sin(270°)
+                    delta_turns: [turn_i16(0.02), 0, 0],
                 },
-                // 7: upper_leg_l (sin(270°) = -1)
+                // 7: upper_leg_l — +0.055 (max trail, stance).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(-0.055), 0, 0], // +0.055 * (-1)
+                    delta_turns: [turn_i16(0.055), 0, 0],
                 },
-                // 8: upper_leg_r (-sin(270°) = +1)
+                // 8: upper_leg_r — −0.055 (max forward reach).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.055), 0, 0], // -0.055 * (-1)
+                    delta_turns: [turn_i16(-0.055), 0, 0],
                 },
-                // 9: lower_leg_l (bending forward, always positive)
+                // 9: lower_leg_l — 0.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.09), 0, 0], // |0.09 * (-1)|
+                    delta_turns: [0, 0, 0],
                 },
-                // 10: lower_leg_r (bending forward, always positive)
+                // 10: lower_leg_r — 0.09 (max knee flexion).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.09), 0, 0], // |0.09 * (-1)|
+                    delta_turns: [turn_i16(0.09), 0, 0],
                 },
             ],
         },
-        // Keyframe 7: t = 0.9625 (phase 315°, seam to t=0).
+        // Keyframe 7: t = 0.9625 (φ = 315° — the right swing
+        // decelerates toward the seam's heel strike at t = 1.1 ≡ 0).
         Keyframe {
             time: 0.9625,
             pose: [
-                // 0: pelvis
-                JointPose {
-                    delta_pos: [0.0, 0.0, 0.0], // 0 at 315° phase
-                    delta_turns: [0, turn_u16(0.008), 0],
-                },
-                // 1: torso
+                // 0: pelvis — Δy = 0; yaw = −0.008·sin(45°).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [0, 0, 0], // cos(630°) = 0
+                    delta_turns: [0, turn_i16(-0.008 * SIN_45), 0],
                 },
-                // 2: head
+                // 1: torso — 0.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
                     delta_turns: [0, 0, 0],
                 },
-                // 3: upper_arm_l (sin(315°) = -SQRT_2_OVER_2)
+                // 2: head — steady.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.045 * SQRT_2_OVER_2), 0, 0], // -0.045 * (-SQRT_2_OVER_2)
+                    delta_turns: [0, 0, 0],
                 },
-                // 4: upper_arm_r (-sin(315°) = +SQRT_2_OVER_2)
+                // 3: upper_arm_l — −0.045·sin(45°).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(-0.045 * SQRT_2_OVER_2), 0, 0], // +0.045 * (-SQRT_2_OVER_2)
+                    delta_turns: [turn_i16(-0.045 * SIN_45), 0, 0],
                 },
-                // 5: lower_arm_l
+                // 4: upper_arm_r — +0.045·sin(45°).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.03 + 0.01 * SQRT_2_OVER_2), 0, 0], // +0.03 - 0.01*sin(315°)
+                    delta_turns: [turn_i16(0.045 * SIN_45), 0, 0],
                 },
-                // 6: lower_arm_r
+                // 5: lower_arm_l — 0.03 + 0.01·sin(45°).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.03 - 0.01 * SQRT_2_OVER_2), 0, 0], // +0.03 + 0.01*sin(315°)
+                    delta_turns: [turn_i16(0.03 + 0.01 * SIN_45), 0, 0],
                 },
-                // 7: upper_leg_l (sin(315°) = -SQRT_2_OVER_2)
+                // 6: lower_arm_r — 0.03 − 0.01·sin(45°).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(-0.055 * SQRT_2_OVER_2), 0, 0], // +0.055 * (-SQRT_2_OVER_2)
+                    delta_turns: [turn_i16(0.03 - 0.01 * SIN_45), 0, 0],
                 },
-                // 8: upper_leg_r (-sin(315°) = +SQRT_2_OVER_2)
+                // 7: upper_leg_l — +0.055·sin(45°) (trailing, settling).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.055 * SQRT_2_OVER_2), 0, 0], // -0.055 * (-SQRT_2_OVER_2)
+                    delta_turns: [turn_i16(0.055 * SIN_45), 0, 0],
                 },
-                // 9: lower_leg_l (bending forward, always positive)
+                // 8: upper_leg_r — −0.055·sin(45°) (forward, settling).
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.09 * SQRT_2_OVER_2), 0, 0], // |0.09 * (-SQRT_2_OVER_2)|
+                    delta_turns: [turn_i16(-0.055 * SIN_45), 0, 0],
                 },
-                // 10: lower_leg_r (bending forward, always positive)
+                // 9: lower_leg_l — 0.
                 JointPose {
                     delta_pos: [0.0, 0.0, 0.0],
-                    delta_turns: [turn_u16(0.09 * SQRT_2_OVER_2), 0, 0], // |0.09 * (-SQRT_2_OVER_2)|
+                    delta_turns: [0, 0, 0],
+                },
+                // 10: lower_leg_r — 0.09·sin(45°) (extending).
+                JointPose {
+                    delta_pos: [0.0, 0.0, 0.0],
+                    delta_turns: [turn_i16(0.09 * SIN_45), 0, 0],
                 },
             ],
         },
@@ -1338,14 +1360,22 @@ pub fn walk_clip() -> Clip {
 mod tests {
     use super::*;
 
-    /// Skeleton structure: parents precede children; pivots lie on their
-    /// boxes' boundaries where claimed; BOX_JOINT maps every box to a
-    /// joint whose pivot is at that box's anatomical anchor.
+    /// The zero-pose fixture (rest) — used by many tests.
+    fn rest_pose() -> [JointPose; HUMANOID_JOINTS] {
+        [JointPose {
+            delta_pos: [0.0; 3],
+            delta_turns: [0; 3],
+        }; HUMANOID_JOINTS]
+    }
+
+    /// Skeleton structure: parents precede children; pivots lie on
+    /// their boxes' boundaries where claimed; BOX_JOINT maps every
+    /// box to a joint whose pivot is at that box's anatomical anchor.
     #[test]
     fn skeleton_structure() {
         let skeleton = humanoid_skeleton();
 
-        // Parents precede children (joint index < parent index).
+        // Parents precede children (the compose loop's invariant).
         for (idx, joint) in skeleton.iter().enumerate() {
             if let Some(parent_idx) = joint.parent {
                 assert!(
@@ -1357,782 +1387,824 @@ mod tests {
             }
         }
 
-        // Pivots at box boundaries.
-        // Pelvis pivot y=0.98 should be within pelvis box [0.90, 1.06].
-        assert!(
-            skeleton[0].pivot[1] >= 0.90 && skeleton[0].pivot[1] <= 1.06,
-            "pelvis pivot in pelvis box"
-        );
+        // Pivots at the documented anatomical anchors.
         assert!(
             (skeleton[1].pivot[1] - 1.06).abs() < 1e-5,
-            "torso pivot at pelvis top / torso bottom"
+            "torso pivot at the waist (pelvis top / torso bottom)"
         );
         assert!(
             (skeleton[2].pivot[1] - 1.60).abs() < 1e-5,
-            "head pivot at torso top"
+            "head pivot at the neck"
         );
         assert!(
             (skeleton[3].pivot[0] + 0.21).abs() < 1e-5,
-            "upper_arm_l pivot at left side of torso"
+            "upper_arm_l pivot at the left shoulder"
         );
         assert!(
             (skeleton[4].pivot[0] - 0.21).abs() < 1e-5,
-            "upper_arm_r pivot at right side of torso"
+            "upper_arm_r pivot at the right shoulder"
         );
 
-        // BOX_JOINT mapping.
-        for box_idx in 0..HUMANOID_JOINTS {
-            let joint_idx = BOX_JOINT[box_idx];
-            assert!(
-                joint_idx < HUMANOID_JOINTS,
-                "BOX_JOINT[{}] = {} is valid",
-                box_idx,
-                joint_idx
-            );
-            // The joint's pivot should be at or near the box.
+        // BOX_JOINT maps every mesh box to a joint whose pivot lies
+        // inside (or on the boundary of) that box — the rigid
+        // binding's sanity.
+        for (box_idx, &joint_idx) in BOX_JOINT.iter().enumerate() {
+            assert!(joint_idx < HUMANOID_JOINTS);
             let (box_lo, box_hi) = HUMANOID_BOXES[box_idx];
-            let pivot = &skeleton[joint_idx].pivot;
-            assert!(
-                pivot[0] >= box_lo[0] - 1e-3 && pivot[0] <= box_hi[0] + 1e-3,
-                "box {} joint {} pivot x in box",
-                box_idx,
-                joint_idx
-            );
-            assert!(
-                pivot[1] >= box_lo[1] - 1e-3 && pivot[1] <= box_hi[1] + 1e-3,
-                "box {} joint {} pivot y in box",
-                box_idx,
-                joint_idx
-            );
-            assert!(
-                pivot[2] >= box_lo[2] - 1e-3 && pivot[2] <= box_hi[2] + 1e-3,
-                "box {} joint {} pivot z in box",
-                box_idx,
-                joint_idx
-            );
+            let pivot = skeleton[joint_idx].pivot;
+            for axis in 0..3 {
+                assert!(
+                    pivot[axis] >= box_lo[axis] - 1e-3 && pivot[axis] <= box_hi[axis] + 1e-3,
+                    "box {box_idx} -> joint {joint_idx}: pivot[{axis}] = {} outside [{}, {}]",
+                    pivot[axis],
+                    box_lo[axis],
+                    box_hi[axis]
+                );
+            }
         }
     }
 
-    /// Rotation convention known answers: positive pitch moves a hanging
-    /// limb (0,-1,0) toward -Z; positive yaw maps +X toward -Z at a
-    /// quarter turn; the Euler order is pinned by a composed known answer.
+    /// The rotation axes' known answers on the RAW matrices (the
+    /// column-major basis images): quarter pitch maps +Y to +Z;
+    /// quarter yaw maps +X to −Z (the instance_columns convention);
+    /// quarter roll maps +X to +Y.
     #[test]
-    fn rotation_convention_known_answers() {
-        // The rotation matrix is COLUMN-MAJOR 3x3 stored as [c0r0, c0r1, c0r2, c1r0, c1r1, c1r2, c2r0, c2r1, c2r2]
-        // where cN is column N and rN is row N.
-        // Column 0 is [m0, m1, m2], column 1 is [m3, m4, m5], column 2 is [m6, m7, m8].
-        // Column N represents the image of basis vector N after rotation.
-
-        // Test pitch: at a quarter turn, +Y -> +Z.
-        // Column 1 (Y basis) should become [0, 0, 1].
-        // Column 1 indices: m3, m4, m5
-        let rot_pitch = rotation_matrix_for_axis(16384, 0);
-        assert!(rot_pitch[3].abs() < 1e-5, "pitch col1.x ~ 0"); // m3
-        assert!(rot_pitch[4].abs() < 1e-5, "pitch col1.y ~ 0"); // m4
-        assert!((rot_pitch[5] - 1.0).abs() < 1e-5, "pitch col1.z ~ 1"); // m5
-
-        // Test yaw: at a quarter turn, +X -> -Z.
-        // Column 0 (X basis) should become [0, 0, -1].
-        // Column 0 indices: m0, m1, m2
-        let rot_yaw = rotation_matrix_for_axis(16384, 1);
-        assert!(rot_yaw[0].abs() < 1e-5, "yaw col0.x ~ 0"); // m0
-        assert!(rot_yaw[1].abs() < 1e-5, "yaw col0.y ~ 0"); // m1
-        assert!((rot_yaw[2] + 1.0).abs() < 1e-5, "yaw col0.z ~ -1"); // m2
-
-        // Test roll: at a quarter turn, +X -> +Y.
-        // Column 0 (X basis) should become [0, 1, 0].
-        // Column 0 indices: m0, m1, m2
-        let rot_roll = rotation_matrix_for_axis(16384, 2);
-        assert!(rot_roll[0].abs() < 1e-5, "roll col0.x ~ 0"); // m0
-        assert!((rot_roll[1] - 1.0).abs() < 1e-5, "roll col0.y ~ 1"); // m1
-        assert!(rot_roll[2].abs() < 1e-5, "roll col0.z ~ 0"); // m2
-
-        // Test Euler order: R = R_yaw · R_pitch · R_roll.
-        // At a quarter pitch, a point at (0,-1,0) should move toward -Z.
-        // Start with (0,-1,0), apply R_roll (no effect since it's about Z), then R_pitch.
-        // R_pitch at 16384: column 1 should be [0, 0, 1], so (0,-1,0) -> (0,0,-1) after R_pitch.
-        // Then R_yaw: [0, 0, -1] -> [1, 0, 0] (quarter turn maps -Z to +X).
-        let pitch_90 = compose_transform_matrix(rotation_matrix_for_axis(16384, 0), [0.0; 3]);
-        let yaw_90 = compose_transform_matrix(rotation_matrix_for_axis(16384, 1), [0.0; 3]);
-
-        // A point at (0,-1,0) in local space.
-        let local = [0.0, -1.0, 0.0, 1.0];
-
-        // Print the pitch matrix for debugging.
-        println!(
-            "Pitch matrix at 16384: col0=[{:.6}, {:.6}, {:.6}], col1=[{:.6}, {:.6}, {:.6}], col2=[{:.6}, {:.6}, {:.6}]",
-            pitch_90[0][0],
-            pitch_90[1][0],
-            pitch_90[2][0],
-            pitch_90[0][1],
-            pitch_90[1][1],
-            pitch_90[2][1],
-            pitch_90[0][2],
-            pitch_90[1][2],
-            pitch_90[2][2]
-        );
-
-        // Apply pitch: p1 = pitch · local (row-major multiplication).
-        let p1 = [
-            pitch_90[0][0] * local[0]
-                + pitch_90[0][1] * local[1]
-                + pitch_90[0][2] * local[2]
-                + pitch_90[0][3] * local[3],
-            pitch_90[1][0] * local[0]
-                + pitch_90[1][1] * local[1]
-                + pitch_90[1][2] * local[2]
-                + pitch_90[1][3] * local[3],
-            pitch_90[2][0] * local[0]
-                + pitch_90[2][1] * local[1]
-                + pitch_90[2][2] * local[2]
-                + pitch_90[2][3] * local[3],
-            pitch_90[3][0] * local[0]
-                + pitch_90[3][1] * local[1]
-                + pitch_90[3][2] * local[2]
-                + pitch_90[3][3] * local[3],
-        ];
-        println!("After pitch: ({:.6}, {:.6}, {:.6})", p1[0], p1[1], p1[2]);
-        assert!(p1[0].abs() < 1e-5, "after pitch: x ~ 0");
-        assert!(p1[1].abs() < 1e-5, "after pitch: y ~ 0");
+    fn rotation_axes_known_answers() {
+        let pitch = rotation_matrix_for_axis(16384, 0);
         assert!(
-            (p1[2] + 1.0).abs() < 1e-5,
-            "after pitch: z ~ -1 (toward -Z)"
+            pitch[3].abs() < 1e-5 && pitch[4].abs() < 1e-5 && (pitch[5] - 1.0).abs() < 1e-5,
+            "quarter pitch: column 1 (the +Y image) is (0, 0, 1)"
         );
-
-        // Apply yaw: p2 = yaw · p1.
-        let p2 = [
-            yaw_90[0][0] * p1[0]
-                + yaw_90[0][1] * p1[1]
-                + yaw_90[0][2] * p1[2]
-                + yaw_90[0][3] * p1[3],
-            yaw_90[1][0] * p1[0]
-                + yaw_90[1][1] * p1[1]
-                + yaw_90[1][2] * p1[2]
-                + yaw_90[1][3] * p1[3],
-            yaw_90[2][0] * p1[0]
-                + yaw_90[2][1] * p1[1]
-                + yaw_90[2][2] * p1[2]
-                + yaw_90[2][3] * p1[3],
-            yaw_90[3][0] * p1[0]
-                + yaw_90[3][1] * p1[1]
-                + yaw_90[3][2] * p1[2]
-                + yaw_90[3][3] * p1[3],
-        ];
-        // After pitch: (0, 0, -1) = -Z. After yaw: -Z -> -X (since Z -> +X).
+        let yaw = rotation_matrix_for_axis(16384, 1);
         assert!(
-            (p2[0] + 1.0).abs() < 1e-5,
-            "after yaw: x ~ -1 (since -Z -> -X)"
+            yaw[0].abs() < 1e-5 && yaw[1].abs() < 1e-5 && (yaw[2] + 1.0).abs() < 1e-5,
+            "quarter yaw: column 0 (the +X image) is (0, 0, -1)"
         );
-        assert!(p2[1].abs() < 1e-5, "after yaw: y ~ 0");
-        assert!(p2[2].abs() < 1e-5, "after yaw: z ~ 0");
+        let roll = rotation_matrix_for_axis(16384, 2);
+        assert!(
+            roll[0].abs() < 1e-5 && (roll[1] - 1.0).abs() < 1e-5 && roll[2].abs() < 1e-5,
+            "quarter roll: column 0 (the +X image) is (0, 1, 0)"
+        );
     }
 
-    /// sample_pose: t=0 returns keyframe 0's pose exactly; t at a keyframe
-    /// returns it exactly; the seam wraps; determinism; bracket edges.
+    /// THE END-TO-END CONVENTION PIN — the test the transpose bug
+    /// exists to fail. A quarter pitch at the left hip, through the
+    /// FULL public chain (compose → skin matrices → skin_vertex),
+    /// must swing a point hanging below the pivot BACKWARD (−Z:
+    /// the humanoid's local forward is +Z, positive pitch trails a
+    /// hanging limb). A transposed matrix core flips this to +Z; a
+    /// wrong apply flips it silently everywhere else too.
+    #[test]
+    fn quarter_pitch_swings_a_hanging_limb_backward() {
+        let skeleton = humanoid_skeleton();
+        let mut pose = rest_pose();
+        pose[7].delta_turns = [16384, 0, 0]; // quarter pitch, left hip.
+        let joint_worlds = compose_joint_matrices(&skeleton, &pose);
+        let skin_mats = skin_matrices(&joint_worlds, &skeleton);
+
+        // A vertex 0.30 m below the left-hip pivot, rigid to joint 7.
+        let pivot = skeleton[7].pivot;
+        let hang = [pivot[0], pivot[1] - 0.30, pivot[2]];
+        let vertex = SkinnedVertex {
+            pos: hang,
+            normal: [0.0, -1.0, 0.0],
+            uv: [0.0, 0.0],
+            joints: [7, 0, 0, 0],
+            weights: [1.0, 0.0, 0.0, 0.0],
+        };
+        let (pos, normal) = skin_vertex(&vertex, &skin_mats);
+        // Quarter pitch maps (0, -1, 0) to (0, 0, -1): the point
+        // lands 0.30 m BEHIND the pivot, at pivot height.
+        assert!(
+            (pos[0] - pivot[0]).abs() < 2e-5,
+            "x stays at the pivot: {pos:?}"
+        );
+        assert!(
+            (pos[1] - pivot[1]).abs() < 2e-5,
+            "the limb swings level: {pos:?}"
+        );
+        assert!(
+            (pos[2] - (pivot[2] - 0.30)).abs() < 2e-5,
+            "positive pitch trails the limb (−Z): {pos:?} — a transposed \
+             matrix core lands it at +Z instead"
+        );
+        // The hanging normal swings to −Z as well.
+        assert!(
+            normal[0].abs() < 2e-5 && normal[1].abs() < 2e-5 && (normal[2] + 1.0).abs() < 2e-5,
+            "the skinned normal is the rotated hang: {normal:?}"
+        );
+
+        // The NEGATIVE pitch swings it forward (+Z).
+        pose[7].delta_turns = [-16384, 0, 0];
+        let joint_worlds = compose_joint_matrices(&skeleton, &pose);
+        let skin_mats = skin_matrices(&joint_worlds, &skeleton);
+        let (pos, _) = skin_vertex(&vertex, &skin_mats);
+        assert!(
+            (pos[2] - (pivot[2] + 0.30)).abs() < 2e-5,
+            "negative pitch reaches the limb forward (+Z): {pos:?}"
+        );
+
+        // The same convention at the left shoulder (an arm swing).
+        pose[7].delta_turns = [0, 0, 0];
+        pose[3].delta_turns = [16384, 0, 0];
+        let joint_worlds = compose_joint_matrices(&skeleton, &pose);
+        let skin_mats = skin_matrices(&joint_worlds, &skeleton);
+        let shoulder = skeleton[3].pivot;
+        let vertex = SkinnedVertex {
+            pos: [shoulder[0], shoulder[1] - 0.30, shoulder[2]],
+            normal: [0.0, -1.0, 0.0],
+            uv: [0.0, 0.0],
+            joints: [3, 0, 0, 0],
+            weights: [1.0, 0.0, 0.0, 0.0],
+        };
+        let (pos, _) = skin_vertex(&vertex, &skin_mats);
+        assert!(
+            (pos[2] - (shoulder[2] - 0.30)).abs() < 2e-5,
+            "the arm trails under positive pitch: {pos:?}"
+        );
+    }
+
+    /// The Euler order pin: with pitch AND yaw both at a quarter,
+    /// R = R_yaw · R_pitch maps +Y → +X (pitch first sends +Y to +Z,
+    /// yaw then sends +Z to +X). The composed local matrix's column
+    /// 1 (the +Y basis image) is the answer; a different composition
+    /// order (or a transposed core) moves it.
+    #[test]
+    fn euler_order_yaw_then_pitch_is_pinned() {
+        let skeleton = humanoid_skeleton();
+        let mut pose = rest_pose();
+        pose[0].delta_turns = [16384, 16384, 0]; // pitch quarter + yaw quarter.
+        let mats = compose_joint_matrices(&skeleton, &pose);
+        let col1 = mats[0][1]; // the +Y basis image.
+        assert!(
+            (col1[0] - 1.0).abs() < 2e-5 && col1[1].abs() < 2e-5 && col1[2].abs() < 2e-5,
+            "R_yaw · R_pitch maps +Y to +X: {col1:?} (a different Euler order \
+             or a transposed core moves this)"
+        );
+    }
+
+    /// sample_pose: t=0 returns keyframe 0's pose exactly; t at a
+    /// keyframe returns it exactly; determinism.
     #[test]
     fn sample_pose_keyframe_exact() {
         let clip = walk_clip();
-
-        // t=0 returns keyframe 0 exactly.
         let pose = sample_pose(&clip, 0.0);
         assert_eq!(pose, clip.keyframes[0].pose, "t=0 returns keyframe 0");
-
-        // At a keyframe time, return that keyframe exactly.
         for (i, kf) in clip.keyframes.iter().enumerate() {
             let pose = sample_pose(&clip, kf.time);
             assert_eq!(pose, kf.pose, "t={} returns keyframe {}", kf.time, i);
         }
-
-        // Determinism: two calls byte-equal.
         let a = sample_pose(&clip, 0.5);
         let b = sample_pose(&clip, 0.5);
         assert_eq!(a, b, "determinism");
     }
 
-    /// Turn interpolation: the lerped turn at alpha 0.5 between two
-    /// keyframes is the rounded midpoint; rounding is ties-away; values
-    /// stay in [0, 65535].
-    /// This test uses the actual walk_clip() which has sufficient data.
+    /// The seam: the loop is CONTINUOUS through the wrap — the left
+    /// limit (t → duration⁻, where the kf7→kf0 interpolation is
+    /// nearly complete) and the right limit (t → 0⁺) both converge
+    /// to keyframe 0's pose, within the interpolation's rounding.
     #[test]
-    fn turn_interpolation() {
+    fn sample_pose_seam_continuity() {
         let clip = walk_clip();
-
-        // Check that turns at t=0.55 (middle of clip) are interpolated values.
-        // At t=0.55, we should be between keyframe 4 and keyframe 0 (wrap).
-        // For simplicity, check that turn values are in valid range.
-        let _pose = sample_pose(&clip, 0.55);
-        for _j in 0..HUMANOID_JOINTS {
-            for _k in 0..3 {
-                // Turn values should be in valid range [0, 65535].
-                // u16 is always <= 65535, so we just verify the type constraint.
+        // ε = 1e-6 s: the residual interpolation left in the wrap is
+        // under 0.02 turn units at the table's largest swing (2085),
+        // so the rounded sample equals keyframe 0 exactly.
+        let before = sample_pose(&clip, 1.1 - 1e-6);
+        let after = sample_pose(&clip, 1e-6);
+        let kf0 = clip.keyframes[0].pose;
+        for j in 0..HUMANOID_JOINTS {
+            for k in 0..3 {
+                assert!(
+                    (before[j].delta_turns[k] - kf0[j].delta_turns[k]).abs() <= 1,
+                    "seam-before at joint {j} axis {k}: the left limit converges to keyframe 0"
+                );
+                assert!(
+                    (after[j].delta_turns[k] - kf0[j].delta_turns[k]).abs() <= 1,
+                    "seam-after at joint {j} axis {k}"
+                );
+            }
+            for axis in 0..3 {
+                assert!(
+                    (before[j].delta_pos[axis] - kf0[j].delta_pos[axis]).abs() < 1e-3
+                        && (after[j].delta_pos[axis] - kf0[j].delta_pos[axis]).abs() < 1e-3,
+                    "seam delta_pos at joint {j} axis {axis}"
+                );
             }
         }
     }
 
-    /// compose_joint_matrices: at the all-zero pose, every joint's world
-    /// matrix is translate(bind_world_j); a rotated hip propagates to
-    /// the child; chain composition known answer.
+    /// Turn interpolation on a synthetic two-keyframe clip: the
+    /// midpoint is the rounded midpoint; quarter points; ties round
+    /// AWAY from zero; sign crossings go through zero the SHORT way.
     #[test]
-    fn compose_joint_matrices_rest_and_propagation() {
-        let skeleton = humanoid_skeleton();
-        let zero_pose = [JointPose {
-            delta_pos: [0.0; 3],
-            delta_turns: [0; 3],
-        }; HUMANOID_JOINTS];
-        let mats = compose_joint_matrices(&skeleton, &zero_pose);
+    fn turn_interpolation_known_answers() {
+        let kf = |time: f32, pitch: i16| {
+            let mut pose = rest_pose();
+            pose[7].delta_turns = [pitch, 0, 0];
+            Keyframe { time, pose }
+        };
+        let keyframes: &'static [Keyframe] =
+            Box::leak([kf(0.0, 0), kf(1.0, 16384)].to_vec().into_boxed_slice());
+        let clip = Clip {
+            duration: 2.0,
+            keyframes,
+        };
+        // t=0.5: alpha 0.5 → the rounded midpoint 8192.
+        assert_eq!(sample_pose(&clip, 0.5)[7].delta_turns[0], 8192);
+        // t=0.25: alpha 0.25 → 4096.
+        assert_eq!(sample_pose(&clip, 0.25)[7].delta_turns[0], 4096);
+        // t=1.5 (the wrap bracket, kf1 → kf0): alpha 0.5 → 8192.
+        assert_eq!(sample_pose(&clip, 1.5)[7].delta_turns[0], 8192);
 
-        // At rest, each joint's world matrix should be a pure translation.
-        // The rotation part should be exactly identity.
+        // Ties away from zero: 0 → 1 over alpha 0.5 lands at 0.5,
+        // which rounds to 1.
+        let keyframes: &'static [Keyframe] =
+            Box::leak([kf(0.0, 0), kf(1.0, 1)].to_vec().into_boxed_slice());
+        let clip = Clip {
+            duration: 2.0,
+            keyframes,
+        };
+        assert_eq!(sample_pose(&clip, 0.5)[7].delta_turns[0], 1);
+
+        // A sign crossing goes through zero (the SHORT way — the
+        // zero-crossing contract's unit form).
+        let keyframes: &'static [Keyframe] =
+            Box::leak([kf(0.0, -10), kf(1.0, 10)].to_vec().into_boxed_slice());
+        let clip = Clip {
+            duration: 2.0,
+            keyframes,
+        };
+        assert_eq!(sample_pose(&clip, 0.5)[7].delta_turns[0], 0);
+        assert_eq!(sample_pose(&clip, 0.25)[7].delta_turns[0], -5);
+    }
+
+    /// THE ZERO-CROSSING PIN: over the whole walk cycle at fine
+    /// resolution, every swing's turn stays within its authored
+    /// amplitude — a wrapped-value lerp (the unsigned-encoding bug)
+    /// sweeps sign crossings the long way around the turn circle
+    /// and blows these bounds out by an order of magnitude.
+    #[test]
+    fn swing_turns_stay_small_across_the_cycle() {
+        let clip = walk_clip();
+        const ULL_BOUND: i32 = 3605; // 0.055 · 65536 = 3604.5 + rounding slack.
+        const UAL_BOUND: i32 = 2950; // 0.045 · 65536 = 2949.1.
+        const YAW_BOUND: i32 = 525; // 0.008 · 65536 = 524.3.
+        const KNEE_BOUND: i32 = 5900; // 0.09 · 65536 = 5898.2.
+        for i in 0..220 {
+            let t = i as f32 * 1.1 / 220.0;
+            let pose = sample_pose(&clip, t);
+            let turn = |j: usize, k: usize| i32::from(pose[j].delta_turns[k]);
+            assert!(
+                turn(7, 0).abs() <= ULL_BOUND && turn(8, 0).abs() <= ULL_BOUND,
+                "t={t}: an upper-leg swing left its amplitude ({} / {}) — \
+                 the interpolation is sweeping the long way around",
+                turn(7, 0),
+                turn(8, 0)
+            );
+            assert!(
+                turn(3, 0).abs() <= UAL_BOUND && turn(4, 0).abs() <= UAL_BOUND,
+                "t={t}: an arm swing left its amplitude"
+            );
+            assert!(
+                turn(0, 1).abs() <= YAW_BOUND,
+                "t={t}: the pelvis yaw swayed out"
+            );
+            for knee in [9, 10] {
+                let value = turn(knee, 0);
+                assert!(
+                    (0..=KNEE_BOUND).contains(&value),
+                    "t={t}: knee {knee} turn {value} outside [0, {KNEE_BOUND}] — \
+                     knees flex positive-only within the amplitude"
+                );
+            }
+        }
+    }
+
+    /// The gait's left/right anti-phase and the knee complement: at
+    /// every keyframe the left and right swings are exact negatives,
+    /// and the right knee at keyframe k is the left knee at k+4
+    /// (the half-stride image).
+    #[test]
+    fn gait_anti_phase_and_knee_complement() {
+        let clip = walk_clip();
+        let n = clip.keyframes.len();
+        for (k, kf) in clip.keyframes.iter().enumerate() {
+            let pairs = [(7usize, 8usize), (3usize, 4usize)];
+            for (l, r) in pairs {
+                assert!(
+                    (kf.pose[l].delta_turns[0] + kf.pose[r].delta_turns[0]).abs() <= 1,
+                    "keyframe {k}: joints {l}/{r} are not anti-phase"
+                );
+            }
+            let half = clip.keyframes[(k + 4) % n];
+            assert_eq!(
+                kf.pose[10].delta_turns[0], half.pose[9].delta_turns[0],
+                "keyframe {k}: the right knee is not the left knee's half-stride image"
+            );
+        }
+    }
+
+    /// The knee phase: the left knee flexes only on the first
+    /// half-stride (keyframes 1-3), the right knee only on the
+    /// second (5-7), both zero at the heel strikes (0, 4) — each
+    /// knee bends during ITS OWN leg's forward swing.
+    #[test]
+    fn knee_bends_only_during_its_legs_swing() {
+        let clip = walk_clip();
+        for (k, kf) in clip.keyframes.iter().enumerate() {
+            let left = kf.pose[9].delta_turns[0];
+            let right = kf.pose[10].delta_turns[0];
+            match k {
+                1..=3 => {
+                    assert!(left > 0, "keyframe {k}: the left knee flexes mid-stride");
+                    assert_eq!(
+                        right, 0,
+                        "keyframe {k}: the right knee is straight in stance"
+                    );
+                }
+                5..=7 => {
+                    assert!(right > 0, "keyframe {k}: the right knee flexes mid-stride");
+                    assert_eq!(left, 0, "keyframe {k}: the left knee is straight in stance");
+                }
+                _ => {
+                    assert_eq!(left, 0, "keyframe {k}: the planted knee is straight");
+                    assert_eq!(right, 0, "keyframe {k}: the planted knee is straight");
+                }
+            }
+        }
+    }
+
+    /// compose_joint_matrices at rest: every joint's world matrix is
+    /// a PURE TRANSLATION to its pivot — the rotation columns are
+    /// bit-exact identity images, and the translation column equals
+    /// the chain-composed pivot.
+    #[test]
+    fn compose_rest_is_pure_translation_to_the_pivots() {
+        let skeleton = humanoid_skeleton();
+        let mats = compose_joint_matrices(&skeleton, &rest_pose());
         for (idx, mat) in mats.iter().enumerate() {
-            // Check that the rotation part (upper 3x3) is identity.
-            assert!(
-                (mat[0][0] - 1.0).abs() < 1e-5,
-                "mat[{}] col0.x = {}",
-                idx,
-                mat[0][0]
+            assert_eq!(
+                mat[0].map(f32::to_bits),
+                [1.0f32, 0.0, 0.0, 0.0].map(f32::to_bits),
+                "joint {idx}: column 0 is the +X image, bit-exact"
             );
-            assert!(
-                mat[0][1].abs() < 1e-5,
-                "mat[{}] col0.y = {}",
-                idx,
-                mat[0][1]
+            assert_eq!(
+                mat[1].map(f32::to_bits),
+                [0.0f32, 1.0, 0.0, 0.0].map(f32::to_bits),
+                "joint {idx}: column 1 is the +Y image, bit-exact"
             );
-            assert!(
-                mat[0][2].abs() < 1e-5,
-                "mat[{}] col0.z = {}",
-                idx,
-                mat[0][2]
+            assert_eq!(
+                mat[2].map(f32::to_bits),
+                [0.0f32, 0.0, 1.0, 0.0].map(f32::to_bits),
+                "joint {idx}: column 2 is the +Z image, bit-exact"
             );
-            assert!(
-                mat[1][0].abs() < 1e-5,
-                "mat[{}] col1.x = {}",
-                idx,
-                mat[1][0]
-            );
-            assert!(
-                (mat[1][1] - 1.0).abs() < 1e-5,
-                "mat[{}] col1.y = {}",
-                idx,
-                mat[1][1]
-            );
-            assert!(
-                mat[1][2].abs() < 1e-5,
-                "mat[{}] col1.z = {}",
-                idx,
-                mat[1][2]
-            );
-            assert!(
-                mat[2][0].abs() < 1e-5,
-                "mat[{}] col2.x = {}",
-                idx,
-                mat[2][0]
-            );
-            assert!(
-                mat[2][1].abs() < 1e-5,
-                "mat[{}] col2.y = {}",
-                idx,
-                mat[2][1]
-            );
-            assert!(
-                (mat[2][2] - 1.0).abs() < 1e-5,
-                "mat[{}] col2.z = {}",
-                idx,
-                mat[2][2]
-            );
+            assert_eq!(mat[3][3], 1.0);
+            let pivot = skeleton[idx].pivot;
+            for axis in 0..3 {
+                assert!(
+                    (mat[3][axis] - pivot[axis]).abs() < 1e-5,
+                    "joint {idx}: the rest translation is the pivot"
+                );
+            }
         }
+        // Two chain-derived pivots (the compose order's arithmetic):
+        // the torso's world pivot is the pelvis pivot + the local
+        // waist offset; the head's adds the neck offset.
+        assert!((mats[1][3][1] - 1.06).abs() < 1e-5, "torso pivot y");
+        assert!((mats[2][3][1] - 1.60).abs() < 1e-5, "head pivot y");
+    }
 
-        // For root (pelvis), the translation should be the pivot [0, 0.98, 0]
-        assert!((mats[0][3][0] - 0.0).abs() < 1e-5, "mat[0] trans.x");
-        assert!((mats[0][3][1] - 0.98).abs() < 1e-5, "mat[0] trans.y");
-        assert!((mats[0][3][2] - 0.0).abs() < 1e-5, "mat[0] trans.z");
-
-        // For torso (index 1), parent is pelvis (index 0)
-        // The world position is pelvis pivot + local offset = [0, 0.98, 0] + [0, 0.08, 0] = [0, 1.06, 0]
-        assert!((mats[1][3][0] - 0.0).abs() < 1e-5, "mat[1] trans.x");
-        assert!((mats[1][3][1] - 1.06).abs() < 1e-5, "mat[1] trans.y");
-        assert!((mats[1][3][2] - 0.0).abs() < 1e-5, "mat[1] trans.z");
-
-        // For head (index 2), parent is torso (index 1)
-        // The world position is torso pivot + local offset = [0, 1.06, 0] + [0, 0.54, 0] = [0, 1.60, 0]
-        assert!((mats[2][3][0] - 0.0).abs() < 1e-5, "mat[2] trans.x");
-        assert!((mats[2][3][1] - 1.60).abs() < 1e-5, "mat[2] trans.y");
-        assert!((mats[2][3][2] - 0.0).abs() < 1e-5, "mat[2] trans.z");
-
-        // Test propagation: a 90° yaw at the pelvis makes the head's world
-        // offset point along the rotated axis.
-        let mut pose = zero_pose;
-        pose[0].delta_turns = [0, 16384, 0]; // 90° yaw at pelvis
+    /// THE CHAIN-ORDER PIN: parent_first composition. A quarter
+    /// pitch at the TORSO rotates the head's offset from the torso
+    /// (0, 0.54, 0) to (0, 0, 0.54) — the head's world translation
+    /// becomes the torso pivot plus that rotated offset. A
+    /// local-first multiply order instead rotates the torso's own
+    /// offset too and moves the head somewhere else entirely.
+    #[test]
+    fn chain_composes_parent_then_local() {
+        let skeleton = humanoid_skeleton();
+        let mut pose = rest_pose();
+        pose[1].delta_turns = [16384, 0, 0]; // quarter pitch at the torso.
         let mats = compose_joint_matrices(&skeleton, &pose);
-
-        // The head's world position after 90° yaw about pelvis.
-        // Head pivot relative to pelvis: [0.0, 1.60 - 0.98, 0.0] = [0.0, 0.62, 0.0].
-        // After 90° yaw about pelvis (0, 0, 0): [0.0, 0.62, 0.0] stays at [0.0, 0.62, 0.0]
-        // because it's on the Y-axis (the rotation axis).
-        // Actually, the head is at [0, 1.60] in world space at rest.
-        // After 90° yaw, since it's on Y-axis, it stays at [0, 1.60, 0].
-        println!(
-            "Head world position after pelvis yaw: ({:.6}, {:.6}, {:.6})",
-            mats[2][3][0], mats[2][3][1], mats[2][3][2]
-        );
-        assert!(mats[2][3][0].abs() < 1e-4, "head x after pelvis yaw");
+        let head = mats[2][3];
         assert!(
-            (mats[2][3][1] - 1.60).abs() < 1e-4,
-            "head y after pelvis yaw"
+            head[0].abs() < 2e-5 && (head[1] - 1.06).abs() < 2e-5 && (head[2] - 0.54).abs() < 2e-5,
+            "the head after a torso pitch: {head:?} — expected the torso pivot \
+             (0, 1.06, 0) plus the rotated (0, 0.54, 0) offset, i.e. (0, 1.06, 0.54)"
         );
-        assert!(mats[2][3][2].abs() < 1e-4, "head z after pelvis yaw");
+
+        // A quarter yaw at the pelvis swings the left shoulder
+        // (pivot offset (-0.21, 0.60, 0) from the pelvis) to
+        // (0, 0.60, +0.21): +X maps to −Z, so −X maps to +Z.
+        let mut pose = rest_pose();
+        pose[0].delta_turns = [0, 16384, 0];
+        let mats = compose_joint_matrices(&skeleton, &pose);
+        let shoulder = mats[3][3];
+        assert!(
+            shoulder[0].abs() < 2e-5
+                && (shoulder[1] - 1.58).abs() < 2e-5
+                && (shoulder[2] - 0.21).abs() < 2e-5,
+            "the left shoulder after a pelvis yaw: {shoulder:?}"
+        );
     }
 
-    /// skin_matrices: THE REST IDENTITY — at the zero pose every skin
-    /// matrix is BIT-EXACT identity.
+    /// THE REST-IDENTITY PIN (the pixel-perfect promise): at the
+    /// zero pose every skin matrix is BIT-EXACT identity. This is
+    /// the property that lets the skinned path render the authored
+    /// mesh byte-identically at rest — the Stage-2 gates lean on it.
     #[test]
-    fn skin_matrices_rest_identity() {
+    fn skin_matrices_rest_identity_is_bit_exact() {
         let skeleton = humanoid_skeleton();
-        let zero_pose = [JointPose {
-            delta_pos: [0.0; 3],
-            delta_turns: [0; 3],
-        }; HUMANOID_JOINTS];
-        let joint_worlds = compose_joint_matrices(&skeleton, &zero_pose);
+        let joint_worlds = compose_joint_matrices(&skeleton, &rest_pose());
         let skin_mats = skin_matrices(&joint_worlds, &skeleton);
-
-        // Each skin matrix should be exactly identity.
+        let identity = [
+            [1.0f32, 0.0, 0.0, 0.0],
+            [0.0f32, 1.0, 0.0, 0.0],
+            [0.0f32, 0.0, 1.0, 0.0],
+            [0.0f32, 0.0, 0.0, 1.0],
+        ];
         for (idx, mat) in skin_mats.iter().enumerate() {
-            assert!(
-                (mat[0][0] - 1.0).abs() < 1e-10,
-                "skin_mat[{}] col0.x = {}",
-                idx,
-                mat[0][0]
-            );
-            assert!(
-                mat[0][1].abs() < 1e-10,
-                "skin_mat[{}] col0.y = {}",
-                idx,
-                mat[0][1]
-            );
-            assert!(
-                mat[0][2].abs() < 1e-10,
-                "skin_mat[{}] col0.z = {}",
-                idx,
-                mat[0][2]
-            );
-            assert!(
-                mat[0][3].abs() < 1e-10,
-                "skin_mat[{}] col0.w = {}",
-                idx,
-                mat[0][3]
-            );
-
-            assert!(
-                mat[1][0].abs() < 1e-10,
-                "skin_mat[{}] col1.x = {}",
-                idx,
-                mat[1][0]
-            );
-            assert!(
-                (mat[1][1] - 1.0).abs() < 1e-10,
-                "skin_mat[{}] col1.y = {}",
-                idx,
-                mat[1][1]
-            );
-            assert!(
-                mat[1][2].abs() < 1e-10,
-                "skin_mat[{}] col1.z = {}",
-                idx,
-                mat[1][2]
-            );
-            assert!(
-                mat[1][3].abs() < 1e-10,
-                "skin_mat[{}] col1.w = {}",
-                idx,
-                mat[1][3]
-            );
-
-            assert!(
-                mat[2][0].abs() < 1e-10,
-                "skin_mat[{}] col2.x = {}",
-                idx,
-                mat[2][0]
-            );
-            assert!(
-                mat[2][1].abs() < 1e-10,
-                "skin_mat[{}] col2.y = {}",
-                idx,
-                mat[2][1]
-            );
-            assert!(
-                (mat[2][2] - 1.0).abs() < 1e-10,
-                "skin_mat[{}] col2.z = {}",
-                idx,
-                mat[2][2]
-            );
-            assert!(
-                mat[2][3].abs() < 1e-10,
-                "skin_mat[{}] col2.w = {}",
-                idx,
-                mat[2][3]
-            );
-
-            assert!(
-                mat[3][0].abs() < 1e-10,
-                "skin_mat[{}] col3.x = {}",
-                idx,
-                mat[3][0]
-            );
-            assert!(
-                mat[3][1].abs() < 1e-10,
-                "skin_mat[{}] col3.y = {}",
-                idx,
-                mat[3][1]
-            );
-            assert!(
-                mat[3][2].abs() < 1e-10,
-                "skin_mat[{}] col3.z = {}",
-                idx,
-                mat[3][2]
-            );
-            assert!(
-                (mat[3][3] - 1.0).abs() < 1e-10,
-                "skin_mat[{}] col3.w = {}",
-                idx,
-                mat[3][3]
-            );
+            for col in 0..4 {
+                assert_eq!(
+                    mat[col].map(f32::to_bits),
+                    identity[col].map(f32::to_bits),
+                    "skin matrix {idx} column {col} is not bit-exact identity — \
+                     the rest-pose pixel-identity promise is broken"
+                );
+            }
         }
     }
 
-    /// skin_vertex: a rigid vertex follows its joint exactly; weights sum
-    /// to one; zero-weight terms vanish exactly.
+    /// skin_vertex: a rigid vertex follows its joint's transform
+    /// EXACTLY (the hand-rotated known answer), and the shipped
+    /// mesh's weights sum to one.
     #[test]
-    fn skin_vertex_rigid_follows_joint() {
+    fn skin_vertex_rigid_follows_its_joint() {
         let skeleton = humanoid_skeleton();
-        let zero_pose = [JointPose {
-            delta_pos: [0.0; 3],
-            delta_turns: [0; 3],
-        }; HUMANOID_JOINTS];
-        let joint_worlds = compose_joint_matrices(&skeleton, &zero_pose);
+        let mut pose = rest_pose();
+        pose[7].delta_turns = [16384, 0, 0]; // quarter pitch, left hip.
+        let joint_worlds = compose_joint_matrices(&skeleton, &pose);
         let skin_mats = skin_matrices(&joint_worlds, &skeleton);
 
-        // Get a vertex from the upper leg box.
+        // A mesh vertex of the left upper-leg box (emission box 7).
         let mesh = skinned_humanoid_mesh();
-        let v = &mesh[36]; // First vertex of box 1 (torso).
+        let v = &mesh[7 * 36];
+        assert_eq!(v.joints[0], 7, "the vertex is rigid to joint 7");
+        let (pos, _) = skin_vertex(v, &skin_mats);
+        // The independent hand answer: M_7 · v = pivot + R_quarter ·
+        // (v − pivot), and quarter pitch maps (x, y, z) → (x, −z, y).
+        let pivot = skeleton[7].pivot;
+        let d = [
+            v.pos[0] - pivot[0],
+            v.pos[1] - pivot[1],
+            v.pos[2] - pivot[2],
+        ];
+        let expected = [pivot[0] + d[0], pivot[1] + (-d[2]), pivot[2] + d[1]];
+        for axis in 0..3 {
+            assert!(
+                (pos[axis] - expected[axis]).abs() < 2e-5,
+                "axis {axis}: {pos:?} vs the hand rotation {expected:?}"
+            );
+        }
 
-        // At rest, skinning should return the original position.
-        let (skinned_pos, _) = skin_vertex(v, &skin_mats);
-        assert!(
-            (skinned_pos[0] - v.pos[0]).abs() < 1e-5,
-            "skinned_pos.x matches"
-        );
-        assert!(
-            (skinned_pos[1] - v.pos[1]).abs() < 1e-5,
-            "skinned_pos.y matches"
-        );
-        assert!(
-            (skinned_pos[2] - v.pos[2]).abs() < 1e-5,
-            "skinned_pos.z matches"
-        );
-
-        // Weights sum to 1.0.
-        for vertex in &mesh {
-            let sum = vertex.weights[0] + vertex.weights[1] + vertex.weights[2] + vertex.weights[3];
-            assert!((sum - 1.0).abs() < 1e-5, "weights sum to 1.0: {}", sum);
+        // At rest, the identity skinning returns the authored vertex.
+        let joint_worlds = compose_joint_matrices(&skeleton, &rest_pose());
+        let skin_mats = skin_matrices(&joint_worlds, &skeleton);
+        for v in mesh.iter().step_by(37) {
+            let (pos, normal) = skin_vertex(v, &skin_mats);
+            for axis in 0..3 {
+                assert!((pos[axis] - v.pos[axis]).abs() < 1e-6, "rest pos identity");
+                assert!(
+                    (normal[axis] - v.normal[axis]).abs() < 1e-6,
+                    "rest normal identity"
+                );
+            }
+        }
+        // The weights sum to one on the whole shipped mesh.
+        for (i, v) in mesh.iter().enumerate() {
+            let sum: f32 = v.weights.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-6, "vertex {i}: weights sum to 1.0");
         }
     }
 
-    /// skinned_humanoid_mesh: 396 vertices; pos/normal/uv bits byte-identical
-    /// to humanoid_mesh() in the same order; every joints[0] == BOX_JOINT[v/36];
-    /// weights rigid; SkinnedVertex size is 64.
+    /// The blended form of the equation: a vertex split between two
+    /// differently-rotated joints lands at the weighted sum of the
+    /// two rigid results, evaluated in the same fixed term order.
+    #[test]
+    fn skin_vertex_blended_is_the_weighted_sum() {
+        let skeleton = humanoid_skeleton();
+        let mut pose = rest_pose();
+        pose[7].delta_turns = [16384, 0, 0]; // left hip quarter pitch.
+        pose[8].delta_turns = [-8192, 0, 0]; // right hip eighth back.
+        let joint_worlds = compose_joint_matrices(&skeleton, &pose);
+        let skin_mats = skin_matrices(&joint_worlds, &skeleton);
+
+        let pos = [-0.02, 0.60, 0.03]; // between the two hips, below them
+        let rigid = |joint: u32| SkinnedVertex {
+            pos,
+            normal: [0.0, -1.0, 0.0],
+            uv: [0.0; 2],
+            joints: [joint, 0, 0, 0],
+            weights: [1.0, 0.0, 0.0, 0.0],
+        };
+        let (p7, _) = skin_vertex(&rigid(7), &skin_mats);
+        let (p8, _) = skin_vertex(&rigid(8), &skin_mats);
+        let blended = SkinnedVertex {
+            pos,
+            normal: [0.0, -1.0, 0.0],
+            uv: [0.0; 2],
+            joints: [7, 8, 0, 0],
+            weights: [0.25, 0.75, 0.0, 0.0],
+        };
+        let (pb, _) = skin_vertex(&blended, &skin_mats);
+        for axis in 0..3 {
+            let expected = 0.25 * p7[axis] + 0.75 * p8[axis];
+            assert!(
+                (pb[axis] - expected).abs() < 1e-6,
+                "axis {axis}: the blend {pb:?} is the weighted sum of {p7:?} and {p8:?}"
+            );
+        }
+        // And it lies between the two rigid results on each axis
+        // where they differ.
+        assert!(pb[2] >= p7[2].min(p8[2]) - 1e-6 && pb[2] <= p7[2].max(p8[2]) + 1e-6);
+    }
+
+    /// skinned_humanoid_mesh: 396 vertices; pos/normal/uv bits
+    /// byte-identical to humanoid_mesh() in the same order (the
+    /// derivation-is-faithful pin); rigid binding to the emission
+    /// box's joint; the 64-byte layout with joints at 32 and weights
+    /// at 48.
     #[test]
     fn skinned_humanoid_mesh_structure() {
         let skinned = skinned_humanoid_mesh();
         let unskinned = crate::populated_meshes::humanoid_mesh();
 
-        assert_eq!(skinned.len(), 396, "396 vertices");
-        assert_eq!(skinned.len(), unskinned.len(), "same count as unskinned");
-
-        // pos/normal/uv bits byte-identical.
+        assert_eq!(skinned.len(), 396, "11 boxes x 36 vertices");
+        assert_eq!(skinned.len(), unskinned.len());
         for (s, u) in skinned.iter().zip(unskinned.iter()) {
-            // Compare f32 bits one by one since arrays don't have to_le_bytes
             for i in 0..3 {
-                assert_eq!(
-                    s.pos[i].to_bits(),
-                    u.pos[i].to_bits(),
-                    "pos[{}] bytes match",
-                    i
-                );
-                assert_eq!(
-                    s.normal[i].to_bits(),
-                    u.normal[i].to_bits(),
-                    "normal[{}] bytes match",
-                    i
-                );
+                assert_eq!(s.pos[i].to_bits(), u.pos[i].to_bits(), "pos bits");
+                assert_eq!(s.normal[i].to_bits(), u.normal[i].to_bits(), "normal bits");
             }
             for i in 0..2 {
-                assert_eq!(
-                    s.uv[i].to_bits(),
-                    u.uv[i].to_bits(),
-                    "uv[{}] bytes match",
-                    i
+                assert_eq!(s.uv[i].to_bits(), u.uv[i].to_bits(), "uv bits");
+            }
+        }
+        for (i, v) in skinned.iter().enumerate() {
+            let expected = BOX_JOINT[i / 36] as u32;
+            assert_eq!(v.joints, [expected, 0, 0, 0], "vertex {i} is rigid");
+            assert_eq!(v.weights, [1.0, 0.0, 0.0, 0.0]);
+        }
+        assert_eq!(std::mem::size_of::<SkinnedVertex>(), 64);
+        assert_eq!(std::mem::offset_of!(SkinnedVertex, joints), 32);
+        assert_eq!(std::mem::offset_of!(SkinnedVertex, weights), 48);
+    }
+
+    /// posed_box_bounds: at rest, every box's bounds equal its
+    /// authored HUMANOID_BOXES entry; under a quarter pelvis yaw the
+    /// torso box's world bounds SWAP its x and z extents (the yaw
+    /// exchanges the horizontal axes; the box's center sits on the
+    /// rotation axis).
+    #[test]
+    fn posed_box_bounds_rest_and_under_rotation() {
+        let skeleton = humanoid_skeleton();
+        let joint_worlds = compose_joint_matrices(&skeleton, &rest_pose());
+        let skin_mats = skin_matrices(&joint_worlds, &skeleton);
+        for (box_idx, &(expected_lo, expected_hi)) in HUMANOID_BOXES.iter().enumerate() {
+            let (lo, hi) = posed_box_bounds(&skin_mats, box_idx);
+            for axis in 0..3 {
+                assert!(
+                    (lo[axis] - expected_lo[axis]).abs() < 1e-5
+                        && (hi[axis] - expected_hi[axis]).abs() < 1e-5,
+                    "box {box_idx} axis {axis}: rest bounds are the authored box"
                 );
             }
         }
 
-        // joints[0] == BOX_JOINT[v/36].
-        for (i, v) in skinned.iter().enumerate() {
-            let expected_joint = BOX_JOINT[i / 36] as u32;
-            assert_eq!(v.joints[0], expected_joint, "joints[0] at vertex {}", i);
-            assert_eq!(v.joints[1], 0, "joints[1] = 0");
-            assert_eq!(v.joints[2], 0, "joints[2] = 0");
-            assert_eq!(v.joints[3], 0, "joints[3] = 0");
-            assert!((v.weights[0] - 1.0).abs() < 1e-5, "weight[0] = 1.0");
-            assert!(v.weights[1].abs() < 1e-5, "weight[1] = 0.0");
-            assert!(v.weights[2].abs() < 1e-5, "weight[2] = 0.0");
-            assert!(v.weights[3].abs() < 1e-5, "weight[3] = 0.0");
-        }
-
-        // Size check: 3×f32 + 3×f32 + 2×f32 + 4×u32 + 4×f32 = 12 + 12 + 8 + 16 + 16 = 64 bytes.
-        assert_eq!(
-            std::mem::size_of::<SkinnedVertex>(),
-            64,
-            "SkinnedVertex size"
+        let mut pose = rest_pose();
+        pose[0].delta_turns = [0, 16384, 0];
+        let joint_worlds = compose_joint_matrices(&skeleton, &pose);
+        let skin_mats = skin_matrices(&joint_worlds, &skeleton);
+        // The torso box (emission index 1): x ∈ [−0.21, 0.21],
+        // z ∈ [−0.12, 0.12] at rest. After the quarter yaw the
+        // horizontal extents exchange: x ∈ [−0.12, 0.12],
+        // z ∈ [−0.21, 0.21]; y is untouched (the yaw axis).
+        let (lo, hi) = posed_box_bounds(&skin_mats, 1);
+        assert!(
+            (lo[0] + 0.12).abs() < 2e-5 && (hi[0] - 0.12).abs() < 2e-5,
+            "x extent swaps"
+        );
+        assert!(
+            (lo[2] + 0.21).abs() < 2e-5 && (hi[2] - 0.21).abs() < 2e-5,
+            "z extent swaps"
+        );
+        assert!(
+            (lo[1] - 1.06).abs() < 2e-5 && (hi[1] - 1.60).abs() < 2e-5,
+            "y untouched"
         );
     }
 
-    /// posed_box_bounds: at rest, the bounds equal the authored HUMANOID_BOXES;
-    /// under a 90° pelvis yaw the bounds swap x/z extents for the leg boxes.
+    /// pack_pose_bytes / repack_poses: determinism; the retained
+    /// repack equals the concatenated per-block packs; the capacity
+    /// refusal is ATOMIC (the prior frame's bytes survive a
+    /// refusal); the retained buffer reuses its capacity once
+    /// warmed (the F-05 discipline).
     #[test]
-    fn posed_box_bounds_rest() {
+    fn pose_packing_discipline() {
         let skeleton = humanoid_skeleton();
-        let zero_pose = [JointPose {
-            delta_pos: [0.0; 3],
-            delta_turns: [0; 3],
-        }; HUMANOID_JOINTS];
-        let joint_worlds = compose_joint_matrices(&skeleton, &zero_pose);
-        let skin_mats = skin_matrices(&joint_worlds, &skeleton);
+        let mut pose = rest_pose();
+        pose[7].delta_turns = [16384, 0, 0];
+        let joint_worlds = compose_joint_matrices(&skeleton, &pose);
+        let posed = skin_matrices(&joint_worlds, &skeleton);
+        let rest = rest_pose_block();
 
-        for (box_idx, &(expected_lo, expected_hi)) in HUMANOID_BOXES.iter().enumerate() {
-            let (lo, hi) = posed_box_bounds(&skin_mats, box_idx);
+        let bytes1 = pack_pose_bytes(&posed);
+        let bytes2 = pack_pose_bytes(&posed);
+        assert_eq!(bytes1, bytes2, "packing determinism");
+        assert_eq!(bytes1.len(), POSE_STRIDE);
 
-            assert!(
-                (lo[0] - expected_lo[0]).abs() < 1e-5,
-                "box {} lo.x",
-                box_idx
-            );
-            assert!(
-                (lo[1] - expected_lo[1]).abs() < 1e-5,
-                "box {} lo.y",
-                box_idx
-            );
-            assert!(
-                (lo[2] - expected_lo[2]).abs() < 1e-5,
-                "box {} lo.z",
-                box_idx
-            );
-            assert!(
-                (hi[0] - expected_hi[0]).abs() < 1e-5,
-                "box {} hi.x",
-                box_idx
-            );
-            assert!(
-                (hi[1] - expected_hi[1]).abs() < 1e-5,
-                "box {} hi.y",
-                box_idx
-            );
-            assert!(
-                (hi[2] - expected_hi[2]).abs() < 1e-5,
-                "box {} hi.z",
-                box_idx
-            );
-        }
-    }
-
-    /// pack_pose_bytes / repack_poses: determinism; the retained repack
-    /// equals the concatenated per-block packs; capacity refusal is atomic.
-    #[test]
-    fn pack_pose_bytes_determinism() {
-        let skeleton = humanoid_skeleton();
-        let zero_pose = [JointPose {
-            delta_pos: [0.0; 3],
-            delta_turns: [0; 3],
-        }; HUMANOID_JOINTS];
-        let joint_worlds = compose_joint_matrices(&skeleton, &zero_pose);
-        let skin_mats = skin_matrices(&joint_worlds, &skeleton);
-
-        // Determinism.
-        let bytes1 = pack_pose_bytes(&skin_mats);
-        let bytes2 = pack_pose_bytes(&skin_mats);
-        assert_eq!(bytes1, bytes2, "pack_pose_bytes determinism");
-
-        // Repack equals concatenated packs.
         let mut buffer = Vec::new();
-        let blocks = [&skin_mats, &skin_mats];
-        repack_poses(&mut buffer, &blocks).unwrap();
-
-        let expected: Vec<u8> = pack_pose_bytes(&skin_mats)
+        repack_poses(&mut buffer, &[rest, posed]).unwrap();
+        let expected: Vec<u8> = pack_pose_bytes(&rest)
             .iter()
-            .chain(pack_pose_bytes(&skin_mats).iter())
+            .chain(pack_pose_bytes(&posed).iter())
             .copied()
             .collect();
-        assert_eq!(buffer, expected, "repack equals concatenated");
+        assert_eq!(buffer, expected, "the repack is the concatenated packs");
+        assert_eq!(buffer.len(), 2 * POSE_STRIDE);
 
-        // Capacity refusal.
-        let mut buffer = Vec::new();
-        let big_blocks = vec![&skin_mats; MAX_POSE_BLOCKS + 1];
+        // The refusal is atomic: over-capacity leaves the prior bytes.
+        let prior = buffer.clone();
+        let over: Vec<_> = vec![rest; MAX_POSE_BLOCKS + 1];
         assert_eq!(
-            repack_poses(&mut buffer, &big_blocks),
+            repack_poses(&mut buffer, &over),
             Err(PosePackError::Capacity {
                 capacity: MAX_POSE_BLOCKS,
                 requested: MAX_POSE_BLOCKS + 1
             })
         );
+        assert_eq!(buffer, prior, "the refusal left the prior frame intact");
+
+        // The retained buffer never grows once warmed.
+        let warmed = buffer.capacity();
+        for _ in 0..3 {
+            repack_poses(&mut buffer, &[rest, posed]).unwrap();
+            assert_eq!(buffer.capacity(), warmed, "no reallocation once warmed");
+        }
+        repack_poses(&mut buffer, &[rest]).unwrap();
+        assert_eq!(
+            buffer.capacity(),
+            warmed,
+            "a smaller pack keeps the capacity"
+        );
+        assert_eq!(buffer.len(), POSE_STRIDE);
     }
 
-    /// rest_pose_block: equals skin_matrices at the zero pose, bit-exact.
+    /// rest_pose_block: equals skin_matrices at the zero pose,
+    /// bit-exact.
     #[test]
     fn rest_pose_block_equals_skin_matrices() {
         let skeleton = humanoid_skeleton();
-        let zero_pose = [JointPose {
-            delta_pos: [0.0; 3],
-            delta_turns: [0; 3],
-        }; HUMANOID_JOINTS];
-        let joint_worlds = compose_joint_matrices(&skeleton, &zero_pose);
+        let joint_worlds = compose_joint_matrices(&skeleton, &rest_pose());
         let expected = skin_matrices(&joint_worlds, &skeleton);
-        let actual = rest_pose_block();
-
-        assert_eq!(
-            expected, actual,
-            "rest_pose_block equals skin_matrices at zero pose"
-        );
+        assert_eq!(rest_pose_block(), expected);
     }
 
-    /// walk_clip structure: duration 1.1; 8 keyframes; times strictly
-    /// increasing, first is 0.0, last < duration; knee turns only positive;
-    /// left/right upper legs anti-phase; head all zeros; pelvis bob double
-    /// frequency.
+    /// walk_clip structure: duration 1.1; 8 keyframes; strictly
+    /// increasing times, first at 0.0, last < duration; the pelvis
+    /// bobs at double frequency (low at the heel strikes, high at
+    /// mid-stance); the head is steady; and the amplitude formulas
+    /// are pinned at their 45° marks (the table-is-the-formula
+    /// check — a mis-slotted keyframe fails here).
     #[test]
     fn walk_clip_structure() {
         let clip = walk_clip();
-
-        assert!((clip.duration - 1.1).abs() < 1e-5, "duration = 1.1");
-        assert_eq!(clip.keyframes.len(), 8, "8 keyframes");
-
-        // Times strictly increasing.
+        assert!((clip.duration - 1.1).abs() < 1e-5);
+        assert_eq!(clip.keyframes.len(), 8);
         for i in 1..clip.keyframes.len() {
             assert!(
                 clip.keyframes[i].time > clip.keyframes[i - 1].time,
-                "time {} > {}",
-                i,
-                i - 1
+                "times strictly increasing"
             );
         }
-        assert!(clip.keyframes[0].time == 0.0, "first keyframe at t=0");
-        assert!(
-            clip.keyframes[clip.keyframes.len() - 1].time < clip.duration,
-            "last keyframe < duration"
-        );
+        assert_eq!(clip.keyframes[0].time, 0.0);
+        assert!(clip.keyframes[7].time < clip.duration);
 
-        // Knee turns only positive.
+        // The pelvis vault: low (−0.02) at the heel strikes (φ = 0,
+        // 180), high (+0.02) at mid-stance (φ = 90, 270).
+        for k in [0, 4] {
+            assert_eq!(
+                clip.keyframes[k].pose[0].delta_pos[1], -0.02,
+                "heel-strike low"
+            );
+        }
+        for k in [2, 6] {
+            assert_eq!(
+                clip.keyframes[k].pose[0].delta_pos[1], 0.02,
+                "mid-stance high"
+            );
+        }
+        for k in [1, 3, 5, 7] {
+            assert_eq!(
+                clip.keyframes[k].pose[0].delta_pos[1], 0.0,
+                "the zero crossing"
+            );
+        }
+
+        // The head is steady everywhere.
         for kf in clip.keyframes.iter() {
-            for j in [9, 10] {
-                for k in 0..3 {
-                    let turn = kf.pose[j].delta_turns[k];
-                    assert!(
-                        turn <= 32768,
-                        "knee turn {} axis {} at keyframe {} is {} (max 32768)",
-                        j,
-                        k,
-                        kf.time,
-                        turn
-                    );
+            assert_eq!(
+                kf.pose[2],
+                JointPose {
+                    delta_pos: [0.0; 3],
+                    delta_turns: [0; 3]
                 }
-            }
-        }
-
-        // Left/right upper legs anti-phase: joint 7's turn ≈ -joint 8's turn.
-        for kf in clip.keyframes.iter() {
-            let turn7 = kf.pose[7].delta_turns[0] as i16;
-            let turn8 = kf.pose[8].delta_turns[0] as i16;
-            // The turns should be approximately opposite.
-            // Check that turn7 + turn8 ≈ 0 (within some tolerance for rounding).
-            let sum = (turn7 + turn8).abs();
-            assert!(
-                sum <= 2,
-                "left/right upper legs anti-phase at t={}: {} vs {} (sum={})",
-                kf.time,
-                turn7,
-                turn8,
-                sum
             );
         }
 
-        // Head all zeros.
-        for kf in clip.keyframes.iter() {
-            for j in 0..3 {
-                assert!(
-                    kf.pose[2].delta_turns[j] == 0,
-                    "head turn {} at t={}",
-                    j,
-                    kf.time
+        // The formula pins at the 45° marks: the left leg's swing is
+        // −0.055·sin(45°), the left knee +0.09·sin(45°), the pelvis
+        // yaw +0.008·sin(45°), the left arm +0.045·sin(45°).
+        let sin45 = core::f32::consts::FRAC_1_SQRT_2;
+        let kf = &clip.keyframes[1];
+        let expect = |fraction: f32| (fraction * 65536.0) as i16;
+        assert_eq!(
+            kf.pose[7].delta_turns[0],
+            expect(-0.055 * sin45),
+            "the 45° leg swing"
+        );
+        assert_eq!(
+            kf.pose[9].delta_turns[0],
+            expect(0.09 * sin45),
+            "the 45° knee"
+        );
+        assert_eq!(
+            kf.pose[0].delta_turns[1],
+            expect(0.008 * sin45),
+            "the 45° pelvis yaw"
+        );
+        assert_eq!(
+            kf.pose[3].delta_turns[0],
+            expect(0.045 * sin45),
+            "the 45° arm swing"
+        );
+        // The mid-swing extremes at φ = 90°.
+        let kf = &clip.keyframes[2];
+        assert_eq!(
+            kf.pose[7].delta_turns[0],
+            expect(-0.055),
+            "the max forward reach"
+        );
+        assert_eq!(
+            kf.pose[9].delta_turns[0],
+            expect(0.09),
+            "the max knee flexion"
+        );
+        // The heel strikes are the all-zero limb pose.
+        for k in [0, 4] {
+            let kf = &clip.keyframes[k];
+            for j in [3, 4, 7, 8, 9, 10] {
+                assert_eq!(
+                    kf.pose[j].delta_turns,
+                    [0, 0, 0],
+                    "heel strike {k} joint {j}"
                 );
             }
-            assert!(
-                kf.pose[2].delta_pos[0].abs() < 1e-5,
-                "head pos.x at t={}",
-                kf.time
-            );
-            assert!(
-                kf.pose[2].delta_pos[1].abs() < 1e-5,
-                "head pos.y at t={}",
-                kf.time
-            );
-            assert!(
-                kf.pose[2].delta_pos[2].abs() < 1e-5,
-                "head pos.z at t={}",
-                kf.time
-            );
         }
-
-        // Pelvis bob double frequency: at t=0 and t=0.55, the pelvis y should be +0.02.
-        let kf0 = &clip.keyframes[0];
-        let kf4 = &clip.keyframes[4];
-        assert!(
-            (kf0.pose[0].delta_pos[1] - 0.02).abs() < 1e-5,
-            "pelvis y at t=0"
-        );
-        assert!(
-            (kf4.pose[0].delta_pos[1] - 0.02).abs() < 1e-5,
-            "pelvis y at t=0.55"
-        );
     }
 
-    /// pose_sequence_digest: determinism across calls.
+    /// pose_sequence_digest: deterministic across calls.
     #[test]
     fn pose_sequence_digest_determinism() {
         let clip = walk_clip();
         let skeleton = humanoid_skeleton();
-
-        let digest1 = pose_sequence_digest(&clip, &skeleton, 64);
-        let digest2 = pose_sequence_digest(&clip, &skeleton, 64);
-        assert_eq!(digest1, digest2, "pose_sequence_digest determinism");
+        assert_eq!(
+            pose_sequence_digest(&clip, &skeleton, 64),
+            pose_sequence_digest(&clip, &skeleton, 64)
+        );
     }
 
-    /// The cross-platform byte pin for the walk clip at 64 samples.
-    /// This value was measured once with a temporary print to obtain it.
-    /// Any movement is an investigation, never a silent repin.
+    /// THE CROSS-PLATFORM POSE DIGEST PIN: the walk clip's sampled
+    /// pose sequence hashes to this MEASURED u64 (the placeholder-pin
+    /// discipline: the first run measures, the pin follows, and any
+    /// later movement is an investigation — a math, table, or
+    /// packing change — never a silent repin). Linux and Windows CI
+    /// asserting the same value IS the cross-platform determinism
+    /// proof (the FNV discipline applied to the pose bytes).
     #[test]
     fn pose_sequence_digest_pin() {
         let clip = walk_clip();
         let skeleton = humanoid_skeleton();
-
         let digest = pose_sequence_digest(&clip, &skeleton, 64);
-
-        // MEASURED actual: 0x76b2c8e5a9f3d124 (placeholder, run once to obtain).
-        // TODO: Replace this with the actual measured value after running once.
-        // const PINNED_FNV: u64 = 0x76b2c8e5a9f3d124;
-        // assert_eq!(digest, PINNED_FNV, "the pose sequence digest moved: an investigation, never a silent repin");
-
-        // Print the actual value for now.
-        println!("pose_sequence_digest(64 samples) = 0x{:016x}", digest);
-
-        // For now, just assert that it's a valid u64.
-        // The actual pin will be added after the first run.
-        assert!(digest != 0, "digest is non-zero");
+        // MEASURED at this tree (the convention repair + the signed
+        // turn model + the corrected gait table — the placeholder
+        // pin's first real value; the delegate build's digest was
+        // never pinned, so this is the pin's origin, not a repin).
+        const PINNED_FNV: u64 = 2_694_074_108_253_436_588;
+        assert_eq!(
+            digest, PINNED_FNV,
+            "the walk clip's pose digest moved: a math, table, or packing change — \
+             an investigation, never a silent repin"
+        );
     }
 }
