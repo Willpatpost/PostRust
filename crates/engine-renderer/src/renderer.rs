@@ -227,6 +227,15 @@ pub struct Renderer {
     /// the chain is a corner-family feature (the brief's reference
     /// scene), documented like the sky's scope.
     post: bool,
+    /// The Era-1 wet-ground reflection's sticky setting: `true`
+    /// makes every subsequent corner-family frame render the
+    /// mirrored scene into an offscreen target and re-draw the
+    /// ground Schlick-blended over it (planar.rs's matrix and
+    /// blend); `false` keeps the dry byte-identical path. Carries
+    /// the post state implicitly (the reflection pass rides its
+    /// HDR render pass object) — the post CHAIN itself stays
+    /// optional.
+    wet: bool,
 }
 
 /// The Era-1 sky layer's frame description (the sticky `set_sky`
@@ -343,6 +352,7 @@ impl Renderer {
             proxy_draw_mode: ProxyDrawMode::default(),
             sky: None,
             post: false,
+            wet: false,
         })
     }
 
@@ -431,8 +441,10 @@ impl Renderer {
             // stays skyless.
             None,
             // The post chain likewise (the region path stays
-            // postless — the setting's documented scope).
+            // postless — the setting's documented scope), and the
+            // wet reflection with it.
             false,
+            None,
         )?;
         Ok(self.finish_frame(outcome))
     }
@@ -452,6 +464,7 @@ impl Renderer {
         }
         let params = vulkan::corner::FrameParams::new(*view_proj, eye, light);
         let sky = self.sky_params(view_proj);
+        let wet = self.wet_camera(view_proj, eye, light);
         let outcome = vulkan::render_frame(
             &mut self.ctx,
             &mut self.swapchain,
@@ -471,6 +484,7 @@ impl Renderer {
             None,
             sky.as_ref(),
             self.post,
+            wet.as_ref(),
         )?;
         Ok(self.finish_frame(outcome))
     }
@@ -526,6 +540,7 @@ impl Renderer {
             mode: self.proxy_draw_mode,
         };
         let sky = self.sky_params(view_proj);
+        let wet = self.wet_camera(view_proj, eye, light);
         let outcome = vulkan::render_frame(
             &mut self.ctx,
             &mut self.swapchain,
@@ -545,6 +560,7 @@ impl Renderer {
             None,
             sky.as_ref(),
             self.post,
+            wet.as_ref(),
         )?;
         Ok(self.finish_frame(outcome))
     }
@@ -601,6 +617,7 @@ impl Renderer {
             ],
         };
         let sky = self.sky_params(view_proj);
+        let wet = self.wet_camera(view_proj, eye, light);
         let outcome = vulkan::render_frame(
             &mut self.ctx,
             &mut self.swapchain,
@@ -620,6 +637,7 @@ impl Renderer {
             Some(&params),
             sky.as_ref(),
             self.post,
+            wet.as_ref(),
         )?;
         Ok(self.finish_frame(outcome))
     }
@@ -670,6 +688,45 @@ impl Renderer {
     /// The current post setting.
     pub fn post(&self) -> bool {
         self.post
+    }
+
+    /// Sets the Era-1 wet-ground reflection (the set_sky/set_post
+    /// precedent: a sticky per-renderer setting). `true` makes
+    /// every subsequent corner-family frame render the mirrored
+    /// scene (the corner mesh's building masses, the world-mirror
+    /// construction — planar.rs's `ground_reflection_matrix`, the
+    /// winding flipped) into an offscreen RGBA16F target, then
+    /// re-draw the ground with the reflection sampled at the same
+    /// screen position, Schlick-blended by view angle
+    /// (`planar.rs::reflection_blend`). `false` restores the dry
+    /// path (byte-identical; the state, once created, stays
+    /// allocated). The mirrored scene is the BUILDINGS only — the
+    /// sky and the proxy population are the documented follow-ups
+    /// (a wet populated frame renders the population unreflected,
+    /// honestly labeled).
+    pub fn set_wet(&mut self, wet: bool) {
+        self.wet = wet;
+    }
+
+    /// The current wet setting.
+    pub fn wet(&self) -> bool {
+        self.wet
+    }
+
+    /// The wet reflection's camera description (the sticky
+    /// setting's frame data — the true camera the mirrored math
+    /// consumes).
+    fn wet_camera(
+        &self,
+        view_proj: &[[f32; 4]; 4],
+        eye: [f32; 3],
+        light: crate::lit_scene::LightParams,
+    ) -> Option<vulkan::reflection_draw::WetCamera> {
+        self.wet.then_some(vulkan::reflection_draw::WetCamera {
+            view_proj: *view_proj,
+            eye,
+            light,
+        })
     }
 
     /// The sky pass's per-frame parameters from the sticky setting

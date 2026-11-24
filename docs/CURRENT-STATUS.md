@@ -285,6 +285,45 @@ repins are values inside existing tests, no new test anywhere).
   scene target through the build's atlas-share binding map (moved
   to binding 4, the 6-F shadow map's convention). Every Era-1
   graphical gate now executes and passes on the pod's lavapipe.
+  The Era-1 wet-ground reflection package (2026-11-23, the
+  ladder's last rung): the planar pass — the corner mesh's
+  building masses re-rendered MIRRORED (planar.rs's
+  ground_reflection_matrix composed into the view-projection,
+  the winding flipped to CLOCKWISE, the ground itself never
+  drawn in the mirror — it would occlude its own reflection)
+  into per-frame-slot RGBA16F targets riding the post state's
+  HDR render pass object (the wet mode carries the post state,
+  never necessarily its chain) — and the ground re-draw:
+  the ground quad re-rasterized inside whichever scene pass
+  runs (EQUAL depth, no write) sampling the reflection at the
+  same screen position (the planar property: the mirror fixes
+  the ground plane, so the texel IS the reflected scene behind
+  the pixel), Schlick-blended on the alpha stage (planar.rs's
+  reflection_blend, r0 = 0.02). --corner --wet, composes with
+  every corner flag; the mirrored scene is the buildings (the
+  sky and the proxies are the documented follow-ups). The gates
+  (tests/render_reflection.rs): the known-answer chain — the
+  pixel's ray to its ground hit, the reflected ray raycast into
+  the boxes, the lit equation at the hit (the mirror
+  invariance: the mirrored render's shading at the mirrored
+  point IS the real equation at the real point from the real
+  eye), the Schlick blend over the dry pixel — MEASURED 1/255
+  at grazing (60 pixels, blend factors 0.43-0.46) and overhead
+  (3249 pixels, wet ~ dry at ~r0); the dry path byte-identical;
+  the one-time allocation delta pinned with its decomposition;
+  the composition smokes (wet+post, wet+post+sky,
+  wet+shadows, wet+populated) all clean. The heavy shard's
+  ignored count 16 -> 17 and result lines 61 -> 62 (the new
+  binary's one #[ignore]d gate); the main shard and renderer
+  release +1 each (planar.rs's mirrored-view-projection
+  contract test). The package's own first-run catches (all
+  fixed, the evidence in the commit): the color-write-mask
+  default is ZERO (a legal, validation-silent no-op pipeline —
+  the re-draw recorded, rasterized, and wrote nothing), the
+  ground re-draw initially recorded OUTSIDE the HDR scene pass
+  (a lavapipe segfault), and the mirrored sets' per-material
+  indexing was off by one (the buildings rendered with the
+  ground's asphalt texture).
 Cycle 6-F candidate's Linux counts were MEASURED locally with the
 workflow's own awk (1146 main = the pre-6-F 1138 + 8 platform-uniform
 engine-renderer tests — the shadow core's full battery; heavy passed

@@ -254,6 +254,14 @@ impl CornerResources {
         }
     }
 
+    /// The corner's own FrameParams uniform buffer (the Era-1 wet
+    /// reflection's ground re-draw binds THE TRUE camera's regions
+    /// — the same buffer the corner mesh draws read — at its own
+    /// binding 3).
+    pub(crate) fn frame_buffer(&self) -> vk::Buffer {
+        self.uniforms
+    }
+
     /// The corner mesh's vertex buffer and its material-grouped draw
     /// ranges (the shadow state's depth-only pass draws the whole
     /// mesh through them).

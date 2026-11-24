@@ -74,6 +74,11 @@ fn main() {
     // the bright-passed 1/4 downsample + the separable blur feeding
     // post.wgsl's composite — post.rs's chain, mirrored term-for-term.
     compile_wgsl("bloom.wgsl", "bloom.spv");
+    // The Era-1 package 7 wet-ground reflection (see
+    // docs/CYCLE6-ERA1-BRIEF.md): the ground re-draw sampling the
+    // planar-reflection target, Schlick-blended — planar.rs's
+    // reflection_blend mirrored term-for-term.
+    compile_wgsl("ground_reflect.wgsl", "ground_reflect.spv");
 }
 
 /// The WGSL path (Cycle 6-A): parse + validate + emit ONE SPIR-V

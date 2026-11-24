@@ -82,6 +82,10 @@ Interactive modes
                                      chain, the 1/4-res bloom mips, and the ACES
                                      tonemap composite; composes with every
                                      corner flag)
+  --corner --wet                     The wet-ground reflection (Era 1: the mirrored
+                                     scene about the ground plane, the ground
+                                     re-drawn Schlick-blended by view angle;
+                                     composes with every corner flag)
   --corner --free-look               Interactive WASD + mouse camera (Era 1's
                                     eyeball mode — presentation only, the camera
                                     never enters a measured claim; starts on the
@@ -549,6 +553,7 @@ fn main() {
             let mut free_look = false;
             let mut free_look_frames: Option<u64> = None;
             let mut post = false;
+            let mut wet = false;
             let mut fps = 60;
             let mut present = engine_renderer::PresentModePreference::Auto;
             let mut validation = engine_renderer::ValidationPreference::Auto;
@@ -601,6 +606,11 @@ fn main() {
                     // ACES tonemap; composes with every other
                     // corner flag).
                     "--post" => post = true,
+                    // Era 1 package 7: the wet-ground reflection
+                    // (the mirrored scene + the Schlick-blended
+                    // ground re-draw; composes with every other
+                    // corner flag).
+                    "--wet" => wet = true,
                     // The free-look smoke's bounded exit — auto-quit
                     // after N presented frames. Free-look ONLY: the
                     // scripted route has its own fixed 601-frame
@@ -658,6 +668,7 @@ fn main() {
                 sky,
                 day_night,
                 post,
+                wet,
             )
         };
         if let Err(e) = run() {
