@@ -44,7 +44,12 @@ impl PresentModePreference {
 /// Validation-layer preference. `Auto` enables validation in debug builds
 /// when the layer is installed; the renderer records whether it is
 /// actually active so application errors stay distinguishable from
-/// environment limitations.
+/// environment limitations. `On` additionally chains the
+/// `VK_EXT_validation_features` enablement for SYNCHRONIZATION
+/// validation (finding 9's explicit enablement — the layer's
+/// execution/memory dependency modeling, so hazard-class errors are
+/// counted in `RenderStats::validation_errors`); `Auto` keeps core
+/// validation only (no development-loop cost).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ValidationPreference {
     #[default]

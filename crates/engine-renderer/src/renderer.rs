@@ -161,6 +161,17 @@ pub struct RenderStats {
     pub frames_presented: u64,
     pub swapchain_recreations: u64,
     pub validation_active: bool,
+    /// Synchronization validation requested-and-accepted on the
+    /// validation instance (finding 9's explicit enablement: the
+    /// VK_EXT_validation_features pNext chained when
+    /// `ValidationPreference::On` and the layer accepted it — a
+    /// failed attempt falls back with this false alongside
+    /// `validation_active`). When true, the `validation_errors`
+    /// count includes the layer's synchronization-hazard findings
+    /// (SYNC-HAZARD-*), so every gate asserting
+    /// `validation_errors == 0` now also proves the render passes'
+    /// execution and memory dependencies.
+    pub sync_validation: bool,
     pub gpu_timestamps_supported: bool,
     pub validation_errors: u64,
     pub validation_warnings: u64,
@@ -282,7 +293,8 @@ pub struct SkyFrame {
 impl Renderer {
     pub fn new(window: &SdlWindow, config: RenderConfig) -> Result<Renderer, RendererError> {
         let atlas_text = AtlasText::default();
-        let (mut ctx, validation_active) = VulkanContext::new(window, atlas_text.atlas(), &config)?;
+        let (mut ctx, validation_active, sync_validation) =
+            VulkanContext::new(window, atlas_text.atlas(), &config)?;
         // Cross-stage cleanup (corrective finding G): each constructor
         // cleans up its own partials; this ladder releases completed
         // stages when a later stage fails.
@@ -351,6 +363,7 @@ impl Renderer {
             frames_presented: 0,
             swapchain_recreations: 0,
             validation_active,
+            sync_validation,
             gpu_timestamps_supported: frames.timestamps_supported,
             validation_errors: 0,
             validation_warnings: 0,

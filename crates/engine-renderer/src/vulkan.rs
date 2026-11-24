@@ -383,7 +383,7 @@ impl VulkanContext {
         window: &SdlWindow,
         atlas: &crate::glyph_atlas::GlyphAtlas,
         config: &RenderConfig,
-    ) -> Result<(VulkanContext, bool), RendererError> {
+    ) -> Result<(VulkanContext, bool, bool), RendererError> {
         let entry = unsafe { Entry::load() }
             .map_err(|error| RendererError::NoLoader(format!("{error}")))?;
 
@@ -453,6 +453,7 @@ impl VulkanContext {
 
         let mut instance = None;
         let mut validation_active = false;
+        let mut sync_validation = false;
         if want_validation {
             // Try with validation; failure here is an environment
             // limitation (no layer installed), not an application error.
@@ -476,16 +477,35 @@ impl VulkanContext {
                         | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
                 )
                 .pfn_user_callback(Some(validation_callback));
+            // Finding 9's explicitly-enabled synchronization validation
+            // (the Era-1 review's check: the sync-proof gaps were
+            // exercised under core validation only — sync modeling was
+            // off). Chained ONLY on the validation attempt (never the
+            // fallback): VK_EXT_validation_features is a layer-side
+            // pNext — the loader passes it through and the KHRONOS
+            // layer activates its synchronization modeling (the
+            // negative-control proof: neutralizing the shadow pass's
+            // producer-side subpass dependency on this exact build
+            // fires SYNC-HAZARD-WRITE-AFTER-WRITE +
+            // SYNC-HAZARD-READ-AFTER-WRITE at the map's sampled reads,
+            // 44 errors the gates' validation_errors == 0 assertions
+            // catch). Auto (debug builds) keeps core validation only —
+            // no development-loop cost; On is the diagnostics arm.
+            let sync_enables = [vk::ValidationFeatureEnableEXT::SYNCHRONIZATION_VALIDATION];
+            let mut validation_features =
+                vk::ValidationFeaturesEXT::default().enabled_validation_features(&sync_enables);
             let create_info = vk::InstanceCreateInfo::default()
                 .application_info(&app_info)
                 .flags(plan.create_flags())
                 .enabled_extension_names(&extension_names)
                 .enabled_layer_names(&layer_names)
-                .push_next(&mut debug_info);
+                .push_next(&mut debug_info)
+                .push_next(&mut validation_features);
             match unsafe { entry.create_instance(&create_info, None) } {
                 Ok(created) => {
                     instance = Some(created);
                     validation_active = true;
+                    sync_validation = true;
                 }
                 Err(_) => {
                     plan = plan.without_validation();
@@ -714,7 +734,7 @@ impl VulkanContext {
                 }
             }
         }
-        Ok((context, validation_active))
+        Ok((context, validation_active, sync_validation))
     }
 
     fn init_atlas(&mut self, atlas: &crate::glyph_atlas::GlyphAtlas) -> Result<(), RendererError> {
