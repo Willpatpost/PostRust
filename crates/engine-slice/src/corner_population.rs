@@ -157,9 +157,121 @@ const VEHICLE_TABLE: [ProxyInstance; 2] = [
 /// demo holds it for the whole route); the per-frame
 /// zero-allocation discipline is the renderer's retained repack, not
 /// this table's construction.
+/// One NPC's walk-cycle disposition (the placement table's PHASE
+/// column — the mission's "per-NPC phase offsets so the crowd does
+/// not march in lockstep"): the crosswalk WAITERS stand (the rest
+/// pose — a waiting pedestrian mid-stride would look wrong); the
+/// crossers and strollers WALK, each at its hand-authored phase
+/// offset as a u16 turn-fraction of the 1.1 s stride (0 = the left
+/// leg's heel strike).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Standing — the rest pose, no evaluation.
+    Stand,
+    /// Walking at the phase offset (a turn-fraction of one stride:
+    /// `phase / 65536 · 1.1 s`).
+    Walk(u16),
+}
+
+/// The 24 phase offsets, in NPC_TABLE order: the 8 waiters stand;
+/// the 2 crossers and 14 strollers walk at hand-spread phases (all
+/// distinct, deliberately not a gradient — pure data, pinned below).
+#[rustfmt::skip]
+const NPC_PHASE: [Phase; 24] = [
+    // Crosswalk waiters (8): standing.
+    Phase::Stand, Phase::Stand, Phase::Stand, Phase::Stand,
+    Phase::Stand, Phase::Stand, Phase::Stand, Phase::Stand,
+    // Crossers (2): mid-cross, opposite phases (they walk toward
+    // each other's crosswalk ends).
+    Phase::Walk(10923), Phase::Walk(43691),
+    // Sidewalk strollers (14): spread over the stride.
+    Phase::Walk(0),      Phase::Walk(30543),
+    Phase::Walk(15124),  Phase::Walk(53621),
+    Phase::Walk(24986),  Phase::Walk(7714),
+    Phase::Walk(39062),  Phase::Walk(19531),
+    Phase::Walk(46089),  Phase::Walk(58252),
+    Phase::Walk(12872),  Phase::Walk(41899),
+    Phase::Walk(9766),   Phase::Walk(34495),
+];
+
+/// The corner population: 24 NPCs then 2 vehicles, in the fixed
+/// buffer order (the repack's npc-then-vehicle order — the table's
+/// entry order is part of the byte pin). Built ONCE per run (the
+/// demo holds it for the whole route); the per-frame
+/// zero-allocation discipline is the renderer's retained repack, not
+/// this table's construction.
 pub fn corner_population() -> (Vec<ProxyInstance>, Vec<ProxyInstance>) {
     (NPC_TABLE.to_vec(), VEHICLE_TABLE.to_vec())
 }
+
+/// The placement table's phase column (the animated-population
+/// stage's companion to [`corner_population`] — same entry order).
+pub fn corner_population_phases() -> Vec<Phase> {
+    NPC_PHASE.to_vec()
+}
+
+/// The stride the demo's walk clip runs at (seconds) — the phase
+/// column's unit companion (documented here once; the clip itself
+/// lives in engine-renderer's animation core).
+pub const WALK_STRIDE_SECONDS: f32 = 1.1;
+
+/// The demo clock's reference rate: the scripted route advances the
+/// walk at the presented-frame count over 60 Hz (the day/night
+/// cycle's own deterministic-clock precedent — frame k always shows
+/// pose t_k; free-look is presentation-only and follows the same
+/// counter at whatever rate it presents).
+pub const DEMO_CLOCK_HZ: f32 = 60.0;
+
+/// Evaluates the population's pose blocks for presented frame `k`
+/// (the deterministic clock: each walking NPC's clip time is
+/// `k / 60 + phase / 65536 · 1.1` modulo the stride; standing NPCs
+/// carry the bit-exact rest block). Writes into `out` IN PLACE (one
+/// block per table entry, pose-index order — entry i's block is
+/// block i, matching the table's sequential pose_index pin), reusing
+/// the buffer's capacity: the demo's per-frame walk evaluation
+/// allocates nothing after the first frame. Pure and deterministic:
+/// frame k always produces byte-identical blocks (the FNV pins
+/// below).
+pub fn evaluate_population_poses(k: u64, phases: &[Phase], out: &mut Vec<Block>) {
+    use engine_renderer::animation::{
+        compose_joint_matrices, humanoid_skeleton, rest_pose_block, sample_pose, skin_matrices,
+        walk_clip,
+    };
+    let clip = walk_clip();
+    let skeleton = humanoid_skeleton();
+    // THE INTEGER STRIDE REDUCTION: one stride is exactly 66 frames
+    // (1.1 s × 60 Hz), and the frame counter reduces modulo it IN
+    // INTEGERS before any float is formed — `66.0/60.0 + p` does NOT
+    // reduce back to `p` exactly in f32 (the addition rounds), so a
+    // naive `k/60 + phase` breaks byte-exact periodicity at stride
+    // boundaries. With the integer reduction, frame 66m + j computes
+    // the identical `t` as frame j — the loop closes bit-exactly
+    // (the period pin below).
+    let stride_frames = (WALK_STRIDE_SECONDS * DEMO_CLOCK_HZ) as u64;
+    debug_assert_eq!(
+        stride_frames, 66,
+        "one stride is exactly 66 frames at 60 Hz"
+    );
+    let within_stride = (k % stride_frames) as f32 / DEMO_CLOCK_HZ;
+    out.clear();
+    out.reserve(phases.len());
+    for phase in phases {
+        let block = match *phase {
+            Phase::Stand => rest_pose_block(),
+            Phase::Walk(offset) => {
+                let t = within_stride + offset as f32 / 65536.0 * WALK_STRIDE_SECONDS;
+                let pose = sample_pose(&clip, t);
+                let joint_worlds = compose_joint_matrices(&skeleton, &pose);
+                skin_matrices(&joint_worlds, &skeleton)
+            }
+        };
+        out.push(block);
+    }
+}
+
+/// One pose block: 11 column-major skin matrices (the packed-pose
+/// stride's unit — the animation core's HUMANOID_JOINTS).
+pub type Block = [[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS];
 
 #[cfg(test)]
 mod tests {
@@ -380,6 +492,137 @@ mod tests {
             }
         }
     }
+
+    /// THE PHASE-COLUMN PIN: 24 entries matching the table order;
+    /// the first 8 (the waiters) stand; the 16 walkers' phases are
+    /// all distinct (no lockstep marching — the mission's own
+    /// requirement) and none is zero-phase-with-zero... the crossers
+    /// sit near opposite quarters of the stride.
+    #[test]
+    fn phase_column_is_pinned() {
+        let phases = corner_population_phases();
+        assert_eq!(phases.len(), 24, "one phase per table entry");
+        for phase in &phases[..8] {
+            assert_eq!(*phase, Phase::Stand, "the crosswalk waiters stand");
+        }
+        let walkers: Vec<u16> = phases[8..]
+            .iter()
+            .filter_map(|p| match *p {
+                Phase::Walk(offset) => Some(offset),
+                Phase::Stand => None,
+            })
+            .collect();
+        assert_eq!(walkers.len(), 16, "the crossers and strollers walk");
+        let mut sorted = walkers.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            walkers.len(),
+            "every walking phase is distinct"
+        );
+        // The spread: the walkers cover the stride (the min gap
+        // between sorted phases exceeds a 1/64 stride — no two
+        // walkers are within ~1.5% of each other's phase; the crowd
+        // never clusters).
+        let mut gaps_ok = true;
+        for pair in sorted.windows(2) {
+            if u32::from(pair[1] - pair[0]) < 65536 / 64 {
+                gaps_ok = false;
+            }
+        }
+        assert!(
+            gaps_ok,
+            "the walking phases spread over the stride: {sorted:?}"
+        );
+    }
+
+    /// THE EVALUATION DETERMINISM PINS: the pose blocks at a fixed
+    /// frame are byte-identical across calls; the waiters' blocks
+    /// are bit-exact rest; ONE STRIDE = 66 frames at the 60 Hz
+    /// reference, so frame 66's blocks equal frame 0's EXACTLY (the
+    /// loop-closure pin); and the packed bytes' FNV at frames 0/33
+    /// are the cross-platform byte pins (measured below).
+    #[test]
+    fn pose_evaluation_is_deterministic_and_periodic() {
+        let phases = corner_population_phases();
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        evaluate_population_poses(0, &phases, &mut a);
+        evaluate_population_poses(0, &phases, &mut b);
+        assert_eq!(a, b, "byte-identical across calls");
+        assert_eq!(a.len(), 24, "one block per npc");
+
+        // The waiters stand: bit-exact rest blocks.
+        let rest = engine_renderer::animation::rest_pose_block();
+        for (index, block) in a[..8].iter().enumerate() {
+            assert_eq!(*block, rest, "waiter {index} stands at the rest pose");
+        }
+
+        // The walkers move: at least one walker block differs from
+        // rest at frame 0 (the phase spread means some walker is
+        // mid-stride).
+        assert!(
+            a[8..].iter().any(|block| *block != rest),
+            "some walker is off rest at frame 0 (the phase spread)"
+        );
+
+        // THE PERIOD PIN: 66 frames = 1.1 s at 60 Hz — exactly one
+        // stride — so frame 66 reproduces frame 0's blocks EXACTLY.
+        let mut later = Vec::new();
+        evaluate_population_poses(66, &phases, &mut later);
+        assert_eq!(
+            a, later,
+            "one stride later is the same pose (the loop closes)"
+        );
+
+        // The retained buffer never grows across evaluations.
+        let warmed = a.capacity();
+        for k in 0..100u64 {
+            evaluate_population_poses(k, &phases, &mut b);
+            assert_eq!(b.capacity(), warmed, "no reallocation at frame {k}");
+        }
+    }
+
+    /// The packed pose bytes' FNV at fixed frames (the deterministic
+    /// frames discipline: frame k always packs the same bytes —
+    /// Linux and Windows CI asserting the same values IS the
+    /// cross-platform proof).
+    #[test]
+    fn pose_bytes_fnv_pins() {
+        let phases = corner_population_phases();
+        let mut blocks = Vec::new();
+        let mut digest = |k: u64| -> u64 {
+            evaluate_population_poses(k, &phases, &mut blocks);
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for block in &blocks {
+                let bytes = engine_renderer::animation::pack_pose_bytes(block);
+                for &byte in bytes.iter() {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            hash
+        };
+        let frame0 = digest(0);
+        let frame33 = digest(33);
+        assert_ne!(frame0, frame33, "mid-stride differs from the stride start");
+        println!("POSE_FNV_0={frame0}");
+        println!("POSE_FNV_33={frame33}");
+        // The placeholder-pin discipline: the pins follow the first
+        // measured run (the values below are MEASURED at this tree;
+        // movement is an investigation, never a silent repin).
+        const PINNED_0: u64 = PIN_FRAME_0;
+        const PINNED_33: u64 = PIN_FRAME_33;
+        assert_eq!(frame0, PINNED_0, "frame 0's pose-bytes digest moved");
+        assert_eq!(frame33, PINNED_33, "frame 33's pose-bytes digest moved");
+    }
+
+    /// The measured-actual FNV-1a digests of the demo's pose
+    /// evaluation (the placeholder-pin discipline: measured at this
+    /// tree by the first run of pose_bytes_fnv_pins, then frozen).
+    const PIN_FRAME_0: u64 = 5_757_258_358_703_043_002;
+    const PIN_FRAME_33: u64 = 12_735_933_771_296_667_791;
 
     /// THE PLACEMENT-TABLE BYTE PIN: the full population packs to a
     /// byte sequence whose FNV-1a hash is this pinned u64 (measured
