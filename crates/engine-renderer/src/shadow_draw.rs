@@ -41,7 +41,7 @@
 
 use super::corner::CornerResources;
 use super::{RendererError, VulkanContext, create_mapped_buffer, descriptors::create_sets};
-use crate::config::FRAMES_IN_FLIGHT;
+use crate::config::{FRAMES_IN_FLIGHT, TargetFaultSite, TargetFaultStage};
 use crate::shadows::SHADOW_MAP_EXTENT;
 use ash::vk;
 
@@ -249,9 +249,17 @@ impl ShadowResources {
                         | vk::ImageUsageFlags::TRANSFER_SRC,
                 )
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
-            let image = unsafe { ctx.device.create_image(&image_info, None) }
-                .map_err(|error| RendererError::vk(error, "shadow image"))?;
+            // Fault check before image creation (site: Shadow, stage: Image)
+            ctx.check_target_fault(TargetFaultSite::Shadow, TargetFaultStage::Image)?;
+            let image = unsafe { ctx.create_target_image(&image_info, "shadow image") }?;
+            // Immediate registration (corrective finding 8): the
+            // handle is owned from creation, so any later failure in
+            // this slot's construction unwinds through `release` —
+            // the post/reflection target builders' pattern.
+            self.images.push(image);
             let requirements = unsafe { ctx.device.get_image_memory_requirements(image) };
+            // Fault check before memory type lookup (site: Shadow, stage: MemoryLookup)
+            ctx.check_target_fault(TargetFaultSite::Shadow, TargetFaultStage::MemoryLookup)?;
             let memory_index = super::find_memory_type(
                 ctx,
                 requirements.memory_type_bits,
@@ -262,9 +270,16 @@ impl ShadowResources {
                 .allocation_size(requirements.size)
                 .memory_type_index(memory_index);
             // SAFETY: the requirement query is for this live image;
-            // the partial state owns both handles.
-            let memory = unsafe { ctx.allocate_memory(&memory_info) }
-                .map_err(|error| RendererError::vk(error, "shadow image memory"))?;
+            // the partial state owns both handles (the image is
+            // registered above; the memory registers on the next
+            // line).
+            // Fault check before memory allocation (site: Shadow, stage: Memory)
+            ctx.check_target_fault(TargetFaultSite::Shadow, TargetFaultStage::Memory)?;
+            let memory =
+                unsafe { ctx.allocate_target_memory(&memory_info, "shadow image memory") }?;
+            self.memories.push(memory);
+            // Fault check before memory binding (site: Shadow, stage: Bind)
+            ctx.check_target_fault(TargetFaultSite::Shadow, TargetFaultStage::Bind)?;
             unsafe { ctx.device.bind_image_memory(image, memory, 0) }
                 .map_err(|error| RendererError::vk(error, "bind shadow image"))?;
             let subresource = vk::ImageSubresourceRange {
@@ -278,8 +293,10 @@ impl ShadowResources {
                 .view_type(vk::ImageViewType::TYPE_2D)
                 .format(SHADOW_FORMAT)
                 .subresource_range(subresource);
-            let view = unsafe { ctx.device.create_image_view(&view_info, None) }
-                .map_err(|error| RendererError::vk(error, "shadow image view"))?;
+            // Fault check before view creation (site: Shadow, stage: View)
+            ctx.check_target_fault(TargetFaultSite::Shadow, TargetFaultStage::View)?;
+            let view = unsafe { ctx.create_target_image_view(&view_info, "shadow image view") }?;
+            self.views.push(view);
             let framebuffer_attachments = [view];
             let framebuffer_info = vk::FramebufferCreateInfo::default()
                 .render_pass(self.depth_pass)
@@ -287,11 +304,10 @@ impl ShadowResources {
                 .width(self.extent)
                 .height(self.extent)
                 .layers(1);
-            let framebuffer = unsafe { ctx.device.create_framebuffer(&framebuffer_info, None) }
-                .map_err(|error| RendererError::vk(error, "shadow framebuffer"))?;
-            self.images.push(image);
-            self.memories.push(memory);
-            self.views.push(view);
+            // Fault check before framebuffer creation (site: Shadow, stage: Framebuffer)
+            ctx.check_target_fault(TargetFaultSite::Shadow, TargetFaultStage::Framebuffer)?;
+            let framebuffer =
+                unsafe { ctx.create_target_framebuffer(&framebuffer_info, "shadow framebuffer") }?;
             self.framebuffers.push(framebuffer);
         }
 
@@ -947,14 +963,21 @@ impl ShadowResources {
             ctx.device
                 .destroy_descriptor_set_layout(self.depth_set_layout, None);
             for framebuffer in self.framebuffers.drain(..) {
-                ctx.device.destroy_framebuffer(framebuffer, None);
+                ctx.destroy_target_framebuffer(framebuffer);
             }
             for view in self.views.drain(..) {
-                ctx.device.destroy_image_view(view, None);
+                ctx.destroy_target_image_view(view);
             }
-            for (image, memory) in self.images.drain(..).zip(self.memories.drain(..)) {
-                ctx.device.destroy_image(image, None);
-                ctx.device.free_memory(memory, None);
+            // Independent drains, not zipped — a partial slot (the
+            // finding-8 fault points between image and memory
+            // registration) leaves the vectors unbalanced, and a zip
+            // would then destroy NEITHER side (the leak the fault gate
+            // caught on the post chain: VUID-vkDestroyDevice-device-05137).
+            for memory in self.memories.drain(..) {
+                ctx.free_target_memory(memory);
+            }
+            for image in self.images.drain(..) {
+                ctx.destroy_target_image(image);
             }
             // Framebuffers before the render pass they reference.
             ctx.device.destroy_render_pass(self.depth_pass, None);

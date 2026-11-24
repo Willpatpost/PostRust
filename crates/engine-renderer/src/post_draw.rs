@@ -80,7 +80,7 @@ use super::proxy_draw::ProxyFrameUpload;
 use super::shadow_draw::ShadowFrameParams;
 use super::sky_draw::SkyFrameParams;
 use super::{PipelineState, RendererError, VulkanContext, create_mapped_buffer, find_memory_type};
-use crate::config::FRAMES_IN_FLIGHT;
+use crate::config::{FRAMES_IN_FLIGHT, TargetFaultSite, TargetFaultStage};
 use crate::post::BLOOM_STRENGTH;
 use ash::vk;
 
@@ -140,10 +140,11 @@ pub(crate) struct PostFrameInputs<'a> {
 /// recreation idles the device first).
 struct PostTargets {
     extent: (u32, u32),
-    /// The first swapchain view the post framebuffers were built
-    /// over — the view set's identity (recreation rebuilds every
-    /// view, so one handle comparison catches a changed set).
-    swapchain_view0: vk::ImageView,
+    /// The swapchain generation when this bundle was created — the
+    /// view set's identity (recreation produces a new generation;
+    /// Vulkan permits handle reuse, so a numerical view handle could
+    /// recur after destruction). (corrective finding 7)
+    swapchain_generation: u64,
     hdr_images: Vec<vk::Image>,
     hdr_memories: Vec<vk::DeviceMemory>,
     hdr_views: Vec<vk::ImageView>,
@@ -353,11 +354,19 @@ impl PostResources {
             .store_op(vk::AttachmentStoreOp::STORE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .final_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        // The depth attachment's stencil ops are DONT_CARE because the
+        // depth pass writes only depth (no stencil operations), and
+        // the HDR depth attachment is used only for depth testing,
+        // not for stencil. The format may be D24_S8, but the
+        // attachment doesn't use stencil operations (corrective
+        // finding 4).
         let depth_attachment = vk::AttachmentDescription::default()
             .format(self.depth_format)
             .samples(vk::SampleCountFlags::TYPE_1)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         let attachments = [color_attachment, depth_attachment];
@@ -390,8 +399,20 @@ impl PostResources {
                 vk::AccessFlags::COLOR_ATTACHMENT_WRITE
                     | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
             );
+        // The ordering the bloom and composite passes rely on (finding 9):
+        // the color writes (and final transition to SHADER_READ) happen
+        // before the bloom pass's fragment reads and the composite's
+        // final fragment reads. Vulkan orders the final transition before
+        // the visibility operations of outgoing external dependencies.
+        let outgoing_dependency = vk::SubpassDependency::default()
+            .src_subpass(0)
+            .dst_subpass(vk::SUBPASS_EXTERNAL)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
         let subpasses = [subpass];
-        let dependencies = [dependency];
+        let dependencies = [dependency, outgoing_dependency];
         let render_pass_info = vk::RenderPassCreateInfo::default()
             .attachments(&attachments)
             .subpasses(&subpasses)
@@ -439,8 +460,20 @@ impl PostResources {
             .src_access_mask(vk::AccessFlags::SHADER_READ)
             .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
             .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+        // The ordering the composite pass relies on (finding 9): the
+        // bloom pass's color writes (and final transition to SHADER_READ)
+        // happen before the composite's fragment reads. Vulkan orders
+        // the final transition before the visibility operations of
+        // outgoing external dependencies.
+        let outgoing_dependency = vk::SubpassDependency::default()
+            .src_subpass(0)
+            .dst_subpass(vk::SUBPASS_EXTERNAL)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
         let bloom_subpasses = [bloom_subpass];
-        let bloom_dependencies = [read_dependency, write_dependency];
+        let bloom_dependencies = [read_dependency, write_dependency, outgoing_dependency];
         let bloom_pass_info = vk::RenderPassCreateInfo::default()
             .attachments(&bloom_attachments)
             .subpasses(&bloom_subpasses)
@@ -967,18 +1000,25 @@ impl PostResources {
     /// still be reading or writing its images. The FIRST build has
     /// nothing in flight by definition (the state itself was just
     /// created). Called outside command recording.
+    /// Ensures the extent-bound post targets exist and matches the
+    /// swapchain generation. Rebuilds on extent change or swapchain
+    /// recreation (the generation changes, never a view handle
+    /// reuse).
     pub(super) fn ensure_targets(
         &mut self,
         ctx: &VulkanContext,
         extent: vk::Extent2D,
         swapchain_views: &[vk::ImageView],
+        swapchain_generation: u64,
     ) -> Result<(), RendererError> {
-        let first_view = swapchain_views.first().copied().ok_or_else(|| {
-            RendererError::Vulkan("the post chain requires swapchain views".into())
-        })?;
+        if swapchain_views.is_empty() {
+            return Err(RendererError::Vulkan(
+                "the post chain requires swapchain views".into(),
+            ));
+        }
         if let Some(targets) = &self.targets
             && targets.extent == (extent.width, extent.height)
-            && targets.swapchain_view0 == first_view
+            && targets.swapchain_generation == swapchain_generation
         {
             return Ok(());
         }
@@ -989,7 +1029,6 @@ impl PostResources {
         self.targets = Some(PostTargets::build(
             ctx,
             extent,
-            first_view,
             swapchain_views,
             self.hdr_pass,
             self.bloom_pass,
@@ -1000,6 +1039,7 @@ impl PostResources {
             self.depth_format,
             self.params_buffer,
             self.params_mapped,
+            swapchain_generation,
         )?);
         Ok(())
     }
@@ -1110,6 +1150,17 @@ impl PostResources {
                 );
                 ctx.device.cmd_draw(cmd, 3, 1, 0, 0);
             }
+            // The corner buffer must be written before the HDR scene
+            // pass for both the shadowed and ordinary paths (finding 5:
+            // the wet ground re-draw reads this camera block; the
+            // ordinary branch used to write it, the shadowed branch
+            // now depends on it).
+            if let (Some(resources), Some(params)) = (&ctx.corner, inputs.corner_params) {
+                // SAFETY: this slot's fence wait passed above; the
+                // coherent frame regions do not overlap other slots
+                // or the immutable material tail.
+                resources.write_frame(slot, params);
+            }
             if inputs.shadowed.is_some()
                 && let (Some(resources), Some(shadow_state), Some(pipeline)) =
                     (&ctx.corner, &pipes.shadows, self.shadowed_hdr)
@@ -1122,13 +1173,15 @@ impl PostResources {
                 ctx.device
                     .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
                 resources.draw(ctx, cmd, layout, &sets, frame_offset);
-            } else if let (Some(resources), Some(params)) = (&ctx.corner, inputs.corner_params) {
+            } else if let (Some(resources), Some(_params)) = (&ctx.corner, inputs.corner_params) {
                 ctx.device
                     .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.lit_hdr);
                 // SAFETY: this slot's fence wait passed above; the
                 // coherent frame regions do not overlap other slots
                 // or the immutable material tail.
-                resources.write_frame(slot, params);
+                // The corner buffer was written above (the 6-F
+                // shadowed path now supplies the camera, so the
+                // ordinary branch no longer writes).
                 resources.draw(
                     ctx,
                     cmd,
@@ -1337,7 +1390,6 @@ impl PostTargets {
     fn build(
         ctx: &VulkanContext,
         extent: vk::Extent2D,
-        first_view: vk::ImageView,
         swapchain_views: &[vk::ImageView],
         hdr_pass: vk::RenderPass,
         bloom_pass: vk::RenderPass,
@@ -1348,10 +1400,11 @@ impl PostTargets {
         depth_format: vk::Format,
         params_buffer: vk::Buffer,
         params_mapped: *mut core::ffi::c_void,
+        swapchain_generation: u64,
     ) -> Result<PostTargets, RendererError> {
         let mut partial = PostTargets {
             extent: (extent.width, extent.height),
-            swapchain_view0: first_view,
+            swapchain_generation,
             hdr_images: Vec::new(),
             hdr_memories: Vec::new(),
             hdr_views: Vec::new(),
@@ -1388,6 +1441,7 @@ impl PostTargets {
             depth_format,
             params_buffer,
             params_mapped,
+            swapchain_generation,
         ) {
             partial.release(ctx);
             return Err(error);
@@ -1410,6 +1464,7 @@ impl PostTargets {
         depth_format: vk::Format,
         params_buffer: vk::Buffer,
         params_mapped: *mut core::ffi::c_void,
+        _swapchain_generation: u64,
     ) -> Result<(), RendererError> {
         let slots = FRAMES_IN_FLIGHT as usize;
         let scene_extent = (extent.width, extent.height);
@@ -1435,98 +1490,139 @@ impl PostTargets {
         // --- the per-slot images: the HDR color target + its depth
         // attachment at the scene extent, the two bloom mips at
         // the 1/4 extent (the shadow-map creation pattern).
-        let create_image =
-            |format: vk::Format,
-             image_extent: (u32, u32),
-             usage: vk::ImageUsageFlags,
-             what: &str|
-             -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), RendererError> {
-                let image_info = vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(format)
-                    .extent(vk::Extent3D {
-                        width: image_extent.0,
-                        height: image_extent.1,
-                        depth: 1,
-                    })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(usage)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE);
-                // SAFETY: fresh object; the partial state owns it from
-                // creation.
-                let image = unsafe { ctx.device.create_image(&image_info, None) }
-                    .map_err(|error| RendererError::vk(error, what))?;
-                let requirements = unsafe { ctx.device.get_image_memory_requirements(image) };
-                let memory_index = find_memory_type(
-                    ctx,
-                    requirements.memory_type_bits,
-                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                )
-                .ok_or_else(|| RendererError::NoDevice("no DEVICE_LOCAL memory".into()))?;
-                let memory_info = vk::MemoryAllocateInfo::default()
-                    .allocation_size(requirements.size)
-                    .memory_type_index(memory_index);
-                // SAFETY: the requirement query is for this live image;
-                // the partial state owns both handles.
-                let memory = unsafe { ctx.allocate_memory(&memory_info) }
-                    .map_err(|error| RendererError::vk(error, what))?;
-                // SAFETY: as above.
-                unsafe { ctx.device.bind_image_memory(image, memory, 0) }
-                    .map_err(|error| RendererError::vk(error, what))?;
-                let subresource = vk::ImageSubresourceRange {
-                    aspect_mask: if format == vk::Format::D32_SFLOAT {
-                        vk::ImageAspectFlags::DEPTH
-                    } else {
-                        vk::ImageAspectFlags::COLOR
-                    },
-                    level_count: 1,
-                    layer_count: 1,
-                    ..Default::default()
-                };
-                let view_info = vk::ImageViewCreateInfo::default()
-                    .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(format)
-                    .subresource_range(subresource);
-                // SAFETY: as above.
-                let view = unsafe { ctx.device.create_image_view(&view_info, None) }
-                    .map_err(|error| RendererError::vk(error, what))?;
-                Ok((image, memory, view))
+        //
+        // The create_image closure takes an explicit aspect mask so it
+        // can handle depth formats correctly (corrective finding 4):
+        // D32_SFLOAT and D16_UNORM → DEPTH, D24_UNORM_S8_UINT →
+        // DEPTH | STENCIL, color → COLOR.
+        //
+        // The closure now takes the partial bundle's image/memory/view
+        // vectors as parameters, and pushes each handle immediately
+        // after its successful creation (corrective finding 8:
+        // immediate registration to avoid leaks on partial failure).
+        //
+        // The diagnostic fault-injection seam (corrective findings 3+8)
+        // checks before each fallible step. On the first matching fault,
+        // returns RendererError::InjectedFault instead of proceeding.
+        let create_image = |format: vk::Format,
+                            image_extent: (u32, u32),
+                            usage: vk::ImageUsageFlags,
+                            aspect: vk::ImageAspectFlags,
+                            images: &mut Vec<vk::Image>,
+                            memories: &mut Vec<vk::DeviceMemory>,
+                            views: &mut Vec<vk::ImageView>,
+                            what: &str|
+         -> Result<(), RendererError> {
+            let image_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(vk::Extent3D {
+                    width: image_extent.0,
+                    height: image_extent.1,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            // SAFETY: fresh object; push it to the partial bundle's
+            // image vector immediately so release() can free it on error.
+            // Fault check before image creation (site: Post, stage: Image)
+            ctx.check_target_fault(TargetFaultSite::Post, TargetFaultStage::Image)?;
+            let image = unsafe { ctx.create_target_image(&image_info, what) }?;
+            images.push(image);
+            let requirements = unsafe { ctx.device.get_image_memory_requirements(image) };
+            // Fault check before memory type lookup (site: Post, stage: MemoryLookup)
+            ctx.check_target_fault(TargetFaultSite::Post, TargetFaultStage::MemoryLookup)?;
+            let memory_index = find_memory_type(
+                ctx,
+                requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+            .ok_or_else(|| RendererError::NoDevice("no DEVICE_LOCAL memory".into()))?;
+            let memory_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(memory_index);
+            // SAFETY: push the memory immediately after allocation
+            // (it's bound to the image we just pushed).
+            // Fault check before memory allocation (site: Post, stage: Memory)
+            ctx.check_target_fault(TargetFaultSite::Post, TargetFaultStage::Memory)?;
+            let memory = unsafe { ctx.allocate_target_memory(&memory_info, what) }?;
+            memories.push(memory);
+            // Fault check before memory binding (site: Post, stage: Bind)
+            ctx.check_target_fault(TargetFaultSite::Post, TargetFaultStage::Bind)?;
+            unsafe { ctx.device.bind_image_memory(image, memory, 0) }
+                .map_err(|error| RendererError::vk(error, what))?;
+            let subresource = vk::ImageSubresourceRange {
+                aspect_mask: aspect,
+                level_count: 1,
+                layer_count: 1,
+                ..Default::default()
             };
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .subresource_range(subresource);
+            // SAFETY: push the view immediately after creation.
+            // Fault check before view creation (site: Post, stage: View)
+            ctx.check_target_fault(TargetFaultSite::Post, TargetFaultStage::View)?;
+            let view = unsafe { ctx.create_target_image_view(&view_info, what) }?;
+            views.push(view);
+            Ok(())
+        };
         let color_usage = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED;
         for _slot in 0..slots {
-            let (image, memory, view) =
-                create_image(HDR_FORMAT, scene_extent, color_usage, "post HDR image")?;
-            self.hdr_images.push(image);
-            self.hdr_memories.push(memory);
-            self.hdr_views.push(view);
-            let (image, memory, view) =
-                create_image(HDR_FORMAT, bloom_extent, color_usage, "post bloom_a image")?;
-            self.bloom_a_images.push(image);
-            self.bloom_a_memories.push(memory);
-            self.bloom_a_views.push(view);
-            let (image, memory, view) =
-                create_image(HDR_FORMAT, bloom_extent, color_usage, "post bloom_b image")?;
-            self.bloom_b_images.push(image);
-            self.bloom_b_memories.push(memory);
-            self.bloom_b_views.push(view);
+            // Color images: aspect is COLOR.
+            create_image(
+                HDR_FORMAT,
+                scene_extent,
+                color_usage,
+                vk::ImageAspectFlags::COLOR,
+                &mut self.hdr_images,
+                &mut self.hdr_memories,
+                &mut self.hdr_views,
+                "post HDR image",
+            )?;
+            create_image(
+                HDR_FORMAT,
+                bloom_extent,
+                color_usage,
+                vk::ImageAspectFlags::COLOR,
+                &mut self.bloom_a_images,
+                &mut self.bloom_a_memories,
+                &mut self.bloom_a_views,
+                "post bloom_a image",
+            )?;
+            create_image(
+                HDR_FORMAT,
+                bloom_extent,
+                color_usage,
+                vk::ImageAspectFlags::COLOR,
+                &mut self.bloom_b_images,
+                &mut self.bloom_b_memories,
+                &mut self.bloom_b_views,
+                "post bloom_b image",
+            )?;
         }
         // The depth attachments: the renderer's own depth format,
         // DEPTH_STENCIL_ATTACHMENT usage only (nothing reads it
-        // after the pass).
+        // after the pass). Use the negotiated depth format's aspect
+        // flags (corrective finding 4: D32/D16 → DEPTH, D24_S8 →
+        // DEPTH | STENCIL).
         for _slot in 0..slots {
-            let (image, memory, view) = create_image(
+            create_image(
                 depth_format,
                 scene_extent,
                 vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                super::depth_aspect(depth_format),
+                &mut self.hdr_depth_images,
+                &mut self.hdr_depth_memories,
+                &mut self.hdr_depth_views,
                 "post HDR depth image",
             )?;
-            self.hdr_depth_images.push(image);
-            self.hdr_depth_memories.push(memory);
-            self.hdr_depth_views.push(view);
         }
         // The HDR scene framebuffers: color + depth per slot.
         for slot in 0..slots {
@@ -1537,9 +1633,11 @@ impl PostTargets {
                 .width(extent.width)
                 .height(extent.height)
                 .layers(1);
+            // Fault check before framebuffer creation (site: Post, stage: Framebuffer)
+            ctx.check_target_fault(TargetFaultSite::Post, TargetFaultStage::Framebuffer)?;
             // SAFETY: fresh object; the partial state owns it.
-            let framebuffer = unsafe { ctx.device.create_framebuffer(&info, None) }
-                .map_err(|error| RendererError::vk(error, "post HDR framebuffer"))?;
+            let framebuffer =
+                unsafe { ctx.create_target_framebuffer(&info, "post HDR framebuffer") }?;
             self.hdr_framebuffers.push(framebuffer);
         }
         // The bloom framebuffers: one per mip target per slot
@@ -1557,9 +1655,10 @@ impl PostTargets {
                 .width(fb_extent.0)
                 .height(fb_extent.1)
                 .layers(1);
+            // Fault check before framebuffer creation (site: Post, stage: Framebuffer)
+            ctx.check_target_fault(TargetFaultSite::Post, TargetFaultStage::Framebuffer)?;
             // SAFETY: fresh object; the partial state owns it.
-            unsafe { ctx.device.create_framebuffer(&info, None) }
-                .map_err(|error| RendererError::vk(error, what))
+            unsafe { ctx.create_target_framebuffer(&info, what) }
         };
         for slot in 0..slots {
             let framebuffer = create_framebuffer(
@@ -1703,58 +1802,62 @@ impl PostTargets {
             // Framebuffers before the render passes they reference
             // (the passes themselves are the parent's).
             for framebuffer in self.post_framebuffers.drain(..) {
-                ctx.device.destroy_framebuffer(framebuffer, None);
+                ctx.destroy_target_framebuffer(framebuffer);
             }
             for framebuffer in self.bloom_b_framebuffers.drain(..) {
-                ctx.device.destroy_framebuffer(framebuffer, None);
+                ctx.destroy_target_framebuffer(framebuffer);
             }
             for framebuffer in self.bloom_a_framebuffers.drain(..) {
-                ctx.device.destroy_framebuffer(framebuffer, None);
+                ctx.destroy_target_framebuffer(framebuffer);
             }
             for framebuffer in self.hdr_framebuffers.drain(..) {
-                ctx.device.destroy_framebuffer(framebuffer, None);
+                ctx.destroy_target_framebuffer(framebuffer);
             }
             ctx.device.destroy_descriptor_pool(self.post_pool, None);
             ctx.device.destroy_descriptor_pool(self.bloom_pool, None);
-            for (image, memory) in self
-                .bloom_b_images
-                .drain(..)
-                .zip(self.bloom_b_memories.drain(..))
-            {
-                ctx.device.destroy_image(image, None);
-                ctx.device.free_memory(memory, None);
+            // The images and memories drain INDEPENDENTLY, not zipped:
+            // a partial construction (the finding-8 fault points —
+            // memory lookup, allocation, or bind failing after the
+            // image was registered) leaves the vectors unbalanced, and
+            // a zip would then destroy NEITHER side (the leak the
+            // fault gate caught: VUID-vkDestroyDevice-device-05137).
+            // For a fully-built bundle the vectors are balanced and
+            // this destroys exactly what the zip did.
+            for memory in self.bloom_b_memories.drain(..) {
+                ctx.free_target_memory(memory);
+            }
+            for image in self.bloom_b_images.drain(..) {
+                ctx.destroy_target_image(image);
             }
             for view in self.bloom_b_views.drain(..) {
-                ctx.device.destroy_image_view(view, None);
+                ctx.destroy_target_image_view(view);
             }
-            for (image, memory) in self
-                .bloom_a_images
-                .drain(..)
-                .zip(self.bloom_a_memories.drain(..))
-            {
-                ctx.device.destroy_image(image, None);
-                ctx.device.free_memory(memory, None);
+            for memory in self.bloom_a_memories.drain(..) {
+                ctx.free_target_memory(memory);
+            }
+            for image in self.bloom_a_images.drain(..) {
+                ctx.destroy_target_image(image);
             }
             for view in self.bloom_a_views.drain(..) {
-                ctx.device.destroy_image_view(view, None);
+                ctx.destroy_target_image_view(view);
             }
-            for (image, memory) in self
-                .hdr_depth_images
-                .drain(..)
-                .zip(self.hdr_depth_memories.drain(..))
-            {
-                ctx.device.destroy_image(image, None);
-                ctx.device.free_memory(memory, None);
+            for memory in self.hdr_depth_memories.drain(..) {
+                ctx.free_target_memory(memory);
+            }
+            for image in self.hdr_depth_images.drain(..) {
+                ctx.destroy_target_image(image);
             }
             for view in self.hdr_depth_views.drain(..) {
-                ctx.device.destroy_image_view(view, None);
+                ctx.destroy_target_image_view(view);
             }
-            for (image, memory) in self.hdr_images.drain(..).zip(self.hdr_memories.drain(..)) {
-                ctx.device.destroy_image(image, None);
-                ctx.device.free_memory(memory, None);
+            for memory in self.hdr_memories.drain(..) {
+                ctx.free_target_memory(memory);
+            }
+            for image in self.hdr_images.drain(..) {
+                ctx.destroy_target_image(image);
             }
             for view in self.hdr_views.drain(..) {
-                ctx.device.destroy_image_view(view, None);
+                ctx.destroy_target_image_view(view);
             }
         }
     }

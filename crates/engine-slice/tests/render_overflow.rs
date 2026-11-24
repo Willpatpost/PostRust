@@ -21,7 +21,8 @@
 
 use engine_renderer::scene::{SceneVertex, push_box};
 use engine_renderer::{
-    DemoScenePreference, PresentModePreference, RenderConfig, Renderer, ValidationPreference,
+    DemoScenePreference, DepthFormatPreference, PresentModePreference, RenderConfig, Renderer,
+    ValidationPreference,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 
@@ -88,6 +89,7 @@ fn oversized_region_and_overlay_report_exact_truncation() {
         validation: ValidationPreference::On,
         replace_pipelines: false,
         demo_scene: DemoScenePreference::Included,
+        depth_format: DepthFormatPreference::Auto,
     };
     let mut app = ShellApp::new(ShellConfig {
         title: "Sektor7 F-03 Step 1 oversize smoke".to_string(),
