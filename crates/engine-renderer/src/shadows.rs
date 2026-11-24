@@ -420,7 +420,7 @@ mod tests {
 
     fn corner_cascade() -> ShadowCascade {
         let boxes = intersection_boxes();
-        let (min, max) = scene_bounds(&boxes);
+        let (min, max) = scene_bounds(boxes);
         cascade_for(day_preset().dir_toward_light, min, max)
     }
 
@@ -435,7 +435,7 @@ mod tests {
             [0.0, 0.9999, 0.0],
             [0.7, 0.7, 0.0],
         ] {
-            let (min, max) = scene_bounds(&intersection_boxes());
+            let (min, max) = scene_bounds(intersection_boxes());
             let cascade = cascade_for(light, min, max);
             let unit = |v: [f32; 3]| (dot3(v, v)).sqrt();
             assert!((unit(cascade.light) - 1.0).abs() < 1e-6, "light unit");
@@ -449,7 +449,7 @@ mod tests {
         // stays non-degenerate) instead of producing a zero cross.
         // With the light along +Y, +Y IS the depth axis, so the
         // map's up becomes +X (the flipped reference).
-        let (min, max) = scene_bounds(&intersection_boxes());
+        let (min, max) = scene_bounds(intersection_boxes());
         let vertical = cascade_for([0.0, 1.0, 0.0], min, max);
         assert!(vertical.right != [0.0; 3]);
         assert_eq!(
@@ -469,7 +469,7 @@ mod tests {
     #[test]
     fn cascade_matrix_covers_the_scene() {
         let cascade = corner_cascade();
-        let (min, max) = scene_bounds(&intersection_boxes());
+        let (min, max) = scene_bounds(intersection_boxes());
         for corner in 0..8 {
             let world = [
                 if corner & 1 == 0 { min[0] } else { max[0] },
@@ -575,11 +575,11 @@ mod tests {
         let cascade = corner_cascade();
         // The center: shadowed by the SW mass's near edge.
         assert!(
-            is_shadowed([0.0, 0.0, 0.0], &cascade, &boxes),
+            is_shadowed([0.0, 0.0, 0.0], &cascade, boxes),
             "the day sun's signature shadow falls on the cross center"
         );
         // Deep inside the tall SW mass: only itself along the ray.
-        assert!(!is_shadowed([-20.0, 10.0, -20.0], &cascade, &boxes));
+        assert!(!is_shadowed([-20.0, 10.0, -20.0], &cascade, boxes));
         // Both regimes exist on the ground: sample the road cross
         // and the world square's open ring outside the masses.
         let mut lit = 0;
@@ -596,7 +596,7 @@ mod tests {
                 if inside {
                     continue;
                 }
-                if is_shadowed(point, &cascade, &boxes) {
+                if is_shadowed(point, &cascade, boxes) {
                     shadowed += 1;
                 } else {
                     lit += 1;
@@ -704,7 +704,7 @@ mod tests {
         let mut ground_hits = 0;
         for y in (0..n).step_by(3) {
             for x in (0..n).step_by(3) {
-                let texel = map_texel_depth(&cascade, &boxes, x, y, n);
+                let texel = map_texel_depth(&cascade, boxes, x, y, n);
                 assert!(texel.depth >= 0.0 && texel.depth <= 1.0);
                 match texel.box_index {
                     Some(index) => {

@@ -43,8 +43,18 @@ struct FrameParams {
 @group(0) @binding(3)
 var<uniform> frame: FrameParams;
 
+// The position output is `@invariant` (Era-1 review finding 19):
+// this re-draw depth-tests EQUAL (no depth write) against the depth
+// lit_scene.wgsl / lit_scene_shadowed.wgsl wrote for the SAME
+// ground vertices — equal algebra in separately compiled pipelines
+// does not establish bit-identical clip positions (the Vulkan
+// invariance rules), and a divergent rasterized depth silently
+// rejects the wet fragments on oblique ground. The Invariant
+// decoration — carried by ALL THREE shaders — is the correction;
+// vulkan.rs::position_invariance pins the emitted SPIR-V
+// decorations from the pinned naga.
 struct VertexOut {
-    @builtin(position) position: vec4<f32>,
+    @invariant @builtin(position) position: vec4<f32>,
     @location(0) world_normal: vec3<f32>,
     @location(1) world_pos: vec3<f32>,
 };

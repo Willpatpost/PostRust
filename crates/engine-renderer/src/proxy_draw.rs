@@ -73,9 +73,7 @@ use super::{
 use crate::ProxyDrawMode;
 use crate::config::FRAMES_IN_FLIGHT;
 use crate::populated_meshes::{humanoid_mesh, sedan_mesh};
-use crate::proxy_indirect::{
-    INDIRECT_COMMAND_BYTES, INDIRECT_SLOT_BYTES, indirect_kind_offset, indirect_slot_commands,
-};
+use crate::proxy_indirect::{INDIRECT_COMMAND_BYTES, INDIRECT_SLOT_BYTES, indirect_kind_offset};
 use crate::proxy_instances::{INSTANCE_STRIDE, MAX_INSTANCES};
 use crate::proxy_mesh::ProxyVertex;
 use ash::vk;
@@ -161,10 +159,18 @@ pub(crate) struct IndirectResources {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     mapped: *mut core::ffi::c_void,
+    /// The NPC mesh's vertex count (396 — the Era-1 v2 humanoid).
+    npc_vertices: u32,
+    /// The vehicle mesh's vertex count (552 — the Era-1 v2 sedan).
+    vehicle_vertices: u32,
 }
 
 impl IndirectResources {
-    fn new(ctx: &VulkanContext) -> Result<Self, RendererError> {
+    fn new(
+        ctx: &VulkanContext,
+        npc_vertices: u32,
+        vehicle_vertices: u32,
+    ) -> Result<Self, RendererError> {
         let (buffer, memory, mapped) = create_mapped_buffer(
             ctx,
             // The draw reads the commands from GPU memory — the
@@ -179,6 +185,8 @@ impl IndirectResources {
             buffer,
             memory,
             mapped,
+            npc_vertices,
+            vehicle_vertices,
         })
     }
 
@@ -191,16 +199,25 @@ impl IndirectResources {
     /// (the same contract as [`ProxyResources::write_slot`], which
     /// the frame flow satisfies immediately before this call).
     pub(super) unsafe fn write_slot(&self, slot: usize, npc_count: u32, vehicle_count: u32) {
-        let block = indirect_slot_commands(npc_count, vehicle_count);
+        let block = crate::proxy_indirect::pack_indirect_block(
+            self.npc_vertices,
+            npc_count,
+            self.vehicle_vertices,
+            vehicle_count,
+        );
         // SAFETY: the documented caller contract — this slot's
         // fence wait passed, so the previous submission through this
         // slot (whose draws read this region) has completed.
         unsafe {
             let dest = self
                 .mapped
-                .byte_add(slot * INDIRECT_SLOT_BYTES)
+                .byte_add(slot * crate::proxy_indirect::INDIRECT_SLOT_BYTES)
                 .cast::<u8>();
-            core::ptr::copy_nonoverlapping(block.as_ptr(), dest, INDIRECT_SLOT_BYTES);
+            core::ptr::copy_nonoverlapping(
+                block.as_ptr(),
+                dest,
+                crate::proxy_indirect::INDIRECT_SLOT_BYTES,
+            );
         }
     }
 
@@ -308,7 +325,7 @@ impl ProxyResources {
         if self.indirect.is_some() {
             return Ok(());
         }
-        match IndirectResources::new(ctx) {
+        match IndirectResources::new(ctx, self.npc_vertices, self.vehicle_vertices) {
             Ok(state) => {
                 self.indirect = Some(state);
                 Ok(())
@@ -459,7 +476,10 @@ impl ProxyResources {
                                 // no multiDrawIndirect feature, no
                                 // cross-kind state; firstInstance is
                                 // pinned zero in the packed bytes (the
-                                // portability contract).
+                                // portability contract). The issuance
+                                // is counted AT the call site (the
+                                // 6-E2 observation the render_instanced
+                                // gate asserts — see the field's doc).
                                 ctx.device.cmd_draw_indirect(
                                     cmd,
                                     indirect.buffer,
@@ -467,6 +487,8 @@ impl ProxyResources {
                                     1,
                                     INDIRECT_COMMAND_BYTES as u32,
                                 );
+                                ctx.indirect_draws_issued
+                                    .set(ctx.indirect_draws_issued.get() + 1);
                                 calls += 1;
                             }
                             None => {

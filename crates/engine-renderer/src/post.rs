@@ -18,6 +18,8 @@
 /// unguarded rational would map toward 1) clamp to black — the
 /// documented guard, mirrored by the shader. The shader mirrors
 /// term-for-term.
+/// Mirrors post.wgsl's tonemap branch structure: nonpositive inputs
+/// return exactly 0.0; positive inputs use the rational polynomial.
 pub fn tonemap(x: f32) -> f32 {
     if x <= 0.0 {
         return 0.0;
@@ -282,6 +284,29 @@ mod tests {
         assert_eq!(tonemap(-0.5), 0.0);
     }
 
+    /// Tonemap edge cases match the shader's branch structure:
+    /// nonpositive (negative, zero) → exactly 0.0; positive uses
+    /// the rational polynomial (the shader mirrors this exactly).
+    #[test]
+    fn tonemap_edge_cases_match_shader_branch_structure() {
+        // Negative input → 0 (shader returns 0 via branch)
+        assert_eq!(tonemap(-0.5), 0.0, "negative input");
+        assert_eq!(tonemap(-1.0), 0.0, "more negative input");
+        assert_eq!(tonemap(-100.0), 0.0, "large negative");
+
+        // Zero input → 0 (shader returns 0 via branch)
+        assert_eq!(tonemap(0.0), 0.0, "zero input");
+        assert_eq!(tonemap(0.000_001), tonemap(0.000_001), "tiny positive");
+
+        // Midtone → rational result (shader uses polynomial)
+        let mid = tonemap(0.18);
+        assert!((mid - 0.267).abs() < 0.005, "mid-gray: {mid}");
+
+        // Over one → rational result (shader uses polynomial)
+        let high = tonemap(2.0);
+        assert!(high > 0.0 && high <= 1.0, "over-one: {high}");
+    }
+
     /// The per-channel form is the scalar applied independently.
     #[test]
     fn tonemap_rgb_independent() {
@@ -323,6 +348,16 @@ mod tests {
         assert!(bright_pass(-1.0) <= 0.0, "negatives never bloom");
     }
 
+    /// The bright pass per-channel form mirrors the scalar per
+    /// component (the shader's fs_bright uses it per channel).
+    #[test]
+    fn bright_pass_rgb_per_channel() {
+        let out = bright_pass_rgb([0.5, 1.25, 2.0]);
+        assert_eq!(out[0], bright_pass(0.5));
+        assert_eq!(out[1], bright_pass(1.25));
+        assert_eq!(out[2], bright_pass(2.0));
+    }
+
     /// The bright pass is EXACTLY zero below the threshold (not
     /// merely small): the far-from-the-disc gate rests on this —
     /// a dark sky contributes nothing to the bloom mip, so those
@@ -333,6 +368,17 @@ mod tests {
             assert_eq!(bright_pass(x), 0.0, "x = {x}");
         }
         assert_eq!(bright_pass_rgb([0.9, 0.99, 0.999_999]), [0.0; 3]);
+    }
+
+    /// Bright-pass zero at negative inputs — the shader's branch
+    /// structure (smoothstep evaluates to 0 for x <= 1.0, then
+    /// multiplied by x gives 0). This matches the CPU guard.
+    #[test]
+    fn bright_pass_negative_inputs_zero() {
+        assert_eq!(bright_pass(-0.5), 0.0, "negative");
+        assert_eq!(bright_pass(-1.0), 0.0, "more negative");
+        assert_eq!(bright_pass(-100.0), 0.0, "large negative");
+        assert_eq!(bright_pass_rgb([-0.5, -1.0, -100.0]), [0.0; 3]);
     }
 
     /// The mip extent: floor division by 4 on both axes, at least
@@ -397,6 +443,54 @@ mod tests {
             let expect = bright_pass_rgb([value, value, value]);
             assert_eq!(mip[3], expect, "value {value}");
         }
+    }
+
+    /// Downsample OOB fetches return zero — the shader's textureLoad
+    /// on an extent of 1 or 2 texels has taps at 4i+1 / 4i+2 that
+    /// fall outside. The CPU zero-fills exactly like the shader's
+    /// bounds check (the review's requirement).
+    #[test]
+    fn downsample_oob_taps_zero_fill_at_small_extents() {
+        // 1×1 image: every bloom texel's 2×2 box falls entirely OOB.
+        let extent = (1u32, 1u32);
+        let hdr: Vec<[f32; 3]> = vec![[1.0, 2.0, 3.0]];
+        for y in 0..2u32 {
+            for x in 0..2u32 {
+                let texel = downsample_texel(&hdr, extent, (x, y));
+                assert_eq!(texel, [0.0; 3], "1×1: bloom texel ({x},{y})");
+            }
+        }
+
+        // 1×4 image: only the first bloom texel has any in-range tap.
+        let extent = (1u32, 4u32);
+        let hdr: Vec<[f32; 3]> = (0..4).map(|y| [y as f32, 0.0, 0.0]).collect();
+        // Bloom texel (0,0): base (1,1) → all OOB → zero.
+        let texel = downsample_texel(&hdr, extent, (0, 0));
+        assert_eq!(texel, [0.0; 3], "1×4: texel (0,0) OOB");
+        // Bloom texel (0,1): base (1,5) → y=5 is OOB (height=4) → zero.
+        let texel = downsample_texel(&hdr, extent, (0, 1));
+        assert_eq!(texel, [0.0; 3], "1×4: texel (0,1) OOB");
+    }
+
+    /// 2×N and N×2 extents also hit OOB at the 4i+1/4i+2 taps (the
+    /// 2 texel axis still produces at least one OOB fetch per box).
+    #[test]
+    fn downsample_oob_taps_at_2xn_extents() {
+        // 2×2 image: bloom texel (0,0) → base (1,1), (2,1), (1,2), (2,2)
+        // Valid: (1,1) only (indices 0..=1). B,C,D are OOB.
+        // The tap at (1,1) returns [1.0, 0, 0], others return 0.
+        // Average = 1.0 * 0.25 = 0.25.
+        let extent = (2u32, 2u32);
+        let hdr: Vec<[f32; 3]> = vec![[1.0, 0.0, 0.0]; 4];
+        let texel = downsample_texel(&hdr, extent, (0, 0));
+        assert_eq!(texel, [0.25, 0.0, 0.0], "2×2: texel (0,0) one valid tap");
+
+        // 2×4 image: bloom texel (0,1) → base (1,5) → y=5 is OOB
+        // (height=4 means valid y ∈ {0,1,2,3}).
+        let extent = (2u32, 4u32);
+        let hdr: Vec<[f32; 3]> = (0..8).map(|_| [1.0, 0.0, 0.0]).collect();
+        let texel = downsample_texel(&hdr, extent, (0, 1));
+        assert_eq!(texel, [0.0; 3], "2×4: texel (0,1) all OOB");
     }
 
     /// The blur taps: the weights ARE the shader's literals

@@ -37,8 +37,18 @@ struct MaterialParams {
 @group(0) @binding(3)
 var<uniform> material: MaterialParams;
 
+// The position output is `@invariant` (Era-1 review finding 19):
+// the wet ground's re-draw (ground_reflect.wgsl) depth-tests EQUAL
+// against the depth THIS pipeline writes, and the shadowed variant
+// (lit_scene_shadowed.wgsl) must produce the same depth for the
+// same ground — identical inputs and operation order do NOT
+// establish bit-identical clip positions across separately
+// compiled pipelines (the Vulkan invariance rules); the Invariant
+// decoration does. All three shaders carry it, and
+// vulkan.rs::position_invariance pins the emitted SPIR-V
+// decorations from the pinned naga.
 struct VertexOut {
-    @builtin(position) position: vec4<f32>,
+    @invariant @builtin(position) position: vec4<f32>,
     @location(0) world_normal: vec3<f32>,
     @location(1) world_pos: vec3<f32>,
     @location(2) uv: vec2<f32>,
