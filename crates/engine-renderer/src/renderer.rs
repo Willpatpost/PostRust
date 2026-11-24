@@ -941,6 +941,18 @@ impl Renderer {
         self.ctx.set_target_fault(site, stage, ordinal);
     }
 
+    /// Arms a one-shot acquire-out-of-date injection (finding 6's
+    /// verification knob — the driver-forced
+    /// `VK_ERROR_OUT_OF_DATE_KHR` acquire path, unreachable from the
+    /// test API otherwise). Diagnostic-only, test-only: the plan is
+    /// consumed at the first acquire site of the next frame so the
+    /// retry acquire inside the out-of-date arm is structurally
+    /// real. The `&mut self` is intentional: the one-shot intent is
+    /// encoded in the type (a caller must mutably borrow to arm it).
+    pub fn inject_acquire_out_of_date(&mut self) {
+        self.ctx.set_acquire_out_of_date();
+    }
+
     pub fn stats(&self) -> &RenderStats {
         &self.stats
     }
