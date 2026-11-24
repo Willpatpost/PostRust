@@ -378,8 +378,15 @@ jobs:
           # independently adds +7 — with both landed the count is
           # 1196/1145; whichever lands second re-measures and takes
           # the actuals.
-          expected=1189
-          if [ "$(uname -s)" != "Linux" ]; then expected=1138; fi
+          # Era 1 corrective/allocations-geometry-gates run 2
+          # (2026-11-24, finding 12): +2 platform-uniform
+          # engine-renderer lib tests (the full-vertex FNV-1a digest
+          # pins, one per v2 mesh — pure f32-bit serialization).
+          # Linux 1191/2/33 MEASURED locally with this step's own
+          # awk; Windows 1140 = 1138 + the same 2. With #22 landed
+          # too: 1198/1147 — whichever lands last takes the actuals.
+          expected=1191
+          if [ "$(uname -s)" != "Linux" ]; then expected=1140; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -446,8 +453,11 @@ jobs:
           # MERGE-ORDER ARITHMETIC: #22 independently adds +7 —
           # with both landed 119; whichever lands second takes the
           # actuals.
-          echo "renderer release: $passed passed, $results test-result lines (expected 112 / 2)"
-          [ "$passed" -eq 112 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 112"; exit 1; }
+          # Run 2 (finding 12): +2 (the digest pins, the same +2 as
+          # the main shard) — 112 -> 114, MEASURED locally (114/0
+          # failures/2 result lines).
+          echo "renderer release: $passed passed, $results test-result lines (expected 114 / 2)"
+          [ "$passed" -eq 114 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 114"; exit 1; }
           [ "$results" -eq 2 ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != 2"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production

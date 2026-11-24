@@ -295,6 +295,74 @@ mod tests {
         assert!(expected_angle.is_finite());
     }
 
+    /// THE CROSS-PLATFORM FULL-VERTEX DIGEST PIN (finding 12 — the
+    /// full-vertex regression gate). The v2 meshes' determinism test
+    /// only checked position bits. A change to UV, normal, or
+    /// triangle ordering evaded it. After the winding fix (finding
+    /// 11), pin one canonical full-vertex digest per mesh: position,
+    /// normal, and UV serialized as little-endian f32 bits in that
+    /// fixed order, folded with FNV-1a 64-bit (the repo's established
+    /// hash). The same values measured on Linux and Windows CI ARE
+    /// the cross-platform determinism proof — the fingerprint-pin
+    /// discipline applied to the full-vertex set. The existing
+    /// position-only checks stay untouched.
+    fn vertex_digest_fnv(mesh: &[ProxyVertex]) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash = FNV_OFFSET;
+        for v in mesh {
+            // pos (3×f32) + normal (3×f32) + uv (2×f32): 8 f32s = 32 bytes
+            for &f in v.pos.iter().chain(v.normal.iter()).chain(v.uv.iter()) {
+                for &byte in f.to_le_bytes().iter() {
+                    hash ^= byte as u64;
+                    hash = hash.wrapping_mul(FNV_PRIME);
+                }
+            }
+        }
+        hash
+    }
+
+    /// The humanoid v2 full-vertex digest: MEASURED at this tree
+    /// (post-winding-fix — finding 11's wheel-winding correction
+    /// deliberately changed the normal-bearing bytes). The digest
+    /// pins the entire vertex content: pos, normal, AND uv across all
+    /// 396 vertices. Cross-platform determinism follows from the
+    /// libm-free fixed-order construction and the IEEE f32 bits
+    /// serialization (no platform-dependent libm or iteration order).
+    #[test]
+    fn humanoid_mesh_full_vertex_digest_pin() {
+        let mesh = humanoid_mesh();
+        assert_eq!(mesh.len(), 396, "11 boxes x 36 vertices");
+        let digest = vertex_digest_fnv(&mesh);
+        // The measured-actual FNV-1a of the complete vertex set.
+        // Run once with a temporary println to obtain the actual, then
+        // pin it. A later mismatch is an investigation, never a silent
+        // repin. The value changed after the winding fix (finding 11).
+        const PINNED_FNV: u64 = 14589391755680253577;
+        assert_eq!(
+            digest, PINNED_FNV,
+            "the humanoid full-vertex digest moved: a vertex-shape or \
+             triangle-ordering change — an investigation, never a silent repin"
+        );
+    }
+
+    /// The sedan v2 full-vertex digest: the same discipline at 552
+    /// vertices, measured post-winding-fix.
+    #[test]
+    fn sedan_mesh_full_vertex_digest_pin() {
+        let mesh = sedan_mesh();
+        assert_eq!(mesh.len(), 552, "2 boxes x 36 + 4 wheels x 120");
+        let digest = vertex_digest_fnv(&mesh);
+        // The measured-actual FNV-1a of the complete vertex set.
+        // The value changed after the winding fix (finding 11).
+        const PINNED_FNV: u64 = 14576727727469601309;
+        assert_eq!(
+            digest, PINNED_FNV,
+            "the sedan full-vertex digest moved: a vertex-shape or \
+             triangle-ordering change — an investigation, never a silent repin"
+        );
+    }
+
     /// (corrective finding 11) Every wheel triangle's geometric
     /// normal must agree with its authored normals: the side quads'
     /// cross product points outward radially (the smooth-shading

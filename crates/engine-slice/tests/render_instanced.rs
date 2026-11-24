@@ -306,6 +306,138 @@ fn check_single_instance_oracle(
     );
 }
 
+/// FINDING 13's lit-transform oracle: the single-instance known-
+/// answer check for a TRANSLATED, ROTATED, non-unit-scaled wall —
+/// the camera looks DEAD-ON along the rotated face normal, so the
+/// wall's scaled rectangle fills the framebuffer exactly as the
+/// axis-aligned fixture's does, and every pixel's expected color is
+/// derived independently through the pinned instance-transform
+/// convention (proxy_instances::instance_columns: world = pos +
+/// yaw·(scale·local), +Z → [s, 0, c], +X → [c, 0, −s]). The local
+/// coordinates for the UV come from the INVERSE transform (the
+/// instance transform never touches UV — the shader computes it
+/// from the local position), the normal is the rotated +Z, and the
+/// eye vector is the dead-on camera's. A shader that drops or
+/// transposes the normal rotation, or ignores the scale in the
+/// world position, moves these pixels off their expected values.
+fn check_rotated_instance_oracle(
+    renderer: &mut Renderer,
+    size: (u32, u32),
+    instance: &ProxyInstance,
+    material: usize,
+    half_width: f32,
+    y_local: [f32; 2],
+) {
+    let t = &instance.transform;
+    let (s, c) = engine_renderer::proxy_instances::sin_cos_turn(t.turn);
+    // The pinned convention's basis images (unit — sin_cos_turn's
+    // Taylor is within 2e-6 of unit; normalize like the shader does).
+    let n_len = (s * s + c * c).sqrt();
+    let normal = [s / n_len, 0.0, c / n_len]; // local +Z → world
+    let tangent = [c / n_len, 0.0, -s / n_len]; // local +X → world
+    let k = t.scale;
+    // The wall's WORLD rectangle: center and half extents (yaw
+    // preserves Y, so the local y range only scales and lifts).
+    let y_mid_local = (y_local[0] + y_local[1]) / 2.0;
+    let center = [t.pos[0], t.pos[1] + k * y_mid_local, t.pos[2]];
+    let hw = half_width * k;
+    let hh = (y_local[1] - y_local[0]) / 2.0 * k;
+    // The dead-on orthographic camera: right = tangent, up = +Y,
+    // looking along −normal from eye = center + 4·normal (the
+    // axis-aligned fixture's own 4-unit standoff). Row-vector
+    // convention, the existing machinery's layout: NDC.x = ((P−C)·
+    // tangent)/hw, NDC.y = (Py−Cy)/hh, depth = 0.25 − 0.0625·((P−C)·
+    // normal) (the wall lands at 0.25, the existing fixture's depth).
+    let matrix = [
+        [tangent[0] / hw, 0.0, tangent[2] / hw, 0.0],
+        [0.0, 1.0 / hh, 0.0, 0.0],
+        [-0.0625 * normal[0], 0.0, -0.0625 * normal[2], 0.0],
+        [
+            -(center[0] * tangent[0] + center[2] * tangent[2]) / hw,
+            -center[1] / hh,
+            0.25 + 0.0625 * (center[0] * normal[0] + center[2] * normal[2]),
+            1.0,
+        ],
+    ];
+    let eye = [
+        center[0] + 4.0 * normal[0],
+        center[1] + 4.0 * normal[1],
+        center[2] + 4.0 * normal[2],
+    ];
+    let single = [*instance];
+    renderer.request_frame_capture().unwrap();
+    let frame = renderer
+        .render_corner_populated(
+            &matrix,
+            eye,
+            day_preset(),
+            &populated(&single, &[], 1, 0),
+            size,
+        )
+        .unwrap();
+    assert!(frame.presented);
+    assert_eq!(
+        frame.geometry.proxy_draw_calls, 1,
+        "the single rotated instance draws once"
+    );
+    let image = renderer.take_frame_capture().unwrap().unwrap();
+    let mat = materials()[material];
+    let texture = procedural_texture(mat.texture);
+    let mut largest_error = 0u8;
+    let mut checked = 0usize;
+    for y in 8..size.1 - 8 {
+        for x in 8..size.0 - 8 {
+            let dx = (x as f32 + 0.5) * 2. / size.0 as f32 - 1.;
+            let dy = (y as f32 + 0.5) * 2. / size.1 as f32 - 1.;
+            // Screen → world: the dead-on rectangle (pixel-down is
+            // world-down, the raster convention).
+            let world = [
+                center[0] + dx * hw * tangent[0],
+                center[1] - dy * hh,
+                center[2] + dx * hw * tangent[2],
+            ];
+            // World → LOCAL (the inverse transform — scale then
+            // un-yaw then un-translate; the dot with the basis
+            // recovers the scaled local coordinates exactly, since
+            // tangent ⊥ normal ⊥ +Y).
+            let local_x =
+                ((world[0] - t.pos[0]) * tangent[0] + (world[2] - t.pos[2]) * tangent[2]) / k;
+            let local_y = (world[1] - t.pos[1]) / k;
+            let [tx, ty] = [(local_x / 4.), (local_y / 4.)]
+                .map(|m| (m.rem_euclid(1.) * TEXTURE_SIZE as f32).floor() as usize);
+            let index = 4 * (ty * TEXTURE_SIZE as usize + tx);
+            let albedo =
+                std::array::from_fn(|ch| texture[index + ch] as f32 / 255. * instance.tint[ch]);
+            let view = std::array::from_fn(|i| eye[i] - world[i]);
+            let expected = lit_surface_color(albedo, normal, view, mat, day_preset())
+                .map(|ch| (255. * ch.clamp(0., 1.)).round() as u8);
+            let pixel = image.pixel_rgba(x, y);
+            let error = expected
+                .iter()
+                .zip(pixel)
+                .map(|(e, a)| e.abs_diff(a))
+                .max()
+                .unwrap();
+            largest_error = largest_error.max(error);
+            assert!(
+                error <= 2,
+                "rotated-instance pixel ({x},{y}) world {world:?}: expected {expected:?}, \
+                 got {pixel:?} (a dropped or transposed normal rotation, or a scale ignored \
+                 in the world position, moves this pixel off its expected value)"
+            );
+            assert_eq!(pixel[3], 255);
+            checked += 1;
+        }
+    }
+    assert!(checked > 0);
+    println!(
+        "rotated-instance oracle (material {material}, turn {}): {checked} framebuffer \
+         pixels, max RGB error {largest_error}/255 — N·L ≈ {:.3}",
+        t.turn,
+        normal[0] * day_preset().dir_toward_light[0] + normal[2] * day_preset().dir_toward_light[2]
+    );
+}
+
 #[test]
 #[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
 fn instanced_draws_match_per_object_pixels_and_pin_counts() {
@@ -592,6 +724,83 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
     // The stride contract the packed bytes rely on (defense in depth
     // for the buffer math this test exercised end to end).
     assert_eq!(INSTANCE_STRIDE, 96);
+
+    // FINDING 13'S LIT-TRANSFORM ORACLE FIXTURE (SHOULD-FIX — the
+    // independent instancing oracle measured ambient-only,
+    // identity-transform walls: unit scale, zero yaw, +Z normal, and
+    // the day light's negative Z clamped N·L to 0, so diffuse and
+    // specular vanished and a wrong rotated normal still matched).
+    // The fixture: a TRANSLATED, ROTATED (turn 40960 = 225°), 2×-
+    // scaled wall under the day light — the rotated normal
+    // [−0.707, 0, −0.707] points INTO the light's (−0.5, 0.707,
+    // −0.5) direction: N·L ≈ 0.707 (strong diffuse) and the
+    // dead-on view's half vector gives N·H ≈ 0.923 (measurable
+    // specular). The CPU reference derives the hit, UV, rotated
+    // normal, and eye vector independently at the ACTUAL face
+    // depth, through the pinned instance-transform convention
+    // (proxy_instances::instance_columns: +Z → [s, 0, c], +X →
+    // [c, 0, −s], scale then yaw then translate).
+    check_rotated_instance_oracle(
+        &mut renderer,
+        size,
+        &ProxyInstance {
+            transform: InstanceTransform {
+                pos: [2.0, 0.02, -2.0],
+                turn: 40_960, // 225° — the normal faces the day light
+                scale: 2.0,
+            },
+            tint: [1.0, 1.0, 1.0],
+        },
+        1,            // the building facade material
+        0.21,         // the NPC torso's local half width
+        [0.54, 0.80], // the local y range the torso wall spans
+    );
+
+    // THE SELF-DISCRIMINATION CONTROL (the review's bar, proven
+    // CPU-side): the same surface lit with the UN-ROTATED +Z normal
+    // clamps N·L to zero (the day light's z is −0.5) — ambient-only,
+    // the exact failure mode this fixture exists to catch. The
+    // expected colors differ by far more than the 2/255 tolerance,
+    // so a shader that drops or transposes the normal rotation
+    // fails the pixel checks above.
+    {
+        let (s, c) = engine_renderer::proxy_instances::sin_cos_turn(40_960);
+        let rotated = [-s, 0.0, -c]; // +Z under 225°: both components negative
+        let unrotated = [0.0, 0.0, 1.0];
+        let light = day_preset();
+        let mat = materials()[1];
+        let albedo = [0.5f32; 3];
+        let view = [rotated[0] * 4.0, 0.0, rotated[2] * 4.0]; // the dead-on eye vector
+        let correct = lit_surface_color(albedo, rotated, view, mat, light);
+        let buggy = lit_surface_color(albedo, unrotated, view, mat, light);
+        let n_dot_l = (rotated[0] * light.dir_toward_light[0]
+            + rotated[2] * light.dir_toward_light[2])
+            .max(0.0);
+        let v = view;
+        let l = light.dir_toward_light;
+        let h_len = ((l[0] + v[0]).powi(2) + (l[1] + v[1]).powi(2) + (l[2] + v[2]).powi(2)).sqrt();
+        let n_dot_h = ((rotated[0] * (l[0] + v[0]) + rotated[2] * (l[2] + v[2])) / h_len).max(0.0);
+        let mut spec = n_dot_h;
+        for _ in 0..mat.shininess.trailing_zeros() {
+            spec *= spec;
+        }
+        let delta = correct[0] - buggy[0];
+        println!(
+            "lit-transform fixture: N·L {n_dot_l:.3}, N·H {n_dot_h:.3}, specular factor              {spec:.3}, un-rotated-normal color delta {delta:.3} (the tolerance is 2/255 ≈ 0.008)"
+        );
+        assert!(
+            n_dot_l > 0.5,
+            "the fixture's diffuse is strong, not ambient-only (N·L {n_dot_l:.3})"
+        );
+        assert!(
+            spec > 0.05,
+            "the fixture's specular is measurable (factor {spec:.3})"
+        );
+        assert!(
+            delta > 0.05,
+            "the fixture discriminates a dropped normal rotation (delta {delta:.3})"
+        );
+    }
 }
 
 /// The ladder package 3 gate (the corner-scene population): the
