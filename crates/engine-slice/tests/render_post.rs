@@ -502,6 +502,7 @@ fn post_pixels_match_post_rs_and_the_disc_blooms() {
 #[test]
 #[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
 fn depth_fallbacks_and_the_post_lifecycle() {
+    let _guard = sdl_lock();
     /// The full presented image the pure-sky CPU chain computes for
     /// an already-built HDR texel field (the first gate's own
     /// arithmetic, materialized for probe reuse).
@@ -522,14 +523,19 @@ fn depth_fallbacks_and_the_post_lifecycle() {
     /// bloom feeder) and the four far-corner 3×3 patches (the pure
     /// ACES tonemap, the orientation detector) — against a presented
     /// oracle image.
-    fn check_probes(image: &[[u8; 4]], oracle: &[[u8; 4]], size: (u32, u32), what: &str) {
+    fn check_probes(
+        capture: &engine_renderer::CapturedFrame,
+        oracle: &[[u8; 4]],
+        size: (u32, u32),
+        what: &str,
+    ) {
         let center = size.0 / 2;
         let mut max_error = 0u8;
         let mut checked = 0usize;
         for y in center - 2..=center + 2 {
             for x in center - 2..=center + 2 {
                 let expected = oracle[(y * size.0 + x) as usize];
-                let actual = image[(y * size.0 + x) as usize];
+                let actual = capture.pixel_rgba(x, y);
                 let error = expected
                     .iter()
                     .zip(actual)
@@ -553,7 +559,7 @@ fn depth_fallbacks_and_the_post_lifecycle() {
             for y in cy..cy + 3 {
                 for x in cx..cx + 3 {
                     let expected = oracle[(y * size.0 + x) as usize];
-                    let actual = image[(y * size.0 + x) as usize];
+                    let actual = capture.pixel_rgba(x, y);
                     let error = expected
                         .iter()
                         .zip(actual)
@@ -640,7 +646,7 @@ fn depth_fallbacks_and_the_post_lifecycle() {
             })
             .collect::<Vec<_>>();
         check_probes(
-            posted.bytes.as_chunks::<4>().0,
+            &posted,
             &presented_from_hdr(&hdr, size),
             size,
             &format!("post fallback {forced_name} at 256"),
@@ -665,7 +671,7 @@ fn depth_fallbacks_and_the_post_lifecycle() {
             })
             .collect::<Vec<_>>();
         check_probes(
-            resized_capture.bytes.as_chunks::<4>().0,
+            &resized_capture,
             &presented_from_hdr(&hdr_resized, resized),
             resized,
             &format!("post fallback {forced_name} after resize"),
@@ -746,7 +752,7 @@ fn depth_fallbacks_and_the_post_lifecycle() {
         .collect::<Vec<_>>();
     let reference_oracle = presented_from_hdr(&hdr, size);
     check_probes(
-        reference.bytes.as_chunks::<4>().0,
+        &reference,
         &reference_oracle,
         size,
         "post lifecycle reference",
@@ -783,7 +789,7 @@ fn depth_fallbacks_and_the_post_lifecycle() {
     );
     let restored = renderer.take_frame_capture().unwrap().unwrap();
     check_probes(
-        restored.bytes.as_chunks::<4>().0,
+        &restored,
         &reference_oracle,
         size,
         "post lifecycle restored at the original extent",
