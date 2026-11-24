@@ -40,6 +40,7 @@
 // here instead.) `engine-core`'s Cargo-level deny is untouched.
 #![deny(unsafe_code)]
 
+pub mod animation;
 pub mod config;
 pub use vulkan::{descriptors, textures};
 pub mod glyph_atlas;
@@ -61,6 +62,12 @@ pub mod sky;
 mod renderer;
 mod vulkan;
 
+pub use animation::{
+    BOX_JOINT, Clip, HUMANOID_BOXES, HUMANOID_JOINTS, Joint, JointPose, Keyframe, MAX_POSE_BLOCKS,
+    POSE_STRIDE, PosePackError, SkinnedVertex, compose_joint_matrices, humanoid_skeleton,
+    pack_pose_bytes, pose_sequence_digest, posed_box_bounds, repack_poses, rest_pose_block,
+    sample_pose, skin_matrices, skin_vertex, skinned_humanoid_mesh, walk_clip,
+};
 pub use config::{
     DemoScenePreference, DepthFormatPreference, PresentModePreference, RenderConfig,
     TargetFaultSite, TargetFaultStage, ValidationPreference,
