@@ -1934,11 +1934,25 @@ impl PipelineState {
             .store_op(vk::AttachmentStoreOp::STORE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+        // The depth attachment's stencil ops are DONT_CARE for the
+        // same reason post_draw.rs and shadow_draw.rs state
+        // (corrective finding 4): no pipeline in this renderer
+        // performs stencil operations — the attachment is depth
+        // testing only. Explicit rather than defaulted: ash's
+        // AttachmentDescription::default() zero-fills, and
+        // stencil_load_op = 0 is LOAD, which the validation layer
+        // rejects for a stencil-capable format (the D24 fallback)
+        // with an UNDEFINED initialLayout — VUID-VkAttachmentDescription-
+        // format-06700 (the forced-D24 post-lifecycle gate caught
+        // exactly this: the pass was silent on D32 only because
+        // D32_SFLOAT has no stencil aspect).
         let depth_attachment = vk::AttachmentDescription::default()
             .format(depth_format)
             .samples(vk::SampleCountFlags::TYPE_1)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         let attachments = [color_attachment, depth_attachment];

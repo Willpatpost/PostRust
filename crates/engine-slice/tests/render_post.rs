@@ -760,7 +760,22 @@ fn depth_fallbacks_and_the_post_lifecycle() {
     let warm = renderer.allocations();
 
     // Post OFF, then two recreations — away and BACK to the original
-    // extent — then post ON again.
+    // extent — then post ON again. The allocation ledger is asserted
+    // as an EXACT rebuild budget, not a flat equality: AllocationStats
+    // counts successful allocation CALLS since construction (the
+    // documented monotonic semantics the pipeline-replacement gates
+    // pin their deltas against), and a swapchain recreation necessarily
+    // makes new calls — corrective finding A's own one-depth-per-image
+    // design rebuilds the depth set at the new extent, and corrective
+    // finding 7's generation key rebuilds the post bundle against the
+    // new views. What must NOT happen: the postless frame allocating
+    // anything, the away recreation touching pools/sets (post is OFF —
+    // the bundle must not rebuild while nothing reads it), the back
+    // frame rebuilding the bundle MORE than once, or the warmed final
+    // frame drifting. (The first version of this check asserted a flat
+    // `== warm` across the two recreations — unpassable by design, and
+    // masked behind the stencil-load validation failure until that was
+    // fixed; see the branch's finding-4 corrective.)
     renderer.set_post(false);
     renderer.request_frame_capture().unwrap();
     assert!(
@@ -770,6 +785,11 @@ fn depth_fallbacks_and_the_post_lifecycle() {
             .presented
     );
     let _ = renderer.take_frame_capture().unwrap().unwrap();
+    assert_eq!(
+        renderer.allocations(),
+        warm,
+        "the postless frame allocates nothing (the lazy states stay put)"
+    );
     let away = (size.0 + 8, size.1 + 8);
     renderer.request_frame_capture().unwrap();
     assert!(
@@ -779,6 +799,21 @@ fn depth_fallbacks_and_the_post_lifecycle() {
             .presented
     );
     let _ = renderer.take_frame_capture().unwrap().unwrap();
+    let after_away = renderer.allocations();
+    // The away recreation's only growth is the replacement chain's
+    // per-image depth set (finding A): device_memory by the image
+    // count, nothing else. N is self-calibrated here — the image count
+    // is the device's to choose (this pod's lavapipe: 6).
+    let depth_per_chain = after_away.device_memory - warm.device_memory;
+    assert!(
+        depth_per_chain > 0,
+        "the away recreation rebuilt its depth set (found {depth_per_chain} depth memories)"
+    );
+    assert_eq!(
+        (after_away.descriptor_pools, after_away.descriptor_sets),
+        (warm.descriptor_pools, warm.descriptor_sets),
+        "post OFF: the away recreation must not rebuild the post bundle"
+    );
     renderer.set_post(true);
     renderer.request_frame_capture().unwrap();
     assert!(
@@ -809,10 +844,31 @@ fn depth_fallbacks_and_the_post_lifecycle() {
         repeat.bytes, restored.bytes,
         "byte-identical restored frames"
     );
+    // The EXACT rebuild budget: across the whole lifecycle the growth
+    // is two replacement depth sets (one per recreation, N memories
+    // each) plus ONE post bundle (2 pools, 8 sets, 8 memories — its
+    // images). A second bundle rebuild (a per-frame or per-acquire
+    // churn) fails the pools/sets equality; a stale bundle fails the
+    // pixel oracle above; a per-frame drift fails the warmed equality
+    // below.
+    let final_stats = renderer.allocations();
+    assert_eq!(
+        (
+            final_stats.device_memory,
+            final_stats.descriptor_pools,
+            final_stats.descriptor_sets
+        ),
+        (
+            warm.device_memory + 2 * depth_per_chain + 8,
+            warm.descriptor_pools + 2,
+            warm.descriptor_sets + 8
+        ),
+        "the lifecycle grew exactly two depth sets and one post bundle"
+    );
     assert_eq!(
         renderer.allocations(),
-        warm,
-        "the post lifecycle grew no allocations across two recreations"
+        final_stats,
+        "the warmed restored frame allocates nothing"
     );
     assert_eq!(
         renderer.stats().validation_errors,
@@ -821,7 +877,8 @@ fn depth_fallbacks_and_the_post_lifecycle() {
         renderer.stats().recent_validation
     );
     println!(
-        "post lifecycle: restored at the original extent through the oracle, allocations \
-         unchanged, validation clean"
+        "post lifecycle: restored at the original extent through the oracle, the exact \
+         rebuild budget ({depth_per_chain} depth memories per chain × 2 + one post bundle), \
+         no warmed drift, validation clean"
     );
 }
