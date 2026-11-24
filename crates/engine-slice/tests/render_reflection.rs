@@ -182,12 +182,16 @@ fn raycast_boxes(origin: [f32; 3], dir: [f32; 3]) -> Option<BoxHit> {
 /// ceiling with the budget documented.
 const TOLERANCE: u8 = 3;
 
-#[test]
-#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
-fn wet_ground_blends_the_mirrored_scene_by_planar_rs() {
-    let _guard = sdl_lock();
+/// The whole known-answer gate at one depth-format preference
+/// (finding 19's "across D32 and a supported fallback depth format"
+/// half — the 6/n commit measured the D32 pass; this branch adds the
+/// forced fallback pass on the same bands). The skip condition is
+/// the REPORTED format, never a guess (the knob's own semantics — a
+/// device without D24_S8 falls back to the negotiated pick and the
+/// pass is skipped with a printed line).
+fn wet_ground_gate_at(preference: DepthFormatPreference, label: &str) {
     let mut app = ShellApp::new(ShellConfig {
-        title: "Era 1 wet ground".into(),
+        title: format!("Era 1 wet ground ({label})"),
         width: 256,
         height: 256,
         target_fps: 60,
@@ -200,6 +204,7 @@ fn wet_ground_blends_the_mirrored_scene_by_planar_rs() {
             demo_scene: DemoScenePreference::Corner,
             validation: ValidationPreference::On,
             replace_pipelines: true,
+            depth_format: preference,
             ..Default::default()
         },
     )
@@ -207,6 +212,24 @@ fn wet_ground_blends_the_mirrored_scene_by_planar_rs() {
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
+    let forced_name = match preference {
+        DepthFormatPreference::Auto => None,
+        DepthFormatPreference::ForceD24S8 => Some("D24_UNORM_S8_UINT"),
+        DepthFormatPreference::ForceD16 => Some("D16_UNORM"),
+    };
+    if let Some(wanted) = forced_name
+        && renderer.stats().depth_format != wanted
+    {
+        println!(
+            "wet ground {label}: the device lacks {wanted} (reported {}) — the              forced fallback pass is skipped",
+            renderer.stats().depth_format
+        );
+        return;
+    }
+    println!(
+        "wet ground {label}: forced {} honored",
+        renderer.stats().depth_format
+    );
     let _ = app.frame();
 
     // THE PRE-WET PINS: the plain corner's own.
@@ -774,6 +797,20 @@ fn wet_ground_blends_the_mirrored_scene_by_planar_rs() {
         near_band.checked,
         far_band.max_error.max(near_band.max_error)
     );
+}
+
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
+fn wet_ground_blends_the_mirrored_scene_by_planar_rs() {
+    let _guard = sdl_lock();
+    // Finding 19's check: "Verify wet coverage at near and far oblique
+    // ground pixels across D32 and a supported fallback depth format."
+    // The whole gate runs at BOTH: the negotiated pick (D32 on the
+    // pod's lavapipe) and the forced D24_S8 fallback (the format with
+    // the stencil aspect — the aspect/attachment class the D32 pass
+    // can never exercise).
+    wet_ground_gate_at(DepthFormatPreference::Auto, "negotiated (D32)");
+    wet_ground_gate_at(DepthFormatPreference::ForceD24S8, "forced D24_S8");
 }
 
 /// FINDING 18'S BEYOND-TOLERANCE DISCRIMINATION — the review's check:
