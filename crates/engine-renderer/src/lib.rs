@@ -64,6 +64,6 @@ mod vulkan;
 pub use config::{DemoScenePreference, PresentModePreference, RenderConfig, ValidationPreference};
 pub use renderer::{
     AllocationStats, FrameResult, GeometryStats, ProxyDrawMode, ProxyPopulation, RenderStats,
-    Renderer, SceneLayer, ShadowMapReadback,
+    Renderer, SceneLayer, ShadowMapReadback, SkyFrame,
 };
 pub use vulkan::{CaptureFormat, CapturedFrame, RendererError};

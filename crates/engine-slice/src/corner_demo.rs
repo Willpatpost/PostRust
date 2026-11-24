@@ -286,6 +286,7 @@ pub fn run(
     proxy_instanced: bool,
     shadows: bool,
     free_look: Option<FreeLookOptions>,
+    sky: bool,
 ) -> Result<(), String> {
     let mut app = ShellApp::new(ShellConfig {
         title: "One Corner of the City".into(),
@@ -337,6 +338,25 @@ pub fn run(
         ProxyDrawMode::Indirect
     };
     renderer.set_proxy_draw_mode(proxy_mode);
+    // Era 1 package 3: the sky layer, driven from atmosphere_at's
+    // palettes (the endpoints are BIT-EQUAL to the day/night
+    // presets — the pinned special case; the day/night cycle
+    // package advances t continuously). The disc rides the SAME
+    // direction as the light (the sun by day, the moon by night).
+    if sky {
+        let atmosphere = engine_renderer::sky::atmosphere_at(if night { 1.0 } else { 0.0 });
+        renderer.set_sky(Some(engine_renderer::SkyFrame {
+            palette: atmosphere.sky,
+            disc_dir: atmosphere.disc_dir,
+        }));
+        println!(
+            "sky: the atmosphere_at {} palette behind the scene (horizon {:?}, zenith {:?}, the disc at {:?})",
+            if night { "night" } else { "day" },
+            atmosphere.sky.horizon,
+            atmosphere.sky.zenith,
+            atmosphere.disc_dir
+        );
+    }
     // The combination refusal (the union's policy, from the verified
     // three-way resolution): proxy shadows (a populated scene drawn
     // through the shadowed path) are a deferred package on both the

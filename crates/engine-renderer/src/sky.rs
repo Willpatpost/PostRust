@@ -21,6 +21,63 @@
 
 use crate::lit_scene::LightParams;
 
+/// The inverse of a column-major 4×4 (the repo's `Mat4` convention:
+/// `m[column][row]`, clip = Σ columns[i] · p[i]) — pure IEEE f32
+/// arithmetic in FIXED order (the cofactor expansion, transcribed
+/// through a row-major scratch so the indexing convention cannot
+/// transpose silently; the round-trip tests pin the contract).
+///
+/// This exists for the sky pass: the fullscreen triangle's vertex
+/// shader reconstructs the view ray from
+/// `inverse(view_proj) · NDC`, so the CPU computes the inverse the
+/// shader consumes. Singular inputs return the identity (never
+/// reached by the camera matrices this exists for — a perspective
+/// × rigid-view product with near > 0 is always invertible; the
+/// contract is documented and tested).
+pub fn mat4_inverse(m: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    // Row-major scratch: rm[row][col] = m[col][row] (the repo's
+    // column-major convention transcribed once, so the cofactor
+    // indexing below reads naturally and cannot transpose silently).
+    let rm: [[f32; 4]; 4] = std::array::from_fn(|row| std::array::from_fn(|col| m[col][row]));
+    // The 3×3 determinant over explicit row/column picks, fixed
+    // operation order (the Sarrus expansion).
+    let det3 = |rows: [usize; 3], cols: [usize; 3]| -> f32 {
+        let (r0, r1, r2) = (rows[0], rows[1], rows[2]);
+        let (c0, c1, c2) = (cols[0], cols[1], cols[2]);
+        rm[r0][c0] * (rm[r1][c1] * rm[r2][c2] - rm[r1][c2] * rm[r2][c1])
+            - rm[r0][c1] * (rm[r1][c0] * rm[r2][c2] - rm[r1][c2] * rm[r2][c0])
+            + rm[r0][c2] * (rm[r1][c0] * rm[r2][c1] - rm[r1][c1] * rm[r2][c0])
+    };
+    // The index sets excluding one row/column, in fixed order.
+    const REST: [[usize; 3]; 4] = [[1, 2, 3], [0, 2, 3], [0, 1, 3], [0, 1, 2]];
+    // The cofactor C(i,j) = (−1)^{i+j} · det(minor without row i,
+    // column j).
+    let cofactor = |i: usize, j: usize| -> f32 {
+        let sign = if (i + j).is_multiple_of(2) { 1.0 } else { -1.0 };
+        sign * det3(REST[i], REST[j])
+    };
+    // The determinant (the row-0 cofactor expansion).
+    let determinant = rm[0][0] * cofactor(0, 0)
+        + rm[0][1] * cofactor(0, 1)
+        + rm[0][2] * cofactor(0, 2)
+        + rm[0][3] * cofactor(0, 3);
+    if determinant == 0.0 {
+        return [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+    }
+    let inverse_determinant = 1.0 / determinant;
+    // The adjugate is the cofactor matrix TRANSPOSED: inverse(r,c) =
+    // C(c,r)/det — scaled once per element by the reciprocal,
+    // written back into the column-major output layout.
+    std::array::from_fn(|column| {
+        std::array::from_fn(|row| cofactor(column, row) * inverse_determinant)
+    })
+}
+
 /// The sun disc's angular half-radius, ~2.0 degrees — as the FIXED
 /// literal cosine of that angle (0.99939 in f32; precomputed, never
 /// a runtime transcendental).
@@ -109,8 +166,25 @@ pub struct AtmosphereFrame {
     pub light: LightParams,
     pub sky: SkyPalette,
     /// The celestial disc's direction (unit, toward the body) — the
-    /// sun by day, the moon by night (the presets' light directions).
+    /// sun by day, the moon by night (the presets' light
+    /// directions, NORMALIZED: the night preset's raw direction is
+    /// 0.9055 long, and the disc's cosine threshold contract needs
+    /// the unit form — the first-run correction found when the sky
+    /// gate finally executed; the LIGHT parameters stay raw
+    /// exactly as the presets carry them).
     pub disc_dir: [f32; 3],
+}
+
+/// The unit vector along `dir` (pure IEEE sqrt — deterministic;
+/// the zero vector maps to +Y so a degenerate input never
+/// fabricates a disc).
+fn unit_dir(dir: [f32; 3]) -> [f32; 3] {
+    let length = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+    if length == 0.0 {
+        [0.0, 1.0, 0.0]
+    } else {
+        [dir[0] / length, dir[1] / length, dir[2] / length]
+    }
 }
 
 /// The full day/night cycle at `t` in [0, 1]: t=0 is EXACTLY the
@@ -129,14 +203,14 @@ pub fn atmosphere_at(t: f32) -> AtmosphereFrame {
         return AtmosphereFrame {
             light: day_light,
             sky: day_sky_palette,
-            disc_dir: day_light.dir_toward_light,
+            disc_dir: unit_dir(day_light.dir_toward_light),
         };
     }
     if t >= 1.0 {
         return AtmosphereFrame {
             light: night_light,
             sky: night_sky_palette,
-            disc_dir: night_light.dir_toward_light,
+            disc_dir: unit_dir(night_light.dir_toward_light),
         };
     }
     let lerp = |a: f32, b: f32| a + (b - a) * t;
@@ -185,8 +259,10 @@ pub fn atmosphere_at(t: f32) -> AtmosphereFrame {
             ],
         },
         // The disc direction follows the light direction (the sun
-        // sets as the moon rises — one shared axis in this model).
-        disc_dir: [
+        // sets as the moon rises — one shared axis in this model),
+        // normalized to the unit contract (a lerped pair of unit
+        // vectors is not unit).
+        disc_dir: unit_dir([
             lerp(
                 day_light.dir_toward_light[0],
                 night_light.dir_toward_light[0],
@@ -199,7 +275,7 @@ pub fn atmosphere_at(t: f32) -> AtmosphereFrame {
                 day_light.dir_toward_light[2],
                 night_light.dir_toward_light[2],
             ),
-        ],
+        ]),
     }
 }
 
@@ -303,5 +379,148 @@ mod tests {
             (off[0] - off_grad[0]).abs() < 1e-3,
             "off-disc: no disc term"
         );
+    }
+
+    /// The inverse: identity inverts to itself, a singular input
+    /// returns the identity (the documented contract), and a
+    /// translate+scale product round-trips to the identity.
+    #[test]
+    fn mat4_inverse_identity_singular_and_round_trip() {
+        let identity = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        assert_eq!(mat4_inverse(&identity), identity);
+        let singular = [
+            [1.0, 0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        assert_eq!(mat4_inverse(&singular), identity, "the documented fallback");
+        // A column-major translate+scale: column 0 = (2,0,0,0),
+        // column 3 = (10, 20, 30, 1).
+        let ts = [
+            [2.0, 0.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0, 0.0],
+            [0.0, 0.0, 2.0, 0.0],
+            [10.0, 20.0, 30.0, 1.0],
+        ];
+        let inverse = mat4_inverse(&ts);
+        let product = mul4(&ts, &inverse);
+        assert_near_identity(&product);
+        let product = mul4(&inverse, &ts);
+        assert_near_identity(&product);
+    }
+
+    /// THE RAY PROPERTY (what the sky pass consumes): for a
+    /// perspective × rigid-view product, the inverse maps NDC (0,0)
+    /// back onto the camera's forward axis — every depth slice's
+    /// point lies on the forward ray, and the axis points at the
+    /// camera's look-at target. The sky gate's known-answer pixels
+    /// rest on this (the screen-center ray is definitionally the
+    /// camera axis, independent of the reconstruction).
+    #[test]
+    fn mat4_inverse_maps_the_center_axis_to_the_camera_forward() {
+        // A representative view-projection: the corner route's own
+        // shape (65° Vulkan perspective, near 0.1, far 150) times a
+        // yawed/pitched rigid view.
+        let perspective = |aspect: f32| -> [[f32; 4]; 4] {
+            let fov = 65_f32.to_radians();
+            let (near, far) = (0.1f32, 150.0f32);
+            let focal = 1.0 / (fov / 2.0).tan();
+            // engine-slice math.rs's own form (column-major, the
+            // [0,1] Vulkan depth, w = −z_view: the camera looks down
+            // −Z_view).
+            let mut matrix = [[0.0f32; 4]; 4];
+            matrix[0][0] = focal / aspect;
+            matrix[1][1] = focal;
+            matrix[2][2] = far / (near - far);
+            matrix[2][3] = -1.0;
+            matrix[3][2] = near * far / (near - far);
+            matrix
+        };
+        // The rigid rotation, ROW-MAJOR r[row][col] (an orthonormal
+        // yaw-then-pitch composition; the test is self-consistent —
+        // any orthonormal R exercises the inverse the same way).
+        let (yaw, pitch) = (0.7f32, 0.25f32);
+        let (sy, cy) = (yaw.sin(), yaw.cos());
+        let (sp, cp) = (pitch.sin(), pitch.cos());
+        let r = [
+            [cy, sp * sy, -cp * sy, 0.0],
+            [0.0, cp, sp, 0.0],
+            [sy, -sp * cy, cp * cy, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let position = [3.0, 1.7, -5.0];
+        // The view: Rᵀ · T(−position). Its LINEAR part in the
+        // column-major storage equals r's array element-wise
+        // (view[c][r] = R(c, r) — the transpose folds into the
+        // storage convention); the translation column is
+        // −(R's rows)·position per output row: view[3][i] =
+        // −Σ_j r[j][i]·p[j].
+        let mut view = r;
+        for i in 0..3 {
+            view[3][i] = -(r[0][i] * position[0] + r[1][i] * position[1] + r[2][i] * position[2]);
+        }
+        let view_proj = mul4(&perspective(1.0), &view);
+        let inverse = mat4_inverse(&view_proj);
+        // The camera's forward axis: the local −Z axis in world —
+        // the negated COLUMN 2 of R.
+        let forward = [-r[0][2], -r[1][2], -r[2][2]];
+        for depth in [0.0f32, 0.5, 1.0] {
+            let clip: [f32; 4] = std::array::from_fn(|i| {
+                inverse[0][i] * 0.0 + inverse[1][i] * 0.0 + inverse[2][i] * depth + inverse[3][i]
+            });
+            let point = [clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3]];
+            // The point lies on the forward ray from the camera
+            // position (parallel to the axis; positive scalings only
+            // for depth > 0).
+            let offset = [
+                point[0] - position[0],
+                point[1] - position[1],
+                point[2] - position[2],
+            ];
+            let length =
+                (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt();
+            let scale = if length == 0.0 {
+                0.0
+            } else {
+                (offset[0] * forward[0] + offset[1] * forward[1] + offset[2] * forward[2]) / length
+            };
+            assert!(
+                (scale - 1.0).abs() < 1e-3,
+                "depth {depth}: the center ray runs along the forward axis (cos {scale})"
+            );
+            if depth > 0.0 {
+                assert!(length > 0.0, "depth {depth}: in front of the camera");
+            }
+        }
+    }
+
+    fn mul4(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+        std::array::from_fn(|column| {
+            std::array::from_fn(|row| {
+                let mut sum = 0.0;
+                for k in 0..4 {
+                    sum += a[k][row] * b[column][k];
+                }
+                sum
+            })
+        })
+    }
+
+    fn assert_near_identity(m: &[[f32; 4]; 4]) {
+        for (column, values) in m.iter().enumerate() {
+            for (row, value) in values.iter().enumerate() {
+                let expected = f32::from(column == row);
+                assert!(
+                    (value - expected).abs() < 1e-4,
+                    "element ({row},{column}): {value} vs {expected}"
+                );
+            }
+        }
     }
 }
