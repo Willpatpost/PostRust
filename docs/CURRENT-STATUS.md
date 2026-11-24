@@ -419,9 +419,27 @@ comment chains and the PR bodies):
   587 Windows (26 ignored / 62 result lines) — MEASURED with the
   workflow's own awk, Windows confirmed by the exact-count CI gate.
 
-The full union's counts (adding #21/#24/#25 to #27's tree) re-measure
-at the owner's merge — the workflow's exact-count gate enforces the
-actuals, never a guess. Every rig-dependent clause (the discrete-GPU
+The full union's counts are MEASURED (the 2026-11-24 union
+  rehearsal, branch `corrective/union-rehearsal` — seven `--no-ff`
+  merges in the ladder order over `main` @ `406aceb`, the full
+  local gate battery with the workflow's own awk): main
+  **1208/2/33** (Windows 1157), renderer release **131/2**, heavy
+  **588/27/62** (Windows 587 — #27's 26 plus #21's capture gate,
+  which #26/#27's trees never contained); the push dispatches the
+  five-job CI on the exact union tree, and the workflow's
+  exact-count gate enforces the actuals at the owner's merge,
+  never a guess. The rehearsal also caught the union's two
+  merge-time obligations — both at the #21×#23 seam, correct on
+  every branch's own tree and invisible to GitHub's conflict
+  detection: `compare_map`'s 4→7-tuple (four destructure sites in
+  #21's capture gate) and `intersection_boxes()`'s Vec→`&'static
+  [SceneBox]` slice change (the same four sites' `&boxes` becomes
+  a needless borrow under clippy `-D warnings`) — plus #22's
+  accidentally-committed `vulkan.rs.backup` (a stale 5083-line
+  copy of `vulkan.rs`, removed on that branch in `5a4cbd2` with a
+  diff-identity proof of gate inertness). The full record lives in
+  PR #28's comment trail; the fixes are carried verbatim on the
+  rehearsal branch for the owner's merge sequence. Every rig-dependent clause (the discrete-GPU
 capture-visibility behavior, driver-forced fallback paths) is
 documented as rig-pending in the PR bodies, awaiting the owner's
 RTX 5070 Ti procedure — never presented as measured. The cycle's own
@@ -882,9 +900,12 @@ check-halves audit (#27). All seven PRs are open and never merged
 merge-order notes are in §4 and the PR bodies). The cycle's closing
 re-audit (2026-11-24, independently re-verified against source) found
 the recursive queue empty. What awaits the owner: the merge GOs (in
-the documented merge order), and the rig run for the rig-pending
-clauses (the discrete-GPU capture-visibility behavior and the
-driver-forced depth-fallback paths — the RTX 5070 Ti procedure,
+the documented merge order — with the two #21×#23 merge-time fixes
+and the measured union counts from the 2026-11-24 union rehearsal,
+`corrective/union-rehearsal` / PR #28's comment trail), and the rig
+run for the rig-pending clauses (the discrete-GPU
+capture-visibility behavior and the driver-forced depth-fallback
+paths — the RTX 5070 Ti procedure,
 `docs/WINDOWS-GPU-PROFILING-KIT.md`).
 
 ## 10. The authoritative coordination ledger
