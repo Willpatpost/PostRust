@@ -367,7 +367,6 @@ jobs:
           # property: the ground plane fixed bit-equal). Linux
           # 1188/2/33 MEASURED locally; Windows 1137 = 1136 + the
           # same 1.
-<<<<<<< HEAD
           # Era 1 corrective/frame-preparation (2026-11-24, findings
           # 4+7+8): +7 platform-uniform engine-renderer lib tests
           # (the depth_aspect aspect-mask contract ×4 — D32/D16
@@ -383,8 +382,6 @@ jobs:
           # fires-once, ordinal, the error variant, unarmed), the
           # same +4 platform-uniform in the renderer-release step.
           # MEASURED locally with this step's own awk.
-=======
->>>>>>> 0779242
           # Era 1 corrective/allocations-geometry-gates (2026-11-24,
           # findings 10+11): +1 platform-uniform engine-renderer lib
           # test (the wheel normal-agreement contract — every wheel
@@ -419,7 +416,6 @@ jobs:
           # matching, no cfg gates). Linux 1197/2/33 MEASURED
           # locally with this step's own awk; Windows 1146 = 1145 +
           # the same 1.
-<<<<<<< HEAD
           # UNION REHEARSAL (2026-11-24, the overnight session's
           # seven-PR merge rehearsal): #21 + #22 + #23 landed
           # together = 1188 + 11 (#22's 7 format + 4 seam) + 9
@@ -428,22 +424,6 @@ jobs:
           # wet-depth-coverage merge (#26) measured on its own
           # #22+#23 tree. Confirmed below from this rehearsal's own
           # measured actuals.
-=======
-          # Era 1 corrective/frame-preparation (2026-11-24, findings
-          # 4+7+8): +7 platform-uniform engine-renderer lib tests
-          # (the depth_aspect aspect-mask contract ×4 — D32/D16
-          # DEPTH, D24_S8 DEPTH|STENCIL, color COLOR; the
-          # resolve_depth_format battery ×3 — Auto always the
-          # negotiated pick, forced-honored, forced-unsupported
-          # fallback — pure f32-free enum logic, no cfg gates).
-          # Linux 1195/2/33 MEASURED locally with this step's own
-          # awk; Windows 1144 = 1137 + the same 7.
-          # Era-1 corrective recursive phase (2026-11-24, findings 3+8
-          # on corrective/frame-preparation): +4 engine-renderer lib
-          # tests (the target-fault seam's plan-advance battery —
-          # fires-once, ordinal, the error variant, unarmed), the
-          # same +4 platform-uniform in the renderer-release step.
-          # MEASURED locally with this step's own awk.
           # Era-1 corrective recursive phase, the wet-depth-coverage
           # stack (2026-11-24): this branch merges
           # corrective/frame-preparation (db7ae45 - findings 3-9,
@@ -456,7 +436,6 @@ jobs:
           # MEASURED locally on the merged tree with this step's
           # own awk; Windows 1157 = 1146 + the same 11
           # (platform-uniform).
->>>>>>> 0779242
           expected=1208
           if [ "$(uname -s)" != "Linux" ]; then expected=1157; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
@@ -517,7 +496,6 @@ jobs:
           # property contract, the same +1 as the main shard) —
           # 110 -> 111. MEASURED locally (111/0 failures/2 result
           # lines).
-<<<<<<< HEAD
           # Era 1 corrective/frame-preparation (2026-11-24, findings
           # 4+7+8): +7 (the depth_aspect and resolve_depth_format
           # batteries, the same +7 as the main shard,
@@ -528,8 +506,6 @@ jobs:
           # the same +4 as the main shard, platform-uniform) —
           # 118 -> 122. MEASURED locally with this step's own awk
           # (122/0 failures/2 result lines).
-=======
->>>>>>> 0779242
           # Era 1 corrective/allocations-geometry-gates (2026-11-24,
           # findings 10+11): +1 (the wheel normal-agreement
           # contract, the same +1 as the main shard,
@@ -549,27 +525,14 @@ jobs:
           # the same +1 as the main shard, platform-uniform) —
           # 119 -> 120, MEASURED locally with this step's own awk
           # (120/0 failures/2 result lines).
-<<<<<<< HEAD
           # UNION REHEARSAL (2026-11-24): 111 + 11 (#22) + 9 (#23)
           # = 131 — the same union value the wet-depth-coverage
           # merge (#26) measured on its #22+#23 tree; confirmed
           # below from this rehearsal's own measured actuals.
-=======
-          # Era 1 corrective/frame-preparation (2026-11-24, findings
-          # 4+7+8): +7 (the depth_aspect and resolve_depth_format
-          # batteries, the same +7 as the main shard,
-          # platform-uniform) — 111 -> 118. MEASURED locally with
-          # this step's own awk (118/0 failures/2 result lines).
-          # Era-1 corrective recursive phase (2026-11-24, findings
-          # 3+8): +4 (the target-fault seam's plan-advance battery,
-          # the same +4 as the main shard, platform-uniform) —
-          # 118 -> 122. MEASURED locally with this step's own awk
-          # (122/0 failures/2 result lines).
           # The wet-depth-coverage merge (see the main shard's note):
           # the UNION of both branches' renderer additions - 131/2
           # MEASURED locally on the merged tree with this step's
           # own awk.
->>>>>>> 0779242
           echo "renderer release: $passed passed, $results test-result lines (expected 131 / 2)"
           [ "$passed" -eq 131 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 131"; exit 1; }
           [ "$results" -eq 2 ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != 2"; exit 1; }
@@ -790,6 +753,19 @@ jobs:
       # target-builder stage fault unwinds to the pre-attempt
       # census, no slot strands, recoveries land (MEASURED on the
       # pod's lavapipe — the full 21-cell matrix, 4.65 s).
+      # (Era-1 corrective recursive phase, post-edge-coverage,
+      # findings 16+17) The same step now also executes the two
+      # check-half gates: the asymmetric off-center disc at the odd
+      # rectangular 121×75 extent under the frame's TRUE aspect
+      # (disc patch 0/255, corners 1/255, the bloom ring's measured
+      # lift ≥2/255 at the oracle-chosen distance — the
+      # horizontal-mirror discriminator the centered square fixture
+      # is provably blind to) and the tiny-extent + ambient cells
+      # (1×256 and 2×256 through the actual safe_load OOB guards,
+      # max 3-4/255 at each cell's single mid-ramp row; the
+      # negative/zero/midtone/over-one HDR through the real
+      # composite, the negative channels EXACT black — MEASURED on
+      # the pod's lavapipe).
       - name: Post gates (lavapipe)
         if: runner.os == 'Linux'
         shell: bash
@@ -803,6 +779,13 @@ jobs:
       # overhead matte anchor, the dry byte-identity, the
       # allocation delta, and the composition smokes. The
       # per-stage println! evidence is what the CI log must show.
+      # (Era-1 corrective recursive phase, post-edge-coverage,
+      # finding 4's wet half) The wet-band gate now runs ALL THREE
+      # depth-format cells — D32 negotiated, forced D24_S8, and
+      # forced D16 (the review's "force each supported fallback";
+      # D16's coarser 16-bit quantization makes the EQUAL-comparison
+      # invariance a DISTINCT cell — MEASURED honored and green on
+      # the pod's lavapipe).
       - name: Reflection gates (lavapipe)
         if: runner.os == 'Linux'
         shell: bash
@@ -1449,11 +1432,7 @@ jobs:
           # are engine-renderer lib tests — the main shard's).
           # Linux 582/14/59 MEASURED locally with this step's own
           # awk; Windows 581/14/59 platform-uniform.
-<<<<<<< HEAD
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 25 / 62)"
-=======
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 24 / 62)"
->>>>>>> 0779242
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 27 / 62)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           # Era 1 package 3 (the sky, 2026-11-23): the NEW
           # tests/render_sky.rs binary carries ONE #[ignore]d
@@ -1517,7 +1496,6 @@ jobs:
           # MEASURED locally with this step's own awk (582/22/62).
           # With #21 also landed the count is 23 — the merge-order
           # note above applies unchanged.
-<<<<<<< HEAD
           # Era-1 corrective recursive phase (2026-11-24, findings
           # 11+18, run 8/n): TWO new #[ignore]d engine-slice tests —
           # render_instanced's oblique wheel fixture and
@@ -1528,23 +1506,35 @@ jobs:
           # own awk (588/19/62). MERGE-ORDER: #22 independently holds
           # 22 and the wet-depth-coverage stack 24 — whichever lands
           # last re-measures and takes the actuals.
-          # UNION REHEARSAL (2026-11-24, the overnight session's
-          # seven-PR merge rehearsal): #21 + #22 + #23 landed
-          # together = 17 + 1 (capture-trust) + 4 (frame-preparation
-          # gates) + 1 (the fault gate) + 2 (the oblique wheel and
-          # specular-eye gates) = 25. The pin below is the union
-          # value, to be confirmed from the rehearsal's own measured
-          # actuals (the awk below) — the established discipline,
-          # never a guess.
-          [ "$ignored" -eq 25 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 25"; exit 1; }
-=======
           # The wet-depth-coverage merge (see the main shard's note): the
           # union of both branches' ignored gates - 24 MEASURED
           # locally on the merged tree (19 on allocations-geometry-
           # gates + the fault gate and capture gates from
           # frame-preparation) with this step's own awk.
-          [ "$ignored" -eq 24 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 24"; exit 1; }
->>>>>>> 0779242
+          # Era-1 corrective recursive phase, post-edge-coverage
+          # (2026-11-24): findings 16+17's check-halves add TWO
+          # #[ignore]d render_post gates (the asymmetric off-center
+          # disc at the odd rectangular 121×75 extent under the true
+          # aspect — the horizontal-mirror discriminator — and the
+          # tiny-extent + ambient-feed cells: 1×256, 2×256 through
+          # the actual safe_load guards, the negative/zero/midtone/
+          # over-one HDR through the real composite) — executed by
+          # the unchanged post-gates Linux Vulkan step below; ignored
+          # in this plain run: 24 -> 26. Passed counts and result
+          # lines unchanged (the wet D16 cell rides inside the
+          # existing reflection gate). MEASURED locally on this
+          # branch's tree with this step's own awk (588/26/62, zero
+          # failures); platform-uniform (no cfg gates).
+          # UNION REHEARSAL FINAL (2026-11-24, the overnight
+          # session's seven-PR merge rehearsal): the full union of
+          # all seven corrective PRs = #26's measured 26 + #21's
+          # capture-trust gate (absent from #26's tree) = 17 + 1
+          # (#21) + 4 (#22 gates) + 1 (the fault gate) + 2 (#23 run
+          # 8/n) + 2 (#27's post-edge gates) = 27. The pin below is
+          # that union value, to be confirmed from this rehearsal's
+          # own measured actuals (the awk above) — the established
+          # discipline, never a guess.
+          [ "$ignored" -eq 27 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 27"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local

@@ -37,8 +37,8 @@ use engine_renderer::{
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 
-use engine_renderer::lit_scene::RouteWaypoint;
 use engine_renderer::lit_scene::day_preset;
+use engine_renderer::lit_scene::{LightParams, RouteWaypoint};
 use engine_slice::corner_demo::view_projection;
 use engine_slice::math::{camera_forward, camera_right};
 
@@ -99,6 +99,51 @@ fn pixel_ray(
     ray.map(|component| component / length)
 }
 
+/// The CPU ray for one raster pixel of a NON-SQUARE frame — `pixel_ray`
+/// above with the horizontal tangent carrying the frame's ASPECT
+/// (perspective's matrix[0][0] = focal/aspect: a point at NDC nx lies at
+/// x/(−z) = nx·aspect·tan_half in view space; the vertical term needs no
+/// factor). `aimed_at_aspect` below must supply that same aspect to the
+/// GPU's projection — the pair is the sky gate's off-axis block's proven
+/// model (its 264×200 disc-edge probes pinned it at 0/255 on this same
+/// ICD). At a square frame the factor is exactly one and this reduces to
+/// `pixel_ray` bit-for-bit.
+fn pixel_ray_aspected(
+    forward: [f32; 3],
+    right: [f32; 3],
+    up: [f32; 3],
+    x: u32,
+    y: u32,
+    size: (u32, u32),
+) -> [f32; 3] {
+    let nx = (x as f32 + 0.5) * 2. / size.0 as f32 - 1.;
+    let ny = (y as f32 + 0.5) * 2. / size.1 as f32 - 1.;
+    let math_y = -ny;
+    let tan_half = (65_f32.to_radians() / 2.0).tan();
+    let aspect = size.0 as f32 / size.1 as f32;
+    let mut ray = std::array::from_fn(|axis| {
+        forward[axis] + nx * tan_half * aspect * right[axis] + math_y * tan_half * up[axis]
+    });
+    let length = (ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]).sqrt();
+    ray = ray.map(|component| component / length);
+    ray
+}
+
+/// `aimed` with the frame's TRUE aspect — the projection the renderer
+/// actually rasterizes a non-square target with (`aimed` hardcodes 1.0,
+/// the square-frame special case the 256×256 gate sits on; a rectangular
+/// target under it is a stretched square, NOT the non-square coverage
+/// the review's rectangular-target check is about).
+fn aimed_at_aspect(position: [f32; 3], toward: [f32; 3], aspect: f32) -> [[f32; 4]; 4] {
+    view_projection(
+        RouteWaypoint {
+            position,
+            look_at: toward,
+        },
+        aspect,
+    )
+}
+
 fn quantized(color: [f32; 3]) -> [u8; 3] {
     color.map(|c| (255. * c.clamp(0., 1.)).round() as u8)
 }
@@ -114,6 +159,20 @@ fn quantized(color: [f32; 3]) -> [u8; 3] {
 /// error over every checked pixel is printed — the pin below is
 /// the ceiling with the budget documented.
 const TOLERANCE: u8 = 2;
+
+/// The every-pixel tiny-extent cells' tolerance. The full-frame walk
+/// lands on each cell's SINGLE mid-ramp row — the row whose ray sits
+/// inside the disc's soft edge, where the color swings the disc's full
+/// additive height (~217/255 in R) over the ramp's 0.00012 dot-units
+/// (a slope of ~1.8·10⁶/255 per unit dot): the residual sub-ulp dot
+/// difference between the shader's inverse-matrix ray and the CPU
+/// basis reconstruction — invisible everywhere else (the raw-sky
+/// off-axis gate measured 1/255 at ITS ramp, PR #25; the post chain's
+/// f16/ACES additions are ≤0.1/255 by analysis) — lands at 3-4/255
+/// there, BOTH signs observed (+3 at 1×256's top ramp, −4 at 2×256's
+/// bottom ramp). MEASURED; every non-ramp row measures 0-1/255, the
+/// TOLERANCE-2 budget.
+const TOLERANCE_RAMP: u8 = 4;
 
 #[test]
 #[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
@@ -502,6 +561,770 @@ fn post_pixels_match_post_rs_and_the_disc_blooms() {
     );
 }
 
+/// Item 1 — Finding 16's asymmetric discriminator (the review's check:
+/// "An asymmetric, off-center bright patch in a rectangular target would
+/// also discriminate swapped blur axes or a horizontal mirror that a
+/// centered disc and vertically varying gradient can hide.")
+///
+/// THE BLIND SPOT, proven first: the existing 256×256 gate puts the disc
+/// DEAD CENTER under a square projection, and the day gradient varies
+/// with ELEVATION ONLY — so the left and right corners of any row hold
+/// equal values and the centered disc's bloom ring is symmetric: a
+/// horizontal mirror of that entire fixture is byte-identical. Nothing
+/// in it can see a mirrored composite.
+///
+/// THE FIXTURE: a second renderer at an ODD RECTANGULAR extent — 121×75,
+/// both axes odd, aspect ≈1.61 (the odd axes also serve the odd-extent
+/// coverage: floor-divided mip extents and every fractional upsample
+/// weight; item 2's ambient cell runs at its own SECOND odd extent,
+/// 89×55) — under the frame's TRUE aspect (`aimed_at_aspect`,
+/// the sky gate's off-axis block's proven model: the GPU projection
+/// carries size.0/size.1, and the CPU oracle below reconstructs rays
+/// with the same factor — a square projection stretched onto a
+/// rectangular target is NOT this coverage), with the view axis tilted
+/// AWAY from the sun in a compound east-and-UP direction so the disc
+/// lands fully interior and clearly off-center toward the frame's
+/// lower-left. The tilt is UP, not down: the day sun sits at 45°
+/// elevation and the 65° vertical fov puts the frame's bottom edge at
+/// (view elevation − 32.5°) — an up-tilted axis keeps EVERY row above
+/// the horizon and the frame pure sky (the pose clears every mass a
+/// fortiori: it looks strictly higher than the proven-clear 256×256
+/// sun pose). A down-tilted variant would put the ground plane in the
+/// bottom rows and the sky-only oracle below would fail loudly at
+/// TOLERANCE 2 — the guard that keeps this fixture honest.
+///
+/// Probes, all against the full-chain CPU oracle rebuilt at 121×75 with
+/// the aspect-corrected rays (`pixel_ray_aspected` → `sky_color` →
+/// `bloom_mip_from_hdr` → `post_pixel`), TOLERANCE 2 — the same budget
+/// the square gate measures 0/255 under:
+/// - The disc-center 5×5 patch, with the disc's position ASSERTED
+///   off-center by ≥12% of BOTH axes and interior with margin — under a
+///   horizontal mirror this probe reads plain sky: the discriminator.
+/// - The bloom ring at (±ring_d, 0) and (0, ±ring_d) around the disc
+///   (ring_d CHOSEN by the CPU oracle's own predicted lift — the scan
+///   below maximizes the minimum over the four directions and requires
+///   ≥2/255, so the fixture can never silently rest on a probe the
+///   chain cannot lift): full-chain error ≤ TOLERANCE plus the
+///   finding-16 measured-lift form — captured minus the probe's own
+///   no-bloom tonemap ≥ 2/255.
+/// - The four corner 3×3 patches: the vertical-gradient orientation
+///   detector (a vertical flip swaps zenith-ward and horizon-ward
+///   corners; the values differ row to row).
+///
+/// DOCUMENTED HONESTLY (the 4/n commit's precedent): a pure blur-AXIS
+/// swap is mathematically UNOBSERVABLE in this chain — `fs_blur_h` and
+/// `fs_blur_v` (shaders/bloom.wgsl) share
+/// the same five weights (0.0625/0.25/0.375/0.25/0.0625), the same clamp
+/// to-edge policy, and same-extent mips, so the separable double sum is
+/// symmetric under axis exchange; no fixture can or needs to discriminate it.
+/// What the off-center rectangular fixture DOES discriminate: the horizontal
+/// mirror (disc-center probe), vertical flip (corner gradient probes), and
+/// any future per-axis divergence of weights or clamp policy (the ring probes
+/// sit on both axes).
+///
+/// SDL discipline: one EventPump alive at a time — this gate creates its
+/// app fresh under the binary's `sdl_lock`; item 2's gate drops its own
+/// renderers before the next.
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
+fn post_discriminator_asymmetric_disc_and_bloom_lift() {
+    let _guard = sdl_lock();
+
+    // --- THE 121×75 RENDERER (odd rectangular; aspect ≈1.61) ---
+    let mut app = ShellApp::new(ShellConfig {
+        title: "post asymmetric discriminator".into(),
+        width: 121,
+        height: 75,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    })
+    .unwrap();
+    let mut renderer = Renderer::new(
+        app.window(),
+        RenderConfig {
+            demo_scene: DemoScenePreference::Corner,
+            validation: ValidationPreference::On,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let size = app.window().size_in_pixels();
+    assert_eq!(size, (121, 75));
+    assert!(renderer.stats().validation_active);
+    let _ = app.frame();
+
+    let day = atmosphere_at(0.0);
+    let sun_dir = day.disc_dir;
+    let high_eye = [0.0, 25.0, 0.0];
+
+    // The aim: the view axis tilted AWAY from the sun in a compound
+    // east-and-UP tangent direction, sized to put the disc off-center
+    // toward the frame's lower-left. The tangent offsets a (east) and
+    // b (up) map through the camera basis's yaw/pitch to the disc's
+    // NDC — a = 0.30·tan_half·aspect and b = 0.70·tan_half land it at
+    // NDC (−0.47, −0.31) ≈ (26% of width, 65% of height): off-center
+    // on BOTH axes (24% / 15%) with the disc (angular radius ≈2°,
+    // ~2-3 px here) far from every edge. The UP half matters twice:
+    // it keeps the frame's bottom edge above the horizon (pure sky —
+    // see the doc comment), and it gives the vertical off-center
+    // margin. (The constants were chosen against the CPU camera math
+    // — waypoint_orientation's yaw/pitch over the aim, then the
+    // aspected ray grid — the same arithmetic the oracle below runs;
+    // the GPU agreed on the first render.)
+    let tan_half = (65_f32.to_radians() / 2.0).tan();
+    let aspect = size.0 as f32 / size.1 as f32;
+    // A horizontal perpendicular to the sun direction (the world-up
+    // cross, normalized; nonzero for any non-vertical sun).
+    let east = {
+        let raw = [-sun_dir[2], 0.0, sun_dir[0]];
+        let len = (raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]).sqrt();
+        [raw[0] / len, raw[1] / len, raw[2] / len]
+    };
+    // The sun's OWN up-tangent: world-up projected onto the plane
+    // perpendicular to the sun (positive y — an UP tilt, never the
+    // down-tilt whose ground rows would break the pure-sky premise).
+    let up_tangent = {
+        let dot = sun_dir[1]; // sun · world_up
+        let raw = [-sun_dir[0] * dot, 1.0 - sun_dir[1] * dot, -sun_dir[2] * dot];
+        let len = (raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]).sqrt();
+        [raw[0] / len, raw[1] / len, raw[2] / len]
+    };
+    let a = 0.30 * tan_half * aspect;
+    let b = 0.70 * tan_half;
+    let aim_dir: [f32; 3] =
+        std::array::from_fn(|axis| sun_dir[axis] + a * east[axis] + b * up_tangent[axis]);
+    let aim_len =
+        (aim_dir[0] * aim_dir[0] + aim_dir[1] * aim_dir[1] + aim_dir[2] * aim_dir[2]).sqrt();
+    let aim_dir = aim_dir.map(|component| component / aim_len);
+    // The pure-sky guard, derived not assumed: the view axis's elevation
+    // minus the half-fov is the frame's bottom-edge elevation — it must
+    // sit above the horizon (the sun's 45° plus the up-tilt minus 32.5°
+    // leaves ≈31.5° of margin here).
+    let bottom_edge_elevation = aim_dir[1].asin().to_degrees() - 65_f32 / 2.0;
+    assert!(
+        bottom_edge_elevation > 5.0,
+        "the fixture's bottom edge must stay above the horizon (view elevation {}° − 32.5° = {}°)",
+        aim_dir[1].asin().to_degrees(),
+        bottom_edge_elevation
+    );
+    let toward = std::array::from_fn(|i| high_eye[i] + aim_dir[i]);
+    let matrix = aimed_at_aspect(high_eye, toward, aspect);
+
+    renderer.set_sky(Some(SkyFrame {
+        palette: day.sky,
+        disc_dir: sun_dir,
+    }));
+    renderer.set_post(true);
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner(&matrix, high_eye, day_preset(), size)
+            .unwrap()
+            .presented
+    );
+    let posted = renderer.take_frame_capture().unwrap().unwrap();
+
+    // THE CPU ORACLE at 121×75: the same arithmetic as the square gate,
+    // with the rays reconstructed through the frame's TRUE aspect —
+    // the pair (aimed_at_aspect, pixel_ray_aspected) is the model the
+    // sky gate's off-axis block pinned at 0/255 on this ICD.
+    let (forward, right, up) = basis(high_eye, toward);
+    let hdr: Vec<[f32; 3]> = (0..size.1)
+        .flat_map(|y| (0..size.0).map(move |x| (x, y)))
+        .map(|(x, y)| {
+            let ray = pixel_ray_aspected(forward, right, up, x, y, size);
+            sky_color(ray, &day.sky, sun_dir)
+        })
+        .collect();
+    let mip = bloom_mip_from_hdr(&hdr, size);
+    let oracle = |x: u32, y: u32| -> [u8; 4] {
+        let hdr_texel = hdr[(y * size.0 + x) as usize];
+        let bloom = bloom_at_pixel(&mip, size, (x, y));
+        let presented = quantized(post_pixel(hdr_texel, bloom));
+        [presented[0], presented[1], presented[2], 255]
+    };
+
+    // Find the disc center from the ray-dot with the sun direction
+    // (deterministic, like render_sky's off-axis probe): the pixel whose
+    // aspect-corrected reconstructed ray dots highest with the sun
+    // direction is the disc center's projection — the TRUE disc
+    // position under the non-square projection.
+    let mut best = (0u32, 0u32, -1.0f32);
+    for y in 0..size.1 {
+        for x in 0..size.0 {
+            let ray = pixel_ray_aspected(forward, right, up, x, y, size);
+            let dot = ray[0] * sun_dir[0] + ray[1] * sun_dir[1] + ray[2] * sun_dir[2];
+            if dot > best.2 {
+                best = (x, y, dot);
+            }
+        }
+    }
+    let (cx, cy) = (best.0, best.1);
+    // The projected disc center must be OFF-CENTER on BOTH axes (≥12%
+    // from the 50% middle) and interior with room for the ring probes —
+    // a centered disc is exactly the blind spot this gate exists to
+    // close, and an edge-grazing disc would clamp its ring probes.
+    let cx_pct = cx as f32 / size.0 as f32;
+    let cy_pct = cy as f32 / size.1 as f32;
+    assert!(
+        (cx_pct - 0.5).abs() >= 0.12,
+        "the disc center is off-center by ≥12% of width (actual {cx_pct:.2})"
+    );
+    assert!(
+        (cy_pct - 0.5).abs() >= 0.12,
+        "the disc center is off-center by ≥12% of height (actual {cy_pct:.2})"
+    );
+    // The ring scan's widest candidate (the interior guard below uses
+    // it): every candidate distance must keep its probes off the frame
+    // edge, with the disc's own ~3 px radius plus the soft edge left
+    // between it and the probe.
+    const RING_D_MAX: i32 = 12;
+    assert!(
+        cx as i32 - RING_D_MAX - 2 >= 0
+            && cx as i32 + RING_D_MAX + 2 < size.0 as i32
+            && cy as i32 - RING_D_MAX - 2 >= 0
+            && cy as i32 + RING_D_MAX + 2 < size.1 as i32,
+        "the disc center ({cx},{cy}) must keep the ±{RING_D_MAX} ring probes interior"
+    );
+    println!(
+        "disc center (121×75): projected to ({cx},{cy}) = ({cx_pct:.2}, {cy_pct:.2}) of frame, \
+         bottom edge {bottom_edge_elevation:.1}° above the horizon"
+    );
+
+    let mut max_error = 0u8;
+    let mut checked = 0usize;
+
+    // A. THE DISC CENTER 5×5 PATCH (the discriminator under horizontal mirror).
+    for y in cy.saturating_sub(2)..=(cy + 2).min(size.1 - 1) {
+        for x in cx.saturating_sub(2)..=(cx + 2).min(size.0 - 1) {
+            let expected = oracle(x, y);
+            let pixel = posted.pixel_rgba(x, y);
+            let error = expected
+                .iter()
+                .zip(pixel.iter())
+                .map(|(e, a)| e.abs_diff(*a))
+                .max()
+                .unwrap();
+            max_error = max_error.max(error);
+            assert!(
+                error <= TOLERANCE,
+                "disc-center pixel ({x},{y}): expected {expected:?}, got {pixel:?}"
+            );
+            checked += 1;
+        }
+    }
+    println!(
+        "disc center 5×5: {checked} pixels vs the full-chain oracle, max error {max_error}/255"
+    );
+
+    // B. THE BLOOM RING at ±ring_d around the disc center, on BOTH
+    // axes (the four cardinal directions). ring_d is CHOSEN by the
+    // CPU oracle's own predicted lift — the scan maximizes the
+    // MINIMUM predicted lift over the four directions across
+    // d ∈ [5, 12] (5 clears the disc's own ~3 px radius plus its soft
+    // edge; 12 rides the blur's reach: ±2 mip texels = ±8 scene px
+    // plus the upsample's bilinear spread) and REQUIRES ≥2/255, so the
+    // fixture can never silently rest on a probe the chain cannot
+    // lift — a probe the oracle cannot lift fails the scan loudly.
+    let no_bloom_at = |x: u32, y: u32| -> [u8; 3] {
+        let ray = pixel_ray_aspected(forward, right, up, x, y, size);
+        quantized(tonemap_rgb(sky_color(ray, &day.sky, sun_dir)))
+    };
+    let predicted_lift_at = |d: i32| -> i32 {
+        let mut worst = i32::MAX;
+        for (dx, dy) in [(d, 0), (-d, 0), (0, d), (0, -d)] {
+            let (x, y) = ((cx as i32 + dx) as u32, (cy as i32 + dy) as u32);
+            let expected = oracle(x, y);
+            let no_bloom = no_bloom_at(x, y);
+            let lift = expected
+                .iter()
+                .zip(no_bloom.iter())
+                .map(|(e, n)| (*e as i32) - (*n as i32))
+                .max()
+                .unwrap();
+            worst = worst.min(lift);
+        }
+        worst
+    };
+    let mut ring_d = 0i32;
+    let mut best_lift = i32::MIN;
+    for d in 5..=RING_D_MAX {
+        let lift = predicted_lift_at(d);
+        println!("ring candidate d={d}: minimum predicted lift {lift}/255");
+        if lift > best_lift {
+            best_lift = lift;
+            ring_d = d;
+        }
+    }
+    assert!(
+        best_lift >= 2,
+        "no ring distance in [5, {RING_D_MAX}] lifts all four probes ≥2/255 (best {best_lift} at d={ring_d}) — the fixture's bloom is too thin to measure"
+    );
+    let mut ring_lift = 0i32;
+    for (dx, dy) in [(ring_d, 0), (-ring_d, 0), (0, ring_d), (0, -ring_d)] {
+        let (x, y) = ((cx as i32 + dx) as u32, (cy as i32 + dy) as u32);
+        let expected = oracle(x, y);
+        let pixel = posted.pixel_rgba(x, y);
+        let error = expected
+            .iter()
+            .zip(pixel.iter())
+            .map(|(e, a)| e.abs_diff(*a))
+            .max()
+            .unwrap();
+        max_error = max_error.max(error);
+        assert!(
+            error <= TOLERANCE,
+            "bloom-ring pixel ({x},{y}): expected {expected:?}, got {pixel:?}"
+        );
+        checked += 1;
+
+        // Finding 16 correction: use captured RGB minus no-bloom baseline.
+        let no_bloom = no_bloom_at(x, y);
+        let captured_lift = pixel
+            .iter()
+            .zip(no_bloom.iter())
+            .map(|(e, n)| (*e as i32) - (*n as i32))
+            .max()
+            .unwrap();
+        ring_lift = ring_lift.max(captured_lift);
+        assert!(
+            captured_lift >= 2,
+            "bloom-ring pixel ({x},{y}): captured lift {captured_lift}/255 >= 2/255 (pixel {pixel:?} vs no-bloom {no_bloom:?})"
+        );
+    }
+    println!(
+        "bloom ring (d={ring_d}): 4 pixels vs the oracle within {TOLERANCE}/255, captured lift ≥2/255 (max captured lift {ring_lift}/255, predicted {best_lift}/255)"
+    );
+
+    // C. THE FOUR CORNERS 3×3 PATCHES (the orientation detector): a
+    // vertical flip swaps the zenith-ward and horizon-ward corners — the
+    // gradient differs row to row, so the values differ loudly. At the
+    // SAME TOLERANCE 2 as the square gate: the fixture's pure-sky guard
+    // (bottom edge above the horizon) is what makes these probes
+    // oracle-comparable at all — under the honest budget, any geometry
+    // in view or any aspect error in the ray reconstruction fails here.
+    for (px, py) in [
+        (2, 2),
+        (2, size.1 - 5),
+        (size.0 - 5, 2),
+        (size.0 - 5, size.1 - 5),
+    ] {
+        for y in py..py + 3 {
+            for x in px..px + 3 {
+                let expected = oracle(x, y);
+                let pixel = posted.pixel_rgba(x, y);
+                let error = expected
+                    .iter()
+                    .zip(pixel.iter())
+                    .map(|(e, a)| e.abs_diff(*a))
+                    .max()
+                    .unwrap();
+                max_error = max_error.max(error);
+                assert!(
+                    error <= TOLERANCE,
+                    "far-corner pixel ({x},{y}): expected {expected:?}, got {pixel:?} (error {error})"
+                );
+                checked += 1;
+            }
+        }
+    }
+    println!("far corners: 36 pixels vs the pure-tonemap oracle, max error so far {max_error}/255");
+
+    assert_eq!(
+        renderer.stats().validation_errors,
+        0,
+        "{:?}",
+        renderer.stats().recent_validation
+    );
+    println!(
+        "Era-1 post asymmetric discriminator: {checked} pixels vs the chain oracle within {TOLERANCE}/255 (max {max_error}), \
+         the disc center off-center ({cx_pct:.2}, {cy_pct:.2}), bloom ring lifted ≥2/255"
+    );
+}
+
+/// Item 2 — Finding 17's GPU-side edge feed (the review's check:
+/// "Feed negative, zero, midtone and over-one HDR into the actual shader
+/// chain. Use 1×N, 2×N and an odd rectangular offscreen extent so window-
+/// system minimums do not prevent exercising the contract.")
+///
+/// The review: CPU tonemapping explicitly maps nonpositive input to zero.
+/// The shader evaluates the rational function for all inputs. At −0.5 the
+/// CPU returns black and the shader clamps to white. In addition, the
+/// minimum bloom extent is one texel. For a scene axis of length one or
+/// two, some 4i+1 and 4i+2 source taps are outside the image. The CPU
+/// explicitly supplies zero. The shader calculates the source extent but
+/// issues four unconditional textureLoad calls. The CPU's zero-fill premise
+/// is therefore unproven for these accepted dimensions.
+///
+/// (a) TINY EXTENTS: renderers at 1×256 and 2×256 (sky on, post on, the
+/// existing high-eye sun pose under the frame's TRUE aspect —
+/// `aimed_at_aspect`). Compare EVERY pixel of the frame against the
+/// CPU oracle at that extent, aspect-corrected rays. At width 1 the
+/// mip's x-box taps (4i+1, 4i+2) are ALL out of range — the bright mip
+/// is provably all-zero (the CPU oracle computes it) — so presented =
+/// pure tonemap(sky); at width 2 the box is HALF out of range (the
+/// safe_load half-OOB contract) and both columns sit inside the disc's
+/// angular radius at the sun's rows (the disc band IS present — a
+/// square projection would push the columns ±17.6° off the sun and
+/// silently drop it). These cells execute the actual bloom.wgsl
+/// safe_load guards on device. The 1×256 window is ACCEPTED by the
+/// offscreen driver + lavapipe (MEASURED; the gate asserts it — the
+/// review's own "so window-system minimums do not prevent exercising
+/// the contract" premise, held to rather than assumed).
+///
+/// (b) THE AMBIENT FEED at a SECOND odd rectangular extent, 89×55
+/// (sky OFF, post ON, the
+/// geometry-clearing high-eye pose): `render_corner(&matrix, high_eye,
+/// light, size)` with a custom `LightParams` whose ambient is
+/// [-0.5, 0.0, 0.18] — the HDR clear color IS the ambient
+/// (corner::FrameParams::clear_color). The oracle is the FULL uniform
+/// field through the real chain functions (bright → blur → upsample of
+/// a constant is the constant): the negative and zero channels must
+/// present EXACT black (the pre-4/n shader clamped −0.5 to WHITE — a
+/// 255-vs-0 discrimination), the midtone channel the ACES value. Then
+/// a second frame with ambient [1.7, 1.7, 1.7]: over-one through ACES
+/// WITH the surviving bloom term (1.7 is above the bright-pass
+/// threshold, so presented = tonemap(1.7 + 1.7·0.15) — a tonemap-only
+/// oracle misses it by ~5/255). A five-pixel spread per frame; any
+/// deviation is a geometry bleed or coordinate error, never a
+/// tolerance matter.
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
+fn post_edge_cases_tiny_extents_and_ambient_feed() {
+    let _guard = sdl_lock();
+
+    // --- (a) TINY EXTENTS: 1×256 and 2×256 ---
+    // PROBE: does SDL/lavapipe accept 1×256?
+    let probe_app = ShellApp::new(ShellConfig {
+        title: "post tiny-extent probe".into(),
+        width: 1,
+        height: 256,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    });
+    let (accepted_width, probe_msg) = match probe_app {
+        Ok(app) => {
+            let size = app.window().size_in_pixels();
+            drop(app);
+            if size == (1, 256) {
+                (1, "1×256 window accepted".to_string())
+            } else {
+                (
+                    size.0,
+                    format!("1×256 refused, smallest accepted width is {0}", size.0),
+                )
+            }
+        }
+        Err(_) => {
+            // If app creation fails entirely, we need to use a different width
+            let fallback_app = ShellApp::new(ShellConfig {
+                title: "post tiny-extent fallback".into(),
+                width: 2,
+                height: 256,
+                target_fps: 60,
+                driver: DriverPreference::Real,
+            })
+            .unwrap();
+            let size = fallback_app.window().size_in_pixels();
+            drop(fallback_app);
+            (
+                size.0,
+                format!("1×256 creation failed, using {0}×256", size.0),
+            )
+        }
+    };
+    println!("tiny-extent probe: {probe_msg}");
+    // The 1×N cell is the review's own requirement ("Use 1×N, 2×N ...
+    // so window-system minimums do not prevent exercising the
+    // contract") — the offscreen driver exists precisely to have no
+    // such minimums. If this environment ever refuses width 1, the gate
+    // fails LOUDLY with the probe's message rather than silently
+    // degrading to a wider frame: the 4i+1/4i+2 ALL-out-of-range cell
+    // (every x-tap of the downsample box beyond the image) exists only
+    // at width 1.
+    assert!(
+        accepted_width == 1,
+        "the offscreen environment must accept a 1×256 window ({probe_msg})"
+    );
+
+    let day = atmosphere_at(0.0);
+    let sun_dir = day.disc_dir;
+    let high_eye = [0.0, 25.0, 0.0];
+    let toward_sun = std::array::from_fn(|i| high_eye[i] + sun_dir[i]);
+
+    // Test with the accepted width.
+    for width in [accepted_width, 2] {
+        let mut app = ShellApp::new(ShellConfig {
+            title: format!("post tiny-extent {width}×256"),
+            width,
+            height: 256,
+            target_fps: 60,
+            driver: DriverPreference::Real,
+        })
+        .unwrap();
+        let mut renderer = Renderer::new(
+            app.window(),
+            RenderConfig {
+                demo_scene: DemoScenePreference::Corner,
+                validation: ValidationPreference::On,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let size = app.window().size_in_pixels();
+        assert_eq!(
+            size,
+            (width, 256),
+            "the renderer honors the requested extent"
+        );
+        assert!(renderer.stats().validation_active);
+        let _ = app.frame();
+
+        renderer.set_sky(Some(SkyFrame {
+            palette: day.sky,
+            disc_dir: sun_dir,
+        }));
+        renderer.set_post(true);
+        // The TRUE aspect into the projection (aimed_at_aspect): at
+        // width 2 the columns sit ±0.28° of azimuth from the view axis
+        // — both INSIDE the disc's ~2° angular radius, so the disc band
+        // is present at the sun's rows on both columns and the oracle
+        // below must model it (a square projection here would push the
+        // columns ±17.6° off the sun and silently drop the disc — the
+        // stretched-square accident this gate must not rest on).
+        let aspect = size.0 as f32 / size.1 as f32;
+        let matrix = aimed_at_aspect(high_eye, toward_sun, aspect);
+        renderer.request_frame_capture().unwrap();
+        assert!(
+            renderer
+                .render_corner(&matrix, high_eye, day_preset(), size)
+                .unwrap()
+                .presented
+        );
+        let posted = renderer.take_frame_capture().unwrap().unwrap();
+
+        // THE CPU ORACLE at this extent, aspect-corrected rays. At
+        // width 1 the single column's nx is exactly 0 (the frame's
+        // center ray — aspect-irrelevant); at width 2 both columns'
+        // rays hug the view axis per the comment above.
+        let (forward, right, up) = basis(high_eye, toward_sun);
+        let hdr: Vec<[f32; 3]> = (0..size.1)
+            .flat_map(|y| (0..size.0).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let ray = pixel_ray_aspected(forward, right, up, x, y, size);
+                sky_color(ray, &day.sky, sun_dir)
+            })
+            .collect();
+        let mip = bloom_mip_from_hdr(&hdr, size);
+        let oracle = |x: u32, y: u32| -> [u8; 4] {
+            let hdr_texel = hdr[(y * size.0 + x) as usize];
+            let bloom = bloom_at_pixel(&mip, size, (x, y));
+            let presented = quantized(post_pixel(hdr_texel, bloom));
+            [presented[0], presented[1], presented[2], 255]
+        };
+
+        // Compare EVERY pixel of the frame against the oracle — the
+        // whole column at width 1, both columns at width 2 (the
+        // half-OOB downsample box differs between the columns' mip
+        // texels only through the y taps; the x taps are the contract).
+        // At width 1 the bright mip is provably ALL ZERO (the CPU
+        // oracle computes it: every 4i+1/4i+2 x-tap is beyond the
+        // image, so the box averages zeros) — presented = the pure
+        // tonemap of the sky; at width 2 the box is HALF out of range
+        // (the 4/n safe_load contract, executed on device).
+        //
+        // TOLERANCE_RAMP, not TOLERANCE: the every-pixel walk crosses
+        // the disc's SOFT EDGE — each cell has ONE mid-ramp row where
+        // the ~1.8·10⁶/255-per-dot ramp slope amplifies the CPU/GPU
+        // ray-arithmetic residual to 3-4/255 (MEASURED, both signs —
+        // the constant's doc comment carries the full analysis; the
+        // raw-sky path measured 1/255 at its ramp in PR #25). Away
+        // from the ramp rows the error is 0-1.
+        let mut max_error = 0u8;
+        let mut checked = 0usize;
+        for y in 0..size.1 {
+            for x in 0..size.0 {
+                let expected = oracle(x, y);
+                let pixel = posted.pixel_rgba(x, y);
+                let error = expected
+                    .iter()
+                    .zip(pixel.iter())
+                    .map(|(e, a)| e.abs_diff(*a))
+                    .max()
+                    .unwrap();
+                max_error = max_error.max(error);
+                assert!(
+                    error <= TOLERANCE_RAMP,
+                    "tiny-extent ({width}×256) pixel ({x},{y}): expected {expected:?}, got {pixel:?}"
+                );
+                checked += 1;
+            }
+        }
+        println!(
+            "tiny-extent {width}×256: {checked} pixels vs the oracle within {TOLERANCE}/255, max error {max_error}/255"
+        );
+
+        assert_eq!(
+            renderer.stats().validation_errors,
+            0,
+            "{:?}",
+            renderer.stats().recent_validation
+        );
+
+        // Drop the renderer and app before the next iteration or ambient feed test.
+        drop(renderer);
+        drop(app);
+    }
+
+    // --- (b) THE AMBIENT FEED at 89×55 (sky OFF, post ON) ---
+    // Create a fresh 89×55 renderer for the ambient feed test.
+    let mut app = ShellApp::new(ShellConfig {
+        title: "post ambient feed 89×55".into(),
+        width: 89,
+        height: 55,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    })
+    .unwrap();
+    let mut renderer = Renderer::new(
+        app.window(),
+        RenderConfig {
+            demo_scene: DemoScenePreference::Corner,
+            validation: ValidationPreference::On,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let size = app.window().size_in_pixels();
+    assert_eq!(size, (89, 55));
+    assert!(renderer.stats().validation_active);
+    let _ = app.frame();
+
+    // The geometry-clearing high-eye pose (skyless — the HDR target
+    // holds NOTHING but the clear color, which IS the ambient:
+    // corner::FrameParams::clear_color returns [r, g, b, 1.0] from
+    // light.ambient). The same true-aspect discipline as item 1.
+    let toward = std::array::from_fn(|i| high_eye[i] + sun_dir[i]);
+    let matrix = aimed_at_aspect(high_eye, toward, size.0 as f32 / size.1 as f32);
+
+    // The uniform-field oracle: the FULL chain over a constant HDR
+    // field — the bright pass, the blur, and the upsample of a uniform
+    // value are that value (the box average, the clamped taps, and the
+    // bilinear weights all reproduce a constant; the CPU oracle's own
+    // arithmetic, never a hand-derived shortcut). For ambients at or
+    // below 1 the bright pass zeroes the field and presented =
+    // tonemap(ambient); for 1.7 the bloom term SURVIVES — presented =
+    // tonemap(1.7 + 1.7·0.15) — the term a tonemap-only oracle would
+    // miss by ~5/255.
+    let uniform_oracle = |ambient: [f32; 3]| -> [u8; 4] {
+        let hdr = vec![ambient; (size.0 * size.1) as usize];
+        let mip = bloom_mip_from_hdr(&hdr, size);
+        let bloom = bloom_at_pixel(&mip, size, (size.0 / 2, size.1 / 2));
+        let presented = quantized(post_pixel(ambient, bloom));
+        [presented[0], presented[1], presented[2], 255]
+    };
+
+    // A five-pixel spread (the four corners and the center): the frame
+    // is uniform by construction, so any pixel that deviates is a
+    // geometry bleed or a coordinate error — not a tolerance matter.
+    let spread = [
+        (0u32, 0u32),
+        (size.0 - 1, 0),
+        (0, size.1 - 1),
+        (size.0 - 1, size.1 - 1),
+        (size.0 / 2, size.1 / 2),
+    ];
+
+    // (b-i) ambient = [-0.5, 0.0, 0.18] — negative → black, zero →
+    // black, midtone → ACES, channel-wise in ONE frame. The R and G
+    // channels are asserted EXACTLY zero: before the 4/n shader guard,
+    // post.wgsl evaluated the ACES rational at −0.5 and clamped to
+    // WHITE — a 255-vs-0 discrimination no tolerance could miss; the
+    // exact-zero assertion keeps that margin honest forever.
+    let light_neg = LightParams {
+        ambient: [-0.5, 0.0, 0.18],
+        ..day_preset()
+    };
+    renderer.set_sky(None);
+    renderer.set_post(true);
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner(&matrix, high_eye, light_neg, size)
+            .unwrap()
+            .presented
+    );
+    let ambient_neg = renderer.take_frame_capture().unwrap().unwrap();
+    let expected_neg = uniform_oracle([-0.5, 0.0, 0.18]);
+    println!(
+        "ambient feed [-0.5, 0.0, 0.18]: expected {expected_neg:?} (negative/zero black, midtone tonemapped)"
+    );
+    assert_eq!(
+        expected_neg[0], 0,
+        "the CPU contract maps the negative channel to exactly black"
+    );
+    assert_eq!(
+        expected_neg[1], 0,
+        "the CPU contract maps the zero channel to exactly black"
+    );
+    for (x, y) in spread {
+        let pixel = ambient_neg.pixel_rgba(x, y);
+        assert_eq!(
+            pixel[0], 0,
+            "ambient feed [-0.5, 0.0, 0.18] at ({x},{y}): the negative channel must present EXACT black (the pre-guard shader clamped it to white)"
+        );
+        assert_eq!(
+            pixel[1], 0,
+            "ambient feed [-0.5, 0.0, 0.18] at ({x},{y}): the zero channel must present EXACT black"
+        );
+        assert!(
+            pixel[2].abs_diff(expected_neg[2]) <= TOLERANCE,
+            "ambient feed [-0.5, 0.0, 0.18] at ({x},{y}): midtone channel {pixel:?} vs expected {expected_neg:?}"
+        );
+    }
+
+    // (b-ii) ambient = [1.7, 1.7, 1.7] — over-one through the ACTUAL
+    // ACES composite WITH the surviving bloom term (1.7 is above the
+    // bright-pass threshold, so the chain adds 0.15·1.7 before the
+    // tonemap — the uniform oracle above computes it through the real
+    // pipeline).
+    let light_over = LightParams {
+        ambient: [1.7, 1.7, 1.7],
+        ..day_preset()
+    };
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner(&matrix, high_eye, light_over, size)
+            .unwrap()
+            .presented
+    );
+    let ambient_over = renderer.take_frame_capture().unwrap().unwrap();
+    let expected_over = uniform_oracle([1.7, 1.7, 1.7]);
+    println!(
+        "ambient feed [1.7, 1.7, 1.7]: expected {expected_over:?} (over-one through ACES + the uniform bloom term)"
+    );
+    for (x, y) in spread {
+        let pixel = ambient_over.pixel_rgba(x, y);
+        for channel in 0..3 {
+            let error = pixel[channel].abs_diff(expected_over[channel]);
+            assert!(
+                error <= TOLERANCE,
+                "ambient feed [1.7, 1.7, 1.7] at ({x},{y}) channel {channel}: pixel {pixel:?} vs expected {expected_over:?} (error {error})"
+            );
+        }
+    }
+
+    assert_eq!(
+        renderer.stats().validation_errors,
+        0,
+        "{:?}",
+        renderer.stats().recent_validation
+    );
+    println!(
+        "Era-1 post edge cases: tiny extents ({accepted_width}×256, 2×256) + ambient feed verified"
+    );
+}
 /// (corrective/frame-preparation, findings 4 + 7) The depth-format
 /// fallback matrix and the post lifecycle across swapchain
 /// recreations. Finding 4: with each forced fallback depth format
