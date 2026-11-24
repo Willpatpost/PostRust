@@ -768,8 +768,13 @@ fn wet_ground_gate_at(preference: DepthFormatPreference, label: &str) {
     // wet + populated (the population unreflected — the documented
     // scope; the proxy draws still land inside the wet frame).
     let (npc, vehicle) = engine_slice::corner_population::corner_population();
+    // The Era-2 rest-pose blocks (the skinning input at rest —
+    // bit-exact identity, so the composition's pixels are the
+    // authored-silhouette equation).
+    let npc_poses = vec![engine_renderer::animation::rest_pose_block(); npc.len()];
     let population = engine_renderer::ProxyPopulation {
         npc: &npc,
+        npc_poses: &npc_poses,
         npc_material: 1,
         vehicle: &vehicle,
         vehicle_material: 2,

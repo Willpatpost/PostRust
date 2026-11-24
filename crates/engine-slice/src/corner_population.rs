@@ -76,30 +76,30 @@ const NPC_TABLE: [ProxyInstance; 24] = [
     //    crosswalks — the two crosswalks the camera route passes.
     // West crosswalk, south end (the south band at the crosswalk
     // line): facing north (turn 0), waiting to cross the west arm.
-    ProxyInstance { transform: InstanceTransform { pos: [-5.0, 0.02, -4.5], turn: 0, scale: 1.0 }, tint: [0.85, 0.70, 0.55] },
-    ProxyInstance { transform: InstanceTransform { pos: [-5.7, 0.02, -4.8], turn: 0, scale: 1.0 }, tint: [0.20, 0.45, 0.75] },
+    ProxyInstance { transform: InstanceTransform { pos: [-5.0, 0.02, -4.5], turn: 0, scale: 1.0 }, tint: [0.85, 0.70, 0.55] , pose_index: 0 },
+    ProxyInstance { transform: InstanceTransform { pos: [-5.7, 0.02, -4.8], turn: 0, scale: 1.0 }, tint: [0.20, 0.45, 0.75] , pose_index: 1 },
     // West crosswalk, north end (the north band at the crosswalk
     // line): facing south (turn 32768).
-    ProxyInstance { transform: InstanceTransform { pos: [-5.1, 0.02, 4.5], turn: 32768, scale: 1.0 }, tint: [0.90, 0.35, 0.20] },
-    ProxyInstance { transform: InstanceTransform { pos: [-5.7, 0.02, 4.9], turn: 32768, scale: 1.0 }, tint: [0.35, 0.75, 0.30] },
+    ProxyInstance { transform: InstanceTransform { pos: [-5.1, 0.02, 4.5], turn: 32768, scale: 1.0 }, tint: [0.90, 0.35, 0.20] , pose_index: 2 },
+    ProxyInstance { transform: InstanceTransform { pos: [-5.7, 0.02, 4.9], turn: 32768, scale: 1.0 }, tint: [0.35, 0.75, 0.30] , pose_index: 3 },
     // North crosswalk, west end (the west band at the crosswalk
     // line): facing east (turn 16384), waiting to cross the north
     // arm. The lead stands tight to the road edge, off the corner
     // the west crosswalk's north-end pair occupies.
-    ProxyInstance { transform: InstanceTransform { pos: [-4.5, 0.02, 5.1], turn: 16384, scale: 1.0 }, tint: [0.75, 0.30, 0.60] },
-    ProxyInstance { transform: InstanceTransform { pos: [-4.9, 0.02, 5.7], turn: 16384, scale: 1.0 }, tint: [0.95, 0.80, 0.40] },
+    ProxyInstance { transform: InstanceTransform { pos: [-4.5, 0.02, 5.1], turn: 16384, scale: 1.0 }, tint: [0.75, 0.30, 0.60] , pose_index: 4 },
+    ProxyInstance { transform: InstanceTransform { pos: [-4.9, 0.02, 5.7], turn: 16384, scale: 1.0 }, tint: [0.95, 0.80, 0.40] , pose_index: 5 },
     // North crosswalk, east end (the east band at the crosswalk
     // line): facing west (turn 49152).
-    ProxyInstance { transform: InstanceTransform { pos: [4.5, 0.02, 5.1], turn: 49152, scale: 1.0 }, tint: [0.15, 0.55, 0.85] },
-    ProxyInstance { transform: InstanceTransform { pos: [4.9, 0.02, 5.7], turn: 49152, scale: 1.0 }, tint: [0.60, 0.60, 0.65] },
+    ProxyInstance { transform: InstanceTransform { pos: [4.5, 0.02, 5.1], turn: 49152, scale: 1.0 }, tint: [0.15, 0.55, 0.85] , pose_index: 6 },
+    ProxyInstance { transform: InstanceTransform { pos: [4.9, 0.02, 5.7], turn: 49152, scale: 1.0 }, tint: [0.60, 0.60, 0.65] , pose_index: 7 },
     // -- Crossers (2): mid-crosswalk, the only pedestrians in the
     //    road. The west crosswalk is crossed northbound (turn 0),
     //    the north crosswalk eastbound (turn 16384); both hold
     //    >= 1.0 m of footprint-inclusive clearance from the camera
     //    route, which runs z~0 through the west arm and x~0 through
     //    the north arm.
-    ProxyInstance { transform: InstanceTransform { pos: [-5.0, 0.02, 1.5], turn: 0, scale: 1.0 }, tint: [0.45, 0.80, 0.75] },
-    ProxyInstance { transform: InstanceTransform { pos: [1.5, 0.02, 5.0], turn: 16384, scale: 1.0 }, tint: [0.70, 0.20, 0.20] },
+    ProxyInstance { transform: InstanceTransform { pos: [-5.0, 0.02, 1.5], turn: 0, scale: 1.0 }, tint: [0.45, 0.80, 0.75] , pose_index: 8 },
+    ProxyInstance { transform: InstanceTransform { pos: [1.5, 0.02, 5.0], turn: 16384, scale: 1.0 }, tint: [0.70, 0.20, 0.20] , pose_index: 9 },
     // -- Sidewalk strollers (14): walking along the bands (parallel
     //    to the road they border), both directions represented. The
     //    far south-east strip is deliberately empty — the route's
@@ -109,29 +109,29 @@ const NPC_TABLE: [ProxyInstance; 24] = [
     // south (turn 32768). The v2 footprint (0.36 m) moved the
     // band's building-clear line outward — the southbound stroller
     // stands at x -4.8 (the corner clearance 1.2 m).
-    ProxyInstance { transform: InstanceTransform { pos: [-5.0, 0.02, 7.5], turn: 0, scale: 1.0 }, tint: [0.55, 0.40, 0.30] },
-    ProxyInstance { transform: InstanceTransform { pos: [-4.8, 0.02, 10.0], turn: 32768, scale: 1.0 }, tint: [0.80, 0.50, 0.30] },
+    ProxyInstance { transform: InstanceTransform { pos: [-5.0, 0.02, 7.5], turn: 0, scale: 1.0 }, tint: [0.55, 0.40, 0.30] , pose_index: 10 },
+    ProxyInstance { transform: InstanceTransform { pos: [-4.8, 0.02, 10.0], turn: 32768, scale: 1.0 }, tint: [0.80, 0.50, 0.30] , pose_index: 11 },
     // West band, south of the E-W road.
-    ProxyInstance { transform: InstanceTransform { pos: [-5.1, 0.02, -7.5], turn: 32768, scale: 1.0 }, tint: [0.30, 0.30, 0.35] },
-    ProxyInstance { transform: InstanceTransform { pos: [-4.9, 0.02, -10.0], turn: 0, scale: 1.0 }, tint: [0.90, 0.75, 0.60] },
+    ProxyInstance { transform: InstanceTransform { pos: [-5.1, 0.02, -7.5], turn: 32768, scale: 1.0 }, tint: [0.30, 0.30, 0.35] , pose_index: 12 },
+    ProxyInstance { transform: InstanceTransform { pos: [-4.9, 0.02, -10.0], turn: 0, scale: 1.0 }, tint: [0.90, 0.75, 0.60] , pose_index: 13 },
     // East band, north of the E-W road. The southbound stroller
     // stands at x 4.8 for the v2 footprint's corner clearance.
-    ProxyInstance { transform: InstanceTransform { pos: [5.0, 0.02, 8.0], turn: 0, scale: 1.0 }, tint: [0.25, 0.60, 0.40] },
-    ProxyInstance { transform: InstanceTransform { pos: [4.8, 0.02, 10.5], turn: 32768, scale: 1.0 }, tint: [0.85, 0.60, 0.70] },
+    ProxyInstance { transform: InstanceTransform { pos: [5.0, 0.02, 8.0], turn: 0, scale: 1.0 }, tint: [0.25, 0.60, 0.40] , pose_index: 14 },
+    ProxyInstance { transform: InstanceTransform { pos: [4.8, 0.02, 10.5], turn: 32768, scale: 1.0 }, tint: [0.85, 0.60, 0.70] , pose_index: 15 },
     // East band, south of the E-W road.
-    ProxyInstance { transform: InstanceTransform { pos: [5.1, 0.02, -7.0], turn: 0, scale: 1.0 }, tint: [0.40, 0.40, 0.55] },
-    ProxyInstance { transform: InstanceTransform { pos: [4.9, 0.02, -9.5], turn: 32768, scale: 1.0 }, tint: [0.95, 0.55, 0.30] },
+    ProxyInstance { transform: InstanceTransform { pos: [5.1, 0.02, -7.0], turn: 0, scale: 1.0 }, tint: [0.40, 0.40, 0.55] , pose_index: 16 },
+    ProxyInstance { transform: InstanceTransform { pos: [4.9, 0.02, -9.5], turn: 32768, scale: 1.0 }, tint: [0.95, 0.55, 0.30] , pose_index: 17 },
     // North band, west of the N-S road: walking east (turn 16384)
     // and west (turn 49152). The westbound stroller stands at
     // z 4.8 for the v2 footprint's corner clearance.
-    ProxyInstance { transform: InstanceTransform { pos: [-7.5, 0.02, 5.0], turn: 16384, scale: 1.0 }, tint: [0.65, 0.75, 0.30] },
-    ProxyInstance { transform: InstanceTransform { pos: [-10.0, 0.02, 4.8], turn: 49152, scale: 1.0 }, tint: [0.50, 0.65, 0.80] },
+    ProxyInstance { transform: InstanceTransform { pos: [-7.5, 0.02, 5.0], turn: 16384, scale: 1.0 }, tint: [0.65, 0.75, 0.30] , pose_index: 18 },
+    ProxyInstance { transform: InstanceTransform { pos: [-10.0, 0.02, 4.8], turn: 49152, scale: 1.0 }, tint: [0.50, 0.65, 0.80] , pose_index: 19 },
     // North band, east of the N-S road.
-    ProxyInstance { transform: InstanceTransform { pos: [7.5, 0.02, 5.0], turn: 49152, scale: 1.0 }, tint: [0.80, 0.35, 0.45] },
-    ProxyInstance { transform: InstanceTransform { pos: [10.0, 0.02, 4.9], turn: 16384, scale: 1.0 }, tint: [0.30, 0.70, 0.55] },
+    ProxyInstance { transform: InstanceTransform { pos: [7.5, 0.02, 5.0], turn: 49152, scale: 1.0 }, tint: [0.80, 0.35, 0.45] , pose_index: 20 },
+    ProxyInstance { transform: InstanceTransform { pos: [10.0, 0.02, 4.9], turn: 16384, scale: 1.0 }, tint: [0.30, 0.70, 0.55] , pose_index: 21 },
     // South band, west of the N-S road.
-    ProxyInstance { transform: InstanceTransform { pos: [-7.0, 0.02, -5.0], turn: 16384, scale: 1.0 }, tint: [0.70, 0.65, 0.50] },
-    ProxyInstance { transform: InstanceTransform { pos: [-9.5, 0.02, -5.1], turn: 49152, scale: 1.0 }, tint: [0.55, 0.30, 0.65] },
+    ProxyInstance { transform: InstanceTransform { pos: [-7.0, 0.02, -5.0], turn: 16384, scale: 1.0 }, tint: [0.70, 0.65, 0.50] , pose_index: 22 },
+    ProxyInstance { transform: InstanceTransform { pos: [-9.5, 0.02, -5.1], turn: 49152, scale: 1.0 }, tint: [0.55, 0.30, 0.65] , pose_index: 23 },
 ];
 
 /// The 2 vehicle placements, in fixed order (westbound then
@@ -145,10 +145,53 @@ const NPC_TABLE: [ProxyInstance; 24] = [
 const VEHICLE_TABLE: [ProxyInstance; 2] = [
     // Westbound, the north lane (z = +2) of the E-W road's east arm:
     // nose west (turn 49152), stopped short east of the box.
-    ProxyInstance { transform: InstanceTransform { pos: [9.0, 0.0, 2.0], turn: 49152, scale: 1.0 }, tint: [0.75, 0.18, 0.15] },
+    ProxyInstance { transform: InstanceTransform { pos: [9.0, 0.0, 2.0], turn: 49152, scale: 1.0 }, tint: [0.75, 0.18, 0.15] , pose_index: 0 },
     // Northbound, the east lane (x = +2) of the N-S road's north
     // arm: nose north (turn 0), departed clear of the crosswalk.
-    ProxyInstance { transform: InstanceTransform { pos: [2.0, 0.0, 9.0], turn: 0, scale: 1.0 }, tint: [0.15, 0.25, 0.70] },
+    ProxyInstance { transform: InstanceTransform { pos: [2.0, 0.0, 9.0], turn: 0, scale: 1.0 }, tint: [0.15, 0.25, 0.70] , pose_index: 0 },
+];
+
+/// The corner population: 24 NPCs then 2 vehicles, in the fixed
+/// buffer order (the repack's npc-then-vehicle order — the table's
+/// entry order is part of the byte pin). Built ONCE per run (the
+/// demo holds it for the whole route); the per-frame
+/// zero-allocation discipline is the renderer's retained repack, not
+/// this table's construction.
+/// One NPC's walk-cycle disposition (the placement table's PHASE
+/// column — the mission's "per-NPC phase offsets so the crowd does
+/// not march in lockstep"): the crosswalk WAITERS stand (the rest
+/// pose — a waiting pedestrian mid-stride would look wrong); the
+/// crossers and strollers WALK, each at its hand-authored phase
+/// offset as a u16 turn-fraction of the 1.1 s stride (0 = the left
+/// leg's heel strike).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Standing — the rest pose, no evaluation.
+    Stand,
+    /// Walking at the phase offset (a turn-fraction of one stride:
+    /// `phase / 65536 · 1.1 s`).
+    Walk(u16),
+}
+
+/// The 24 phase offsets, in NPC_TABLE order: the 8 waiters stand;
+/// the 2 crossers and 14 strollers walk at hand-spread phases (all
+/// distinct, deliberately not a gradient — pure data, pinned below).
+#[rustfmt::skip]
+const NPC_PHASE: [Phase; 24] = [
+    // Crosswalk waiters (8): standing.
+    Phase::Stand, Phase::Stand, Phase::Stand, Phase::Stand,
+    Phase::Stand, Phase::Stand, Phase::Stand, Phase::Stand,
+    // Crossers (2): mid-cross, opposite phases (they walk toward
+    // each other's crosswalk ends).
+    Phase::Walk(10923), Phase::Walk(43691),
+    // Sidewalk strollers (14): spread over the stride.
+    Phase::Walk(0),      Phase::Walk(30543),
+    Phase::Walk(15124),  Phase::Walk(53621),
+    Phase::Walk(24986),  Phase::Walk(7714),
+    Phase::Walk(39062),  Phase::Walk(19531),
+    Phase::Walk(46089),  Phase::Walk(58252),
+    Phase::Walk(12872),  Phase::Walk(41899),
+    Phase::Walk(9766),   Phase::Walk(34495),
 ];
 
 /// The corner population: 24 NPCs then 2 vehicles, in the fixed
@@ -160,6 +203,75 @@ const VEHICLE_TABLE: [ProxyInstance; 2] = [
 pub fn corner_population() -> (Vec<ProxyInstance>, Vec<ProxyInstance>) {
     (NPC_TABLE.to_vec(), VEHICLE_TABLE.to_vec())
 }
+
+/// The placement table's phase column (the animated-population
+/// stage's companion to [`corner_population`] — same entry order).
+pub fn corner_population_phases() -> Vec<Phase> {
+    NPC_PHASE.to_vec()
+}
+
+/// The stride the demo's walk clip runs at (seconds) — the phase
+/// column's unit companion (documented here once; the clip itself
+/// lives in engine-renderer's animation core).
+pub const WALK_STRIDE_SECONDS: f32 = 1.1;
+
+/// The demo clock's reference rate: the scripted route advances the
+/// walk at the presented-frame count over 60 Hz (the day/night
+/// cycle's own deterministic-clock precedent — frame k always shows
+/// pose t_k; free-look is presentation-only and follows the same
+/// counter at whatever rate it presents).
+pub const DEMO_CLOCK_HZ: f32 = 60.0;
+
+/// Evaluates the population's pose blocks for presented frame `k`
+/// (the deterministic clock: each walking NPC's clip time is
+/// `k / 60 + phase / 65536 · 1.1` modulo the stride; standing NPCs
+/// carry the bit-exact rest block). Writes into `out` IN PLACE (one
+/// block per table entry, pose-index order — entry i's block is
+/// block i, matching the table's sequential pose_index pin), reusing
+/// the buffer's capacity: the demo's per-frame walk evaluation
+/// allocates nothing after the first frame. Pure and deterministic:
+/// frame k always produces byte-identical blocks (the FNV pins
+/// below).
+pub fn evaluate_population_poses(k: u64, phases: &[Phase], out: &mut Vec<Block>) {
+    use engine_renderer::animation::{
+        compose_joint_matrices, humanoid_skeleton, rest_pose_block, sample_pose, skin_matrices,
+        walk_clip,
+    };
+    let clip = walk_clip();
+    let skeleton = humanoid_skeleton();
+    // THE INTEGER STRIDE REDUCTION: one stride is exactly 66 frames
+    // (1.1 s × 60 Hz), and the frame counter reduces modulo it IN
+    // INTEGERS before any float is formed — `66.0/60.0 + p` does NOT
+    // reduce back to `p` exactly in f32 (the addition rounds), so a
+    // naive `k/60 + phase` breaks byte-exact periodicity at stride
+    // boundaries. With the integer reduction, frame 66m + j computes
+    // the identical `t` as frame j — the loop closes bit-exactly
+    // (the period pin below).
+    let stride_frames = (WALK_STRIDE_SECONDS * DEMO_CLOCK_HZ) as u64;
+    debug_assert_eq!(
+        stride_frames, 66,
+        "one stride is exactly 66 frames at 60 Hz"
+    );
+    let within_stride = (k % stride_frames) as f32 / DEMO_CLOCK_HZ;
+    out.clear();
+    out.reserve(phases.len());
+    for phase in phases {
+        let block = match *phase {
+            Phase::Stand => rest_pose_block(),
+            Phase::Walk(offset) => {
+                let t = within_stride + offset as f32 / 65536.0 * WALK_STRIDE_SECONDS;
+                let pose = sample_pose(&clip, t);
+                let joint_worlds = compose_joint_matrices(&skeleton, &pose);
+                skin_matrices(&joint_worlds, &skeleton)
+            }
+        };
+        out.push(block);
+    }
+}
+
+/// One pose block: 11 column-major skin matrices (the packed-pose
+/// stride's unit — the animation core's HUMANOID_JOINTS).
+pub type Block = [[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS];
 
 #[cfg(test)]
 mod tests {
@@ -206,6 +318,17 @@ mod tests {
             );
             assert_eq!(instance.transform.scale, 1.0);
             assert_eq!(instance.transform.turn % 16384, 0, "axis-aligned lanes");
+            assert_eq!(instance.pose_index, 0, "vehicles never read the pose slot");
+        }
+        // THE POSE-INDEX PIN: every npc's block index is its list
+        // position — the identity mapping the renderer's pose repack
+        // and the demo's walk evaluation both rely on (a later
+        // dedup remaps these values consciously, never silently).
+        for (index, instance) in npc.iter().enumerate() {
+            assert_eq!(
+                instance.pose_index, index as u32,
+                "npc {index}'s pose block is its list position"
+            );
         }
     }
 
@@ -370,6 +493,137 @@ mod tests {
         }
     }
 
+    /// THE PHASE-COLUMN PIN: 24 entries matching the table order;
+    /// the first 8 (the waiters) stand; the 16 walkers' phases are
+    /// all distinct (no lockstep marching — the mission's own
+    /// requirement) and none is zero-phase-with-zero... the crossers
+    /// sit near opposite quarters of the stride.
+    #[test]
+    fn phase_column_is_pinned() {
+        let phases = corner_population_phases();
+        assert_eq!(phases.len(), 24, "one phase per table entry");
+        for phase in &phases[..8] {
+            assert_eq!(*phase, Phase::Stand, "the crosswalk waiters stand");
+        }
+        let walkers: Vec<u16> = phases[8..]
+            .iter()
+            .filter_map(|p| match *p {
+                Phase::Walk(offset) => Some(offset),
+                Phase::Stand => None,
+            })
+            .collect();
+        assert_eq!(walkers.len(), 16, "the crossers and strollers walk");
+        let mut sorted = walkers.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            walkers.len(),
+            "every walking phase is distinct"
+        );
+        // The spread: the walkers cover the stride (the min gap
+        // between sorted phases exceeds a 1/64 stride — no two
+        // walkers are within ~1.5% of each other's phase; the crowd
+        // never clusters).
+        let mut gaps_ok = true;
+        for pair in sorted.windows(2) {
+            if u32::from(pair[1] - pair[0]) < 65536 / 64 {
+                gaps_ok = false;
+            }
+        }
+        assert!(
+            gaps_ok,
+            "the walking phases spread over the stride: {sorted:?}"
+        );
+    }
+
+    /// THE EVALUATION DETERMINISM PINS: the pose blocks at a fixed
+    /// frame are byte-identical across calls; the waiters' blocks
+    /// are bit-exact rest; ONE STRIDE = 66 frames at the 60 Hz
+    /// reference, so frame 66's blocks equal frame 0's EXACTLY (the
+    /// loop-closure pin); and the packed bytes' FNV at frames 0/33
+    /// are the cross-platform byte pins (measured below).
+    #[test]
+    fn pose_evaluation_is_deterministic_and_periodic() {
+        let phases = corner_population_phases();
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        evaluate_population_poses(0, &phases, &mut a);
+        evaluate_population_poses(0, &phases, &mut b);
+        assert_eq!(a, b, "byte-identical across calls");
+        assert_eq!(a.len(), 24, "one block per npc");
+
+        // The waiters stand: bit-exact rest blocks.
+        let rest = engine_renderer::animation::rest_pose_block();
+        for (index, block) in a[..8].iter().enumerate() {
+            assert_eq!(*block, rest, "waiter {index} stands at the rest pose");
+        }
+
+        // The walkers move: at least one walker block differs from
+        // rest at frame 0 (the phase spread means some walker is
+        // mid-stride).
+        assert!(
+            a[8..].iter().any(|block| *block != rest),
+            "some walker is off rest at frame 0 (the phase spread)"
+        );
+
+        // THE PERIOD PIN: 66 frames = 1.1 s at 60 Hz — exactly one
+        // stride — so frame 66 reproduces frame 0's blocks EXACTLY.
+        let mut later = Vec::new();
+        evaluate_population_poses(66, &phases, &mut later);
+        assert_eq!(
+            a, later,
+            "one stride later is the same pose (the loop closes)"
+        );
+
+        // The retained buffer never grows across evaluations.
+        let warmed = a.capacity();
+        for k in 0..100u64 {
+            evaluate_population_poses(k, &phases, &mut b);
+            assert_eq!(b.capacity(), warmed, "no reallocation at frame {k}");
+        }
+    }
+
+    /// The packed pose bytes' FNV at fixed frames (the deterministic
+    /// frames discipline: frame k always packs the same bytes —
+    /// Linux and Windows CI asserting the same values IS the
+    /// cross-platform proof).
+    #[test]
+    fn pose_bytes_fnv_pins() {
+        let phases = corner_population_phases();
+        let mut blocks = Vec::new();
+        let mut digest = |k: u64| -> u64 {
+            evaluate_population_poses(k, &phases, &mut blocks);
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for block in &blocks {
+                let bytes = engine_renderer::animation::pack_pose_bytes(block);
+                for &byte in bytes.iter() {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            hash
+        };
+        let frame0 = digest(0);
+        let frame33 = digest(33);
+        assert_ne!(frame0, frame33, "mid-stride differs from the stride start");
+        println!("POSE_FNV_0={frame0}");
+        println!("POSE_FNV_33={frame33}");
+        // The placeholder-pin discipline: the pins follow the first
+        // measured run (the values below are MEASURED at this tree;
+        // movement is an investigation, never a silent repin).
+        const PINNED_0: u64 = PIN_FRAME_0;
+        const PINNED_33: u64 = PIN_FRAME_33;
+        assert_eq!(frame0, PINNED_0, "frame 0's pose-bytes digest moved");
+        assert_eq!(frame33, PINNED_33, "frame 33's pose-bytes digest moved");
+    }
+
+    /// The measured-actual FNV-1a digests of the demo's pose
+    /// evaluation (the placeholder-pin discipline: measured at this
+    /// tree by the first run of pose_bytes_fnv_pins, then frozen).
+    const PIN_FRAME_0: u64 = 5_757_258_358_703_043_002;
+    const PIN_FRAME_33: u64 = 12_735_933_771_296_667_791;
+
     /// THE PLACEMENT-TABLE BYTE PIN: the full population packs to a
     /// byte sequence whose FNV-1a hash is this pinned u64 (measured
     /// actual; the cross-platform proof is the scaffold's
@@ -399,12 +653,14 @@ mod tests {
     /// The measured-actual FNV-1a of the pinned placement table
     /// above (the placeholder-pin discipline: the first run measures,
     /// the pin follows, and any later movement is an investigation).
-    /// Repinned in the Era-1 population-v2 package: the three
-    /// strollers nudged outward for the v2 silhouettes' true
-    /// footprint (the 0.36 m radius's 0.5 m building clearance —
-    /// the movement this pin exists to catch), from the
-    /// population-package value 9_133_392_768_426_866_649.
-    const PINNED_FNV: u64 = 4_298_571_200_219_075_995;
+    /// History: repinned in the Era-1 population-v2 package (the
+    /// three strollers nudged outward for the v2 footprint, from
+    /// 9_133_392_768_426_866_649 to 4_298_571_200_219_075_995);
+    /// repinned again in the Era-2 skinning package — the params
+    /// vec4's x now carries each npc's sequential pose block index
+    /// (the versioned claim; the pin fired on the change exactly as
+    /// designed and the cause is the claim, not an accident).
+    const PINNED_FNV: u64 = 16_877_662_039_878_331_722;
 
     // ------------------------------------------------------- helpers
     // (pure f32; the pins carry margins, so platform ulp differences

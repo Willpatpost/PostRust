@@ -1,7 +1,7 @@
 //! One Corner of the City. One deterministic pose per presented frame
 //! — or, with `--free-look` (Era 1), the interactive eyeball camera:
 //! presentation only, never a measured claim.
-use crate::corner_population::corner_population;
+use crate::corner_population::{Block, Phase, corner_population, corner_population_phases};
 use crate::frame_timing::FrameTiming;
 use crate::math::{Mat4, camera_forward, camera_right, camera_view, mul, percentile, perspective};
 use crate::render_demo::free_flight_look_delta;
@@ -316,16 +316,22 @@ pub fn run(
     } else {
         (Vec::new(), Vec::new())
     };
-    let population = if populated {
-        Some(ProxyPopulation {
-            npc: &npc,
-            npc_material: NPC_MATERIAL,
-            vehicle: &vehicle,
-            vehicle_material: VEHICLE_MATERIAL,
-        })
+    // The Era-2 animated population: the placement table's PHASE
+    // column (8 waiters stand, 16 crossers/strollers walk at
+    // hand-spread offsets — no lockstep marching) and the retained
+    // pose-block buffer the frame loop evaluates into (in place,
+    // zero allocation after the first frame — the deterministic
+    // clock: presented frame k shows pose t_k, the day/night
+    // cycle's own precedent).
+    let phases = if populated {
+        corner_population_phases()
     } else {
-        None
+        Vec::new()
     };
+    let mut pose_blocks: Vec<Block> = Vec::new();
+    if populated {
+        crate::corner_population::evaluate_population_poses(0, &phases, &mut pose_blocks);
+    }
     // The submission mode, in evidence order: the per-object
     // reference (one draw per instance — the pre-6-E shape, the
     // before/after measurement mode), the direct 6-E instanced
@@ -392,17 +398,6 @@ pub fn run(
             atmosphere.disc_dir
         );
     }
-    // The combination refusal (the union's policy, from the verified
-    // three-way resolution): proxy shadows (a populated scene drawn
-    // through the shadowed path) are a deferred package on both the
-    // population and the 6-F deferral lists, so asking for both is a
-    // typed upfront refusal — never a silent mode drop.
-    if populated && shadows {
-        return Err(
-            "--populated and --shadows together is not implemented (proxy shadows are a deferred package)"
-                .into(),
-        );
-    }
     // Era 1 package 4: the day/night cycle drives the atmosphere
     // (the light AND the sky) from the day endpoint — a static
     // --night start alongside it is contradictory, refused upfront.
@@ -433,6 +428,17 @@ pub fn run(
             ProxyDrawMode::Instanced => "instanced mode",
             ProxyDrawMode::Indirect => "indirect mode",
         };
+        println!(
+            "animated population: {} walking, {} standing (the {} s walk cycle, per-NPC phases; \
+             presented frame k shows pose t_k at the {} Hz reference)",
+            phases
+                .iter()
+                .filter(|p| matches!(p, Phase::Walk(_)))
+                .count(),
+            phases.iter().filter(|p| matches!(p, Phase::Stand)).count(),
+            crate::corner_population::WALK_STRIDE_SECONDS,
+            crate::corner_population::DEMO_CLOCK_HZ
+        );
         println!(
             "proxy population: {} instances ({} npc + {} vehicle), {} draw calls per frame ({})",
             npc.len() + vehicle.len(),
@@ -478,7 +484,8 @@ pub fn run(
         return run_free_look(
             &mut app,
             &mut renderer,
-            population.as_ref(),
+            populated.then_some((&npc[..], &vehicle[..], &phases[..])),
+            &mut pose_blocks,
             shadows,
             light,
             bias,
@@ -520,14 +527,43 @@ pub fn run(
                 disc_dir: atmosphere.disc_dir,
             }));
         }
+        // The walk cycle's deterministic tick: presented frame i at
+        // the 60 Hz reference advances every walking npc's clip
+        // (the phase column spreads them across the stride; the
+        // standing waiters keep the rest block — the evaluation's
+        // own contract).
+        if populated {
+            crate::corner_population::evaluate_population_poses(
+                i as u64,
+                &phases,
+                &mut pose_blocks,
+            );
+        }
+        // The per-frame population (fresh after the evaluation — the
+        // pose blocks are re-borrowed each frame, never held across
+        // the evaluation).
+        let frame_population = populated.then(|| ProxyPopulation {
+            npc: &npc,
+            npc_poses: &pose_blocks,
+            npc_material: NPC_MATERIAL,
+            vehicle: &vehicle,
+            vehicle_material: VEHICLE_MATERIAL,
+        });
         let matrix = view_projection(pose, aspect);
-        // Submission selection: the shadowed route (6-F) or the
-        // populated route (6-E/6-E2, the mode set above); the
-        // combination was refused above (proxy shadows are the
-        // deferred package).
-        let frame = if shadows {
+        // Submission selection: the four-way union
+        // (--populated --shadows together is the Era-2 stage 4b path).
+        let frame = if shadows && populated {
+            renderer.render_corner_populated_shadowed(
+                &matrix,
+                pose.position,
+                light,
+                bias,
+                frame_population.as_ref().unwrap(),
+                size,
+            )
+        } else if shadows {
             renderer.render_corner_shadowed(&matrix, pose.position, light, bias, size)
-        } else if let Some(population) = population.as_ref() {
+        } else if let Some(population) = frame_population.as_ref() {
             renderer.render_corner_populated(&matrix, pose.position, light, population, size)
         } else {
             renderer.render_corner(&matrix, pose.position, light, size)
@@ -599,7 +635,12 @@ pub fn run(
 fn run_free_look(
     app: &mut ShellApp,
     renderer: &mut Renderer,
-    population: Option<&ProxyPopulation<'_>>,
+    population: Option<(
+        &[engine_renderer::proxy_instances::ProxyInstance],
+        &[engine_renderer::proxy_instances::ProxyInstance],
+        &[Phase],
+    )>,
+    pose_blocks: &mut Vec<Block>,
     shadows: bool,
     mut light: LightParams,
     bias: engine_renderer::shadows::ShadowBias,
@@ -681,10 +722,32 @@ fn run_free_look(
         } else {
             size.0 as f32 / size.1 as f32
         };
+        // The walk tick (presentation-only determinism: the
+        // presented-frame count drives the clip, the same counter
+        // the scripted route uses).
+        let frame_population = population.map(|(npc, vehicle, phases)| {
+            crate::corner_population::evaluate_population_poses(presented, phases, pose_blocks);
+            ProxyPopulation {
+                npc,
+                npc_poses: pose_blocks,
+                npc_material: NPC_MATERIAL,
+                vehicle,
+                vehicle_material: VEHICLE_MATERIAL,
+            }
+        });
         let matrix = camera.view_projection(aspect);
-        let frame = if shadows {
+        let frame = if shadows && let Some(population) = &frame_population {
+            renderer.render_corner_populated_shadowed(
+                &matrix,
+                camera.position,
+                light,
+                bias,
+                population,
+                size,
+            )
+        } else if shadows {
             renderer.render_corner_shadowed(&matrix, camera.position, light, bias, size)
-        } else if let Some(population) = population {
+        } else if let Some(population) = frame_population.as_ref() {
             renderer.render_corner_populated(&matrix, camera.position, light, population, size)
         } else {
             renderer.render_corner(&matrix, camera.position, light, size)

@@ -436,8 +436,31 @@ jobs:
           # MEASURED locally on the merged tree with this step's
           # own awk; Windows 1157 = 1146 + the same 11
           # (platform-uniform).
-          expected=1208
-          if [ "$(uname -s)" != "Linux" ]; then expected=1157; fi
+          # ERA 2 PACKAGE 1 (the animation + skinning + proxy-shadows
+          # branch, 2026-11-24): the Era-1 union's 1208 + the
+          # package's MAIN-SHARD additions, every one a
+          # platform-uniform pure-IEEE engine-renderer lib test:
+          # stage 1 (b675377 + the 6b95875 repair) +22 (animation.rs
+          # — the rotation/interpolation/gait/digest battery);
+          # stages 2a+2b (862e003) +0 (the pose-index claim repins
+          # values inside existing tests; the five WGSL modules
+          # carry no Rust tests); stages 2c+4a (036d88a) +7 (the
+          # populated raycaster oracle battery); stage 3 (16ec1a5)
+          # +0 here (the corner_population module's tests are
+          # engine-slice — the HEAVY shard's); stage 4b (ba58c96)
+          # +0 (wiring only). 1208 + 29 = 1237 Linux MEASURED with
+          # this step's own awk at the stage-4b tip AND by CI run
+          # 45478600773 (1237/2/33 — the run red ONLY on this
+          # step's then-stale 1208 pin, every test passing); Windows
+          # 1186 = 1157 + the same 29, CI-measured on the same run.
+          # STAGE 5 (the gates + this reconciliation): +0 — all
+          # four new gates are #[ignore]d engine-slice lavapipe
+          # gates (the heavy shard's ignored count carries them);
+          # this shard's non-ignored battery is untouched.
+          # 1237/2/33 re-MEASURED with this step's own awk on the
+          # stage-5 tree.
+          expected=1237
+          if [ "$(uname -s)" != "Linux" ]; then expected=1186; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -533,8 +556,17 @@ jobs:
           # the UNION of both branches' renderer additions - 131/2
           # MEASURED locally on the merged tree with this step's
           # own awk.
-          echo "renderer release: $passed passed, $results test-result lines (expected 131 / 2)"
-          [ "$passed" -eq 131 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 131"; exit 1; }
+          # ERA 2 PACKAGE 1 (2026-11-24): stage 1's animation
+          # battery +22 and stages 2c+4a's populated-oracle battery
+          # +7, the same platform-uniform tests the main shard
+          # carries: 131 + 29 = 160/2 MEASURED locally with this
+          # step's own awk (the stage-2c+4a commit's own record:
+          # 153 + 7). Stage 5 (the gates) +0 — the gates live in
+          # engine-slice's test binaries, never in this crate.
+          # 160/2 re-MEASURED with this step's own awk on the
+          # stage-5 tree.
+          echo "renderer release: $passed passed, $results test-result lines (expected 160 / 2)"
+          [ "$passed" -eq 160 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 160"; exit 1; }
           [ "$results" -eq 2 ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != 2"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production
@@ -698,6 +730,20 @@ jobs:
       # indirect submission, and the replacement lifecycle. Three
       # SDL tests now serialize on the same sdl_lock; the command
       # stays unchanged.
+      # (Era 1 corrective, findings 11+18) The oblique wheel
+      # fixture joins the same binary.
+      # (Era 2 stage 5) TWO more gates join the same binary, both
+      # serialized on the same sdl_lock: the skinning oracle (one
+      # walking npc's torso face per-pixel against skin_vertex +
+      # the instance transform, the dead-on camera derived from the
+      # SKINNED rectangle, the rest-pose differential) and the
+      # animated N-vs-1 (the fixture population walking at frame 33,
+      # per-object vs instanced byte-equal, the motion
+      # differential); the full-table gate's animated regime (the
+      # allocation counters constant across warmed WALKING frames,
+      # the per-frame pose digests) extends the EXISTING population
+      # gate. The command stays unchanged (the binary runs all its
+      # gates).
       - name: Instanced-proxy equivalence gate (lavapipe)
         if: runner.os == 'Linux'
         shell: bash
@@ -721,6 +767,14 @@ jobs:
       # (deep shadow / penumbra / full light), and the warmed-
       # allocation constancy. The command is unchanged (the binary
       # runs both tests).
+      # (Era 2 stage 5) The populated shadow-map gate joins the same
+      # binary: the corner population CASTING through the shadowed
+      # depth pass, the captured map vs the populated raycaster
+      # (map_texel_depth_populated over the SAME evaluated blocks)
+      # at REST and at frame-33 WALK, the per-class census with the
+      # 2.68e-7 tolerance's first device-measured evidence printed,
+      # the rest-vs-walked differential, and the warmed constancy.
+      # The command is unchanged (the binary runs all its gates).
       - name: Directional-shadow gates (lavapipe)
         if: runner.os == 'Linux'
         shell: bash
@@ -1463,8 +1517,30 @@ jobs:
           # Windows 587/27 unchanged (the gate runs only in the
           # Linux Vulkan step; the plain-run counts are
           # platform-uniform).
-          expected=588
-          if [ "$(uname -s)" != "Linux" ]; then expected=587; fi
+          # ERA 2 PACKAGE 1 (2026-11-24): stage 3 (16ec1a5) grows the
+          # engine-slice lib battery +3 (the corner_population
+          # module's phase pin, the determinism/period pin, the
+          # digest pins — within the existing lib result line):
+          # 588 + 3 = 591 Linux, 587 + 3 = 590 Windows, ignored 28
+          # and result lines 62 UNCHANGED. MEASURED with this step's
+          # own awk AND by CI run 45478600773 (591/28/62 Linux,
+          # 590/28/62 Windows — the run red ONLY on the then-stale
+          # 588/587 pins, every test passing; the earlier runs
+          # 45472428113 and 45471375791 measured the same deltas at
+          # the stage-3 and stage-2c+4a tips). STAGE 5 (the gates +
+          # this reconciliation): +3 IGNORED, passed counts and
+          # result lines unchanged — three new #[ignore]d lavapipe
+          # gates in EXISTING binaries (render_instanced's
+          # skinned_pose_matches_the_cpu_oracle and
+          # animated_population_matches_per_object_pixels;
+          # render_shadows's populated_shadow_map_matches_the_
+          # raycaster; the full-table gate's animated regime EXTENDS
+          # an existing test, no count): ignored 28 -> 31 (the
+          # binaries' own lines: render_instanced 4 -> 6 ignored,
+          # render_shadows 3 -> 4). 591/31/62 MEASURED with this
+          # step's own awk on the stage-5 tree, zero failures.
+          expected=591
+          if [ "$(uname -s)" != "Linux" ]; then expected=590; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
@@ -1478,7 +1554,7 @@ jobs:
           # are engine-renderer lib tests — the main shard's).
           # Linux 582/14/59 MEASURED locally with this step's own
           # awk; Windows 581/14/59 platform-uniform.
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 28 / 62)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 31 / 62)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           # Era 1 package 3 (the sky, 2026-11-23): the NEW
           # tests/render_sky.rs binary carries ONE #[ignore]d
@@ -1602,7 +1678,14 @@ jobs:
           # eight-PR union value, to be confirmed from this
           # rehearsal's own measured actuals (the awk above) — the
           # established discipline, never a guess.
-          [ "$ignored" -eq 28 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 28"; exit 1; }
+          # ERA 2 PACKAGE 1 (2026-11-24): the union's 28 ignored
+          # holds through stages 1-4b (every Era-2 test until stage 5
+          # is a non-ignored lib/main test). STAGE 5 adds the three
+          # new #[ignore]d lavapipe gates (see the expected= block's
+          # arithmetic above): 28 -> 31, MEASURED with this step's
+          # own awk on the stage-5 tree (render_instanced 6 ignored,
+          # render_shadows 4, and the rest unchanged).
+          [ "$ignored" -eq 31 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 31"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
@@ -1637,7 +1720,7 @@ jobs:
           # its own result line on the combined tree (58 -> 59; its
           # single gate test is #[ignore]d in the plain run and
           # executed by the dedicated Linux Vulkan step).
-          [ "$results" -eq 62 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 60"; exit 1; }
+          [ "$results" -eq 62 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 62"; exit 1; }
       # (F-06, the 2026-11-12 quality audit — Agent C) The release-mode
       # render-path CPU canary: the comparative microbenchmark in
       # release mode on the llvipe runner — NO timing thresholds (the

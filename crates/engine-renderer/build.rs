@@ -79,6 +79,22 @@ fn main() {
     // planar-reflection target, Schlick-blended — planar.rs's
     // reflection_blend mirrored term-for-term.
     compile_wgsl("ground_reflect.wgsl", "ground_reflect.spv");
+    // The Era-2 stage 2B animation + skinning + proxy shadows modules
+    // (five new WGSL shaders, binding 5 for the pose storage buffer).
+    compile_wgsl(
+        "instanced_proxy_skinned.wgsl",
+        "instanced_proxy_skinned.spv",
+    );
+    compile_wgsl(
+        "instanced_proxy_skinned_shadowed.wgsl",
+        "instanced_proxy_skinned_shadowed.spv",
+    );
+    compile_wgsl(
+        "instanced_proxy_shadowed.wgsl",
+        "instanced_proxy_shadowed.spv",
+    );
+    compile_wgsl("shadow_depth_skinned.wgsl", "shadow_depth_skinned.spv");
+    compile_wgsl("shadow_depth_instanced.wgsl", "shadow_depth_instanced.spv");
 }
 
 /// The WGSL path (Cycle 6-A): parse + validate + emit ONE SPIR-V
@@ -105,7 +121,10 @@ fn compile_wgsl(file: &str, out_name: &str) {
         fake_missing_bindings: false,
         ..Default::default()
     };
-    for binding in [0, 1, 2, 3, 4] {
+    // Binding map: the 6-B descriptor foundation is reused as-is.
+    // Binding 5 (the Era-2 skinning pose storage buffer) passes
+    // through unchanged — the same binding number in SPIR-V.
+    for binding in [0, 1, 2, 3, 4, 5] {
         options.binding_map.insert(
             naga::ResourceBinding { group: 0, binding },
             naga::back::spv::BindingInfo {
@@ -113,6 +132,8 @@ fn compile_wgsl(file: &str, out_name: &str) {
                 // blocks must retain their distinct SPIR-V decorations.
                 // Binding 4 (the 6-F shadow map, a texture_depth_2d read
                 // with textureLoad) keeps its own descriptor.
+                // Binding 5 (the 2-B pose storage buffer) keeps its own
+                // descriptor (the Era-2 skinning convention).
                 binding: if binding == 1 { 0 } else { binding },
                 ..Default::default()
             },

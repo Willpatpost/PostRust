@@ -45,6 +45,10 @@ use crate::config::{FRAMES_IN_FLIGHT, TargetFaultSite, TargetFaultStage};
 use crate::shadows::SHADOW_MAP_EXTENT;
 use ash::vk;
 
+// Sibling modules (same `vulkan` parent)
+use super::proxy_draw;
+use super::skinned_draw;
+
 /// The corner material table's length (the shadowed sets' fixed
 /// count: one set per material × frame slot).
 const MATERIAL_COUNT: usize = 3;
@@ -74,6 +78,11 @@ pub(crate) struct ShadowFrameParams {
 }
 
 const _: () = assert!(size_of::<ShadowFrameParams>() == 192);
+
+/// The extended FrameParams block's byte size (the shadowed proxy
+/// sets' binding-2 range — pub for the sibling state's set writes).
+#[allow(dead_code)]
+pub(super) const SHADOW_FRAME_PARAMS_SIZE: u64 = size_of::<ShadowFrameParams>() as u64;
 
 impl ShadowFrameParams {
     /// The clear color (the ambient sky tone, the corner's own
@@ -703,19 +712,28 @@ impl ShadowResources {
 
     /// Records the depth-only shadow pass for this slot: clear to
     /// 1.0, draw the whole corner mesh once through the light
-    /// matrix. Must run BEFORE the main render pass in the same
-    /// command buffer (the pass's final subpass dependency orders the
-    /// map's writes before the main pass's fragment reads).
+    /// matrix, then the populated proxy casts (npc skins, vehicle
+    /// plain) through the shadow map. Must run BEFORE the main pass
+    /// in the same command buffer (the pass's final subpass
+    /// dependency orders the map's writes before the main pass's
+    /// fragment reads).
     ///
     /// # Safety
     /// `cmd` must be recording (pre-main-pass); `slot`'s map is
     /// written here and read by the main pass that follows.
+    /// `shadowed_proxy`, `proxy`, and `skinned` must be the frame
+    /// flow's ensure-discipline states (shadows, proxy, skinned).
+    #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn record_depth_pass(
         &self,
         ctx: &VulkanContext,
         cmd: vk::CommandBuffer,
         corner: &CornerResources,
         slot: usize,
+        shadowed_proxy: Option<&skinned_draw::ShadowedProxyResources>,
+        proxy: Option<&proxy_draw::ProxyResources>,
+        skinned: Option<&skinned_draw::SkinnedProxyResources>,
+        upload: Option<&proxy_draw::ProxyFrameUpload<'_>>,
     ) {
         let (vertices, draws) = corner.mesh();
         let total = draws[2].end;
@@ -768,6 +786,28 @@ impl ShadowResources {
             ctx.device
                 .cmd_bind_vertex_buffers(cmd, 0, &[vertices], &[0]);
             ctx.device.cmd_draw(cmd, total, 1, 0, 0);
+
+            // The proxy casts (npc skins, vehicle plain) if the
+            // shadowed-populated path is active.
+            if let (
+                Some(shadowed_proxy),
+                Some(proxy_state),
+                Some(skinned_state),
+                Some(upload_state),
+            ) = (shadowed_proxy, proxy, skinned, upload)
+            {
+                shadowed_proxy.record_depth_casts(
+                    ctx,
+                    cmd,
+                    corner,
+                    self,
+                    skinned_state,
+                    slot,
+                    upload_state,
+                    proxy_state,
+                );
+            }
+
             ctx.device.cmd_end_render_pass(cmd);
         }
     }
@@ -775,6 +815,43 @@ impl ShadowResources {
     /// The shadowed lit pipeline + the per-material sets for this
     /// slot (the main pass's corner draws bind these instead of the
     /// corner's own).
+    /// The shadowed-proxy state's companions (the Era-2 stage-4b
+    /// accessors — the populated shadowed path binds the shadow
+    /// state's own resources through its sibling state in
+    /// skinned_draw.rs).
+    /// This slot's shadow map view (binding 4's image).
+    pub(super) fn map_view(&self, slot: usize) -> vk::ImageView {
+        self.views[slot]
+    }
+    /// The extended-FrameParams uniform buffer (the shadowed sets'
+    /// binding 2) and its per-slot dynamic stride.
+    pub(super) fn frame_buffer(&self) -> vk::Buffer {
+        self.frame_buffer
+    }
+    pub(super) fn frame_stride(&self) -> u32 {
+        self.frame_stride
+    }
+    /// The light matrix's aligned offset inside each slot's region
+    /// (the depth sets' binding-0 static offset).
+    #[allow(dead_code)]
+    pub(super) fn light_offset(&self) -> u32 {
+        self.light_offset
+    }
+    /// The depth-only render pass (the proxy-cast pipelines' pass).
+    pub(super) fn depth_render_pass(&self) -> vk::RenderPass {
+        self.depth_pass
+    }
+    /// The depth pass's own pipeline layout (the vehicle cast
+    /// pipeline binds the shadow state's own depth set).
+    pub(super) fn depth_layout(&self) -> vk::PipelineLayout {
+        self.depth_layout
+    }
+    /// The depth pass's own descriptor set (the vehicle cast binds
+    /// this set with the frame offset dynamic offset).
+    pub(super) fn depth_set(&self) -> vk::DescriptorSet {
+        self.depth_set
+    }
+
     pub(super) fn shadowed(
         &self,
         slot: usize,

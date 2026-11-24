@@ -66,13 +66,12 @@
 //! of pipeline assembly with the SAME descriptor set layout as the
 //! lit pipeline (the 6-B foundation; no new bindings).
 
-use super::corner::CornerResources;
 use super::{
     RendererError, VulkanContext, create_device_local_buffer_with_data, create_mapped_buffer,
 };
 use crate::ProxyDrawMode;
 use crate::config::FRAMES_IN_FLIGHT;
-use crate::populated_meshes::{humanoid_mesh, sedan_mesh};
+use crate::populated_meshes::sedan_mesh;
 use crate::proxy_indirect::{INDIRECT_COMMAND_BYTES, INDIRECT_SLOT_BYTES, indirect_kind_offset};
 use crate::proxy_instances::{INSTANCE_STRIDE, MAX_INSTANCES};
 use crate::proxy_mesh::ProxyVertex;
@@ -87,8 +86,9 @@ pub(crate) enum ProxyKind {
 }
 
 /// One populated frame's proxy submission request: the safe layer's
-/// repacked instance bytes plus the per-kind counts, materials, and
-/// submission mode.
+/// repacked instance bytes, the repacked POSE bytes (the npc kind's
+/// skin-matrix blocks in pose-index order), the per-kind counts,
+/// materials, and submission mode.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ProxyFrameUpload<'a> {
     /// The repacked instance bytes (npc population first, vehicle
@@ -97,6 +97,13 @@ pub(crate) struct ProxyFrameUpload<'a> {
     /// INSTANCE_STRIDE` bytes (the repack's validated total, at most
     /// [`MAX_INSTANCES`] instances).
     pub bytes: &'a [u8],
+    /// The repacked pose bytes: the npc kind's skin-matrix blocks in
+    /// POSE-INDEX order (block i serves every npc whose
+    /// `pose_index` is i — the safe layer validated `max(npc
+    /// pose_index) < blocks.len()`), at most [`MAX_POSE_BLOCKS`] *
+    /// [`crate::animation::POSE_STRIDE`] bytes (the repack's
+    /// validated capacity). The vehicle kind never reads them.
+    pub pose_bytes: &'a [u8],
     pub npc_count: u32,
     pub vehicle_count: u32,
     /// Per-kind material indices into the corner scene's material
@@ -108,6 +115,43 @@ pub(crate) struct ProxyFrameUpload<'a> {
     /// instanced, the per-object reference, or the 6-E2 indirect
     /// submission.
     pub mode: ProxyDrawMode,
+}
+
+/// The per-kind pipelines one populated recording needs, for ONE
+/// render pass (the main pass or the HDR pass — each carries its own
+/// variants): the vehicle kind's plain proxy pipeline + layout (the
+/// 6-E path, byte-identical) and the npc kind's skinned pipeline
+/// (the skinned state's variant for this pass).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProxyPipelines {
+    pub vehicle: vk::Pipeline,
+    pub npc: vk::Pipeline,
+}
+
+/// The npc kind's skinned set bind: the skinned pipeline layout, the
+/// per-material skinned set, and the pose slot's dynamic offset (the
+/// SECOND dynamic offset in the bind; the first is the corner
+/// FrameParams offset the caller computes).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SkinnedSetBind {
+    pub layout: vk::PipelineLayout,
+    pub set: vk::DescriptorSet,
+    /// The binding-2 dynamic offset (the FrameParams slot region —
+    /// the CORNER uniform's stride for the unshadowed family, the
+    /// SHADOW uniform's for the shadowed family; the caller supplies
+    /// the right one, NEVER derived here).
+    pub frame_offset: u32,
+    pub pose_offset: u32,
+}
+
+/// The vehicle kind's set bind (the plain proxy set — the corner
+/// material set for the unshadowed family, the plain-shadowed set
+/// for the shadowed family; one dynamic offset at binding 2).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VehicleSetBind {
+    pub layout: vk::PipelineLayout,
+    pub set: vk::DescriptorSet,
+    pub frame_offset: u32,
 }
 
 /// The per-kind instance range within one slot's packed bytes (the
@@ -166,6 +210,12 @@ pub(crate) struct IndirectResources {
 }
 
 impl IndirectResources {
+    /// The indirect command buffer handle (Era-2 stage 4b: the
+    /// shadowed depth pass needs access to this buffer).
+    pub(super) fn buffer(&self) -> vk::Buffer {
+        self.buffer
+    }
+
     fn new(
         ctx: &VulkanContext,
         npc_vertices: u32,
@@ -246,8 +296,9 @@ impl IndirectResources {
 pub(crate) struct ProxyResources {
     npc_vbo: vk::Buffer,
     npc_memory: vk::DeviceMemory,
-    /// The NPC mesh's vertex count (108 — measured from the
-    /// generated mesh, pinned by proxy_mesh's own tests).
+    /// The NPC mesh's vertex count (396 — the skinned humanoid's
+    /// own pin; the same count the plain v2 mesh carried, so the
+    /// 6-E2 indirect command pins hold unchanged).
     npc_vertices: u32,
     vehicle_vbo: vk::Buffer,
     vehicle_memory: vk::DeviceMemory,
@@ -266,7 +317,14 @@ pub(crate) struct ProxyResources {
 
 impl ProxyResources {
     pub(super) fn new(ctx: &VulkanContext) -> Result<Self, RendererError> {
-        let npc = humanoid_mesh();
+        // The Era-2 skinning claim: the npc kind's mesh is the
+        // SKINNED humanoid (the same 396 vertices — pos/normal/uv
+        // byte-identical to humanoid_mesh, per animation.rs's
+        // derivation pin — plus the rigid joints/weights tail the
+        // skinned pipeline's locations 8/9 read). The vehicle kind's
+        // mesh stays the plain sedan (32-byte ProxyVertex, the plain
+        // pipeline's own stride — byte-identical path).
+        let npc = crate::animation::skinned_humanoid_mesh();
         let vehicle = sedan_mesh();
         // Partial-initialization cleanup (corrective finding G):
         // handles start null; a failure releases exactly what exists.
@@ -293,7 +351,7 @@ impl ProxyResources {
     fn build(
         &mut self,
         ctx: &VulkanContext,
-        npc: &[ProxyVertex],
+        npc: &[crate::animation::SkinnedVertex],
         vehicle: &[ProxyVertex],
     ) -> Result<(), RendererError> {
         (self.npc_vbo, self.npc_memory) = create_device_local_buffer_with_data(
@@ -355,44 +413,44 @@ impl ProxyResources {
         }
     }
 
-    /// Records the proxy draws for one populated frame. The proxy
-    /// PIPELINE is bound by the caller; this binds each populated
-    /// kind's descriptor set (the corner material set, with the same
-    /// per-slot FrameParams dynamic offset the corner mesh draws
-    /// use), its mesh at binding 0, and its instance range at
-    /// binding 1, then submits per the upload's mode: one direct
+    /// Records the proxy draws for one populated frame, PER KIND:
+    /// the npc kind binds the SKINNED pipeline (this render pass's
+    /// variant — main or HDR) with the skinned set and its two
+    /// dynamic offsets (the corner FrameParams slot offset and the
+    /// pose slot offset); the vehicle kind binds the PLAIN proxy
+    /// pipeline with the corner material set and the single
+    /// FrameParams offset — today's path, byte-identical. Each kind
+    /// then binds its mesh at binding 0 and its instance range at
+    /// binding 1, and submits per the upload's mode: one direct
     /// `vkCmdDraw` per kind, one draw per instance in the reference
     /// mode, or — 6-E2 — one `vkCmdDrawIndirect` per kind reading
     /// this slot's command block. Returns the recorded draw-call
     /// count.
     ///
     /// # Safety
-    /// `cmd` must be recording inside the proxy pipeline's render
-    /// pass with `layout` its pipeline layout; `sets` must be the
-    /// corner material sets the frame flow validated for every
-    /// POPULATED kind (a null set for an empty kind is never bound);
-    /// `slot`'s regions must hold this frame's `upload.bytes` and,
-    /// in the indirect mode, its command block (the frame flow
-    /// writes both after the slot's fence wait).
-    // Private recording plumbing: the context, target, layout, corner
-    // accessor, slot, upload, and validated sets are exactly what the
-    // record step holds — bundling them would hide the call's story
-    // for no gain (the render_frame precedent).
+    /// `cmd` must be recording inside a render pass compatible with
+    /// BOTH `pipelines`' creation passes; `pipelines.npc` must be the
+    /// skinned state's pipeline for THAT pass with `skinned` its own
+    /// set/offsets; `sets` must be the corner material sets the frame
+    /// flow validated for every POPULATED kind (a null set for an
+    /// empty kind is never bound); `slot`'s regions must hold this
+    /// frame's `upload.bytes`, its pose bytes, and, in the indirect
+    /// mode, its command block (the frame flow writes all after the
+    /// slot's fence wait).
     #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn draw(
         &self,
         ctx: &VulkanContext,
         cmd: vk::CommandBuffer,
-        layout: vk::PipelineLayout,
-        corner: &CornerResources,
         slot: usize,
         upload: &ProxyFrameUpload<'_>,
-        sets: [vk::DescriptorSet; 2],
+        pipelines: &ProxyPipelines,
+        skinned: &SkinnedSetBind,
+        vehicle: &VehicleSetBind,
     ) -> u32 {
-        let frame_offset = slot as u32 * corner.dynamic_stride();
         let slot_start = self.slot_bytes * slot as u64;
         let mut calls = 0;
-        for (kind, set) in [ProxyKind::Npc, ProxyKind::Vehicle].into_iter().zip(sets) {
+        for kind in [ProxyKind::Npc, ProxyKind::Vehicle] {
             let (vbo, vertex_count, count, kind_index) = match kind {
                 ProxyKind::Npc => (self.npc_vbo, self.npc_vertices, upload.npc_count, 0),
                 ProxyKind::Vehicle => (
@@ -407,20 +465,49 @@ impl ProxyResources {
             }
             let range = kind_instance_range(upload.npc_count, upload.vehicle_count, kind);
             let base = slot_start + range.start * INSTANCE_STRIDE as u64;
-            // SAFETY: the render pass, pipeline, layout, and this
-            // slot's written instance region are live; the set was
-            // validated before recording (null only for empty kinds,
-            // skipped above); all counts and offsets are the repack's
-            // bounded values.
+            // SAFETY: the render pass, pipelines, layouts, and this
+            // slot's written instance and pose regions are live; the
+            // sets were validated before recording (null only for
+            // empty kinds, skipped above); all counts and offsets are
+            // the repack's bounded values.
             unsafe {
-                ctx.device.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    layout,
-                    0,
-                    &[set],
-                    &[frame_offset],
-                );
+                match kind {
+                    ProxyKind::Npc => {
+                        // The skinned path: the skinned pipeline +
+                        // set, TWO dynamic offsets (the FrameParams
+                        // slot region and the pose slot region, in
+                        // binding order 2 then 5).
+                        ctx.device.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            pipelines.npc,
+                        );
+                        ctx.device.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            skinned.layout,
+                            0,
+                            &[skinned.set],
+                            &[skinned.frame_offset, skinned.pose_offset],
+                        );
+                    }
+                    ProxyKind::Vehicle => {
+                        // The plain path — today's binding, unchanged.
+                        ctx.device.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            pipelines.vehicle,
+                        );
+                        ctx.device.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            vehicle.layout,
+                            0,
+                            &[vehicle.set],
+                            &[vehicle.frame_offset],
+                        );
+                    }
+                }
                 ctx.device.cmd_bind_vertex_buffers(cmd, 0, &[vbo], &[0]);
                 match upload.mode {
                     ProxyDrawMode::PerInstance => {
@@ -509,8 +596,55 @@ impl ProxyResources {
         calls
     }
 
+    /// Binds the per-kind VBO for `kind` at binding 0, and the
+    /// instance range for `slot` at binding 1. Used by the shadowed
+    /// depth pass (the proxy-cast path — the npc kind skins, the
+    /// vehicle kind is plain). The instance range starts at `slot`'s
+    /// region plus the kind's offset within that region (the fixed
+    /// npc-then-vehicle order).
+    pub(super) fn bind_kind_buffers(
+        &self,
+        ctx: &VulkanContext,
+        cmd: vk::CommandBuffer,
+        kind: ProxyKind,
+        slot: usize,
+        upload: &ProxyFrameUpload<'_>,
+    ) {
+        let (vbo, _count) = match kind {
+            ProxyKind::Npc => (self.npc_vbo, upload.npc_count),
+            ProxyKind::Vehicle => (self.vehicle_vbo, upload.vehicle_count),
+        };
+        let range = kind_instance_range(upload.npc_count, upload.vehicle_count, kind);
+        let base = self.slot_bytes * slot as u64 + range.start * INSTANCE_STRIDE as u64;
+        unsafe {
+            ctx.device.cmd_bind_vertex_buffers(cmd, 0, &[vbo], &[0]);
+            ctx.device
+                .cmd_bind_vertex_buffers(cmd, 1, &[self.instances], &[base]);
+        }
+    }
+
     pub(super) fn destroy(mut self, ctx: &VulkanContext) {
         self.release(ctx);
+    }
+
+    /// The per-slot region size (bytes).
+    pub(super) fn slot_bytes(&self) -> u64 {
+        self.slot_bytes
+    }
+
+    /// The NPC mesh's vertex count.
+    pub(super) fn npc_vertices(&self) -> u32 {
+        self.npc_vertices
+    }
+
+    /// The vehicle mesh's vertex count.
+    pub(super) fn vehicle_vertices(&self) -> u32 {
+        self.vehicle_vertices
+    }
+
+    /// The mapped instance buffer handle.
+    pub(super) fn instances(&self) -> vk::Buffer {
+        self.instances
     }
 
     /// Releases every handle exactly once; valid for both the

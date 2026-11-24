@@ -119,6 +119,8 @@ pub(crate) mod reflection_draw;
 pub(crate) mod scene_record;
 #[path = "shadow_draw.rs"]
 pub(crate) mod shadow_draw;
+#[path = "skinned_draw.rs"]
+pub(crate) mod skinned_draw;
 #[path = "sky_draw.rs"]
 pub(crate) mod sky_draw;
 #[path = "textures.rs"]
@@ -253,6 +255,10 @@ pub enum RendererError {
     /// invalid per-field value. Nothing was rendered and no frame
     /// state was touched.
     ProxyPack(crate::proxy_instances::InstancePackError),
+    /// The pose-block repack's typed refusal (over-capacity — the
+    /// same no-partial-overflow discipline the instance pack
+    /// carries; the Era-2 skinning path).
+    PosePack(crate::animation::PosePackError),
     /// A fault deliberately injected through the renderer's diagnostic
     /// seam (the corrective finding 3+8 verification knobs): never
     /// produced by a real Vulkan call. Distinguishes an injected
@@ -300,6 +306,10 @@ impl std::fmt::Display for RendererError {
             RendererError::ProxyPack(error) => write!(
                 f,
                 "proxy population refused (no partial buffer was produced): {error:?}"
+            ),
+            RendererError::PosePack(error) => write!(
+                f,
+                "pose blocks refused (no partial buffer was produced): {error:?}"
             ),
             RendererError::InjectedFault(message) => write!(
                 f,
@@ -1813,6 +1823,22 @@ pub(crate) struct PipelineState {
     /// renderer always carries the post state; the post CHAIN
     /// itself stays optional.
     pub reflection: Option<reflection_draw::ReflectionResources>,
+    /// The skinned proxy state (the mapped pose storage buffer +
+    /// the skinned pipeline), created LAZILY at the first populated
+    /// frame — the region-buffer precedent: the unpopulated path
+    /// pays nothing. Dies with this state (the pipelines reading it
+    /// do); a replacement re-ensures an identical set before
+    /// installation (finding A).
+    pub skinned: Option<skinned_draw::SkinnedProxyResources>,
+    /// The shadowed-populated proxy state (the NPC and vehicle
+    /// casting/receiving paths through the shadow family), created
+    /// LAZILY at the first SHADOWED POPULATED corner frame — one
+    /// level deeper than the skinned state (the indirect-command
+    /// precedent): the unshadowed populated path pays nothing for a
+    /// mechanism it never draws through. Dies with this state (the
+    /// pipelines reading it do); a replacement re-ensures an
+    /// identical set before installation (finding A).
+    pub shadowed_proxy: Option<skinned_draw::ShadowedProxyResources>,
     /// Per-slot vertex capacity of the dynamic region-scene buffer
     /// (Stage 4 graphical integration — the same disjoint per-slot
     /// pattern as the overlay).
@@ -1862,6 +1888,8 @@ impl PipelineState {
             sky: None,
             post: None,
             reflection: None,
+            skinned: None,
+            shadowed_proxy: None,
         };
         if let Err(error) = state.build(ctx, color_format, depth_format, demo_scene) {
             state.destroy(ctx);
@@ -1958,6 +1986,29 @@ impl PipelineState {
         Ok(())
     }
 
+    /// Allocates the skinned proxy state on the first populated
+    /// frame (the same lazy discipline: the unpopulated path pays
+    /// nothing — its allocation pins are untouched). The skinned
+    /// pipeline renders inside THIS state's render pass, so the
+    /// ensure carries it; a no-op once allocated.
+    pub(crate) fn ensure_skinned_resources(
+        &mut self,
+        ctx: &VulkanContext,
+    ) -> Result<(), RendererError> {
+        if self.skinned.is_some() {
+            return Ok(());
+        }
+        let corner = ctx.corner.as_ref().ok_or_else(|| {
+            RendererError::Vulkan("skinned proxy requires the Corner scene preference".into())
+        })?;
+        self.skinned = Some(skinned_draw::SkinnedProxyResources::new(
+            ctx,
+            self.render_pass,
+            corner,
+        )?);
+        Ok(())
+    }
+
     /// Allocates the Cycle 6-F shadow state on the first shadowed
     /// corner frame (the same lazy discipline: the unshadowed corner
     /// path pays nothing — its allocation pins are untouched). The
@@ -1977,6 +2028,42 @@ impl PipelineState {
             ctx,
             self.render_pass,
             corner,
+        )?);
+        Ok(())
+    }
+
+    /// Allocates the shadowed-populated proxy state on the first
+    /// shadowed populated corner frame (one level deeper than the
+    /// skinned state — the indirect-command precedent: the
+    /// unshadowed populated path pays nothing for a mechanism it
+    /// never draws through). The state needs shadows, skinned, AND
+    /// a corner — a no-op once allocated.
+    pub(crate) fn ensure_shadowed_proxy_resources(
+        &mut self,
+        ctx: &VulkanContext,
+    ) -> Result<(), RendererError> {
+        if self.shadowed_proxy.is_some() {
+            return Ok(());
+        }
+        let corner = ctx.corner.as_ref().ok_or_else(|| {
+            RendererError::Vulkan("shadowed proxy requires the Corner scene preference".into())
+        })?;
+        let shadows = self.shadows.as_ref().ok_or_else(|| {
+            RendererError::Vulkan(
+                "shadowed proxy needs shadows (ensure_shadow_resources first)".into(),
+            )
+        })?;
+        let skinned = self.skinned.as_ref().ok_or_else(|| {
+            RendererError::Vulkan(
+                "shadowed proxy needs skinned (ensure_skinned_resources first)".into(),
+            )
+        })?;
+        self.shadowed_proxy = Some(skinned_draw::ShadowedProxyResources::new(
+            ctx,
+            shadows,
+            skinned,
+            corner,
+            self.render_pass,
         )?);
         Ok(())
     }
@@ -2100,6 +2187,13 @@ impl PipelineState {
         // pay nothing for the mechanism they never touch.
         if proxy.is_some() && ctx.corner.is_some() {
             self.ensure_proxy_resources(ctx)?;
+            // The Era-2 companion: the npc kind ALWAYS skins (the
+            // pose storage + the skinned pipeline exist from the
+            // first populated frame; the vehicle kind's plain path
+            // never reads them). One level deeper: the HDR variant
+            // waits for a populated POST frame (the family-growth
+            // block below).
+            self.ensure_skinned_resources(ctx)?;
             if proxy.is_some_and(|upload| matches!(upload.mode, crate::ProxyDrawMode::Indirect))
                 && let Some(proxy_state) = self.proxy.as_mut()
             {
@@ -2114,6 +2208,14 @@ impl PipelineState {
         // scene-preference gate), which the ensure itself re-checks.
         if shadowed.is_some() {
             self.ensure_shadow_resources(ctx)?;
+        }
+        // The shadowed-populated proxy state: one level deeper than the
+        // skinned state (the indirect-command precedent). The frame
+        // flow's ensure discipline guarantees shadows AND skinned exist
+        // before the shadowed populated path is reached (shadows and
+        // skinned are ensured above, so this is safe).
+        if shadowed.is_some() && proxy.is_some() && self.skinned.is_some() {
+            self.ensure_shadowed_proxy_resources(ctx)?;
         }
 
         // The Era-1 lazy sky state (the same discipline): created at the
@@ -2139,6 +2241,17 @@ impl PipelineState {
             {
                 let layout = shadow_state.shadowed(slot).1;
                 post_state.ensure_shadowed_hdr(ctx, layout)?;
+            }
+            // The Era-2 companion: a populated POST frame needs the
+            // skinned state's HDR pipeline variant (the post chain's
+            // scene pass renders the proxies into the HDR target —
+            // the same family-growth shape as the shadowed HDR
+            // variant above; the skinned state itself was ensured
+            // with the populated frame above).
+            if proxy.is_some()
+                && let (Some(post_state), Some(skinned_state)) = (&mut self.post, &mut self.skinned)
+            {
+                skinned_state.ensure_hdr(ctx, post_state.hdr_render_pass())?;
             }
             if sky.is_some()
                 && let (Some(post_state), Some(sky_state)) = (&mut self.post, &self.sky)
@@ -2641,6 +2754,12 @@ impl PipelineState {
             }
             if let Some(reflection) = self.reflection.take() {
                 reflection.destroy(ctx);
+            }
+            if let Some(mut skinned) = self.skinned.take() {
+                skinned.release(ctx);
+            }
+            if let Some(mut shadowed_proxy) = self.shadowed_proxy.take() {
+                shadowed_proxy.release(ctx);
             }
             if !self.region_mapped.is_null() {
                 ctx.device.unmap_memory(self.region_vbo_memory);
@@ -3949,6 +4068,21 @@ pub(crate) fn render_frame(
         {
             unsafe { indirect.write_slot(slot, upload.npc_count, upload.vehicle_count) };
         }
+        // The Era-2 pose bytes: this slot's region of the mapped pose
+        // buffer, written under the SAME fence discipline as the
+        // instance bytes above (the skinned state exists whenever a
+        // populated frame runs — the ensure is unconditional on
+        // proxy presence; the debug_assert co-pins the structural
+        // invariant the way the indirect path does).
+        if let Some(skinned_state) = pipes.skinned.as_ref() {
+            unsafe { skinned_state.write_slot(slot, upload.pose_bytes) };
+        } else {
+            debug_assert!(
+                false,
+                "the skinned ensure discipline makes a missing pose buffer \
+                 unreachable on a populated frame"
+            );
+        }
     }
 
     // Disjoint window-depth intervals allow self-occlusion in both layers
@@ -4011,7 +4145,16 @@ pub(crate) fn render_frame(
             (&ctx.corner, &pipes.shadows, shadowed)
         {
             shadow_state.write_frame(slot, params);
-            shadow_state.record_depth_pass(ctx, command, corner, slot);
+            shadow_state.record_depth_pass(
+                ctx,
+                command,
+                corner,
+                slot,
+                pipes.shadowed_proxy.as_ref(),
+                pipes.proxy.as_ref(),
+                pipes.skinned.as_ref(),
+                proxy,
+            );
         }
 
         // The Era-1 wet reflection's mirrored-scene pass (package 7)
@@ -4096,6 +4239,15 @@ pub(crate) fn render_frame(
                 lit: Some(pipes.lit_pipeline),
                 shadowed: pipes.shadows.as_ref().map(|s| s.shadowed(slot).0),
                 proxy: Some(pipes.proxy_pipeline),
+                proxy_skinned: pipes.skinned.as_ref().map(|s| s.pipeline()),
+                shadowed_proxy_skinned: pipes
+                    .shadowed_proxy
+                    .as_ref()
+                    .map(|s| s.skinned_shadowed_pipeline()),
+                shadowed_proxy_vehicle: pipes
+                    .shadowed_proxy
+                    .as_ref()
+                    .map(|s| s.plain_shadowed_pipeline()),
             };
             match scene_record::record_corner_scene(
                 ctx,
@@ -4577,6 +4729,33 @@ fn recreate_swapchain(
         // against the replacement's own maps).
         if pipes.shadows.is_some()
             && let Err(error) = replacement.ensure_shadow_resources(ctx)
+        {
+            replacement.destroy(ctx);
+            return Err(error);
+        }
+        // The Era-2 companion: a populated renderer's SKINNED state
+        // must likewise exist on the replacement BEFORE installation
+        // (the same finding-A discipline — the replacement's skinned
+        // pipeline renders inside the replacement's own render pass,
+        // and its draws read the same lazily-created pose buffer and
+        // skinned sets; a half-installed state must never draw
+        // through null handles).
+        if pipes.skinned.is_some()
+            && let Err(error) = replacement.ensure_skinned_resources(ctx)
+        {
+            replacement.destroy(ctx);
+            return Err(error);
+        }
+        // The shadowed-populated companion: the replacement's
+        // shadowed-proxy state must exist before installation (the
+        // same finding-A discipline — the replacement's shadowed
+        // pipelines render inside the replacement's own render pass,
+        // and its draws read the same lazily-created state). The
+        // frame flow's ensure discipline guarantees shadows AND
+        // skinned exist on the replacement (they're ensured above),
+        // so this can safely access them.
+        if pipes.shadowed_proxy.is_some()
+            && let Err(error) = replacement.ensure_shadowed_proxy_resources(ctx)
         {
             replacement.destroy(ctx);
             return Err(error);

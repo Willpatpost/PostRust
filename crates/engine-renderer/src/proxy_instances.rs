@@ -33,9 +33,11 @@
 pub const MAX_INSTANCES: usize = 4096;
 
 /// One instance's packed size: 24 little-endian f32s — four matrix
-/// columns (64 B), one tint vec4 (16 B), one reserved params vec4
-/// (16 B, zeros — the forward-compatibility slot; a future field
-/// claims it with a versioned layout change, never a silent reuse).
+/// columns (64 B), one tint vec4 (16 B), and one params vec4 (16 B:
+/// x = the POSE BLOCK INDEX — the Era-2 skinning claim on the
+/// former forward-compatibility slot, a versioned layout change
+/// documented here and in the packed-bytes pin's history; y/z/w stay
+/// reserved zeros, claimed only by another versioned change).
 pub const INSTANCE_STRIDE: usize = 96;
 
 /// One proxy's placement: a world position, a yaw as a turn fraction
@@ -65,6 +67,16 @@ pub struct ProxyInstance {
     pub transform: InstanceTransform,
     /// The per-instance albedo tint, each channel in [0, 1].
     pub tint: [f32; 3],
+    /// The instance's POSE BLOCK INDEX into the frame's pose buffer
+    /// (the Era-2 skinning path): npc instance i's skin matrices
+    /// live at `pose_index * POSE_STRIDE`. Sequential for the
+    /// shipped population (one pose block per NPC); the INDEX form
+    /// is what makes pose-block DEDUP a later non-breaking change
+    /// (several instances sharing one evaluated pose). Vehicles
+    /// carry 0 — the plain vehicle pipeline never reads the slot.
+    /// Validated at the renderer's populated submit against the
+    /// supplied pose bytes (a typed refusal, never a silent clamp).
+    pub pose_index: u32,
 }
 
 /// The typed pack refusal (the D2 no-partial-overflow discipline).
@@ -155,9 +167,12 @@ impl ProxyInstance {
 }
 
 /// Appends one instance's bytes in the fixed field order (the four
-/// matrix columns, tint rgb + alpha 1.0, the 16 reserved zero bytes).
-/// The single packing implementation both the allocating and the
-/// retained forms share — the byte layout exists exactly once.
+/// matrix columns, tint rgb + alpha 1.0, then the params vec4: the
+/// pose block index as an f32 bit pattern followed by three reserved
+/// zero f32s — the Era-2 claim on the former all-zero slot, a
+/// versioned layout change never a silent reuse). The single packing
+/// implementation both the allocating and the retained forms share —
+/// the byte layout exists exactly once.
 fn append_instance_bytes(bytes: &mut Vec<u8>, instance: &ProxyInstance) {
     for column in instance_columns(&instance.transform) {
         for value in column {
@@ -167,12 +182,17 @@ fn append_instance_bytes(bytes: &mut Vec<u8>, instance: &ProxyInstance) {
     for value in [instance.tint[0], instance.tint[1], instance.tint[2], 1.0] {
         bytes.extend_from_slice(&value.to_bits().to_le_bytes());
     }
-    bytes.extend_from_slice(&[0u8; 16]);
+    // The params vec4: x = the pose index (exact in f32 up to 2^24
+    // blocks — far beyond MAX_INSTANCES), y/z/w reserved zeros.
+    let pose_index = instance.pose_index as f32;
+    bytes.extend_from_slice(&pose_index.to_bits().to_le_bytes());
+    bytes.extend_from_slice(&[0u8; 12]);
 }
 
 /// Packs `instances` into the instance-buffer bytes (little-endian
 /// f32 bit patterns, the fixed field order: column 0, 1, 2, 3, tint
-/// rgb + 1.0 alpha, four reserved zero f32s). Byte-identical on
+/// rgb + 1.0 alpha, then the params vec4 — pose index + three
+/// reserved zero f32s). Byte-identical on
 /// every platform for the same input — the packing is pure IEEE
 /// arithmetic and `to_bits`. Validation and capacity refusal happen
 /// BEFORE any byte exists (no partial buffers, ever).
@@ -347,6 +367,7 @@ mod tests {
                 scale: 1.0,
             },
             tint: [0.5, 0.5, 0.5],
+            pose_index: 7,
         };
         let b = ProxyInstance {
             transform: InstanceTransform {
@@ -355,6 +376,7 @@ mod tests {
                 scale: 2.0,
             },
             tint: [1.0, 0.0, 0.0],
+            pose_index: 0,
         };
         let first = pack_instances(&[a, b]).unwrap();
         let second = pack_instances(&[a, b]).unwrap();
@@ -376,6 +398,7 @@ mod tests {
                 scale: 1.0,
             },
             tint: [1.0; 3],
+            pose_index: 0,
         };
         let at_capacity: Vec<_> = vec![valid; 8];
         assert!(pack_instances_bounded(&at_capacity, 8).is_ok());
@@ -423,6 +446,7 @@ mod tests {
                     scale: 1.0,
                 },
                 tint: [0.9, 0.8, 0.7],
+                pose_index: 3,
             },
             ProxyInstance {
                 transform: InstanceTransform {
@@ -431,6 +455,7 @@ mod tests {
                     scale: 2.0,
                 },
                 tint: [0.1, 0.2, 0.3],
+                pose_index: 1,
             },
             ProxyInstance {
                 transform: InstanceTransform {
@@ -439,6 +464,7 @@ mod tests {
                     scale: 0.5,
                 },
                 tint: [1.0, 1.0, 1.0],
+                pose_index: 0,
             },
         ];
         let bytes = pack_instances(&instances).unwrap();
@@ -455,41 +481,50 @@ mod tests {
         );
         // The layout spot-check: instance 0's column 3 (translation)
         // sits at offset 48..60; the tint alpha is 1.0 at offset
-        // 76..80 (tint rgb + alpha occupy 64..80); the reserved
-        // slot is zeros at 80..96.
+        // 76..80 (tint rgb + alpha occupy 64..80); the params vec4's
+        // x is the pose index (3.0f for this fixture) at 80..84 and
+        // the remaining 12 bytes stay reserved zeros.
         let pos_x = f32::from_le_bytes(bytes[48..52].try_into().unwrap());
         assert_eq!(pos_x, 12.5);
         let alpha = f32::from_le_bytes(bytes[76..80].try_into().unwrap());
         assert_eq!(alpha, 1.0);
+        let pose_index = f32::from_le_bytes(bytes[80..84].try_into().unwrap());
+        assert_eq!(pose_index, 3.0, "the params vec4's x is the pose index");
         assert!(
-            bytes[80..96].iter().all(|&b| b == 0),
-            "the reserved slot is zeros"
+            bytes[84..96].iter().all(|&b| b == 0),
+            "the params vec4's y/z/w stay reserved zeros"
         );
     }
 
-    /// The measured-actual FNV-1a of the pinned instance list above
-    /// (re-measured after the quadrant-1 sign fix — the original
-    /// placeholder-pin run caught the swapped sin/cos binding and the
-    /// sign bug before any of it landed: the pin discipline working
-    /// as designed).
-    const PINNED_FNV: u64 = 14524014449239426066;
+    /// The measured-actual FNV-1a of the pinned instance list above.
+    /// History: the original placeholder-pin run caught the swapped
+    /// sin/cos binding and the quadrant-1 sign bug before any of it
+    /// landed; the value 14524014449239426066 carried the all-zero
+    /// reserved slot. REPINNED in the Era-2 skinning package (the
+    /// documented versioned claim: the params vec4's x now carries
+    /// the pose block index — 3/1/0 for this fixture — and the pin
+    /// fired on the change exactly as designed, the cause traced to
+    /// the claim, not an accident).
+    const PINNED_FNV: u64 = 9913137345556047595;
 
     /// Two small fixture populations (varied turns, scales, tints —
     /// enough shape to make an ordering or field bug visible in the
     /// bytes).
     fn fixture_populations() -> (Vec<ProxyInstance>, Vec<ProxyInstance>) {
-        let instance = |pos: [f32; 3], turn: u16, scale: f32, tint: [f32; 3]| ProxyInstance {
-            transform: InstanceTransform { pos, turn, scale },
-            tint,
-        };
+        let instance =
+            |pos: [f32; 3], turn: u16, scale: f32, tint: [f32; 3], pose_index: u32| ProxyInstance {
+                transform: InstanceTransform { pos, turn, scale },
+                tint,
+                pose_index,
+            };
         (
             vec![
-                instance([1.0, 0.0, -2.0], 0, 1.0, [0.9, 0.9, 0.9]),
-                instance([-3.0, 0.0, 4.0], 16384, 1.1, [0.8, 0.6, 0.5]),
+                instance([1.0, 0.0, -2.0], 0, 1.0, [0.9, 0.9, 0.9], 0),
+                instance([-3.0, 0.0, 4.0], 16384, 1.1, [0.8, 0.6, 0.5], 1),
             ],
             vec![
-                instance([7.0, 0.0, 1.0], 40000, 1.0, [0.2, 0.4, 0.9]),
-                instance([-8.0, 0.0, -1.0], 8192, 0.9, [0.9, 0.2, 0.2]),
+                instance([7.0, 0.0, 1.0], 40000, 1.0, [0.2, 0.4, 0.9], 0),
+                instance([-8.0, 0.0, -1.0], 8192, 0.9, [0.9, 0.2, 0.2], 0),
             ],
         )
     }
