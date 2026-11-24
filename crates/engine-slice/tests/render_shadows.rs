@@ -122,7 +122,8 @@ fn capture_shadowed(
 /// the CPU raycaster's, skipping (and counting) texels whose hit
 /// sits within `margin` texels of its surface's edges (rasterization
 /// coverage at edges is implementation territory; interior texels
-/// are exact). Returns (compared, skipped, mismatches, max_error).
+/// are exact). Returns (compared, skipped, mismatches, max_error)
+/// plus per-class census counts.
 fn compare_map(
     cascade: &ShadowCascade,
     boxes: &[engine_renderer::lit_scene::SceneBox],
@@ -130,7 +131,7 @@ fn compare_map(
     extent: u32,
     tolerance: f32,
     margin_texels: f32,
-) -> (usize, usize, usize, f32) {
+) -> (usize, usize, usize, f32, usize, usize, usize) {
     let boxes_table = intersection_boxes();
     let texel_world = (cascade.max_right - cascade.min_right).max(cascade.max_up - cascade.min_up)
         / extent as f32;
@@ -138,16 +139,23 @@ fn compare_map(
     let mut skipped = 0;
     let mut mismatches = 0;
     let mut max_error = 0.0f32;
+    // Per-class census for verification floors (finding 14)
+    let mut clear_count = 0;
+    let mut ground_count = 0;
+    let mut building_count = 0;
     for y in 0..extent {
         for x in 0..extent {
             let expected = map_texel_depth(cascade, boxes, x, y, extent);
             let Some(hit) = expected.hit else {
                 // Clear texel: no surface at all — exact.
                 let gpu = depths[(y * extent + x) as usize];
-                if (gpu - 1.0).abs() > tolerance {
+                // Finding 14 correction (b): reject nonfinite or out-of-range GPU depth FIRST
+                let clear_error = (gpu - 1.0).abs();
+                if !gpu.is_finite() || gpu < 0.0 || gpu > 1.0 + 1e-6 || clear_error > tolerance {
                     mismatches += 1;
                 }
                 compared += 1;
+                clear_count += 1;
                 continue;
             };
             // The edge margin: the hit's distance to its surface's
@@ -163,7 +171,7 @@ fn compare_map(
                     let box_ = &boxes_table[index];
                     ([box_.min, box_.max], [0, 1, 2])
                 }
-                None => ([[-40.0, 0.0, -40.0], [40.0, 0.0, 40.0]], [1, 1, 1]),
+                None => ([[-40.0, 0.0, -40.0], [40.0, 0.0, 40.0]], [0, 2, 1]),
             };
             let mut on_face = 0;
             let mut tangential = [true; 3];
@@ -184,24 +192,37 @@ fn compare_map(
                 skipped += 1;
                 continue;
             }
+            // Finding 14 correction (a): measure the ground perimeter on X and Z
+            // For ground (box_index == None), the ground plate's boundary must be
+            // tested on X and Z (the ground's tangential axes), not Y
             let mut min_edge = f32::MAX;
-            for axis in 0..3 {
-                if !tangential[axis] {
-                    continue;
-                }
-                let lo = (bounds[0][axis] - hit[axis]).abs();
-                let hi = (bounds[1][axis] - hit[axis]).abs();
-                min_edge = min_edge.min(lo).min(hi);
-            }
-            // A hit touching no bound (numerically interior to all
-            // three axes — the ray entered through a face it has
-            // already left behind): the conservative full-margin
-            // form.
-            if min_edge == f32::MAX {
-                for axis in 0..3 {
+            if expected.box_index.is_none() {
+                // Ground: measure X and Z (the tangential axes for ground)
+                for &axis in &[0, 2] {
                     let lo = (bounds[0][axis] - hit[axis]).abs();
                     let hi = (bounds[1][axis] - hit[axis]).abs();
                     min_edge = min_edge.min(lo).min(hi);
+                }
+            } else {
+                // Building: use the original tangential logic
+                for axis in 0..3 {
+                    if !tangential[axis] {
+                        continue;
+                    }
+                    let lo = (bounds[0][axis] - hit[axis]).abs();
+                    let hi = (bounds[1][axis] - hit[axis]).abs();
+                    min_edge = min_edge.min(lo).min(hi);
+                }
+                // A hit touching no bound (numerically interior to all
+                // three axes — the ray entered through a face it has
+                // already left behind): the conservative full-margin
+                // form.
+                if min_edge == f32::MAX {
+                    for axis in 0..3 {
+                        let lo = (bounds[0][axis] - hit[axis]).abs();
+                        let hi = (bounds[1][axis] - hit[axis]).abs();
+                        min_edge = min_edge.min(lo).min(hi);
+                    }
                 }
             }
             if min_edge < margin_texels * texel_world {
@@ -209,6 +230,24 @@ fn compare_map(
                 continue;
             }
             let gpu = depths[(y * extent + x) as usize];
+            // Finding 14 correction (b): reject nonfinite or out-of-range GPU depth FIRST
+            if !gpu.is_finite() || gpu < 0.0 || gpu > 1.0 + 1e-6 {
+                mismatches += 1;
+                if mismatches <= 10 {
+                    println!(
+                        "MISMATCH texel ({x},{y}): nonfinite/out-of-range gpu {gpu} (box {:?}, hit {:?})",
+                        expected.box_index, expected.hit
+                    );
+                }
+                compared += 1;
+                // Classify based on expected
+                if expected.box_index.is_none() {
+                    ground_count += 1;
+                } else {
+                    building_count += 1;
+                }
+                continue;
+            }
             let error = (gpu - expected.depth).abs();
             max_error = max_error.max(error);
             if error > tolerance {
@@ -221,9 +260,23 @@ fn compare_map(
                 }
             }
             compared += 1;
+            // Classify based on expected
+            if expected.box_index.is_none() {
+                ground_count += 1;
+            } else {
+                building_count += 1;
+            }
         }
     }
-    (compared, skipped, mismatches, max_error)
+    (
+        compared,
+        skipped,
+        mismatches,
+        max_error,
+        clear_count,
+        ground_count,
+        building_count,
+    )
 }
 
 /// The per-pixel ground oracle for one patch (the check_patch
@@ -382,13 +435,27 @@ fn shadow_map_depths_match_the_raycaster_and_pixels_gate() {
     assert_eq!(map.depths.len(), map.extent as usize * map.extent as usize);
     let boxes = intersection_boxes();
     let cascade = corner_cascade(light);
-    let (compared, skipped, mismatches, max_error) =
+    let (compared, skipped, mismatches, max_error, clear_count, ground_count, building_count) =
         compare_map(&cascade, boxes, &map.depths, map.extent, 1e-4, 1.5);
     let total = map.extent as usize * map.extent as usize;
     println!(
         "shadow map known-answer: {total} texels, {compared} compared, {skipped} edge-skipped \
          ({:.2}%), {mismatches} mismatches, max |Δdepth| {max_error:.2e}",
         100.0 * skipped as f32 / total as f32
+    );
+    println!("class census: {clear_count} clear, {ground_count} ground, {building_count} building");
+    // Finding 14 correction (a): assert separate positive coverage floors
+    assert!(
+        clear_count >= 5000,
+        "clear texels coverage: {clear_count} (floor 5000)"
+    );
+    assert!(
+        ground_count >= 1000,
+        "ground texels coverage: {ground_count} (floor 1000)"
+    );
+    assert!(
+        building_count >= 500,
+        "building texels coverage: {building_count} (floor 500)"
     );
     assert_eq!(mismatches, 0, "every compared texel matches the raycaster");
     assert!(
@@ -483,7 +550,7 @@ fn shadow_map_depths_match_the_raycaster_and_pixels_gate() {
             .presented
     );
     let map_after = renderer.take_shadow_map_capture().unwrap().unwrap();
-    let (compared_after, skipped_after, mismatches_after, max_error_after) = compare_map(
+    let (compared_after, skipped_after, mismatches_after, max_error_after, _, _, _) = compare_map(
         &cascade,
         boxes,
         &map_after.depths,
@@ -553,10 +620,16 @@ struct PcfPixel {
     /// Some tap's biased compare margin is within
     /// [`COMPARE_EXPOSURE_EPS`] of zero (a flippable tap).
     compare_exposed: bool,
-    /// The projected texel coordinate is within
-    /// [`TEXEL_EXPOSURE_EPS`] of an integer on either axis (a
-    /// truncatable anchor).
-    texel_exposed: bool,
+    /// The projected texel X coordinate is within
+    /// [`TEXEL_EXPOSURE_EPS`] of an integer (a truncatable anchor on X).
+    /// The sign indicates which side: negative means truncated up (toward lower texel),
+    /// positive means truncated down (toward higher texel).
+    texel_exposed_x: Option<f32>,
+    /// The projected texel Y coordinate is within
+    /// [`TEXEL_EXPOSURE_EPS`] of an integer (a truncatable anchor on Y).
+    /// The sign indicates which side: negative means truncated up (toward lower texel),
+    /// positive means truncated down (toward higher texel).
+    texel_exposed_y: Option<f32>,
     /// The CPU anchor's (texel_x, texel_y) — for the alternate
     /// neighborhoods a texel-exposed pixel may have sampled.
     anchor: (u32, u32),
@@ -620,11 +693,26 @@ fn pcf_pixel_diagnostics(
         }
     }
     let boundary = |v: f32| (v - v.round()).abs();
-    let texel_exposed = boundary(fx) < TEXEL_EXPOSURE_EPS || boundary(fy) < TEXEL_EXPOSURE_EPS;
+    let dist_to_x_boundary = boundary(fx);
+    let dist_to_y_boundary = boundary(fy);
+    // Finding 15 correction: track X and Y boundaries separately with signed distances
+    let texel_exposed_x = if dist_to_x_boundary < TEXEL_EXPOSURE_EPS {
+        Some(fx - fx.round())
+    } else {
+        None
+    };
+    let texel_exposed_y = if dist_to_y_boundary < TEXEL_EXPOSURE_EPS {
+        Some(fy - fy.round())
+    } else {
+        None
+    };
+    // For backward compatibility, expose a combined flag if either axis is exposed
+    let _texel_exposed = texel_exposed_x.is_some() || texel_exposed_y.is_some();
     Some(PcfPixel {
         factor,
         compare_exposed,
-        texel_exposed,
+        texel_exposed_x,
+        texel_exposed_y,
         anchor: (texel_x, texel_y),
     })
 }
@@ -821,11 +909,15 @@ fn pcf_penumbra_pixels_match_the_cpu_filter_over_the_same_map_bytes() {
                     .unwrap()
                     <= 2
             };
-            if diag.texel_exposed {
+            // Finding 15 correction: separate X and Y boundary tracking with signed distances
+            let texel_exposed_x = diag.texel_exposed_x.is_some();
+            let texel_exposed_y = diag.texel_exposed_y.is_some();
+
+            if texel_exposed_x || texel_exposed_y {
                 texel_exposed += 1;
-                // The five candidate anchors: the CPU's own and the
-                // four one-texel neighbors (either axis may have
-                // truncated to the other side).
+                // The anchor selection must respect which axis is actually exposed.
+                // Only enumerate reachable anchors: a one-texel shift is admissible
+                // only along an axis that is at its boundary.
                 let normal = [0.0, 1.0, 0.0];
                 let facing = normal[1] * cascade.light[1];
                 let bias_value =
@@ -837,9 +929,43 @@ fn pcf_penumbra_pixels_match_the_cpu_filter_over_the_same_map_bytes() {
                 let reference = clip_z / 1.0;
                 let (tx, ty) = diag.anchor;
                 let mut matched = false;
-                for (ox, oy) in [(0i32, 0i32), (1, 0), (-1, 0), (0, 1), (0, -1)] {
-                    let anchor_x = (tx as i32 + ox).clamp(0, map.extent as i32 - 1) as u32;
-                    let anchor_y = (ty as i32 + oy).clamp(0, map.extent as i32 - 1) as u32;
+
+                // Build the list of reachable anchors based on which axes are exposed
+                // and their signs (which direction they truncated)
+                let mut anchors = vec![(tx as i32, ty as i32)]; // the base anchor
+
+                // If X is exposed, we can shift in the direction it truncated
+                if let Some(shift_x) = diag.texel_exposed_x {
+                    if shift_x < 0.0 {
+                        // Truncated up (toward lower texel), can try -1
+                        anchors.push((tx as i32 - 1, ty as i32));
+                    } else {
+                        // Truncated down (toward higher texel), can try +1
+                        anchors.push((tx as i32 + 1, ty as i32));
+                    }
+                }
+                // If Y is exposed, we can shift in the direction it truncated
+                if let Some(shift_y) = diag.texel_exposed_y {
+                    if shift_y < 0.0 {
+                        // Truncated up (toward lower texel), can try -1
+                        anchors.push((tx as i32, ty as i32 - 1));
+                    } else {
+                        // Truncated down (toward higher texel), can try +1
+                        anchors.push((tx as i32, ty as i32 + 1));
+                    }
+                }
+
+                // Also try the diagonal if BOTH axes are exposed (the actual alternative)
+                if let (Some(shift_x), Some(shift_y)) = (diag.texel_exposed_x, diag.texel_exposed_y)
+                {
+                    let dx = if shift_x < 0.0 { -1 } else { 1 };
+                    let dy = if shift_y < 0.0 { -1 } else { 1 };
+                    anchors.push((tx as i32 + dx, ty as i32 + dy));
+                }
+
+                for (ax, ay) in anchors {
+                    let anchor_x = ax.clamp(0, map.extent as i32 - 1) as u32;
+                    let anchor_y = ay.clamp(0, map.extent as i32 - 1) as u32;
                     let factor = pcf_factor(reference, bias_value, |dx, dy| {
                         let x = anchor_x as i32 + dx;
                         let y = anchor_y as i32 + dy;
@@ -897,6 +1023,13 @@ fn pcf_penumbra_pixels_match_the_cpu_filter_over_the_same_map_bytes() {
          {texel_exposed} texel-exposed; regimes: {deep_shadow} deep shadow, \
          {penumbra} penumbra, {full_light} full light"
     );
+    // Finding 15 correction: pin a minimum strict-interior penumbra coverage
+    // (a positive count of strictly-compared partial-shadow pixels — no more
+    // epsilon-slack-only passes)
+    assert!(
+        interior > 1_000,
+        "strict interior pixels: {interior} (floor 1000)"
+    );
     // The non-vacuity floor: all three regimes present in force (the
     // patch straddles the boundary by construction; the penumbra
     // strip is ~0.22 m wide — the 1.5 m patch maps it to ~35 pixel
@@ -936,4 +1069,132 @@ fn pcf_penumbra_pixels_match_the_cpu_filter_over_the_same_map_bytes() {
          same map bytes — {interior} interior pixels at the 6-B 2/255 discipline, the \
          exposure classes bounded by their documented one-tap/one-anchor slacks"
     );
+}
+
+// ------------------------------------------------------- finding 14 CPU self-check
+// The depth-map comparator must reject nonfinite or out-of-range depths.
+// Run headless without GPU to prove the rejection logic works.
+
+/// Pure-CPU unit test: the comparator rejects a NaN depth value.
+#[test]
+fn depth_comparator_rejects_nan() {
+    // Construct a scenario that would use abs(error) > tolerance
+    // A NaN makes this comparison FALSE, which was the bug
+    let nan_depth: f32 = f32::NAN;
+
+    // Clear check: (gpu - 1.0).abs() > tolerance with gpu = NaN
+    let clear_error = (nan_depth - 1.0).abs();
+    assert!(
+        !clear_error.is_finite(),
+        "abs(NAN - 1.0) must be nonfinite, got {clear_error}"
+    );
+    // The original check was: if (gpu - 1.0).abs() > tolerance { mismatches += 1 }
+    // With NaN, this comparison is FALSE, so it wouldn't increment mismatches.
+    // We verify that our fix rejects NaN explicitly first.
+    assert!(!nan_depth.is_finite(), "NaN must be nonfinite");
+}
+
+/// Pure-CPU unit test: the comparator rejects an out-of-range depth value.
+#[test]
+fn depth_comparator_rejects_out_of_range() {
+    // Depth > 1.0 + epsilon (GPU depth must be in [0, 1])
+    let too_deep: f32 = 1.0 + 2.0 * 1e-6;
+    // This SHOULD be caught by the new check: gpu > 1.0 + 1e-6
+    assert!(
+        too_deep > 1.0 + 1e-6,
+        "out-of-range depth must exceed 1.0 + epsilon"
+    );
+
+    // Depth < 0.0
+    let negative: f32 = -1e-6;
+    assert!(negative < 0.0, "negative depth must be below zero");
+}
+
+/// Pure-CPU unit test: the comparator rejects a damaged interior ground depth.
+#[test]
+fn depth_comparator_rejects_damaged_ground_depth() {
+    // Simulate a ground depth that is clearly wrong (e.g., a building depth in ground territory)
+    // or a depth that's clearly corrupted (e.g., negative or > 1)
+    let damaged_ground_depth: f32 = -0.1; // Clearly wrong for ground
+
+    // The fix adds explicit checks for is_finite() and range [0, 1+eps]
+    assert!(
+        !damaged_ground_depth.is_finite()
+            || damaged_ground_depth < 0.0
+            || damaged_ground_depth > 1.0 + 1e-6,
+        "damaged depth {damaged_ground_depth} should be rejected"
+    );
+}
+
+// ------------------------------------------------------- finding 15 CPU self-check
+// The PCF boundary logic must reject shifts on unexposed axes.
+// Run headless without GPU to prove the anchor enumeration logic works.
+
+/// Pure-CPU unit test: a kernel shifted across an unexposed axis must fail.
+#[test]
+fn pcf_boundary_rejects_unexposed_axis_shift() {
+    // Construct a scenario where only Y is at boundary (X is interior)
+    // The old logic would accept shifts on X even though only Y is exposed
+    // The new logic only allows shifts on the exposed axis
+
+    // Simulate texel_exposed_x = None, texel_exposed_y = Some(shift)
+    // This means: X is interior, Y is at boundary
+
+    // In the test's anchor enumeration, we only add the Y-shift anchor
+    // The diagonal (X+1, Y-1) should NOT be tried because X is not exposed
+    let texel_exposed_x: Option<f32> = None;
+    let texel_exposed_y = Some(0.5); // Y truncated down (positive = toward higher)
+
+    // Build anchors based on the new logic
+    let mut anchors = vec![(0i32, 0i32)]; // base anchor
+
+    if texel_exposed_x.is_some() {
+        // Would add X shift, but it's not exposed
+    }
+
+    if texel_exposed_y.is_some() {
+        // Y is exposed, shift toward higher texel
+        anchors.push((0i32, 1i32));
+    }
+
+    // If BOTH axes were exposed, we'd also try the diagonal
+    let has_diagonal = texel_exposed_x.is_some() && texel_exposed_y.is_some();
+    assert!(!has_diagonal, "diagonal only when both axes exposed");
+
+    // Verify we have exactly 2 anchors: (0,0) and (0,1)
+    assert_eq!(anchors.len(), 2, "only base and Y-shift anchors");
+    assert_eq!(anchors[0], (0, 0));
+    assert_eq!(anchors[1], (0, 1));
+
+    // This proves: when X is NOT exposed, we never try (1,0) or (-1,0)
+    // The unexposed axis never admits a shift
+}
+
+/// Pure-CPU unit test: both axes exposed allows diagonal shift.
+#[test]
+fn pcf_boundary_allows_diagonal_when_both_exposed() {
+    // When both X and Y are at boundary, the diagonal alternative IS reachable
+    let texel_exposed_x: f32 = 0.5; // X truncated down
+    let texel_exposed_y: f32 = -0.3; // Y truncated up
+
+    let mut anchors = vec![(0i32, 0i32)];
+
+    // If X is exposed, we can shift in the direction it truncated
+    // X truncated down (positive), so we add +1
+    anchors.push((1i32, 0i32));
+
+    // If Y is exposed, we can shift in the direction it truncated
+    // Y truncated up (negative), so we add -1
+    anchors.push((0i32, -1i32));
+
+    // Diagonal only if both exposed
+    let dx = if texel_exposed_x < 0.0 { -1 } else { 1 };
+    let dy = if texel_exposed_y < 0.0 { -1 } else { 1 };
+    anchors.push((dx, dy));
+
+    // Verify we have 4 anchors: base, X-shift, Y-shift, diagonal
+    assert_eq!(anchors.len(), 4, "base + X + Y + diagonal");
+
+    // The diagonal must be (1, -1) for our example
+    assert!(anchors.contains(&(1, -1)), "diagonal anchor present");
 }

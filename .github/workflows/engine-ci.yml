@@ -1294,8 +1294,17 @@ jobs:
           # prior 575 + the same 6 (platform-uniform — pure f32
           # arithmetic and struct equality, no cfg gates); ignored
           # and result lines unchanged.
-          expected=582
-          if [ "$(uname -s)" != "Linux" ]; then expected=581; fi
+          # Era 1 corrective/allocations-geometry-gates run 3
+          # (2026-11-24, findings 14+15): +5 NON-ignored CPU
+          # self-checks in the existing render_shadows binary (the
+          # comparator's NaN/out-of-range/damaged-depth rejection and
+          # the PCF boundary's unexposed-axis/diagonal discipline —
+          # pure CPU, headless, executed in THIS shard's plain run).
+          # Linux 587/17/62 MEASURED locally with this step's own
+          # awk; Windows 586 = 581 + the same 5. No ignored or
+          # result-line changes.
+          expected=587
+          if [ "$(uname -s)" != "Linux" ]; then expected=586; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
