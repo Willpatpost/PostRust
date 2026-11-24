@@ -28,6 +28,9 @@
 //! `TRANSFER_SRC` inside the same command buffer, after the main
 //! pass, so the submission fence proves the copy complete before
 //! `take` reads it (the color-capture lifecycle, applied to depth).
+//! The transfer-to-host visibility is established via a buffer
+//! memory barrier after the copy (the fence proves completion, the
+//! barrier makes the write visible to the host reader).
 //!
 //! THE KNOWN-ANSWER PATH: the depth-only pass writes UNBIASED
 //! light-space depths (the compare-time analytical bias lives in the
@@ -802,6 +805,10 @@ impl ShadowResources {
     /// request/ready handshake is the caller's (FrameState — it
     /// survives pipeline replacements).
     ///
+    /// The buffer memory barrier establishes a transfer-to-host
+    /// visibility dependency (the fence proves completion, the
+    /// barrier makes the copy's writes visible to the host reader).
+    ///
     /// # Safety
     /// `cmd` must be recording, past the main render pass; `slot` is
     /// this frame's slot.
@@ -861,7 +868,34 @@ impl ShadowResources {
                 self.readback,
                 &[copy],
             );
+            // The transfer write must be visible to the host reader.
+            // The buffer is HOST_VISIBLE|HOST_COHERENT (create_mapped_buffer),
+            // so no explicit invalidate is needed — the barrier establishes
+            // the availability/visibility dependency.
+            let buffer_barrier = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .buffer(self.readback)
+                .offset(0)
+                .size(self.extent as vk::DeviceSize * self.extent as vk::DeviceSize * 4)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED);
+            ctx.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[buffer_barrier],
+                &[],
+            );
         }
+    }
+
+    /// The readback destination's identity — the frame-state handshake
+    /// pins the producing generation.
+    pub(super) fn readback_buffer(&self) -> vk::Buffer {
+        self.readback
     }
 
     /// Reads the readback buffer's depths (row-major, row 0 first).
@@ -874,13 +908,13 @@ impl ShadowResources {
         &self,
         ctx: &VulkanContext,
         slot_fence: vk::Fence,
-    ) -> Option<Vec<f32>> {
+    ) -> Result<Vec<f32>, RendererError> {
         // SAFETY: the recording frame's submission fence — proven
         // signaled before the mapped bytes are read.
         unsafe {
             ctx.device
                 .wait_for_fences(&[slot_fence], true, super::WAIT_TIMEOUT_NS)
-                .ok()?;
+                .map_err(|error| RendererError::vk(error, "wait_for_fences (shadow readback)"))?;
         }
         let texels = self.extent as usize * self.extent as usize;
         let mut depths = vec![0f32; texels];
@@ -893,7 +927,7 @@ impl ShadowResources {
                 texels,
             );
         }
-        Some(depths)
+        Ok(depths)
     }
 
     pub(super) fn destroy(mut self, ctx: &VulkanContext) {

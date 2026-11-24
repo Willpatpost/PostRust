@@ -367,6 +367,21 @@ jobs:
           # property: the ground plane fixed bit-equal). Linux
           # 1188/2/33 MEASURED locally; Windows 1137 = 1136 + the
           # same 1.
+          # Era 1 corrective/frame-preparation (2026-11-24, findings
+          # 4+7+8): +7 platform-uniform engine-renderer lib tests
+          # (the depth_aspect aspect-mask contract ×4 — D32/D16
+          # DEPTH, D24_S8 DEPTH|STENCIL, color COLOR; the
+          # resolve_depth_format battery ×3 — Auto always the
+          # negotiated pick, forced-honored, forced-unsupported
+          # fallback — pure f32-free enum logic, no cfg gates).
+          # Linux 1195/2/33 MEASURED locally with this step's own
+          # awk; Windows 1144 = 1137 + the same 7.
+          # Era-1 corrective recursive phase (2026-11-24, findings 3+8
+          # on corrective/frame-preparation): +4 engine-renderer lib
+          # tests (the target-fault seam's plan-advance battery —
+          # fires-once, ordinal, the error variant, unarmed), the
+          # same +4 platform-uniform in the renderer-release step.
+          # MEASURED locally with this step's own awk.
           # Era 1 corrective/allocations-geometry-gates (2026-11-24,
           # findings 10+11): +1 platform-uniform engine-renderer lib
           # test (the wheel normal-agreement contract — every wheel
@@ -401,21 +416,14 @@ jobs:
           # matching, no cfg gates). Linux 1197/2/33 MEASURED
           # locally with this step's own awk; Windows 1146 = 1145 +
           # the same 1.
-          # Era 1 corrective/frame-preparation (2026-11-24, findings
-          # 4+7+8): +7 platform-uniform engine-renderer lib tests
-          # (the depth_aspect aspect-mask contract ×4 — D32/D16
-          # DEPTH, D24_S8 DEPTH|STENCIL, color COLOR; the
-          # resolve_depth_format battery ×3 — Auto always the
-          # negotiated pick, forced-honored, forced-unsupported
-          # fallback — pure f32-free enum logic, no cfg gates).
-          # Linux 1195/2/33 MEASURED locally with this step's own
-          # awk; Windows 1144 = 1137 + the same 7.
-          # Era-1 corrective recursive phase (2026-11-24, findings 3+8
-          # on corrective/frame-preparation): +4 engine-renderer lib
-          # tests (the target-fault seam's plan-advance battery —
-          # fires-once, ordinal, the error variant, unarmed), the
-          # same +4 platform-uniform in the renderer-release step.
-          # MEASURED locally with this step's own awk.
+          # UNION REHEARSAL (2026-11-24, the overnight session's
+          # seven-PR merge rehearsal): #21 + #22 + #23 landed
+          # together = 1188 + 11 (#22's 7 format + 4 seam) + 9
+          # (#23's 1 wheel + 2 digest + 5 edge-case + 1 invariant)
+          # = 1208 Linux / 1157 Windows — the same union value the
+          # wet-depth-coverage merge (#26) measured on its own
+          # #22+#23 tree. Confirmed below from this rehearsal's own
+          # measured actuals.
           # Era-1 corrective recursive phase, the wet-depth-coverage
           # stack (2026-11-24): this branch merges
           # corrective/frame-preparation (db7ae45 - findings 3-9,
@@ -488,6 +496,16 @@ jobs:
           # property contract, the same +1 as the main shard) —
           # 110 -> 111. MEASURED locally (111/0 failures/2 result
           # lines).
+          # Era 1 corrective/frame-preparation (2026-11-24, findings
+          # 4+7+8): +7 (the depth_aspect and resolve_depth_format
+          # batteries, the same +7 as the main shard,
+          # platform-uniform) — 111 -> 118. MEASURED locally with
+          # this step's own awk (118/0 failures/2 result lines).
+          # Era-1 corrective recursive phase (2026-11-24, findings
+          # 3+8): +4 (the target-fault seam's plan-advance battery,
+          # the same +4 as the main shard, platform-uniform) —
+          # 118 -> 122. MEASURED locally with this step's own awk
+          # (122/0 failures/2 result lines).
           # Era 1 corrective/allocations-geometry-gates (2026-11-24,
           # findings 10+11): +1 (the wheel normal-agreement
           # contract, the same +1 as the main shard,
@@ -507,16 +525,10 @@ jobs:
           # the same +1 as the main shard, platform-uniform) —
           # 119 -> 120, MEASURED locally with this step's own awk
           # (120/0 failures/2 result lines).
-          # Era 1 corrective/frame-preparation (2026-11-24, findings
-          # 4+7+8): +7 (the depth_aspect and resolve_depth_format
-          # batteries, the same +7 as the main shard,
-          # platform-uniform) — 111 -> 118. MEASURED locally with
-          # this step's own awk (118/0 failures/2 result lines).
-          # Era-1 corrective recursive phase (2026-11-24, findings
-          # 3+8): +4 (the target-fault seam's plan-advance battery,
-          # the same +4 as the main shard, platform-uniform) —
-          # 118 -> 122. MEASURED locally with this step's own awk
-          # (122/0 failures/2 result lines).
+          # UNION REHEARSAL (2026-11-24): 111 + 11 (#22) + 9 (#23)
+          # = 131 — the same union value the wet-depth-coverage
+          # merge (#26) measured on its #22+#23 tree; confirmed
+          # below from this rehearsal's own measured actuals.
           # The wet-depth-coverage merge (see the main shard's note):
           # the UNION of both branches' renderer additions - 131/2
           # MEASURED locally on the merged tree with this step's
@@ -1437,7 +1449,7 @@ jobs:
           # are engine-renderer lib tests — the main shard's).
           # Linux 582/14/59 MEASURED locally with this step's own
           # awk; Windows 581/14/59 platform-uniform.
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 27 / 62)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 28 / 62)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           # Era 1 package 3 (the sky, 2026-11-23): the NEW
           # tests/render_sky.rs binary carries ONE #[ignore]d
@@ -1466,6 +1478,17 @@ jobs:
           # (16 -> 17) AND +1 result line (61 -> 62); passed counts
           # unchanged. Linux 582/17/62 MEASURED locally with this
           # step's own awk.
+          # Era 1 corrective/capture-trust (2026-11-24): the THIRD
+          # #[ignore]d render_shadows gate (the review's finding-1/2
+          # verification — the shadow readback belongs to the
+          # shadowed frame and its buffer generation; executed by the
+          # unchanged Directional-shadow-gates Linux Vulkan step
+          # below) adds +1 ignored (17 -> 18) in the SAME binary;
+          # passed counts and result lines unchanged. 582/18/62
+          # MEASURED by this run's own awk on both platforms (run
+          # 45315072299 — the failed candidate that caught the
+          # missed pin update; every test passed, only the count
+          # moved).
           # Era 1 corrective/frame-preparation (2026-11-24, findings
           # 3-9): FOUR new #[ignore]d lavapipe gates in EXISTING
           # binaries — render_reflection carries three (the
@@ -1490,6 +1513,16 @@ jobs:
           # MEASURED locally with this step's own awk (582/22/62).
           # With #21 also landed the count is 23 — the merge-order
           # note above applies unchanged.
+          # Era-1 corrective recursive phase (2026-11-24, findings
+          # 11+18, run 8/n): TWO new #[ignore]d engine-slice tests —
+          # render_instanced's oblique wheel fixture and
+          # render_reflection's specular-eye swing gate (both executed
+          # by the unchanged instanced/reflection Linux Vulkan steps
+          # below; ignored in this plain run): 17 -> 19. Passed and
+          # result lines unchanged. MEASURED locally with this step's
+          # own awk (588/19/62). MERGE-ORDER: #22 independently holds
+          # 22 and the wet-depth-coverage stack 24 — whichever lands
+          # last re-measures and takes the actuals.
           # The wet-depth-coverage merge (see the main shard's note): the
           # union of both branches' ignored gates - 24 MEASURED
           # locally on the merged tree (19 on allocations-geometry-
@@ -1509,6 +1542,15 @@ jobs:
           # existing reflection gate). MEASURED locally on this
           # branch's tree with this step's own awk (588/26/62, zero
           # failures); platform-uniform (no cfg gates).
+          # UNION REHEARSAL FINAL (2026-11-24, the overnight
+          # session's seven-PR merge rehearsal): the full union of
+          # all seven corrective PRs = #26's measured 26 + #21's
+          # capture-trust gate (absent from #26's tree) = 17 + 1
+          # (#21) + 4 (#22 gates) + 1 (the fault gate) + 2 (#23 run
+          # 8/n) + 2 (#27's post-edge gates) = 27. The pin below is
+          # that union value, to be confirmed from this rehearsal's
+          # own measured actuals (the awk above) — the established
+          # discipline, never a guess.
           # Era-1 corrective recursive phase, acquire-out-of-date
           # (2026-11-24): finding 6's out-of-date half — the ONE
           # #[ignore]d render_reflection gate
@@ -1524,7 +1566,14 @@ jobs:
           # unchanged. MEASURED locally on this branch's tree with
           # this step's own awk (588/27/62, zero failures);
           # platform-uniform (no cfg gates).
-          [ "$ignored" -eq 27 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 27"; exit 1; }
+          # UNION REHEARSAL 8/8 (2026-11-24, the follow-on cycle's
+          # extension): #30's acquire-out-of-date gate joins the
+          # union — the seven-PR rehearsal's measured 27 + this one
+          # gate (absent from that tree) = 28. The pin below is that
+          # eight-PR union value, to be confirmed from this
+          # rehearsal's own measured actuals (the awk above) — the
+          # established discipline, never a guess.
+          [ "$ignored" -eq 28 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 28"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
