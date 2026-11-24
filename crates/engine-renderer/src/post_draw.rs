@@ -1239,7 +1239,14 @@ impl PostResources {
             if inputs.wet
                 && let (Some(reflection_state), Some(corner)) = (&pipes.reflection, &ctx.corner)
             {
-                reflection_state.record_ground_redraw(ctx, corner, cmd, slot, true);
+                reflection_state.record_ground_redraw(
+                    ctx,
+                    corner,
+                    cmd,
+                    slot,
+                    true,
+                    corner.receiver_range(),
+                );
             }
             ctx.device.cmd_end_render_pass(cmd);
         }

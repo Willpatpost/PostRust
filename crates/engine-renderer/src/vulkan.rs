@@ -3725,6 +3725,7 @@ pub(crate) fn render_frame(
                 slot,
                 extent,
                 clear_color,
+                &corner.reflected_ranges(),
             );
             reflection_state.record_read_barrier(ctx, command, slot);
         }
@@ -3978,7 +3979,14 @@ pub(crate) fn render_frame(
                 // SAFETY: the outer recording block's contract (the
                 // command buffer records inside the main render
                 // pass, past the mesh draws).
-                reflection_state.record_ground_redraw(ctx, corner, command, slot, false);
+                reflection_state.record_ground_redraw(
+                    ctx,
+                    corner,
+                    command,
+                    slot,
+                    false,
+                    corner.receiver_range(),
+                );
             }
 
             ctx.device.cmd_end_render_pass(command);
