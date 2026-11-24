@@ -486,7 +486,11 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
 
     // The independent oracle pins (single instance, orthographic,
     // per-pixel against the 6-B CPU reference with albedo * tint):
-    // the NPC torso's +Z wall and the vehicle body's +Z wall.
+    // the v2 humanoid TORSO's +Z wall and the v2 sedan BODY's +Z
+    // nose wall (the Era-1 silhouettes' flat faces — the dead-on
+    // camera frames each wall's rectangle exactly; the neighboring
+    // boxes — arms, head, cabin — sit outside the framed rectangle,
+    // the wheels behind the nose).
     let npc_wall = OracleWall {
         instance: ProxyInstance {
             transform: InstanceTransform {
@@ -497,9 +501,9 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
             tint: [0.9, 0.7, 0.6],
         },
         material: 1,
-        half_width: 0.24,
-        y_local: [0.85, 1.45],
-        eye: [0.0, 1.17, 4.0],
+        half_width: 0.21,
+        y_local: [1.06, 1.60],
+        eye: [0.0, 1.35, 4.0],
     };
     let single_npc = [npc_wall.instance];
     check_single_instance_oracle(
@@ -518,9 +522,9 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
             tint: [0.75, 0.18, 0.15],
         },
         material: 2,
-        half_width: 0.9,
-        y_local: [0.35, 1.0],
-        eye: [0.0, 0.675, 6.0],
+        half_width: 0.95,
+        y_local: [0.35, 0.90],
+        eye: [0.0, 0.625, 6.0],
     };
     let single_vehicle = [vehicle_wall.instance];
     check_single_instance_oracle(
@@ -997,7 +1001,13 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
     // against the 6-B CPU reference — the indirect submission
     // checked against the math, not just against the other
     // submissions (a submission bug shared by all three modes
-    // cannot pass this).
+    // cannot pass this). (The population-v2 re-pin's completion:
+    // this wall still carried the v1 rectangle 0.24 × [0.85, 1.45]
+    // — its frame includes the dead zone below the v2 torso's
+    // bottom edge (the pelvis is narrower than the torso, so local
+    // |x| ∈ (0.19, 0.21] × y < 1.06 renders nothing); found on the
+    // gate's first real execution, same as the first wall's re-pin
+    // in the N-vs-1 test — the v2 torso rectangle, verbatim.)
     let npc_wall = OracleWall {
         instance: ProxyInstance {
             transform: InstanceTransform {
@@ -1008,9 +1018,9 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
             tint: [0.9, 0.7, 0.6],
         },
         material: 1,
-        half_width: 0.24,
-        y_local: [0.85, 1.45],
-        eye: [0.0, 1.17, 4.0],
+        half_width: 0.21,
+        y_local: [1.06, 1.60],
+        eye: [0.0, 1.35, 4.0],
     };
     let single_npc = [npc_wall.instance];
     renderer.set_proxy_draw_mode(ProxyDrawMode::Indirect);
@@ -1056,10 +1066,14 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
     // The command-block contract the submission relies on (defense
     // in depth for the buffer math this test exercised end to end —
     // the pure core's own unit battery pins the same numbers).
+    // (The population-v2 re-pin's completion: the v2 silhouette
+    // vertex counts — 396/552, the values the core's own battery
+    // was re-pinned to; this copy still carried the v1 108/72 when
+    // the gate first executed.)
     let commands = engine_renderer::proxy_indirect::indirect_slot_commands(24, 2);
     let word = |at: usize| u32::from_le_bytes(commands[at..at + 4].try_into().unwrap());
     assert_eq!(engine_renderer::proxy_indirect::INDIRECT_SLOT_BYTES, 32);
-    assert_eq!((word(0), word(4), word(16), word(20)), (108, 24, 72, 2));
+    assert_eq!((word(0), word(4), word(16), word(20)), (396, 24, 552, 2));
     println!(
         "indirect gate: {total} instances, per-object 26 == direct 2 == indirect 2 draws, \
          byte-equal frames, oracle wall within 2/255 through the indirect submission, \

@@ -72,11 +72,12 @@ use super::{
 };
 use crate::ProxyDrawMode;
 use crate::config::FRAMES_IN_FLIGHT;
+use crate::populated_meshes::{humanoid_mesh, sedan_mesh};
 use crate::proxy_indirect::{
     INDIRECT_COMMAND_BYTES, INDIRECT_SLOT_BYTES, indirect_kind_offset, indirect_slot_commands,
 };
 use crate::proxy_instances::{INSTANCE_STRIDE, MAX_INSTANCES};
-use crate::proxy_mesh::{ProxyVertex, npc_proxy_mesh, vehicle_proxy_mesh};
+use crate::proxy_mesh::ProxyVertex;
 use ash::vk;
 use core::ops::Range;
 
@@ -248,8 +249,8 @@ pub(crate) struct ProxyResources {
 
 impl ProxyResources {
     pub(super) fn new(ctx: &VulkanContext) -> Result<Self, RendererError> {
-        let npc = npc_proxy_mesh();
-        let vehicle = vehicle_proxy_mesh();
+        let npc = humanoid_mesh();
+        let vehicle = sedan_mesh();
         // Partial-initialization cleanup (corrective finding G):
         // handles start null; a failure releases exactly what exists.
         let mut partial = ProxyResources {
