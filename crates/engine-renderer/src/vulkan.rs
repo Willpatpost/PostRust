@@ -115,6 +115,8 @@ pub(crate) mod post_draw;
 pub(crate) mod proxy_draw;
 #[path = "reflection_draw.rs"]
 pub(crate) mod reflection_draw;
+#[path = "scene_record.rs"]
+pub(crate) mod scene_record;
 #[path = "shadow_draw.rs"]
 pub(crate) mod shadow_draw;
 #[path = "sky_draw.rs"]
@@ -131,6 +133,8 @@ use crate::overlay::OverlayVertex;
 use crate::scene::SceneVertex;
 use descriptors::DescriptorFoundation;
 use frame_prepare::{FramePreparationResult, prepare_after_recreation, prepare_frame};
+#[allow(unused_imports)]
+use scene_record::record_corner_scene;
 use textures::{SamplerPool, Texture};
 
 use sdl3::video::Window as SdlWindow;
@@ -3771,170 +3775,98 @@ pub(crate) fn render_frame(
             );
             ctx.device.cmd_set_viewport(command, 0, &[viewport]);
             ctx.device.cmd_set_scissor(command, 0, &[scissor]);
-            // The Era-1 sky draw: FIRST inside the main render pass —
-            // the fullscreen triangle replaces the clear-color
-            // background with the sky equation, with NO depth
-            // interaction (no test, no write), so every scene draw below
-            // behaves exactly as it did over the clear (the
-            // unchanged-path proof: only the uncovered background
-            // changes). The ensure above guaranteed the state whenever
-            // `sky` is Some; the belt check keeps a skyless frame on the
-            // skyless path even if a prior sky frame created the state.
-            if let (Some(sky_state), Some(params)) = (&pipes.sky, sky) {
-                // SAFETY (both calls): this slot's fence wait passed above
-                // (the uniform region is disjoint from every other
-                // slot); the recording command buffer is inside the main
-                // render pass, before the scene draws.
-                sky_state.write_frame(slot, params);
-                sky_state.record(ctx, command, slot);
-            }
-            // The corner buffer must be written before the scene pass for
-            // both the shadowed and ordinary paths (finding 5: the wet
-            // ground re-draw reads this camera block; the ordinary branch
-            // used to write it, the shadowed branch now depends on it).
-            if let (Some(resources), Some(params)) = (&ctx.corner, corner_params) {
-                // SAFETY: the slot's fence wait passed above; the coherent
-                // frame regions do not overlap other slots or the immutable
-                // material tail.
-                resources.write_frame(slot, params);
-            }
-            if shadowed.is_some()
-                && let (Some(resources), Some(shadow_state)) = (&ctx.corner, &pipes.shadows)
-            {
-                // The 6-F shadowed corner draws: the shadowed lit
-                // pipeline inside the main render pass, binding the
-                // shadow state's per-material sets for this slot (the
-                // map view rides binding 4; the FrameParams dynamic
-                // offset selects this slot's extended region — written
-                // before the depth pass above). The corner buffer
-                // was written before this branch (the 6-F correction
-                // to finding 5: both shadowed and ordinary branches
-                // now supply the true camera). The ensure above
-                // guaranteed the shadow state whenever `shadowed` is
-                // Some; the belt check keeps an unshadowed frame on the
-                // unshadowed path even if a prior shadowed frame created
-                // the state.
-                let (pipeline, layout, sets, frame_offset) = shadow_state.shadowed(slot);
-                ctx.device
-                    .cmd_bind_pipeline(command, vk::PipelineBindPoint::GRAPHICS, pipeline);
-                resources.draw(ctx, command, layout, &sets, frame_offset);
-            } else if let (Some(resources), Some(_params)) = (&ctx.corner, corner_params) {
-                ctx.device.cmd_bind_pipeline(
-                    command,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipes.lit_pipeline,
-                );
-                // The corner buffer was written above (the 6-F
-                // shadowed path now supplies the camera, so the
-                // ordinary branch no longer writes). The slot's
-                // fence wait passed; the coherent frame regions do
-                // not overlap other slots or the immutable material
-                // tail.
-                resources.draw(
-                    ctx,
-                    command,
-                    pipes.lit_layout,
-                    resources.sets(),
-                    slot as u32 * resources.frame_stride(),
-                );
-                // The 6-E instanced-proxy draws (same render pass, after
-                // the static corner mesh — the corner ground plane wins
-                // the coplanar depth at proxy footprints deterministically
-                // in BOTH submission modes, since the corner mesh draws
-                // first and proxy order is the packed instance order).
-                if let (Some(proxy_state), Some(upload), Some(sets)) =
-                    (&pipes.proxy, proxy, proxy_sets)
-                {
+            // The unified corner-scene recorder (finding 20, Phase B):
+            // extracts the shared sky/corner/shadowed-ordinary/proxy sequence
+            // from the main pass and HDR pass. Returns Some(proxy_calls) when
+            // corner-family (shadowed or ordinary) was recorded, None when
+            // neither occurred (the else-branch body runs below).
+            let targets = scene_record::SceneTargetPipelines {
+                sky: pipes.sky.as_ref().map(|s| s.pipeline()),
+                lit: Some(pipes.lit_pipeline),
+                shadowed: pipes.shadows.as_ref().map(|s| s.shadowed(slot).0),
+                proxy: Some(pipes.proxy_pipeline),
+            };
+            match scene_record::record_corner_scene(
+                ctx,
+                pipes,
+                command,
+                slot,
+                targets,
+                corner_params,
+                shadowed,
+                sky,
+                proxy,
+                proxy_sets,
+            ) {
+                Some(calls) => {
+                    outcome.proxy_draw_calls = calls;
+                }
+                None => {
+                    // The Stage-2 scene_pipeline/region/foreground else-branch body
+                    // (the non-corner path: static scene + dynamic region/foreground).
                     ctx.device.cmd_bind_pipeline(
                         command,
                         vk::PipelineBindPoint::GRAPHICS,
-                        pipes.proxy_pipeline,
+                        pipes.scene_pipeline,
                     );
-                    // SAFETY: the proxy pipeline is bound with its own
-                    // layout inside its render pass; `sets` were validated
-                    // before recording; this slot's instance region holds
-                    // this frame's bytes (written above, after the fence
-                    // wait).
-                    let recorded = proxy_state.draw(
-                        ctx,
+                    ctx.device.cmd_push_constants(
                         command,
-                        pipes.proxy_layout,
-                        resources,
-                        slot,
-                        upload,
-                        sets,
-                    );
-                    // The recorded count and the pure submission model must
-                    // agree (the unit test pins the model; this co-pins the
-                    // loop against it in debug builds).
-                    debug_assert_eq!(
-                        recorded,
-                        proxy_draw::proxy_draw_call_count(
-                            upload.mode,
-                            upload.npc_count,
-                            upload.vehicle_count
-                        )
-                    );
-                    outcome.proxy_draw_calls = recorded;
-                }
-            } else {
-                ctx.device.cmd_bind_pipeline(
-                    command,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipes.scene_pipeline,
-                );
-                ctx.device.cmd_push_constants(
-                    command,
-                    pipes.scene_layout,
-                    vk::ShaderStageFlags::VERTEX,
-                    0,
-                    bytemuck::bytes_of(view_proj),
-                );
-                // The static demonstration scene draws only when the explicit
-                // opt-in uploaded it (`scene_index_count > 0`, P3) — an
-                // omitted renderer binds nothing and draws nothing here; the
-                // scene pipeline below still draws the dynamic region
-                // geometry through the same bound state.
-                if pipes.scene_index_count > 0 {
-                    ctx.device
-                        .cmd_bind_vertex_buffers(command, 0, &[pipes.scene_vbo], &[0]);
-                    ctx.device.cmd_bind_index_buffer(
-                        command,
-                        pipes.scene_ibo,
+                        pipes.scene_layout,
+                        vk::ShaderStageFlags::VERTEX,
                         0,
-                        vk::IndexType::UINT32,
+                        bytemuck::bytes_of(view_proj),
                     );
-                    ctx.device
-                        .cmd_draw_indexed(command, pipes.scene_index_count, 1, 0, 0, 0);
-                }
-
-                if outcome.region.drawn > 0 {
-                    let region_offset = (slot as vk::DeviceSize) * pipes.region_slot_bytes;
-                    ctx.device.cmd_bind_vertex_buffers(
-                        command,
-                        0,
-                        &[pipes.region_vbo],
-                        &[region_offset],
-                    );
-                    if world_drawn > 0 {
-                        ctx.device.cmd_draw(command, world_drawn, 1, 0, 0);
-                    }
-                    if let Some(layer) = foreground.filter(|_| outcome.foreground_drawn > 0) {
-                        let near_viewport = vk::Viewport {
-                            min_depth: 0.0,
-                            max_depth: FOREGROUND_MAX_DEPTH,
-                            ..viewport
-                        };
-                        ctx.device.cmd_set_viewport(command, 0, &[near_viewport]);
-                        ctx.device.cmd_push_constants(
+                    // The static demonstration scene draws only when the explicit
+                    // opt-in uploaded it (`scene_index_count > 0`, P3) — an
+                    // omitted renderer binds nothing and draws nothing here; the
+                    // scene pipeline below still draws the dynamic region
+                    // geometry through the same bound state.
+                    if pipes.scene_index_count > 0 {
+                        ctx.device
+                            .cmd_bind_vertex_buffers(command, 0, &[pipes.scene_vbo], &[0]);
+                        ctx.device.cmd_bind_index_buffer(
                             command,
-                            pipes.scene_layout,
-                            vk::ShaderStageFlags::VERTEX,
+                            pipes.scene_ibo,
                             0,
-                            bytemuck::bytes_of(layer.view_proj),
+                            vk::IndexType::UINT32,
                         );
                         ctx.device
-                            .cmd_draw(command, outcome.foreground_drawn, 1, world_drawn, 0);
+                            .cmd_draw_indexed(command, pipes.scene_index_count, 1, 0, 0, 0);
+                    }
+
+                    if outcome.region.drawn > 0 {
+                        let region_offset = (slot as vk::DeviceSize) * pipes.region_slot_bytes;
+                        ctx.device.cmd_bind_vertex_buffers(
+                            command,
+                            0,
+                            &[pipes.region_vbo],
+                            &[region_offset],
+                        );
+                        if world_drawn > 0 {
+                            ctx.device.cmd_draw(command, world_drawn, 1, 0, 0);
+                        }
+                        if let Some(layer) = foreground.filter(|_| outcome.foreground_drawn > 0) {
+                            let near_viewport = vk::Viewport {
+                                min_depth: 0.0,
+                                max_depth: FOREGROUND_MAX_DEPTH,
+                                ..viewport
+                            };
+                            ctx.device.cmd_set_viewport(command, 0, &[near_viewport]);
+                            ctx.device.cmd_push_constants(
+                                command,
+                                pipes.scene_layout,
+                                vk::ShaderStageFlags::VERTEX,
+                                0,
+                                bytemuck::bytes_of(layer.view_proj),
+                            );
+                            ctx.device.cmd_draw(
+                                command,
+                                outcome.foreground_drawn,
+                                1,
+                                world_drawn,
+                                0,
+                            );
+                        }
                     }
                 }
             }

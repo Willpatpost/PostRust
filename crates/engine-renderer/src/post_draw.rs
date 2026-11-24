@@ -79,7 +79,10 @@ use super::corner::FrameParams;
 use super::proxy_draw::ProxyFrameUpload;
 use super::shadow_draw::ShadowFrameParams;
 use super::sky_draw::SkyFrameParams;
-use super::{PipelineState, RendererError, VulkanContext, create_mapped_buffer, find_memory_type};
+use super::{
+    PipelineState, RendererError, VulkanContext, create_mapped_buffer, find_memory_type,
+    scene_record,
+};
 use crate::config::FRAMES_IN_FLIGHT;
 use crate::post::BLOOM_STRENGTH;
 use ash::vk;
@@ -1131,98 +1134,36 @@ impl PostResources {
             );
             ctx.device.cmd_set_viewport(cmd, 0, &[full_viewport]);
             ctx.device.cmd_set_scissor(cmd, 0, &[full_scissor]);
-            if let (Some(sky_state), Some(params), Some(pipeline)) =
-                (&pipes.sky, inputs.sky, self.sky_hdr)
-            {
-                // SAFETY: this slot's fence wait passed above (the
-                // sky uniform region is disjoint per slot).
-                sky_state.write_frame(slot, params);
-                let (set, layout) = sky_state.set_and_layout();
-                ctx.device
-                    .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-                ctx.device.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    layout,
-                    0,
-                    &[set],
-                    &[slot as u32 * sky_state.frame_stride()],
-                );
-                ctx.device.cmd_draw(cmd, 3, 1, 0, 0);
-            }
-            // The corner buffer must be written before the HDR scene
-            // pass for both the shadowed and ordinary paths (finding 5:
-            // the wet ground re-draw reads this camera block; the
-            // ordinary branch used to write it, the shadowed branch
-            // now depends on it).
-            if let (Some(resources), Some(params)) = (&ctx.corner, inputs.corner_params) {
-                // SAFETY: this slot's fence wait passed above; the
-                // coherent frame regions do not overlap other slots
-                // or the immutable material tail.
-                resources.write_frame(slot, params);
-            }
-            if inputs.shadowed.is_some()
-                && let (Some(resources), Some(shadow_state), Some(pipeline)) =
-                    (&ctx.corner, &pipes.shadows, self.shadowed_hdr)
-            {
-                // The shadowed corner draws: the shadow state's own
-                // per-material sets and frame offset, the HDR
-                // pipeline (the main branch's shape — the extended
-                // FrameParams were written at the depth pass above).
-                let (_, layout, sets, frame_offset) = shadow_state.shadowed(slot);
-                ctx.device
-                    .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-                resources.draw(ctx, cmd, layout, &sets, frame_offset);
-            } else if let (Some(resources), Some(_params)) = (&ctx.corner, inputs.corner_params) {
-                ctx.device
-                    .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.lit_hdr);
-                // SAFETY: this slot's fence wait passed above; the
-                // coherent frame regions do not overlap other slots
-                // or the immutable material tail.
-                // The corner buffer was written above (the 6-F
-                // shadowed path now supplies the camera, so the
-                // ordinary branch no longer writes).
-                resources.draw(
-                    ctx,
-                    cmd,
-                    pipes.lit_layout,
-                    resources.sets(),
-                    slot as u32 * resources.frame_stride(),
-                );
-                // The 6-E instanced-proxy draws, after the static
-                // corner mesh (the depth-ordering note of the main
-                // branch, unchanged).
-                if let (Some(proxy_state), Some(upload), Some(sets)) =
-                    (&pipes.proxy, inputs.proxy, inputs.proxy_sets)
-                {
-                    ctx.device.cmd_bind_pipeline(
-                        cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        self.proxy_hdr,
-                    );
-                    // SAFETY: the proxy pipeline is bound with its
-                    // own layout inside its render pass; `sets` were
-                    // validated before recording; this slot's
-                    // instance region holds this frame's bytes
-                    // (written above, after the fence wait).
-                    let recorded = proxy_state.draw(
-                        ctx,
-                        cmd,
-                        pipes.proxy_layout,
-                        resources,
-                        slot,
-                        upload,
-                        sets,
-                    );
-                    debug_assert_eq!(
-                        recorded,
-                        super::proxy_draw::proxy_draw_call_count(
-                            upload.mode,
-                            upload.npc_count,
-                            upload.vehicle_count
-                        )
-                    );
-                    proxy_calls = recorded;
+            // The unified corner-scene recorder (finding 20, Phase B):
+            // extracts the shared sky/corner/shadowed-ordinary/proxy sequence
+            // from the HDR pass. Returns Some(proxy_calls) when corner-family
+            // (shadowed or ordinary) was recorded, None when neither occurred
+            // (the recorder's belt-check style guards skip un-ensured variants).
+            let targets = scene_record::SceneTargetPipelines {
+                sky: self.sky_hdr,
+                lit: Some(self.lit_hdr),
+                shadowed: self.shadowed_hdr,
+                proxy: Some(self.proxy_hdr),
+            };
+            match scene_record::record_corner_scene(
+                ctx,
+                pipes,
+                cmd,
+                slot,
+                targets,
+                inputs.corner_params,
+                inputs.shadowed,
+                inputs.sky,
+                inputs.proxy,
+                inputs.proxy_sets,
+            ) {
+                Some(calls) => {
+                    proxy_calls = calls;
+                }
+                None => {
+                    // Neither corner-family draw ran; the recorder's belt-check
+                    // guards skipped the un-ensured variants (e.g. self.sky_hdr
+                    // or self.shadowed_hdr not yet created).
                 }
             }
             // The Era-1 wet reflection's ground re-draw (package 7):
