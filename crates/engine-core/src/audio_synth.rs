@@ -70,14 +70,24 @@ fn white_from(state: u64) -> f32 {
 /// INDEPENDENT (the multiplier adapts so 44.1 kHz and 48 kHz
 /// footprints match to f32 rounding).
 const FOOTSTEP_DECAY_PER_SECOND: f32 = 80.0;
-
-/// The footstep's linear attack: `sample_rate / 250` samples
-/// (4 ms), at least 1 — the fast onset.
-const FOOTSTEP_ATTACK_SECONDS_DIVISOR: u32 = 250;
-
-/// The footstep's peak amplitude (of full i16 scale) — a
-/// single step in a crowd, not a gunshot.
-const FOOTSTEP_AMPLITUDE: f32 = 0.6;
+/// The attack length: sample_rate / this = the ramp samples. The
+/// rig-walk corrective: 250 (4ms) produced an audible click — a
+/// footstep's leading edge needs ~10ms to read as a footstep,
+/// not a tick. 100 gives 480 samples at 48kHz ≈ 10ms.
+const FOOTSTEP_ATTACK_SECONDS_DIVISOR: u32 = 100;
+/// The footstep's overall amplitude. The rig-walk corrective: 0.6
+/// was too hot for a single voice (with the pre-fix synchronized
+/// 24-voice mass, the mixer clipped); 0.35 sits in the mix with
+/// the bed at 0.25 peak.
+const FOOTSTEP_AMPLITUDE: f32 = 0.35;
+/// The heel-strike thump's low-pass coefficient (the rig-walk
+/// corrective: a pure noise burst reads as a click, not a footstep;
+/// a real step has a ~100-200Hz thump from the heel mass striking
+/// the ground). The one-pole filter: `y += THUMP_ALPHA·(x−y)` with
+/// THUMP_ALPHA = 0.008 gives a cutoff around ~60 Hz at 48kHz.
+const THUMP_ALPHA: f32 = 0.008;
+/// The thump's mix proportion relative to the noise scrape.
+const THUMP_MIX: f32 = 0.6;
 
 /// One footstep as mono i16 PCM: a short enveloped noise burst
 /// — seeded white noise through a fast linear attack (4 ms) and
@@ -100,6 +110,13 @@ pub fn synthesize_footstep(seed: u64, sample_rate: u32) -> Vec<i16> {
     let mut out = Vec::with_capacity(length);
     let mut state = seed;
     let mut envelope = 1.0;
+    // The heel-strike thump (the rig-walk corrective): a one-pole
+    // low-passed copy of the noise, mixed under the raw scrape.
+    // The thump has a SLOWER decay (the mass resonates) and rides
+    // the same attack ramp so the leading edge stays soft.
+    let mut thump_state = 0.0_f32;
+    let thump_decay = (1.0 - FOOTSTEP_DECAY_PER_SECOND * 0.3 / sample_rate as f32).max(0.0);
+    let mut thump_envelope = 1.0_f32;
     for i in 0..length {
         state = state.wrapping_add(GOLDEN);
         let white = white_from(mix64(state));
@@ -108,7 +125,13 @@ pub fn synthesize_footstep(seed: u64, sample_rate: u32) -> Vec<i16> {
         } else {
             1.0
         };
-        let sample = white * envelope * ramp * FOOTSTEP_AMPLITUDE;
+        // The thump: the same noise, low-passed, slower decay.
+        thump_state += THUMP_ALPHA * (white - thump_state);
+        let thump = thump_state * thump_envelope * ramp * THUMP_MIX;
+        thump_envelope *= thump_decay;
+        // The scrape: the raw noise, fast decay.
+        let scrape = white * envelope * ramp * (1.0 - THUMP_MIX);
+        let sample = (thump + scrape) * FOOTSTEP_AMPLITUDE;
         out.push(crate::audio_mix::to_i16(sample));
         envelope *= decay;
     }
@@ -274,7 +297,7 @@ mod tests {
                 peak_index = i;
             }
         }
-        assert!(peak > 8000, "the burst is audible (peak {peak})");
+        assert!(peak > 2000, "the burst is audible (peak {peak})");
         assert!(
             peak_index < quarter,
             "the peak is early (index {peak_index} of {})",
@@ -401,7 +424,7 @@ mod tests {
 
     /// The measured-actual pin (the pinned footstep seed:
     /// 0x1234_5678 at 48 000 Hz, 3 840 samples).
-    const PINNED_FOOTSTEP_DIGEST: u64 = 4084186983141199492;
+    const PINNED_FOOTSTEP_DIGEST: u64 = 3018555344619146519;
 
     /// The measured-actual pin (the pinned bed seed:
     /// 0x9ABC_DEF0 at 48 000 Hz, 2 s, 96 000 samples).
