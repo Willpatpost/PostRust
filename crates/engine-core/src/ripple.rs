@@ -276,6 +276,53 @@ impl RippleField {
         }
     }
 
+    /// AUTHORS one ring directly (the presentation gates' forced-
+    /// field path — the ripple reflection gate hand-places rings in
+    /// the camera's ground view; the demo's own path stays
+    /// [`Self::observe_death`] with its landing-column derivation).
+    /// The ring is stored VERBATIM at the active prefix's end —
+    /// center, age, and amplitude exactly as supplied, never
+    /// re-derived — and counted in `spawned` (a census spawn: an
+    /// authored ring is one of {live ring, expired ring, typed
+    /// refusal}, the conservation law's own terms). The decimation
+    /// counter is untouched (no death was observed). REFUSALS, both
+    /// fail-visible, the state otherwise untouched: a non-finite
+    /// lane (center, age, or amplitude) refuses with
+    /// `ripple/authored-ring-non-finite` — the policy validate's own
+    /// NaN discipline applied to the ring's data; a negative age
+    /// refuses with `ripple/authored-ring-age-negative` (rings are
+    /// born at age 0). A full pool refuses typed exactly like
+    /// `observe_death` (the ring is NOT stored, `refused_total`
+    /// counts it, the per-tick report carries it). An age at or past
+    /// the lifetime is legal data — the next tick's expiry law
+    /// compacts it (no special case) — so authoring callers keep
+    /// `age < lifetime` while the ring must render.
+    pub fn author_ring(
+        &mut self,
+        ring: RippleRing,
+    ) -> Result<Option<RippleSpawnOverflow>, &'static str> {
+        if !ring.center[0].is_finite()
+            || !ring.center[1].is_finite()
+            || !ring.age.is_finite()
+            || !ring.amplitude.is_finite()
+        {
+            return Err("ripple/authored-ring-non-finite");
+        }
+        if ring.age < 0.0 {
+            return Err("ripple/authored-ring-age-negative");
+        }
+        if self.active < RIPPLE_POOL_BOUND {
+            self.rings[self.active] = ring;
+            self.active += 1;
+            self.spawned += 1;
+            Ok(None)
+        } else {
+            self.refused_total += 1;
+            self.refused_since_tick += 1;
+            Ok(Some(RippleSpawnOverflow { dropped: 1 }))
+        }
+    }
+
     /// One fixed-order tick. THE PINNED ORDER: (1) the age sweep —
     /// every active ring gains `dt` in pool order; (2) the expiry
     /// test and stable compaction — a ring dies iff
@@ -570,6 +617,128 @@ mod tests {
             [position[0], position[2]],
             "aging never moves the center"
         );
+    }
+
+    /// KNOWN ANSWER — the authoring path: `author_ring` stores the
+    /// supplied ring VERBATIM (center, age, amplitude — the
+    /// amplitude is NOT re-derived from the policy, the age is NOT
+    /// reset to zero), appends at the active prefix's end in call
+    /// order, and counts the spawn; the refusals (non-finite lane,
+    /// negative age) leave the state untouched; an authored ring at
+    /// the lifetime dies at the next tick's expiry law (the tick's
+    /// own law, no special case); the census law
+    /// `spawned == expired + active` holds over authored rings
+    /// exactly as over observed ones; the typed capacity refusal is
+    /// the observe_death shape (counted, carried by the report).
+    #[test]
+    fn author_ring_known_answers() {
+        let dt = 1.0f32 / 60.0f32;
+        let mut field = RippleField::new(ripple_policy()).expect("the policy validates");
+        // Two hand-authored rings — amplitude 0.5 is NOT the
+        // policy's 1.0 and age 0.25 is NOT zero: verbatim storage is
+        // the known answer.
+        let rings = [
+            RippleRing {
+                center: [-3.0, 8.0],
+                age: 0.25,
+                amplitude: 0.5,
+            },
+            RippleRing {
+                center: [2.5, 4.5],
+                age: 0.75,
+                amplitude: 0.5,
+            },
+        ];
+        for (i, ring) in rings.iter().copied().enumerate() {
+            assert_eq!(
+                field.author_ring(ring),
+                Ok(None),
+                "ring {i}: the pool has room"
+            );
+        }
+        assert_eq!(field.rings(), &rings[..], "verbatim, in call order");
+        assert_eq!(field.active_count(), 2);
+        assert_eq!(field.spawned(), 2, "an authored ring is a census spawn");
+        assert_eq!(
+            field.deaths_since_ring, 0,
+            "authoring observes no death (the private counter's white-box read)"
+        );
+        // One tick ages the authored rings like any other.
+        let report = field.tick(dt);
+        assert_eq!(report.active, 2);
+        assert_eq!(report.refused, 0);
+        assert_eq!(field.rings()[0].age, 0.25f32 + dt, "the aged authored ring");
+        assert_eq!(field.rings()[1].age, 0.75f32 + dt);
+        // The data refusals: non-finite lane, negative age — the
+        // state untouched by both.
+        let mut before = Fingerprinter::new();
+        field.fold_state(&mut before);
+        assert_eq!(
+            field.author_ring(RippleRing {
+                center: [f32::NAN, 0.0],
+                age: 0.0,
+                amplitude: 1.0,
+            }),
+            Err("ripple/authored-ring-non-finite")
+        );
+        assert_eq!(
+            field.author_ring(RippleRing {
+                center: [0.0, 0.0],
+                age: -0.1,
+                amplitude: 1.0,
+            }),
+            Err("ripple/authored-ring-age-negative")
+        );
+        let mut after = Fingerprinter::new();
+        field.fold_state(&mut after);
+        assert_eq!(
+            before.finish(),
+            after.finish(),
+            "the refusals wrote nothing"
+        );
+        // An authored ring AT the lifetime dies at the next tick
+        // (the expiry law, no special case).
+        assert_eq!(
+            field.author_ring(RippleRing {
+                center: [0.0, 0.0],
+                age: ripple_policy().lifetime,
+                amplitude: 1.0,
+            }),
+            Ok(None)
+        );
+        let report = field.tick(dt);
+        assert_eq!(report.active, 2, "the at-lifetime ring expired");
+        assert_eq!(field.expired(), 1);
+        assert_eq!(
+            field.spawned(),
+            field.expired() + field.active_count() as u64,
+            "the census law holds over authored rings"
+        );
+        // The typed capacity refusal: fill to the bound, one more.
+        while field.active_count() < RIPPLE_POOL_BOUND {
+            assert_eq!(
+                field.author_ring(RippleRing {
+                    center: [1.0, 1.0],
+                    age: 0.0,
+                    amplitude: 1.0,
+                }),
+                Ok(None),
+                "the fill authors while there is room"
+            );
+        }
+        assert_eq!(
+            field.author_ring(RippleRing {
+                center: [9.0, 9.0],
+                age: 0.0,
+                amplitude: 1.0,
+            }),
+            Ok(Some(RippleSpawnOverflow { dropped: 1 })),
+            "the refusal is typed"
+        );
+        assert_eq!(field.refused_total(), 1, "counted, never silently dropped");
+        let report = field.tick(dt);
+        assert_eq!(report.refused, 1, "the report carries the authored refusal");
+        assert_eq!(report.active, RIPPLE_POOL_BOUND as u32);
     }
 
     /// KNOWN ANSWER — the decimation: decimation 3 over seven

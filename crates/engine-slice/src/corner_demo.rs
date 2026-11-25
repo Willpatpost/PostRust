@@ -849,7 +849,10 @@ pub fn run(
         // discipline the rain instances above follow; the crowd's
         // update_rain follows the submit). None (no rain layer) or a
         // dry session clears it — the empty uniform, the wet path's
-        // Era-1 byte-identity.
+        // Era-1 byte-identity. The sticky setter is the presentation
+        // bridge: the field state itself is deterministic sim state
+        // (the campaign digest pins it) — the setter only copies it
+        // into the frame's uniform.
         if wet {
             renderer.set_ripple_field(
                 crowd
@@ -1137,7 +1140,11 @@ fn run_free_look(
         // k renders the ripple field as of the previous presented
         // frame's update. free-look does not carry the `wet` flag —
         // the renderer's own sticky setting IS the state (set at
-        // startup from the flag; reading it back is exact).
+        // startup from the flag; reading it back is exact). The
+        // sticky setter is the presentation bridge: the field state
+        // itself is deterministic sim state (the campaign digest
+        // pins it) — the setter only copies it into the frame's
+        // uniform.
         if renderer.wet() {
             renderer.set_ripple_field(
                 crowd
