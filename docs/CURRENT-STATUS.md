@@ -1569,9 +1569,15 @@ CLOSED 2026-11-25 by the `era2/shadowed-hdr-populated` package: the
 three-way `--post --populated --shadows` composition now works
 end-to-end, gated by the full-chain known answers — the rig command
 `--corner --populated --shadows --post` walks the HDR-shadowed
-corner, composing with `--behavior` and `--free-look`; the skinned family's pass-independent ownership transfer
-that would restore the flat replacement tuple — the
-renderer-architecture follow-up PR #33's body records; ~~the s6_soak
+corner, composing with `--behavior` and `--free-look`; ~~the
+skinned family's pass-independent ownership transfer that would
+restore the flat replacement tuple~~ — CLOSED 2026-11-25 by the
+`era2/skinned-retained-ownership` package (the open stack's newest
+rung, stacked on the part-8 tip: the pose storage, pool, sets, and
+pipeline layout moved to the Vulkan context at device lifetime,
+INHERITED across pipeline replacements — the flat replacement tuple
+re-pinned in `render_instanced`'s two lifecycle gates, PR #33's
+renderer-architecture follow-up executed as recorded); ~~the s6_soak
 fsync-race test-only seam~~ — CLOSED 2026-11-25 by the
 `corrective/s6-soak-late-window-seam` package, §8's record); and the
 three documents' owner
@@ -1863,6 +1869,58 @@ The transcription round went to the coder subagent (the mission's
 delegation rule) and verified clean against the spec on the first
 read — including the one construction site the orchestrator's own
 pre-check missed (s6_evidence.rs).
+
+**The skinned family's pass-independent ownership transfer
+(2026-11-25, the follow-on package — PR #33's recorded
+renderer-architecture follow-up closed, branch
+`era2/skinned-retained-ownership`, stacked on the part-8 tip):**
+the flat replacement tuple restored. The defect, on record since
+PR #33's repair chain: `SkinnedProxyResources` mixed pass-AGNOSTIC
+resources (the mapped pose storage, the skinned set layout/pool,
+the three per-material sets, the pipeline layout — objects that
+bind no render pass, only context-owned corner resources plus the
+family's own pose buffer) with the pass-BOUND pipelines under
+`PipelineState` ownership, so every forced pipeline replacement
+re-created the pool and sets — the churn measured at +1 pool / +3
+sets per replacement (CI run 45488497488, the pin this package
+retires). The fix, the recorded design executed as written: the
+split — `SkinnedRetained` (everything pass-agnostic) now lives on
+`VulkanContext` at device lifetime, created once at the FIRST
+populated frame ever (`ensure_skinned_retained`, idempotent, the
+corner-typed refusal preserved) and INHERITED by every pipeline
+generation (the `pipeline_cache` precedent); the per-state
+`SkinnedProxyResources` shrinks to the main-pass pipeline + the
+lazy HDR variant, rebuilt per generation by the finding-A
+replacement discipline on the RETAINED layout; `ctx.destroy`
+releases the retained state FIRST (reverse creation order; the
+Renderer::drop pipes→ctx ordering is the proof in release's
+SAFETY). The shadowed-populated family is deliberately NOT
+transferred (its sets bind the re-created shadow state's per-slot
+map views — the recorded reason the transfer does not generalize);
+it keeps the finding-A re-ensure and reaches the pose buffer
+through the context. The re-pin (in place, no count movement):
+`render_instanced`'s two lifecycle blocks assert the 4-tuple
+(texture_memory, pools, sets, samplers) EXACTLY EQUAL to the warmed
+tuple — the successor of the +2 pools / +6 sets churn pin and
+STRONGER (any per-replacement re-creation in the family now fails
+the gate outright). MEASURED on this pod's lavapipe: render_instanced
+7/7 — warmed pools 3 / sets 7, after BOTH forced replacements pools
+3 / sets 7 FLAT (device_memory 19→39 / 20→42, the replacement's own
+reallocs plus the re-ensured proxy family's, printed not pinned),
+double-run digit-for-digit; every byte-equality, draw-call,
+oracle, and host-allocation-zero assertion green; render_shadows
+4/4; render_post 6/6 — the shadowed-populated HDR composition
+gate's one-time delta (6/4/16/0) UNCHANGED (the first-frame
+creation cost is identical, only the churn retired), the torso
+walls at max 1/255; the populated route end-to-end 601 frames
+validation 0/0; the CI resize smoke green. The shards with the
+workflow's own awk, ALL UNCHANGED: main 1313/2/33, renderer
+release 160/2, heavy 620/33/63 Linux (Windows 1262/619 inferred,
+the candidate's CI run to confirm); fmt and clippy -D warnings
+clean in both forms. The delegation record, honestly: two rounds
+to the coder subagent produced analysis only (the tree verified
+clean after each); the orchestrator implemented the spec itself
+and audited every hunk before the gates.
 
 ## 10. The authoritative coordination ledger
 
