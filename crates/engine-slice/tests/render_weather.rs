@@ -275,22 +275,29 @@ fn rain_ink_broadside_at_presentation_extent() {
         "rain broadside ink: {ink} pixels of {} changed ({sky_ink} in the sky region)",
         width * height
     );
-    // MEASURED on this pod's lavapipe, this tree, this campaign:
-    // 1660 pixels total, 1350 in the sky region (the deterministic
-    // campaign's own bytes — the double-run discipline pins the
-    // count). The floors hold wide margins below the measurement
-    // (28% / 33%) while sitting ~7x above the collapsed state (the
-    // edge-on billboard regression measures ~164 pixels — the
-    // mining source's 8-frame fresh-capture gate); the mining
-    // source's own vantage measured 2476/2187.
+    // MEASURED on this pod's lavapipe, this tree, this campaign -
+    // RE-PINNED at the volume-refresh corrective: the landed
+    // package C installed the OBSERVED BOX as the spawn volume
+    // (collapsing the spawn band to eye level: drops materialized
+    // at eye height, big near-camera streaks - the 1660/1350 the
+    // gate originally pinned). The rain-ripples branch's corrective
+    // re-derives the quantized BAND above the observed volume
+    // (rain_emitter_config's own form - drops fall from above, the
+    // physically-correct model); the steady-state coverage at this
+    // vantage is now 473 pixels total, 282 in the sky region (the
+    // 60% sky majority holds - rain still falls in front of the
+    // background). The floors sit ~70% under the measurement while
+    // staying ~2x above the edge-on collapse (~164 pixels - the
+    // mining source's 8-frame fresh-capture gate).
     assert!(
-        ink > 1_200,
+        ink > 330,
         "broadside rain coverage: {ink} changed pixels at the presentation extent \
-         (measured 1660 at the steady state; the edge-on collapse measures ~164)"
+         (measured 473 at the steady state after the volume-refresh corrective; \
+         the edge-on collapse measures ~164)"
     );
     assert!(
-        sky_ink > 900,
-        "the sky region carries {sky_ink} of the ink (measured 1350 — rain falls \
+        sky_ink > 190,
+        "the sky region carries {sky_ink} of the ink (measured 282 - rain falls \
          in front of the background)"
     );
 }
