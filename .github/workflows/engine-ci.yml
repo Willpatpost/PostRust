@@ -1632,8 +1632,25 @@ jobs:
           # gate with the spine-churn attribution clause) adds +1
           # ignored: 31 -> 32, result lines unchanged (the same
           # binary).
-          expected=603
-          if [ "$(uname -s)" != "Linux" ]; then expected=602; fi
+          # ERA 2 PACKAGE A PART 6 (the measurement surface,
+          # 2026-11-25, PR era2/npc-ai-measurement-surface): the
+          # behavior_measurement module's 5-test lib battery (the
+          # matrix workload's double-run + the baked stream-digest
+          # pin, the witness census digest pin with the tier-gating
+          # known answer, the activation re-arm arithmetic, the skip
+          # conservation with the exact executed/re-arm-tail counts,
+          # the memory accounting's monotonicity and component sums)
+          # within the existing lib result line: 603 + 5 = 608 Linux
+          # MEASURED with this step's own awk on the package tree;
+          # Windows 602 + 5 = 607 = the same platform-uniform delta
+          # (pure spine/IEEE arithmetic, no cfg gates, no Vulkan — to
+          # be confirmed by this candidate's CI run; a mismatch is
+          # corrected from actuals, never by weakening a test).
+          # Ignored 32 and result lines 62 UNCHANGED (lib tests only,
+          # no new binaries; the benchmark flag is test-free harness
+          # code).
+          expected=608
+          if [ "$(uname -s)" != "Linux" ]; then expected=607; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)

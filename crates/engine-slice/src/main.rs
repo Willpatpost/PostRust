@@ -114,7 +114,7 @@ Headless modes
 Benchmarks
   --benchmark-render | --benchmark-encounter | --benchmark-persistence
   --benchmark-instrumentation | --benchmark-entity-scale | --benchmark-sustained-load
-  --benchmark-locomotion
+  --benchmark-locomotion | --benchmark-behavior
   --benchmark-perf-sweep <cell> | --sustained-load-full-matrix
   --sustained-load-capacity-envelope
 
@@ -205,6 +205,16 @@ fn main() {
         // variants), with the double-run determinism proof (pod
         // results, observational; never CI thresholds).
         engine_slice::benchmark::run_locomotion_scale();
+        return;
+    }
+
+    if std::env::args().any(|arg| arg == "--benchmark-behavior") {
+        // Era 2 package A part 6: the §8.5 measurement surface — the
+        // behavior-workload sustained matrix (§8.4 item 7), witness
+        // enumeration cost, activation latency with schedule catch-up
+        // (E-09), skip-cost curves (E-08), and memory-per-NPC by tier
+        // (pod results, observational; never CI thresholds).
+        engine_slice::behavior_measurement::run_behavior_measurements();
         return;
     }
 

@@ -349,7 +349,18 @@ ARM64) with a five-job CI:
   buffer — 0 host allocations per warmed moving frame,
   `renderer.allocations()` constant, both MEASURED). The
   phase-column path remains pub where gates pin it (the skinning
-  oracle, the populated shadow-map gate).
+  oracle, the populated shadow-map gate). Era 2 package A part 5
+  composed the BEHAVIOR SPINE into that route (`corner_behavior`:
+  the 24 authored schedules, the `CornerCrowdWorld` spine world
+  with the policy seam, `--corner --populated --behavior`), and
+  part 6 added the **measurement surface** (`--benchmark-behavior`,
+  `behavior_measurement.rs` — §8.4 item 7 + §8.5's remaining
+  measurements over the real machinery: the behavior-workload
+  sustained matrix, the witness enumeration cost, the E-09
+  activation crossover, the E-08 skip-cost curves, memory-per-NPC
+  by tier; pod-observational with the double-run determinism
+  asserted in every section, its 5-test lib battery pinning the
+  workload digests — §9's arc record carries the measured numbers).
 
 The **integrated campaign demo** (`--demo-persist`) is the vertical slice:
 one authoritative, persistently-orchestrated 1000-NPC / 8-region campaign
@@ -395,25 +406,30 @@ for the combined candidate.
 | CI partition | Linux | Windows |
 |---|---:|---:|
 | Main shard (`--workspace --exclude engine-slice`) | 1295 | 1244 |
-| Heavy shard (`-p engine-slice --features crash-test-seams`) | 603 | 602 |
-| **Combined** | **1898** | **1846** |
+| Heavy shard (`-p engine-slice --features crash-test-seams`) | 608 | 607 |
+| **Combined** | **1903** | **1851** |
 
 The macOS job has its own partition. Main has two ignored tests and 33
 result lines. Heavy has thirty-two ignored tests and 62 result lines.
-The table is settled at the Era-2 package A part-5 tree
-(`era2/npc-ai-composed-gates`, 2026-11-25, stacked on part 4 — the
-composed gates): heavy **603 Linux MEASURED with the workflow's own awk
-on this exact tree** (603 passed / 32 ignored / 62 result lines, zero
-failures — the part-4 settlement's 599 plus the corner_behavior
-battery's 4 platform-uniform engine-slice lib tests); Windows **602** =
-598 + the same 4 (the platform-uniform inference — pure spine/IEEE
+The table is settled at the Era-2 package A part-6 tree
+(`era2/npc-ai-measurement-surface`, 2026-11-25, stacked on part 5 — the
+measurement surface): heavy **608 Linux MEASURED with the workflow's own
+awk on this exact tree** (608 passed / 32 ignored / 62 result lines, zero
+failures — the part-5 settlement's 603 plus the behavior_measurement
+battery's 5 platform-uniform engine-slice lib tests); Windows **607** =
+602 + the same 5 (the platform-uniform inference — pure spine/IEEE
 arithmetic, no cfg gates, no Vulkan; to be confirmed by this
 candidate's CI run, the count corrected from actuals on a mismatch,
-never a test weakened); the NEW #[ignore]d composed gate moves ignored
-31 → 32 (the same render_instanced binary — result lines unchanged);
-main **1295/2/33 MEASURED unchanged** (engine-core untouched by part
-5); renderer release 160/2 UNCHANGED. The prior settlements,
-superseded in order: the part-4 tree
+never a test weakened); ignored 32 and result lines 62 UNCHANGED (lib
+tests only, no new binaries — the benchmark flag is test-free harness
+code); main **1295/2/33 MEASURED unchanged** (engine-core untouched by
+part 6); renderer release 160/2 UNCHANGED. The prior settlements,
+superseded in order: the part-5 tree
+(`era2/npc-ai-composed-gates`, 2026-11-25, stacked on part 4 — the
+composed gates): heavy 603 Linux MEASURED / 602 Windows (the +4
+corner_behavior battery, ignored 31 → 32 by the new #[ignore]d composed
+lavapipe gate, CI run 45579355303 green on all five jobs at the tip
+`d5b2736`); the part-4 tree
 (`era2/npc-ai-rendering-bridge`, 2026-11-25 — the rendering bridge):
 heavy 599 Linux MEASURED / 598 Windows (the +8 corner_routes battery),
 main 1295/2/33 unchanged, ignored 31 / result lines 62 (CI run
@@ -1320,8 +1336,8 @@ priorities).
 
 **The Era-2 package A arc (2026-11-25, the overnight continuation
 beyond the mission file's terminal queue — the design pass as the
-implementation brief): parts 1-2 MERGED/DELIVERED, parts 3-4
-DELIVERED.** Part 1: the NPC AI deterministic cores (PR #37, the
+implementation brief): part 1 MERGED, parts 2-6 DELIVERED (the open
+PR stack awaiting the owner's GO).** Part 1: the NPC AI deterministic cores (PR #37, the
 owner's GO at 02:02Z; the design pass's §3–§6 as three additive
 pure engine-core modules — §2's record carries the contracts and
 pins). Part 2: the spine integration (`era2/npc-ai-spine-integration`,
@@ -1378,13 +1394,68 @@ execution measures EXACTLY zero host allocations, `renderer.
 allocations()` constant; the demo's own exit summary measured 99
 wakes / 25 arrivals over the route); heavy shard 599 → 603 Linux
 MEASURED, ignored 31 → 32 (the new composed lavapipe gate), main
-shard untouched at 1295/2/33). The remaining part, in the design
-pass's own order: the **measurement surface** (§8.4's item 7 —
-the sustained-load matrix extended with the behavior workload
-classes — and §8.5's remaining measurements: activation latency
-with schedule catch-up, skip-cost curves, memory-per-NPC by tier;
-benchmark work over this composed machinery, a separate package).
-The design pass's §9 open-questions list still awaits the owner.
+shard untouched at 1295/2/33). Part 6: the measurement surface
+(`era2/npc-ai-measurement-surface`, stacked on part 5 — §8.4's item 7
+and §8.5's remaining measurements as `--benchmark-behavior`, one new
+engine-slice module over the REAL machinery, engine-core untouched):
+the **behavior-workload sustained matrix** (12 cells: populations
+{125, 1000} × demand classes {low 100, near 200, overload 400
+events/tick vs budget 200/reserve 60} × synchrony {staggered,
+aligned}, authored cadence arithmetic with the class-target assert;
+per-cell 600 warm + 30×60 measured ticks, double-run digest +
+fingerprint asserted, spine conservation asserted — MEASURED on this
+pod: staggered low/near deliver their authored rate at p50 ≈ 2.0/4.1
+ms per 60-tick window with ZERO lateness and ZERO exhaustion; the
+aligned variants reproduce the E-10 cluster signature (low-demand
+aligned: 214k late executions, 1_072 exhausted ticks of 2_400 —
+budgets sized to cluster PEAKS, not averages); the overload cells
+expose the honest re-arm's self-limiting shape — delivered caps at
+the budget with the backlog bounded at the ENTRY count (2_000
+pending, every tick exhausted, 480k late executions over 2_400
+ticks: per (npc, commitment) the chain is one-deep, so sustained
+authored overload CANNOT pile unbounded work — the E-10 acceptance
+holds by construction); cost tracks the event rate, not the
+population (125 and 1000 at equal rate within noise, ≈ 0.33 µs per
+wake event end-to-end); the **witness enumeration cost** (census +
+the full per-significant-event path at {24, 125, 1000} × {all-Full,
+mixed, all-Dormant}: the census is linear in population — p50 0.092/
+0.271/1.263 µs — and tier-gating is free; the full event at
+1_000-scale all-Full admits 81 witnesses at p50 4.9 µs; the
+all-Dormant census walks the same 1.26 µs and admits NOTHING —
+I2/I3's cost shape); the **activation crossover** (E-09 on the real
+machinery: 125 NPCs × 2 entries, k ∈ 1…64 missed occurrences —
+replay re-executes the missed events through the real queue
+(late-arrival arm + drain to the reactivation point, executed ==
+250k asserted), synthesis is the production shape (one
+`evaluate_wake` per NPC — the single lazy decay over the whole span
+— plus the `next_occurrence` re-arm jumps, asserted at (k+1)·600
+and 300+k·600); MEASURED: replay grows linearly ≈ 0.094 → 9.96 ms
+p50 across k, synthesis is SPAN-INVARIANT at ≈ 0.028 ms (the decay
+is O(1) in the dormancy span) — the crossover lands at k = 1, BELOW
+the harness's 7.6–12.4 (the real machinery's synthesis is cheaper
+than the harness's: the adaptive policy's threshold is moot here,
+replay never wins in the measured range; §9.1's launch-policy
+question stands, now with the real number); the **skip-cost curves**
+(E-08 on the real queue: seven (duration, events) cells at D ∈
+{10⁴, 10⁵, 10⁶} with the pair structure isolating events from
+elapsed, every armed event's honest re-arm authored beyond the
+window so executed == armed exactly — MEASURED decomposition ≈
+35.8 ns/tick + ≈ 0.336 µs/event: the event term dominates at
+game-relevant densities, and the E-08 pair's reading (same elapsed,
+different event counts) shows the DELTA tracking events with the
+tick floor common to both sides; the dormant contrast: 1_000 NPCs'
+retained calendars re-derive in 0.025 µs — the quiet skip is free);
+and **memory-per-NPC by tier** (the accounting over the real structs
+at entries/NPC ∈ {2, 16}: Full 840/1_288 B, Simplified 316/764 B,
+Event-driven 196/644 B, Dormant 20 B (the record + next_event —
+schedules are authored shared data, not per-NPC resident); the
+measured composed world 12_916 B total / 538 B per NPC, locomotion
+8.2% — monotonicity and component sums pinned by the lib battery).
+The battery (5 platform-uniform lib tests) pins the matrix
+workload's stream digest (12_420_752_226_621_264_573) and the
+witness census digest (16_487_293_382_058_425_681), both baked from
+measured runs stable across independent executions. The design
+pass's §9 open-questions list still awaits the owner.
 
 ## 10. The authoritative coordination ledger
 
@@ -1438,7 +1509,7 @@ not implemented** / **not yet designed**.
 | GPU resource streaming | Not yet designed | F-04 deferred; host-visible copies only |
 | Instanced/indirect draws | **Implemented (6-E + 6-E2)** | The Cycle 6-E implementation landed 2026-11-23 on the scaffold's deterministic core (the libm-free turn-fraction transforms, the byte-pinned packing, the proxy meshes, the `instanced_proxy.wgsl` shader): the instance-rate vertex input, the lazily-created zero-per-frame-allocation instance buffer (allocations constant across warmed populated frames), one draw call per populated kind (the populated corner route: **26 instances — the full 24-NPC + 2-vehicle placement table, the ladder's population package `corner_population`, pure data with a placement-validity battery and its own packed-bytes FNV pin — in 2 calls**), the N-vs-1 pixel-equivalence gate (`tests/render_instanced.rs`, byte-equal frames for BOTH the 13-instance fixture and the shipped 24+2 table, per-pixel 6-B oracle checks at 0/255 max error on lavapipe), the draw-call pins, and the `--corner --populated` demo mode — see `docs/CYCLE6-6E-BRIEF.md`. The Cycle 6-E2 package (2026-11-23, riding the population branch) added the indirect submission: `ProxyDrawMode::Indirect` — one `vkCmdDrawIndirect` per populated kind with the counts read from GPU memory, the pure byte-pinned `proxy_indirect` command core (FNV cross-platform pin, `firstVertex`/`firstInstance` pinned zero — no `drawIndirectFirstInstance` feature), a lazily-created per-frame-slot mapped command buffer (one-time +1 device_memory, pinned; the direct path's counters untouched), byte-equal frames across per-object/direct/indirect submissions (the third `render_instanced` gate, with an oracle wall through the indirect path), and the populated route's default submission now indirect (`--proxy-instanced` selects the direct 6-E shape). GPU-side count AUTHORSHIP (compute/culling writing the counts) remains deferred to the GPU-culling package. The rig measurement commands live in the 6-E/6-E2 PRs (lavapipe is correctness evidence only) |
 | Directional shadows | **Implemented (6-F + Era-1 PCF + Era-2 proxy shadows)** | The Cycle 6-F implementation landed 2026-11-23: the deterministic core (the light-space orthographic cascade, the compare-time slope-scaled bias model, the CPU raycaster oracle — pure IEEE, unit-pinned) + the depth-only pass + the shadowed lit pipeline sampling the map (one cascade, the corner scene — PCF-softened since Era-1 package 2). The gates: the map's known-answer (every texel vs the raycaster, max |Δdepth| 2.7e-7 on lavapipe) and the pixel equivalence (a shadowed ground patch renders exactly `albedo·ambient`, a lit patch the unshadowed equation, the unshadowed path pixel-identical) — `tests/render_shadows.rs`, executed by the CI's Linux Vulkan step. The `--corner --shadows` demo mode runs the full route. PCF softening (Era-1 package 2, the 3×3 `shadow_filter` tap table shared verbatim with the CPU oracle) and proxy shadows (Era-2, PR #33 — the populated path casting AND receiving, the skinned per-NPC depth casts) are landed; cascaded splits remain open |
-| NPC/world representation (LOD) | Partially implemented | The region director, four LOD levels, activation/reconstruction — validated at 1000 NPCs / 8 regions; the NPC AI design pass merged (#34) with its deterministic cores landed (PR #37: the behavior selector machinery, the schedule layer, the perception layer — pure, pinned), the spine integration landed (package A part 2: commitment wakes as spine events, the witness census, the honest re-arm — pinned by the integration battery), and the locomotion batch landed (package A part 3: routes as pure data with authored turns, the hand-spread draws, the position bridge, the identity-ordered zero-allocation batch step, the pinned-blocked collision composition — pinned by the 18-test battery with the campaign gates over a real spine, §8.5's p99 measurement discharged: 4.7 µs/tick at the corner's 24 walkers, 70.7 µs/tick at the 1,000-walker pathological case on this pod); the rendering bridge and composed gates remain (package A's remaining parts) |
+| NPC/world representation (LOD) | Partially implemented | The region director, four LOD levels, activation/reconstruction — validated at 1000 NPCs / 8 regions; the NPC AI design pass merged (#34) with its deterministic cores landed (PR #37: the behavior selector machinery, the schedule layer, the perception layer — pure, pinned), the spine integration landed (package A part 2: commitment wakes as spine events, the witness census, the honest re-arm — pinned by the integration battery), and the locomotion batch landed (package A part 3: routes as pure data with authored turns, the hand-spread draws, the position bridge, the identity-ordered zero-allocation batch step, the pinned-blocked collision composition — pinned by the 18-test battery with the campaign gates over a real spine, §8.5's p99 measurement discharged: 4.7 µs/tick at the corner's 24 walkers, 70.7 µs/tick at the 1,000-walker pathological case on this pod); the rendering bridge, the composed gates, and the measurement surface delivered (package A parts 4-6, the open PR stack: the behavior-state walking crowd at zero per-frame allocation, the behavior-spine composition with the allocation-counting gate, and §8.4/§8.5's measured evidence — the sustained matrix, the witness cost, the E-09 crossover at k=1 with span-invariant synthesis, the E-08 skip decomposition, memory-per-NPC by tier) |
 | Physics and collision | Prototype only | The Cycle-1 kinematic player prototype (`engine-core` player module: swept-AABB collision, fixed-step movement, FP/TP cameras) — headless/offscreen validated, collide-what-you-see; reversible and explicitly NOT a ratified production physics backend (§8) |
 | Combat and gameplay systems | Partially implemented (demo-scale prototype, validated) | The Cycle 2–5 line: `engine-core` combat resolution (`resolve_attack`, pure, allocation-free) + the adversary cadence model + the encounter composition with cover/HUD/cues in `engine-slice` — pinned by the combat_world (21) and encounter_world (30) batteries with byte-identical scenario traces; game-scale gameplay systems (progression, economy, AI beyond the cadence prototype) remain undesigned |
 | Networking and replication | In-session boundaries **designed (unratified)** | The player-facing multiplayer and governance rules are **ratified** in `docs/MULTIPLAYER-SPEC.md`; the campaign-level authority/persistence research lives in `docs/MULTIPLAYER-ARCHITECTURE-RESEARCH.md` (unapproved); the **in-session architecture** — sim placement, input ordering, replication scope, divergence detection, session lifecycle — is designed in `docs/CYCLE6-6D-SESSION-REPLICATION-BOUNDARIES.md` (**unratified**; owner decision list §9); transport/provider selection remains undesigned (T-06 deferral) |

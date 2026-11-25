@@ -4,6 +4,7 @@
 //! the same code path without spawning a process.
 
 pub mod backup;
+pub mod behavior_measurement;
 pub mod benchmark;
 pub mod combat_demo;
 pub mod corner_behavior;
