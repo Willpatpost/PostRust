@@ -6,11 +6,14 @@
 //! kind stays on the plain proxy pipeline, byte-identical).
 //!
 //! ZERO-PER-FRAME-ALLOCATION DISCIPLINE (the standing gate): every
-//! object here is created ONCE, lazily, at the FIRST populated
-//! corner frame ([`PipelineState::ensure_skinned_resources`] — the
+//! object here is created ONCE, lazily, outside command recording —
+//! the pass-independent half ([`SkinnedRetained`]) at the FIRST
+//! populated corner frame EVER, on the renderer's Vulkan context
+//! ([`crate::vulkan::VulkanContext::ensure_skinned_retained`] — the
 //! region-buffer precedent: the unpopulated path pays nothing, and
-//! the unpopulated allocation pins are untouched). The per-frame
-//! pose bytes are the safe layer's repacked blocks
+//! the unpopulated allocation pins are untouched); the pass-bound
+//! pipelines ([`SkinnedProxyResources`]) once per pipeline state.
+//! The per-frame pose bytes are the safe layer's repacked blocks
 //! ([`crate::animation::repack_poses`] into the renderer's RETAINED
 //! Vec — the instance-bytes pattern) copied into THIS slot's mapped
 //! region after the slot's fence wait. `renderer.allocations()`
@@ -38,6 +41,22 @@
 //! pass-specific (the main-pass pipeline here, the HDR variant
 //! lazily at the first populated POST frame — the
 //! `ensure_shadowed_hdr` precedent).
+//!
+//! THE OWNERSHIP SPLIT (the Era-2 follow-up, PR #33's recorded
+//! renderer-architecture repair): precisely BECAUSE everything above
+//! is pass-agnostic and binds only context-owned corner resources
+//! plus the family's own pose buffer, the retained half — the pose
+//! storage, the set layout, the pool, the sets, and the pipeline
+//! layout — lives on the renderer's [`VulkanContext`] at DEVICE
+//! lifetime (the `pipeline_cache` precedent), created once at the
+//! first populated frame and INHERITED by every pipeline generation:
+//! a forced pipeline replacement (`--replace-pipelines`, the
+//! surface-format-change lifecycle) rebuilds only the render-pass-
+//! bound pipelines and never re-creates the pool/sets/pose-buffer
+//! (the flat replacement tuple the lifecycle gates pin). The
+//! shadowed-populated family is deliberately NOT transferred: its
+//! sets bind the re-created shadow state's per-slot map views, so it
+//! keeps the finding-A per-generation re-ensure.
 //!
 //! THE ALIGNMENT PROOF (minStorageBufferOffsetAlignment): every
 //! slot's dynamic offset is `slot * 2,883,584`, and 2,883,584 =
@@ -94,12 +113,18 @@ pub(super) enum ProxyVertexForm {
     Plain,
 }
 
-/// Device-lifetime skinned proxy resources. Owned by
-/// [`super::PipelineState`] (dies with the pipelines that read it; a
-/// pipeline replacement re-ensures an identical set before
-/// installation — the finding-A discipline, `vulkan.rs`'s
-/// replacement path).
-pub(crate) struct SkinnedProxyResources {
+/// The device-lifetime, pass-independent skinned resources (the
+/// Era-2 ownership transfer): the mapped pose storage, the skinned
+/// set layout/pool/sets, and the skinned pipeline layout — every
+/// object that binds no render pass. Owned by
+/// [`super::VulkanContext`] (the `pipeline_cache` precedent:
+/// created once at the first populated frame, INHERITED by every
+/// pipeline generation, released only at context teardown — AFTER
+/// the owning Renderer destroyed every PipelineState, so every
+/// pipeline that read these objects is already gone). A pipeline
+/// replacement therefore rebuilds only the pass-bound pipelines
+/// ([`SkinnedProxyResources`]) and never re-creates this state.
+pub(crate) struct SkinnedRetained {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     mapped: *mut core::ffi::c_void,
@@ -107,24 +132,19 @@ pub(crate) struct SkinnedProxyResources {
     set_layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
     sets: [vk::DescriptorSet; MATERIAL_COUNT],
-    /// The main-pass skinned lit pipeline (vs_main/fs_main of
-    /// instanced_proxy_skinned.spv).
-    pipeline: vk::Pipeline,
+    /// The skinned pipeline layout (pass-agnostic — it wraps only
+    /// the set layout above, so it transfers with the retained
+    /// state; the pass-bound pipelines are built on it).
     pipeline_layout: vk::PipelineLayout,
-    /// The HDR-pass variant (created lazily at the first populated
-    /// POST frame — the ensure_shadowed_hdr precedent; reuses THIS
-    /// state's pipeline layout and sets, which are pass-agnostic).
-    skinned_hdr: Option<vk::Pipeline>,
 }
 
-impl SkinnedProxyResources {
-    /// Builds the whole skinned state against the MAIN render pass
-    /// and the corner's resources. Partial-construction safe:
-    /// `release` frees exactly what exists (null handles denote
-    /// partial construction — the corrective-finding-G discipline).
+impl SkinnedRetained {
+    /// Builds the whole retained state against the corner's
+    /// resources. Partial-construction safe: `release` frees
+    /// exactly what exists (null handles denote partial
+    /// construction — the corrective-finding-G discipline).
     pub(super) fn new(
         ctx: &VulkanContext,
-        main_render_pass: vk::RenderPass,
         corner: &CornerResources,
     ) -> Result<Self, RendererError> {
         // The alignment proof's live check (the header's arithmetic
@@ -144,7 +164,7 @@ impl SkinnedProxyResources {
             )));
         }
 
-        let mut partial = SkinnedProxyResources {
+        let mut partial = SkinnedRetained {
             buffer: vk::Buffer::null(),
             memory: vk::DeviceMemory::null(),
             mapped: core::ptr::null_mut(),
@@ -152,11 +172,9 @@ impl SkinnedProxyResources {
             set_layout: vk::DescriptorSetLayout::null(),
             pool: vk::DescriptorPool::null(),
             sets: [vk::DescriptorSet::null(); MATERIAL_COUNT],
-            pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
-            skinned_hdr: None,
         };
-        if let Err(error) = partial.build(ctx, main_render_pass, corner) {
+        if let Err(error) = partial.build(ctx, corner) {
             partial.release(ctx);
             return Err(error);
         }
@@ -166,7 +184,6 @@ impl SkinnedProxyResources {
     fn build(
         &mut self,
         ctx: &VulkanContext,
-        main_render_pass: vk::RenderPass,
         corner: &CornerResources,
     ) -> Result<(), RendererError> {
         // The mapped pose storage: one disjoint region per frame
@@ -278,13 +295,10 @@ impl SkinnedProxyResources {
         self.set_layout = set_layout;
         self.sets = sets;
 
-        // The skinned lit pipeline: the SAME render pass, rasterizer
-        // (the proxy meshes wind CCW about their outward normals),
-        // depth contract, and blend as the plain proxy pipeline —
-        // the vertex input and the LAYOUT differ (the SkinnedVertex
-        // format with joints/weights at locations 8/9, the instance
-        // params vec4's pose index at location 10; the skinned set
-        // layout with the pose storage).
+        // The skinned pipeline layout (pass-agnostic — it wraps only
+        // the set layout above, so the retained state owns it; every
+        // per-generation pipeline — main-pass and HDR — is built on
+        // it, with the SKINNED vertex input and this set family).
         // SAFETY: the layout is owned by this state immediately; the
         // create-info slices live through the call.
         self.pipeline_layout = unsafe {
@@ -294,15 +308,15 @@ impl SkinnedProxyResources {
             )
         }
         .map_err(|e| RendererError::vk(e, "skinned proxy layout"))?;
-        self.pipeline = self.build_pipeline(ctx, main_render_pass, "skinned proxy pipeline")?;
         Ok(())
     }
 
     /// The skinned lit pipeline against `render_pass` — the plain
     /// proxy pipeline's states with the SKINNED vertex input (the
-    /// one pipeline builder both the main-pass and HDR variants
-    /// call; the states exist exactly once).
-    fn build_pipeline(
+    /// one pipeline builder the per-generation family's main-pass
+    /// and HDR variants call, on THIS retained state's layout; the
+    /// states exist exactly once).
+    pub(super) fn build_pipeline(
         &self,
         ctx: &VulkanContext,
         render_pass: vk::RenderPass,
@@ -517,23 +531,6 @@ impl SkinnedProxyResources {
         .map(|mut pipelines| pipelines.remove(0))
     }
 
-    /// Creates the HDR-pass skinned pipeline variant if absent (the
-    /// lazy discipline one level deeper: the first populated POST
-    /// frame pays the one-time pipeline; postless populated frames
-    /// never do). A failure leaves the prior state fully intact.
-    pub(super) fn ensure_hdr(
-        &mut self,
-        ctx: &VulkanContext,
-        hdr_render_pass: vk::RenderPass,
-    ) -> Result<(), RendererError> {
-        if self.skinned_hdr.is_some() {
-            return Ok(());
-        }
-        let pipeline = self.build_pipeline(ctx, hdr_render_pass, "skinned proxy hdr pipeline")?;
-        self.skinned_hdr = Some(pipeline);
-        Ok(())
-    }
-
     /// Copies this frame's pose bytes into `slot`'s mapped region.
     ///
     /// # Safety
@@ -557,16 +554,6 @@ impl SkinnedProxyResources {
                 .cast::<u8>();
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, bytes.len());
         }
-    }
-
-    /// The main-pass skinned pipeline handle.
-    pub(super) fn pipeline(&self) -> vk::Pipeline {
-        self.pipeline
-    }
-
-    /// The HDR-pass skinned pipeline handle, when ensured.
-    pub(super) fn skinned_hdr(&self) -> Option<vk::Pipeline> {
-        self.skinned_hdr
     }
 
     /// The skinned pipeline layout (the recording binds it with the
@@ -706,16 +693,14 @@ impl SkinnedProxyResources {
     /// fully-built and the partial state (null handles denote
     /// partial construction).
     pub(super) fn release(&mut self, ctx: &VulkanContext) {
-        // SAFETY: owned by this state; the owning PipelineState is
-        // destroyed only while the device is idle (replacement waits;
-        // teardown waits), after the pipelines reading these objects.
+        // SAFETY: owned by the VulkanContext, which releases this
+        // state only at its own teardown — AFTER the owning Renderer
+        // destroyed every PipelineState (Renderer::drop: frames →
+        // swapchain → pipes.destroy → ctx.destroy; the replacement
+        // path destroys an outgoing state only after a device wait)
+        // — so every pipeline that read these objects is already
+        // destroyed, and no in-flight submission references them.
         unsafe {
-            if let Some(hdr) = self.skinned_hdr.take() {
-                ctx.device.destroy_pipeline(hdr, None);
-            }
-            if self.pipeline != vk::Pipeline::null() {
-                ctx.device.destroy_pipeline(self.pipeline, None);
-            }
             if self.pipeline_layout != vk::PipelineLayout::null() {
                 ctx.device
                     .destroy_pipeline_layout(self.pipeline_layout, None);
@@ -737,12 +722,103 @@ impl SkinnedProxyResources {
             if self.memory != vk::DeviceMemory::null() {
                 ctx.device.free_memory(self.memory, None);
             }
-            self.pipeline = vk::Pipeline::null();
             self.pipeline_layout = vk::PipelineLayout::null();
             self.pool = vk::DescriptorPool::null();
             self.set_layout = vk::DescriptorSetLayout::null();
             self.buffer = vk::Buffer::null();
             self.memory = vk::DeviceMemory::null();
+        }
+    }
+}
+
+/// The per-render-pass skinned pipelines (the Era-2 ownership
+/// transfer's other half): the main-pass skinned lit pipeline and
+/// its lazily-created HDR variant — every object here IS
+/// render-pass-bound. Owned by [`super::PipelineState`] (dies with
+/// the state's pipelines; a replacement rebuilds both against the
+/// new render pass BEFORE installation — the finding-A discipline),
+/// built on the context's RETAINED layout
+/// ([`SkinnedRetained::pipeline_layout`]) and recording through the
+/// retained sets and pose storage, which the replacement INHERITS
+/// (never re-creates — the flat replacement tuple).
+pub(crate) struct SkinnedProxyResources {
+    /// The main-pass skinned lit pipeline (vs_main/fs_main of
+    /// instanced_proxy_skinned.spv).
+    pipeline: vk::Pipeline,
+    /// The HDR-pass variant (created lazily at the first populated
+    /// POST frame — the ensure_shadowed_hdr precedent; built on the
+    /// same retained layout, which is pass-agnostic).
+    skinned_hdr: Option<vk::Pipeline>,
+}
+
+impl SkinnedProxyResources {
+    /// Builds the per-generation pipelines on the RETAINED state's
+    /// layout against this state's render pass. A failed build owns
+    /// nothing (the builder releases its own shader module on both
+    /// paths), so no partial-state dance is needed.
+    pub(super) fn new(
+        ctx: &VulkanContext,
+        retained: &SkinnedRetained,
+        main_render_pass: vk::RenderPass,
+    ) -> Result<Self, RendererError> {
+        // The skinned lit pipeline: the SAME rasterizer (the proxy
+        // meshes wind CCW about their outward normals), depth
+        // contract, and blend as the plain proxy pipeline — the
+        // vertex input and the LAYOUT differ (the SkinnedVertex
+        // format with joints/weights at locations 8/9, the instance
+        // params vec4's pose index at location 10; the skinned set
+        // layout with the pose storage).
+        Ok(SkinnedProxyResources {
+            pipeline: retained.build_pipeline(ctx, main_render_pass, "skinned proxy pipeline")?,
+            skinned_hdr: None,
+        })
+    }
+
+    /// Creates the HDR-pass skinned pipeline variant if absent (the
+    /// lazy discipline one level deeper: the first populated POST
+    /// frame pays the one-time pipeline; postless populated frames
+    /// never do). A failure leaves the prior state fully intact.
+    pub(super) fn ensure_hdr(
+        &mut self,
+        ctx: &VulkanContext,
+        retained: &SkinnedRetained,
+        hdr_render_pass: vk::RenderPass,
+    ) -> Result<(), RendererError> {
+        if self.skinned_hdr.is_some() {
+            return Ok(());
+        }
+        let pipeline =
+            retained.build_pipeline(ctx, hdr_render_pass, "skinned proxy hdr pipeline")?;
+        self.skinned_hdr = Some(pipeline);
+        Ok(())
+    }
+
+    /// The main-pass skinned pipeline handle.
+    pub(super) fn pipeline(&self) -> vk::Pipeline {
+        self.pipeline
+    }
+
+    /// The HDR-pass skinned pipeline handle, when ensured.
+    pub(super) fn skinned_hdr(&self) -> Option<vk::Pipeline> {
+        self.skinned_hdr
+    }
+
+    /// Releases every handle exactly once; valid for both the
+    /// fully-built and the partial state (null/absent handles denote
+    /// partial construction).
+    pub(super) fn release(&mut self, ctx: &VulkanContext) {
+        // SAFETY: owned by this state; the owning PipelineState is
+        // destroyed only while the device is idle (replacement waits;
+        // teardown waits). The RETAINED layout/sets/pose-buffer these
+        // pipelines read are the context's and outlive this state.
+        unsafe {
+            if let Some(hdr) = self.skinned_hdr.take() {
+                ctx.device.destroy_pipeline(hdr, None);
+            }
+            if self.pipeline != vk::Pipeline::null() {
+                ctx.device.destroy_pipeline(self.pipeline, None);
+            }
+            self.pipeline = vk::Pipeline::null();
         }
     }
 }
@@ -786,12 +862,12 @@ pub(crate) struct ShadowedProxyResources {
 impl ShadowedProxyResources {
     /// Builds the shadowed-populated proxy state against the shadow
     /// state's depth pass, its extended uniform, its per-slot map
-    /// views, and the skinned state's pose buffer. Partial-
-    /// construction safe (the release discipline).
+    /// views, and the context's RETAINED skinned pose buffer.
+    /// Partial-construction safe (the release discipline).
     pub(super) fn new(
         ctx: &VulkanContext,
         shadows: &super::shadow_draw::ShadowResources,
-        skinned: &SkinnedProxyResources,
+        retained: &SkinnedRetained,
         corner: &CornerResources,
         main_render_pass: vk::RenderPass,
     ) -> Result<Self, RendererError> {
@@ -816,7 +892,7 @@ impl ShadowedProxyResources {
             skinned_shadowed_hdr: None,
             plain_shadowed_hdr: None,
         };
-        if let Err(error) = partial.build(ctx, shadows, skinned, corner, main_render_pass) {
+        if let Err(error) = partial.build(ctx, shadows, retained, corner, main_render_pass) {
             partial.release(ctx);
             return Err(error);
         }
@@ -827,7 +903,7 @@ impl ShadowedProxyResources {
         &mut self,
         ctx: &VulkanContext,
         shadows: &super::shadow_draw::ShadowResources,
-        skinned: &SkinnedProxyResources,
+        retained: &SkinnedRetained,
         corner: &CornerResources,
         main_render_pass: vk::RenderPass,
     ) -> Result<(), RendererError> {
@@ -870,7 +946,7 @@ impl ShadowedProxyResources {
             .offset(u64::from(shadows.light_offset()))
             .range(64)];
         let poses = [vk::DescriptorBufferInfo::default()
-            .buffer(skinned.pose_buffer())
+            .buffer(retained.pose_buffer())
             .range(SLOT_STRIDE)];
         // SAFETY: a fresh set; the shadow uniform and pose buffer
         // outlive this pool (their states own them).
@@ -901,7 +977,7 @@ impl ShadowedProxyResources {
             )
         }
         .map_err(|e| RendererError::vk(e, "skinned shadow depth layout"))?;
-        self.skinned_depth_pipeline = skinned.build_skinned_depth_pipeline(
+        self.skinned_depth_pipeline = retained.build_skinned_depth_pipeline(
             ctx,
             include_bytes!(concat!(env!("OUT_DIR"), "/shadow_depth_skinned.spv")),
             shadows.depth_render_pass(),
@@ -911,7 +987,7 @@ impl ShadowedProxyResources {
         // The vehicle cast: the PLAIN vertex input against the shadow
         // state's depth pass, laid out for the shadow state's OWN
         // depth set/layout (the recording binds them).
-        self.plain_depth_pipeline = skinned.build_plain_depth_pipeline(
+        self.plain_depth_pipeline = retained.build_plain_depth_pipeline(
             ctx,
             include_bytes!(concat!(env!("OUT_DIR"), "/shadow_depth_instanced.spv")),
             shadows.depth_render_pass(),
@@ -971,7 +1047,7 @@ impl ShadowedProxyResources {
                     .buffer(shadows.frame_buffer())
                     .range(super::shadow_draw::SHADOW_FRAME_PARAMS_SIZE)];
                 let poses = [vk::DescriptorBufferInfo::default()
-                    .buffer(skinned.pose_buffer())
+                    .buffer(retained.pose_buffer())
                     .range(SLOT_STRIDE)];
                 let write = vk::WriteDescriptorSet::default().dst_set(set);
                 // SAFETY: fresh sets; every resource outlives the
@@ -1015,7 +1091,7 @@ impl ShadowedProxyResources {
             )
         }
         .map_err(|e| RendererError::vk(e, "skinned shadowed layout"))?;
-        self.skinned_shadowed_pipeline = skinned.build_skinned_lit_pipeline(
+        self.skinned_shadowed_pipeline = retained.build_skinned_lit_pipeline(
             ctx,
             include_bytes!(concat!(
                 env!("OUT_DIR"),
@@ -1108,7 +1184,7 @@ impl ShadowedProxyResources {
         // skinned module's locations 8-10 do not exist in the
         // 32-byte ProxyVertex stream (the first 4b draft built this
         // pipeline from the skinned shader — caught in this repair).
-        self.plain_shadowed_pipeline = skinned.build_plain_lit_pipeline(
+        self.plain_shadowed_pipeline = retained.build_plain_lit_pipeline(
             ctx,
             include_bytes!(concat!(env!("OUT_DIR"), "/instanced_proxy_shadowed.spv")),
             main_render_pass,
@@ -1178,11 +1254,11 @@ impl ShadowedProxyResources {
     pub(super) fn ensure_hdr(
         &mut self,
         ctx: &VulkanContext,
-        skinned: &SkinnedProxyResources,
+        retained: &SkinnedRetained,
         hdr_render_pass: vk::RenderPass,
     ) -> Result<(), RendererError> {
         if self.skinned_shadowed_hdr.is_none() {
-            self.skinned_shadowed_hdr = Some(skinned.build_skinned_lit_pipeline(
+            self.skinned_shadowed_hdr = Some(retained.build_skinned_lit_pipeline(
                 ctx,
                 include_bytes!(concat!(
                     env!("OUT_DIR"),
@@ -1194,7 +1270,7 @@ impl ShadowedProxyResources {
             )?);
         }
         if self.plain_shadowed_hdr.is_none() {
-            self.plain_shadowed_hdr = Some(skinned.build_plain_lit_pipeline(
+            self.plain_shadowed_hdr = Some(retained.build_plain_lit_pipeline(
                 ctx,
                 include_bytes!(concat!(env!("OUT_DIR"), "/instanced_proxy_shadowed.spv")),
                 hdr_render_pass,
@@ -1299,13 +1375,13 @@ impl ShadowedProxyResources {
         cmd: vk::CommandBuffer,
         _corner: &CornerResources,
         shadows: &super::shadow_draw::ShadowResources,
-        skinned: &SkinnedProxyResources,
+        retained: &SkinnedRetained,
         slot: usize,
         upload: &super::proxy_draw::ProxyFrameUpload<'_>,
         proxy: &super::proxy_draw::ProxyResources,
     ) -> u32 {
         let frame_offset = slot as u32 * shadows.frame_stride();
-        let pose_offset = skinned.pose_offset(slot);
+        let pose_offset = retained.pose_offset(slot);
         let mut calls = 0;
 
         // NPC kind (the skinned depth pipeline)

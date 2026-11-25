@@ -721,8 +721,9 @@ impl ShadowResources {
     /// # Safety
     /// `cmd` must be recording (pre-main-pass); `slot`'s map is
     /// written here and read by the main pass that follows.
-    /// `shadowed_proxy`, `proxy`, and `skinned` must be the frame
-    /// flow's ensure-discipline states (shadows, proxy, skinned).
+    /// `shadowed_proxy`, `proxy`, and `retained` must be the frame
+    /// flow's ensure-discipline states (shadows, proxy, the
+    /// context's retained skinned state).
     #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn record_depth_pass(
         &self,
@@ -732,7 +733,7 @@ impl ShadowResources {
         slot: usize,
         shadowed_proxy: Option<&skinned_draw::ShadowedProxyResources>,
         proxy: Option<&proxy_draw::ProxyResources>,
-        skinned: Option<&skinned_draw::SkinnedProxyResources>,
+        retained: Option<&skinned_draw::SkinnedRetained>,
         upload: Option<&proxy_draw::ProxyFrameUpload<'_>>,
     ) {
         let (vertices, draws) = corner.mesh();
@@ -792,16 +793,16 @@ impl ShadowResources {
             if let (
                 Some(shadowed_proxy),
                 Some(proxy_state),
-                Some(skinned_state),
+                Some(retained_state),
                 Some(upload_state),
-            ) = (shadowed_proxy, proxy, skinned, upload)
+            ) = (shadowed_proxy, proxy, retained, upload)
             {
                 shadowed_proxy.record_depth_casts(
                     ctx,
                     cmd,
                     corner,
                     self,
-                    skinned_state,
+                    retained_state,
                     slot,
                     upload_state,
                     proxy_state,

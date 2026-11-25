@@ -84,7 +84,9 @@
 //! view, image and memory → device. Frame slots release
 //! their mapped overlay buffers during frame-state teardown. Failed
 //! swapchain replacements release the retired chain and leave a pending
-//! recreation for the next renderable frame.
+//! recreation for the next renderable frame. At context teardown (after
+//! every PipelineState) the retained skinned state releases BEFORE the
+//! corner it binds (reverse creation order).
 
 // Unsafe containment (Stage 2 authorization, item 1): this module-level
 // allow overrides the crate-level `#![deny(unsafe_code)]` in lib.rs —
@@ -360,6 +362,22 @@ pub(crate) struct VulkanContext {
     /// fresh empty one that dies with its state.
     pub pipeline_cache: vk::PipelineCache,
     corner: Option<corner::CornerResources>,
+    /// The skinned family's PASS-INDEPENDENT resources (the Era-2
+    /// ownership transfer): the mapped pose storage, the skinned set
+    /// layout/pool/sets, and the skinned pipeline layout — created
+    /// LAZILY once at the first populated frame EVER, then INHERITED
+    /// by every pipeline generation (the `pipeline_cache` precedent:
+    /// device-lifetime objects shared across swapchain recreations
+    /// and pipeline replacements, so a replacement rebuilds only the
+    /// pass-bound pipelines and the allocation counters stay flat
+    /// across the replacement lifecycle). Valid because these
+    /// objects bind no render pass — only the corner's own resources
+    /// (ctx-owned, same lifetime) plus the family's own pose buffer.
+    /// Released at context teardown, BEFORE the corner (reverse
+    /// creation order), and after every PipelineState whose
+    /// pipelines read it (the Renderer's drop order guarantees
+    /// pipes.destroy precedes ctx.destroy).
+    pub(crate) skinned_retained: Option<skinned_draw::SkinnedRetained>,
     texture: Texture,
     samplers: SamplerPool,
     descriptors: DescriptorFoundation,
@@ -740,6 +758,7 @@ impl VulkanContext {
             supported_present_modes,
             pipeline_cache,
             corner: None,
+            skinned_retained: None,
             texture: Default::default(),
             samplers: Default::default(),
             descriptors: Default::default(),
@@ -987,9 +1006,37 @@ impl VulkanContext {
             .set(self.target_memory_frees.get() + 1);
     }
 
+    /// Allocates the skinned family's PASS-INDEPENDENT resources on
+    /// the first populated frame EVER (the same lazy discipline as
+    /// the pipeline states, one level up in ownership: the state
+    /// lives HERE, at device lifetime, so every pipeline generation
+    /// inherits it and a replacement never re-creates it). A no-op
+    /// once allocated; the unpopulated path pays nothing.
+    pub(crate) fn ensure_skinned_retained(&mut self) -> Result<(), RendererError> {
+        if self.skinned_retained.is_some() {
+            return Ok(());
+        }
+        let corner = self.corner.as_ref().ok_or_else(|| {
+            RendererError::Vulkan("skinned proxy requires the Corner scene preference".into())
+        })?;
+        let retained = skinned_draw::SkinnedRetained::new(self, corner)?;
+        self.skinned_retained = Some(retained);
+        Ok(())
+    }
+
     /// Full teardown in manifest order (assumes swapchain/pipelines/frames
     /// were already destroyed by the owning Renderer).
     pub(crate) fn destroy(&mut self) {
+        // The retained skinned state FIRST (reverse creation order:
+        // the corner exists from construction, the retained state
+        // from the first populated frame). Valid because every
+        // PipelineState — whose skinned pipelines read these objects
+        // — was already destroyed by the owning Renderer
+        // (Renderer::drop: frames → swapchain → pipes.destroy →
+        // ctx.destroy).
+        if let Some(mut retained) = self.skinned_retained.take() {
+            retained.release(self);
+        }
         if let Some(corner) = self.corner.take() {
             corner.destroy(self);
         }
@@ -1823,12 +1870,15 @@ pub(crate) struct PipelineState {
     /// renderer always carries the post state; the post CHAIN
     /// itself stays optional.
     pub reflection: Option<reflection_draw::ReflectionResources>,
-    /// The skinned proxy state (the mapped pose storage buffer +
-    /// the skinned pipeline), created LAZILY at the first populated
-    /// frame — the region-buffer precedent: the unpopulated path
-    /// pays nothing. Dies with this state (the pipelines reading it
-    /// do); a replacement re-ensures an identical set before
-    /// installation (finding A).
+    /// The skinned proxy family's PASS-BOUND pipelines (the
+    /// main-pass skinned lit pipeline + the lazy HDR variant),
+    /// created LAZILY at the first populated frame — the
+    /// region-buffer precedent: the unpopulated path pays nothing.
+    /// Dies with this state; a replacement rebuilds the pipelines
+    /// before installation (finding A) on the CONTEXT's inherited
+    /// retained skinned state (the pass-independent pose storage /
+    /// pool / sets / layout — never re-created; see
+    /// [`VulkanContext::skinned_retained`]).
     pub skinned: Option<skinned_draw::SkinnedProxyResources>,
     /// The shadowed-populated proxy state (the NPC and vehicle
     /// casting/receiving paths through the shadow family), created
@@ -1986,26 +2036,33 @@ impl PipelineState {
         Ok(())
     }
 
-    /// Allocates the skinned proxy state on the first populated
-    /// frame (the same lazy discipline: the unpopulated path pays
-    /// nothing — its allocation pins are untouched). The skinned
-    /// pipeline renders inside THIS state's render pass, so the
-    /// ensure carries it; a no-op once allocated.
+    /// Ensures the skinned family on the first populated frame (the
+    /// same lazy discipline: the unpopulated path pays nothing — its
+    /// allocation pins are untouched). TWO halves since the Era-2
+    /// ownership transfer: the PASS-INDEPENDENT resources (pose
+    /// storage, pool, sets, layout) are ensured ON THE CONTEXT —
+    /// once ever, inherited by every pipeline generation — and only
+    /// the PASS-BOUND pipelines (this state's main-pass skinned
+    /// pipeline, rendering inside THIS state's render pass) are
+    /// built here, once per state. A pipeline replacement therefore
+    /// re-runs this ensure against the inherited retained state and
+    /// rebuilds ONLY the pipelines (the flat replacement tuple).
     pub(crate) fn ensure_skinned_resources(
         &mut self,
-        ctx: &VulkanContext,
+        ctx: &mut VulkanContext,
     ) -> Result<(), RendererError> {
-        if self.skinned.is_some() {
-            return Ok(());
+        ctx.ensure_skinned_retained()?;
+        if self.skinned.is_none() {
+            let retained = ctx.skinned_retained.as_ref().expect(
+                "the retained ensure above makes a missing retained \
+                 state unreachable",
+            );
+            self.skinned = Some(skinned_draw::SkinnedProxyResources::new(
+                ctx,
+                retained,
+                self.render_pass,
+            )?);
         }
-        let corner = ctx.corner.as_ref().ok_or_else(|| {
-            RendererError::Vulkan("skinned proxy requires the Corner scene preference".into())
-        })?;
-        self.skinned = Some(skinned_draw::SkinnedProxyResources::new(
-            ctx,
-            self.render_pass,
-            corner,
-        )?);
         Ok(())
     }
 
@@ -2036,7 +2093,8 @@ impl PipelineState {
     /// shadowed populated corner frame (one level deeper than the
     /// skinned state — the indirect-command precedent: the
     /// unshadowed populated path pays nothing for a mechanism it
-    /// never draws through). The state needs shadows, skinned, AND
+    /// never draws through). The state needs shadows, the context's
+    /// RETAINED skinned state (the pose buffer its sets bind), AND
     /// a corner — a no-op once allocated.
     pub(crate) fn ensure_shadowed_proxy_resources(
         &mut self,
@@ -2053,15 +2111,18 @@ impl PipelineState {
                 "shadowed proxy needs shadows (ensure_shadow_resources first)".into(),
             )
         })?;
-        let skinned = self.skinned.as_ref().ok_or_else(|| {
-            RendererError::Vulkan(
-                "shadowed proxy needs skinned (ensure_skinned_resources first)".into(),
-            )
-        })?;
+        // The pose buffer comes from the CONTEXT's retained skinned
+        // state — the frame flow's ensure order (skinned before the
+        // shadowed-populated gate) makes its absence unreachable on
+        // a shadowed populated frame.
+        let retained = ctx.skinned_retained.as_ref().expect(
+            "the skinned ensure discipline makes a missing retained \
+             state unreachable on a shadowed populated frame",
+        );
         self.shadowed_proxy = Some(skinned_draw::ShadowedProxyResources::new(
             ctx,
             shadows,
-            skinned,
+            retained,
             corner,
             self.render_pass,
         )?);
@@ -2251,7 +2312,11 @@ impl PipelineState {
             if proxy.is_some()
                 && let (Some(post_state), Some(skinned_state)) = (&mut self.post, &mut self.skinned)
             {
-                skinned_state.ensure_hdr(ctx, post_state.hdr_render_pass())?;
+                let retained = ctx.skinned_retained.as_ref().expect(
+                    "the skinned ensure discipline makes a populated frame's \
+                     missing retained state unreachable",
+                );
+                skinned_state.ensure_hdr(ctx, retained, post_state.hdr_render_pass())?;
             }
             // The Era-2 companion's shadowed half: a populated SHADOWED
             // POST frame needs the shadowed-populated state's HDR pipeline
@@ -2268,11 +2333,11 @@ impl PipelineState {
                 && let (Some(post_state), Some(shadowed_proxy_state)) =
                     (&mut self.post, &mut self.shadowed_proxy)
             {
-                let skinned = self.skinned.as_ref().expect(
+                let retained = ctx.skinned_retained.as_ref().expect(
                     "the skinned ensure discipline makes a populated frame's \
-                     missing skinned state unreachable",
+                     missing retained state unreachable",
                 );
-                shadowed_proxy_state.ensure_hdr(ctx, skinned, post_state.hdr_render_pass())?;
+                shadowed_proxy_state.ensure_hdr(ctx, retained, post_state.hdr_render_pass())?;
             }
             if sky.is_some()
                 && let (Some(post_state), Some(sky_state)) = (&mut self.post, &self.sky)
@@ -4091,12 +4156,12 @@ pub(crate) fn render_frame(
         }
         // The Era-2 pose bytes: this slot's region of the mapped pose
         // buffer, written under the SAME fence discipline as the
-        // instance bytes above (the skinned state exists whenever a
-        // populated frame runs — the ensure is unconditional on
-        // proxy presence; the debug_assert co-pins the structural
-        // invariant the way the indirect path does).
-        if let Some(skinned_state) = pipes.skinned.as_ref() {
-            unsafe { skinned_state.write_slot(slot, upload.pose_bytes) };
+        // instance bytes above (the context's RETAINED skinned state
+        // exists whenever a populated frame runs — the ensure is
+        // unconditional on proxy presence; the debug_assert co-pins
+        // the structural invariant the way the indirect path does).
+        if let Some(retained) = ctx.skinned_retained.as_ref() {
+            unsafe { retained.write_slot(slot, upload.pose_bytes) };
         } else {
             debug_assert!(
                 false,
@@ -4173,7 +4238,7 @@ pub(crate) fn render_frame(
                 slot,
                 pipes.shadowed_proxy.as_ref(),
                 pipes.proxy.as_ref(),
-                pipes.skinned.as_ref(),
+                ctx.skinned_retained.as_ref(),
                 proxy,
             );
         }
@@ -4754,13 +4819,18 @@ fn recreate_swapchain(
             replacement.destroy(ctx);
             return Err(error);
         }
-        // The Era-2 companion: a populated renderer's SKINNED state
-        // must likewise exist on the replacement BEFORE installation
-        // (the same finding-A discipline — the replacement's skinned
-        // pipeline renders inside the replacement's own render pass,
-        // and its draws read the same lazily-created pose buffer and
-        // skinned sets; a half-installed state must never draw
-        // through null handles).
+        // The Era-2 companion: a populated renderer's SKINNED
+        // pipelines must likewise exist on the replacement BEFORE
+        // installation (the same finding-A discipline — the
+        // replacement's skinned pipeline renders inside the
+        // replacement's own render pass; a half-installed state must
+        // never draw through null handles). The ownership transfer
+        // halves the cost: the PASS-INDEPENDENT resources (pose
+        // storage, pool, sets, pipeline layout) live on the context
+        // and are INHERITED — this ensure is a no-op for them (their
+        // counters stay flat across the replacement, the lifecycle
+        // gates' pin) — so only the replacement's main-pass pipeline
+        // rebuilds here.
         if pipes.skinned.is_some()
             && let Err(error) = replacement.ensure_skinned_resources(ctx)
         {
