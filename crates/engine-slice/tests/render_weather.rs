@@ -185,6 +185,110 @@ fn rain_ink_count_gate() {
     );
 }
 
+/// THE BROADSIDE INK GATE AT THE PRESENTATION EXTENT (the
+/// implementation seat's strengthening fold-in — the mining source
+/// era2/pc-impl-seat-stage45's presentation-extent gate, adapted to
+/// this harness): the PIXEL metric (not bytes — a changed pixel
+/// counts once however many of its channels moved) over the FULL
+/// 1280×720 extent, a 60-frame steady-state campaign (the field at
+/// its census equilibrium, not the 8-frame fresh capture), the dry
+/// campaign's own double-run as the baseline discipline, and THE
+/// SKY-REGION CHECK — the fixed upper-third rectangle must carry a
+/// majority of the ink (rain falls IN FRONT of the background: the
+/// depth interaction's visible half; a depth-write regression that
+/// punches streak holes, or a billboard regression that turns them
+/// edge-on, collapses this count long before the total).
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe)"]
+fn rain_ink_broadside_at_presentation_extent() {
+    let _guard = sdl_lock();
+    let (_app, mut renderer) = app_and_renderer("rain broadside ink gate");
+    let (matrix, yaw) = gate_matrix();
+    let light = day_preset();
+
+    // The dry baseline, double-run (byte-identical — the baseline
+    // discipline).
+    renderer.set_proxy_draw_mode(ProxyDrawMode::Instanced);
+    let dry = {
+        let pop = rainless();
+        for _ in 0..60 {
+            renderer
+                .render_corner_populated(&matrix, GATE_EYE, light, &pop, SIZE)
+                .unwrap();
+        }
+        renderer.request_frame_capture().unwrap();
+        assert!(
+            renderer
+                .render_corner_populated(&matrix, GATE_EYE, light, &pop, SIZE)
+                .unwrap()
+                .presented
+        );
+        renderer.take_frame_capture().unwrap().unwrap()
+    };
+    let dry_repeat = {
+        let pop = rainless();
+        for _ in 0..60 {
+            renderer
+                .render_corner_populated(&matrix, GATE_EYE, light, &pop, SIZE)
+                .unwrap();
+        }
+        renderer.request_frame_capture().unwrap();
+        assert!(
+            renderer
+                .render_corner_populated(&matrix, GATE_EYE, light, &pop, SIZE)
+                .unwrap()
+                .presented
+        );
+        renderer.take_frame_capture().unwrap().unwrap()
+    };
+    assert_eq!(
+        dry.bytes, dry_repeat.bytes,
+        "the dry campaign's double-run is byte-identical"
+    );
+
+    // The raining campaign: the 60-frame steady state.
+    let raining = raining_capture(&mut renderer, &matrix, yaw, light, 60);
+
+    // The pixel metric: 4-byte pixels, a pixel counts once when any
+    // of its bytes moved. MEASURED on this pod's lavapipe (pinned in
+    // the asserts below from the run's own print).
+    assert_eq!(dry.bytes.len(), raining.bytes.len());
+    let (width, height) = (SIZE.0 as usize, SIZE.1 as usize);
+    let mut ink = 0usize;
+    let mut sky_ink = 0usize;
+    let sky_pixels = width * height / 3;
+    for (index, (a, b)) in dry.bytes.chunks(4).zip(raining.bytes.chunks(4)).enumerate() {
+        if a != b {
+            ink += 1;
+            if index < sky_pixels {
+                sky_ink += 1;
+            }
+        }
+    }
+    println!(
+        "rain broadside ink: {ink} pixels of {} changed ({sky_ink} in the sky region)",
+        width * height
+    );
+    // MEASURED on this pod's lavapipe, this tree, this campaign:
+    // 1660 pixels total, 1350 in the sky region (the deterministic
+    // campaign's own bytes — the double-run discipline pins the
+    // count). The floors hold wide margins below the measurement
+    // (28% / 33%) while sitting ~7x above the collapsed state (the
+    // edge-on billboard regression measures ~164 pixels — the
+    // mining source's 8-frame fresh-capture gate); the mining
+    // source's own vantage measured 2476/2187.
+    assert!(
+        ink > 1_200,
+        "broadside rain coverage: {ink} changed pixels at the presentation extent \
+         (measured 1660 at the steady state; the edge-on collapse measures ~164)"
+    );
+    assert!(
+        sky_ink > 900,
+        "the sky region carries {sky_ink} of the ink (measured 1350 — rain falls \
+         in front of the background)"
+    );
+}
+
 /// THE WARMED RAINING ALLOCATION CONSTANCY: both counters —
 /// `renderer.allocations()` constant AND the host-allocation
 /// counter zero — across ≥8 warmed raining frames, with ≥3

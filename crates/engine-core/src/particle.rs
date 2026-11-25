@@ -1000,4 +1000,67 @@ mod tests {
         assert_eq!(ra, rb, "the no-op refresh preserved the stream");
         assert_eq!(a.particles(), b.particles(), "particle states match");
     }
+
+    /// THE N-EMITTER COMPOSITION EQUIVALENCE GATE (the verifier
+    /// seat's open strengthening item — the retired plural core's
+    /// test 7, folded onto THIS API): four emitters (distinct seeds,
+    /// volumes, rates, lifetimes) ticked 128 ticks TOGETHER — in
+    /// fixed Vec order, the multi-emitter composition's shape — vs
+    /// each ALONE from fresh construction: byte-identical alive
+    /// prefixes, because every emitter owns its stream, accumulator,
+    /// and pool. This gate exists to catch any future shared-state
+    /// introduction (a shared RNG, a global spawn budget, or a
+    /// static accumulator would break it); the mining source is
+    /// era2/pc-wip-billboard-renderer's n_emitters_equivalence.
+    #[test]
+    fn n_emitters_compose_byte_identically_with_standalone() {
+        let configs: Vec<EmitterConfig> = (0..4usize)
+            .map(|i| {
+                let mut config = rain_like_campaign(0x100 + i as u64);
+                config.volume = SpawnVolume {
+                    min: [-20.0 + 10.0 * i as f32, 10.0 + i as f32, -4.0],
+                    max: [-12.0 + 10.0 * i as f32, 14.0 + i as f32, 4.0],
+                };
+                config.rate = [1.0, 2.5, 0.75, 3.7][i];
+                config
+            })
+            .collect();
+        let dt = 1.0 / 60.0;
+
+        // TOGETHER: the fixed-order composition (Vec order is part
+        // of the contract — the future multi-emitter demo's shape).
+        let mut together: Vec<Emitter> =
+            configs.iter().map(|c| Emitter::new(*c).unwrap()).collect();
+        for _ in 0..128 {
+            for emitter in &mut together {
+                let report = emitter.tick(dt);
+                assert!(
+                    report.overflow.is_none(),
+                    "the fixture's rates never saturate the pool"
+                );
+            }
+        }
+
+        // EACH ALONE: fresh construction, same campaign length.
+        for (i, config) in configs.iter().enumerate() {
+            let mut alone = Emitter::new(*config).unwrap();
+            for _ in 0..128 {
+                alone.tick(dt);
+            }
+            let composed = &together[i];
+            assert_eq!(
+                composed.active_count(),
+                alone.active_count(),
+                "emitter {i}: composed alive count == standalone alive count"
+            );
+            for (pa, pb) in composed.particles().iter().zip(alone.particles().iter()) {
+                assert_eq!(
+                    (pa.position, pa.velocity, pa.life),
+                    (pb.position, pb.velocity, pb.life),
+                    "emitter {i}: every alive particle byte-identical composed vs \
+                     standalone (own stream, own accumulator, own pool)"
+                );
+            }
+        }
+    }
 }

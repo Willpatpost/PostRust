@@ -69,11 +69,34 @@ impl Weather {
     }
 
     /// The rain weather state, the intensity clamped to [0, 1].
+    /// The RAW-state form: interpolation and blend code may feed it
+    /// any finite value (the clamp keeps the state well-formed).
+    /// POLICY data — author-supplied intensities — should use
+    /// [`Weather::rain_validated`] instead (the fail-closed house
+    /// form: a policy author's out-of-range value is a refusal, not
+    /// a silent clamp; the verifier seat's first-review note, folded
+    /// 2026-11-25).
     pub fn rain(intensity: f32) -> Self {
         Self {
             class: WeatherClass::Rain,
             intensity: intensity.clamp(0.0, 1.0),
         }
+    }
+
+    /// The rain weather state for POLICY data: the intensity must be
+    /// finite and inside [0, 1] — a typed refusal otherwise (never a
+    /// silent clamp hiding the caller's data error).
+    pub fn rain_validated(intensity: f32) -> Result<Self, &'static str> {
+        if !intensity.is_finite() {
+            return Err("the rain intensity must be finite");
+        }
+        if !(0.0..=1.0).contains(&intensity) {
+            return Err("the rain intensity must be inside [0, 1]");
+        }
+        Ok(Self {
+            class: WeatherClass::Rain,
+            intensity,
+        })
     }
 
     /// Whether it is raining.
@@ -364,5 +387,34 @@ mod tests {
             );
         }
         assert_eq!(emitter.overflow_total(), 0, "the happy path drops nothing");
+    }
+
+    /// The validated rain constructor: the fail-closed POLICY form
+    /// (the verifier seat's first-review note). In-range values
+    /// construct; non-finite and out-of-range values refuse typed.
+    #[test]
+    fn validated_rain_refuses_out_of_range_policy_data() {
+        assert!(Weather::rain_validated(0.0).is_ok());
+        assert!(Weather::rain_validated(1.0).is_ok());
+        assert!(Weather::rain_validated(0.5).is_ok());
+        assert_eq!(
+            Weather::rain_validated(f32::NAN).err(),
+            Some("the rain intensity must be finite")
+        );
+        assert_eq!(
+            Weather::rain_validated(f32::INFINITY).err(),
+            Some("the rain intensity must be finite")
+        );
+        assert_eq!(
+            Weather::rain_validated(-0.01).err(),
+            Some("the rain intensity must be inside [0, 1]")
+        );
+        assert_eq!(
+            Weather::rain_validated(1.01).err(),
+            Some("the rain intensity must be inside [0, 1]")
+        );
+        // The raw form still clamps (the interpolation/blend path).
+        assert_eq!(Weather::rain(1.5).intensity, 1.0);
+        assert_eq!(Weather::rain(-0.5).intensity, 0.0);
     }
 }
