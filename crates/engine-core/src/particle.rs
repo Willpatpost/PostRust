@@ -304,6 +304,29 @@ impl Emitter {
     /// PINNED INTEGRATION ORDER, the death test runs, and survivors
     /// compact stably into the prefix. The report must be observed.
     pub fn tick(&mut self, dt: f32) -> TickReport {
+        // The plain tick passes NO sink — zero allocation, always
+        // (the collect variant's Vec would allocate per death; the
+        // zero-allocation law holds on this, the production path).
+        self.tick_impl(dt, None)
+    }
+
+    /// One fixed-order tick, collecting deaths into the caller's
+    /// Vec.
+    ///
+    /// Identical semantics to `tick` (byte-identical stream, pool,
+    /// accumulator, compaction — the SAME internal implementation,
+    /// the shared `tick_impl`). The ONLY difference: each death is
+    /// pushed to `out` in SLOT ORDER just before the compaction
+    /// drop. The caller owns the Vec (the reused-scratch
+    /// discipline; `tick` allocates nothing).
+    pub fn tick_collecting_deaths(&mut self, dt: f32, out: &mut Vec<Particle>) -> TickReport {
+        self.tick_impl(dt, Some(out))
+    }
+
+    /// The shared tick core: `sink` collects the deaths (in slot
+    /// order, each pushed just before its compaction drop) when
+    /// `Some` — `tick` passes `None` and allocates NOTHING.
+    fn tick_impl(&mut self, dt: f32, mut sink: Option<&mut Vec<Particle>>) -> TickReport {
         let mut spawned: u32 = 0;
         let mut dropped: u32 = 0;
         self.spawn_accumulator += dt * self.config.rate;
@@ -342,6 +365,13 @@ impl Emitter {
             if !dead {
                 self.particles[write] = p;
                 write += 1;
+            } else {
+                // Death: the collector (when present) receives the
+                // particle just before the compaction drop — the
+                // kill-plane observation, in slot order.
+                if let Some(out) = sink.as_deref_mut() {
+                    out.push(p);
+                }
             }
         }
         self.active = write;
