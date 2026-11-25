@@ -62,7 +62,10 @@ pub use engine_core::diag::{Diagnostics, Level};
 pub use sdl3::keyboard::Keycode;
 pub use sdl3::mouse::MouseButton;
 
-pub use audio::{Audio, AudioStatus, CUES, Cue};
+pub use audio::{
+    Audio, AudioDevice, AudioError, AudioStatus, CUES, Cue, Listener, SOUND_CLASS_AMBIENCE,
+    SOUND_CLASS_FOOTSTEP,
+};
 
 /// The SDL3 version linked into this binary (the vendored build).
 pub fn linked_sdl_version() -> sdl3::version::Version {
