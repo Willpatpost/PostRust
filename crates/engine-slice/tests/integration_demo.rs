@@ -66,6 +66,7 @@ fn headless_options(dir: &TestDir, ticks: u64, action_at: Option<u64>) -> DemoOp
         action_at,
         poison_at_tick: None,
         abort_at_tick: None,
+        park_publication_at_tick: None,
         evidence: None,
         evidence_fail_writes: false,
         scenario: None,

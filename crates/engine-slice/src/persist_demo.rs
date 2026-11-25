@@ -195,6 +195,23 @@ pub struct DemoOptions {
     /// interrupted-run regressions.
     #[doc(hidden)]
     pub abort_at_tick: Option<u64>,
+    /// Test-only (the s6_soak late-window determinism seam — the
+    /// 2026-11-23 macOS flake's principled fix, CURRENT-STATUS §8):
+    /// park the I/O worker INSIDE the scripted publication's append
+    /// at this scenario tick — the publication is admitted and its
+    /// append job started (past the poison and cancellation
+    /// boundaries) but its store execution never begins, so nothing
+    /// of the transaction is durable. Paired with `--abort-after-
+    /// tick` past it, the hard exit lands with the publication
+    /// PROVABLY in flight on every runner — the deterministic
+    /// replacement for the flaky "the pure-sim ticks between always
+    /// outrun the fsync" timing assumption (a 726 ms runner stall
+    /// disproved it: run 45104773498 recovered at 3300 where the
+    /// test pins 3054). Never set by the binary's documented
+    /// surface; exposed through the hidden flag for the interrupted-
+    /// run regression only.
+    #[doc(hidden)]
+    pub park_publication_at_tick: Option<u64>,
     /// S6-C1 observational evidence collection (opt-in; `None` is the
     /// default — zero cost, zero behavior change): when set, the run
     /// carries a [`EvidenceCollector`] whose bounded non-blocking
@@ -917,6 +934,10 @@ pub struct PersistDemo {
     /// default — every hook is guarded, so an absent scenario is zero
     /// cost and zero behavior change).
     scenario: Option<SoakScenario>,
+    /// Test-only (the s6_soak late-window determinism seam — see
+    /// [`DemoOptions::park_publication_at_tick`]): the scenario tick
+    /// whose scripted publication parks the worker inside its append.
+    park_publication_at_tick: Option<u64>,
 }
 
 impl PersistDemo {
@@ -946,6 +967,7 @@ impl PersistDemo {
             confirmed_revision: None,
             evidence: None,
             scenario: None,
+            park_publication_at_tick: None,
         }
     }
 
@@ -956,6 +978,14 @@ impl PersistDemo {
     /// frame, so frame cadence cannot change logical behavior.
     pub fn attach_scenario(&mut self, scenario: SoakScenario) {
         self.scenario = Some(scenario);
+    }
+
+    /// Test-only (the s6_soak late-window determinism seam — see
+    /// [`DemoOptions::park_publication_at_tick`]): the scenario tick
+    /// whose scripted publication parks the worker inside its append.
+    #[doc(hidden)]
+    pub fn park_publication_at(&mut self, tick: u64) {
+        self.park_publication_at_tick = Some(tick);
     }
 
     /// The attached scenario driver (read-only; `None` when no
@@ -1293,6 +1323,27 @@ impl PersistDemo {
                     }
                 }
                 if step.fire_publication {
+                    // Test-only (the s6_soak late-window determinism
+                    // seam — DemoOptions::park_publication_at_tick):
+                    // arm the worker's append park BEFORE this
+                    // publication's append is submitted, so the job
+                    // the worker next dispatches parks INSIDE its
+                    // dispatch (past the poison and cancellation
+                    // boundaries, before any store execution) — the
+                    // publication admitted and started, nothing of
+                    // its transaction durable. The five ticks to the
+                    // paired hard exit provably need no blocking
+                    // worker dependency (the original test's own
+                    // passing state held the worker busy inside this
+                    // same append for the whole window — the fsync
+                    // always outlasted the pure-sim ticks), so the
+                    // parked case cannot deadlock: the exit kills
+                    // the parked worker with the process.
+                    if self.park_publication_at_tick == Some(step.scenario_tick) {
+                        self.session
+                            .fault_control()
+                            .set(crate::worker::WorkerFault::ParkExecutingAppend);
+                    }
                     self.publish();
                     if let Some(scenario) = self.scenario.as_mut() {
                         scenario.record_publication(step.scenario_tick);
@@ -3783,6 +3834,10 @@ pub fn run_persist_demo_headless(options: DemoOptions) -> Result<HeadlessReport,
             options.scenario_seed.unwrap_or(STAGE6_SCENARIO_SEED),
             demo.session().director().config().centers,
         ));
+    }
+    // The s6_soak late-window determinism seam (see DemoOptions).
+    if let Some(tick) = options.park_publication_at_tick {
+        demo.park_publication_at(tick);
     }
     let mut application_failure: Option<String> = None;
     for tick_index in 0..options.headless_ticks {

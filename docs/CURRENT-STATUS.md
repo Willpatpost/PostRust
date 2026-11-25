@@ -258,6 +258,31 @@ ARM64) with a five-job CI:
   ping-pong images (the shadow-map discipline) and NO per-frame
   uniforms (the PostParams block is extent-static), composes with
   every corner flag, and the postless path stays byte-identical.
+  The **shadowed-HDR populated variant** (`era2/shadowed-hdr-populated`,
+  2026-11-25 — Era-2 package 1's documented follow-up, landed): the
+  HDR scene pass's shadowed arm now draws the population through
+  the shadowed-populated state's lazily-ensured HDR pipeline
+  variants (`ShadowedProxyResources::ensure_hdr` — the same shader
+  modules, layouts, and sets as the main-pass pipelines, only the
+  HDR render pass differs; the `skinned.ensure_hdr` precedent,
+  per-frame idempotent so pipeline replacement re-ensures) —
+  closing the last corner-flag composition gap: `--corner
+  --populated --shadows --post` previously REFUSED on its first
+  frame ("populated route drew no proxy calls" — the HDR arm
+  passed `None` for the shadowed proxy pipelines and the
+  recorder's belt-check skipped the population; MEASURED on the
+  pod before the fix). The composition gate
+  (`shadowed_populated_composes_through_the_hdr_chain`,
+  render_post): the defect pin (2 draws), the presence ink (34166
+  bytes vs the unpopulated frame), the one-time populated
+  families' delta (6, 4, 16, 0) then constant with the warmed
+  frame byte-identical, and the decisive full-chain known answers
+  — a light-facing torso wall deep in a building's shadow
+  rendering exactly `albedo·ambient` through bloom+ACES (57,600
+  pixels, max 1/255) and the same wall in open sun rendering the
+  full lit equation (57,600 pixels, max 1/255; the equations
+  differ by 0.360 linear — the fixture pair discriminates both an
+  always-ambient and a map-ignoring pipeline).
   The Era-2 **animation + skinning + proxy-shadows package**
   (PR #33, MERGED 2026-11-24 — the owner's GO; the branch deleted on
   merge): the **deterministic animation core** (`animation.rs`
@@ -410,16 +435,30 @@ for the combined candidate.
 | **Combined** | **1903** | **1851** |
 
 The macOS job has its own partition. Main has two ignored tests and 33
-result lines. Heavy has thirty-two ignored tests and 62 result lines.
-The table is settled at the Era-2 package A part-6 tree
+result lines. Heavy has thirty-three ignored tests and 62 result lines.
+The table is settled at the shadowed-HDR populated-variant tree
+(`era2/shadowed-hdr-populated`, 2026-11-25, stacked on the part-6 tip
+— the composition gate): heavy **608 Linux MEASURED with the
+workflow's own awk on this exact tree** (608 passed / 33 ignored / 62
+result lines, zero failures — the part-6 settlement's counts with the
+ignored count 32 → 33 by the ONE new #[ignore]d render_post gate; the
+passed count and result lines UNCHANGED — the gate rides the existing
+binary); Windows 607 passed UNCHANGED with ignored 33 (the
+platform-uniform inference — the gate is lavapipe-class, executed by
+the Linux Post-gates step, ignored identically on both platforms; to
+be confirmed by this candidate's CI run, the count corrected from
+actuals on a mismatch, never a test weakened); main **1295/2/33
+MEASURED unchanged** (engine-renderer gains no lib tests); renderer
+release 160/2 UNCHANGED. The prior settlement, superseded: the
+Era-2 package A part-6 tree
 (`era2/npc-ai-measurement-surface`, 2026-11-25, stacked on part 5 — the
 measurement surface): heavy **608 Linux MEASURED with the workflow's own
-awk on this exact tree** (608 passed / 32 ignored / 62 result lines, zero
+awk on that tree** (608 passed / 32 ignored / 62 result lines, zero
 failures — the part-5 settlement's 603 plus the behavior_measurement
 battery's 5 platform-uniform engine-slice lib tests); Windows **607** =
-602 + the same 5, **CONFIRMED by this candidate's own CI run
+602 + the same 5, **CONFIRMED by that candidate's own CI run
 45587893215** (green on all five jobs — both heavy-shard exact-count
-gates enforced the measured counts); ignored 32 and result lines 62 UNCHANGED (lib
+gates enforced the measured counts); ignored 32 and result lines 62 (lib
 tests only, no new binaries — the benchmark flag is test-free harness
 code); main **1295/2/33 MEASURED unchanged** (engine-core untouched by
 part 6); renderer release 160/2 UNCHANGED. The prior settlements,
@@ -1148,20 +1187,38 @@ The following audit finding remains genuinely open:
 - The entity-scale benchmark's 5k/20k dead-chain read-through (§7): the
   historical at-scale evidence is one-1000-chain steady state.
 - **The s6_soak late-window fsync race (flake C, 2026-11-23, macOS run
-  45104773498):** `deterministic_late_window_hard_exit_control_recovers`
-  assumes the tick-3300 publication's WAL fsync cannot complete within
+  45104773498) — CLOSED 2026-11-25 (the
+  `corrective/s6-soak-late-window-seam` package):**
+  `deterministic_late_window_hard_exit_control_recovers`
+  assumed the tick-3300 publication's WAL fsync cannot complete within
   the five sim ticks before the controlled hard exit ("the pure-sim
   ticks between always outrun the fsync") — but a 726 ms runner stall
   on the sim path let the fsync land first (the campaign recovered at
   tick 3300, not the asserted 3054). A genuine wall-clock race in the
   test's SETUP, not an engine defect (recovery, conservation, and
-  close integrity all held). The principled fix — a test-only
-  fsync-timing control (a fault-seam delay in the journal path making
-  the in-flight state deterministic) — is an open engine-persist
-  package; until then the test may flake rarely on contended runners
-  (the third 2026-11-23 runner-timing flake; see
-  `docs/AUTONOMOUS-CYCLE-PROTOCOL.md` §3.1 for the rerun-once
-  protocol).
+  close integrity all held). **The principled fix LANDED** (the
+  shape §8 specified, one refinement: the seam sits at the demo's
+  publication boundary, not inside engine-persist — the worker's
+  EXISTING `ParkExecutingAppend` fault is the deterministic barrier,
+  so the production persistence stack is untouched): the demo's
+  hidden `--park-publication-at-tick` arms the I/O worker's append
+  park AT the scripted publication's own scenario tick (before its
+  append job is submitted), so the worker parks INSIDE the job's
+  dispatch — the publication admitted and started (past the poison
+  and cancellation boundaries), its store execution never begun,
+  nothing of its transaction durable — and the paired hard exit at
+  3305 kills the parked worker with the process. The in-flight state
+  is now PROVABLE on every runner (the safety argument: the
+  original test's own passing state held the worker busy inside
+  that same append for the whole 3301-3305 window — those five
+  ticks need no blocking worker dependency, so the parked case
+  cannot deadlock). The test's child arms the seam at 3300; the
+  3054 recovery and every close assertion unchanged; three
+  consecutive runs green on this pod (69.6/69.5/69.7 s) plus the
+  full s6_soak battery 34/34; no test-count movement anywhere (the
+  field/flag is test-free harness code). The rerun-once protocol
+  (AUTONOMOUS-CYCLE-PROTOCOL §3.1) remains for any OTHER runner
+  flake, but this one is retired by construction.
 - Sustained-load scale is QUALIFIED with composition-dependent
   interpretations (sustainable at 1k across scenarios; at 5k the full and
   mixed compositions genuinely overload the 200/tick budget while
@@ -1322,12 +1379,17 @@ rig commands — `cargo run -p engine-slice --release -- --corner
 --populated --shadows` and its `--free-look` variant walk the moving
 corner (24 NPCs, 16 walking at hand-spread phases, per-NPC soft
 shadows that walk with them, 2 sedans); the Era-1 rig-pending clauses
-above; the documented follow-ups (the shadowed-HDR variant — `--post`
-with `--populated --shadows` draws the proxies unshadowed-in-HDR, PR
-#33's body; the skinned family's pass-independent ownership transfer
+above; the documented follow-ups (~~the shadowed-HDR variant~~ —
+CLOSED 2026-11-25 by the `era2/shadowed-hdr-populated` package: the
+three-way `--post --populated --shadows` composition now works
+end-to-end, gated by the full-chain known answers — the rig command
+`--corner --populated --shadows --post` walks the HDR-shadowed
+corner, composing with `--behavior` and `--free-look`; the skinned family's pass-independent ownership transfer
 that would restore the flat replacement tuple — the
-renderer-architecture follow-up PR #33's body records; the s6_soak
-fsync-race test-only seam, §8); and the three documents' owner
+renderer-architecture follow-up PR #33's body records; ~~the s6_soak
+fsync-race test-only seam~~ — CLOSED 2026-11-25 by the
+`corrective/s6-soak-late-window-seam` package, §8's record); and the
+three documents' owner
 decisions (the NPC AI design pass's unratified boundaries, T-06's
 physics middleware recommendation awaiting ratification in
 `docs/DECISIONS.md`, the audio subsystem map's groundwork
@@ -1455,6 +1517,94 @@ workload's stream digest (12_420_752_226_621_264_573) and the
 witness census digest (16_487_293_382_058_425_681), both baked from
 measured runs stable across independent executions. The design
 pass's §9 open-questions list still awaits the owner.
+
+**The shadowed-HDR populated variant (2026-11-25, the follow-on
+session's package — Era-2 package 1's documented follow-up closed,
+branch `era2/shadowed-hdr-populated`, stacked on the part-6 tip):**
+the last corner-flag composition gap. The defect, MEASURED before
+the fix on the pod's lavapipe: `--corner --populated --shadows
+--post` REFUSED on its first frame — "error: populated route drew
+no proxy calls" — because the post chain's HDR scene pass passed
+`None` for the shadowed proxy pipelines (PR #33's documented
+follow-up; its body's "draws the proxies unshadowed-in-HDR"
+understated the shipped behavior — the recorder's belt-check
+skipped the population entirely and the demo's fail-visible
+populated-route check errored the route). The fix, the
+`SkinnedProxyResources::ensure_hdr` precedent: two lazily-created
+HDR pipeline variants on the shadowed-populated state (the same
+shader modules, pipeline layouts, and descriptor sets as the
+main-pass receiving pipelines — only the HDR render pass differs,
+so the one-time cost is two pipeline objects, invisible to
+AllocationStats), ensured in the frame flow's post family-growth
+block at the first populated shadowed post frame (per-frame
+idempotent — the pipeline-replacement path re-ensures against the
+new pass, the finding-A discipline), supplied through the HDR
+scene pass's `SceneTargetPipelines` (the recorder's belt-check
+stays as the lazy-window guard, the sky_hdr shape). The gate
+(`shadowed_populated_composes_through_the_hdr_chain`, the heavy
+shard's ignored 32 → 33): the defect pin (the full 24+2 rest table
+through the three-way path, 2 draws), the presence ink (34,166
+bytes vs the unpopulated shadowed frame), the one-time
+populated-families' delta (6 device_memory / 4 pools / 16 sets / 0
+samplers — the instance buffer + the two mesh VBOs + their staging
+memories + the pose storage; the skinned pool + the
+shadowed-populated state's three; the 3 + 13 sets) then CONSTANT
+across warmed composed frames with the warmed frame
+byte-identical, and the decisive full-chain known answers — a
+light-facing NPC torso wall (the rotated-oracle orientation, N·L ≈
+0.707) placed by deterministic CPU search DEEP inside a building's
+shadow (the raycaster verifying five probes + ±0.3 m margins, the
+footprint and camera corridor clear) rendering EXACTLY
+`albedo·ambient` through the bloom + ACES chain (57,600 pixels,
+max 1/255), and the same wall in open sun rendering the FULL lit
+equation (57,600 pixels, max 1/255 — no self-shadow acne: the
+wall's self-depth-plus-bias compare holds exactly as the 6-F lit
+ground patches prove, at the same light-space slope); the two
+equations differ by 0.360 linear at the wall center, so the
+fixture pair discriminates both an always-ambient and a
+map-ignoring pipeline. Every existing gate re-fired green
+(render_post 6/6, render_shadows 4/4, render_instanced 7/7 — the
+postless paths byte-identical); the routes ran end-to-end
+(`--populated --shadows --post`: 601 frames, 0/0 validation; the
+composed `--behavior` variant: 99 wakes / 25 arrivals, part 5's
+pins reproducing); main 1295/2/33 MEASURED unchanged, heavy
+608/33/62 MEASURED with the workflow's own awk (the ignored pin
+corrected from the measured actual). The implementation went to
+the coder subagent (the mission's delegation rule) and its round's
+audit found the decisive fixtures missing (the spec's text pasted
+as comments — the overclaim class PR #38 records); the home team
+implemented the fixtures and repaired the round's working halves
+(the hand-rolled bias copy → the demo's own `demo_bias()`, the
+allocation delta re-measured and re-pinned from (3,3,16,1) to the
+actual (6,4,16,0) with the staging-memory decomposition).
+
+**The s6_soak late-window seam (2026-11-25, the follow-on package —
+§8's open flake fix closed, branch
+`corrective/s6-soak-late-window-seam`, stacked on the shadowed-HDR
+tip):** the third recorded 2026-11-23 runner-timing flake retired by
+construction. The demo's hidden `--park-publication-at-tick <t>`
+(#[doc(hidden)], the `--abort-after-tick`/`--poison-at-tick`
+precedent — engine-slice's demo-layer seam class, not the B4
+crossing's cfg-gated statics) arms the I/O worker's EXISTING
+`ParkExecutingAppend` fault at the scripted publication's own
+scenario tick, just before its append job is submitted: the worker
+parks inside the job's dispatch (admitted and started, past the
+poison and cancellation boundaries, no store execution — nothing
+of the transaction durable), and the paired hard exit kills the
+parked worker with the process. The production persistence stack is
+untouched (the fix's one refinement over §8's sketched shape: the
+seam sits at the demo's publication boundary, not inside
+engine-persist — the barrier machinery already existed in the
+worker). The §7D control test arms it at 3300; the 3054 recovery
+and every close assertion unchanged; MEASURED on this pod: three
+consecutive green runs (69.6/69.5/69.7 s — the determinism proof)
+plus the full s6_soak battery 34/34, fmt/clippy clean, the main
+shard 1295/2/33 unchanged, and NO count movement anywhere (the
+field/flag is test-free harness code; no workflow pin touched).
+The transcription round went to the coder subagent (the mission's
+delegation rule) and verified clean against the spec on the first
+read — including the one construction site the orchestrator's own
+pre-check missed (s6_evidence.rs).
 
 ## 10. The authoritative coordination ledger
 

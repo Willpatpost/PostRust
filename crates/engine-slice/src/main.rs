@@ -407,6 +407,7 @@ fn main() {
             action_at: None,
             poison_at_tick: None,
             abort_at_tick: None,
+            park_publication_at_tick: None,
             evidence: None,
             evidence_fail_writes: false,
             scenario: None,
@@ -445,6 +446,14 @@ fn main() {
                         && let Ok(tick) = value.parse::<u64>()
                     {
                         options.abort_at_tick = Some(tick);
+                        index += 1;
+                    }
+                }
+                "--park-publication-at-tick" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Ok(tick) = value.parse::<u64>()
+                    {
+                        options.park_publication_at_tick = Some(tick);
                         index += 1;
                     }
                 }

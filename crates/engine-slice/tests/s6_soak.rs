@@ -115,6 +115,7 @@ fn scenario_options(dir: &TestDir, scenario: SoakScenarioId, seed: Option<u64>) 
         action_at: None,
         poison_at_tick: None,
         abort_at_tick: None,
+        park_publication_at_tick: None,
         evidence: None,
         evidence_fail_writes: false,
         scenario: Some(scenario),
@@ -1004,6 +1005,8 @@ fn deterministic_late_window_hard_exit_control_recovers() {
             "--headless",
             "--scenario",
             "stage6-v1",
+            "--park-publication-at-tick",
+            "3300",
             "--abort-after-tick",
             "3305",
         ])
@@ -1036,13 +1039,23 @@ fn deterministic_late_window_hard_exit_control_recovers() {
         relaunch.status.code()
     );
     assert!(stdout.contains("campaign: recovered"), "{stdout}");
-    // Deterministic on every platform: the tick-3300 scripted
-    // publication is still IN FLIGHT (admitted, its WAL fsync not
-    // yet committed) when the hard exit at 3305 lands — the pure-sim
-    // ticks between always outrun the fsync — so the newest LANDED
-    // snapshot is the action's tick-3054 publication, which
-    // post-dates the region-0 deactivations (the episode filter
-    // skips them: the passing path, unchanged by the corrective).
+    // Deterministic on every platform (the 2026-11-23 macOS flake's
+    // principled fix, CURRENT-STATUS §8): the tick-3300 scripted
+    // publication is parked INSIDE its append job — admitted and
+    // started (past the poison and cancellation boundaries), its
+    // store execution never begun — so nothing of its transaction is
+    // durable when the hard exit at 3305 lands (the worker's
+    // ParkExecutingAppend fault, armed at the publication's own
+    // scenario tick through the hidden demo seam). The original
+    // timing assumption ("the pure-sim ticks between always outrun
+    // the fsync") was a wall-clock race in the test's SETUP — a
+    // 726 ms runner stall on the sim path let the fsync land first
+    // (run 45104773498: recovered at 3300 where this pins 3054);
+    // the parked barrier replaces it with the deterministic
+    // in-flight state. The five ticks to the exit provably need no
+    // blocking worker dependency — the original passing state held
+    // the worker busy inside this same append for the whole window —
+    // so the parked case cannot deadlock.
     assert!(stdout.contains("recovered at tick 3054"), "{stdout}");
     assert!(
         stdout.contains("closed at tick 3084 · ticks due 3084 · outstanding 0 · conservation true"),
