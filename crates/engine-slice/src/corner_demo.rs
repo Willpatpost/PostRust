@@ -5,6 +5,11 @@ use crate::corner_population::Block;
 use crate::frame_timing::FrameTiming;
 use crate::math::{Mat4, camera_forward, camera_right, camera_view, mul, percentile, perspective};
 use crate::render_demo::free_flight_look_delta;
+use engine_core::audio_triggers::{
+    ActivityObservation, ClassMapping, SoundEmitter, SoundTrigger, project_triggers,
+};
+use engine_core::lod::LodLevel;
+use engine_core::npc_behavior::NpcId;
 use engine_core::timing::TimingSamples;
 use engine_renderer::config::FRAMES_IN_FLIGHT;
 use engine_renderer::lit_scene::{
@@ -14,7 +19,10 @@ use engine_renderer::{
     AllocationStats, DemoScenePreference, PresentModePreference, ProxyDrawMode, RenderConfig,
     Renderer, ValidationPreference,
 };
-use engine_shell::{DriverPreference, Keycode, ShellApp, ShellConfig, pace_until};
+use engine_shell::{
+    AudioDevice, AudioError, DriverPreference, Keycode, Listener, SOUND_CLASS_FOOTSTEP, ShellApp,
+    ShellConfig, pace_until,
+};
 use std::time::{Duration, Instant};
 
 const STEPS: usize = 120;
@@ -27,6 +35,30 @@ const WARMUP: usize = 60;
 /// policy.
 const NPC_MATERIAL: u32 = 1;
 const VEHICLE_MATERIAL: u32 = 2;
+
+/// The demo's walking activity class — POLICY vocabulary on the
+/// demo's side of the trigger projection's engine/policy boundary:
+/// one walking NPC's one footstep (the observation carries it; the
+/// mapping below projects it onto the device layer's footstep sound
+/// class).
+const WALKING_ACTIVITY_CLASS: u32 = 1;
+
+/// The demo's class mapping table (POLICY data above the engine's
+/// projection): the walking activity class projects onto the SDL3
+/// device layer's [`SOUND_CLASS_FOOTSTEP`].
+const AUDIO_CLASS_MAPPINGS: [ClassMapping; 1] = [ClassMapping {
+    activity_class: WALKING_ACTIVITY_CLASS,
+    sound_class: SOUND_CLASS_FOOTSTEP,
+}];
+
+/// The footstep interval (seconds per step). PRESENTATION-SIDE
+/// timing, NOT deterministic state: which footstep fires when is the
+/// audible rendering's business (the audio map's constraint 1.1:
+/// "the audible rendering is outside the contract") — this constant
+/// and the accumulator it drives never enter the spine, a
+/// fingerprint, or a measured claim. 0.65 s is a reasonable walk
+/// cadence at the crowd's strolling speeds.
+const AUDIO_STEP_INTERVAL: f32 = 0.65;
 
 /// The rendering bridge's per-frame crowd state: the routes, states,
 /// and mask from `corner_population_locomotion`, the RETAINED instance
@@ -202,6 +234,18 @@ impl LocomotionCrowd {
             npc_material: NPC_MATERIAL,
             vehicle: &self.vehicles,
             vehicle_material: VEHICLE_MATERIAL,
+        }
+    }
+
+    /// The crowd's CURRENT locomotion states — the same states the
+    /// rendering bridge re-packs into the instance buffer each step:
+    /// the local table in the plain mode, the spine world's in the
+    /// composed mode (the states live IN the world when behavior is
+    /// on; borrow them out the same way `step_composed` does).
+    fn states(&self) -> &[engine_core::npc_locomotion::NpcLocomotion] {
+        match &self.spine {
+            Some(spine) => &spine.world().states,
+            None => &self.states,
         }
     }
 }
@@ -457,6 +501,7 @@ pub fn demo_bias() -> engine_renderer::shadows::ShadowBias {
 // the post chain by one bool (its own setting is data-free — the
 // sticky renderer flag is the whole mode).
 // The behavior spine adds one more flag; the union stays at 8 args.
+// Era 2 package B part 3's audio flag adds one more bool (9).
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     night: bool,
@@ -473,6 +518,7 @@ pub fn run(
     post: bool,
     wet: bool,
     behavior: bool,
+    audio: bool,
 ) -> Result<(), String> {
     let mut app = ShellApp::new(ShellConfig {
         title: "One Corner of the City".into(),
@@ -678,6 +724,7 @@ pub fn run(
             day_night,
             options,
             pace,
+            audio,
         );
     }
     let mut poses = route_poses().peekable();
@@ -828,6 +875,7 @@ fn run_free_look(
     day_night: Option<f32>,
     options: FreeLookOptions,
     pace: Option<Duration>,
+    audio: bool,
 ) -> Result<(), String> {
     // Relative mouse capture is the mouse-look contract: the shell
     // collects deltas only while captured (and clears them on focus
@@ -838,6 +886,49 @@ fn run_free_look(
          starts on the route's entry waypoint, clamped to the scene's world AABB; \
          no measurement series (the scripted route's print without --free-look)"
     );
+    // Era 2 package B part 3: the SDL3 audio device layer behind the
+    // walking crowd. LAZY (constructed here, on first audio use —
+    // never at startup) and DEGRADING: the typed [`AudioError`]
+    // refusals are printed silence, never an error — the frame path
+    // continues without sound (audio is never a prerequisite; the
+    // shell's dummy-driver precedent).
+    let mut audio_device: Option<AudioDevice> = if audio {
+        match AudioDevice::try_new(app.platform()) {
+            Ok(device) => {
+                println!(
+                    "audio: device opened ({} / {})",
+                    device.driver(),
+                    device.device_name()
+                );
+                Some(device)
+            }
+            Err(AudioError::NoDevice) => {
+                println!("audio: no device (typed silence — the frame path continues)");
+                None
+            }
+            Err(AudioError::StreamOpen(reason)) => {
+                println!(
+                    "audio: the stream refused to open ({reason}) — typed silence, \
+                     the frame path continues"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // The per-NPC step accumulator (fixed [f32; 24] — the crowd's NPC
+    // count). PRESENTATION-SIDE timing, NOT deterministic state:
+    // which footstep fires when is the audible rendering's business
+    // (the audio map's constraint 1.1: "the audible rendering is
+    // outside the contract") — this array never enters the spine, a
+    // fingerprint, or a measured claim.
+    let mut step_accumulators = [0.0_f32; 24];
+    // The observation/trigger buffers, retained across frames (zero
+    // allocation after the first audio frame — the crowd's own
+    // retained-buffer discipline).
+    let mut observations: Vec<ActivityObservation> = Vec::new();
+    let mut triggers: Vec<SoundTrigger> = Vec::new();
     let mut camera = FreeLookCamera::at_waypoint(camera_route()[0]);
     let mut timing = FrameTiming::new();
     let mut presented: u64 = 0;
@@ -944,6 +1035,70 @@ fn run_free_look(
         if let Some(crowd) = crowd.as_mut() {
             crowd.step();
         }
+        // Era 2 package B part 3 — THE AUDIBLE CROWD (after the
+        // composed tick, presentation-side): the walking NPCs'
+        // footsteps through the trigger projection into the SDL3
+        // device layer, and the listener from the camera's own pose.
+        // Skipped identically to the tick above (a frame that steps
+        // nothing accumulates nothing — feet only move on presented
+        // frames).
+        if let (Some(audio), Some(crowd)) = (audio_device.as_mut(), crowd.as_ref()) {
+            observations.clear();
+            // The step accumulator: each WALKING NPC (speed > 0 from
+            // the crowd states — the same states the rendering bridge
+            // re-packs) accumulates the tick's own dt (the
+            // deterministic 1/60 the crowd stepped, so footsteps stay
+            // in lockstep with the visible walking — never the wall
+            // clock, which uncapped presentation decouples); past the
+            // step interval one footstep observation fires and the
+            // accumulator resets. A standing NPC resets (no
+            // half-steps carry across a stand).
+            for (i, state) in crowd.states().iter().enumerate() {
+                if state.speed > 0.0 {
+                    step_accumulators[i] += 1.0 / 60.0;
+                    if step_accumulators[i] >= AUDIO_STEP_INTERVAL {
+                        step_accumulators[i] = 0.0;
+                        observations.push(ActivityObservation {
+                            emitter: SoundEmitter::Npc(NpcId(i as u32)),
+                            activity_class: WALKING_ACTIVITY_CLASS,
+                            // The instance position — the same
+                            // [x, 0.02, z] the rendering bridge reads.
+                            position: crowd.instances[i].transform.pos,
+                            // Free-look is the near field: the Full
+                            // LOD tier projects.
+                            tier: LodLevel::Full,
+                        });
+                    }
+                } else {
+                    step_accumulators[i] = 0.0;
+                }
+            }
+            // The projection (the pure trigger core) then the device
+            // submission. The typed overflow refusal is observed
+            // fail-visibly — unreachable at the crowd's 24-NPC scale
+            // against the 64-trigger pool bound, but never swallowed.
+            if let Err(overflow) =
+                project_triggers(&observations, &AUDIO_CLASS_MAPPINGS, &mut triggers)
+            {
+                println!(
+                    "audio: trigger pool overflow ({} dropped — fail-visible)",
+                    overflow.dropped
+                );
+            }
+            audio.submit_triggers(&triggers);
+            // The listener: the camera's own basis — camera_forward/
+            // camera_right are the rotation matrix's columns, so they
+            // arrive pre-normalized and orthogonal (the Listener
+            // contract); the falloff is the slice's spatial policy
+            // (reference distance 4, rolloff 1).
+            audio.set_listener(Listener {
+                position: camera.position,
+                forward: camera_forward(camera.yaw, camera.pitch, 0.),
+                right: camera_right(camera.yaw, camera.pitch, 0.),
+                ref_distance: 4.0,
+                rolloff: 1.0,
+            });
+        }
         presented += 1;
         if presented == WARMUP as u64 {
             warm = Some(renderer.allocations());
@@ -983,6 +1138,23 @@ fn run_free_look(
             "Vulkan allocations: {:?} (no warmed-constancy claim: the session resized or never warmed)",
             renderer.allocations()
         ),
+    }
+    // Era 2 package B part 3: the audio exit summary — the
+    // fail-visible counters (§4's gates) plus the counted residency,
+    // only when the device opened (the silent degradations printed
+    // their reason at construction and carry nothing further).
+    if let Some(audio) = &audio_device {
+        let stats = audio.stats();
+        println!(
+            "audio: underruns {}, worst callback {} ns, voices active {}, \
+             voices stolen {}, triggers dropped {}; residency {} bytes",
+            stats.underruns,
+            stats.worst_callback_ns,
+            stats.voices_active,
+            stats.voices_stolen,
+            stats.triggers_dropped,
+            audio.residency_bytes()
+        );
     }
     Ok(())
 }
