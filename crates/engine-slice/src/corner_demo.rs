@@ -34,6 +34,16 @@ const VEHICLE_MATERIAL: u32 = 2;
 /// palette, the RETAINED pose buffer, and the (unchanged) vehicle
 /// table. `step` advances one deterministic 1/60 tick and re-evaluates
 /// both buffers — zero allocation after the first frame.
+///
+/// When behavior is on, the crowd holds the `Spine<CornerCrowdWorld>`
+/// (constructed once: `corner_population_locomotion()` → the world
+/// takes the states/present, the crowd keeps the routes; the 24 first
+/// wakes armed at construction) and `step()` becomes the composed tick:
+/// `spine.run_tick()` then `world.composed_tick(1/60)` then the
+/// instance/pose re-packs (the states now live IN the world — borrow
+/// them out: `spine.world().states`). Render-then-step, frame 0 =
+/// part 4's construction (byte-identical — the composed mode's first
+/// frame equals the plain populated mode's first frame; documented).
 struct LocomotionCrowd {
     routes: Vec<engine_core::npc_locomotion::Route>,
     states: Vec<engine_core::npc_locomotion::NpcLocomotion>,
@@ -42,9 +52,12 @@ struct LocomotionCrowd {
     tints: [[f32; 3]; 24],
     poses: Vec<Block>,
     vehicles: Vec<engine_renderer::proxy_instances::ProxyInstance>,
+    /// When behavior is on, the behavior spine and world.
+    spine: Option<engine_core::spine::Spine<crate::corner_behavior::CornerCrowdWorld>>,
 }
 
 impl LocomotionCrowd {
+    /// The plain (non-behavior) constructor.
     fn new() -> Self {
         let (routes, states, present) = crate::corner_routes::corner_population_locomotion();
         let tints = crate::corner_population::corner_npc_tints();
@@ -73,10 +86,76 @@ impl LocomotionCrowd {
             tints,
             poses,
             vehicles,
+            spine: None,
         }
     }
 
-    fn step(&mut self) {
+    /// The behavior spine constructor: the 24 schedules/routines/rngs,
+    /// the locomotion states and present mask from part 4's constructor,
+    /// and the routes (cloned once at construction). The 40 initial wake
+    /// events are armed at construction.
+    fn with_behavior() -> Self {
+        let (routes, states, present) = crate::corner_routes::corner_population_locomotion();
+        let tints = crate::corner_population::corner_npc_tints();
+        let mut instances = Vec::with_capacity(24);
+        instances.resize(
+            24,
+            engine_renderer::proxy_instances::ProxyInstance {
+                transform: engine_renderer::proxy_instances::InstanceTransform {
+                    pos: [0.0, 0.0, 0.0],
+                    turn: 0,
+                    scale: 0.0,
+                },
+                tint: [0.0, 0.0, 0.0],
+                pose_index: 0,
+            },
+        );
+        crate::corner_routes::corner_instances_into(&states, &tints, &mut instances);
+        let mut poses = Vec::new();
+        crate::corner_routes::evaluate_population_poses_locomotion(&states, &mut poses);
+        let (_, vehicles) = crate::corner_population::corner_population();
+
+        // Build the behavior world with the 64/near32 reservation.
+        let world = crate::corner_behavior::CornerCrowdWorld::new(states.clone(), present.clone());
+        let mut spine = engine_core::spine::Spine::with_reservation(world, 64, 32);
+
+        // Arm EVERY schedule entry at its own first occurrence.
+        let world = spine.world();
+        let mut specs: Vec<engine_core::event::EventSpec> = Vec::new();
+        for npc in 0..24 {
+            let schedule = &world.schedules[npc];
+            for (entry_idx, entry) in schedule.entries.iter().enumerate() {
+                let payload =
+                    engine_core::npc_execution::wake_payload(npc as u32, entry_idx as u32)
+                        .expect("the entry index packs");
+                specs.push(engine_core::event::EventSpec {
+                    class: crate::corner_behavior::WAKE_CLASS,
+                    schedule: engine_core::event::Schedule::AtLogicalTime { due: entry.start },
+                    payload,
+                    field: entry.activity.field,
+                    depends_on: Vec::new(),
+                });
+            }
+        }
+        let _ = world;
+        for spec in specs {
+            spine.schedule(spec).expect("arming is legal");
+        }
+
+        LocomotionCrowd {
+            routes,
+            states,
+            present,
+            instances,
+            tints,
+            poses,
+            vehicles,
+            spine: Some(spine),
+        }
+    }
+
+    /// The plain step: batch, instances, poses.
+    fn step_plain(&mut self) {
         engine_core::npc_locomotion::advance_batch(
             &self.routes,
             &mut self.states,
@@ -88,6 +167,32 @@ impl LocomotionCrowd {
         );
         crate::corner_routes::corner_instances_into(&self.states, &self.tints, &mut self.instances);
         crate::corner_routes::evaluate_population_poses_locomotion(&self.states, &mut self.poses);
+    }
+
+    /// The composed step: spine.run_tick() then composed_tick() then
+    /// instances/poses re-packs (borrow states from the world).
+    fn step_composed(&mut self) {
+        let spine = self.spine.as_mut().expect("behavior spine exists");
+        spine.run_tick();
+        let world = spine.world_mut();
+        let dt = 1.0 / 60.0;
+        world.composed_tick(dt);
+        // Borrow states from the world and re-pack instances/poses.
+        crate::corner_routes::corner_instances_into(
+            &world.states,
+            &self.tints,
+            &mut self.instances,
+        );
+        crate::corner_routes::evaluate_population_poses_locomotion(&world.states, &mut self.poses);
+    }
+
+    /// One step: plain or composed depending on behavior flag.
+    fn step(&mut self) {
+        if self.spine.is_some() {
+            self.step_composed();
+        } else {
+            self.step_plain();
+        }
     }
 
     fn population(&self) -> engine_renderer::ProxyPopulation<'_> {
@@ -351,6 +456,7 @@ pub fn demo_bias() -> engine_renderer::shadows::ShadowBias {
 // the sky layer by one bool, the day/night cycle by one Option, and
 // the post chain by one bool (its own setting is data-free — the
 // sticky renderer flag is the whole mode).
+// The behavior spine adds one more flag; the union stays at 8 args.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     night: bool,
@@ -366,6 +472,7 @@ pub fn run(
     day_night: Option<f32>,
     post: bool,
     wet: bool,
+    behavior: bool,
 ) -> Result<(), String> {
     let mut app = ShellApp::new(ShellConfig {
         title: "One Corner of the City".into(),
@@ -393,7 +500,21 @@ pub fn run(
     // crowd after k batch ticks at DEMO_CLOCK_HZ (render-then-step —
     // frame 0 is the construction; the day/night cycle's own
     // deterministic-clock precedent).
-    let mut crowd = populated.then(LocomotionCrowd::new);
+    //
+    // When behavior is on, the crowd holds the `Spine<CornerCrowdWorld>`
+    // (constructed once: `corner_population_locomotion()` → the world
+    // takes the states/present, the crowd keeps the routes; the 40
+    // initial wake events armed at construction) and `step()` becomes
+    // the composed tick: `spine.run_tick()` then `world.composed_tick(1/60)`
+    // then the instance/pose re-packs (the states now live IN the world).
+    let mut crowd = populated.then(|| {
+        if behavior {
+            println!("behavior spine composed: 24 schedules, the commitment wakes drive the crowd");
+            LocomotionCrowd::with_behavior()
+        } else {
+            LocomotionCrowd::new()
+        }
+    });
     // The submission mode, in evidence order: the per-object
     // reference (one draw per instance — the pre-6-E shape, the
     // before/after measurement mode), the direct 6-E instanced
@@ -499,6 +620,12 @@ pub fn run(
             crate::corner_population::WALK_STRIDE_SECONDS,
             crate::corner_population::DEMO_CLOCK_HZ
         );
+        if crowd.spine.is_some() {
+            println!(
+                "behavior spine composed: 24 schedules, the commitment wakes drive the crowd \
+                 (the exit summary carries the counts)"
+            );
+        }
         println!(
             "proxy population: {} instances ({} npc + {} vehicle), {} draw calls per frame ({})",
             crowd.instances.len() + crowd.vehicles.len(),
@@ -661,6 +788,15 @@ pub fn run(
         "{WARMUP} warmup + {count} route frames + {lag} timestamp drain; validation warnings/errors {}/{}",
         stats.validation_warnings, stats.validation_errors
     );
+    if let Some(crowd) = &crowd
+        && let Some(spine) = &crowd.spine
+    {
+        let world = spine.world();
+        println!(
+            "behavior spine composed: {} wake executions, {} arrivals over the route (exit)",
+            world.wake_executions, world.arrivals
+        );
+    }
     let peak = peak_resident_kib().map_or_else(|| "unavailable".into(), |v| format!("{v} KiB"));
     cpu.report("CPU frame work (poll through present, includes Vulkan waits)");
     intervals.report("frame interval (consecutive present returns, includes pacing)");

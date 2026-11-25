@@ -114,7 +114,7 @@ Headless modes
 Benchmarks
   --benchmark-render | --benchmark-encounter | --benchmark-persistence
   --benchmark-instrumentation | --benchmark-entity-scale | --benchmark-sustained-load
-  --benchmark-locomotion
+  --benchmark-locomotion | --benchmark-behavior
   --benchmark-perf-sweep <cell> | --sustained-load-full-matrix
   --sustained-load-capacity-envelope
 
@@ -205,6 +205,16 @@ fn main() {
         // variants), with the double-run determinism proof (pod
         // results, observational; never CI thresholds).
         engine_slice::benchmark::run_locomotion_scale();
+        return;
+    }
+
+    if std::env::args().any(|arg| arg == "--benchmark-behavior") {
+        // Era 2 package A part 6: the §8.5 measurement surface — the
+        // behavior-workload sustained matrix (§8.4 item 7), witness
+        // enumeration cost, activation latency with schedule catch-up
+        // (E-09), skip-cost curves (E-08), and memory-per-NPC by tier
+        // (pod results, observational; never CI thresholds).
+        engine_slice::behavior_measurement::run_behavior_measurements();
         return;
     }
 
@@ -566,6 +576,7 @@ fn main() {
             let mut free_look_frames: Option<u64> = None;
             let mut post = false;
             let mut wet = false;
+            let mut behavior = false;
             let mut fps = 60;
             let mut present = engine_renderer::PresentModePreference::Auto;
             let mut validation = engine_renderer::ValidationPreference::Auto;
@@ -623,6 +634,10 @@ fn main() {
                     // ground re-draw; composes with every other
                     // corner flag).
                     "--wet" => wet = true,
+                    // The behavior spine (Era 2 package A part 5 — the
+                    // composed gates): the commitment wakes drive the
+                    // populated crowd. Refuses without --populated.
+                    "--behavior" => behavior = true,
                     // The free-look smoke's bounded exit — auto-quit
                     // after N presented frames. Free-look ONLY: the
                     // scripted route has its own fixed 601-frame
@@ -665,6 +680,12 @@ fn main() {
                         .into(),
                 );
             }
+            if behavior && !populated {
+                return Err(
+                    "--behavior requires --populated (the composed crowd drives the populated route's NPCs)"
+                        .into(),
+                );
+            }
             engine_slice::corner_demo::run(
                 night,
                 fps,
@@ -681,6 +702,7 @@ fn main() {
                 day_night,
                 post,
                 wet,
+                behavior,
             )
         };
         if let Err(e) = run() {

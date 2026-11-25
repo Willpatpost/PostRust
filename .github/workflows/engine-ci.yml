@@ -1614,8 +1614,43 @@ jobs:
           # result lines 62 UNCHANGED (the three re-pinned
           # render_instanced gates extend in place; no new
           # binaries).
-          expected=599
-          if [ "$(uname -s)" != "Linux" ]; then expected=598; fi
+          # ERA 2 PACKAGE A PART 5 (the composed gates,
+          # 2026-11-25, PR era2/npc-ai-composed-gates): the
+          # corner_behavior module's 4-test lib battery (the
+          # schedule pins, the composed campaign double-run with
+          # the digest pins and the 99-wake cadence-arithmetic
+          # pin, the seam's known answers on the real function,
+          # the arrival mirror + the composed pairwise clearance)
+          # within the existing lib result line: 599 + 4 = 603
+          # Linux MEASURED with this step's own awk on the package
+          # tree; Windows 598 + 4 = 602 = the same platform-uniform
+          # delta (pure spine/IEEE arithmetic, no cfg gates, no
+          # Vulkan — to be confirmed by this candidate's CI run).
+          # The NEW #[ignore]d render_instanced gate
+          # (composed_population_matches_per_object_pixels — the
+          # composed N-vs-1 byte equality + the allocation-counting
+          # gate with the spine-churn attribution clause) adds +1
+          # ignored: 31 -> 32, result lines unchanged (the same
+          # binary).
+          # ERA 2 PACKAGE A PART 6 (the measurement surface,
+          # 2026-11-25, PR era2/npc-ai-measurement-surface): the
+          # behavior_measurement module's 5-test lib battery (the
+          # matrix workload's double-run + the baked stream-digest
+          # pin, the witness census digest pin with the tier-gating
+          # known answer, the activation re-arm arithmetic, the skip
+          # conservation with the exact executed/re-arm-tail counts,
+          # the memory accounting's monotonicity and component sums)
+          # within the existing lib result line: 603 + 5 = 608 Linux
+          # MEASURED with this step's own awk on the package tree;
+          # Windows 602 + 5 = 607 = the same platform-uniform delta
+          # (pure spine/IEEE arithmetic, no cfg gates, no Vulkan — to
+          # be confirmed by this candidate's CI run; a mismatch is
+          # corrected from actuals, never by weakening a test).
+          # Ignored 32 and result lines 62 UNCHANGED (lib tests only,
+          # no new binaries; the benchmark flag is test-free harness
+          # code).
+          expected=608
+          if [ "$(uname -s)" != "Linux" ]; then expected=607; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
@@ -1629,7 +1664,7 @@ jobs:
           # are engine-renderer lib tests — the main shard's).
           # Linux 582/14/59 MEASURED locally with this step's own
           # awk; Windows 581/14/59 platform-uniform.
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 31 / 62)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 32 / 62)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           # Era 1 package 3 (the sky, 2026-11-23): the NEW
           # tests/render_sky.rs binary carries ONE #[ignore]d
@@ -1760,7 +1795,16 @@ jobs:
           # arithmetic above): 28 -> 31, MEASURED with this step's
           # own awk on the stage-5 tree (render_instanced 6 ignored,
           # render_shadows 4, and the rest unchanged).
-          [ "$ignored" -eq 31 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 31"; exit 1; }
+          # ERA 2 PACKAGE A PART 5 (2026-11-25, PR
+          # era2/npc-ai-composed-gates): the NEW #[ignore]d composed
+          # gate (composed_population_matches_per_object_pixels in
+          # render_instanced) moves the ignored count 31 -> 32 —
+          # MEASURED by this candidate's own CI run 45578151682 (both
+          # platforms 32; the run red ONLY on this then-stale 31, the
+          # passed counts 602/603 and result lines 62 CORRECT — the
+          # pin corrected from the run's actuals, the d104094
+          # discipline).
+          [ "$ignored" -eq 32 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 32"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
