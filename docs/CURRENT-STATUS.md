@@ -395,35 +395,36 @@ for the combined candidate.
 | CI partition | Linux | Windows |
 |---|---:|---:|
 | Main shard (`--workspace --exclude engine-slice`) | 1295 | 1244 |
-| Heavy shard (`-p engine-slice --features crash-test-seams`) | 599 | 598 |
-| **Combined** | **1894** | **1842** |
+| Heavy shard (`-p engine-slice --features crash-test-seams`) | 603 | 602 |
+| **Combined** | **1898** | **1846** |
 
 The macOS job has its own partition. Main has two ignored tests and 33
-result lines. Heavy has thirty-one ignored tests and 62 result lines.
-The table is settled at the Era-2 package A part-4 tree
-(`era2/npc-ai-rendering-bridge`, 2026-11-25, stacked on part 3 —
-the rendering bridge): heavy **599 Linux MEASURED with the
-workflow's own awk on this exact tree** (599 passed / 31 ignored /
-62 result lines, zero failures — the part-3 workflow pin's 591
-plus the corner_routes battery's 8 platform-uniform engine-slice
-lib tests); Windows **598** = 590 + the same 8 (the
-platform-uniform inference — pure f32 arithmetic and struct
-equality, no cfg gates, no Vulkan; to be confirmed by this
-candidate's CI run, the count corrected from actuals on a
-mismatch, never a test weakened); main **1295 Linux MEASURED with
-the workflow's own awk on this exact tree** (1295 passed / 2
-ignored / 33 result lines, zero failures — engine-core untouched
-by part 4) with Windows **1244** (part 3's own pin: 1226 + the
-npc_locomotion battery's 18 platform-uniform engine-core lib
-tests, the same inference discipline); renderer release 160/2
-UNCHANGED. The prior settlements, superseded in order: the part-3
-tree (`era2/npc-ai-locomotion-batch`, 2026-11-25 — the locomotion
-batch): the WORKFLOW's pins moved to main 1295/1244 with heavy
-591/590 unchanged (engine-slice gained only the test-free
-benchmark route), Linux 1295/2/33 MEASURED with the workflow's
-own awk on that tree — but the §4 TABLE's part-2 row (main
-1277/1226) was left stale by that package and is corrected here
-from the measured actuals; the part-2 tree
+result lines. Heavy has thirty-two ignored tests and 62 result lines.
+The table is settled at the Era-2 package A part-5 tree
+(`era2/npc-ai-composed-gates`, 2026-11-25, stacked on part 4 — the
+composed gates): heavy **603 Linux MEASURED with the workflow's own awk
+on this exact tree** (603 passed / 32 ignored / 62 result lines, zero
+failures — the part-4 settlement's 599 plus the corner_behavior
+battery's 4 platform-uniform engine-slice lib tests); Windows **602** =
+598 + the same 4 (the platform-uniform inference — pure spine/IEEE
+arithmetic, no cfg gates, no Vulkan; to be confirmed by this
+candidate's CI run, the count corrected from actuals on a mismatch,
+never a test weakened); the NEW #[ignore]d composed gate moves ignored
+31 → 32 (the same render_instanced binary — result lines unchanged);
+main **1295/2/33 MEASURED unchanged** (engine-core untouched by part
+5); renderer release 160/2 UNCHANGED. The prior settlements,
+superseded in order: the part-4 tree
+(`era2/npc-ai-rendering-bridge`, 2026-11-25 — the rendering bridge):
+heavy 599 Linux MEASURED / 598 Windows (the +8 corner_routes battery),
+main 1295/2/33 unchanged, ignored 31 / result lines 62 (CI run
+45572074231 green on all five jobs, both shard counts measured by the
+run's own logs); the part-3 tree (`era2/npc-ai-locomotion-batch`,
+2026-11-25 — the locomotion batch): the WORKFLOW's pins moved to main
+1295/1244 with heavy 591/590 unchanged (engine-slice gained only the
+test-free benchmark route), Linux 1295/2/33 MEASURED with the
+workflow's own awk on that tree — but the §4 TABLE's part-2 row (main
+1277/1226) was left stale by that package and was corrected at the
+part-4 settlement from the measured actuals; the part-2 tree
 (`era2/npc-ai-spine-integration`, 2026-11-25, stacked on the #38
 reconciliation — `d9a034d`'s code plus this package): main **1277
 Linux MEASURED with the workflow's own awk on this exact tree**
@@ -1354,11 +1355,36 @@ gates re-pinned on the locomotion source (the moving-crowd 26-vs-2
 byte equality, the frame-0 static fixtures, the allocation
 constancy under motion); heavy shard 591 → 599 Linux MEASURED
 with the workflow's own awk, main shard untouched at 1295/2/33).
-The remaining part, in the design pass's own order: the
-**composition gates** (§8.4 — the named verification strategy,
-including the allocation-counting gate on the warmed behavior
-path over the composed world). The design pass's §9
-open-questions list still awaits the owner.
+Part 5: the composed gates (`era2/npc-ai-composed-gates`, stacked
+on part 4 — §8.4's named allocation-counting gate made possible:
+the `--behavior` flag composes the behavior spine INTO the demo's
+populated crowd — the 24 schedules (the waiters' idle re-arms, the
+crossers' alternating pacing commitments, the strollers'
+stroll/rest pairs), the `CornerCrowdWorld` spine world (evaluate
+at the wake, the authored seam `set_destination` table, the
+arrival mirror, the pre-allocated stream), one composed tick per
+presented frame — spine first, then the batch; the campaign
+pinned: 99 wake executions over the 663-tick window (the cadence
+arithmetic hand-derived and asserted), 25 arrivals (measured),
+double-run byte-identical (states, stream, world fingerprint) with
+digest pins at sampled ticks — frame 0's locomotion digest EQUALS
+part 4's (the composed mode's first frames are the plain mode's);
+the waiters byte-frozen through the composed campaign; the
+allocation-counting gate with the spine-churn attribution clause
+(the investigation's finding: `Spine::schedule`'s unfinished-index
+node churn allocates on an amortized cadence — engine-core
+internals, documented, out of scope; a composed frame with NO wake
+execution measures EXACTLY zero host allocations, `renderer.
+allocations()` constant; the demo's own exit summary measured 99
+wakes / 25 arrivals over the route); heavy shard 599 → 603 Linux
+MEASURED, ignored 31 → 32 (the new composed lavapipe gate), main
+shard untouched at 1295/2/33). The remaining part, in the design
+pass's own order: the **measurement surface** (§8.4's item 7 —
+the sustained-load matrix extended with the behavior workload
+classes — and §8.5's remaining measurements: activation latency
+with schedule catch-up, skip-cost curves, memory-per-NPC by tier;
+benchmark work over this composed machinery, a separate package).
+The design pass's §9 open-questions list still awaits the owner.
 
 ## 10. The authoritative coordination ledger
 

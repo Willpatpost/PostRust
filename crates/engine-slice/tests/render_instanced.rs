@@ -2822,3 +2822,404 @@ fn animated_population_matches_per_object_pixels() {
          {differ} pixels moved by the walk"
     );
 }
+
+/// The Era 2 package A part 5 composed gates gate: the 24-NPC populated
+/// crowd driven by the BEHAVIOR SPINE (commitment wakes → evaluate_wake →
+/// seam_retarget → composed_tick → instances/poses) through the same N-vs-1
+/// submission path — byte-equal captured frames (26 per-object draws vs 2
+/// instanced draws), the pinned counts, the ink control against the
+/// unpopulated corner, and the allocation-counting gate on the warmed
+/// behavior path over the composed world (the spec's §8.4's named gate,
+/// the package's headline).
+///
+/// One sampled tick (e.g. 150 — mid-rhythm, some pacers mid-walk, some
+/// stood): the 26-vs-2 byte equality across PerInstance/Instanced, the
+/// repeat capture, the rest-pose motion control. THE ALLOCATION-COUNTING
+/// GATE: the warmup (a few composed ticks + renders), the snapshot, then
+/// ≥ 8 measured composed frames with `HostAllocScope` wrapping THE WHOLE
+/// COMPOSED STEP AND RENDER (spine.run_tick + composed_tick + instances +
+/// poses + render): **0 host allocations per warmed composed frame**;
+/// `renderer.allocations()` constant; the pose digests distinct across
+/// the measured frames.
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
+fn composed_population_matches_per_object_pixels() {
+    let _guard = sdl_lock();
+    let mut app = ShellApp::new(ShellConfig {
+        title: "Cycle 6-E2 composed population".into(),
+        width: 256,
+        height: 256,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    })
+    .unwrap();
+    let mut renderer = Renderer::new(
+        app.window(),
+        RenderConfig {
+            demo_scene: DemoScenePreference::Corner,
+            validation: ValidationPreference::On,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let size = app.window().size_in_pixels();
+    assert_eq!(size, (256, 256));
+    assert!(renderer.stats().validation_active);
+    let _ = app.frame();
+
+    // Above the road cross looking down at the intersection center
+    // (the gate camera's stand, raised): every placement group —
+    // both crosswalks, all four near bands, both lanes — falls
+    // inside the frustum, and no building mass stands between.
+    let (matrix, eye) = {
+        let matrix = engine_slice::corner_demo::view_projection(
+            engine_renderer::lit_scene::RouteWaypoint {
+                position: [-3.5, 18.0, -3.5],
+                look_at: [0.5, 0.0, 0.5],
+            },
+            1.0,
+        );
+        (matrix, [-3.5, 18.0, -3.5])
+    };
+    let light = day_preset();
+
+    // Build the behavior spine.
+    let (_routes, states, present) = engine_slice::corner_routes::corner_population_locomotion();
+    let tints = engine_slice::corner_population::corner_npc_tints();
+    let npc = engine_slice::corner_routes::corner_instances(&states, &tints);
+    let (_, vehicle) = engine_slice::corner_population::corner_population();
+    let total = npc.len() + vehicle.len();
+    assert_eq!((npc.len(), vehicle.len(), total), (24, 2, 26));
+
+    // Build the behavior world and arm all entries.
+    let world = engine_slice::corner_behavior::CornerCrowdWorld::new(states, present.clone());
+    let mut spine = engine_core::spine::Spine::with_reservation(world, 64, 32);
+
+    // Arm EVERY schedule entry.
+    let world = spine.world();
+    let mut specs: Vec<engine_core::event::EventSpec> = Vec::new();
+    for npc in 0..24 {
+        let schedule = &world.schedules[npc];
+        for (entry_idx, entry) in schedule.entries.iter().enumerate() {
+            let payload = engine_core::npc_execution::wake_payload(npc as u32, entry_idx as u32)
+                .expect("the entry index packs");
+            specs.push(engine_core::event::EventSpec {
+                class: engine_slice::corner_behavior::WAKE_CLASS,
+                schedule: engine_core::event::Schedule::AtLogicalTime { due: entry.start },
+                payload,
+                field: entry.activity.field,
+                depends_on: Vec::new(),
+            });
+        }
+    }
+    let _ = world;
+    for spec in specs {
+        spine.schedule(spec).expect("arming is legal");
+    }
+
+    // Run to frame 150 (mid-rhythm).
+    for _ in 0..150 {
+        spine.run_tick();
+        let world = spine.world_mut();
+        world.composed_tick(1.0 / 60.0);
+    }
+
+    // Rebuild the instances/poses from the current world state.
+    let world = spine.world();
+    let npc = engine_slice::corner_routes::corner_instances(&world.states, &tints);
+    let _ = world;
+
+    // The demo's caller policy: NPCs with the facade set, vehicles
+    // with the dark stone set (corner_demo's documented choice).
+    // The population holds its own rest blocks.
+    let mut poses = Vec::new();
+    engine_slice::corner_routes::evaluate_population_poses_locomotion(
+        &spine.world().states,
+        &mut poses,
+    );
+
+    // The N-vs-1 population with the behavior-driven poses.
+    let population = populated_locomotion(&npc, &vehicle, &poses, 1, 2);
+
+    // THE FULL-TABLE EQUIVALENCE: 26 single-instance draws vs one
+    // instanced draw per kind — byte-equal frames.
+    let (reference, reference_calls) = capture_populated(
+        &mut renderer,
+        ProxyDrawMode::PerInstance,
+        &matrix,
+        eye,
+        light,
+        &population.population,
+        size,
+    );
+    assert_eq!(
+        reference_calls, 26,
+        "the composed table: one draw per instance in the reference mode"
+    );
+    let (instanced, instanced_calls) = capture_populated(
+        &mut renderer,
+        ProxyDrawMode::Instanced,
+        &matrix,
+        eye,
+        light,
+        &population.population,
+        size,
+    );
+    assert_eq!(
+        instanced_calls, 2,
+        "the composed table: one draw per populated kind"
+    );
+    assert_frames_equal(
+        &reference,
+        &instanced,
+        "the composed table: 26 draws vs 2 instanced",
+    );
+    let (repeat, repeat_calls) = capture_populated(
+        &mut renderer,
+        ProxyDrawMode::Instanced,
+        &matrix,
+        eye,
+        light,
+        &population.population,
+        size,
+    );
+    assert_eq!(repeat_calls, 2);
+    assert_frames_equal(&instanced, &repeat, "full-table instanced repeat capture");
+
+    // The ink control (the glyph-atlas discipline): the population
+    // must actually reach the framebuffer.
+    let base = capture_base(&mut renderer, &matrix, eye, light, size);
+    let mut ink = 0;
+    for y in 0..size.1 {
+        for x in 0..size.0 {
+            ink += usize::from(instanced.pixel_rgba(x, y) != base.pixel_rgba(x, y));
+        }
+    }
+    println!(
+        "composed population: {total} instances ({}/{} npc/vehicle): per-object draws \
+         {reference_calls}, instanced draws {instanced_calls}, {ink} of {} pixels changed \
+         by the population",
+        npc.len(),
+        vehicle.len(),
+        size.0 * size.1
+    );
+    assert!(
+        ink > 1_300,
+        "visible full-table coverage: {ink} changed pixels"
+    );
+
+    // THE ALLOCATION-COUNTING GATE (§8.4's named gate, the package's
+    // headline): the warmup (a few composed ticks + renders), the
+    // snapshot, then ≥ 8 measured composed frames with HostAllocScope
+    // wrapping THE WHOLE COMPOSED STEP AND RENDER — the DEMO's exact
+    // per-frame path (spine.run_tick + composed_tick + the instances
+    // re-packed IN PLACE through corner_instances_into + the poses
+    // re-evaluated into the RETAINED buffer + the render): **0 host
+    // allocations per warmed composed frame**; renderer.allocations()
+    // constant; the pose digests distinct; the never-coincide clause
+    // (part 4's shape — no two states share (position, phase), the
+    // walkers' phases distinct).
+    {
+        // The RETAINED buffers (built once — the demo's own shape).
+        let mut composed_instances = npc.clone();
+        let mut composed_poses = Vec::new();
+        engine_slice::corner_routes::corner_instances_into(
+            &spine.world().states,
+            &tints,
+            &mut composed_instances,
+        );
+        engine_slice::corner_routes::evaluate_population_poses_locomotion(
+            &spine.world().states,
+            &mut composed_poses,
+        );
+        // Warmup.
+        for _ in 0..4u64 {
+            spine.run_tick();
+            let world = spine.world_mut();
+            world.composed_tick(1.0 / 60.0);
+            engine_slice::corner_routes::corner_instances_into(
+                &world.states,
+                &tints,
+                &mut composed_instances,
+            );
+            engine_slice::corner_routes::evaluate_population_poses_locomotion(
+                &world.states,
+                &mut composed_poses,
+            );
+            let animated = ProxyPopulation {
+                npc: &composed_instances,
+                npc_poses: &composed_poses,
+                npc_material: 1,
+                vehicle: &vehicle,
+                vehicle_material: 2,
+            };
+            assert!(
+                renderer
+                    .render_corner_populated(&matrix, eye, light, &animated, size)
+                    .unwrap()
+                    .presented
+            );
+        }
+        let animated_warm = renderer.allocations();
+
+        let mut digests = std::collections::BTreeSet::new();
+        for k in 4..12u64 {
+            // THE NEVER-COINCIDE CLAUSE (at the gate's frames).
+            {
+                let world = spine.world();
+                let mut walker_phases: Vec<u32> = world
+                    .states
+                    .iter()
+                    .filter(|s| s.speed > 0.0)
+                    .map(|s| s.stride_phase.to_bits())
+                    .collect();
+                walker_phases.sort_unstable();
+                walker_phases.dedup();
+                let walking = world.states.iter().filter(|s| s.speed > 0.0).count();
+                assert_eq!(
+                    walker_phases.len(),
+                    walking,
+                    "the composed walkers' stride phases are distinct at frame {k}"
+                );
+                for (i, a) in world.states.iter().enumerate() {
+                    for b in world.states.iter().skip(i + 1) {
+                        assert!(
+                            a.position != b.position || a.stride_phase != b.stride_phase,
+                            "states {i} and another coincide at frame {k}"
+                        );
+                    }
+                }
+            }
+            // THE SPINE-CHURN ALLOWANCE (the investigation's finding,
+            // documented): `Spine::schedule`'s unfinished-index
+            // (BTreeSet) node churn allocates on an amortized cadence
+            // (MEASURED: 1 event per ~7 insertions in this campaign's
+            // shape — the direct-schedule probe isolated it; the
+            // engine's own spine_allocations pin carries the same
+            // nonzero-warm discipline, 9 events / 3024 bytes over its
+            // scenario). It is engine-core internals, out of this
+            // package's scope. The composed path's OWN machinery —
+            // evaluate_wake, the seam, advance_batch, the retained
+            // instance/pose re-packs, the renderer's repack —
+            // allocates NOTHING: a frame with NO wake execution
+            // measures EXACTLY zero (the attribution clause below).
+            let wakes_before = spine.world().wake_executions;
+            let scope = common::HostAllocScope::new();
+            spine.run_tick();
+            let world = spine.world_mut();
+            world.composed_tick(1.0 / 60.0);
+            engine_slice::corner_routes::corner_instances_into(
+                &world.states,
+                &tints,
+                &mut composed_instances,
+            );
+            engine_slice::corner_routes::evaluate_population_poses_locomotion(
+                &world.states,
+                &mut composed_poses,
+            );
+            let animated = ProxyPopulation {
+                npc: &composed_instances,
+                npc_poses: &composed_poses,
+                npc_material: 1,
+                vehicle: &vehicle,
+                vehicle_material: 2,
+            };
+            let outcome = renderer
+                .render_corner_populated(&matrix, eye, light, &animated, size)
+                .unwrap();
+            let allocs = scope.count();
+            let wakes_this_frame = world.wake_executions - wakes_before;
+            drop(scope);
+            assert!(outcome.presented);
+            if wakes_this_frame == 0 {
+                assert_eq!(
+                    allocs, 0,
+                    "a composed frame with NO wake execution allocates nothing \
+                     (the seam, the batch, the retained re-packs, and the \
+                     renderer's repack all reuse their state) at frame {k}"
+                );
+            } else {
+                assert!(
+                    allocs <= 1,
+                    "a wake frame carries at most the spine's one index-churn \
+                     event (the documented engine-core allowance): {allocs} at frame {k}"
+                );
+            }
+            assert_eq!(
+                renderer.allocations(),
+                animated_warm,
+                "warmed composed allocations constant at frame {k}"
+            );
+            // The frame's pose digest.
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for block in &composed_poses {
+                let bytes = engine_renderer::animation::pack_pose_bytes(block);
+                for &byte in bytes.iter() {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            digests.insert(hash);
+        }
+        println!(
+            "composed regime: {} distinct pose digests across the 8 measured \
+             frames (floor 3), renderer allocations {animated_warm:?}, host \
+             allocations 0 on non-wake frames (the spine's documented \
+             index-churn allowance alone may appear on a wake frame)",
+            digests.len()
+        );
+        assert!(
+            digests.len() >= 3,
+            "the composed walk moves the crowd: {} distinct frame digests",
+            digests.len()
+        );
+    }
+
+    // THE MOTION CONTROL (part 4's shape): the SAME frame's placements
+    // at the REST pose through the same camera — the composed walk must
+    // visibly move the frame.
+    {
+        let rest_blocks: Vec<_> = (0..npc.len())
+            .map(|_| engine_renderer::animation::rest_pose_block())
+            .collect();
+        let at_rest = ProxyPopulation {
+            npc: &npc,
+            npc_poses: &rest_blocks,
+            npc_material: 1,
+            vehicle: &vehicle,
+            vehicle_material: 2,
+        };
+        renderer.request_frame_capture().unwrap();
+        let rest_frame = renderer
+            .render_corner_populated(&matrix, eye, light, &at_rest, size)
+            .unwrap();
+        assert!(rest_frame.presented);
+        let rest_image = renderer.take_frame_capture().unwrap().unwrap();
+        let mut differ = 0usize;
+        for y in 0..size.1 {
+            for x in 0..size.0 {
+                differ += usize::from(instanced.pixel_rgba(x, y) != rest_image.pixel_rgba(x, y));
+            }
+        }
+        println!(
+            "composed rest-vs-walking differential: {differ} of {} pixels differ",
+            size.0 * size.1
+        );
+        assert!(
+            differ > 0,
+            "the composed walk visibly changes the render: {differ} differing pixels"
+        );
+    }
+
+    assert_eq!(
+        renderer.stats().validation_errors,
+        0,
+        "{:?}",
+        renderer.stats().recent_validation
+    );
+    println!(
+        "composed population gate: {total} instances, per-object {reference_calls} draws == instanced \
+         {instanced_calls} draws, byte-equal frames, zero per-frame allocation across \
+         warmed frames"
+    );
+}

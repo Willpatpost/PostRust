@@ -6,6 +6,7 @@
 pub mod backup;
 pub mod benchmark;
 pub mod combat_demo;
+pub mod corner_behavior;
 pub mod corner_demo;
 pub mod corner_population;
 pub mod corner_routes;

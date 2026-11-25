@@ -566,6 +566,7 @@ fn main() {
             let mut free_look_frames: Option<u64> = None;
             let mut post = false;
             let mut wet = false;
+            let mut behavior = false;
             let mut fps = 60;
             let mut present = engine_renderer::PresentModePreference::Auto;
             let mut validation = engine_renderer::ValidationPreference::Auto;
@@ -623,6 +624,10 @@ fn main() {
                     // ground re-draw; composes with every other
                     // corner flag).
                     "--wet" => wet = true,
+                    // The behavior spine (Era 2 package A part 5 — the
+                    // composed gates): the commitment wakes drive the
+                    // populated crowd. Refuses without --populated.
+                    "--behavior" => behavior = true,
                     // The free-look smoke's bounded exit — auto-quit
                     // after N presented frames. Free-look ONLY: the
                     // scripted route has its own fixed 601-frame
@@ -665,6 +670,12 @@ fn main() {
                         .into(),
                 );
             }
+            if behavior && !populated {
+                return Err(
+                    "--behavior requires --populated (the composed crowd drives the populated route's NPCs)"
+                        .into(),
+                );
+            }
             engine_slice::corner_demo::run(
                 night,
                 fps,
@@ -681,6 +692,7 @@ fn main() {
                 day_night,
                 post,
                 wet,
+                behavior,
             )
         };
         if let Err(e) = run() {

@@ -408,7 +408,7 @@ fn north_crosswalk_pacer() -> Route {
 /// N-S east north, N-S east south, E-W north west, E-W north east,
 /// E-W south west, E-W south east)
 /// Routes 8-9: the 2 crosswalk pacers (west, north)
-fn corner_routes() -> Vec<Route> {
+pub fn corner_routes() -> Vec<Route> {
     vec![
         ns_west_north_flank(),
         ns_west_south_flank(),

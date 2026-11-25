@@ -1614,8 +1614,26 @@ jobs:
           # result lines 62 UNCHANGED (the three re-pinned
           # render_instanced gates extend in place; no new
           # binaries).
-          expected=599
-          if [ "$(uname -s)" != "Linux" ]; then expected=598; fi
+          # ERA 2 PACKAGE A PART 5 (the composed gates,
+          # 2026-11-25, PR era2/npc-ai-composed-gates): the
+          # corner_behavior module's 4-test lib battery (the
+          # schedule pins, the composed campaign double-run with
+          # the digest pins and the 99-wake cadence-arithmetic
+          # pin, the seam's known answers on the real function,
+          # the arrival mirror + the composed pairwise clearance)
+          # within the existing lib result line: 599 + 4 = 603
+          # Linux MEASURED with this step's own awk on the package
+          # tree; Windows 598 + 4 = 602 = the same platform-uniform
+          # delta (pure spine/IEEE arithmetic, no cfg gates, no
+          # Vulkan — to be confirmed by this candidate's CI run).
+          # The NEW #[ignore]d render_instanced gate
+          # (composed_population_matches_per_object_pixels — the
+          # composed N-vs-1 byte equality + the allocation-counting
+          # gate with the spine-churn attribution clause) adds +1
+          # ignored: 31 -> 32, result lines unchanged (the same
+          # binary).
+          expected=603
+          if [ "$(uname -s)" != "Linux" ]; then expected=602; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
