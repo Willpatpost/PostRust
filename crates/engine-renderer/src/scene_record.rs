@@ -42,13 +42,11 @@ use ash::vk;
 /// The shadowed arm's proxy draws use the shadowed-populated state's
 /// own pipelines and sets (the npc kind's `skinned_shadowed` set with
 /// the skinned shadowed pipeline, the vehicle kind's `plain_shadowed`
-/// set with the plain shadowed pipeline). The HDR arm's shadowed
-/// variant (the follow-up, the ensure_shadowed_hdr precedent) would
-/// need separate shadowed-HDR pipelines — for THIS stage, the HDR arm
-/// passes `None` for `shadowed_proxy_skinned` and `shadowed_proxy_vehicle`,
-/// so the shadowed arm's belt-check skips proxy draws when HDR is
-/// active (--populated --shadows --post together draws the proxies
-/// unshadowed-in-HDR until the shadowed HDR variants land).
+/// set with the plain shadowed pipeline). The HDR arm now carries the
+/// ensured shadowed variants through the family-growth block (the
+/// frame flow ensures them lazily at the first populated SHADOWED POST
+/// frame). The belt-check below remains for the lazy first-frame window
+/// and pipeline-replacement frames (the same guard shape as `sky`).
 #[derive(Clone, Copy)]
 pub(crate) struct SceneTargetPipelines {
     /// The sky pipeline handle — `Option` for belt-check style guards.
@@ -57,7 +55,7 @@ pub(crate) struct SceneTargetPipelines {
     /// The ordinary lit pipeline handle — `Option` for belt-check style.
     /// Main pass: `Some(pipes.lit_pipeline)`; HDR pass: `Some(self.lit_hdr)`.
     pub lit: Option<vk::Pipeline>,
-    /// The shadowed lit pipeline handle — `Option` for belt-check style.
+    /// The SHADOWED lit pipeline handle — `Option` for belt-check style.
     /// Main pass: `pipes.shadows.map(|s| s.shadowed(slot).0)`; HDR pass:
     /// `self.shadowed_hdr`.
     pub shadowed: Option<vk::Pipeline>,
@@ -71,11 +69,12 @@ pub(crate) struct SceneTargetPipelines {
     /// first populated post frame).
     pub proxy_skinned: Option<vk::Pipeline>,
     /// The shadowed-populated npc kind pipeline (the main pass's
-    /// skinned shadowed pipeline). HDR passes `None` (see the struct
-    /// doc above: the shadowed HDR variant is a follow-up).
+    /// skinned shadowed pipeline). HDR passes the ensured variant
+    /// (the frame flow's family-growth block; the belt-check below
+    /// remains for the lazy first-frame window and pipeline-replacement).
     pub shadowed_proxy_skinned: Option<vk::Pipeline>,
     /// The shadowed-populated vehicle kind pipeline (the main pass's
-    /// plain shadowed pipeline). HDR passes `None`.
+    /// plain shadowed pipeline). HDR passes the ensured variant.
     pub shadowed_proxy_vehicle: Option<vk::Pipeline>,
 }
 
@@ -207,10 +206,10 @@ pub(crate) unsafe fn record_corner_scene(
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, shadowed_pipeline);
             corner_resources.draw(ctx, cmd, layout, &sets, frame_offset);
         }
-        // The shadowed arm draws proxies only on the main pass (the
-        // HDR arm's shadowed variant is a follow-up — see the struct
-        // doc: the HDR arm passes None for `shadowed_proxy_skinned`
-        // and `shadowed_proxy_vehicle`, so this belt-check skips).
+        // The shadowed arm draws proxies when the HDR variants are ensured
+        // (the frame flow's family-growth block). The belt-check guards the
+        // lazy first-frame window and pipeline-replacement frames (the same
+        // shape as `sky` — see the struct doc).
         if targets.shadowed_proxy_skinned.is_none() || targets.shadowed_proxy_vehicle.is_none() {
             return Some(0);
         }

@@ -773,6 +773,14 @@ pub(crate) struct ShadowedProxyResources {
     plain_shadowed_sets: [vk::DescriptorSet; MATERIAL_COUNT * 2],
     plain_shadowed_pool: vk::DescriptorPool,
     plain_shadowed_set_layout: vk::DescriptorSetLayout,
+    /// The npc receiving pipeline's HDR variant (the post chain's HDR
+    /// scene pass — the same shader module, layout, and sets as the
+    /// main-pass pipeline, built against the post state's HDR render
+    /// pass; lazily created at the first populated SHADOWED POST frame,
+    /// the `SkinnedProxyResources::ensure_hdr` precedent).
+    skinned_shadowed_hdr: Option<vk::Pipeline>,
+    /// The vehicle receiving pipeline's HDR variant (the same shape).
+    plain_shadowed_hdr: Option<vk::Pipeline>,
 }
 
 impl ShadowedProxyResources {
@@ -805,6 +813,8 @@ impl ShadowedProxyResources {
             plain_shadowed_sets: [vk::DescriptorSet::null(); MATERIAL_COUNT * 2],
             plain_shadowed_pool: vk::DescriptorPool::null(),
             plain_shadowed_set_layout: vk::DescriptorSetLayout::null(),
+            skinned_shadowed_hdr: None,
+            plain_shadowed_hdr: None,
         };
         if let Err(error) = partial.build(ctx, shadows, skinned, corner, main_render_pass) {
             partial.release(ctx);
@@ -1155,6 +1165,56 @@ impl ShadowedProxyResources {
         self.plain_shadowed_pipeline
     }
 
+    /// Creates the HDR-pass shadowed proxy pipeline variants if absent
+    /// (the lazy discipline one level deeper: the first populated
+    /// SHADOWED POST frame pays the two one-time pipelines; postless
+    /// and unshadowed-populated frames never do). The SAME shader
+    /// modules, pipeline layouts, and descriptor sets serve both passes
+    /// — only the render pass (and its color attachment format) differs,
+    /// so nothing else is created. A failure between the two builds
+    /// leaves the built one owned by this state (released at teardown
+    /// exactly once — the partial-construction discipline); the method
+    /// is idempotent and re-ensures only what is missing.
+    pub(super) fn ensure_hdr(
+        &mut self,
+        ctx: &VulkanContext,
+        skinned: &SkinnedProxyResources,
+        hdr_render_pass: vk::RenderPass,
+    ) -> Result<(), RendererError> {
+        if self.skinned_shadowed_hdr.is_none() {
+            self.skinned_shadowed_hdr = Some(skinned.build_skinned_lit_pipeline(
+                ctx,
+                include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/instanced_proxy_skinned_shadowed.spv"
+                )),
+                hdr_render_pass,
+                self.skinned_shadowed_layout,
+                "skinned shadowed proxy hdr pipeline",
+            )?);
+        }
+        if self.plain_shadowed_hdr.is_none() {
+            self.plain_shadowed_hdr = Some(skinned.build_plain_lit_pipeline(
+                ctx,
+                include_bytes!(concat!(env!("OUT_DIR"), "/instanced_proxy_shadowed.spv")),
+                hdr_render_pass,
+                self.plain_shadowed_layout,
+                "plain shadowed proxy hdr pipeline",
+            )?);
+        }
+        Ok(())
+    }
+
+    /// The npc kind's HDR-pass shadowed pipeline handle, when ensured.
+    pub(super) fn skinned_shadowed_hdr(&self) -> Option<vk::Pipeline> {
+        self.skinned_shadowed_hdr
+    }
+
+    /// The vehicle kind's HDR-pass shadowed pipeline handle, when ensured.
+    pub(super) fn plain_shadowed_hdr(&self) -> Option<vk::Pipeline> {
+        self.plain_shadowed_hdr
+    }
+
     /// Releases every handle exactly once; valid for both the
     /// fully-built and the partial state (null handles denote
     /// partial construction).
@@ -1170,6 +1230,8 @@ impl ShadowedProxyResources {
                 self.plain_depth_pipeline,
                 self.skinned_shadowed_pipeline,
                 self.plain_shadowed_pipeline,
+                self.skinned_shadowed_hdr.unwrap_or(vk::Pipeline::null()),
+                self.plain_shadowed_hdr.unwrap_or(vk::Pipeline::null()),
             ] {
                 if pipeline != vk::Pipeline::null() {
                     ctx.device.destroy_pipeline(pipeline, None);
@@ -1206,6 +1268,8 @@ impl ShadowedProxyResources {
             self.plain_depth_pipeline = vk::Pipeline::null();
             self.skinned_shadowed_pipeline = vk::Pipeline::null();
             self.plain_shadowed_pipeline = vk::Pipeline::null();
+            self.skinned_shadowed_hdr = None;
+            self.plain_shadowed_hdr = None;
             self.skinned_depth_layout = vk::PipelineLayout::null();
             self.skinned_shadowed_layout = vk::PipelineLayout::null();
             self.plain_shadowed_layout = vk::PipelineLayout::null();

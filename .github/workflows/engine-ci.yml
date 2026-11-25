@@ -874,6 +874,25 @@ jobs:
       # negative/zero/midtone/over-one HDR through the real
       # composite, the negative channels EXACT black — MEASURED on
       # the pod's lavapipe).
+      # (The shadowed-HDR populated variant, 2026-11-25 — Era-2
+      # package 1's documented follow-up landed) The same step now
+      # also executes the three-way composition gate
+      # shadowed_populated_composes_through_the_hdr_chain:
+      # --populated --shadows --post together drew NO proxies before
+      # (the HDR arm's belt-check skipped them; the demo route
+      # refused with 'populated route drew no proxy calls' —
+      # MEASURED on this pod). The gate pins: the full 24+2 table
+      # through the composition (2 draws), the presence ink (34166
+      # bytes vs the unpopulated frame), the one-time populated
+      # families' delta (6, 4, 16, 0) then constant with the warmed
+      # frame byte-identical, and the decisive full-chain known
+      # answers — a light-facing torso wall DEEP in a building's
+      # shadow rendering exactly albedo·ambient through bloom+ACES
+      # (57600 pixels, max 1/255) and the same wall in open sun
+      # rendering the full lit equation (57600 pixels, max 1/255;
+      # the equations differ by 0.360 linear — the fixtures
+      # discriminate both an always-ambient and a map-ignoring
+      # pipeline). MEASURED on the pod's lavapipe.
       - name: Post gates (lavapipe)
         if: runner.os == 'Linux'
         shell: bash
@@ -1804,7 +1823,16 @@ jobs:
           # passed counts 602/603 and result lines 62 CORRECT — the
           # pin corrected from the run's actuals, the d104094
           # discipline).
-          [ "$ignored" -eq 32 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 32"; exit 1; }
+          # THE SHADOWED-HDR POPULATED VARIANT (2026-11-25, PR
+          # era2/shadowed-hdr-populated, Era-2 package 1's documented
+          # follow-up landed): the NEW #[ignore]d composition gate
+          # (shadowed_populated_composes_through_the_hdr_chain in
+          # render_post — executed by the unchanged Post-gates Linux
+          # Vulkan step below) moves the ignored count 32 -> 33; the
+          # passed counts (608/607) and result lines (62) UNCHANGED
+          # (the gate rides the existing render_post binary). 608/33/62
+          # MEASURED with this step's own awk on the package tree.
+          [ "$ignored" -eq 33 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 33"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local

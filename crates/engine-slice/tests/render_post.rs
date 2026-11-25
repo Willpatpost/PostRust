@@ -38,7 +38,8 @@ use engine_renderer::{
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 
 use engine_renderer::lit_scene::day_preset;
-use engine_renderer::lit_scene::{LightParams, RouteWaypoint};
+use engine_renderer::lit_scene::{LightParams, RouteWaypoint, lit_surface_color, materials};
+use engine_renderer::proc_texture::{TEXTURE_SIZE, procedural_texture};
 use engine_slice::corner_demo::view_projection;
 use engine_slice::math::{camera_forward, camera_right};
 
@@ -2377,4 +2378,579 @@ fn tonemap_and_bright_pass_edge_cases() {
     assert_eq!(bright_pass(0.5), 0.0);
     assert_eq!(bright_pass(1.0), 0.0);
     assert!((bright_pass(2.0) - 2.0).abs() < 1e-6);
+}
+
+/// The shadowed-HDR populated composition gate (Era-2 package 1's
+/// documented follow-up, LANDED): `--corner --populated --shadows
+/// --post` together — the HDR scene pass's shadowed arm draws the
+/// population through the shadowed-populated state's lazily-ensured
+/// HDR pipeline variants (the same shader modules, layouts, and
+/// descriptor sets as the main-pass pipelines; only the render pass
+/// — and its R16G16B16A16 color attachment — differs).
+///
+/// THE DEFECT THIS GATE PINS DEAD (measured on this pod, 2026-11-25,
+/// before the fix): the composition REFUSED on its first frame —
+/// "error: populated route drew no proxy calls" — because the HDR arm
+/// passed `None` for the shadowed proxy pipelines and the recorder's
+/// belt-check skipped the population entirely (PR #33's body called
+/// it "draws the proxies unshadowed-in-HDR"; the shipped behavior was
+/// worse: the demo's fail-visible populated-route check errored the
+/// route outright).
+///
+/// The verification layers:
+/// 1. THE DEFECT PIN — the full shipped 24+2 rest-pose table through
+///    the three-way path presents with the per-kind draw count (the
+///    direct-instanced default: one call per populated kind).
+/// 2. THE PRESENCE INK — the composed frame against the UNPOPULATED
+///    shadowed frame at the same camera: the silhouettes and their
+///    ground casts must move pixels (the pre-fix composed frame was
+///    the unpopulated one in the proxy region — nothing drew).
+/// 3. THE ALLOCATION GATES — the composition's one-time delta against
+///    the post+shadows baseline (the populated families' known lazy
+///    states; the two HDR pipelines are pipeline objects, not
+///    AllocationStats entries — only memories/pools/sets/samplers
+///    are counted), then CONSTANT across warmed composed frames (the
+///    zero-per-frame-allocation discipline).
+/// 4. FIXTURE S (the decisive known answer) — one LIGHT-FACING NPC
+///    torso wall (the rotated-oracle orientation, N·L ≈ 0.707 under
+///    the day light) placed by CPU search DEEP inside a building's
+///    shadow: every interior pixel must equal the FULL POST CHAIN
+///    over the shader's exact deep-shadow equation `albedo · ambient`
+///    (the direct terms — diffuse AND specular — multiply by the PCF
+///    factor; check_ground_patch's discipline carried through the
+///    bloom + ACES chain).
+/// 5. FIXTURE L (the lit control) — the same wall orientation in
+///    open sun: the FULL lit equation `lit_surface_color` through the
+///    chain (the map's verdict is 1 — the placement verified
+///    unshadowed by the raycaster at the probes and their margins).
+///    Together S and L prove the shadowed HDR variant applies the
+///    MAP'S verdict per fragment: an always-ambient pipeline fails L,
+///    an always-lit (map-ignoring) pipeline fails S — the CPU-side
+///    self-discrimination control prints the two equations' delta
+///    (the diffuse term the shadow removes, far above TOLERANCE).
+///
+/// `#[ignore]`d like the binary's other lavapipe gates: it requires
+/// SDL_VIDEODRIVER=offscreen plus a software Vulkan ICD (lavapipe)
+/// and the validation layer. The dev pod needs the user-local ICD
+/// setup (see render_overflow). CI's Post-gates Linux step executes
+/// it enforced; the per-stage println! evidence is what the CI log
+/// must show.
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
+fn shadowed_populated_composes_through_the_hdr_chain() {
+    let _guard = sdl_lock();
+    let mut app = ShellApp::new(ShellConfig {
+        title: "shadowed-populated-hdr".into(),
+        width: 256,
+        height: 256,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    })
+    .unwrap();
+    let mut renderer = Renderer::new(
+        app.window(),
+        RenderConfig {
+            demo_scene: DemoScenePreference::Corner,
+            validation: ValidationPreference::On,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let size = app.window().size_in_pixels();
+    assert_eq!(size, (256, 256));
+    assert!(renderer.stats().validation_active);
+    let _ = app.frame();
+
+    renderer.set_post(true);
+    let light = day_preset();
+    // The demo's own bias — one source for both sides (render_shadows'
+    // discipline; a hand-rolled copy here would drift when the demo's
+    // policy moves).
+    let bias = engine_slice::corner_demo::demo_bias();
+
+    // THE STAND: eye height 1.35 m at the north crosswalk's south end,
+    // looking east-southeast along the east arm — a walk-among-the-crowd
+    // view (the free-look route's own eye height) that keeps the
+    // population, the east building's shadowed ground, and the casts in
+    // frame. The full-table layer only needs the silhouettes visible;
+    // the pixel known answers below use their own dead-on cameras.
+    let matrix = aimed([2.0, 1.35, 6.0], [10.0, 0.0, 2.0]);
+    let eye = [2.0, 1.35, 6.0];
+
+    // THE BASELINE (the unpopulated shadowed post frame): the same
+    // camera through the shadowed mesh path — post + shadows warm, the
+    // populated families NOT yet created (their lazy states do not
+    // exist), and this test's first capture allocates the readback
+    // destination (the sky gate's lesson: +1 device memory, once —
+    // folded into the baseline so the composition delta below is the
+    // populated families' alone).
+    renderer.request_frame_capture().unwrap();
+    let unpopulated = renderer
+        .render_corner_shadowed(&matrix, eye, light, bias, size)
+        .unwrap();
+    assert!(unpopulated.presented, "the unpopulated baseline presents");
+    let unpopulated_image = renderer.take_frame_capture().unwrap().unwrap();
+    let baseline = renderer.allocations();
+
+    // 1. THE DEFECT PIN: the full shipped table (rest poses — the
+    //    skinning input at rest is bit-exact identity, so the composed
+    //    pixels are the authored-silhouette equation) through the
+    //    three-way path.
+    let (npc, vehicle) = engine_slice::corner_population::corner_population();
+    let rest_blocks: Vec<_> = (0..npc.len())
+        .map(|_| engine_renderer::animation::rest_pose_block())
+        .collect();
+    let population = engine_renderer::ProxyPopulation {
+        npc: &npc,
+        npc_poses: &rest_blocks,
+        npc_material: 1,
+        vehicle: &vehicle,
+        vehicle_material: 2,
+    };
+    renderer.request_frame_capture().unwrap();
+    let composed = renderer
+        .render_corner_populated_shadowed(&matrix, eye, light, bias, &population, size)
+        .unwrap();
+    assert!(composed.presented, "the three-way composition presents");
+    assert_eq!(
+        composed.geometry.proxy_draw_calls, 2,
+        "the composed frame draws the population: one call per populated kind \
+         (the direct-instanced default — the pre-fix behavior was 0 and the \
+         demo route refused with 'populated route drew no proxy calls')"
+    );
+    let composed_image = renderer.take_frame_capture().unwrap().unwrap();
+
+    // 2. THE PRESENCE INK: the composed frame against the unpopulated
+    //    baseline — the silhouettes AND their ground casts must move
+    //    pixels (the threshold is the measured floor from this gate's
+    //    first execution on this pod; the actual count prints above).
+    let ink = count_differing_pixels(&composed_image.bytes, &unpopulated_image.bytes, size);
+    println!("composed-vs-unpopulated ink: {ink} bytes differ (of 262144)");
+    assert!(
+        ink >= 200,
+        "the population must be visible in the composed frame (ink {ink} < 200)"
+    );
+
+    // 3. THE ALLOCATION GATES: the one-time composition delta (the
+    //    populated families' lazy states — proxy + skinned +
+    //    shadowed-proxy — measured against the post+shadows baseline),
+    //    then CONSTANT across warmed composed frames.
+    let warm = renderer.allocations();
+    let delta = (
+        warm.device_memory - baseline.device_memory,
+        warm.descriptor_pools - baseline.descriptor_pools,
+        warm.descriptor_sets - baseline.descriptor_sets,
+        warm.samplers - baseline.samplers,
+    );
+    println!(
+        "composition one-time delta vs the post+shadows baseline: {delta:?} \
+         (device_memory, pools, sets, samplers); warm tuple {warm:?}"
+    );
+    assert_eq!(
+        delta,
+        (6, 4, 16, 0),
+        "the populated families' lazy states, one-time: the proxy state's instance-buffer \
+         memory + the two per-kind mesh VBO memories + their staged uploads' staging \
+         memories + the skinned pose storage's memory (6 device_memory); the skinned \
+         family's pool + the shadowed-populated state's three pools (the depth-cast, \
+         skinned-receiving, and plain-receiving families); the skinned family's 3 \
+         per-material sets + the shadowed-populated state's 13 (1 depth + 6 + 6 \
+         receiving, 3 materials × 2 slots); no new samplers (the shadowed families' \
+         immutable nearest sampler is the corner's own, shared)"
+    );
+    renderer.request_frame_capture().unwrap();
+    let repeat = renderer
+        .render_corner_populated_shadowed(&matrix, eye, light, bias, &population, size)
+        .unwrap();
+    assert!(repeat.presented);
+    assert_eq!(
+        renderer.allocations(),
+        warm,
+        "warmed composed allocations constant (zero per-frame allocation)"
+    );
+    let repeat_image = renderer.take_frame_capture().unwrap().unwrap();
+    assert_eq!(
+        repeat_image.bytes, composed_image.bytes,
+        "the warmed composed frame is byte-identical (deterministic composition)"
+    );
+
+    // 4 + 5. THE KNOWN ANSWERS: the light-facing torso wall in deep
+    //    building shadow (S) and in open sun (L), each through the
+    //    three-way path and the full-chain CPU oracle.
+    let (checked_s, max_s, shadowed_center) =
+        check_torso_wall_through_the_chain(&mut renderer, size, light, bias, true);
+    let (checked_l, max_l, lit_center) =
+        check_torso_wall_through_the_chain(&mut renderer, size, light, bias, false);
+
+    // The CPU-side self-discrimination control: the two equations at the
+    // same wall differ by the diffuse + specular terms the shadow
+    // removes — far above TOLERANCE, so fixture S catches a map-ignoring
+    // (always-lit) pipeline and fixture L catches an always-ambient one.
+    let discrimination = shadowed_center
+        .iter()
+        .zip(lit_center)
+        .map(|(s, l)| (l - s).max(0.0))
+        .fold(0.0_f32, f32::max);
+    println!(
+        "S-vs-L equation discrimination at the wall center: {discrimination:.3} \
+         (shadowed {shadowed_center:?} vs lit {lit_center:?}, TOLERANCE {TOLERANCE}/255)"
+    );
+    assert!(
+        discrimination > 0.05,
+        "the fixtures discriminate: the lit equation exceeds the shadowed by \
+         the removed diffuse term ({discrimination:.3} ≤ 0.05 would make both \
+         fixtures vacuous)"
+    );
+
+    assert_eq!(
+        renderer.stats().validation_errors,
+        0,
+        "{:?}",
+        renderer.stats().recent_validation
+    );
+    println!(
+        "shadowed-populated HDR composition: defect pin 2 draws, ink {ink}, one-time delta \
+         {delta:?} then constant, fixture S {checked_s} pixels max {max_s}/255, fixture L \
+         {checked_l} pixels max {max_l}/255 — the shadowed HDR variants apply the map's \
+         verdict per fragment"
+    );
+}
+
+/// One torso-wall fixture's known answer through the full post chain:
+/// a single light-facing NPC (turn 40_960 — the rotated-oracle
+/// orientation, the wall normal [−√½, 0, −√½] pointing into the day
+/// light's horizontal direction, N·L ≈ 0.707) at a placement found by
+/// CPU search, rendered through `render_corner_populated_shadowed`
+/// with post on, and compared per-pixel against the chain reference
+/// (`bloom_mip_from_hdr` → `post_pixel` → `quantized`) over the
+/// expected scene equation:
+///
+/// - `want_shadowed` (fixture S): the wall DEEP inside a building's
+///   shadow — the raycaster must confirm `is_shadowed` at the five
+///   wall probes AND a ±0.3 m margin ring around each (deep interior,
+///   not a penumbra edge; the margin also covers the PCF 3×3 tap
+///   footprint at the map's ≈0.11 m/texel). The expected HDR is the
+///   shader's exact deep-shadow form `albedo · ambient` (both direct
+///   terms multiply by the PCF factor).
+/// - `!want_shadowed` (fixture L): the same wall in open sun — the
+///   raycaster must confirm all probes AND margins lit. The expected
+///   HDR is the full `lit_surface_color` equation (the map's verdict
+///   is 1; the wall is the first surface along its own light rays —
+///   the same self-depth-plus-bias compare the 6-F lit ground patches
+///   prove, at the same N·L ≈ 0.707 light-space slope).
+///
+/// The search also proves the CAMERA corridor: the dead-on eye
+/// (center + 4·normal) outside every building box, the eye→center
+/// segment missing every box (a slab ray-AABB test), and the NPC's
+/// own footprint (±0.3 m in x/z up to y 1.9) outside every box — the
+/// wall is shadowed BY A BUILDING, not standing inside one, and the
+/// camera looks at the wall through open air.
+///
+/// Returns (checked pixels, max channel error, the expected color at
+/// the wall's center) for the caller's summary and the discrimination
+/// control.
+fn check_torso_wall_through_the_chain(
+    renderer: &mut Renderer,
+    size: (u32, u32),
+    light: LightParams,
+    bias: ShadowBias,
+    want_shadowed: bool,
+) -> (usize, u8, [f32; 3]) {
+    // The rotated basis (the pinned convention: +Z → [s, 0, c],
+    // +X → [c, 0, −s]; sin_cos_turn's Taylor is within 2e-6 of unit —
+    // normalize like the shader does).
+    let (s, c) = engine_renderer::proxy_instances::sin_cos_turn(40_960);
+    let n_len = (s * s + c * c).sqrt();
+    let normal = [s / n_len, 0.0, c / n_len];
+    let tangent = [c / n_len, 0.0, -s / n_len];
+    // The v2 torso wall: local half width 0.21, local y ∈ [1.06, 1.60]
+    // (the single-instance oracle's own rectangle — the dead zone
+    // below y 1.06 renders nothing, the pelvis is narrower than the
+    // torso).
+    let hw = 0.21_f32;
+    let y_lo = 1.06_f32;
+    let y_hi = 1.60_f32;
+    let hh = (y_hi - y_lo) / 2.0;
+
+    let boxes = engine_renderer::lit_scene::intersection_boxes();
+    let (scene_min, scene_max) = engine_renderer::shadows::scene_bounds(boxes);
+    let cascade =
+        engine_renderer::shadows::cascade_for(light.dir_toward_light, scene_min, scene_max);
+    // A point is inside a box when it is inside all three slabs.
+    let inside_box = |p: [f32; 3]| {
+        boxes.iter().any(|b| {
+            p[0] >= b.min[0]
+                && p[0] <= b.max[0]
+                && p[1] >= b.min[1]
+                && p[1] <= b.max[1]
+                && p[2] >= b.min[2]
+                && p[2] <= b.max[2]
+        })
+    };
+    // The slab ray-AABB test (the player module's segment_hit shape):
+    // does the segment a→b intersect any box's interior?
+    let segment_hits_box = |a: [f32; 3], b: [f32; 3]| {
+        let dir = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        boxes.iter().any(|bx| {
+            let mut t_enter = 0.0_f32;
+            let mut t_exit = 1.0_f32;
+            for axis in 0..3 {
+                if dir[axis].abs() < f32::EPSILON {
+                    if a[axis] < bx.min[axis] || a[axis] > bx.max[axis] {
+                        return false;
+                    }
+                    continue;
+                }
+                let mut t0 = (bx.min[axis] - a[axis]) / dir[axis];
+                let mut t1 = (bx.max[axis] - a[axis]) / dir[axis];
+                if t0 > t1 {
+                    std::mem::swap(&mut t0, &mut t1);
+                }
+                t_enter = t_enter.max(t0);
+                t_exit = t_exit.min(t1);
+                if t_enter > t_exit {
+                    return false;
+                }
+            }
+            true
+        })
+    };
+    // The five wall probes (center + the ±0.9·(hw, hh) corners) and
+    // each probe's margin ring (±0.3 m along the wall's tangent and
+    // normal axes): ALL must carry the wanted shadow verdict — deep
+    // interior for S, open sun for L.
+    let probes_shadow_state_ok = |pos: [f32; 3]| {
+        let ctr = [pos[0], pos[1] + (y_lo + y_hi) / 2.0, pos[2]];
+        for (a, b) in [
+            (0.0_f32, 0.0_f32),
+            (0.9, 0.9),
+            (0.9, -0.9),
+            (-0.9, 0.9),
+            (-0.9, -0.9),
+        ] {
+            let base = [
+                ctr[0] + a * hw * tangent[0],
+                ctr[1] + b * hh,
+                ctr[2] + a * hw * tangent[2],
+            ];
+            for (dt, dn) in [
+                (0.0_f32, 0.0_f32),
+                (0.3, 0.0),
+                (-0.3, 0.0),
+                (0.0, 0.3),
+                (0.0, -0.3),
+            ] {
+                let probe = [
+                    base[0] + dt * tangent[0] + dn * normal[0],
+                    base[1],
+                    base[2] + dt * tangent[2] + dn * normal[2],
+                ];
+                if engine_renderer::shadows::is_shadowed(probe, &cascade, boxes) != want_shadowed {
+                    return false;
+                }
+            }
+        }
+        true
+    };
+    // The placement search (a deterministic row-major grid scan): the
+    // shadow verdicts, the NPC footprint outside every box, and the
+    // camera corridor open. The grid spans the intersection and the
+    // east/north building-shadow bands.
+    let mut placement = None;
+    'search: for gx in 4..=48 {
+        for gz in -28..=40 {
+            let pos = [gx as f32 * 0.25, 0.02, gz as f32 * 0.25];
+            if !probes_shadow_state_ok(pos) {
+                continue;
+            }
+            // The NPC's own footprint (the v2 silhouette spans ≈0.55 m
+            // wide and 1.85 m tall — the eight corners of ±0.3 m in
+            // x/z at y 0.02 and 1.9).
+            let footprint_clear = !inside_box([pos[0] - 0.3, pos[1], pos[2] - 0.3])
+                && !inside_box([pos[0] - 0.3, pos[1], pos[2] + 0.3])
+                && !inside_box([pos[0] + 0.3, pos[1], pos[2] - 0.3])
+                && !inside_box([pos[0] + 0.3, pos[1], pos[2] + 0.3])
+                && !inside_box([pos[0] - 0.3, pos[1] + 1.9, pos[2] - 0.3])
+                && !inside_box([pos[0] - 0.3, pos[1] + 1.9, pos[2] + 0.3])
+                && !inside_box([pos[0] + 0.3, pos[1] + 1.9, pos[2] - 0.3])
+                && !inside_box([pos[0] + 0.3, pos[1] + 1.9, pos[2] + 0.3]);
+            if !footprint_clear {
+                continue;
+            }
+            let ctr = [pos[0], pos[1] + (y_lo + y_hi) / 2.0, pos[2]];
+            let fixture_eye = [
+                ctr[0] + 4.0 * normal[0],
+                ctr[1] + 4.0 * normal[1],
+                ctr[2] + 4.0 * normal[2],
+            ];
+            if inside_box(fixture_eye) || segment_hits_box(fixture_eye, ctr) {
+                continue;
+            }
+            placement = Some(pos);
+            break 'search;
+        }
+    }
+    let pos = placement.unwrap_or_else(|| {
+        panic!(
+            "no placement found for the {} torso wall fixture (the search grid \
+             x ∈ [1,12], z ∈ [−7,10] carried no spot with the wanted shadow \
+             verdicts, a clear footprint, and an open camera corridor)",
+            if want_shadowed { "shadowed" } else { "lit" }
+        )
+    });
+    let center = [pos[0], pos[1] + (y_lo + y_hi) / 2.0, pos[2]];
+    let fixture_eye = [
+        center[0] + 4.0 * normal[0],
+        center[1] + 4.0 * normal[1],
+        center[2] + 4.0 * normal[2],
+    ];
+
+    // The dead-on orthographic camera (the rotated oracle's own
+    // matrix: each column is one world basis axis's image, the wall's
+    // rectangle fills [-1,1]², the wall lands at depth 0.25).
+    let matrix = [
+        [tangent[0] / hw, 0.0, -0.0625 * normal[0], 0.0],
+        [0.0, 1.0 / hh, 0.0, 0.0],
+        [tangent[2] / hw, 0.0, -0.0625 * normal[2], 0.0],
+        [
+            -(center[0] * tangent[0] + center[2] * tangent[2]) / hw,
+            -center[1] / hh,
+            0.25 + 0.0625 * (center[0] * normal[0] + center[2] * normal[2]),
+            1.0,
+        ],
+    ];
+
+    // The single-NPC population at the found placement, rest pose.
+    let instance = engine_renderer::proxy_instances::ProxyInstance {
+        transform: engine_renderer::proxy_instances::InstanceTransform {
+            pos,
+            turn: 40_960,
+            scale: 1.0,
+        },
+        tint: [0.9, 0.7, 0.6],
+        pose_index: 0,
+    };
+    let single = [instance];
+    let poses = [engine_renderer::animation::rest_pose_block()];
+    let population = engine_renderer::ProxyPopulation {
+        npc: &single,
+        npc_poses: &poses,
+        npc_material: 1,
+        vehicle: &[],
+        vehicle_material: 0,
+    };
+    renderer.request_frame_capture().unwrap();
+    let frame = renderer
+        .render_corner_populated_shadowed(&matrix, fixture_eye, light, bias, &population, size)
+        .unwrap();
+    assert!(frame.presented);
+    assert_eq!(
+        frame.geometry.proxy_draw_calls, 1,
+        "the single-npc fixture draws once (the npc kind)"
+    );
+    let image = renderer.take_frame_capture().unwrap().unwrap();
+
+    // THE FULL-CHAIN CPU ORACLE: the wall fills the frame, so every
+    // pixel's HDR color is the expected equation at that pixel's world
+    // point (screen → world through the dead-on rectangle; the
+    // albedo's UV from the INVERSE transform's local coordinates —
+    // the instance transform never touches UV), and the chain
+    // reference runs over the reconstructed image exactly (the
+    // pure-sky oracle's discipline applied to the wall).
+    let mat = materials()[1];
+    let texture = procedural_texture(mat.texture);
+    let mut hdr = Vec::with_capacity((size.0 * size.1) as usize);
+    let mut expected_center = [0.0_f32; 3];
+    for y in 0..size.1 {
+        for x in 0..size.0 {
+            let dx = (x as f32 + 0.5) * 2. / size.0 as f32 - 1.;
+            let dy = (y as f32 + 0.5) * 2. / size.1 as f32 - 1.;
+            let world = [
+                center[0] + dx * hw * tangent[0],
+                center[1] - dy * hh,
+                center[2] + dx * hw * tangent[2],
+            ];
+            let local_x = (world[0] - pos[0]) * tangent[0] + (world[2] - pos[2]) * tangent[2];
+            let local_y = world[1] - pos[1];
+            let [tx, ty] = [(local_x / 4.), (local_y / 4.)]
+                .map(|m| (m.rem_euclid(1.) * TEXTURE_SIZE as f32).floor() as usize);
+            let index = 4 * (ty * TEXTURE_SIZE as usize + tx);
+            let albedo =
+                std::array::from_fn(|ch| texture[index + ch] as f32 / 255. * instance.tint[ch]);
+            let view = std::array::from_fn(|i| fixture_eye[i] - world[i]);
+            // The expected scene equation: deep shadow zeroes BOTH
+            // direct terms (the shader's `albedo * (ambient + light ·
+            // NdotL · shadow) + specular · light · NdotL · shadow`
+            // collapses to `albedo * ambient` at factor 0); open sun
+            // is the full lit equation (factor 1 — the placement's
+            // probes proved the map's verdict).
+            let expected = if want_shadowed {
+                [
+                    albedo[0] * light.ambient[0],
+                    albedo[1] * light.ambient[1],
+                    albedo[2] * light.ambient[2],
+                ]
+            } else {
+                lit_surface_color(albedo, normal, view, mat, light)
+            };
+            if x == size.0 / 2 && y == size.1 / 2 {
+                expected_center = expected;
+            }
+            hdr.push(expected);
+        }
+    }
+    let mip = bloom_mip_from_hdr(&hdr, size);
+    let mut largest_error = 0u8;
+    let mut checked = 0usize;
+    for y in 8..size.1 - 8 {
+        for x in 8..size.0 - 8 {
+            let hdr_texel = hdr[(y * size.0 + x) as usize];
+            let bloom = bloom_at_pixel(&mip, size, (x, y));
+            let presented = quantized(post_pixel(hdr_texel, bloom));
+            let expected = [presented[0], presented[1], presented[2], 255];
+            let pixel = image.pixel_rgba(x, y);
+            let error = expected
+                .iter()
+                .zip(pixel)
+                .map(|(e, a)| e.abs_diff(a))
+                .max()
+                .unwrap();
+            largest_error = largest_error.max(error);
+            assert!(
+                error <= TOLERANCE,
+                "{} torso wall at {pos:?} pixel ({x},{y}): expected {expected:?}, \
+                 got {pixel:?} (through the full chain over the {} equation)",
+                if want_shadowed { "shadowed" } else { "lit" },
+                if want_shadowed {
+                    "albedo·ambient"
+                } else {
+                    "lit_surface_color"
+                }
+            );
+            checked += 1;
+        }
+    }
+    println!(
+        "{} torso wall at {pos:?}: {checked} pixels through the full chain, max RGB \
+         error {largest_error}/255, expected center {expected_center:?}",
+        if want_shadowed {
+            "shadowed (S)"
+        } else {
+            "lit (L)"
+        }
+    );
+    (checked, largest_error, expected_center)
+}
+
+/// Counts differing bytes between two same-size frame captures (the
+/// ink differential: every byte that moved — the captured frames are
+/// opaque, so the alpha channel never moves spuriously).
+fn count_differing_pixels(a: &[u8], b: &[u8], size: (u32, u32)) -> usize {
+    let expected = (size.0 * size.1 * 4) as usize;
+    assert_eq!(
+        (a.len(), b.len()),
+        (expected, expected),
+        "the captured frames must be full-size RGBA"
+    );
+    a.iter().zip(b.iter()).filter(|&(x, y)| x != y).count()
 }

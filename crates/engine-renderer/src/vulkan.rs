@@ -2253,6 +2253,27 @@ impl PipelineState {
             {
                 skinned_state.ensure_hdr(ctx, post_state.hdr_render_pass())?;
             }
+            // The Era-2 companion's shadowed half: a populated SHADOWED
+            // POST frame needs the shadowed-populated state's HDR pipeline
+            // variants (the HDR scene pass's shadowed arm draws the proxies
+            // through them — the same family-growth shape as the skinned
+            // ensure above; the shadowed-proxy state itself was ensured with
+            // the shadowed populated frame, before this block). Per-frame
+            // idempotent, so the pipeline-replacement path re-ensures against
+            // the new pass exactly like the skinned HDR variant (the finding-A
+            // discipline: the replacement replicates the base states, the
+            // variants re-ensure lazily).
+            if proxy.is_some()
+                && shadowed.is_some()
+                && let (Some(post_state), Some(shadowed_proxy_state)) =
+                    (&mut self.post, &mut self.shadowed_proxy)
+            {
+                let skinned = self.skinned.as_ref().expect(
+                    "the skinned ensure discipline makes a populated frame's \
+                     missing skinned state unreachable",
+                );
+                shadowed_proxy_state.ensure_hdr(ctx, skinned, post_state.hdr_render_pass())?;
+            }
             if sky.is_some()
                 && let (Some(post_state), Some(sky_state)) = (&mut self.post, &self.sky)
             {
