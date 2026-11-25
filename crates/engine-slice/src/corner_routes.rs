@@ -15,15 +15,18 @@
 //! # THE ROUTE TABLE
 //! - THE FLANK LOOPS (EIGHT): both sidewalk bands of each road arm's FAR
 //!   segment — closed there-and-backs, two lanes exactly 0.75 m apart.
-//! - THE CROSSWALK PACERS (TWO): inside the west and north crosswalks'
-//!   camera-far halves, starting at the ORIGINAL crossers' exact positions.
+//! - THE CROSSWALK CROSSERS (TWO): the full crossings of both crosswalks
+//!   on the shared clock — the crosser completes its original crossing
+//!   (away from the camera's line) while the camera passes the crosswalk
+//!   behind it, then crosses the full road arm; the crossing turn-arounds
+//!   at ±3.7 clear the standing waiters by the 0.8 walker-waiter margin.
 //! - THE WAITERS (8): no route — standing states at the original placement
 //!   table's entries, byte-identical.
 //!
 //! THE CORNER RING IS RETIRED: a closed circuit around the intersection
 //! must cross roads, the scene's only crosswalks are the camera's own
 //! (west and north), and a camera-safe ring is not a ring — the honest
-//! camera-safe crowd is the flanks + pacers + the waiters' standing.
+//! camera-safe crowd is the flanks + crossers + the waiters' standing.
 
 use crate::corner_population::{Block, WALK_STRIDE_SECONDS};
 use engine_core::npc_locomotion::{LOOPING, NpcLocomotion, Route, RouteLeg, start_route};
@@ -64,10 +67,10 @@ const FLANK_FAR: f32 = 10.5;
 /// edges — nothing remains for a spread. The de-lockstep lives in the
 /// speed and phase draws; the pacers carry the lateral spread.
 const FLANK_SPREAD: f32 = 0.0;
-/// The pacers' lateral spread: the swept band ±0.3 stays inside the
+/// The crossers' lateral spread: the swept band ±0.3 stays inside the
 /// crosswalk strips' ±0.64 footprint-clear band (the original crosser
 /// convention).
-const PACER_SPREAD: f32 = 0.3;
+const CROSSER_SPREAD: f32 = 0.3;
 
 // THE LANE-SEPARATION DERIVATION: the two flank lanes are EXACTLY 0.75
 // apart (5.125 − 4.375 — both dyadic, so the subtraction is exact in f32).
@@ -342,64 +345,66 @@ fn ew_south_east_flank() -> Route {
 }
 
 // ------------------------------------------------------- the crosswalk pacers (2)
-/// The crosswalk pacing loops: the two crossers pace INSIDE their
-/// crosswalks' camera-far halves (the west crosswalk's north half at
-/// x = -5.0, z ∈ [1.5, 2.6] — >= 1.0 m from the camera spline's
-/// z ~ 0 west-arm line; the north crosswalk's east half at z = 5.0,
-/// x in [1.5, 2.6] — >= 1.0 m from the x ~ 0 north-arm line). The
-/// about-face at each end is the turn blend's rate-limited rotation
-/// (a pedestrian pausing to look before crossing). The 0.3 lateral
-/// spread keeps the swept band inside the crosswalk strip
-/// (|x + 5.0| <= 0.64 / |z - 5.0| <= 0.64, the original placement
-/// battery's crosser convention). The FULL crossing (the whole road
-/// arm) crosses the camera spline by construction and belongs to the
-/// composed-crowd package (noted, not done).
-/// The west crosswalk pacer.
-fn west_crosswalk_pacer() -> Route {
+/// THE CROSSWALK CROSSERS (TWO): full crossings of both crosswalks on the shared clock — the
+/// crosser completes its original crossing (away from the camera's line) while the camera passes
+/// the crosswalk behind it, then crosses the full road arm; the crossing turn-arounds at ±3.7 are
+/// the furthest points that clear the standing waiters by the walker-waiter margin (4.5 − 3.7;
+/// f32 measures 0.79999995 — 3.7 is not dyadic) — the whole road arm curb-to-curb minus the
+/// waiter standoff (the waiters stand ON the crosswalk lines at the curbs).
+/// The west crosswalk crosser.
+fn west_crosswalk_crosser() -> Route {
     Route::new(
         [-5.0, 1.5],
         vec![
             RouteLeg {
-                to: [-5.0, 2.6],
+                to: [-5.0, 3.7],
                 turn: 0,
-            }, // northbound pace
+            }, // northbound: completing the original crossing (away from the camera's west-arm line z=0)
+            RouteLeg {
+                to: [-5.0, -3.7],
+                turn: 32768,
+            }, // the about-face at the north turn-around; the FULL southbound crossing
             RouteLeg {
                 to: [-5.0, 1.5],
-                turn: 32768,
-            }, // the about-face, south
+                turn: 0,
+            }, // the full northbound crossing back to the origin (the loop closes; no turn at the origin — the heading is north on both sides)
         ],
         WALK_SPEED,
-        PACER_SPREAD,
+        CROSSER_SPREAD,
         STRIDE_LENGTH,
         TURN_RATE,
         true,
         9,
     )
-    .expect("the west pacer closes exactly")
+    .expect("the west crosser closes exactly")
 }
 
-/// The north crosswalk pacer.
-fn north_crosswalk_pacer() -> Route {
+/// The north crosswalk crosser.
+fn north_crosswalk_crosser() -> Route {
     Route::new(
         [1.5, 5.0],
         vec![
             RouteLeg {
-                to: [2.6, 5.0],
+                to: [3.7, 5.0],
                 turn: 16384,
-            }, // eastbound pace
+            }, // eastbound: completing the original crossing (away from the camera's north-arm line x=0)
+            RouteLeg {
+                to: [-3.7, 5.0],
+                turn: 49152,
+            }, // the about-face; the FULL westbound crossing
             RouteLeg {
                 to: [1.5, 5.0],
-                turn: 49152,
-            }, // the about-face, west
+                turn: 16384,
+            }, // the full eastbound crossing back to the origin (closes)
         ],
         WALK_SPEED,
-        PACER_SPREAD,
+        CROSSER_SPREAD,
         STRIDE_LENGTH,
         TURN_RATE,
         true,
         10,
     )
-    .expect("the north pacer closes exactly")
+    .expect("the north crosser closes exactly")
 }
 
 // ------------------------------------------------------- route table (10 routes total)
@@ -407,7 +412,7 @@ fn north_crosswalk_pacer() -> Route {
 /// Routes 0-7: the 8 flank loops (N-S west north, N-S west south,
 /// N-S east north, N-S east south, E-W north west, E-W north east,
 /// E-W south west, E-W south east)
-/// Routes 8-9: the 2 crosswalk pacers (west, north)
+/// Routes 8-9: the 2 crosswalk crossers (west, north)
 pub fn corner_routes() -> Vec<Route> {
     vec![
         ns_west_north_flank(),
@@ -418,8 +423,8 @@ pub fn corner_routes() -> Vec<Route> {
         ew_north_east_flank(),
         ew_south_west_flank(),
         ew_south_east_flank(),
-        west_crosswalk_pacer(),
-        north_crosswalk_pacer(),
+        west_crosswalk_crosser(),
+        north_crosswalk_crosser(),
     ]
 }
 
@@ -703,6 +708,9 @@ pub struct SweepSummary {
     /// Any swept sample vs any waiter position. Margin >= 0.75.
     pub waiter_min: f32,
     /// Any swept sample vs the camera polyline. Margin >= 0.8.
+    /// The check is scoped to FLANK routes only (sample.route < 8);
+    /// the crossers cross the spline BY DESIGN (part 4's documented deferral;
+    /// the TEMPORAL gate below owns their camera safety).
     pub camera_min: f32,
     /// min(|x|,|z|) - (ROAD_EDGE + FOOTPRINT) over sidewalk samples.
     pub road_margin: f32,
@@ -710,8 +718,8 @@ pub struct SweepSummary {
     pub building_margin: f32,
     /// Any swept sample vs the VEHICLE_TABLE boxes. Margin >= 1.0.
     pub sedan_min: f32,
-    /// Pacer samples outside their crosswalk bands (0 expected).
-    pub pacer_band_violations: u32,
+    /// Crosser samples outside their crosswalk bands (0 expected).
+    pub crosser_band_violations: u32,
 }
 
 /// The sedans' axis-aligned half extents at their turns.
@@ -772,14 +780,19 @@ pub fn sweep_battery(routes: &[Route]) -> SweepSummary {
     }
 
     // --- camera_min: every sample vs the camera_route's segments
+    // The check is scoped to FLANK routes only (sample.route < 8);
+    // the crossers cross the spline BY DESIGN (part 4's documented deferral;
+    // the TEMPORAL gate below owns their camera safety).
     let mut camera_min = f32::INFINITY;
     let camera_route = camera_route();
     for window in camera_route.windows(2) {
         let a = [window[0].position[0], window[0].position[2]];
         let b = [window[1].position[0], window[1].position[2]];
         for sample in &samples {
-            let dist = point_segment_distance(sample.pos, a, b);
-            camera_min = camera_min.min(dist);
+            if sample.route < 8 {
+                let dist = point_segment_distance(sample.pos, a, b);
+                camera_min = camera_min.min(dist);
+            }
         }
     }
 
@@ -826,22 +839,22 @@ pub fn sweep_battery(routes: &[Route]) -> SweepSummary {
         sedan_min = sedan_min.min(d1.min(d2));
     }
 
-    // --- pacer_band_violations: samples from routes 8-9 must be in their crosswalk bands
-    let mut pacer_band_violations = 0u32;
+    // --- crosser_band_violations: samples from routes 8-9 must be in their crosswalk bands
+    let mut crosser_band_violations = 0u32;
     for sample in &samples {
         if sample.route == 8 {
-            // West pacer: x = -5.0, z ∈ [1.5, 2.6]
+            // West crosser: |x + 5.0| <= 0.64 AND z ∈ [-3.7, 3.7]
             let [x, z] = sample.pos;
-            let in_band = (x + 5.0).abs() <= 1.0 - FOOTPRINT && z.abs() <= ROAD_EDGE - FOOTPRINT;
+            let in_band = (x + 5.0).abs() <= 0.64 && (-3.7..=3.7).contains(&z);
             if !in_band {
-                pacer_band_violations += 1;
+                crosser_band_violations += 1;
             }
         } else if sample.route == 9 {
-            // North pacer: z = 5.0, x ∈ [1.5, 2.6]
+            // North crosser: |z - 5.0| <= 0.64 AND x ∈ [-3.7, 3.7]
             let [x, z] = sample.pos;
-            let in_band = (z - 5.0).abs() <= 1.0 - FOOTPRINT && x.abs() <= ROAD_EDGE - FOOTPRINT;
+            let in_band = (z - 5.0).abs() <= 0.64 && (-3.7..=3.7).contains(&x);
             if !in_band {
-                pacer_band_violations += 1;
+                crosser_band_violations += 1;
             }
         }
     }
@@ -854,7 +867,7 @@ pub fn sweep_battery(routes: &[Route]) -> SweepSummary {
         road_margin,
         building_margin,
         sedan_min,
-        pacer_band_violations,
+        crosser_band_violations,
     }
 }
 
@@ -909,9 +922,9 @@ mod tests {
             assert!(route.loops(), "route {i} loops");
         }
 
-        // Routes 8-9: pacers have 2 legs
+        // Routes 8-9: crossers have 3 legs
         for (i, route) in routes.iter().enumerate().skip(8) {
-            assert_eq!(route.leg_count(), 2, "pacer route {i} has 2 legs");
+            assert_eq!(route.leg_count(), 3, "crosser route {i} has 3 legs");
         }
 
         // The policy tags: table index + 1 (the routes' diagnostic
@@ -931,12 +944,22 @@ mod tests {
         assert_eq!(route0.leg_from(3), [-FLANK_BUILDING_SIDE, FLANK_NEAR]);
         assert_eq!(route0.leg_to(3), [-FLANK_ROAD_SIDE, FLANK_NEAR]);
 
-        // Spot-pin route 8's leg coordinates and turns (west pacer)
+        // Spot-pin route 8's leg coordinates and turns (west crosser)
         let route8 = &routes[8];
         assert_eq!(route8.leg_from(0), [-5.0, 1.5]);
-        assert_eq!(route8.leg_to(0), [-5.0, 2.6]);
-        assert_eq!(route8.leg_from(1), [-5.0, 2.6]);
-        assert_eq!(route8.leg_to(1), [-5.0, 1.5]);
+        assert_eq!(route8.leg_to(0), [-5.0, 3.7]);
+        assert_eq!(route8.leg_from(1), [-5.0, 3.7]);
+        assert_eq!(route8.leg_to(1), [-5.0, -3.7]);
+        assert_eq!(route8.leg_from(2), [-5.0, -3.7]);
+        assert_eq!(route8.leg_to(2), [-5.0, 1.5]);
+        // Spot-pin route 9's leg coordinates and turns (north crosser)
+        let route9 = &routes[9];
+        assert_eq!(route9.leg_from(0), [1.5, 5.0]);
+        assert_eq!(route9.leg_to(0), [3.7, 5.0]);
+        assert_eq!(route9.leg_from(1), [3.7, 5.0]);
+        assert_eq!(route9.leg_to(1), [-3.7, 5.0]);
+        assert_eq!(route9.leg_from(2), [-3.7, 5.0]);
+        assert_eq!(route9.leg_to(2), [1.5, 5.0]);
     }
 
     /// THE POPULATION CONSTRUCTOR: builds the routes, 24 states, and mask.
@@ -972,8 +995,10 @@ mod tests {
             );
         }
 
-        // Crossers 8-9: at the pacing starts — the ORIGINAL crossers'
-        // exact positions and facings — walking, LOOPING.
+        // Crossers 8-9: at the crossing starts — the ORIGINAL crossers'
+        // exact positions and facings — walking, LOOPING (frame 0 is
+        // byte-identical to the pacers' own: same origin, same first-leg
+        // heading, same seed draws).
         assert_eq!(states[8].position, [-5.0, 1.5]);
         assert_eq!(states[8].facing, 0);
         assert_eq!(states[8].route, 8);
@@ -1077,15 +1102,16 @@ mod tests {
 
         assert!(
             summary.cross_route_min >= 0.75,
-            "cross_route_min >= 0.75, measured 1.9445436: {summary:?}"
+            "cross_route_min >= 0.75, measured 1.3768167: {summary:?}"
         );
         assert!(
             summary.waiter_min >= 0.75,
-            "waiter_min >= 0.75, measured 0.8003907: {summary:?}"
+            "waiter_min >= 0.75, measured 0.79999995 (the crossers' turn-around standoff: \
+             4.5 - 3.7 in f32 — 3.7 is not dyadic): {summary:?}"
         );
         assert!(
             summary.camera_min >= 0.8,
-            "camera_min >= 0.8, measured 1.5: {summary:?}"
+            "camera_min >= 0.8, measured 4.375: {summary:?}"
         );
         assert!(
             summary.road_margin > 0.0,
@@ -1100,8 +1126,8 @@ mod tests {
             "sedan_min >= 1.0, measured 1.395: {summary:?}"
         );
         assert_eq!(
-            summary.pacer_band_violations, 0,
-            "the pacers stay inside their crosswalk bands: {summary:?}"
+            summary.crosser_band_violations, 0,
+            "the crossers stay inside their crosswalk bands: {summary:?}"
         );
         assert!(summary.samples > 0, "the sweep sampled the routes");
     }
@@ -1169,13 +1195,16 @@ mod tests {
                     })
                     .collect();
                 let digest = locomotion_digest(&samples);
+                // The MEASURED pins (this tree's own run; movement is an
+                // investigation, never a silent repin). Frame 66, 300, 600, 662 re-measure
+                // after route structure change (3 legs crossers).
                 let pinned = match k {
                     0 => 5_555_165_838_415_353_039,
                     33 => 15_857_914_442_065_508_438,
-                    66 => 7_884_320_277_839_605_183,
-                    300 => 2_298_866_077_436_191_627,
-                    600 => 3_676_128_144_009_102_166,
-                    _ => 1_541_710_115_810_823_099,
+                    66 => 6_639_413_311_845_848_126,
+                    300 => 6_989_226_880_933_403_699,
+                    600 => 15_161_854_520_410_245_683,
+                    _ => 6_317_174_068_473_851_239,
                 };
                 assert_eq!(digest, pinned, "the locomotion digest moved at frame {k}");
             }
@@ -1376,4 +1405,177 @@ mod tests {
     }
 
     // Import helpers from engine_core for advance_batch (used in pose_bytes_fnv_pins test)
+
+    /// THE FULL CROSSINGS CLEAR THE CAMERA ON THE SHARED CLOCK (the
+    /// composed-crowd package's headline): the camera route and the crowd
+    /// advance on the SAME deterministic clock, and at EVERY frame the
+    /// whole population clears the camera's SAME-FRAME position by at
+    /// least 0.8 (the placement battery's own camera convention, now
+    /// temporal: a full crossing crosses the camera's road line BY
+    /// DESIGN — the gate proves it crosses BEHIND the camera).
+    ///
+    /// THE DEMO'S OWN PAIRING (verified in corner_demo's route loop):
+    /// the crowd steps from the timing warmup's first loop iteration
+    /// while the camera's pose advances only inside the measured window
+    /// (WARMUP = 60), so the owner sees crowd step k with camera pose
+    /// `clamp(k - 60, 0, 600)` — the crowd runs 60 ticks (1 s) ahead of
+    /// the pose index; the 663 presented frames are 60 warmup, 601
+    /// route, and 2 drain. The gate models exactly that sequence,
+    /// extended to
+    /// 1280 steps to cover both crossers' second-loop line crossings
+    /// against the parked camera (crosser 8's loop period ~648 frames
+    /// at its 1.3704 m/s draw, crosser 9's ~671 at 1.3231). The
+    /// pairwise discipline is NOT claimed beyond the demo's 663
+    /// presented frames (the same-loop stroller drift bound is a
+    /// 663-frame design bound — the campaign test's own scope).
+    ///
+    /// THE CAMERA'S SCHEDULE (SCENE_EXTENT 40: the first segment runs
+    /// x -38 -> -4 over poses 0-120, so the camera passes the west
+    /// crosswalk line x = -5 at pose ~116.5; the north arm runs z 2 ->
+    /// 20 over poses 360-480, passing the north crosswalk line z = 5 at
+    /// pose 380; beyond pose 600 the camera is parked at [0, 1.7, 38]):
+    /// crosser 8 crosses z = 0 at steps 259/583/907/1231 (poses
+    /// 199/523/847/1171) — the first 82 poses after the camera passed
+    /// the crosswalk, with the camera already at the intersection
+    /// approach; crosser 9 crosses x = 0 at steps 268/604/939/1275
+    /// (poses 208/544/879/1215) — the first while the camera is still
+    /// in the west arm's east end, the second 164 poses after the
+    /// camera passed the north crosswalk, the rest against the parked
+    /// camera. The MEASURED same-frame minimum: 1.8529123 at step 178
+    /// (crosser 8 southbound mid-crosswalk at z ~ 1.83, the camera at
+    /// x = -4.57 exiting the west arm) — 2.3x the 0.8 gate.
+    #[test]
+    fn full_crossings_clear_the_camera_on_the_shared_clock() {
+        use engine_core::npc_locomotion::advance_batch;
+
+        // Materialize the route poses once (601 entries).
+        let poses: Vec<_> = crate::corner_demo::route_poses().collect();
+
+        let dt = 1.0 / 60.0;
+        let (routes_a, mut states_a, present_a) = corner_population_locomotion();
+        let (routes_b, mut states_b, present_b) = corner_population_locomotion();
+
+        // The window covers the demo's full 663-frame sequence plus both
+        // crossers' second-loop line crossings with the parked camera
+        // (crosser 8's period ~648 frames, crosser 9's ~671; 1280 covers both).
+        let mut global_min = f32::INFINITY;
+        let mut global_min_frame = 0u64;
+        let mut crosser8_crossings = Vec::new();
+        let mut crosser9_crossings = Vec::new();
+        let mut prev_z8 = states_a[8].position[1];
+        let mut prev_x9 = states_a[9].position[0];
+
+        for k in 0..=1280u64 {
+            // THE DOUBLE-RUN: both populations hold identical states.
+            for npc_idx in [8usize, 9] {
+                assert_eq!(
+                    (
+                        states_a[npc_idx].position,
+                        states_a[npc_idx].facing,
+                        states_a[npc_idx].leg,
+                        states_a[npc_idx].stride_phase
+                    ),
+                    (
+                        states_b[npc_idx].position,
+                        states_b[npc_idx].facing,
+                        states_b[npc_idx].leg,
+                        states_b[npc_idx].stride_phase
+                    ),
+                    "the double-run diverged at frame {k}, npc {npc_idx}"
+                );
+            }
+
+            // THE CAMERA MINIMUM: compute the camera's 2D position at frame k
+            // using the demo's pairing: pose index = clamp(k - 60, 0, 600).
+            let pose_idx = ((k as i64 - 60).max(0) as u64).min(600);
+            let pose = &poses[pose_idx as usize];
+            let camera_pos = [pose.position[0], pose.position[2]];
+
+            let mut min_dist = f32::INFINITY;
+            for state in states_a.iter().take(24) {
+                let npc_pos = state.position;
+                let dx = npc_pos[0] - camera_pos[0];
+                let dz = npc_pos[1] - camera_pos[1];
+                let dist = (dx * dx + dz * dz).sqrt();
+                min_dist = min_dist.min(dist);
+            }
+            if min_dist < global_min {
+                global_min = min_dist;
+                global_min_frame = k;
+            }
+            assert!(
+                min_dist >= 0.8,
+                "crowd and camera too close at frame {k}: {min_dist} m"
+            );
+
+            // Crosser 8's z=0 crossings (northbound positive, southbound negative)
+            let curr_z8 = states_a[8].position[1];
+            if (prev_z8 <= 0.0 && curr_z8 > 0.0) || (prev_z8 >= 0.0 && curr_z8 < 0.0) {
+                crosser8_crossings.push(k);
+            }
+            prev_z8 = curr_z8;
+
+            // Crosser 9's x=0 crossings (eastbound positive, westbound negative)
+            let curr_x9 = states_a[9].position[0];
+            if (prev_x9 <= 0.0 && curr_x9 > 0.0) || (prev_x9 >= 0.0 && curr_x9 < 0.0) {
+                crosser9_crossings.push(k);
+            }
+            prev_x9 = curr_x9;
+
+            advance_batch(&routes_a, &mut states_a, &present_a, dt, None, 0.3, 1.75);
+            advance_batch(&routes_b, &mut states_b, &present_b, dt, None, 0.3, 1.75);
+        }
+
+        println!(
+            "full crossings camera minimum: {global_min} at frame {global_min_frame}; \
+             crosser 8 z=0 crossings: {:?}; crosser 9 x=0 crossings: {:?}",
+            crosser8_crossings, crosser9_crossings
+        );
+
+        // THE MEASURED PINS (this tree's own run; movement is an
+        // investigation, never a silent repin).
+        assert_eq!(
+            global_min, 1.8529123,
+            "the same-frame camera minimum moved (was 1.8529123 at step 178)"
+        );
+        assert_eq!(
+            global_min_frame, 178,
+            "the same-frame camera minimum's frame moved"
+        );
+        assert_eq!(
+            crosser8_crossings,
+            [259, 583, 907, 1231],
+            "crosser 8's z=0 crossing steps moved"
+        );
+        assert_eq!(
+            crosser9_crossings,
+            [268, 604, 939, 1275],
+            "crosser 9's x=0 crossing steps moved"
+        );
+
+        // THE SEMANTIC TIMING BOUNDS (pose-index terms — the camera's
+        // own schedule): crosser 8's first crossing lands at pose
+        // 259 - 60 = 199, which must sit past the camera's west-arm
+        // exit (pose 120; the camera passed the crosswalk line x = -5
+        // at pose ~116.5) — the crossing happens BEHIND the camera.
+        let first8_pose = crosser8_crossings[0] - 60;
+        assert!(
+            first8_pose > 130,
+            "crosser 8's first z=0 crossing lands at pose {first8_pose}, past the \
+             camera's west-arm exit (120) — the design's behind-the-camera bound"
+        );
+        // None of crosser 9's crossings may land inside the camera's
+        // +-1.5 m window around its own north-crosswalk pass (the
+        // camera crosses z = 5 at pose 380 at 9 m/s, so z in [3.5, 6.5]
+        // spans poses [370, 390]); the measured crossings land at poses
+        // 208/544 and, past the route's end, against the parked camera.
+        for &step in &crosser9_crossings {
+            let pose = step.saturating_sub(60).min(600);
+            assert!(
+                !(370..=390).contains(&pose),
+                "crosser 9's x=0 crossing lands at pose {pose}, inside the camera's \
+                 north-crosswalk window [370, 390]"
+            );
+        }
+    }
 }

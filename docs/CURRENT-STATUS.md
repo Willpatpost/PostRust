@@ -28,6 +28,19 @@ work from THIS file alone.
   minutes; the extension re-settles the §4 table at `d9a034d` and carries
   the package's record into §2, §9, and the capability matrix, so the
   index is current at merge time rather than born one landing behind.
+- **Extended for the Era-2 package A part 8 delivery on 2026-11-25:** the
+  composed-crowd camera crossing (part 4's documented deferral closed — the
+  full crosswalk crossings on the shared clock) delivered on
+  `era2/npc-ai-composed-crowd`, stacked on the part-7 tip; this pass
+  settles the §4 table at that tree (main 1313/2/33 unchanged and heavy
+  620/33/63, both Linux MEASURED with the workflow's own awk) and carries
+  the package's record into §2, §9, and the matrix.
+- **Extended for the Era-2 package A part 7 delivery on 2026-11-25:** the
+  capture-lane gates (§8.4 item 4, the last unlanded design-pass gate)
+  delivered on `era2/npc-ai-capture-lane`, stacked on the s6-soak-seam
+  tip; this pass settles the §4 table at that tree (main 1313/2/33 and
+  heavy 618/33/63, both Linux MEASURED with the workflow's own awk) and
+  carries the package's record into §2, §9, and the matrix.
 - **Update rule:** every change that alters capabilities, test counts,
   performance evidence, or priorities updates this file in the same change.
 
@@ -181,6 +194,32 @@ ARM64) with a five-job CI:
   has LANDED as package A part 4 (the corner demo's populated route
   on the locomotion state — see `engine-slice`'s corner_routes
   paragraph); the composed gates remain as package A's final part.
+  The **memory-lane core** (package A part 7, `npc_memory.rs` — the
+  design pass §5.2/§5.3 + §8.4 item 4's engine half, additive, the
+  spine and every existing module untouched): the idempotency-keyed
+  capture ledger (MemoryKey = the EVENT's key × witness × kind, the
+  S6-lite harness's mem:/rel:/cand: family; MemoryDelta = §5.3's
+  three writes — the episodic PerceptionTrace reused verbatim, the
+  witness→actor relationship delta, the reputation candidate) with
+  capture-at-production (I1 by construction: the discard can never
+  precede the capture), first-capture-wins idempotence, the async
+  confirm transition, and the canonical-global-key-order
+  witness_records merge (both phases, never phase-partitioned — the
+  rebuild's retention depends on the event order); the live
+  representation (WitnessMemory: the bounded episodic Vec through
+  the EXISTING retain_trace, the checked relationship accumulators,
+  the candidate phases); the transition surface (capture_and_apply
+  — the single-sourced exactly-once event path with the
+  active/dormant materialization gate: a dormant witness's records
+  accumulate ledger-only; deactivate/activate — the discard and the
+  canonical-order rebuild with the durable classification decisions
+  re-applied, fail-closed overflow); and the M-08 shared campaign
+  reputation (`reputation_score` — one shared fold over the LEDGER's
+  accepted candidates only, representation-independent so a
+  deactivation cannot move it) — pinned by an 18-test battery
+  (main-shard platform-uniform) including the phase-interleave pin,
+  the inactive-witness gate, the retention-bounded rebuild, and the
+  accepted-only fold with the cross-cycle score durability.
 - **`engine-persist`** — the persistence stack: SHA-256 content-addressed
   revision store; `CanonicalMedium` boundary with **two production mediums
   carrying distinct durability contracts** — SQLiteMedium
@@ -386,6 +425,113 @@ ARM64) with a five-job CI:
   by tier; pod-observational with the double-run determinism
   asserted in every section, its 5-test lib battery pinning the
   workload digests — §9's arc record carries the measured numbers).
+  The **memory-lane composition** (package A part 7,
+  `npc_memory_lane.rs` + `tests/npc_memory_lane.rs` — §8.4 item 4's
+  driven half, the corner_behavior precedent: game policy by
+  placement): the authored policy table (three encounter kinds with
+  the radii/relationship-deltas/candidate classes, the 24-NPC
+  population with the measured adjacency minimums, the payload
+  codec with the namespace-collision proof against the wake/witness
+  tags), the composed world (impl World — the REAL
+  enumerate_witnesses census tier-gated by the region levels, the
+  fixed-order per-witness captures through capture_and_apply, the
+  encounter log, the versioned fingerprint domain
+  engine-slice/memory-lane-world/1), the LOD transitions over the
+  REAL spine machinery (suspend_ids/resume_matching/schedule_held,
+  with the BETWEEN-LEVEL immediate retention re-application — the
+  memory depth follows the tier now, the fuzz gate's own catch),
+  and the REAL pipeline ride (commit_witness_captures in the
+  crossing's staged-commit order: stage → the fsynced T1 journal
+  capture → mark_applied → commit_canonical, the dropped-ack fault
+  as the withheld submit, the global actionable-set confirmation
+  mapping back to the lane's per-record confirms). The gates: the
+  driven census known answers, the I2 dormant gate (the
+  geometrically-inside witness excluded and re-included through the
+  world's own execution), the held lane, the byte-identical rebuild
+  with the mid-cycle C2 duplicate, the composed
+  pending-until-classified reputation with the M-08 cross-cycle
+  durability, the real pipeline ride (confirmation, the
+  dropped-ack, the C2 re-delivery, the fresh-open recovery read),
+  and THE S6 FUZZ GATE — 2×200 seeded ops in the S6-lite
+  distribution with all fault classes (duplicate delivery, dropped
+  acks, event replay, reviews) over the real spine/census/
+  CommitPipeline, the per-op conservation identities (lane AND
+  spine), the C1 rebuild checks at every activation (same-level
+  byte-identity; tier-changing cycles keep exactly the LAST budget
+  episodic records, derived independently), the C4 independent
+  oracle, and the double-run byte-identity — MEASURED on this pod:
+  38 encounters executed, 431 records captured (188
+  pipeline-confirmed), the shared reputation −105 (21 accepted
+  Theft candidates at −5), 310 ms for both campaigns (tmpfs-backed
+  temp dirs; the durability semantics are the machinery's, pinned
+  by the b3/b4 batteries on real mediums) — a NORMAL test, no
+  #[ignore].
+  The **composed-crowd camera crossing** (package A part 8,
+  `corner_routes`/`corner_behavior`, 2026-11-25 — part 4's
+  documented deferral closed): the two crosswalk PACERS became
+  full-crossing CROSSERS, each walking the whole road arm through
+  its crosswalk (curb-to-curb minus the waiter standoff — the
+  turn-arounds at ±3.7 are the furthest points that clear the
+  standing waiters by the walker-waiter margin; f32 measures
+  0.79999995, 3.7 is not dyadic), crossing the camera's road line
+  BEHIND the camera on the SHARED CLOCK. The three-leg loop shapes
+  (west: origin [−5.0, 1.5] north to 3.7, the full southbound
+  crossing to −3.7, the full northbound crossing back to the
+  origin — closing with no turn at the origin; north: the mirror)
+  keep the ORIGINAL crossers' exact positions, facings, and seed
+  draws — frame 0 is byte-identical to the pacers' own, and the
+  part-4 pose-bytes pins at frames 0/33/300 hold UNCHANGED (the
+  stride-phase stream depends on the walking speed and draws, not
+  the route geometry). THE TIMING (authored against the camera's
+  schedule — SCENE_EXTENT 40: the camera passes the west crosswalk
+  line x=−5 at pose ~116.5 and the north crosswalk line z=5 at pose
+  380, parking at [0, 1.7, 38] beyond pose 600): crosser 8 crosses
+  z=0 at steps 259/583/907/1231 (poses 199/523/847/1171), crosser 9
+  crosses x=0 at steps 268/604/939/1275 — every line-crossing
+  outside the camera's own crosswind-pass windows, the measured
+  same-frame minimum **1.8529123 m at step 178** (crosser 8
+  southbound mid-crosswalk, the camera at x=−4.57 exiting the west
+  arm) against the 0.8 gate. THE GATES: the two TEMPORAL CAMERA
+  GATES (the package's headline) — the plain crowd over 1280 steps
+  (the demo's full 663-frame presented sequence plus both crossers'
+  second-loop crossings against the parked camera) and the composed
+  campaign over its 663 ticks, both under the DEMO'S OWN PAIRING
+  (the crowd steps from the timing warmup's first loop iteration
+  while the camera's pose advances only in the measured window —
+  the owner sees crowd step k with camera pose clamp(k−60, 0, 600)),
+  every frame's whole population ≥ 0.8 from the camera's same-frame
+  position, the measured minimum pinned in both (the composed gate
+  measures the plain gate's own value — a cross-check between the
+  gates); the semantic timing bounds in pose-index terms (crosser
+  8's first crossing past the camera's west-arm exit; none of
+  crosser 9's crossings inside the camera's ±1.5 m north-crosswalk
+  window [370, 390]); the sweep battery restructured (the geometric
+  camera_min scoped to the flank routes — the crossers cross the
+  spline BY DESIGN, the temporal gate owns their camera safety —
+  measuring 4.375 exactly over the flanks; the crossers'
+  crosswalk-strip band membership over the full crossing span, 0
+  violations; cross_route_min re-measured 1.3768167 — crosser 8's
+  west band edge vs the E-W north-west flank's road-side lane;
+  waiter_min 0.79999995 — the standoff itself; sedan_min unchanged
+  1.395); the composed schedules re-authored (crossers 8/9: kind
+  200 → the far curb (waypoint 2) at tick 90, kind 201 → the near
+  curb (waypoint 1) at tick 510, both every(840) — every retarget
+  lands after a curb arrival, never mid-crossing: the crossing
+  takes ≤ 457 frames from frame 0 at the slowest draw, so 510
+  always fires after the far-curb stand begins; the curb stands are
+  the pedestrian waiting on the far side), the wake count 99 → 82
+  by the new cadence arithmetic, the arrivals re-measured 9 (the
+  crossers' 2 + the strollers' 7), the composed digest pins at
+  300/662 re-measured (ticks 0/33 EQUAL the plain campaign's own
+  pins — no wake fires before 90); the pairwise walker discipline
+  stays the 663-frame campaign test's own scope (the same-loop
+  stroller drift bound is a 663-frame design bound — the temporal
+  gates' 1280-step window explicitly does NOT claim it). Every
+  existing gate re-fired green (render_instanced 7/7 and
+  render_shadows 4/4 on the pod's lavapipe; the routes ran
+  end-to-end: `--populated`, `--populated --behavior` (the exit
+  summary reproducing 82 wakes / 9 arrivals digit-for-digit), and
+  `--populated --shadows`, all 601 frames with validation 0/0).
 
 The **integrated campaign demo** (`--demo-persist`) is the vertical slice:
 one authoritative, persistently-orchestrated 1000-NPC / 8-region campaign
@@ -430,13 +576,52 @@ for the combined candidate.
 
 | CI partition | Linux | Windows |
 |---|---:|---:|
-| Main shard (`--workspace --exclude engine-slice`) | 1295 | 1244 |
-| Heavy shard (`-p engine-slice --features crash-test-seams`) | 608 | 607 |
-| **Combined** | **1903** | **1851** |
+| Main shard (`--workspace --exclude engine-slice`) | 1313 | 1262 |
+| Heavy shard (`-p engine-slice --features crash-test-seams`) | 620 | 619 |
+| **Combined** | **1933** | **1881** |
 
 The macOS job has its own partition. Main has two ignored tests and 33
-result lines. Heavy has thirty-three ignored tests and 62 result lines.
-The table is settled at the shadowed-HDR populated-variant tree
+result lines. Heavy has thirty-three ignored tests and 63 result
+lines. The table is settled at the composed-crowd tree
+(`era2/npc-ai-composed-crowd`, 2026-11-25, stacked on the part-7 tip —
+the composed-crowd camera crossing, part 4's documented deferral
+closed): main **1313/2/33 UNCHANGED (engine-core untouched) and heavy
+620/33/63 both Linux MEASURED with the workflow's own awk on this
+exact tree** (heavy 618 + the two platform-uniform temporal camera
+gates: corner_routes' `full_crossings_clear_the_camera_on_the_shared_clock`
+— the plain crowd's 1280-step window against the camera's same-frame
+position under the demo's own warmup-lead pairing (crowd step k with
+camera pose clamp(k−60, 0, 600); the measured minimum 1.8529123 at
+step 178, both crossers' line-crossing steps pinned: 259/583/907/1231
+and 268/604/939/1275) — and corner_behavior's
+`composed_crossings_clear_the_camera_on_the_shared_clock` — the
+composed campaign's 663 ticks against the same pairing, measuring the
+plain gate's own minimum as its cross-check); Windows 619 = 617 + the
+same 2 (the platform-uniform inference — pure spine/IEEE arithmetic
+plus the route_poses f32 lerp, no cfg gates, no Vulkan) —
+CONFIRMED by this candidate's own CI run 45637296212 (green on all
+five jobs, first push — the run's own exact-count gates enforced the
+measured counts on both platforms: `heavy shard: 620 passed, 33
+ignored, 63` on ubuntu-latest and `heavy shard: 619 passed, 33
+ignored, 63` on windows-latest, `main shard: 1313 passed, 2 ignored,
+33` on both); renderer release 160/2 UNCHANGED (engine-renderer
+untouched) (main 1295 + the
+npc_memory battery's 18 platform-uniform engine-core lib tests;
+heavy 608 + the memory-lane composition's 10 platform-uniform — the
+npc_memory_lane lib battery's three and the new
+tests/npc_memory_lane.rs binary's seven, its result line 62 → 63;
+ignored 33 UNCHANGED — the S6 fuzz gate is a NORMAL test, 310 ms
+measured on the pod, no #[ignore]); Windows 1262/617 = the same
+platform-uniform deltas, **CONFIRMED by this candidate's own CI run
+45625263643** (green on all five jobs, first push — the run's own
+exact-count gates enforced the measured counts on both platforms:
+`main shard: 1313 passed, 2 ignored, 33` and `heavy shard: 618
+passed, 33 ignored, 63` on ubuntu-latest, `main shard: 1262 passed,
+2 ignored, 33` and `heavy shard: 617 passed, 33 ignored, 63` on
+windows-latest, the S6 fuzz gate `s6_fuzz_memory_lane_i1_through_i3_exactly_once
+... ok` as an ordinary test on the runner); renderer release 160/2
+UNCHANGED (engine-renderer untouched by the package). The prior settlement,
+superseded: the shadowed-HDR populated-variant tree
 (`era2/shadowed-hdr-populated`, 2026-11-25, stacked on the part-6 tip
 — the composition gate): heavy **608 Linux MEASURED with the
 workflow's own awk on this exact tree** (608 passed / 33 ignored / 62
@@ -1397,8 +1582,10 @@ priorities).
 
 **The Era-2 package A arc (2026-11-25, the overnight continuation
 beyond the mission file's terminal queue — the design pass as the
-implementation brief): part 1 MERGED, parts 2-6 DELIVERED (the open
-PR stack awaiting the owner's GO).** Part 1: the NPC AI deterministic cores (PR #37, the
+implementation brief): part 1 MERGED, parts 2-8 DELIVERED — the open
+stack #38 → #39 → #40 → #41 → #42 → #43 → #44 → #45 → #46 → #47
+(every rung CI-green on its own head, #38 docs-only by the workflow's
+path filter), awaiting the owner's GO in that order.** Part 1: the NPC AI deterministic cores (PR #37, the
 owner's GO at 02:02Z; the design pass's §3–§6 as three additive
 pure engine-core modules — §2's record carries the contracts and
 pins). Part 2: the spine integration (`era2/npc-ai-spine-integration`,
@@ -1517,6 +1704,77 @@ workload's stream digest (12_420_752_226_621_264_573) and the
 witness census digest (16_487_293_382_058_425_681), both baked from
 measured runs stable across independent executions. The design
 pass's §9 open-questions list still awaits the owner.
+
+**Part 7: the capture-lane gates** (`era2/npc-ai-capture-lane`,
+2026-11-25, stacked on the s6-soak-seam tip — §8.4 item 4, the LAST
+unlanded §8.4 gate, delivered): the durable perception memory lane
+through the real pipeline, deactivate/reactivate exactly-once, the
+S6 fuzz discipline, and reputation candidates
+pending-until-classified — the design pass's §5.3 lane shape (the
+episodic entry, the relationship delta, the reputation candidate —
+all captured at production, pending-live in both phases, riding the
+commit pipeline to canonical confirmation asynchronously, never
+blocking a transition) landed as engine-core's `npc_memory` core
+(the 18-test battery) and the `npc_memory_lane` composition over
+the real spine/census/CommitPipeline (the seven-gate battery with
+THE S6 fuzz gate — the S6-lite op distribution and fault classes,
+the per-op conservations, the C1 rebuild checks, the C2 faults, the
+independent oracle, the double-run byte-identity; MEASURED: 38
+encounters, 431 records, 188 pipeline-confirmed, the shared
+reputation −105, 310 ms both campaigns). The fuzz gate caught and
+the package fixed two real defects before landing (the lazy
+tier-change retention re-application; the confirmation loop's
+claimed-set ordering). The §5.3-listed composition follow-ups
+remain the owner's: the memory depth and reputation classes are
+[OPEN] §9.2 (the engine ships the knobs; the demo authors the
+policy table); the M-08 shared-reputation game composition and any
+ledger-content compaction are measured-trigger decisions (the
+full-fidelity ledger is the shipped shape — the S3-lite cost
+lesson recorded; compaction only if measurements demand it).
+
+**Part 8: the composed-crowd camera crossing** (`era2/npc-ai-composed-crowd`,
+2026-11-25, stacked on the part-7 tip — part 4's documented deferral
+closed, the honest queue's next item): the full crosswalk crossings on
+the shared clock. The pacers became crossers walking the whole road arm
+(three-leg loops, the ±3.7 waiter standoff documented, frame 0
+byte-identical), the crossing timing authored against the camera's own
+schedule and gated by THE TEMPORAL CAMERA GATES — the plain 1280-step
+window and the composed 663-tick campaign, both under the demo's own
+warmup-lead pairing (crowd step k with camera pose clamp(k−60, 0, 600)
+— the pairing verified in corner_demo's route loop, WARMUP = 60),
+every frame's whole population ≥ 0.8 from the camera's same-frame
+position with the measured minimum 1.8529123 at step 178 pinned in
+both gates (the composed gate measuring the plain gate's own value as
+its cross-check — the composed trajectory is the plain one through
+the first curb stand). The composed schedules re-authored (the
+crossing commitments at 90/510, cadence 840 — every retarget after a
+curb arrival, the far-curb stands the pedestrian's wait), the wake
+count 99 → 82, the arrivals 9 (measured; the crossers' 2 + the
+strollers' 7), the digests re-pinned (ticks 0/33 equal the plain
+campaign's own pins). The implementation went to the coder subagent
+(the mission's delegation rule); the round's audit (this orchestrator)
+found and repaired three defects before landing: the semantic
+crossing bounds derived from a WRONG SCENE EXTENT (the spec's author
+— this orchestrator — had modeled SCENE_EXTENT as 16; the probe of
+the real route_poses proved 40, moving the camera's crosswalk passes
+to poses ~116.5/~380 and the ±1.5 m window to [370, 390] — the
+bounds re-derived in pose-index terms), the composed gate's
+off-by-one (measuring after the tick's step — one frame of mismatch
+against the demo's render-then-step; restructured to measure before),
+and an unrequested extra test correctly removed — with one repair of
+the repair itself: the round's `pose_bytes_fnv_pins` deletion
+initially took PART 4'S LANDED TEST with it (recognized in the count
+reconciliation: the lib battery measured 97 against the predicted
+98, the inventory diff showing the baseline already carried it since
+df06b22) — restored verbatim from the tip, its pins holding
+UNCHANGED (the pose-phase stream is route-geometry-independent, a
+verification in itself). The counts: heavy 618 → 620 Linux MEASURED
+with the workflow's own awk (+2 platform-uniform lib tests), Windows
+619 inferred, main 1313/2/33 and renderer release 160/2 UNCHANGED;
+every existing gate re-fired green (render_instanced 7/7,
+render_shadows 4/4 on the pod's lavapipe; the three routes
+end-to-end with validation 0/0; the composed exit summary
+reproducing the lib pins digit-for-digit).
 
 **The shadowed-HDR populated variant (2026-11-25, the follow-on
 session's package — Era-2 package 1's documented follow-up closed,
@@ -1658,7 +1916,7 @@ not implemented** / **not yet designed**.
 | GPU resource streaming | Not yet designed | F-04 deferred; host-visible copies only |
 | Instanced/indirect draws | **Implemented (6-E + 6-E2)** | The Cycle 6-E implementation landed 2026-11-23 on the scaffold's deterministic core (the libm-free turn-fraction transforms, the byte-pinned packing, the proxy meshes, the `instanced_proxy.wgsl` shader): the instance-rate vertex input, the lazily-created zero-per-frame-allocation instance buffer (allocations constant across warmed populated frames), one draw call per populated kind (the populated corner route: **26 instances — the full 24-NPC + 2-vehicle placement table, the ladder's population package `corner_population`, pure data with a placement-validity battery and its own packed-bytes FNV pin — in 2 calls**), the N-vs-1 pixel-equivalence gate (`tests/render_instanced.rs`, byte-equal frames for BOTH the 13-instance fixture and the shipped 24+2 table, per-pixel 6-B oracle checks at 0/255 max error on lavapipe), the draw-call pins, and the `--corner --populated` demo mode — see `docs/CYCLE6-6E-BRIEF.md`. The Cycle 6-E2 package (2026-11-23, riding the population branch) added the indirect submission: `ProxyDrawMode::Indirect` — one `vkCmdDrawIndirect` per populated kind with the counts read from GPU memory, the pure byte-pinned `proxy_indirect` command core (FNV cross-platform pin, `firstVertex`/`firstInstance` pinned zero — no `drawIndirectFirstInstance` feature), a lazily-created per-frame-slot mapped command buffer (one-time +1 device_memory, pinned; the direct path's counters untouched), byte-equal frames across per-object/direct/indirect submissions (the third `render_instanced` gate, with an oracle wall through the indirect path), and the populated route's default submission now indirect (`--proxy-instanced` selects the direct 6-E shape). GPU-side count AUTHORSHIP (compute/culling writing the counts) remains deferred to the GPU-culling package. The rig measurement commands live in the 6-E/6-E2 PRs (lavapipe is correctness evidence only) |
 | Directional shadows | **Implemented (6-F + Era-1 PCF + Era-2 proxy shadows)** | The Cycle 6-F implementation landed 2026-11-23: the deterministic core (the light-space orthographic cascade, the compare-time slope-scaled bias model, the CPU raycaster oracle — pure IEEE, unit-pinned) + the depth-only pass + the shadowed lit pipeline sampling the map (one cascade, the corner scene — PCF-softened since Era-1 package 2). The gates: the map's known-answer (every texel vs the raycaster, max |Δdepth| 2.7e-7 on lavapipe) and the pixel equivalence (a shadowed ground patch renders exactly `albedo·ambient`, a lit patch the unshadowed equation, the unshadowed path pixel-identical) — `tests/render_shadows.rs`, executed by the CI's Linux Vulkan step. The `--corner --shadows` demo mode runs the full route. PCF softening (Era-1 package 2, the 3×3 `shadow_filter` tap table shared verbatim with the CPU oracle) and proxy shadows (Era-2, PR #33 — the populated path casting AND receiving, the skinned per-NPC depth casts) are landed; cascaded splits remain open |
-| NPC/world representation (LOD) | Partially implemented | The region director, four LOD levels, activation/reconstruction — validated at 1000 NPCs / 8 regions; the NPC AI design pass merged (#34) with its deterministic cores landed (PR #37: the behavior selector machinery, the schedule layer, the perception layer — pure, pinned), the spine integration landed (package A part 2: commitment wakes as spine events, the witness census, the honest re-arm — pinned by the integration battery), and the locomotion batch landed (package A part 3: routes as pure data with authored turns, the hand-spread draws, the position bridge, the identity-ordered zero-allocation batch step, the pinned-blocked collision composition — pinned by the 18-test battery with the campaign gates over a real spine, §8.5's p99 measurement discharged: 4.7 µs/tick at the corner's 24 walkers, 70.7 µs/tick at the 1,000-walker pathological case on this pod); the rendering bridge, the composed gates, and the measurement surface delivered (package A parts 4-6, the open PR stack: the behavior-state walking crowd at zero per-frame allocation, the behavior-spine composition with the allocation-counting gate, and §8.4/§8.5's measured evidence — the sustained matrix, the witness cost, the E-09 crossover at k=1 with span-invariant synthesis, the E-08 skip decomposition, memory-per-NPC by tier) |
+| NPC/world representation (LOD) | Partially implemented | The region director, four LOD levels, activation/reconstruction — validated at 1000 NPCs / 8 regions; the NPC AI design pass merged (#34) with its deterministic cores landed (PR #37: the behavior selector machinery, the schedule layer, the perception layer — pure, pinned), the spine integration landed (package A part 2: commitment wakes as spine events, the witness census, the honest re-arm — pinned by the integration battery), and the locomotion batch landed (package A part 3: routes as pure data with authored turns, the hand-spread draws, the position bridge, the identity-ordered zero-allocation batch step, the pinned-blocked collision composition — pinned by the 18-test battery with the campaign gates over a real spine, §8.5's p99 measurement discharged: 4.7 µs/tick at the corner's 24 walkers, 70.7 µs/tick at the 1,000-walker pathological case on this pod); the rendering bridge, the composed gates, and the measurement surface delivered (package A parts 4-6, the open PR stack: the behavior-state walking crowd at zero per-frame allocation, the behavior-spine composition with the allocation-counting gate, and §8.4/§8.5's measured evidence — the sustained matrix, the witness cost, the E-09 crossover at k=1 with span-invariant synthesis, the E-08 skip decomposition, memory-per-NPC by tier); the capture-lane gates delivered (package A part 7, the open stack's top: the durable perception memory lane — the keyed capture ledger with capture-at-production I1, the canonical-order rebuild, the M-08 shared reputation folding accepted candidates only, and THE S6 FUZZ GATE over the real spine/census/CommitPipeline with the per-op conservations, the C1/C2 checks, the independent oracle, and the double-run byte-identity); the composed-crowd camera crossing delivered (package A part 8, the open stack's top: the full crosswalk crossings on the shared clock — the pacers became crossers walking the whole road arm behind the camera, gated by the two temporal camera gates under the demo's own warmup-lead pairing, the measured same-frame minimum 1.8529123 pinned in both, the composed crossing commitments with the far-curb stands) |
 | Physics and collision | Prototype only | The Cycle-1 kinematic player prototype (`engine-core` player module: swept-AABB collision, fixed-step movement, FP/TP cameras) — headless/offscreen validated, collide-what-you-see; reversible and explicitly NOT a ratified production physics backend (§8) |
 | Combat and gameplay systems | Partially implemented (demo-scale prototype, validated) | The Cycle 2–5 line: `engine-core` combat resolution (`resolve_attack`, pure, allocation-free) + the adversary cadence model + the encounter composition with cover/HUD/cues in `engine-slice` — pinned by the combat_world (21) and encounter_world (30) batteries with byte-identical scenario traces; game-scale gameplay systems (progression, economy, AI beyond the cadence prototype) remain undesigned |
 | Networking and replication | In-session boundaries **designed (unratified)** | The player-facing multiplayer and governance rules are **ratified** in `docs/MULTIPLAYER-SPEC.md`; the campaign-level authority/persistence research lives in `docs/MULTIPLAYER-ARCHITECTURE-RESEARCH.md` (unapproved); the **in-session architecture** — sim placement, input ordering, replication scope, divergence detection, session lifecycle — is designed in `docs/CYCLE6-6D-SESSION-REPLICATION-BOUNDARIES.md` (**unratified**; owner decision list §9); transport/provider selection remains undesigned (T-06 deferral) |

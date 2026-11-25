@@ -513,8 +513,30 @@ jobs:
           # uniform delta (to be confirmed by this candidate's CI
           # run — a mismatch is corrected from actuals, never by
           # weakening a test).
-          expected=1295
-          if [ "$(uname -s)" != "Linux" ]; then expected=1244; fi
+          #
+          # Era 2 package A part 7 (the capture-lane gates,
+          # 2026-11-25, PR era2/npc-ai-capture-lane):
+          # +18 platform-uniform engine-core lib tests (npc_memory:
+          # the key/delta/record canonical byte layouts hand-computed
+          # and pinned, the key order, the kind/observer validation
+          # refusals, the capture idempotence with first-wins, the
+          # confirm move byte-identical, the phase-interleave pin,
+          # the exactly-once event path, the inactive-witness gate,
+          # the retention-bounded rebuild, the checked relationship
+          # accumulation, the byte-identical deactivate/activate
+          # rebuild, rebuild-never-invents, the classification's
+          # exactly-once and durability, the shared-reputation
+          # accepted-only fold (the 8.4-item-4 gate), the
+          # conservation, the digest purity/order sensitivity, and
+          # the digest pin. Pure integer/BTree arithmetic, no cfg
+          # gates, no Vulkan, no I/O. 1295 + 18 = 1313 Linux
+          # MEASURED with this step's own awk on the package tree;
+          # Windows 1244 + 18 = 1262 = the same platform-uniform
+          # delta (to be confirmed by this candidate's CI run — a
+          # mismatch is corrected from actuals, never by weakening a
+          # test).
+          expected=1313
+          if [ "$(uname -s)" != "Linux" ]; then expected=1262; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -1668,8 +1690,55 @@ jobs:
           # Ignored 32 and result lines 62 UNCHANGED (lib tests only,
           # no new binaries; the benchmark flag is test-free harness
           # code).
-          expected=608
-          if [ "$(uname -s)" != "Linux" ]; then expected=607; fi
+          #
+          # Era 2 package A part 7 (the capture-lane gates,
+          # 2026-11-25, PR era2/npc-ai-capture-lane):
+          # +10 platform-uniform passed (the npc_memory_lane lib
+          # battery's three — the codec round-trip/refusal, the
+          # tag-collision proof, the population layout with the
+          # measured adjacency minimums; and the new
+          # tests/npc_memory_lane.rs binary's seven — the driven
+          # census known answers, the I2 dormant gate, the held
+          # lane, the byte-identical rebuild with the C2 duplicate,
+          # the composed pending-until-classified reputation, the
+          # real pipeline ride with the dropped-ack fault and the
+          # recovery read, and the S6 fuzz gate — 2x200 seeded ops
+          # over the real spine/census/CommitPipeline, the per-op
+          # conservations, the C1 rebuild checks, the C2 faults, the
+          # independent oracle, and the double-run byte-identity;
+          # NO #[ignore] — 310 ms measured on the pod, tmpfs-backed
+          # temp dirs). Ignored 33 UNCHANGED (no new ignored gates);
+          # result lines 62 -> 63 (the new binary). 608 + 10 = 618
+          # Linux MEASURED with this step's own awk on the package
+          # tree; Windows 607 + 10 = 617 = the same platform-uniform
+          # delta (the tests are std-fs + spine + pipeline
+          # arithmetic, no cfg gates, no Vulkan; to be confirmed by
+          # this candidate's CI run — a mismatch is corrected from
+          # actuals, never by weakening a test).
+          #
+          # Era 2 package A part 8 (the composed-crowd camera
+          # crossing, 2026-11-25, PR era2/npc-ai-composed-crowd,
+          # stacked on the part-7 tip): the two TEMPORAL CAMERA GATES
+          # as platform-uniform lib tests (corner_routes'
+          # full_crossings_clear_the_camera_on_the_shared_clock — the
+          # plain crowd's 1280-step window against the camera's
+          # same-frame position under the demo's own warmup-lead
+          # pairing, the measured minimum 1.8529123 at step 178 and
+          # both crossers' line-crossing steps pinned; and
+          # corner_behavior's composed_crossings_clear_the_camera_
+          # on_the_shared_clock — the composed campaign's 663 ticks
+          # against the same pairing, measuring the PLAIN gate's own
+          # minimum as its cross-check): 618 + 2 = 620 Linux
+          # MEASURED with this step's own awk on the package tree;
+          # Windows 617 + 2 = 619 = the same platform-uniform delta
+          # (pure spine/IEEE arithmetic + the route_poses f32 lerp,
+          # no cfg gates, no Vulkan — to be confirmed by this
+          # candidate's CI run; a mismatch is corrected from
+          # actuals, never by weakening a test). Ignored 33 and
+          # result lines 63 UNCHANGED (lib tests only, no new
+          # binaries; the demo wiring is route-agnostic).
+          expected=620
+          if [ "$(uname -s)" != "Linux" ]; then expected=619; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
@@ -1683,7 +1752,7 @@ jobs:
           # are engine-renderer lib tests — the main shard's).
           # Linux 582/14/59 MEASURED locally with this step's own
           # awk; Windows 581/14/59 platform-uniform.
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 32 / 62)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 33 / 63)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           # Era 1 package 3 (the sky, 2026-11-23): the NEW
           # tests/render_sky.rs binary carries ONE #[ignore]d
@@ -1867,7 +1936,11 @@ jobs:
           # its own result line on the combined tree (58 -> 59; its
           # single gate test is #[ignore]d in the plain run and
           # executed by the dedicated Linux Vulkan step).
-          [ "$results" -eq 62 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 62"; exit 1; }
+          # Era 2 package A part 7 (the capture-lane gates,
+          # 2026-11-25): 62 -> 63 — the new tests/npc_memory_lane.rs
+          # binary adds the 63rd result line (MEASURED with this
+          # step's own awk on the package tree).
+          [ "$results" -eq 63 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 63"; exit 1; }
       # (F-06, the 2026-11-12 quality audit — Agent C) The release-mode
       # render-path CPU canary: the comparative microbenchmark in
       # release mode on the llvipe runner — NO timing thresholds (the

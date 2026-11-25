@@ -21,6 +21,7 @@ pub mod encounter_visuals;
 pub mod frame_timing;
 pub mod math;
 pub mod npc;
+pub mod npc_memory_lane;
 pub mod orchestration;
 pub mod perf_sweep;
 pub mod persist_demo;
