@@ -545,6 +545,8 @@ fn post_pixels_match_post_rs_and_the_disc_blooms() {
         npc_material: 1,
         vehicle: &vehicle,
         vehicle_material: 2,
+        rain: &[],
+        rain_material: 0,
     };
     renderer.request_frame_capture().unwrap();
     let populated_frame = renderer
@@ -2506,6 +2508,8 @@ fn shadowed_populated_composes_through_the_hdr_chain() {
         npc_material: 1,
         vehicle: &vehicle,
         vehicle_material: 2,
+        rain: &[],
+        rain_material: 0,
     };
     renderer.request_frame_capture().unwrap();
     let composed = renderer
@@ -2548,10 +2552,12 @@ fn shadowed_populated_composes_through_the_hdr_chain() {
     );
     assert_eq!(
         delta,
-        (6, 4, 16, 0),
+        (8, 4, 16, 0),
         "the populated families' lazy states, one-time: the proxy state's instance-buffer \
-         memory + the two per-kind mesh VBO memories + their staged uploads' staging \
-         memories + the skinned pose storage's memory (6 device_memory); the skinned \
+         memory + the three per-kind mesh VBO memories (npc, vehicle, and the Era-2 \
+         package C rain kind's streak quad — dc7eadc's third kind) + their staged \
+         uploads' staging memories + the skinned pose storage's memory (8 \
+         device_memory); the skinned \
          family's pool + the shadowed-populated state's three pools (the depth-cast, \
          skinned-receiving, and plain-receiving families); the skinned family's 3 \
          per-material sets + the shadowed-populated state's 13 (1 depth + 6 + 6 \
@@ -2828,6 +2834,7 @@ fn check_torso_wall_through_the_chain(
             scale: 1.0,
         },
         tint: [0.9, 0.7, 0.6],
+        alpha: 1.0,
         pose_index: 0,
     };
     let single = [instance];
@@ -2838,6 +2845,8 @@ fn check_torso_wall_through_the_chain(
         npc_material: 1,
         vehicle: &[],
         vehicle_material: 0,
+        rain: &[],
+        rain_material: 0,
     };
     renderer.request_frame_capture().unwrap();
     let frame = renderer

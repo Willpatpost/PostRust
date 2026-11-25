@@ -901,6 +901,8 @@ fn populated_shadow_map_matches_the_raycaster() {
         npc_material: 1,
         vehicle: &vehicle,
         vehicle_material: 2,
+        rain: &[],
+        rain_material: 0,
     };
     renderer.request_shadow_map_capture().unwrap();
     let frame = renderer
@@ -968,6 +970,8 @@ fn populated_shadow_map_matches_the_raycaster() {
         npc_material: 1,
         vehicle: &vehicle,
         vehicle_material: 2,
+        rain: &[],
+        rain_material: 0,
     };
     renderer.request_shadow_map_capture().unwrap();
     let walked_frame = renderer

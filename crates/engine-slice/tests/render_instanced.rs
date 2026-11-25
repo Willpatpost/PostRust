@@ -121,6 +121,7 @@ fn gate_population() -> (Vec<ProxyInstance>, Vec<ProxyInstance>) {
     let npc = |pos: [f32; 3], turn: u16, scale: f32, tint: [f32; 3]| ProxyInstance {
         transform: InstanceTransform { pos, turn, scale },
         tint,
+        alpha: 1.0,
         pose_index: 0,
     };
     let vehicle = |pos: [f32; 3], turn: u16, tint: [f32; 3]| ProxyInstance {
@@ -130,6 +131,7 @@ fn gate_population() -> (Vec<ProxyInstance>, Vec<ProxyInstance>) {
             scale: 1.0,
         },
         tint,
+        alpha: 1.0,
         pose_index: 0,
     };
     (
@@ -208,6 +210,12 @@ impl<'a> FixturePopulation<'a> {
                 npc_material,
                 vehicle,
                 vehicle_material,
+                // The rain kind is EMPTY on every fixture of this
+                // gate (the dry path — byte-identical to the
+                // pre-package frames; the rain gate arrives with the
+                // package's own stage).
+                rain: &[],
+                rain_material: 0,
             },
         }
     }
@@ -226,6 +234,8 @@ impl<'a> FixturePopulation<'a> {
                 npc_material,
                 vehicle,
                 vehicle_material,
+                rain: &[],
+                rain_material: 0,
             },
         }
     }
@@ -776,6 +786,7 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
                 scale: 1.0,
             },
             tint: [0.9, 0.7, 0.6],
+            alpha: 1.0,
             pose_index: 0,
         },
         material: 1,
@@ -798,6 +809,7 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
                 scale: 1.0,
             },
             tint: [0.75, 0.18, 0.15],
+            alpha: 1.0,
             pose_index: 0,
         },
         material: 2,
@@ -893,6 +905,7 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
                 scale: 2.0,
             },
             tint: [1.0, 1.0, 1.0],
+            alpha: 1.0,
             pose_index: 0,
         },
         1,            // the building facade material
@@ -1168,6 +1181,8 @@ fn full_corner_population_matches_per_object_pixels() {
                 npc_material: 1,
                 vehicle: &vehicle,
                 vehicle_material: 2,
+                rain: &[],
+                rain_material: 0,
             };
             assert!(
                 renderer
@@ -1232,6 +1247,8 @@ fn full_corner_population_matches_per_object_pixels() {
                 npc_material: 1,
                 vehicle: &vehicle,
                 vehicle_material: 2,
+                rain: &[],
+                rain_material: 0,
             };
             let outcome = renderer
                 .render_corner_populated(&matrix, eye, light, &animated, size)
@@ -1612,6 +1629,7 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
                 scale: 1.0,
             },
             tint: [0.9, 0.7, 0.6],
+            alpha: 1.0,
             pose_index: 0,
         },
         material: 1,
@@ -1676,10 +1694,16 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
     // (corrective finding 10: the block is packed through
     // pack_indirect_block with explicit counts — the legacy wrapper
     // that reconstructed both meshes per call is gone.)
-    let commands = engine_renderer::proxy_indirect::pack_indirect_block(396, 24, 552, 2);
+    // (The Era-2 package C three-command form: the rain kind's
+    // command at offset 32 with the streak quad's 6 vertices and
+    // this gate's EMPTY rain population — the dry path's counts.)
+    let commands = engine_renderer::proxy_indirect::pack_indirect_block(396, 24, 552, 2, 6, 0);
     let word = |at: usize| u32::from_le_bytes(commands[at..at + 4].try_into().unwrap());
-    assert_eq!(engine_renderer::proxy_indirect::INDIRECT_SLOT_BYTES, 32);
-    assert_eq!((word(0), word(4), word(16), word(20)), (396, 24, 552, 2));
+    assert_eq!(engine_renderer::proxy_indirect::INDIRECT_SLOT_BYTES, 48);
+    assert_eq!(
+        (word(0), word(4), word(16), word(20), word(32), word(36)),
+        (396, 24, 552, 2, 6, 0)
+    );
 
     // THE ISSUANCE OBSERVATION (the Era-1 review's gate-by-gate
     // disposition for this gate: "one command trace or recording
@@ -1851,6 +1875,7 @@ fn oblique_wheel_views_expose_the_outside_tire_and_both_cap_orientations() {
             scale: 1.0,
         },
         tint: [1.0, 1.0, 1.0],
+        alpha: 1.0,
         pose_index: 0,
     }];
     let population = populated(&[], &sedan, 1, 0);
@@ -2334,6 +2359,7 @@ fn skinned_pose_matches_the_cpu_oracle() {
             scale: 1.0,
         },
         tint: [0.9, 0.7, 0.6],
+        alpha: 1.0,
         pose_index: 0,
     };
     let (s, c) = engine_renderer::proxy_instances::sin_cos_turn(instance.transform.turn);
@@ -2489,6 +2515,8 @@ fn skinned_pose_matches_the_cpu_oracle() {
         npc_material: 1,
         vehicle: &[],
         vehicle_material: 0,
+        rain: &[],
+        rain_material: 0,
     };
     renderer.request_frame_capture().unwrap();
     let frame = renderer
@@ -2588,6 +2616,8 @@ fn skinned_pose_matches_the_cpu_oracle() {
         npc_material: 1,
         vehicle: &[],
         vehicle_material: 0,
+        rain: &[],
+        rain_material: 0,
     };
     renderer.request_frame_capture().unwrap();
     let rest_frame = renderer
@@ -2731,6 +2761,8 @@ fn animated_population_matches_per_object_pixels() {
         npc_material: 1,
         vehicle: &vehicle,
         vehicle_material: 2,
+        rain: &[],
+        rain_material: 0,
     };
 
     // THE EQUIVALENCE UNDER MOTION: 26 single-instance draws vs one
@@ -2788,6 +2820,8 @@ fn animated_population_matches_per_object_pixels() {
         npc_material: 1,
         vehicle: &vehicle,
         vehicle_material: 2,
+        rain: &[],
+        rain_material: 0,
     };
     renderer.request_frame_capture().unwrap();
     let rest_frame = renderer
@@ -3053,6 +3087,8 @@ fn composed_population_matches_per_object_pixels() {
                 npc_material: 1,
                 vehicle: &vehicle,
                 vehicle_material: 2,
+                rain: &[],
+                rain_material: 0,
             };
             assert!(
                 renderer
@@ -3124,6 +3160,8 @@ fn composed_population_matches_per_object_pixels() {
                 npc_material: 1,
                 vehicle: &vehicle,
                 vehicle_material: 2,
+                rain: &[],
+                rain_material: 0,
             };
             let outcome = renderer
                 .render_corner_populated(&matrix, eye, light, &animated, size)
@@ -3189,6 +3227,8 @@ fn composed_population_matches_per_object_pixels() {
             npc_material: 1,
             vehicle: &vehicle,
             vehicle_material: 2,
+            rain: &[],
+            rain_material: 0,
         };
         renderer.request_frame_capture().unwrap();
         let rest_frame = renderer

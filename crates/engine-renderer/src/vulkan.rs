@@ -1818,6 +1818,18 @@ pub(crate) struct PipelineState {
     lit_pipeline: vk::Pipeline,
     lit_layout: vk::PipelineLayout,
     proxy_pipeline: vk::Pipeline,
+    /// The Era-2 package C rain pipeline (the third populated kind):
+    /// the unlit blended particle pipeline — ONE object,
+    /// render-pass-bound (created in the corner branch of pipeline
+    /// assembly beside the proxy pipeline, from particle.spv; the
+    /// HDR variant is the post state's lazy `rain_hdr` family). The
+    /// same proxy vertex input and corner layout as the proxy
+    /// pipeline; the depth WRITE flipped off and the overlay blend
+    /// attachment (the translucent-streak contract —
+    /// particle.wgsl's header). Destroyed in the proxy pipeline's
+    /// release path; re-created by the replacement discipline (a
+    /// replacement rebuilds it in its own assembly).
+    rain_pipeline: vk::Pipeline,
     proxy_layout: vk::PipelineLayout,
     pub scene_pipeline: vk::Pipeline,
     pub scene_layout: vk::PipelineLayout,
@@ -1918,6 +1930,7 @@ impl PipelineState {
             lit_pipeline: vk::Pipeline::null(),
             lit_layout: vk::PipelineLayout::null(),
             proxy_pipeline: vk::Pipeline::null(),
+            rain_pipeline: vk::Pipeline::null(),
             proxy_layout: vk::PipelineLayout::null(),
             scene_pipeline: vk::Pipeline::null(),
             scene_layout: vk::PipelineLayout::null(),
@@ -2317,6 +2330,24 @@ impl PipelineState {
                      missing retained state unreachable",
                 );
                 skinned_state.ensure_hdr(ctx, retained, post_state.hdr_render_pass())?;
+            }
+            // The Era-2 package C companion: a populated POST frame
+            // needs the rain kind's HDR pipeline variant (the HDR
+            // scene pass draws rain through the unlit blended
+            // pipeline against the HDR attachments — the same
+            // family-growth shape as the skinned HDR variant above;
+            // the rain kind itself needs no state beyond the proxy
+            // family, so this ensure is only the pass-bound
+            // pipeline). Per-frame idempotent, so the
+            // pipeline-replacement path re-ensures against the new
+            // pass exactly like the skinned HDR variant (the
+            // finding-A discipline: the replacement replicates the
+            // base states, the variants re-ensure lazily).
+            if proxy.is_some()
+                && let Some(post_state) = &mut self.post
+            {
+                let proxy_layout = self.proxy_layout;
+                post_state.ensure_rain_hdr(ctx, proxy_layout)?;
             }
             // The Era-2 companion's shadowed half: a populated SHADOWED
             // POST frame needs the shadowed-populated state's HDR pipeline
@@ -2769,6 +2800,68 @@ impl PipelineState {
                     .create_graphics_pipelines(ctx.pipeline_cache, &[proxy_info], None)
             }
             .map_err(|(_, e)| RendererError::vk(e, "proxy pipeline"))?[0];
+
+            // The Era-2 package C rain pipeline (the THIRD populated
+            // kind — the mission's "particle shader variant ... or
+            // unlit tinted quads" option, the documented choice in
+            // particle.wgsl's header): the SAME vertex input state
+            // (the two proxy bindings, locations 0-7), raster,
+            // input assembly, viewport, and multisample as the proxy
+            // pipeline above — no new pipeline CLASS, one more
+            // object through the identical assembly. The DEPTH
+            // contract copies `scene_depth` and flips the write flag
+            // (a dedicated `rain_depth` value: TEST on, WRITE off —
+            // rain is occluded by geometry, never occludes). The
+            // COLOR BLEND is the OVERLAY precedent's attachment
+            // state verbatim (SRC_ALPHA/ONE_MINUS_SRC_ALPHA, ADD;
+            // alpha ONE/ZERO, ADD — defined below it in this
+            // assembly; restated here because the corner branch
+            // precedes it). The layout is the SAME corner proxy
+            // layout, so the rain material's corner sets bind
+            // unchanged.
+            let rain_module = create_shader_module(
+                ctx,
+                include_bytes!(concat!(env!("OUT_DIR"), "/particle.spv")),
+            )?;
+            modules.push(rain_module);
+            let rain_stages = [
+                scene_stages[0].module(rain_module).name(c"vs_main"),
+                scene_stages[1].module(rain_module).name(c"fs_main"),
+            ];
+            let rain_depth = scene_depth.depth_write_enable(false);
+            let rain_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA)
+                .blend_enable(true)
+                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .color_blend_op(vk::BlendOp::ADD)
+                .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+                .alpha_blend_op(vk::BlendOp::ADD);
+            let rain_blend_attachments = [rain_blend_attachment];
+            let rain_blend = vk::PipelineColorBlendStateCreateInfo::default()
+                .attachments(&rain_blend_attachments);
+            let rain_info = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&rain_stages)
+                .vertex_input_state(&proxy_inputs)
+                .input_assembly_state(&scene_input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&raster)
+                .multisample_state(&multisampling)
+                .depth_stencil_state(&rain_depth)
+                .color_blend_state(&rain_blend)
+                .dynamic_state(&dynamic_state)
+                .layout(out.proxy_layout)
+                .render_pass(out.render_pass)
+                .subpass(0);
+            // SAFETY: same render pass and viewport contract as the
+            // proxy pipeline; the module/layout are the live objects
+            // above.
+            out.rain_pipeline = unsafe {
+                ctx.device
+                    .create_graphics_pipelines(ctx.pipeline_cache, &[rain_info], None)
+            }
+            .map_err(|(_, e)| RendererError::vk(e, "rain pipeline"))?[0];
         }
 
         let overlay_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
@@ -2860,6 +2953,7 @@ impl PipelineState {
             ctx.device.destroy_pipeline(self.lit_pipeline, None);
             ctx.device.destroy_pipeline_layout(self.lit_layout, None);
             ctx.device.destroy_pipeline(self.proxy_pipeline, None);
+            ctx.device.destroy_pipeline(self.rain_pipeline, None);
             ctx.device.destroy_pipeline_layout(self.proxy_layout, None);
             ctx.device.destroy_pipeline(self.overlay_pipeline, None);
             ctx.device
@@ -3850,23 +3944,28 @@ pub(crate) fn render_frame(
     // here can never leave a fence reset-but-unsignaled or an
     // acquired image's semaphore unconsumed). A populated kind whose
     // material index falls outside the corner table is a typed error;
-    // an EMPTY kind may carry any index (it draws nothing).
+    // an EMPTY kind may carry any index (it draws nothing). The
+    // Era-2 package C rain kind joins the validation exactly like
+    // the other kinds.
     let proxy_sets = match (ctx.corner.as_ref(), proxy) {
         (Some(corner), Some(upload)) => {
             let npc_set = corner.material_set(upload.npc_material);
             let vehicle_set = corner.material_set(upload.vehicle_material);
+            let rain_set = corner.material_set(upload.rain_material);
             if (upload.npc_count > 0 && npc_set.is_none())
                 || (upload.vehicle_count > 0 && vehicle_set.is_none())
+                || (upload.rain_count > 0 && rain_set.is_none())
             {
                 return Err(RendererError::Vulkan(format!(
                     "proxy material index outside the corner material table \
-                     (npc {}, vehicle {})",
-                    upload.npc_material, upload.vehicle_material
+                     (npc {}, vehicle {}, rain {})",
+                    upload.npc_material, upload.vehicle_material, upload.rain_material
                 )));
             }
             Some([
                 npc_set.unwrap_or(vk::DescriptorSet::null()),
                 vehicle_set.unwrap_or(vk::DescriptorSet::null()),
+                rain_set.unwrap_or(vk::DescriptorSet::null()),
             ])
         }
         // A proxy upload without corner resources is structurally
@@ -4152,7 +4251,14 @@ pub(crate) fn render_frame(
         if let Some(indirect) = proxy_state.indirect.as_ref()
             && matches!(upload.mode, crate::ProxyDrawMode::Indirect)
         {
-            unsafe { indirect.write_slot(slot, upload.npc_count, upload.vehicle_count) };
+            unsafe {
+                indirect.write_slot(
+                    slot,
+                    upload.npc_count,
+                    upload.vehicle_count,
+                    upload.rain_count,
+                )
+            };
         }
         // The Era-2 pose bytes: this slot's region of the mapped pose
         // buffer, written under the SAME fence discipline as the
@@ -4325,6 +4431,10 @@ pub(crate) fn render_frame(
                 lit: Some(pipes.lit_pipeline),
                 shadowed: pipes.shadows.as_ref().map(|s| s.shadowed(slot).0),
                 proxy: Some(pipes.proxy_pipeline),
+                // The rain kind's main-pass pipeline (the unlit
+                // blended particle object — the third populated
+                // kind).
+                proxy_rain: Some(pipes.rain_pipeline),
                 proxy_skinned: pipes.skinned.as_ref().map(|s| s.pipeline()),
                 shadowed_proxy_skinned: pipes
                     .shadowed_proxy
@@ -4953,56 +5063,81 @@ pub(crate) fn consume_recreate(needs_recreate: &mut bool) -> bool {
 mod policy_tests {
     use super::*;
 
-    /// The 6-E per-kind instance ranges: the fixed npc-then-vehicle
-    /// order partitions the slot (disjoint, contiguous, covering the
-    /// total), and the draw-call count is the pinned headline — one
-    /// per populated kind instanced, one per instance in the
-    /// per-object reference.
+    /// The 6-E per-kind instance ranges: the fixed
+    /// npc-then-vehicle-then-rain order (rain LAST — the Era-2
+    /// package C third kind) partitions the slot (disjoint,
+    /// contiguous, covering the total), and the draw-call count is
+    /// the pinned headline — one per populated kind instanced, one
+    /// per instance in the per-object reference.
     #[test]
     fn proxy_kind_ranges_and_draw_call_counts() {
         use crate::ProxyDrawMode;
         use proxy_draw::{ProxyKind, kind_instance_range, proxy_draw_call_count};
 
         let stride = crate::proxy_instances::INSTANCE_STRIDE as u64;
-        // A mixed population: npc [0, 3), vehicle [3, 5).
-        let npc = kind_instance_range(3, 2, ProxyKind::Npc);
-        let vehicle = kind_instance_range(3, 2, ProxyKind::Vehicle);
+        // A mixed population: npc [0, 3), vehicle [3, 5), rain [5, 6).
+        let npc = kind_instance_range(3, 2, 1, ProxyKind::Npc);
+        let vehicle = kind_instance_range(3, 2, 1, ProxyKind::Vehicle);
+        let rain = kind_instance_range(3, 2, 1, ProxyKind::Rain);
         assert_eq!(npc, 0..3);
         assert_eq!(vehicle, 3..5);
+        assert_eq!(rain, 5..6);
         assert_eq!(npc.end, vehicle.start, "contiguous");
-        assert_eq!(vehicle.end, 5, "covers the total");
+        assert_eq!(vehicle.end, rain.start, "contiguous");
+        assert_eq!(rain.end, 6, "covers the total");
         // Byte offsets (the vertex-buffer binding arithmetic).
         assert_eq!(npc.start * stride, 0);
         assert_eq!(vehicle.start * stride, 3 * stride);
+        assert_eq!(rain.start * stride, 5 * stride);
 
         // The pinned integers: the populated corner scene's proxy
         // submission count under each mode. The 6-E2 indirect mode
         // records the SAME count as the direct instanced mode — the
         // GPU-side count changes where N lives, never how many draws
-        // submit (the headline must not regress).
+        // submit (the headline must not regress). The rain kind
+        // joins every arm exactly like the other kinds.
         assert_eq!(
-            proxy_draw_call_count(ProxyDrawMode::Instanced, 24, 2),
+            proxy_draw_call_count(ProxyDrawMode::Instanced, 24, 2, 0),
             2,
-            "one per kind"
+            "one per kind (the rain kind empty — the renderer-kind \
+             stage's dry path)"
         );
         assert_eq!(
-            proxy_draw_call_count(ProxyDrawMode::Indirect, 24, 2),
-            2,
+            proxy_draw_call_count(ProxyDrawMode::Instanced, 24, 2, 512),
+            3,
+            "one per kind with rain populated"
+        );
+        assert_eq!(
+            proxy_draw_call_count(ProxyDrawMode::Indirect, 24, 2, 512),
+            3,
             "the indirect mode: still one per kind"
         );
         assert_eq!(
-            proxy_draw_call_count(ProxyDrawMode::PerInstance, 24, 2),
+            proxy_draw_call_count(ProxyDrawMode::PerInstance, 24, 2, 0),
             26,
             "one per instance"
         );
         assert_eq!(
-            proxy_draw_call_count(ProxyDrawMode::Indirect, 0, 2),
+            proxy_draw_call_count(ProxyDrawMode::PerInstance, 24, 2, 512),
+            538,
+            "one per instance with rain populated"
+        );
+        assert_eq!(
+            proxy_draw_call_count(ProxyDrawMode::Indirect, 0, 2, 0),
             1,
             "empty kind draws nothing"
         );
-        assert_eq!(proxy_draw_call_count(ProxyDrawMode::PerInstance, 0, 0), 0);
         assert_eq!(
-            proxy_draw_call_count(ProxyDrawMode::Indirect, 0, 0),
+            proxy_draw_call_count(ProxyDrawMode::Indirect, 0, 0, 512),
+            1,
+            "a rain-only population is one draw"
+        );
+        assert_eq!(
+            proxy_draw_call_count(ProxyDrawMode::PerInstance, 0, 0, 0),
+            0
+        );
+        assert_eq!(
+            proxy_draw_call_count(ProxyDrawMode::Indirect, 0, 0, 0),
             0,
             "empty population"
         );

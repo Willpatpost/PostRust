@@ -124,7 +124,10 @@ pub(crate) struct PostFrameInputs<'a> {
     pub clear_color: [f32; 4],
     pub corner_params: Option<&'a FrameParams>,
     pub proxy: Option<&'a ProxyFrameUpload<'a>>,
-    pub proxy_sets: Option<[vk::DescriptorSet; 2]>,
+    /// The per-kind corner material sets the frame flow validated
+    /// (npc, vehicle, rain — the rain kind's joined the Era-2
+    /// package C; the array grew from two to three).
+    pub proxy_sets: Option<[vk::DescriptorSet; 3]>,
     pub shadowed: Option<&'a ShadowFrameParams>,
     pub sky: Option<&'a SkyFrameParams>,
     /// The Era-1 wet reflection's ground re-draw lands inside THIS
@@ -213,6 +216,14 @@ pub(crate) struct PostResources {
     /// The sky pipeline bound to the HDR pass — created at the
     /// first SKY post frame (the same ordering argument).
     sky_hdr: Option<vk::Pipeline>,
+    /// The rain kind's pipeline bound to the HDR pass (the unlit
+    /// blended particle variant — the Era-2 package C third
+    /// populated kind), created at the first populated POST frame
+    /// (the `ensure_shadowed_hdr` precedent: the same particle
+    /// module and corner proxy layout as the main-pass rain
+    /// pipeline, built against THIS pass's R16G16B16A16
+    /// attachments). Idempotent; re-ensured on replacement.
+    rain_hdr: Option<vk::Pipeline>,
     bright_pipeline: vk::Pipeline,
     blur_h_pipeline: vk::Pipeline,
     blur_v_pipeline: vk::Pipeline,
@@ -315,6 +326,7 @@ impl PostResources {
             proxy_hdr: vk::Pipeline::null(),
             shadowed_hdr: None,
             sky_hdr: None,
+            rain_hdr: None,
             bright_pipeline: vk::Pipeline::null(),
             blur_h_pipeline: vk::Pipeline::null(),
             blur_v_pipeline: vk::Pipeline::null(),
@@ -919,6 +931,183 @@ impl PostResources {
         Ok(())
     }
 
+    /// The rain kind's pipeline against the HDR pass (created at
+    /// the first populated post frame — the `ensure_shadowed_hdr`
+    /// precedent; the corner proxy layout is the caller's — the
+    /// live pipeline state's own, the same layout the main-pass rain
+    /// pipeline binds, so the corner material sets bind unchanged).
+    /// Idempotent; a failure leaves the prior state fully intact.
+    pub(super) fn ensure_rain_hdr(
+        &mut self,
+        ctx: &VulkanContext,
+        proxy_layout: vk::PipelineLayout,
+    ) -> Result<(), RendererError> {
+        if self.rain_hdr.is_some() {
+            return Ok(());
+        }
+        let module = super::create_shader_module(
+            ctx,
+            include_bytes!(concat!(env!("OUT_DIR"), "/particle.spv")),
+        )?;
+        let result = Self::rain_hdr_pipeline(
+            ctx,
+            module,
+            proxy_layout,
+            self.hdr_pass,
+            "post rain hdr pipeline",
+        );
+        // SAFETY: consumed by the pipeline above (or failed with
+        // none alive); destroyed exactly once.
+        unsafe { ctx.device.destroy_shader_module(module, None) };
+        self.rain_hdr = Some(result?);
+        Ok(())
+    }
+
+    /// The rain kind's scene pipeline against the HDR pass — the
+    /// EXACT config `PipelineState::assemble_pipelines` builds for
+    /// the main pass (the same two-binding proxy vertex input, the
+    /// lit CCW front face, the depth TEST kept and the WRITE flipped
+    /// off, the overlay blend attachment — the translucent-streak
+    /// contract particle.wgsl's header documents), parameterized by
+    /// the corner proxy layout. Not the `scene_pipeline` helper: the
+    /// depth-write and blend states differ from every scene pipeline
+    /// that helper builds, and folding them in would parameterize
+    /// the helper for one caller.
+    fn rain_hdr_pipeline(
+        ctx: &VulkanContext,
+        module: vk::ShaderModule,
+        layout: vk::PipelineLayout,
+        render_pass: vk::RenderPass,
+        what: &str,
+    ) -> Result<vk::Pipeline, RendererError> {
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(module)
+                .name(c"vs_main"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(module)
+                .name(c"fs_main"),
+        ];
+        use crate::proxy_mesh::ProxyVertex;
+        let mesh_binding = vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: size_of::<ProxyVertex>() as u32,
+            input_rate: vk::VertexInputRate::VERTEX,
+        };
+        // The 6-E instance-rate binding: the packed transform + tint
+        // columns (the proxy_instances::pack layout — location 7's
+        // .a is the instance alpha, the Era-2 package C claim).
+        let instance_binding = vk::VertexInputBindingDescription {
+            binding: 1,
+            stride: crate::proxy_instances::INSTANCE_STRIDE as u32,
+            input_rate: vk::VertexInputRate::INSTANCE,
+        };
+        let bindings = [mesh_binding, instance_binding];
+        let vec4 = vk::Format::R32G32B32A32_SFLOAT;
+        // The mesh's pos/normal/uv at locations 0-2 (the normal is
+        // present in the format and ignored by the shader).
+        let mesh_attributes = [
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 1,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 12,
+            },
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 2,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: std::mem::offset_of!(ProxyVertex, uv) as u32,
+            },
+        ];
+        let instance_attributes =
+            [3, 4, 5, 6, 7].map(|location| vk::VertexInputAttributeDescription {
+                binding: 1,
+                location,
+                format: vec4,
+                offset: (location - 3) * 16,
+            });
+        let all_attributes = [
+            mesh_attributes[0],
+            mesh_attributes[1],
+            mesh_attributes[2],
+            instance_attributes[0],
+            instance_attributes[1],
+            instance_attributes[2],
+            instance_attributes[3],
+            instance_attributes[4],
+        ];
+        let inputs = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&bindings)
+            .vertex_attribute_descriptions(&all_attributes);
+        let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        // The corner and proxy meshes wind CCW about their outward
+        // normals (the lit convention); the rain streak quad follows
+        // it.
+        let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        // The rain contract: depth TEST on, depth WRITE off — rain
+        // is occluded by geometry, never occludes.
+        let depth = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(false)
+            .depth_compare_op(vk::CompareOp::LESS);
+        // The overlay precedent's attachment state verbatim.
+        let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .alpha_blend_op(vk::BlendOp::ADD)];
+        let blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&inputs)
+            .input_assembly_state(&assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterizer)
+            .multisample_state(&multisampling)
+            .depth_stencil_state(&depth)
+            .color_blend_state(&blend)
+            .dynamic_state(&dynamic_state)
+            .layout(layout)
+            .render_pass(render_pass)
+            .subpass(0);
+        // SAFETY: the module/layout/render pass are the caller's
+        // live objects; the pipeline is returned to the state that
+        // owns it.
+        unsafe {
+            ctx.device
+                .create_graphics_pipelines(ctx.pipeline_cache, &[info], None)
+        }
+        .map_err(|(_, error)| RendererError::vk(error, what))
+        .map(|pipelines| pipelines[0])
+    }
+
     /// A fullscreen-triangle pipeline (the bloom and post passes'
     /// shape — no vertex input, no depth, no culling, dynamic
     /// viewport/scissor).
@@ -1144,6 +1333,12 @@ impl PostResources {
                 lit: Some(self.lit_hdr),
                 shadowed: self.shadowed_hdr,
                 proxy: Some(self.proxy_hdr),
+                // The rain kind's HDR variant — ensured at the first
+                // populated post frame (the frame flow's
+                // family-growth block); the belt-check guard below
+                // stays as the not-yet-ensured safety net (the
+                // sky_hdr shape).
+                proxy_rain: self.rain_hdr,
                 // The npc kind's HDR skinned variant — ensured at the
                 // first populated post frame (the frame flow's
                 // family-growth block); a postless populated frame
@@ -1323,6 +1518,9 @@ impl PostResources {
             ctx.device.destroy_pipeline(self.blur_h_pipeline, None);
             ctx.device.destroy_pipeline(self.bright_pipeline, None);
             if let Some(pipeline) = self.sky_hdr.take() {
+                ctx.device.destroy_pipeline(pipeline, None);
+            }
+            if let Some(pipeline) = self.rain_hdr.take() {
                 ctx.device.destroy_pipeline(pipeline, None);
             }
             if let Some(pipeline) = self.shadowed_hdr.take() {

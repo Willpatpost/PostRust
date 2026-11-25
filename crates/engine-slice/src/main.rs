@@ -87,6 +87,9 @@ Interactive modes
                                      scene about the ground plane, the ground
                                      re-drawn Schlick-blended by view angle;
                                      composes with every corner flag)
+  --corner --weather <rain>        The rain layer (Era 2 package C — particles +
+                                     weather; requires --populated; the emitter
+                                     seed 0xDEADBEEF, policy rate=480/s)
   --corner --free-look               Interactive WASD + mouse camera (Era 1's
                                     eyeball mode — presentation only, the camera
                                     never enters a measured claim; starts on the
@@ -587,6 +590,7 @@ fn main() {
             let mut post = false;
             let mut wet = false;
             let mut behavior = false;
+            let mut weather: Option<String> = None;
             let mut audio = false;
             let mut fps = 60;
             let mut present = engine_renderer::PresentModePreference::Auto;
@@ -645,6 +649,12 @@ fn main() {
                     // ground re-draw; composes with every other
                     // corner flag).
                     "--wet" => wet = true,
+                    // The rain layer (Era 2 package C — particles +
+                    // weather): the only accepted value is 'rain'.
+                    // Refuses without --populated.
+                    "--weather" => {
+                        weather = Some(options.next().ok_or("--weather requires a value")?.clone());
+                    }
                     // The behavior spine (Era 2 package A part 5 — the
                     // composed gates): the commitment wakes drive the
                     // populated crowd. Refuses without --populated.
@@ -703,6 +713,19 @@ fn main() {
                         .into(),
                 );
             }
+            // --weather rain requires --populated.
+            if weather.is_some() && !populated {
+                return Err("--weather rain requires --populated (the rain kind rides the populated routes)".into());
+            }
+            // --weather only accepts 'rain' (the loud typed refusal).
+            if let Some(ref weather_type) = weather
+                && weather_type != "rain"
+            {
+                return Err(format!(
+                    "--weather {} is not supported (only 'rain' is accepted)",
+                    weather_type
+                ));
+            }
             // The audio mode's own gate (the --frames precedent: never
             // a silent mode drop) — the footsteps ride the free-look
             // session's listener and come from the walking crowd, so
@@ -732,6 +755,7 @@ fn main() {
                 post,
                 wet,
                 behavior,
+                weather,
                 audio,
             )
         };

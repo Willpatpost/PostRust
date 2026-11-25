@@ -35,8 +35,9 @@
 //! implementation including lavapipe (the CI gate's rasterizer).
 //!
 //! ZERO-PER-FRAME-ALLOCATION DISCIPLINE: the packed commands are a
-//! FIXED 32-byte block per frame slot (two commands, npc then
-//! vehicle — the repack's fixed kind order), written into a
+//! FIXED 48-byte block per frame slot (three commands, npc then
+//! vehicle then rain — the repack's fixed kind order, the rain kind
+//! appended LAST by the Era-2 package C), written into a
 //! persistently mapped host-visible buffer with one disjoint region
 //! per frame slot (the instance buffer's exact discipline: slot S's
 //! region is written only inside the frame flow that first waited
@@ -48,15 +49,17 @@
 pub const INDIRECT_COMMAND_BYTES: usize = 16;
 
 /// The proxy kinds an indirect block carries commands for, in the
-/// repack's FIXED order (npc then vehicle — the instance buffer's
-/// own kind order; a kind's command sits at its index times
+/// repack's FIXED order (npc then vehicle then rain — the instance
+/// buffer's own kind order, the rain kind appended LAST by the
+/// Era-2 package C; a kind's command sits at its index times
 /// [`INDIRECT_COMMAND_BYTES`]).
-pub const INDIRECT_KINDS: usize = 2;
+pub const INDIRECT_KINDS: usize = 3;
 
 /// One frame slot's indirect-command block: one command per kind.
 pub const INDIRECT_SLOT_BYTES: usize = INDIRECT_COMMAND_BYTES * INDIRECT_KINDS;
 
-/// The byte offset of `kind`'s command within a slot's block.
+/// The byte offset of `kind`'s command within a slot's block (npc at
+/// 0, vehicle at 16, rain at 32).
 ///
 /// Pure — pinned by tests alongside the slot-region math.
 pub const fn indirect_kind_offset(kind_index: usize) -> usize {
@@ -78,11 +81,14 @@ pub fn append_indirect_command(bytes: &mut [u8], vertex_count: u32, instance_cou
 }
 
 /// Packs one indirect command block for a population: the NPC command
-/// at offset 0, the vehicle command at offset 16 — each kind's mesh
-/// vertex count (the pinned proxy-mesh constants: NPC 396, vehicle
-/// 552 — the Era-1 v2 silhouettes) paired with its instance count.
-/// Empty kinds pack `instanceCount = 0` commands (the draw loop never
-/// submits them; the block's shape stays fixed regardless).
+/// at offset 0, the vehicle command at offset 16, the RAIN command at
+/// offset 32 (the Era-2 package C third kind, appended LAST — the
+/// repack's fixed order) — each kind's mesh vertex count (the pinned
+/// proxy-mesh constants: NPC 396, vehicle 552 — the Era-1 v2
+/// silhouettes; rain 6 — the streak quad) paired with its instance
+/// count. Empty kinds pack `instanceCount = 0` commands (the draw
+/// loop never submits them; the block's shape stays fixed
+/// regardless).
 ///
 /// Pure — byte-identical on every platform; the FNV-1a pin below
 /// pins the shipped population's actual block. The draw-CALL model
@@ -95,6 +101,8 @@ pub fn pack_indirect_block(
     npc_count: u32,
     vehicle_vertices: u32,
     vehicle_count: u32,
+    rain_vertices: u32,
+    rain_count: u32,
 ) -> [u8; INDIRECT_SLOT_BYTES] {
     let mut block = [0u8; INDIRECT_SLOT_BYTES];
     append_indirect_command(
@@ -106,6 +114,11 @@ pub fn pack_indirect_block(
         &mut block[indirect_kind_offset(1)..],
         vehicle_vertices,
         vehicle_count,
+    );
+    append_indirect_command(
+        &mut block[indirect_kind_offset(2)..],
+        rain_vertices,
+        rain_count,
     );
     block
 }
@@ -130,18 +143,21 @@ mod tests {
     #[test]
     fn commands_packed_deterministically_with_pinned_layout() {
         // The mesh vertex counts are pinned by populated_meshes's
-        // own tests (396/552 — the Era-1 v2 silhouettes); the
-        // command bytes carry the same numbers.
-        let a = pack_indirect_block(396, 24, 552, 2);
-        let b = pack_indirect_block(396, 24, 552, 2);
+        // own tests (396/552 — the Era-1 v2 silhouettes; 6 — the
+        // rain streak quad); the command bytes carry the same
+        // numbers.
+        let a = pack_indirect_block(396, 24, 552, 2, 6, 0);
+        let b = pack_indirect_block(396, 24, 552, 2, 6, 0);
         assert_eq!(a, b, "double-packing reproduces the identical bytes");
         assert_eq!(word(&a, 0), 396, "npc vertexCount = the mesh's 396");
         assert_eq!(word(&a, 4), 24, "npc instanceCount = the population");
         assert_eq!(word(&a, 16), 552, "vehicle vertexCount = the mesh's 552");
         assert_eq!(word(&a, 20), 2, "vehicle instanceCount = the population");
+        assert_eq!(word(&a, 32), 6, "rain vertexCount = the streak quad's 6");
+        assert_eq!(word(&a, 36), 0, "rain instanceCount = the population");
         // The pinned zero words: firstVertex and firstInstance on
-        // BOTH commands.
-        for base in [0, 16] {
+        // ALL THREE commands.
+        for base in [0, 16, 32] {
             assert_eq!(word(&a, base + 8), 0, "firstVertex pinned zero");
             assert_eq!(word(&a, base + 12), 0, "firstInstance pinned zero");
         }
@@ -151,19 +167,24 @@ mod tests {
         // asserted so a field swap cannot pass silently.
         assert_eq!((word(&a, 0), word(&a, 4)), (396, 24));
         assert_eq!((word(&a, 16), word(&a, 20)), (552, 2));
+        assert_eq!((word(&a, 32), word(&a, 36)), (6, 0));
     }
 
     /// THE CROSS-PLATFORM BYTE PIN (the fingerprint-pin discipline
     /// applied to the indirect commands): the shipped corner
-    /// population's command block — 24 NPCs, 2 vehicles, the pinned
-    /// mesh vertex counts — hashes to this FNV-1a u64. Pure integer
-    /// packing: Linux and Windows CI asserting the same value IS
-    /// the determinism proof.
+    /// population's command block — 24 NPCs, 2 vehicles, the rain
+    /// kind EMPTY at the renderer-kind stage (the demo's rain
+    /// population arrives with the Era-2 package C weather wiring;
+    /// the pin covers the THREE-COMMAND layout with the streak
+    /// mesh's pinned 6-vertex count) — hashes to this FNV-1a u64.
+    /// Pure integer packing: Linux and Windows CI asserting the same
+    /// value IS the determinism proof.
     #[test]
     fn slot_commands_fnv_pin() {
         // The mesh vertex counts are pinned by populated_meshes's
-        // own tests (396/552 — the Era-1 v2 silhouettes).
-        let bytes = pack_indirect_block(396, 24, 552, 2);
+        // own tests (396/552 — the Era-1 v2 silhouettes; 6 — the
+        // rain streak quad).
+        let bytes = pack_indirect_block(396, 24, 552, 2, 6, 0);
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for &byte in &bytes {
             hash ^= byte as u64;
@@ -176,52 +197,68 @@ mod tests {
         );
     }
 
-    /// The measured-actual FNV-1a of the shipped population's
-    /// command block (24 npc + 2 vehicle over the Era-1 v2
-    /// silhouettes' 396/552 vertex counts — the population-v2
-    /// package's deliberate mesh swap, the documented cause of the
-    /// repin from the 6-E2 value 5608403408697128027) — measured at
-    /// this package's first test run on this pod (the
-    /// placeholder-pin discipline: run once, read the actual, pin
-    /// it; a later mismatch is an investigation, never a silent
-    /// repin).
-    const PINNED_FNV: u64 = 1080195817659645834;
+    /// The measured-actual FNV-1a of the pinned population's command
+    /// block (24 npc + 2 vehicle over the Era-1 v2 silhouettes'
+    /// 396/552 vertex counts — the population-v2 package's
+    /// deliberate mesh swap, the documented cause of the repin from
+    /// the 6-E2 value 5608403408697128027; 1080195817659645834
+    /// carried the TWO-command 32-byte block). REPINNED in the Era-2
+    /// package C (rain) renderer-kind stage — the MEASURED cause:
+    /// the block grew to the three-command 48-byte form (the rain
+    /// command at offset 32: vertexCount 6, instanceCount 0 for the
+    /// empty-at-this-stage kind), so every byte past offset 32 is
+    /// new hashed content. Measured at this stage's first test run
+    /// on this pod (the placeholder-pin discipline: run once, read
+    /// the actual, pin it; a later mismatch is an investigation,
+    /// never a silent repin).
+    const PINNED_FNV: u64 = 16573840442944668300;
 
     /// Empty kinds pack zero-instanceCount commands — the block's
-    /// shape is fixed (two commands) regardless of which kinds are
+    /// shape is fixed (three commands) regardless of which kinds are
     /// populated, and an empty population's block is all
     /// zero-instance commands (nothing draws; the bytes stay
     /// deterministic).
     #[test]
     fn empty_kinds_pack_zero_instance_counts() {
-        let empty = pack_indirect_block(396, 0, 552, 0);
+        let empty = pack_indirect_block(396, 0, 552, 0, 6, 0);
         assert_eq!(word(&empty, 0), 396, "the npc command stays present");
         assert_eq!(word(&empty, 4), 0, "npc instanceCount zero");
         assert_eq!(word(&empty, 16), 552, "the vehicle command stays present");
         assert_eq!(word(&empty, 20), 0, "vehicle instanceCount zero");
-        // Half-populated: the empty kind's command is zeroed, the
-        // populated kind's carries its count.
-        let npc_only = pack_indirect_block(396, 7, 552, 0);
+        assert_eq!(word(&empty, 32), 6, "the rain command stays present");
+        assert_eq!(word(&empty, 36), 0, "rain instanceCount zero");
+        // Half-populated: the empty kinds' commands are zeroed, the
+        // populated kinds' carry their counts.
+        let npc_only = pack_indirect_block(396, 7, 552, 0, 6, 0);
         assert_eq!(word(&npc_only, 4), 7);
         assert_eq!(word(&npc_only, 20), 0);
+        assert_eq!(word(&npc_only, 36), 0);
+        // The rain-populated half (the translucent kind's own
+        // shape): npc and vehicle empty, the rain command populated.
+        let rain_only = pack_indirect_block(396, 0, 552, 0, 6, 512);
+        assert_eq!(word(&rain_only, 4), 0);
+        assert_eq!(word(&rain_only, 20), 0);
+        assert_eq!(word(&rain_only, 32), 6);
+        assert_eq!(word(&rain_only, 36), 512);
     }
 
-    /// The slot-region math the buffer carve relies on: one 32-byte
+    /// The slot-region math the buffer carve relies on: one 48-byte
     /// block per frame slot, kind commands at their fixed offsets.
     #[test]
     fn slot_region_and_kind_offsets() {
         assert_eq!(INDIRECT_COMMAND_BYTES, 16, "four u32 words");
-        assert_eq!(INDIRECT_KINDS, 2, "npc then vehicle");
-        assert_eq!(INDIRECT_SLOT_BYTES, 32, "one command per kind");
+        assert_eq!(INDIRECT_KINDS, 3, "npc then vehicle then rain");
+        assert_eq!(INDIRECT_SLOT_BYTES, 48, "one command per kind");
         assert_eq!(indirect_kind_offset(0), 0);
         assert_eq!(indirect_kind_offset(1), 16);
+        assert_eq!(indirect_kind_offset(2), 32);
         // The per-slot region stride the GPU buffer uses: the block
         // times the frames-in-flight constant (the instance
         // buffer's own discipline — one disjoint region per slot).
         assert_eq!(
             INDIRECT_SLOT_BYTES * crate::config::FRAMES_IN_FLIGHT as usize,
-            64,
-            "two frame slots of 32 bytes"
+            96,
+            "two frame slots of 48 bytes"
         );
     }
 }

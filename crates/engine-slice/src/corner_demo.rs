@@ -76,6 +76,9 @@ const AUDIO_STEP_INTERVAL: f32 = 0.65;
 /// them out: `spine.world().states`). Render-then-step, frame 0 =
 /// part 4's construction (byte-identical — the composed mode's first
 /// frame equals the plain populated mode's first frame; documented).
+///
+/// When rain is enabled, the crowd also owns the `RainLayer` that
+/// drives the rain particles and builds the instance buffer per frame.
 struct LocomotionCrowd {
     routes: Vec<engine_core::npc_locomotion::Route>,
     states: Vec<engine_core::npc_locomotion::NpcLocomotion>,
@@ -86,6 +89,9 @@ struct LocomotionCrowd {
     vehicles: Vec<engine_renderer::proxy_instances::ProxyInstance>,
     /// When behavior is on, the behavior spine and world.
     spine: Option<engine_core::spine::Spine<crate::corner_behavior::CornerCrowdWorld>>,
+    /// When rain is enabled, the rain layer that owns the emitter
+    /// and builds instances per frame.
+    rain: Option<crate::corner_weather::RainLayer>,
 }
 
 impl LocomotionCrowd {
@@ -103,6 +109,7 @@ impl LocomotionCrowd {
                     scale: 0.0,
                 },
                 tint: [0.0, 0.0, 0.0],
+                alpha: 1.0,
                 pose_index: 0,
             },
         );
@@ -119,6 +126,7 @@ impl LocomotionCrowd {
             poses,
             vehicles,
             spine: None,
+            rain: None,
         }
     }
 
@@ -139,6 +147,7 @@ impl LocomotionCrowd {
                     scale: 0.0,
                 },
                 tint: [0.0, 0.0, 0.0],
+                alpha: 1.0,
                 pose_index: 0,
             },
         );
@@ -183,7 +192,17 @@ impl LocomotionCrowd {
             poses,
             vehicles,
             spine: Some(spine),
+            rain: None,
         }
+    }
+
+    /// Constructs the crowd with the rain layer warm-started (the
+    /// first route waypoint's eye — the first presented frame is
+    /// already wet).
+    fn with_rain() -> Self {
+        let mut crowd = Self::new();
+        crowd.rain = Some(crate::corner_weather::RainLayer::new([-5.0, 1.7, 13.0]));
+        crowd
     }
 
     /// The plain step: batch, instances, poses.
@@ -234,7 +253,37 @@ impl LocomotionCrowd {
             npc_material: NPC_MATERIAL,
             vehicle: &self.vehicles,
             vehicle_material: VEHICLE_MATERIAL,
+            // The rain kind is populated when the layer exists.
+            rain: self
+                .rain
+                .as_ref()
+                .map(|r| r.population().rain)
+                .unwrap_or(&[]),
+            rain_material: self
+                .rain
+                .as_ref()
+                .map(|_| crate::corner_weather::RAIN_MATERIAL)
+                .unwrap_or(0),
         }
+    }
+
+    /// Updates the rain layer for one frame, building instances and
+    /// ticking the emitter. `camera_position` and `camera_yaw` are
+    /// from the current frame's view. `day_night` is the cycle position.
+    fn update_rain(&mut self, camera_position: [f32; 3], camera_yaw: f32, day_night: f32) {
+        if let Some(rain) = &mut self.rain {
+            let _report = rain.update_and_build(camera_position, camera_yaw, day_night);
+        }
+    }
+
+    /// Returns the rain layer's exit summary.
+    fn rain_exit_summary(&self) -> Option<String> {
+        self.rain.as_ref().map(|r| r.exit_summary())
+    }
+
+    /// Returns the rain layer's folded state for the digest pin.
+    fn rain_fold_state(&self) -> Option<u64> {
+        self.rain.as_ref().map(|r| r.fold_state())
     }
 
     /// The crowd's CURRENT locomotion states — the same states the
@@ -501,7 +550,8 @@ pub fn demo_bias() -> engine_renderer::shadows::ShadowBias {
 // the post chain by one bool (its own setting is data-free — the
 // sticky renderer flag is the whole mode).
 // The behavior spine adds one more flag; the union stays at 8 args.
-// Era 2 package B part 3's audio flag adds one more bool (9).
+// The rain layer adds one more parameter (weather mode) and Era 2
+// package B part 3's audio flag one more bool.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     night: bool,
@@ -518,6 +568,7 @@ pub fn run(
     post: bool,
     wet: bool,
     behavior: bool,
+    weather: Option<String>,
     audio: bool,
 ) -> Result<(), String> {
     let mut app = ShellApp::new(ShellConfig {
@@ -553,14 +604,29 @@ pub fn run(
     // initial wake events armed at construction) and `step()` becomes
     // the composed tick: `spine.run_tick()` then `world.composed_tick(1/60)`
     // then the instance/pose re-packs (the states now live IN the world).
+    // When weather is "rain", the crowd includes the warm-started rain layer.
     let mut crowd = populated.then(|| {
-        if behavior {
+        if weather.as_ref().is_some_and(|w| w == "rain") {
+            if behavior {
+                println!(
+                    "behavior spine composed: 24 schedules, the commitment wakes drive the crowd"
+                );
+                println!("rain layer: enabled (the emitter seed 0xDEADBEEF, policy rate=480/s)");
+                let mut crowd = LocomotionCrowd::with_behavior();
+                crowd.rain = Some(crate::corner_weather::RainLayer::new([-5.0, 1.7, 13.0]));
+                crowd
+            } else {
+                println!("rain layer: enabled (the emitter seed 0xDEADBEEF, policy rate=480/s)");
+                LocomotionCrowd::with_rain()
+            }
+        } else if behavior {
             println!("behavior spine composed: 24 schedules, the commitment wakes drive the crowd");
             LocomotionCrowd::with_behavior()
         } else {
             LocomotionCrowd::new()
         }
     });
+
     // The submission mode, in evidence order: the per-object
     // reference (one draw per instance — the pre-6-E shape, the
     // before/after measurement mode), the direct 6-E instanced
@@ -799,7 +865,23 @@ pub fn run(
         // blocks re-evaluated into their retained buffers (zero
         // allocation; the presentation-only crowd never enters the
         // spine, a fingerprint, or a measured claim).
+        // The rain layer is updated here too — it rebuilds instances
+        // from the emitter's current particles and ticks the emitter.
         if let Some(crowd) = crowd.as_mut() {
+            // The rain update: rebuild instances and tick emitter.
+            // For the scripted route, the camera yaw is derived from
+            // the route's waypoint (the SAME expression the view
+            // matrix uses — never re-derived differently); the tint
+            // rides the day/night CYCLE position when the cycle is
+            // active (the same t the atmosphere above consumed —
+            // the rain darkens with the sky), else the static
+            // preset.
+            let offset = std::array::from_fn(|j| pose.look_at[j] - pose.position[j]);
+            let (yaw, _pitch) = crate::corner_demo::waypoint_orientation(offset);
+            let rain_t = day_night
+                .map(|period| engine_renderer::sky::cycle_position(i as f32 / 60.0, period))
+                .unwrap_or(if night { 1.0 } else { 0.0 });
+            crowd.update_rain(pose.position, yaw, rain_t);
             crowd.step();
         }
         if measured.contains(&i) {
@@ -843,6 +925,15 @@ pub fn run(
             "behavior spine composed: {} wake executions, {} arrivals over the route (exit)",
             world.wake_executions, world.arrivals
         );
+    }
+    // Rain layer exit summary (if enabled).
+    if let Some(crowd) = &crowd {
+        if let Some(summary) = crowd.rain_exit_summary() {
+            println!("{}", summary);
+        }
+        if let Some(digest) = crowd.rain_fold_state() {
+            println!("rain digest: {}", digest);
+        }
     }
     let peak = peak_resident_kib().map_or_else(|| "unavailable".into(), |v| format!("{v} KiB"));
     cpu.report("CPU frame work (poll through present, includes Vulkan waits)");
@@ -1032,7 +1123,24 @@ fn run_free_look(
         // The crowd's tick (render-then-step — one deterministic 1/60
         // batch step per PRESENTED frame; a minimized or deferred frame
         // presents nothing and steps nothing).
+        // The rain layer is updated here too — it rebuilds instances
+        // from the emitter's current particles and ticks the emitter.
         if let Some(crowd) = crowd.as_mut() {
+            // For free-look, the camera yaw is from the FreeLookCamera
+            // (the live interactive camera drives the billboard basis
+            // and the listener — presentation only, never a
+            // fingerprint); the tint rides the cycle's current
+            // position when active (the same t the atmosphere above
+            // consumed), else the day preset.
+            let rain_t = day_night
+                .map(|period| {
+                    engine_renderer::sky::cycle_position(
+                        timing.total_sim_advanced().as_secs_f32(),
+                        period,
+                    )
+                })
+                .unwrap_or(0.0);
+            crowd.update_rain(camera.position, camera.yaw, rain_t);
             crowd.step();
         }
         // Era 2 package B part 3 — THE AUDIBLE CROWD (after the

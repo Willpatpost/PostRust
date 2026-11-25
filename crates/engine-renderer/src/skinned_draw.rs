@@ -1364,6 +1364,12 @@ impl ShadowedProxyResources {
     /// pipeline and draws the same instance ranges the lit pass will
     /// draw). Returns the recorded draw-call count.
     ///
+    /// THE RAIN KIND NEVER CASTS (the Era-2 package C documented
+    /// exclusion): translucent streaks have no silhouette, so this
+    /// pass submits the npc and vehicle kinds ONLY — there is no
+    /// rain arm here by design; the shadowed populated path carries
+    /// rain through the LIT pass alone.
+    ///
     /// # Safety
     /// `cmd` is recording INSIDE the depth pass; the slot's instance
     /// and pose regions hold this frame's bytes (written after the
@@ -1407,6 +1413,7 @@ impl ShadowedProxyResources {
                     let range = super::proxy_draw::kind_instance_range(
                         upload.npc_count,
                         upload.vehicle_count,
+                        upload.rain_count,
                         super::proxy_draw::ProxyKind::Npc,
                     );
                     let base =
@@ -1484,6 +1491,7 @@ impl ShadowedProxyResources {
                     let range = super::proxy_draw::kind_instance_range(
                         upload.npc_count,
                         upload.vehicle_count,
+                        upload.rain_count,
                         super::proxy_draw::ProxyKind::Vehicle,
                     );
                     let base =

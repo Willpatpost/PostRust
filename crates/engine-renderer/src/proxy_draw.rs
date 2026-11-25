@@ -6,7 +6,11 @@
 //! Cycle 6-E2 adds the indirect command buffer (see
 //! [`crate::proxy_indirect`] — the deterministic command-byte core):
 //! the same one-draw-per-kind submission with the instance count
-//! read from GPU memory at draw time.
+//! read from GPU memory at draw time. The Era-2 package C adds the
+//! THIRD populated kind, Rain (the unlit blended particle path —
+//! see [`ProxyKind::Rain`]): the same instance buffer, the same
+//! per-kind mesh VBO discipline, one more command in the indirect
+//! block.
 //!
 //! ZERO-PER-FRAME-ALLOCATION DISCIPLINE (the standing gate): every
 //! object here is created ONCE, lazily, at the FIRST populated
@@ -46,10 +50,11 @@
 //! THE INDIRECT SUBMISSION (6-E2): one `vkCmdDrawIndirect` per
 //! populated kind, drawCount = 1, reading the kind's 16-byte
 //! `VkDrawIndirectCommand` from this slot's block of the indirect
-//! buffer (npc at offset 0, vehicle at 16 — the repack's fixed kind
-//! order). `firstInstance` is pinned zero (the instance range
-//! arrives through the instance-rate vertex-binding offset, exactly
-//! as the direct instanced draw — no `drawIndirectFirstInstance`
+//! buffer (npc at offset 0, vehicle at 16, rain at 32 — the
+//! repack's fixed kind order, the rain kind appended LAST by the
+//! Era-2 package C). `firstInstance` is pinned zero (the instance
+//! range arrives through the instance-rate vertex-binding offset,
+//! exactly as the direct instanced draw — no `drawIndirectFirstInstance`
 //! feature required), and `firstVertex` is pinned zero (each kind's
 //! mesh draws from its own bound VBO at offset 0). The command
 //! bytes are the pure [`crate::proxy_indirect`] packing: the pinned
@@ -71,7 +76,7 @@ use super::{
 };
 use crate::ProxyDrawMode;
 use crate::config::FRAMES_IN_FLIGHT;
-use crate::populated_meshes::sedan_mesh;
+use crate::populated_meshes::{rain_streak_mesh, sedan_mesh};
 use crate::proxy_indirect::{INDIRECT_COMMAND_BYTES, INDIRECT_SLOT_BYTES, indirect_kind_offset};
 use crate::proxy_instances::{INSTANCE_STRIDE, MAX_INSTANCES};
 use crate::proxy_mesh::ProxyVertex;
@@ -79,10 +84,17 @@ use ash::vk;
 use core::ops::Range;
 
 /// Which proxy kind a draw addresses (its mesh and instance range).
+/// The Era-2 package C adds the third populated kind: Rain — the
+/// translucent streaks, drawn LAST in the fixed kind order (after
+/// vehicle, never between), through the unlit blended particle
+/// pipeline. Rain NEVER reaches the shadow depth pass (the
+/// proxy-cast path submits npc/vehicle only — translucent streaks
+/// have no silhouette; see [`ProxyResources::bind_kind_buffers`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProxyKind {
     Npc,
     Vehicle,
+    Rain,
 }
 
 /// One populated frame's proxy submission request: the safe layer's
@@ -92,25 +104,36 @@ pub(crate) enum ProxyKind {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ProxyFrameUpload<'a> {
     /// The repacked instance bytes (npc population first, vehicle
-    /// after — [`crate::proxy_instances::repack_populations`]'s
-    /// fixed order); exactly `(npc_count + vehicle_count) *
-    /// INSTANCE_STRIDE` bytes (the repack's validated total, at most
-    /// [`MAX_INSTANCES`] instances).
+    /// after, rain LAST — [`crate::proxy_instances::repack_populations`]'s
+    /// fixed order); exactly `(npc_count + vehicle_count +
+    /// rain_count) * INSTANCE_STRIDE` bytes (the repack's validated
+    /// total, at most [`MAX_INSTANCES`] instances).
     pub bytes: &'a [u8],
     /// The repacked pose bytes: the npc kind's skin-matrix blocks in
     /// POSE-INDEX order (block i serves every npc whose
     /// `pose_index` is i — the safe layer validated `max(npc
     /// pose_index) < blocks.len()`), at most [`MAX_POSE_BLOCKS`] *
     /// [`crate::animation::POSE_STRIDE`] bytes (the repack's
-    /// validated capacity). The vehicle kind never reads them.
+    /// validated capacity). The vehicle and rain kinds never read
+    /// them.
     pub pose_bytes: &'a [u8],
     pub npc_count: u32,
     pub vehicle_count: u32,
+    /// The rain kind's instance count (the Era-2 package C third
+    /// populated kind — the translucent streaks, appended after
+    /// vehicle in every fixed order).
+    pub rain_count: u32,
     /// Per-kind material indices into the corner scene's material
     /// table (caller policy). Validated by the safe layer AND again
-    /// by the frame flow before any synchronization state is touched.
+    /// by the frame flow before any synchronization state is
+    /// touched — the rain kind's index included, exactly like the
+    /// other kinds.
     pub npc_material: u32,
     pub vehicle_material: u32,
+    /// The rain kind's material index (the corner material its set
+    /// binds — the streak texture's albedo/sampler; the tint and
+    /// alpha come per-instance).
+    pub rain_material: u32,
     /// The submission mode (the equivalence gate's axis): direct
     /// instanced, the per-object reference, or the 6-E2 indirect
     /// submission.
@@ -120,12 +143,15 @@ pub(crate) struct ProxyFrameUpload<'a> {
 /// The per-kind pipelines one populated recording needs, for ONE
 /// render pass (the main pass or the HDR pass — each carries its own
 /// variants): the vehicle kind's plain proxy pipeline + layout (the
-/// 6-E path, byte-identical) and the npc kind's skinned pipeline
-/// (the skinned state's variant for this pass).
+/// 6-E path, byte-identical), the npc kind's skinned pipeline (the
+/// skinned state's variant for this pass), and the rain kind's
+/// UNLIT BLENDED particle pipeline (one object, render-pass-bound —
+/// the HDR variant is the post state's lazy `rain_hdr` family).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ProxyPipelines {
     pub vehicle: vk::Pipeline,
     pub npc: vk::Pipeline,
+    pub rain: vk::Pipeline,
 }
 
 /// The npc kind's skinned set bind: the skinned pipeline layout, the
@@ -144,28 +170,39 @@ pub(crate) struct SkinnedSetBind {
     pub pose_offset: u32,
 }
 
-/// The vehicle kind's set bind (the plain proxy set — the corner
-/// material set for the unshadowed family, the plain-shadowed set
-/// for the shadowed family; one dynamic offset at binding 2).
+/// A PLAIN kind's set bind (formerly the vehicle kind's own
+/// `VehicleSetBind` — the Era-2 package C rain stage generalized the
+/// shape: every kind that draws through a plain corner-material set
+/// with ONE dynamic offset at binding 2 — the vehicle kind's corner
+/// material set for the unshadowed family, its plain-shadowed set
+/// for the shadowed family, and the rain kind's corner set in both
+/// (rain receives no shadows, so its set is always the corner one)
+/// — reuses this struct; the reuse is deliberate, one shape for one
+/// binding contract).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct VehicleSetBind {
+pub(crate) struct PlainSetBind {
     pub layout: vk::PipelineLayout,
     pub set: vk::DescriptorSet,
     pub frame_offset: u32,
 }
 
 /// The per-kind instance range within one slot's packed bytes (the
-/// fixed npc-then-vehicle order; byte offsets are the range times
-/// [`INSTANCE_STRIDE`]). Pure — pinned by tests.
+/// fixed npc-then-vehicle-then-rain order — rain LAST; byte offsets
+/// are the range times [`INSTANCE_STRIDE`]). Pure — pinned by tests.
 pub(crate) fn kind_instance_range(
     npc_count: u32,
     vehicle_count: u32,
+    rain_count: u32,
     kind: ProxyKind,
 ) -> Range<u64> {
     let (start, end) = match kind {
         ProxyKind::Npc => (0, npc_count as u64),
         // Chained index arithmetic (u32 total, bounded by the repack).
         ProxyKind::Vehicle => (npc_count as u64, npc_count as u64 + vehicle_count as u64),
+        ProxyKind::Rain => (
+            npc_count as u64 + vehicle_count as u64,
+            npc_count as u64 + vehicle_count as u64 + rain_count as u64,
+        ),
     };
     start..end
 }
@@ -173,27 +210,30 @@ pub(crate) fn kind_instance_range(
 /// The draw-call count a population records under a submission mode
 /// (the pinned-integer headline): one per POPULATED kind instanced
 /// and indirect alike (the GPU-side count changes where N lives,
-/// never how many draws submit); one per INSTANCE in the per-object
+/// never how many draws submit) — the rain kind joins every arm,
+/// exactly like the other kinds; one per INSTANCE in the per-object
 /// reference. Pure — pinned by tests; the recorded draw's own count
 /// must equal it.
 pub(crate) fn proxy_draw_call_count(
     mode: ProxyDrawMode,
     npc_count: u32,
     vehicle_count: u32,
+    rain_count: u32,
 ) -> u32 {
     match mode {
-        ProxyDrawMode::PerInstance => npc_count + vehicle_count,
+        ProxyDrawMode::PerInstance => npc_count + vehicle_count + rain_count,
         ProxyDrawMode::Instanced | ProxyDrawMode::Indirect => {
-            u32::from(npc_count > 0) + u32::from(vehicle_count > 0)
+            u32::from(npc_count > 0) + u32::from(vehicle_count > 0) + u32::from(rain_count > 0)
         }
     }
 }
 
 /// The 6-E2 indirect command state: one persistently mapped
-/// host-visible buffer holding one 32-byte command block per frame
-/// slot (the npc command at offset 0, the vehicle command at 16 —
-/// the repack's fixed kind order). Created LAZILY at the first
-/// INDIRECT-mode populated frame, inside
+/// host-visible buffer holding one 48-byte command block per frame
+/// slot (the npc command at offset 0, the vehicle command at 16,
+/// the rain command at 32 — the repack's fixed kind order, the rain
+/// kind appended LAST by the Era-2 package C). Created LAZILY at
+/// the first INDIRECT-mode populated frame, inside
 /// [`ProxyResources::ensure_indirect`] (the instance buffer's own
 /// discipline one level deeper: the direct instanced path's
 /// allocation pins pay nothing for a mechanism it never touches);
@@ -207,6 +247,8 @@ pub(crate) struct IndirectResources {
     npc_vertices: u32,
     /// The vehicle mesh's vertex count (552 — the Era-1 v2 sedan).
     vehicle_vertices: u32,
+    /// The rain streak mesh's vertex count (6 — one quad).
+    rain_vertices: u32,
 }
 
 impl IndirectResources {
@@ -220,6 +262,7 @@ impl IndirectResources {
         ctx: &VulkanContext,
         npc_vertices: u32,
         vehicle_vertices: u32,
+        rain_vertices: u32,
     ) -> Result<Self, RendererError> {
         let (buffer, memory, mapped) = create_mapped_buffer(
             ctx,
@@ -227,7 +270,7 @@ impl IndirectResources {
             // INDIRECT_BUFFER usage the validation layer demands
             // (VUID-vkCmdDrawIndirect-buffer-02709).
             vk::BufferUsageFlags::INDIRECT_BUFFER,
-            // One disjoint 32-byte region per frame slot — the
+            // One disjoint 48-byte region per frame slot — the
             // fence-before-write discipline needs no smaller carve.
             INDIRECT_SLOT_BYTES as u64 * FRAMES_IN_FLIGHT as u64,
         )?;
@@ -237,10 +280,11 @@ impl IndirectResources {
             mapped,
             npc_vertices,
             vehicle_vertices,
+            rain_vertices,
         })
     }
 
-    /// Copies this frame's two command bytes into `slot`'s mapped
+    /// Copies this frame's three command bytes into `slot`'s mapped
     /// region — the pure [`crate::proxy_indirect`] packing of the
     /// pinned mesh vertex counts and this frame's per-kind counts.
     ///
@@ -248,12 +292,20 @@ impl IndirectResources {
     /// The caller must own `slot` — its fence wait already passed
     /// (the same contract as [`ProxyResources::write_slot`], which
     /// the frame flow satisfies immediately before this call).
-    pub(super) unsafe fn write_slot(&self, slot: usize, npc_count: u32, vehicle_count: u32) {
+    pub(super) unsafe fn write_slot(
+        &self,
+        slot: usize,
+        npc_count: u32,
+        vehicle_count: u32,
+        rain_count: u32,
+    ) {
         let block = crate::proxy_indirect::pack_indirect_block(
             self.npc_vertices,
             npc_count,
             self.vehicle_vertices,
             vehicle_count,
+            self.rain_vertices,
+            rain_count,
         );
         // SAFETY: the documented caller contract — this slot's
         // fence wait passed, so the previous submission through this
@@ -288,11 +340,12 @@ impl IndirectResources {
     }
 }
 
-/// Device-lifetime proxy resources: the two mesh VBOs and the mapped
+/// Device-lifetime proxy resources: the three mesh VBOs (npc,
+/// vehicle, rain — the Era-2 package C third kind) and the mapped
 /// instance buffer. Created lazily at the first populated corner
 /// frame; owned by [`super::PipelineState`] (rebuilt identically on
 /// pipeline replacement — the finding-A re-ensure discipline, since
-/// the proxy pipeline that reads these buffers dies with that state).
+/// the proxy pipelines that read these buffers die with that state).
 pub(crate) struct ProxyResources {
     npc_vbo: vk::Buffer,
     npc_memory: vk::DeviceMemory,
@@ -303,6 +356,12 @@ pub(crate) struct ProxyResources {
     vehicle_vbo: vk::Buffer,
     vehicle_memory: vk::DeviceMemory,
     vehicle_vertices: u32,
+    /// The rain streak mesh's VBO and vertex count (6 — one quad;
+    /// the Era-2 package C third kind's own mesh, uploaded through
+    /// the same staged helper at construction).
+    rain_vbo: vk::Buffer,
+    rain_memory: vk::DeviceMemory,
+    rain_vertices: u32,
     instances: vk::Buffer,
     instances_memory: vk::DeviceMemory,
     instances_mapped: *mut core::ffi::c_void,
@@ -323,9 +382,13 @@ impl ProxyResources {
         // derivation pin — plus the rigid joints/weights tail the
         // skinned pipeline's locations 8/9 read). The vehicle kind's
         // mesh stays the plain sedan (32-byte ProxyVertex, the plain
-        // pipeline's own stride — byte-identical path).
+        // pipeline's own stride — byte-identical path). The rain
+        // kind's mesh is the streak quad (6 vertices, the same
+        // 32-byte ProxyVertex form — the unlit blended pipeline's
+        // own input).
         let npc = crate::animation::skinned_humanoid_mesh();
         let vehicle = sedan_mesh();
+        let rain = rain_streak_mesh();
         // Partial-initialization cleanup (corrective finding G):
         // handles start null; a failure releases exactly what exists.
         let mut partial = ProxyResources {
@@ -335,13 +398,16 @@ impl ProxyResources {
             vehicle_vbo: vk::Buffer::null(),
             vehicle_memory: vk::DeviceMemory::null(),
             vehicle_vertices: vehicle.len() as u32,
+            rain_vbo: vk::Buffer::null(),
+            rain_memory: vk::DeviceMemory::null(),
+            rain_vertices: rain.len() as u32,
             instances: vk::Buffer::null(),
             instances_memory: vk::DeviceMemory::null(),
             instances_mapped: core::ptr::null_mut(),
             slot_bytes: (MAX_INSTANCES * INSTANCE_STRIDE) as u64,
             indirect: None,
         };
-        if let Err(error) = partial.build(ctx, &npc, &vehicle) {
+        if let Err(error) = partial.build(ctx, &npc, &vehicle, &rain) {
             partial.release(ctx);
             return Err(error);
         }
@@ -353,6 +419,7 @@ impl ProxyResources {
         ctx: &VulkanContext,
         npc: &[crate::animation::SkinnedVertex],
         vehicle: &[ProxyVertex],
+        rain: &[ProxyVertex],
     ) -> Result<(), RendererError> {
         (self.npc_vbo, self.npc_memory) = create_device_local_buffer_with_data(
             ctx,
@@ -363,6 +430,11 @@ impl ProxyResources {
             ctx,
             vk::BufferUsageFlags::VERTEX_BUFFER,
             bytemuck::cast_slice(vehicle),
+        )?;
+        (self.rain_vbo, self.rain_memory) = create_device_local_buffer_with_data(
+            ctx,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            bytemuck::cast_slice(rain),
         )?;
         (self.instances, self.instances_memory, self.instances_mapped) = create_mapped_buffer(
             ctx,
@@ -383,7 +455,12 @@ impl ProxyResources {
         if self.indirect.is_some() {
             return Ok(());
         }
-        match IndirectResources::new(ctx, self.npc_vertices, self.vehicle_vertices) {
+        match IndirectResources::new(
+            ctx,
+            self.npc_vertices,
+            self.vehicle_vertices,
+            self.rain_vertices,
+        ) {
             Ok(state) => {
                 self.indirect = Some(state);
                 Ok(())
@@ -413,30 +490,37 @@ impl ProxyResources {
         }
     }
 
-    /// Records the proxy draws for one populated frame, PER KIND:
-    /// the npc kind binds the SKINNED pipeline (this render pass's
-    /// variant — main or HDR) with the skinned set and its two
-    /// dynamic offsets (the corner FrameParams slot offset and the
-    /// pose slot offset); the vehicle kind binds the PLAIN proxy
-    /// pipeline with the corner material set and the single
-    /// FrameParams offset — today's path, byte-identical. Each kind
-    /// then binds its mesh at binding 0 and its instance range at
-    /// binding 1, and submits per the upload's mode: one direct
-    /// `vkCmdDraw` per kind, one draw per instance in the reference
-    /// mode, or — 6-E2 — one `vkCmdDrawIndirect` per kind reading
-    /// this slot's command block. Returns the recorded draw-call
-    /// count.
+    /// Records the proxy draws for one populated frame, PER KIND in
+    /// the FIXED order (npc, vehicle, rain — rain LAST): the npc
+    /// kind binds the SKINNED pipeline (this render pass's variant —
+    /// main or HDR) with the skinned set and its two dynamic offsets
+    /// (the corner FrameParams slot offset and the pose slot
+    /// offset); the vehicle kind binds the PLAIN proxy pipeline with
+    /// the corner material set and the single FrameParams offset —
+    /// today's path, byte-identical; the rain kind binds the RAIN
+    /// pipeline (this pass's unlit blended particle variant) with
+    /// the rain material's corner set and the same single FrameParams
+    /// offset (the [`PlainSetBind`] shape, shared with the vehicle
+    /// kind). Each kind then binds its mesh at binding 0 and its
+    /// instance range at binding 1, and submits per the upload's
+    /// mode: one direct `vkCmdDraw` per kind, one draw per instance
+    /// in the reference mode, or — 6-E2 — one `vkCmdDrawIndirect`
+    /// per kind reading this slot's command block. Returns the
+    /// recorded draw-call count.
     ///
     /// # Safety
     /// `cmd` must be recording inside a render pass compatible with
-    /// BOTH `pipelines`' creation passes; `pipelines.npc` must be the
-    /// skinned state's pipeline for THAT pass with `skinned` its own
-    /// set/offsets; `sets` must be the corner material sets the frame
-    /// flow validated for every POPULATED kind (a null set for an
-    /// empty kind is never bound); `slot`'s regions must hold this
-    /// frame's `upload.bytes`, its pose bytes, and, in the indirect
-    /// mode, its command block (the frame flow writes all after the
-    /// slot's fence wait).
+    /// EVERY `pipelines`' creation passes; `pipelines.npc` must be
+    /// the skinned state's pipeline for THAT pass with `skinned` its
+    /// own set/offsets; `pipelines.rain` must be the unlit blended
+    /// particle pipeline for THAT pass (the rain arm's blend and
+    /// depth-write-off states are the pipeline's own, never the
+    /// caller's); `skinned`, `vehicle`, and `rain` must be the
+    /// per-kind set binds the frame flow validated for every
+    /// POPULATED kind (a null set for an empty kind is never bound);
+    /// `slot`'s regions must hold this frame's `upload.bytes`, its
+    /// pose bytes, and, in the indirect mode, its command block (the
+    /// frame flow writes all after the slot's fence wait).
     #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn draw(
         &self,
@@ -446,11 +530,15 @@ impl ProxyResources {
         upload: &ProxyFrameUpload<'_>,
         pipelines: &ProxyPipelines,
         skinned: &SkinnedSetBind,
-        vehicle: &VehicleSetBind,
+        vehicle: &PlainSetBind,
+        rain: &PlainSetBind,
     ) -> u32 {
         let slot_start = self.slot_bytes * slot as u64;
         let mut calls = 0;
-        for kind in [ProxyKind::Npc, ProxyKind::Vehicle] {
+        // The fixed kind order: npc, vehicle, rain — the rain kind
+        // appends AFTER vehicle, never between (the repack's byte
+        // order and the indirect block's command order both pin it).
+        for kind in [ProxyKind::Npc, ProxyKind::Vehicle, ProxyKind::Rain] {
             let (vbo, vertex_count, count, kind_index) = match kind {
                 ProxyKind::Npc => (self.npc_vbo, self.npc_vertices, upload.npc_count, 0),
                 ProxyKind::Vehicle => (
@@ -459,17 +547,26 @@ impl ProxyResources {
                     upload.vehicle_count,
                     1,
                 ),
+                ProxyKind::Rain => (self.rain_vbo, self.rain_vertices, upload.rain_count, 2),
             };
             if count == 0 {
                 continue;
             }
-            let range = kind_instance_range(upload.npc_count, upload.vehicle_count, kind);
+            let range = kind_instance_range(
+                upload.npc_count,
+                upload.vehicle_count,
+                upload.rain_count,
+                kind,
+            );
             let base = slot_start + range.start * INSTANCE_STRIDE as u64;
             // SAFETY: the render pass, pipelines, layouts, and this
             // slot's written instance and pose regions are live; the
             // sets were validated before recording (null only for
             // empty kinds, skipped above); all counts and offsets are
-            // the repack's bounded values.
+            // the repack's bounded values. The rain arm's set is the
+            // corner material set (never a shadowed variant — rain
+            // receives no shadows), bound with the rain pipeline's
+            // own layout.
             unsafe {
                 match kind {
                     ProxyKind::Npc => {
@@ -505,6 +602,31 @@ impl ProxyResources {
                             0,
                             &[vehicle.set],
                             &[vehicle.frame_offset],
+                        );
+                    }
+                    ProxyKind::Rain => {
+                        // The Era-2 package C rain path: the unlit
+                        // blended particle pipeline with the rain
+                        // material's corner set (the PlainSetBind
+                        // shape — one dynamic offset at binding 2,
+                        // the corner FrameParams region the unlit
+                        // shader's view_proj reads). The pipeline's
+                        // own states carry the blend and the
+                        // depth-test-on/write-off contract; the
+                        // submission logic below is the per-kind
+                        // discipline shared with the other kinds.
+                        ctx.device.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            pipelines.rain,
+                        );
+                        ctx.device.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            rain.layout,
+                            0,
+                            &[rain.set],
+                            &[rain.frame_offset],
                         );
                     }
                 }
@@ -601,7 +723,12 @@ impl ProxyResources {
     /// depth pass (the proxy-cast path — the npc kind skins, the
     /// vehicle kind is plain). The instance range starts at `slot`'s
     /// region plus the kind's offset within that region (the fixed
-    /// npc-then-vehicle order).
+    /// npc-then-vehicle-then-rain order). The RAIN arm exists for
+    /// the exhaustive match only: the shadow depth pass never
+    /// requests it (rain casts no shadows — translucent streaks
+    /// have no silhouette; the shadowed populated path carries rain
+    /// through the LIT pass only, a documented exclusion at the
+    /// CALLER, `skinned_draw::record_depth_casts`).
     pub(super) fn bind_kind_buffers(
         &self,
         ctx: &VulkanContext,
@@ -613,8 +740,14 @@ impl ProxyResources {
         let (vbo, _count) = match kind {
             ProxyKind::Npc => (self.npc_vbo, upload.npc_count),
             ProxyKind::Vehicle => (self.vehicle_vbo, upload.vehicle_count),
+            ProxyKind::Rain => (self.rain_vbo, upload.rain_count),
         };
-        let range = kind_instance_range(upload.npc_count, upload.vehicle_count, kind);
+        let range = kind_instance_range(
+            upload.npc_count,
+            upload.vehicle_count,
+            upload.rain_count,
+            kind,
+        );
         let base = self.slot_bytes * slot as u64 + range.start * INSTANCE_STRIDE as u64;
         unsafe {
             ctx.device.cmd_bind_vertex_buffers(cmd, 0, &[vbo], &[0]);
@@ -667,12 +800,16 @@ impl ProxyResources {
             ctx.device.free_memory(self.instances_memory, None);
             ctx.device.destroy_buffer(self.vehicle_vbo, None);
             ctx.device.free_memory(self.vehicle_memory, None);
+            ctx.device.destroy_buffer(self.rain_vbo, None);
+            ctx.device.free_memory(self.rain_memory, None);
             ctx.device.destroy_buffer(self.npc_vbo, None);
             ctx.device.free_memory(self.npc_memory, None);
             self.instances = vk::Buffer::null();
             self.instances_memory = vk::DeviceMemory::null();
             self.vehicle_vbo = vk::Buffer::null();
             self.vehicle_memory = vk::DeviceMemory::null();
+            self.rain_vbo = vk::Buffer::null();
+            self.rain_memory = vk::DeviceMemory::null();
             self.npc_vbo = vk::Buffer::null();
             self.npc_memory = vk::DeviceMemory::null();
         }

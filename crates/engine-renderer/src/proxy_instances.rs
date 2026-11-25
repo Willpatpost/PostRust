@@ -67,6 +67,15 @@ pub struct ProxyInstance {
     pub transform: InstanceTransform,
     /// The per-instance albedo tint, each channel in [0, 1].
     pub tint: [f32; 3],
+    /// The per-instance ALPHA — the tint vec4's `.a` slot, formerly
+    /// the packing's hard-coded 1.0. A VERSIONED-LAYOUT claim of the
+    /// Era-2 package C (rain) stage, documented here and in the
+    /// packed-bytes pins' history: 1.0 for every OPAQUE kind (the
+    /// existing npc/vehicle populations' bytes UNCHANGED — the
+    /// re-run byte gates re-verify), the translucent rain kind's
+    /// per-streak coverage otherwise. Validated in [0, 1] (never
+    /// negative, never non-finite).
+    pub alpha: f32,
     /// The instance's POSE BLOCK INDEX into the frame's pose buffer
     /// (the Era-2 skinning path): npc instance i's skin matrices
     /// live at `pose_index * POSE_STRIDE`. Sequential for the
@@ -145,8 +154,9 @@ pub fn instance_columns(transform: &InstanceTransform) -> [[f32; 4]; 4] {
 
 impl ProxyInstance {
     /// The R4-style input contract: finite position/scale, strictly
-    /// positive scale, tint channels in [0, 1]. Returns the refusing
-    /// field name, or `None` when valid.
+    /// positive scale, tint channels in [0, 1], alpha finite in
+    /// [0, 1]. Returns the refusing field name, or `None` when
+    /// valid.
     pub fn validate(&self) -> Option<&'static str> {
         let t = &self.transform;
         if !t.pos.iter().all(|v| v.is_finite()) {
@@ -162,24 +172,32 @@ impl ProxyInstance {
         {
             return Some("tint");
         }
+        if !self.alpha.is_finite() || !(0.0..=1.0).contains(&self.alpha) {
+            return Some("alpha");
+        }
         None
     }
 }
 
 /// Appends one instance's bytes in the fixed field order (the four
-/// matrix columns, tint rgb + alpha 1.0, then the params vec4: the
-/// pose block index as an f32 bit pattern followed by three reserved
-/// zero f32s — the Era-2 claim on the former all-zero slot, a
-/// versioned layout change never a silent reuse). The single packing
-/// implementation both the allocating and the retained forms share —
-/// the byte layout exists exactly once.
+/// matrix columns, tint rgb + the instance alpha, then the params
+/// vec4: the pose block index as an f32 bit pattern followed by
+/// three reserved zero f32s — the Era-2 claim on the former
+/// all-zero slot, a versioned layout change never a silent reuse).
+/// The single packing implementation both the allocating and the
+/// retained forms share — the byte layout exists exactly once.
 fn append_instance_bytes(bytes: &mut Vec<u8>, instance: &ProxyInstance) {
     for column in instance_columns(&instance.transform) {
         for value in column {
             bytes.extend_from_slice(&value.to_bits().to_le_bytes());
         }
     }
-    for value in [instance.tint[0], instance.tint[1], instance.tint[2], 1.0] {
+    for value in [
+        instance.tint[0],
+        instance.tint[1],
+        instance.tint[2],
+        instance.alpha,
+    ] {
         bytes.extend_from_slice(&value.to_bits().to_le_bytes());
     }
     // The params vec4: x = the pose index (exact in f32 up to 2^24
@@ -191,8 +209,8 @@ fn append_instance_bytes(bytes: &mut Vec<u8>, instance: &ProxyInstance) {
 
 /// Packs `instances` into the instance-buffer bytes (little-endian
 /// f32 bit patterns, the fixed field order: column 0, 1, 2, 3, tint
-/// rgb + 1.0 alpha, then the params vec4 — pose index + three
-/// reserved zero f32s). Byte-identical on
+/// rgb + the instance alpha, then the params vec4 — pose index +
+/// three reserved zero f32s). Byte-identical on
 /// every platform for the same input — the packing is pure IEEE
 /// arithmetic and `to_bits`. Validation and capacity refusal happen
 /// BEFORE any byte exists (no partial buffers, ever).
@@ -225,17 +243,19 @@ pub fn pack_instances_bounded(
     Ok(bytes)
 }
 
-/// Repacks the two proxy populations — `npc` then `vehicle`, the
-/// FIXED per-frame buffer order — INTO `buffer` in place (the F-05
-/// retained-buffer discipline applied to the instance bytes: the Vec
-/// is cleared and refilled, so its capacity from the first populated
-/// frames is reused every frame — no per-frame allocation or growth;
-/// the byte content is identical to the allocating form
-/// concatenated in the same order). Both populations are validated
-/// BEFORE the clear: a typed refusal leaves the previous frame's
-/// bytes intact — an atomic repack, never a partial buffer.
+/// Repacks the three proxy populations — `npc` then `vehicle` then
+/// `rain`, the FIXED per-frame buffer order (the Era-2 package C
+/// rain kind appends LAST, after vehicle, never between) — INTO
+/// `buffer` in place (the F-05 retained-buffer discipline applied to
+/// the instance bytes: the Vec is cleared and refilled, so its
+/// capacity from the first populated frames is reused every frame —
+/// no per-frame allocation or growth; the byte content is identical
+/// to the allocating form concatenated in the same order). All three
+/// populations are validated BEFORE the clear: a typed refusal
+/// leaves the previous frame's bytes intact — an atomic repack,
+/// never a partial buffer.
 ///
-/// The bound is [`MAX_INSTANCES`] TOTAL across both kinds (the
+/// The bound is [`MAX_INSTANCES`] TOTAL across all three kinds (the
 /// sustained-load entity range the constant documents: one frame's
 /// whole population, not per kind), because one slot region of the
 /// GPU instance buffer holds exactly that many packed instances.
@@ -243,22 +263,23 @@ pub fn repack_populations(
     buffer: &mut Vec<u8>,
     npc: &[ProxyInstance],
     vehicle: &[ProxyInstance],
+    rain: &[ProxyInstance],
 ) -> Result<(), InstancePackError> {
-    let total = npc.len() + vehicle.len();
+    let total = npc.len() + vehicle.len() + rain.len();
     if total > MAX_INSTANCES {
         return Err(InstancePackError::Capacity {
             capacity: MAX_INSTANCES,
             requested: total,
         });
     }
-    for (index, instance) in npc.iter().chain(vehicle).enumerate() {
+    for (index, instance) in npc.iter().chain(vehicle).chain(rain).enumerate() {
         if let Some(field) = instance.validate() {
             return Err(InstancePackError::Invalid { index, field });
         }
     }
     buffer.clear();
     buffer.reserve(total * INSTANCE_STRIDE);
-    for instance in npc.iter().chain(vehicle) {
+    for instance in npc.iter().chain(vehicle).chain(rain) {
         append_instance_bytes(buffer, instance);
     }
     Ok(())
@@ -367,6 +388,7 @@ mod tests {
                 scale: 1.0,
             },
             tint: [0.5, 0.5, 0.5],
+            alpha: 1.0,
             pose_index: 7,
         };
         let b = ProxyInstance {
@@ -376,6 +398,7 @@ mod tests {
                 scale: 2.0,
             },
             tint: [1.0, 0.0, 0.0],
+            alpha: 1.0,
             pose_index: 0,
         };
         let first = pack_instances(&[a, b]).unwrap();
@@ -398,6 +421,7 @@ mod tests {
                 scale: 1.0,
             },
             tint: [1.0; 3],
+            alpha: 1.0,
             pose_index: 0,
         };
         let at_capacity: Vec<_> = vec![valid; 8];
@@ -428,6 +452,70 @@ mod tests {
                 field: "scale"
             })
         );
+        // The Era-2 package C alpha claim: the per-instance alpha is
+        // validated like the tint channels — outside [0, 1] and
+        // non-finite are typed refusals, never a silent clamp.
+        let mut alpha_high = valid;
+        alpha_high.alpha = 1.5;
+        assert_eq!(
+            pack_instances(&[alpha_high]),
+            Err(InstancePackError::Invalid {
+                index: 0,
+                field: "alpha"
+            })
+        );
+        let mut alpha_nan = valid;
+        alpha_nan.alpha = f32::NAN;
+        assert_eq!(
+            pack_instances(&[alpha_nan]),
+            Err(InstancePackError::Invalid {
+                index: 0,
+                field: "alpha"
+            })
+        );
+    }
+
+    /// The alpha slot's own pin (the Era-2 package C claim on the
+    /// tint vec4's `.a`): a NON-1.0 alpha lands in the packed bytes
+    /// at the former hard-coded-1.0 offset (76..80 — the tint vec4's
+    /// tail), two instances differing ONLY in alpha pack
+    /// differently, and the opaque 1.0 default reproduces the
+    /// former bytes exactly (the existing populations' pin).
+    #[test]
+    fn alpha_packs_into_the_tint_slot() {
+        let instance = |alpha: f32| ProxyInstance {
+            transform: InstanceTransform {
+                pos: [0.0; 3],
+                turn: 0,
+                scale: 1.0,
+            },
+            tint: [1.0; 3],
+            alpha,
+            pose_index: 0,
+        };
+        let bytes = pack_instances(&[instance(0.5)]).unwrap();
+        let packed_alpha = f32::from_le_bytes(bytes[76..80].try_into().unwrap());
+        assert_eq!(packed_alpha, 0.5, "the alpha rides the tint vec4's .a");
+        assert_eq!(
+            bytes[80..INSTANCE_STRIDE].len(),
+            16,
+            "the params vec4 tail is untouched by the claim"
+        );
+        assert_ne!(
+            pack_instances(&[instance(0.5)]).unwrap(),
+            pack_instances(&[instance(0.25)]).unwrap(),
+            "the alpha is significant in the bytes"
+        );
+        // The opaque default: alpha 1.0 reproduces the former
+        // hard-coded slot bit-for-bit.
+        assert_eq!(
+            f32::from_le_bytes(
+                pack_instances(&[instance(1.0)]).unwrap()[76..80]
+                    .try_into()
+                    .unwrap()
+            ),
+            1.0
+        );
     }
 
     /// THE CROSS-PLATFORM BYTE PIN: a fixed instance list packs to a
@@ -446,6 +534,7 @@ mod tests {
                     scale: 1.0,
                 },
                 tint: [0.9, 0.8, 0.7],
+                alpha: 1.0,
                 pose_index: 3,
             },
             ProxyInstance {
@@ -455,6 +544,7 @@ mod tests {
                     scale: 2.0,
                 },
                 tint: [0.1, 0.2, 0.3],
+                alpha: 1.0,
                 pose_index: 1,
             },
             ProxyInstance {
@@ -464,6 +554,7 @@ mod tests {
                     scale: 0.5,
                 },
                 tint: [1.0, 1.0, 1.0],
+                alpha: 1.0,
                 pose_index: 0,
             },
         ];
@@ -504,72 +595,91 @@ mod tests {
     /// documented versioned claim: the params vec4's x now carries
     /// the pose block index — 3/1/0 for this fixture — and the pin
     /// fired on the change exactly as designed, the cause traced to
-    /// the claim, not an accident).
+    /// the claim, not an accident). UNCHANGED through the Era-2
+    /// package C (rain) alpha claim: this fixture's instances carry
+    /// `alpha: 1.0`, which packs to the identical bits the former
+    /// hard-coded 1.0 produced — the pin re-ran green on the claim's
+    /// first test, the opaque populations' byte-compatibility proof.
     const PINNED_FNV: u64 = 9913137345556047595;
 
-    /// Two small fixture populations (varied turns, scales, tints —
-    /// enough shape to make an ordering or field bug visible in the
-    /// bytes).
-    fn fixture_populations() -> (Vec<ProxyInstance>, Vec<ProxyInstance>) {
+    /// Three small fixture populations (varied turns, scales, tints
+    /// — enough shape to make an ordering or field bug visible in
+    /// the bytes). The rain population carries NON-1.0 alphas (the
+    /// translucent kind's own claim on the tint vec4's .a).
+    fn fixture_populations() -> (Vec<ProxyInstance>, Vec<ProxyInstance>, Vec<ProxyInstance>) {
         let instance =
-            |pos: [f32; 3], turn: u16, scale: f32, tint: [f32; 3], pose_index: u32| ProxyInstance {
-                transform: InstanceTransform { pos, turn, scale },
-                tint,
-                pose_index,
+            |pos: [f32; 3], turn: u16, scale: f32, tint: [f32; 3], alpha: f32, pose_index: u32| {
+                ProxyInstance {
+                    transform: InstanceTransform { pos, turn, scale },
+                    tint,
+                    alpha,
+                    pose_index,
+                }
             };
         (
             vec![
-                instance([1.0, 0.0, -2.0], 0, 1.0, [0.9, 0.9, 0.9], 0),
-                instance([-3.0, 0.0, 4.0], 16384, 1.1, [0.8, 0.6, 0.5], 1),
+                instance([1.0, 0.0, -2.0], 0, 1.0, [0.9, 0.9, 0.9], 1.0, 0),
+                instance([-3.0, 0.0, 4.0], 16384, 1.1, [0.8, 0.6, 0.5], 1.0, 1),
             ],
             vec![
-                instance([7.0, 0.0, 1.0], 40000, 1.0, [0.2, 0.4, 0.9], 0),
-                instance([-8.0, 0.0, -1.0], 8192, 0.9, [0.9, 0.2, 0.2], 0),
+                instance([7.0, 0.0, 1.0], 40000, 1.0, [0.2, 0.4, 0.9], 1.0, 0),
+                instance([-8.0, 0.0, -1.0], 8192, 0.9, [0.9, 0.2, 0.2], 1.0, 0),
+            ],
+            vec![
+                instance([2.0, 6.0, 0.0], 0, 1.0, [0.6, 0.7, 0.8], 0.5, 0),
+                instance([-4.0, 5.0, 3.0], 16384, 1.0, [0.5, 0.6, 0.75], 0.35, 0),
+                instance([0.0, 7.0, -3.0], 32768, 1.0, [0.55, 0.65, 0.85], 0.65, 0),
             ],
         )
     }
 
     /// The retained repack produces byte-identical content to the
     /// allocating form concatenated in the fixed per-frame order (npc
-    /// first, vehicle after), at the pinned stride math — the F-05
-    /// reuse changes WHERE the bytes live, never WHAT they are.
+    /// first, vehicle after, rain LAST — the Era-2 package C fixed
+    /// kind order), at the pinned stride math — the F-05 reuse
+    /// changes WHERE the bytes live, never WHAT they are.
     #[test]
     fn repack_matches_allocating_form_in_kind_order() {
-        let (npc, vehicle) = fixture_populations();
+        let (npc, vehicle, rain) = fixture_populations();
         let mut buffer = Vec::new();
-        repack_populations(&mut buffer, &npc, &vehicle).unwrap();
+        repack_populations(&mut buffer, &npc, &vehicle, &rain).unwrap();
         let mut expected = pack_instances(&npc).unwrap();
         expected.extend_from_slice(&pack_instances(&vehicle).unwrap());
+        expected.extend_from_slice(&pack_instances(&rain).unwrap());
         assert_eq!(buffer, expected);
-        assert_eq!(buffer.len(), (npc.len() + vehicle.len()) * INSTANCE_STRIDE);
+        assert_eq!(
+            buffer.len(),
+            (npc.len() + vehicle.len() + rain.len()) * INSTANCE_STRIDE
+        );
     }
 
     /// The repack refusal is ATOMIC: an over-capacity or invalid
     /// input leaves the previous frame's bytes untouched (a failed
     /// frame never corrupts the buffer content; the chained index
-    /// crosses the kind boundary — npc.len() + 0).
+    /// crosses the kind boundaries — npc.len() + vehicle.len() + 0
+    /// for the rain kind's first instance).
     #[test]
     fn repack_refusal_preserves_the_prior_frame() {
-        let (npc, vehicle) = fixture_populations();
+        let (npc, vehicle, rain) = fixture_populations();
         let mut buffer = Vec::new();
-        repack_populations(&mut buffer, &npc, &vehicle).unwrap();
+        repack_populations(&mut buffer, &npc, &vehicle, &rain).unwrap();
         let prior = buffer.clone();
-        let mut bad = vehicle.clone();
-        bad[0].tint = [2.0, 0.0, 0.0]; // outside [0, 1]
+        let mut bad = rain.clone();
+        bad[0].alpha = 2.0; // outside [0, 1]
         assert_eq!(
-            repack_populations(&mut buffer, &npc, &bad),
+            repack_populations(&mut buffer, &npc, &vehicle, &bad),
             Err(InstancePackError::Invalid {
-                index: npc.len(),
-                field: "tint"
+                index: npc.len() + vehicle.len(),
+                field: "alpha"
             })
         );
         assert_eq!(buffer, prior, "the refusal left the prior bytes intact");
         let over: Vec<_> = vec![npc[0]; MAX_INSTANCES];
         assert_eq!(
-            repack_populations(&mut buffer, &over, &vehicle),
+            repack_populations(&mut buffer, &over, &vehicle, &rain),
             Err(InstancePackError::Capacity {
                 capacity: MAX_INSTANCES,
-                requested: MAX_INSTANCES + vehicle.len()
+                requested: MAX_INSTANCES + vehicle.len() + rain.len()
             })
         );
         assert_eq!(buffer, prior);
@@ -580,21 +690,21 @@ mod tests {
     /// smaller population never reallocates once warmed.
     #[test]
     fn repack_reuses_capacity_without_growth() {
-        let (npc, vehicle) = fixture_populations();
+        let (npc, vehicle, rain) = fixture_populations();
         let mut buffer = Vec::new();
-        repack_populations(&mut buffer, &npc, &vehicle).unwrap();
+        repack_populations(&mut buffer, &npc, &vehicle, &rain).unwrap();
         let warmed = buffer.capacity();
-        assert!(warmed >= (npc.len() + vehicle.len()) * INSTANCE_STRIDE);
+        assert!(warmed >= (npc.len() + vehicle.len() + rain.len()) * INSTANCE_STRIDE);
         for _ in 0..3 {
-            repack_populations(&mut buffer, &npc, &vehicle).unwrap();
+            repack_populations(&mut buffer, &npc, &vehicle, &rain).unwrap();
             assert_eq!(buffer.capacity(), warmed, "no reallocation once warmed");
         }
-        repack_populations(&mut buffer, &npc, &[]).unwrap();
+        repack_populations(&mut buffer, &npc, &vehicle, &[]).unwrap();
         assert_eq!(
             buffer.capacity(),
             warmed,
             "a smaller population keeps the capacity"
         );
-        assert_eq!(buffer.len(), npc.len() * INSTANCE_STRIDE);
+        assert_eq!(buffer.len(), (npc.len() + vehicle.len()) * INSTANCE_STRIDE);
     }
 }

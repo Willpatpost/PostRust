@@ -778,6 +778,8 @@ fn wet_ground_gate_at(preference: DepthFormatPreference, label: &str) {
         npc_material: 1,
         vehicle: &vehicle,
         vehicle_material: 2,
+        rain: &[],
+        rain_material: 0,
     };
     renderer.request_frame_capture().unwrap();
     let populated = renderer
