@@ -1915,8 +1915,11 @@ creation cost is identical, only the churn retired), the torso
 walls at max 1/255; the populated route end-to-end 601 frames
 validation 0/0; the CI resize smoke green. The shards with the
 workflow's own awk, ALL UNCHANGED: main 1313/2/33, renderer
-release 160/2, heavy 620/33/63 Linux (Windows 1262/619 inferred,
-the candidate's CI run to confirm); fmt and clippy -D warnings
+release 160/2, heavy 620/33/63 Linux and 1262/619 Windows — both
+platforms MEASURED, the Windows inferences confirmed by the
+candidate's own first CI run (45656765496, all five jobs green on
+the exact tip 1a38f9a, first push, every exact-count gate
+enforcing the measured counts); fmt and clippy -D warnings
 clean in both forms. The delegation record, honestly: two rounds
 to the coder subagent produced analysis only (the tree verified
 clean after each); the orchestrator implemented the spec itself
