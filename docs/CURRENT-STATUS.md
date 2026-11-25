@@ -417,10 +417,9 @@ measurement surface): heavy **608 Linux MEASURED with the workflow's own
 awk on this exact tree** (608 passed / 32 ignored / 62 result lines, zero
 failures — the part-5 settlement's 603 plus the behavior_measurement
 battery's 5 platform-uniform engine-slice lib tests); Windows **607** =
-602 + the same 5 (the platform-uniform inference — pure spine/IEEE
-arithmetic, no cfg gates, no Vulkan; to be confirmed by this
-candidate's CI run, the count corrected from actuals on a mismatch,
-never a test weakened); ignored 32 and result lines 62 UNCHANGED (lib
+602 + the same 5, **CONFIRMED by this candidate's own CI run
+45587893215** (green on all five jobs — both heavy-shard exact-count
+gates enforced the measured counts); ignored 32 and result lines 62 UNCHANGED (lib
 tests only, no new binaries — the benchmark flag is test-free harness
 code); main **1295/2/33 MEASURED unchanged** (engine-core untouched by
 part 6); renderer release 160/2 UNCHANGED. The prior settlements,
