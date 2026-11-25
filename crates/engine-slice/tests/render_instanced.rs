@@ -2832,7 +2832,7 @@ fn animated_population_matches_per_object_pixels() {
 /// behavior path over the composed world (the spec's §8.4's named gate,
 /// the package's headline).
 ///
-/// One sampled tick (e.g. 150 — mid-rhythm, some pacers mid-walk, some
+/// One sampled tick (e.g. 150 — mid-rhythm, some crossers mid-crossing, some
 /// stood): the 26-vs-2 byte equality across PerInstance/Instanced, the
 /// repeat capture, the rest-pose motion control. THE ALLOCATION-COUNTING
 /// GATE: the warmup (a few composed ticks + renders), the snapshot, then

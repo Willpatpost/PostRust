@@ -55,11 +55,12 @@ fn seed_for(npc: u32) -> u32 {
 ///   activity: kind 100 (waiter idle re-arm — NO locomotion retarget)
 ///   target: { npc: i, anchor: (0, 0) }
 ///
-/// CROSSERS 8-9 (the pacers, routes 8/9): TWO entries each (the pacing alternation).
-///   Crosser 8: entry 0 start=30, entry 1 start=90
-///   Crosser 9: entry 0 start=90, entry 1 start=150
-///   Both entries: cadence every(120), kind 200→201 alternating
-///   The seam maps kind 200→waypoint 1 (far end), 201→waypoint 0 (back).
+/// CROSSERS 8-9 (the full crossings, routes 8/9): TWO entries each (the crossing alternation).
+///   Crosser 8: entry 0 start=90, entry 1 start=510, BOTH Cadence::every(840)
+///   Crosser 9: entry 0 start=90, entry 1 start=510, BOTH Cadence::every(840)
+///   Both entries: kind 200/201, Field::Near, target npc.
+///   The seam maps kind 200→waypoint 2 (the far curb — across the road),
+///   kind 201→waypoint 1 (the near curb — back).
 ///
 /// STROLLERS 10-23 (the flank loops, routes 0-7): TWO entries each (the stroll/rest pair).
 ///   Let k = i - 10 (0..13)
@@ -91,12 +92,12 @@ pub fn corner_schedules() -> Vec<NpcSchedule> {
     }
 
     // -- Crossers 8-9
-    for (npc, start0, start1) in [(8u32, 30u64, 90u64), (9, 90, 150)] {
+    for npc in [8u32, 9u32] {
         let schedule = NpcSchedule {
             entries: vec![
                 Commitment {
-                    start: Tick(start0),
-                    cadence: Cadence::every(120).expect("period 120 is nonzero"),
+                    start: Tick(90),
+                    cadence: Cadence::every(840).expect("period 840 is nonzero"),
                     activity: ActivityDescriptor {
                         kind: 200,
                         field: Field::Near,
@@ -107,8 +108,8 @@ pub fn corner_schedules() -> Vec<NpcSchedule> {
                     },
                 },
                 Commitment {
-                    start: Tick(start1),
-                    cadence: Cadence::every(120).expect("period 120 is nonzero"),
+                    start: Tick(510),
+                    cadence: Cadence::every(840).expect("period 840 is nonzero"),
                     activity: ActivityDescriptor {
                         kind: 201,
                         field: Field::Near,
@@ -167,13 +168,13 @@ pub fn corner_schedules() -> Vec<NpcSchedule> {
 /// The commitment → locomotion retarget (§7's game-side seam, the
 /// campaign's POLICY comment made into the demo's authored table):
 /// waiters (kind 100) never retarget — byte-frozen; crossers: kind
-/// 200 → the far pacing end (waypoint 1), 201 → back (waypoint 0);
-/// strollers: kind 300 → LOOPING (the resume — no redraw, no phase
-/// reset, continuing from the current leg_distance), 301 → the rest
-/// waypoint W_k (1 for even k, 3 for odd — the pauses spread over
-/// both lanes). Returns the `set_destination` outcome: false is the
-/// authored refusal, NEVER expected on this table — the world counts
-/// it and the campaign gate asserts zero.
+/// 200 → the far curb (waypoint 2, across the road), 201 → the near curb
+/// (waypoint 1, back); strollers: kind 300 → LOOPING (the resume — no
+/// redraw, no phase reset, continuing from the current leg_distance),
+/// 301 → the rest waypoint W_k (1 for even k, 3 for odd — the pauses
+/// spread over both lanes). Returns the `set_destination` outcome: false
+/// is the authored refusal, NEVER expected on this table — the world
+/// counts it and the campaign gate asserts zero.
 fn seam_retarget(
     npc: u32,
     commitment_kind: u16,
@@ -188,8 +189,8 @@ fn seam_retarget(
         return false;
     };
     match commitment_kind {
-        200 => set_destination(route, state, 1),
-        201 => set_destination(route, state, 0),
+        200 => set_destination(route, state, 2),
+        201 => set_destination(route, state, 1),
         300 => set_destination(route, state, LOOPING),
         301 => {
             let k = npc - 10;
@@ -532,25 +533,25 @@ mod tests {
             );
         }
 
-        // Crosser 8: 2 entries (30/90, kinds 200/201, every 120).
+        // Crosser 8: 2 entries (90/510, kinds 200/201, every 840).
         let s = &schedules[8];
         assert_eq!(s.entries.len(), 2, "crosser 8 has 2 entries");
-        assert_eq!(s.entries[0].start.as_u64(), 30, "crosser 8 entry 0 start");
+        assert_eq!(s.entries[0].start.as_u64(), 90, "crosser 8 entry 0 start");
         assert_eq!(s.entries[0].activity.kind, 200, "crosser 8 entry 0 kind");
-        assert_eq!(s.entries[1].start.as_u64(), 90, "crosser 8 entry 1 start");
+        assert_eq!(s.entries[1].start.as_u64(), 510, "crosser 8 entry 1 start");
         assert_eq!(s.entries[1].activity.kind, 201, "crosser 8 entry 1 kind");
         assert_eq!(
             s.entries[0].cadence,
-            Cadence::every(120).unwrap(),
+            Cadence::every(840).unwrap(),
             "crosser 8 cadence"
         );
 
-        // Crosser 9: 2 entries (90/150).
+        // Crosser 9: 2 entries (90/510).
         let s = &schedules[9];
         assert_eq!(s.entries.len(), 2, "crosser 9 has 2 entries");
         assert_eq!(s.entries[0].start.as_u64(), 90, "crosser 9 entry 0 start");
         assert_eq!(s.entries[0].activity.kind, 200, "crosser 9 entry 0 kind");
-        assert_eq!(s.entries[1].start.as_u64(), 150, "crosser 9 entry 1 start");
+        assert_eq!(s.entries[1].start.as_u64(), 510, "crosser 9 entry 1 start");
         assert_eq!(s.entries[1].activity.kind, 201, "crosser 9 entry 1 kind");
 
         // Stroller 10 (k=0): entries at 60 and 180, kinds 300/301, every 240.
@@ -601,22 +602,25 @@ mod tests {
     /// - waiters: entry start 120+40i, period 360 → waiters 0-4 fire
     ///   twice (120/480, 160/520, 200/560, 240/600, 280/640), waiters
     ///   5-7 once (320, 360, 400) = 13;
-    /// - crosser 8: entry 0 at 30+120k (30,150,270,390,510,630 = 6),
-    ///   entry 1 at 90+120k (90,210,330,450,570 = 5) = 11;
-    /// - crosser 9: entry 0 at 90+120k (5), entry 1 at 150+120k
-    ///   (150,270,390,510,630 = 5) = 10;
+    /// - crossers 8-9: entry 0 at 90+840k (only 90), entry 1 at 510+840k
+    ///   (only 510) = 4 (2 each);
     /// - strollers: entry 0 at 60+17k+240m, entry 1 at +120 — npc 10
     ///   fires 6 (60,300,540 + 180,420,660), npcs 11-17 fire 5 each,
     ///   npcs 18-23 fire 4 each = 6 + 35 + 24 = 65.
     ///
-    /// TOTAL 13 + 11 + 10 + 65 = 99 wake executions.
+    /// TOTAL 13 + 4 + 65 = 82 wake executions.
     ///
-    /// The arrival count's crosser portion is derived (each pacing
-    /// retarget walks ~47 ticks and arrives, except a fire too late in
-    /// the window); the stroller portion depends on where the rests
-    /// find them (a rest may be interrupted by the next stroll before
-    /// reaching W) — the total is a MEASURED pin (the placeholder-pin
-    /// discipline: 25 at this tree).
+    /// The arrival count's crosser portion is derived: the first
+    /// crossing is under way from frame 0 (the retarget at 90
+    /// re-affirms it), and L0 + L1 (2.2 + 7.4 m) at the measured draws
+    /// (1.3704/1.3231 m/s) lands each crosser at its far curb at
+    /// ~420/~435 — INSIDE the window, one arrival each; the return
+    /// crossings (retargets at 510) arrive at ~835/~846, outside — so
+    /// the crossers contribute exactly 2 arrivals. The stroller
+    /// portion depends on where the rests find them (a rest may be
+    /// interrupted by the next stroll before reaching W) — the total
+    /// is a MEASURED pin (the placeholder-pin discipline: 9 at this
+    /// tree = the crossers' 2 + the strollers' 7).
     #[test]
     fn composed_campaign_double_run() {
         let a = run_campaign(663);
@@ -632,11 +636,11 @@ mod tests {
 
         // THE COUNTER PINS (the derivation above; the arrivals measured).
         assert_eq!(
-            a.wake_executions, 99,
+            a.wake_executions, 82,
             "the wake count matches the cadence arithmetic"
         );
         assert_eq!(a.retarget_refusals, 0, "the seam never refuses");
-        assert_eq!(a.arrivals, 25, "the measured arrival count");
+        assert_eq!(a.arrivals, 9, "the measured arrival count");
 
         // THE DIGEST PINS: the locomotion digest over the 24 states at
         // sampled ticks and the execution digest over the stream.
@@ -664,8 +668,7 @@ mod tests {
             "composed digests: loco 0/33/300/662 = {loco_0}/{loco_33}/{loco_300}/{loco_662}; \
              exec 0/33/300/662 = {exec_0}/{exec_33}/{exec_300}/{exec_662}"
         );
-        // The MEASURED pins (this tree's own run; movement is an
-        // investigation, never a silent repin).
+        // The MEASURED pins (the consts' doc carries the derivation).
         assert_eq!(loco_0, PIN_LOCO_0, "frame 0's locomotion digest moved");
         assert_eq!(loco_33, PIN_LOCO_33, "frame 33's locomotion digest moved");
         assert_eq!(
@@ -696,18 +699,20 @@ mod tests {
     /// the first run measures, the pins follow, any later movement is
     /// an investigation). Frame 0's locomotion digest is part 4's own
     /// frame-0 pin (the composed mode's first frames equal the plain
-    /// mode's — no wake fires before tick 30); frame 33's likewise (the
-    /// retarget at tick 30 changes only the destination, not the motion
-    /// before the first arrival); frame 0's execution digest is the FNV
-    /// offset basis (the empty stream — no wake has fired yet).
+    /// mode's — no wake fires before tick 90); frame 33's likewise (the
+    /// retarget at tick 90 re-affirms the crossing already under way,
+    /// so the composed states at tick 33 are the plain mode's own —
+    /// the SAME pin value the plain campaign carries); frame 0's and
+    /// frame 33's execution digests are the FNV offset basis (the
+    /// empty stream — the first wake fires at tick 90).
     const PIN_LOCO_0: u64 = 5_555_165_838_415_353_039;
     const PIN_LOCO_33: u64 = 15_857_914_442_065_508_438;
-    const PIN_LOCO_300: u64 = 178_212_510_757_263_954;
-    const PIN_LOCO_662: u64 = 9_730_262_620_159_629_689;
+    const PIN_LOCO_300: u64 = 2_194_641_527_225_081_114;
+    const PIN_LOCO_662: u64 = 765_261_949_917_836_765;
     const PIN_EXEC_0: u64 = 14_695_981_039_346_656_037;
-    const PIN_EXEC_33: u64 = 14_402_972_430_116_642_247;
-    const PIN_EXEC_300: u64 = 16_534_949_987_853_281_436;
-    const PIN_EXEC_662: u64 = 12_924_330_556_365_912_741;
+    const PIN_EXEC_33: u64 = 14_695_981_039_346_656_037;
+    const PIN_EXEC_300: u64 = 17_642_371_054_831_568_059;
+    const PIN_EXEC_662: u64 = 2_580_761_500_374_851_303;
 
     /// THE SEAM RETARGET KNOWN ANSWERS (the REAL seam — the same
     /// function `execute` drives, never a test copy).
@@ -715,19 +720,19 @@ mod tests {
     fn seam_retarget_known_answers() {
         let routes = corner_routes();
 
-        // The pacer's alternation: standing at waypoint 0, kind 200
-        // walks to the far end (waypoint 1); after the ARRIVAL (the
+        // The crosser's alternation: standing at waypoint 0, kind 200
+        // walks to the far curb (waypoint 2); after the ARRIVAL (the
         // snap-and-stand shape: leg = destination, speed = 0), kind
-        // 201 walks back (waypoint 0).
+        // 201 walks to the near curb (waypoint 1).
         let mut state = start_route(8, &routes[8], 200, 0, 0).expect("crosser start");
         assert!(seam_retarget(8, 200, &mut state, &routes));
-        assert_eq!(state.destination, 1, "kind 200 → the far pacing end");
+        assert_eq!(state.destination, 2, "kind 200 → the far curb");
         assert!(state.speed > 0.0, "kind 200 restarts the walk");
-        state.leg = 1; // the arrival's snap-and-stand (advance_batch's own shape)
+        state.leg = 2; // the arrival's snap-and-stand (advance_batch's own shape)
         state.speed = 0.0;
         assert!(seam_retarget(8, 201, &mut state, &routes));
-        assert_eq!(state.destination, 0, "kind 201 → back");
-        assert!(state.speed > 0.0, "kind 201 restarts the walk (leg 1 → 0)");
+        assert_eq!(state.destination, 1, "kind 201 → the near curb");
+        assert!(state.speed > 0.0, "kind 201 restarts the walk (leg 2 → 1)");
 
         // The stroller's MID-LEG resume: a walking state mid-leg with a
         // forged phase, kind 300 → LOOPING keeps leg_distance and the
@@ -801,5 +806,141 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// THE COMPOSED CROSSINGS CLEAR THE CAMERA ON THE SHARED CLOCK: the
+    /// composed campaign (the spine-driven crowd, the same 663-tick
+    /// window as the campaign pin) measured against the camera's
+    /// same-frame position at EVERY tick — >= 0.8, the measured minimum
+    /// pinned. The demo's pairing is the plain gate's own (crowd step k
+    /// with camera pose clamp(k - 60, 0, 600)); the composed mode's
+    /// first ~420 ticks are the plain mode's trajectory (the retarget
+    /// at 90 re-affirms the crossing already under way), so the
+    /// measured minimum EQUALS the plain gate's own pin — a
+    /// cross-check between the two gates. The curb stands (from the
+    /// far-curb arrivals ~420/~435 to the retargets at 510) hold the
+    /// crossers at the far curbs — crosser 9 standing at the west
+    /// curb (-3.7, 5.0) while the camera passes the north crosswalk
+    /// (pose 380, its z = 5 line) 3.7 m east; the return crossings
+    /// (from 510) cross the camera's line at ticks ~672/~678, after
+    /// the camera has parked at [0, 1.7, 38] (pose 600 = tick 660).
+    /// The pairwise discipline is NOT claimed beyond the demo's 663
+    /// presented frames.
+    #[test]
+    fn composed_crossings_clear_the_camera_on_the_shared_clock() {
+        use crate::corner_routes::corner_population_locomotion;
+
+        // Materialize the route poses once (601 entries).
+        let poses: Vec<_> = crate::corner_demo::route_poses().collect();
+
+        // Build two spines with identical world states
+        let (_routes, states, present) = corner_population_locomotion();
+        let world_a = CornerCrowdWorld::new(states.clone(), present.clone());
+        let mut spine_a = engine_core::spine::Spine::with_reservation(world_a, 64, 32);
+        let world_b = CornerCrowdWorld::new(states, present);
+        let mut spine_b = engine_core::spine::Spine::with_reservation(world_b, 64, 32);
+
+        // Arm every schedule entry at its first occurrence (same as run_campaign)
+        let arm_entries = |spine: &mut engine_core::spine::Spine<CornerCrowdWorld>| {
+            let world = spine.world();
+            let mut specs: Vec<engine_core::event::EventSpec> = Vec::new();
+            for npc in 0..24 {
+                let schedule = &world.schedules[npc];
+                for (entry_idx, entry) in schedule.entries.iter().enumerate() {
+                    let payload =
+                        engine_core::npc_execution::wake_payload(npc as u32, entry_idx as u32)
+                            .expect("the entry index packs");
+                    specs.push(engine_core::event::EventSpec {
+                        class: WAKE_CLASS,
+                        schedule: engine_core::event::Schedule::AtLogicalTime { due: entry.start },
+                        payload,
+                        field: entry.activity.field,
+                        depends_on: Vec::new(),
+                    });
+                }
+            }
+            let _world = world;
+            for spec in specs {
+                spine.schedule(spec).expect("arming is legal");
+            }
+        };
+        arm_entries(&mut spine_a);
+        arm_entries(&mut spine_b);
+
+        let mut global_min = f32::INFINITY;
+        let mut global_min_tick = 0u64;
+
+        // THE FRAME-k CONVENTION (the demo's render-then-step, the plain
+        // gate's own): presented frame k renders the crowd after k
+        // composed ticks with camera pose clamp(k - 60, 0, 600) — the
+        // measurement reads the state BEFORE the tick's spine+batch
+        // step, exactly the state the demo renders at that frame.
+        for k in 0..=662u64 {
+            let world_a = spine_a.world();
+            let world_b = spine_b.world();
+
+            // Double-run equality for states[8]/states[9]
+            for i in 8..10 {
+                assert_eq!(
+                    (
+                        world_a.states[i].position,
+                        world_a.states[i].facing,
+                        world_a.states[i].leg,
+                        world_a.states[i].stride_phase
+                    ),
+                    (
+                        world_b.states[i].position,
+                        world_b.states[i].facing,
+                        world_b.states[i].leg,
+                        world_b.states[i].stride_phase
+                    ),
+                    "the composed double-run diverged at tick {k}, npc {i}"
+                );
+            }
+
+            // THE CAMERA MINIMUM
+            let pose_idx = ((k as i64 - 60).max(0) as u64).min(600);
+            let pose = &poses[pose_idx as usize];
+            let camera_pos = [pose.position[0], pose.position[2]];
+
+            let mut min_dist = f32::INFINITY;
+            for i in 0..24 {
+                let npc_pos = world_a.states[i].position;
+                let dx = npc_pos[0] - camera_pos[0];
+                let dz = npc_pos[1] - camera_pos[1];
+                let dist = (dx * dx + dz * dz).sqrt();
+                min_dist = min_dist.min(dist);
+            }
+            if min_dist < global_min {
+                global_min = min_dist;
+                global_min_tick = k;
+            }
+            assert!(
+                min_dist >= 0.8,
+                "composed crowd and camera too close at tick {k}: {min_dist} m"
+            );
+            // THE TICK'S STEP (after the measurement — the state the
+            // next frame renders).
+            spine_a.run_tick();
+            spine_b.run_tick();
+            spine_a.world_mut().composed_tick(1.0 / 60.0);
+            spine_b.world_mut().composed_tick(1.0 / 60.0);
+        }
+
+        println!("composed crossings camera minimum: {global_min} at tick {global_min_tick}");
+        // THE MEASURED PIN: the composed mode's first ~420 ticks are the
+        // plain mode's own (the retarget at 90 re-affirms the crossing
+        // already under way; the first stand begins at the far-curb
+        // arrival ~420), so the minimum is the PLAIN gate's own value
+        // at its own frame — a genuine cross-check between the two
+        // gates (movement is an investigation, never a silent repin).
+        assert_eq!(
+            global_min, 1.8529123,
+            "the composed same-frame camera minimum moved (the plain gate's own pin)"
+        );
+        assert_eq!(
+            global_min_tick, 178,
+            "the composed same-frame camera minimum's tick moved (the plain gate's own frame)"
+        );
     }
 }
