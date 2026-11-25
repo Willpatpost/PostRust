@@ -22,6 +22,17 @@ work from THIS file alone.
   three recursive-phase documents; this pass settles the §4 table at
   `e4842d6`, marks the merged state throughout, and records the package's
   post-merge second-device evidence.
+- **Reconciled for the Era-2 package C landing on 2026-11-25:** the
+  owner's GO (21:53:23Z, `04b09b9`) merged the whole particles +
+  weather package — the deterministic cores (digest
+  `16840467954493462700`), the renderer's third populated kind,
+  the demo rain layer with the gate battery, and the strengthening
+  fold-ins; this pass settles the §4 table at the merge endpoint
+  (main 1371/1320, renderer release 163/2, heavy 625/624 with
+  ignored 39 — all enforced by the runs' own gates), carries the
+  cores' records into §2, the arc into §9, the matrix row, and
+  records the two-seat build (the restart's orphaned session and
+  the supervisor's session, one canonical core).
 - **Reconciled for the Era-2 package A landing on 2026-11-25:** the
   owner's GO wave (18:26:20–18:37:23Z) took the whole eleven-PR stack
   terminal — #38, #41–#47 merged (four real merge commits carrying the
@@ -230,7 +241,35 @@ ARM64) with a five-job CI:
   deactivation cannot move it) — pinned by an 18-test battery
   (main-shard platform-uniform) including the phase-interleave pin,
   the inactive-witness gate, the retention-bounded rebuild, and the
-  accepted-only fold with the cross-cycle score durability.
+  accepted-only fold with the cross-cycle score durability. Plus
+  the Era-2 **package C particle + weather cores** (`particle.rs`
+  + `weather.rs`, MERGED with PR #51, 2026-11-25 — the animation
+  core's discipline applied to unbound particles): the per-emitter
+  **seeded SplitMix64 spawn stream** (the `NpcRng` family's
+  arithmetic verbatim, seven fixed-order draws per spawn) — a
+  fixed seed's trajectory sequence byte-identical forever,
+  cross-platform, pure IEEE f32, **no transcendental anywhere**;
+  **the pinned integration order** (gravity → drag the per-step
+  multiply → position → life → the death test, stable compaction
+  — spawn order among survivors is part of the byte contract);
+  the fixed-array bounded pool (1024, active prefix, zero
+  tick-path allocation) with the **typed, counted, per-tick-
+  reported overflow refusal** (`TickReport` must be observed —
+  the `audio_triggers` discipline) and the accumulator clamp;
+  `Emitter::set_volume` (the mid-campaign volume refresh —
+  validates, replaces only the config, preserves the stream);
+  `fold_state` (the FNV-1a fold over position+life bits) with
+  **the trajectory digest pin `16840467954493462700`** (seed
+  `0xC0FFEE`, the rain-like campaign, 600 ticks at dt = 1/60 —
+  measured from the run, held byte-exact through every merge and
+  both seats' independent runs); the weather model as pure data
+  (`RainPolicy` caller-supplied — the engine carries no rain
+  numbers; `rain_emitter_config` over the OBSERVED volume, the
+  listener-relative discipline, `None` on the dry path;
+  `Weather::rain_validated` the fail-closed policy form beside
+  the clamping blend form); and the **N-emitter composition
+  equivalence gate** (four emitters together vs alone —
+  byte-identical, no shared state exists to introduce silently).
 - **`engine-persist`** — the persistence stack: SHA-256 content-addressed
   revision store; `CanonicalMedium` boundary with **two production mediums
   carrying distinct durability contracts** — SQLiteMedium
@@ -577,7 +616,28 @@ ARM64) with a five-job CI:
   composition smoke — all green on the pod's lavapipe. The
   coordination record (four actors, two sessions, the contract
   consolidation) lives in PR #51's trail and the pod-root
-  OVERNIGHT-STATUS.md.
+  OVERNIGHT-STATUS.md. The **strengthening fold-ins** (`7749ebd`,
+  the package's final commit): the **N-emitter composition
+  equivalence gate** (four emitters, distinct seeds/volumes/rates,
+  128 ticks together in fixed Vec order vs each alone —
+  byte-identical alive prefixes; the gate exists to catch any
+  future shared-state introduction), the **broadside ink gate at
+  the presentation extent** (the pixel metric over the full
+  1280×720, the 60-frame steady state, the dry double-run
+  baseline, and the sky-region check — MEASURED 1660 pixels
+  total, 1350 in the upper third: rain provably IN FRONT of the
+  background, the depth interaction's visible half; floors
+  1200/900, ~7× above the edge-on collapse), and
+  **`Weather::rain_validated`** (the fail-closed policy form —
+  finite and inside [0,1] or a typed refusal; the clamping
+  `rain()` kept and documented as the interpolation/blend form).
+  The renderer's own half (the third populated kind —
+  `particle.wgsl` unlit tinted alpha-blended, depth test-on/
+  write-off, `ProxyInstance.alpha` in the tint vec4's `.a` with
+  the existing packed-bytes pins UNCHANGED, the third indirect
+  command, no rain in the shadow map) is recorded in the
+  engine-renderer section above; the whole ladder's evidence and
+  the two-seat record live in PR #51's body and commits.
 
 The **integrated campaign demo** (`--demo-persist`) is the vertical slice:
 one authoritative, persistently-orchestrated 1000-NPC / 8-region campaign
@@ -627,8 +687,29 @@ for the combined candidate.
 | **Combined** | **1933** | **1881** |
 
 The macOS job has its own partition. Main has two ignored tests and 33
-result lines. Heavy has thirty-three ignored tests and 63 result
-lines. The table is settled at the landed `main` `d782a27`
+result lines. Heavy has thirty-nine ignored tests and 64 result
+lines. The table is settled at the landed `main` `04b09b9`
+(2026-11-25, PR #51's merge — the package C endpoint): main
+**1371/2/33**, renderer release **163/2**, heavy **625/39/64** —
+every count ENFORCED by the exact-count gates of the runs on the
+exact trees: the branch's final run `45702469099` on `7749ebd`
+(the merge was fast-forward-shaped — `04b09b9`'s tree is EXACTLY
+`7749ebd`'s) green on all five jobs with its own lines: `main
+shard: 1371 passed, 2 ignored, 33` and `renderer release: 163
+passed, 2` and `heavy shard: 625 passed, 39 ignored, 64` on
+ubuntu-latest; `main shard: 1320 passed, 2 ignored, 33` and
+`heavy shard: 624 passed, 39 ignored, 64` on windows-latest — the
+Windows platform-uniform inferences CONFIRMED by the run itself;
+the merge-endpoint run `45708420586` on `04b09b9` re-enforces the
+same counts on `main`. The package's own count history is on
+record in its commits: the red run `45693271859` (the stale-pin
+push — stage 3's tests never absorbed by the then-pin 1339)
+corrected from actuals at `8128ae2` (1369/1318, heavy 625/624
+with ignored 38), then the strengthening fold-ins at `7749ebd`
+(+2 main: the N-emitter composition gate and the validated
+intensity battery, 1371/1320; +1 ignored heavy: the broadside ink
+gate, 39) — never a test weakened. The prior settlement,
+superseded: the landed `main` `d782a27`
 (2026-11-25, PR #48's merge — the evening GO wave's endpoint; the
 FIRST settlement whose tree is a merge commit on `main` itself
 rather than a candidate branch): main **1313/2/33**, renderer release
@@ -1627,11 +1708,17 @@ design pass #34, the physics middleware decision #35, the audio
 subsystem map #36) all took the owner's GO in one wave
 (2026-11-24T23:45Z), the #33 merge-commit CI green on all five jobs
 with the exact-count pins enforced. What awaits the owner now
-(settled at the package-A landing, 2026-11-25T18:37Z): the rig
+(settled at the package-C landing, 2026-11-25T21:53Z): the rig
 commands — `cargo run -p engine-slice --release -- --corner
 --populated --shadows` and its `--free-look` variant walk the moving
 corner (24 NPCs, 16 walking at hand-spread phases, per-NPC soft
-shadows that walk with them, 2 sedans); the Era-1 rig-pending clauses
+shadows that walk with them, 2 sedans), and
+**`--corner --free-look --populated --shadows --day-night 60
+--weather rain` walks the living corner IN THE RAIN** (the
+package C acceptance — ~300 warm streaks falling through the
+observed volume, dying at the ground, tinted by the sky;
+composing with `--post`, `--behavior`, and `--audio`); the
+Era-1 rig-pending clauses
 above; the documented follow-ups (~~the shadowed-HDR variant~~ —
 CLOSED 2026-11-25 by the `era2/shadowed-hdr-populated` package,
 MERGED as PR #44 in the evening GO wave: the
@@ -2020,6 +2107,49 @@ to the coder subagent produced analysis only (the tree verified
 clean after each); the orchestrator implemented the spec itself
 and audited every hunk before the gates.
 
+**The Era-2 package C arc (2026-11-25, particles + weather — rain
+over the corner, deterministic to the byte; MERGED as PR #51 at
+21:53:23Z via `04b09b9`, the final run `45702469099` green on all
+five jobs with every exact-count gate enforcing the measured
+counts):** the five-stage ladder — the deterministic cores
+(`0c64601`: the seeded spawn stream, the pinned integration
+order, the typed overflow, **the digest pin
+`16840467954493462700`**), the renderer's third populated kind
+(`dc7eadc`: the unlit blended `particle.wgsl`, the alpha claim on
+the tint vec4's `.a` with the existing packed-bytes pins
+UNCHANGED, the third indirect command, the `ccc5b50` placeholder
+retired per the no-new-pipeline-class law), the verifier-found
+corrective (`ee8b907`: the render_post populated-HDR delta
+re-pinned +2 device_memory — the rain kind's third mesh VBO and
+its staging), the demo rain layer + the gate battery (`8128ae2`),
+the final main merges (`89ae9dd`/`b6b3f1b` — the audio
+compositions absorbed, the three-way `--populated --weather rain
+--audio` composition), and the strengthening fold-ins (`7749ebd`:
+the N-emitter composition gate, the broadside ink gate measuring
+1660/1350, the validated intensity constructor). **The two-seat
+record, honestly:** the server restart orphaned the 17:07
+implementation seat while the supervisor spawned the 19:07 seat —
+both held the package C mandate, and a genuine duplication
+crisis (two parallel cores with diverging digest pins in the
+making) was resolved through the repo-as-shared-state
+coordination (the pushed canonical core, the worktree note, the
+OVERNIGHT-STATUS records, the PR comment trail): the cores and
+the renderer kind from the implementation seat, the demo layer
+and gates from the build seat, each verified by the other (the
+build seat's line review caught the render_post pin the
+implementation seat's round missed; the implementation seat's
+full-device-surface runs verified the build seat's delivery).
+The parallel drafts survive as mining branches
+(`era2/pc-wip-billboard-renderer`, `era2/pc-impl-seat-stage45`);
+the digest-pin-once argument held — one canonical core, one
+canonical pin. The package's count history includes the red run
+`45693271859` (the stale-pin push, corrected from actuals at
+`8128ae2` — the exact-count gates doing exactly their job) and
+the measured landings 1369/1318 → 1371/1320 (main) and 625/624
+with ignored 38 → 39 (heavy). The recursive follow-ups: the
+wet-ground rain ripples (in flight on `era2/rain-ripples*`,
+stacked through the package branch) and the particle LOD tiers.
+
 ## 10. The authoritative coordination ledger
 
 - **Location:** `/home/coder/sektor7-coordination/` on the development pod
@@ -2070,6 +2200,7 @@ not implemented** / **not yet designed**.
 | Rendering (Vulkan presentation) | Partially implemented (prototype-class design) | `engine-renderer`; lavapipe + rig validation; F-03 Step 1 delivered (fail-visible truncation counters), Step-2 policy + F-04 open |
 | Shader/material architecture | Prototype only | Hand-written build-time naga shaders; no material system |
 | GPU resource streaming | Not yet designed | F-04 deferred; host-visible copies only |
+| Particles + weather | **Implemented (Era 2 package C, MERGED #51)** | The deterministic particle core (engine-core `particle.rs`: the seeded per-emitter SplitMix64 spawn stream, the pinned integration order gravity→drag→position→life→death-test with stable compaction, the fixed-array bounded pool with the typed counted overflow refusal, the trajectory digest pin `16840467954493462700`, the N-emitter composition gate) + the weather model (`weather.rs`: pure state, caller-supplied `RainPolicy`, the observed-volume `rain_emitter_config`, the validated policy form) + the renderer's THIRD populated kind (rain through the existing instanced path — the unlit tinted alpha-blended `particle.wgsl`, depth test-on/write-off, `ProxyInstance.alpha` with the existing packed-bytes pins unchanged, the third indirect command, no rain in the shadow map) + the demo rain layer (`corner_weather.rs`: warm-started, the 4 m-quantized listener-following spawn box, render-then-step at dt=1/60, the physically-derived billboard turn, the exit census with the conservation exact) — gated by the lavapipe battery (the ink-count both metrics, the both-counter allocation constancy, the double-run byte-equality, the rain-kind N-vs-1, the typed overflow surfaced). `--corner --free-look --populated --shadows --day-night 60 --weather rain` walks the living corner in the rain; composes with `--post`, `--behavior`, and `--audio`. The wet-ground ripple extension and the particle LOD tiers are the package's recursive follow-ups |
 | Instanced/indirect draws | **Implemented (6-E + 6-E2)** | The Cycle 6-E implementation landed 2026-11-23 on the scaffold's deterministic core (the libm-free turn-fraction transforms, the byte-pinned packing, the proxy meshes, the `instanced_proxy.wgsl` shader): the instance-rate vertex input, the lazily-created zero-per-frame-allocation instance buffer (allocations constant across warmed populated frames), one draw call per populated kind (the populated corner route: **26 instances — the full 24-NPC + 2-vehicle placement table, the ladder's population package `corner_population`, pure data with a placement-validity battery and its own packed-bytes FNV pin — in 2 calls**), the N-vs-1 pixel-equivalence gate (`tests/render_instanced.rs`, byte-equal frames for BOTH the 13-instance fixture and the shipped 24+2 table, per-pixel 6-B oracle checks at 0/255 max error on lavapipe), the draw-call pins, and the `--corner --populated` demo mode — see `docs/CYCLE6-6E-BRIEF.md`. The Cycle 6-E2 package (2026-11-23, riding the population branch) added the indirect submission: `ProxyDrawMode::Indirect` — one `vkCmdDrawIndirect` per populated kind with the counts read from GPU memory, the pure byte-pinned `proxy_indirect` command core (FNV cross-platform pin, `firstVertex`/`firstInstance` pinned zero — no `drawIndirectFirstInstance` feature), a lazily-created per-frame-slot mapped command buffer (one-time +1 device_memory, pinned; the direct path's counters untouched), byte-equal frames across per-object/direct/indirect submissions (the third `render_instanced` gate, with an oracle wall through the indirect path), and the populated route's default submission now indirect (`--proxy-instanced` selects the direct 6-E shape). GPU-side count AUTHORSHIP (compute/culling writing the counts) remains deferred to the GPU-culling package. The rig measurement commands live in the 6-E/6-E2 PRs (lavapipe is correctness evidence only) |
 | Directional shadows | **Implemented (6-F + Era-1 PCF + Era-2 proxy shadows)** | The Cycle 6-F implementation landed 2026-11-23: the deterministic core (the light-space orthographic cascade, the compare-time slope-scaled bias model, the CPU raycaster oracle — pure IEEE, unit-pinned) + the depth-only pass + the shadowed lit pipeline sampling the map (one cascade, the corner scene — PCF-softened since Era-1 package 2). The gates: the map's known-answer (every texel vs the raycaster, max |Δdepth| 2.7e-7 on lavapipe) and the pixel equivalence (a shadowed ground patch renders exactly `albedo·ambient`, a lit patch the unshadowed equation, the unshadowed path pixel-identical) — `tests/render_shadows.rs`, executed by the CI's Linux Vulkan step. The `--corner --shadows` demo mode runs the full route. PCF softening (Era-1 package 2, the 3×3 `shadow_filter` tap table shared verbatim with the CPU oracle) and proxy shadows (Era-2, PR #33 — the populated path casting AND receiving, the skinned per-NPC depth casts) are landed; cascaded splits remain open |
 | NPC/world representation (LOD) | Partially implemented | The region director, four LOD levels, activation/reconstruction — validated at 1000 NPCs / 8 regions; the NPC AI design pass merged (#34) with its deterministic cores landed (PR #37: the behavior selector machinery, the schedule layer, the perception layer — pure, pinned), the spine integration landed (package A part 2: commitment wakes as spine events, the witness census, the honest re-arm — pinned by the integration battery), and the locomotion batch landed (package A part 3: routes as pure data with authored turns, the hand-spread draws, the position bridge, the identity-ordered zero-allocation batch step, the pinned-blocked collision composition — pinned by the 18-test battery with the campaign gates over a real spine, §8.5's p99 measurement discharged: 4.7 µs/tick at the corner's 24 walkers, 70.7 µs/tick at the 1,000-walker pathological case on this pod); the rendering bridge, the composed gates, and the measurement surface landed (package A parts 4-6, MERGED in the 2026-11-25 evening GO wave: the behavior-state walking crowd at zero per-frame allocation, the behavior-spine composition with the allocation-counting gate, and §8.4/§8.5's measured evidence — the sustained matrix, the witness cost, the E-09 crossover at k=1 with span-invariant synthesis, the E-08 skip decomposition, memory-per-NPC by tier); the capture-lane gates landed (package A part 7, MERGED in the wave: the durable perception memory lane — the keyed capture ledger with capture-at-production I1, the canonical-order rebuild, the M-08 shared reputation folding accepted candidates only, and THE S6 FUZZ GATE over the real spine/census/CommitPipeline with the per-op conservations, the C1/C2 checks, the independent oracle, and the double-run byte-identity); the composed-crowd camera crossing landed (package A part 8, MERGED in the wave: the full crosswalk crossings on the shared clock — the pacers became crossers walking the whole road arm behind the camera, gated by the two temporal camera gates under the demo's own warmup-lead pairing, the measured same-frame minimum 1.8529123 pinned in both, the composed crossing commitments with the far-curb stands) |

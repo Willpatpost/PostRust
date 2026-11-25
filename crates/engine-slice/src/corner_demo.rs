@@ -1011,10 +1011,19 @@ fn run_free_look(
     // The per-NPC step accumulator (fixed [f32; 24] — the crowd's NPC
     // count). PRESENTATION-SIDE timing, NOT deterministic state:
     // which footstep fires when is the audible rendering's business
+    // The per-NPC phase offset (the rig-walk corrective: the walk
+    // cycle's own anti-lockstep pattern — "per-NPC phase offsets so
+    // the crowd does not march in lockstep" — applied to the AUDIO
+    // step cycle; without it, all 24 accumulators start at zero and
+    // fire simultaneously every interval, producing one mass click
+    // at a constant tempo from everywhere at once). NPC i starts at
+    // i/24 of the interval, so the 24 footsteps spread evenly across
+    // the cadence. PRESENTATION-SIDE TIMING outside the contract
     // (the audio map's constraint 1.1: "the audible rendering is
-    // outside the contract") — this array never enters the spine, a
+    // outside the contract") - this array never enters the spine, a
     // fingerprint, or a measured claim.
-    let mut step_accumulators = [0.0_f32; 24];
+    let mut step_accumulators: [f32; 24] =
+        std::array::from_fn(|i| (i as f32 / 24.0) * AUDIO_STEP_INTERVAL);
     // The observation/trigger buffers, retained across frames (zero
     // allocation after the first audio frame — the crowd's own
     // retained-buffer discipline).
