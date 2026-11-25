@@ -1582,8 +1582,10 @@ priorities).
 
 **The Era-2 package A arc (2026-11-25, the overnight continuation
 beyond the mission file's terminal queue — the design pass as the
-implementation brief): part 1 MERGED, parts 2-6 DELIVERED (the open
-PR stack awaiting the owner's GO).** Part 1: the NPC AI deterministic cores (PR #37, the
+implementation brief): part 1 MERGED, parts 2-8 DELIVERED — the open
+stack #38 → #39 → #40 → #41 → #42 → #43 → #44 → #45 → #46 → #47
+(every rung CI-green on its own head, #38 docs-only by the workflow's
+path filter), awaiting the owner's GO in that order.** Part 1: the NPC AI deterministic cores (PR #37, the
 owner's GO at 02:02Z; the design pass's §3–§6 as three additive
 pure engine-core modules — §2's record carries the contracts and
 pins). Part 2: the spine integration (`era2/npc-ai-spine-integration`,
