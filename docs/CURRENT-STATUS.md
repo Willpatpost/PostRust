@@ -598,10 +598,14 @@ and 268/604/939/1275) — and corner_behavior's
 composed campaign's 663 ticks against the same pairing, measuring the
 plain gate's own minimum as its cross-check); Windows 619 = 617 + the
 same 2 (the platform-uniform inference — pure spine/IEEE arithmetic
-plus the route_poses f32 lerp, no cfg gates, no Vulkan; to be
-confirmed by this candidate's CI run, the count corrected from
-actuals on a mismatch, never a test weakened); renderer release
-160/2 UNCHANGED (engine-renderer untouched) (main 1295 + the
+plus the route_poses f32 lerp, no cfg gates, no Vulkan) —
+CONFIRMED by this candidate's own CI run 45637296212 (green on all
+five jobs, first push — the run's own exact-count gates enforced the
+measured counts on both platforms: `heavy shard: 620 passed, 33
+ignored, 63` on ubuntu-latest and `heavy shard: 619 passed, 33
+ignored, 63` on windows-latest, `main shard: 1313 passed, 2 ignored,
+33` on both); renderer release 160/2 UNCHANGED (engine-renderer
+untouched) (main 1295 + the
 npc_memory battery's 18 platform-uniform engine-core lib tests;
 heavy 608 + the memory-lane composition's 10 platform-uniform — the
 npc_memory_lane lib battery's three and the new
