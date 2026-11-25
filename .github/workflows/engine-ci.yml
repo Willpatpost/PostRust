@@ -548,7 +548,11 @@ jobs:
           # own awk on this exact tree; Windows 1288 + 30 = 1318 =
           # the same platform-uniform delta (to be confirmed by
           # this candidate's CI run; a mismatch is corrected from
-          # actuals, never by weakening a test).
+          # actuals, never by weakening a test). The final main
+          # merge (fa61c13, the package B audio demo integration —
+          # engine-slice wiring only) moves no main-shard count;
+          # re-measured on the merged tree by the implementation
+          # seat: 1369 Linux, unchanged.
           expected=1369
           if [ "$(uname -s)" != "Linux" ]; then expected=1318; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)

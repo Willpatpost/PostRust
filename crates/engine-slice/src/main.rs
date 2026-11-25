@@ -78,6 +78,7 @@ Interactive modes
                                     demo clock — the light and the sky ride the
                                     same atmosphere_at frame; implies the sky
                                     layer)
+  --corner --audio                   The corner scene with procedural audio (Era 2 package B: the walking crowd's footsteps through the trigger projection and the SDL3 device layer)
   --corner --post                    The post chain (Era 1: the HDR render-target
                                      chain, the 1/4-res bloom mips, and the ACES
                                      tonemap composite; composes with every
@@ -590,6 +591,7 @@ fn main() {
             let mut wet = false;
             let mut behavior = false;
             let mut weather: Option<String> = None;
+            let mut audio = false;
             let mut fps = 60;
             let mut present = engine_renderer::PresentModePreference::Auto;
             let mut validation = engine_renderer::ValidationPreference::Auto;
@@ -657,6 +659,12 @@ fn main() {
                     // composed gates): the commitment wakes drive the
                     // populated crowd. Refuses without --populated.
                     "--behavior" => behavior = true,
+                    // Era 2 package B part 3: the procedural audio —
+                    // the walking crowd's footsteps through the
+                    // trigger projection and the SDL3 device layer
+                    // (the free-look near-field session). Refuses
+                    // without --free-look and --populated.
+                    "--audio" => audio = true,
                     // The free-look smoke's bounded exit — auto-quit
                     // after N presented frames. Free-look ONLY: the
                     // scripted route has its own fixed 601-frame
@@ -718,6 +726,18 @@ fn main() {
                     weather_type
                 ));
             }
+            // The audio mode's own gate (the --frames precedent: never
+            // a silent mode drop) — the footsteps ride the free-look
+            // session's listener and come from the walking crowd, so
+            // both flags are prerequisites.
+            if audio && (!free_look || !populated) {
+                return Err(
+                    "--audio requires --free-look and --populated (the walking crowd's \
+                     footsteps drive the interactive near-field session; the scripted \
+                     route keeps its fixed measurement shape)"
+                        .into(),
+                );
+            }
             engine_slice::corner_demo::run(
                 night,
                 fps,
@@ -736,6 +756,7 @@ fn main() {
                 wet,
                 behavior,
                 weather,
+                audio,
             )
         };
         if let Err(e) = run() {
