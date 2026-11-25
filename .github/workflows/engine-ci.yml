@@ -459,8 +459,8 @@ jobs:
           # this shard's non-ignored battery is untouched.
           # 1237/2/33 re-MEASURED with this step's own awk on the
           # stage-5 tree.
-          expected=1237
-          if [ "$(uname -s)" != "Linux" ]; then expected=1186; fi
+          expected=1263
+          if [ "$(uname -s)" != "Linux" ]; then expected=1212; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
