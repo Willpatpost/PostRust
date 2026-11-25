@@ -459,8 +459,62 @@ jobs:
           # this shard's non-ignored battery is untouched.
           # 1237/2/33 re-MEASURED with this step's own awk on the
           # stage-5 tree.
-          expected=1263
-          if [ "$(uname -s)" != "Linux" ]; then expected=1212; fi
+          #
+          # Era 2 package A part 1 (the NPC AI deterministic cores,
+          # 2026-11-25, PR #37, the owner's GO): +26 platform-uniform
+          # engine-core lib tests (npc_behavior 7, npc_schedule 10,
+          # npc_perception 9); the first push failed this gate with
+          # the then-pin 1237 (run 45528096205) and the correction
+          # commit re-pinned from the measured actual — the count
+          # corrected, never a test weakened (the record: d104094,
+          # runs 45528096205 red / 45529070104 green / the merge run
+          # 45530057475 green). 1237 + 26 = 1263 Linux / 1186 + 26 =
+          # 1212 Windows, both measured by that candidate's own runs.
+          #
+          # Era 2 package A part 2 (the NPC AI spine integration,
+          # 2026-11-25, PR era2/npc-ai-spine-integration):
+          # +14 platform-uniform engine-core lib tests (npc_execution:
+          # 9 machinery tests — the codec round-trips/refusals, the
+          # lazy-decay exact-f32 known answer, the re-arm anchoring,
+          # the corrupted-index refusal, the witness selection, the
+          # census geometry with the inclusive boundary and the
+          # Dormant exclusion, the fail-closed radii, the retention
+          # eviction, the digest sensitivity; 5 integration tests —
+          # the seeded double-run byte-identity, the stream digest
+          # pin, the E-10 synchrony cluster absorbed by the near
+          # reservation, the late-arrival honest skip, the witness
+          # census with depends_on causality). Pure spine/IEEE
+          # arithmetic, no cfg gates, no Vulkan. 1263 + 14 = 1277
+          # Linux MEASURED with this step's own awk on the package
+          # tree; Windows 1212 + 14 = 1226 = the same platform-
+          # uniform delta (to be confirmed by this candidate's CI
+          # run — a mismatch is corrected from actuals, never by
+          # weakening a test).
+          #
+          # Era 2 package A part 3 (the locomotion batch,
+          # 2026-11-25, PR era2/npc-ai-locomotion-batch):
+          # +18 platform-uniform engine-core lib tests (npc_locomotion:
+          # the construction geometry/refusals, the start_route known
+          # state with the draw-reconstruction proof and its refusals,
+          # the exact-binary advance known answer, the crossing
+          # remainder carry, the destination arrival snap-and-stand,
+          # the loop wrap cycle, the set_destination semantics, the
+          # shortest-way turn blend with the wrap case, the lateral
+          # fade window's exact smoothstep values and the
+          # corner-continuity proof, the pinned-blocked collision
+          # idempotence with the frozen phase and the counterfactual,
+          # the committed-cell known answers, the clip bands, the
+          # digest purity/sensitivity, the batch skip semantics, and
+          # the two campaign gates over a real spine — the double-run
+          # byte-identity and the locomotion digest pin). Pure IEEE
+          # arithmetic, no cfg gates, no Vulkan. 1277 + 18 = 1295
+          # Linux MEASURED with this step's own awk on the package
+          # tree; Windows 1226 + 18 = 1244 = the same platform-
+          # uniform delta (to be confirmed by this candidate's CI
+          # run — a mismatch is corrected from actuals, never by
+          # weakening a test).
+          expected=1295
+          if [ "$(uname -s)" != "Linux" ]; then expected=1244; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -1539,8 +1593,29 @@ jobs:
           # binaries' own lines: render_instanced 4 -> 6 ignored,
           # render_shadows 3 -> 4). 591/31/62 MEASURED with this
           # step's own awk on the stage-5 tree, zero failures.
-          expected=591
-          if [ "$(uname -s)" != "Linux" ]; then expected=590; fi
+          # ERA 2 PACKAGE A PART 4 (the rendering bridge,
+          # 2026-11-25, PR era2/npc-ai-rendering-bridge): the
+          # corner_routes module lands its 8-test battery (the
+          # WIP commit's own count, restructured in place: the
+          # route construction + tag pins, the population
+          # construction pin with the waiter byte-identity proof,
+          # the construction determinism over every field, the
+          # sweep battery's measured margins, the 663-frame
+          # locomotion campaign (double-run + digest pins +
+          # pairwise clearance), the instances/into forms, the
+          # phase-column byte-compatibility, and the pose-FNV
+          # pins) within the existing lib result line: 591 + 8 =
+          # 599 Linux MEASURED with this step's own awk on the
+          # package tree; Windows 590 + 8 = 598 = the same
+          # platform-uniform delta (pure f32 arithmetic and struct
+          # equality, no cfg gates, no Vulkan — to be confirmed by
+          # this candidate's CI run; a mismatch is corrected from
+          # actuals, never by weakening a test). Ignored 31 and
+          # result lines 62 UNCHANGED (the three re-pinned
+          # render_instanced gates extend in place; no new
+          # binaries).
+          expected=599
+          if [ "$(uname -s)" != "Linux" ]; then expected=598; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)

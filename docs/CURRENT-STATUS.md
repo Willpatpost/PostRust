@@ -17,6 +17,17 @@ work from THIS file alone.
   below still use it). This pass also brought the §4 counts and the
   capability matrix current through Cycle 5 + perf-hardening batch 1; the
   extraction baseline is `main` @ `b19d210`, five-job CI run `44827915274`.
+- **Reconciled for the Era-2 landing on 2026-11-24:** the owner's GO wave
+  (PRs #33–#36, 23:45Z) merged the whole Era-2 mission — package 1 plus the
+  three recursive-phase documents; this pass settles the §4 table at
+  `e4842d6`, marks the merged state throughout, and records the package's
+  post-merge second-device evidence.
+- **Extended for the Era-2 package A part-1 landing on 2026-11-25:** the
+  owner's GO merged PR #37 (the NPC AI deterministic cores) at 02:02Z —
+  after this reconciliation's branch was cut, racing its push by 45
+  minutes; the extension re-settles the §4 table at `d9a034d` and carries
+  the package's record into §2, §9, and the capability matrix, so the
+  index is current at merge time rather than born one landing behind.
 - **Update rule:** every change that alters capabilities, test counts,
   performance evidence, or priorities updates this file in the same change.
 
@@ -33,6 +44,7 @@ work from THIS file alone.
 | Slice 0 integration acceptance | `docs/SLICE0-INTEGRATION-ACCEPTANCE-RECORD-2026-10-26.md` |
 | Production-persistence line records (PP-B1…B4) | `docs/PP-B1-SQLITE-PERSISTENCE-RECORD.md` … `PP-B4-ORCHESTRATION-VALIDATION-RECORD.md` |
 | Stage 6 evidence schema, burst validation, soak runbooks | `docs/STAGE6-*.md` |
+| The Era-2 recursive-phase research set — the NPC AI design pass, the physics middleware decision, the audio subsystem map | `docs/ERA2-NPC-AI-DESIGN-PASS.md`, `docs/PHYSICS-MIDDLEWARE-DECISION.md`, `docs/AUDIO-SUBSYSTEM-MAP.md` (PRs #34/#35/#36, merged 2026-11-24) |
 | The game-side vision and design bible | `VISION.md`, `DESIGN-BIBLE.md` in the **Sektor7 game repository** (https://github.com/Willpatpost/Sektor7 — they moved with the game at the extraction); `docs/TECH-ARCHITECTURE.md` here |
 
 These are point-in-time acceptance records. Later work does not edit them to
@@ -62,7 +74,113 @@ ARM64) with a five-job CI:
   against 87 / 12990 for the SAME scenario measured on the
   pre-optimization implementation; every fingerprint and scenario pin
   byte-identical, and the measured sustained-load execution cost
-  dropped p50 1.24 -> 0.51 ms/window with identical trace digests).
+  dropped p50 1.24 -> 0.51 ms/window with identical trace digests); plus
+  the Era-2 **NPC AI deterministic cores** (package A part 1, PR #37,
+  MERGED 2026-11-25 — the design pass's §3–§6 as three additive pure
+  engine-core modules, every existing test untouched): `npc_behavior.rs`
+  (the two-lane record — `NpcIdentity` the durable lane, `NpcRoutine`
+  the reconstructible; the needs counters with fixed-order clamped
+  decay; the pure rule-table selector with needs-ranked scoring,
+  schedule authority, and per-NPC RNG-stream tie-breaks — a fixed rule
+  table over a fixed record produces the same activity sequence
+  forever, the 24-decision FNV digest pinned at
+  1277463877274275604), `npc_schedule.rs` (the calendar layer:
+  authored `Commitment`/`Cadence` pure data with integer u64 tick
+  arithmetic and checked overflow — no floats anywhere; the
+  fixed-order due iteration and the fast-forward `next_due` for
+  time-skip; the due-sequence digest pinned at 11670746710459133860),
+  and `npc_perception.rs` (the inverted-query census — WHICH NPCs lie
+  within a radius of a point, squared f32 distances in fixed
+  operation order with NO sqrt; the fail-closed admissible gate — a
+  non-finite coordinate can never authorize a witness, the gate that
+  caught a real overflow bug during its own gating; the four-tier
+  perception budget table; the durable trace record's canonical
+  little-endian encoding, its digest pinned at 1076637108585072602).
+  The engine/policy boundary held throughout: the selector MACHINERY,
+  the calendar queries, and the census mechanism are engine; the rule
+  tables, schedule content, and perception classes are policy authored
+  above. The **spine integration** (package A part 2, `npc_execution.rs`
+  — §6.2's contract landed on the real queue, additive, the spine
+  itself untouched): the **event payload codecs** (tags 0xA1/0xA2 in
+  bits 63..56, the full-32-bit npc field, the 24-bit arg with the
+  TYPED pack refusal — an unrepresentable arg is `None`, never a
+  silent truncation; the namespace-collision proof against the
+  routine layout pinned by test); `evaluate_wake` (the per-event
+  LAZY need decay — cost per event, not per tick, §4.2's EventDriven
+  shape; the schedule-authority selection from the EVENT's own
+  payload, never a calendar re-derivation; and the HONEST RE-ARM
+  anchored at actual execution — a late wake skips missed
+  occurrences, never fires them in a burst); `evaluate_witness`
+  (§4.1's perception selection boundary — the fired perceptions
+  offered to the rule table, no schedule authority);
+  `enumerate_witnesses` (the §5.1 inverted census into a
+  caller-owned cleared scratch — population order, the LANDED
+  four-tier budget table as the single tier authority, the
+  fail-closed radii); `retain_trace` (§5.2's retention: oldest-first
+  eviction at the tier budget, the zero-budget append refused);
+  and `execution_digest` (the §8.4 gate-2 byte pin over (tick, npc,
+  activity) in `decision_digest`'s exact field order) — pinned by a
+  14-test battery whose five INTEGRATION tests drive a real
+  `Spine::with_reservation` through a test-side `World` (game
+  policy by placement): the seeded double-run byte-identity (stream
+  digest AND world fingerprint), the measured stream-digest pin
+  10778018066104731562, the E-10 synchrony cluster (40 same-tick
+  near commitments absorbed by the reservation, none dropped), the
+  late-arrival honest skip (intended 5, executed 9 under a held
+  reservation — the re-arm jumps the missed 8-occurrence to 11, the
+  chain on time from the shift onward), and the witness census with
+  `depends_on` causality (the dormant NPC inside the radius
+  witnesses nothing). `npc_schedule`'s `Commitment::next_occurrence`
+  made public as the per-entry re-arm anchor (the private logic,
+  byte-identical). The **locomotion batch** (package A part 3,
+  `npc_locomotion.rs` — §4.3's near-lane batch + §4.2's Full-tier
+  row landed, additive, the spine and every existing module
+  untouched): **routes as pure data** (`RouteLeg { to, turn }` from
+  an authored origin — per-leg heading TURNS AUTHORED in u16
+  turn units, the placement-table pattern extended to paths: no
+  runtime atan2/sin/cos exists anywhere; leg lengths/units/perps
+  precomputed at `Route::new`, the module's only sqrt,
+  IEEE-correctly-rounded at authoring; zero-length legs,
+  non-finite fields, unclosed loops, and non-positive
+  speeds/strides are typed refusals); **the hand-spread draws**
+  (speed scale [0.9, 1.1), lateral fraction [-1, 1] × the route's
+  authored width, and the initial stride phase — three draws in
+  fixed order from the appearance seed's OWN stream, never the
+  selector's, so locomotion reconstruction never depends on
+  selector replay order); **the position bridge** (continuous f32
+  in fixed operation order; the committed location stays coarse —
+  `leg` mirrored into `route_progress` at arrival, the
+  `committed_cell` quantizer onto the (u8, u8) region grid); the
+  **identity-ordered zero-allocation batch step** (`advance_batch`
+  — fixed-order per-NPC arithmetic: the crossing loop with
+  remainder carry bounded by MAX_CROSSINGS_PER_TICK, arrival snaps
+  to the AUTHORED waypoint bytes, loop wraps, the shortest-way
+  INTEGER turn blend at an authored rate, the smoothstep lateral
+  fade with the no-pop-at-corners window, the stride phase from
+  DISTANCE); the **pinned-blocked collision composition** (the
+  player's `depenetration` contract, near tier only,
+  ground-constrained — a blocked tick reverts the along-leg
+  distance and freezes the phase: no foot slide, byte-idempotent
+  across blocked ticks, the walk resuming the instant the path
+  clears); the **speed-band clip selection** (`clip_for` —
+  policy's threshold); and `locomotion_digest` (the FNV byte pin
+  over npc/position-bits/facing/phase-bits/leg) — pinned by an
+  18-test battery whose two CAMPAIGN gates drive a real
+  `Spine::with_reservation` (a commitment-driven MoveTo through
+  `evaluate_wake`, a LOOPING stroll, a standing waiter, an absent
+  far-tier NPC): the double-run byte-identity (locomotion digest
+  AND activity stream) and the measured locomotion-digest pin
+  852983358677453085. The §8.5 measurement discharged on this pod
+  (`--benchmark-locomotion`, release, 2,048 samples per config):
+  the corner's 24-walker shape p99 **0.0047 ms/tick** (the
+  µs-scale [ASSUMPTION] confirmed), the 1,000-walker pathological
+  all-present case p99 **0.0707 ms/tick** with the collision query
+  (0.42% of a 60 Hz frame), the all-blocked worst case p99
+  0.0497 ms/tick, and the no-query arithmetic p99 0.0184 ms/tick
+  — every configuration double-run identical. The rendering bridge
+  has LANDED as package A part 4 (the corner demo's populated route
+  on the locomotion state — see `engine-slice`'s corner_routes
+  paragraph); the composed gates remain as package A's final part.
 - **`engine-persist`** — the persistence stack: SHA-256 content-addressed
   revision store; `CanonicalMedium` boundary with **two production mediums
   carrying distinct durability contracts** — SQLiteMedium
@@ -141,8 +259,8 @@ ARM64) with a five-job CI:
   uniforms (the PostParams block is extent-static), composes with
   every corner flag, and the postless path stays byte-identical.
   The Era-2 **animation + skinning + proxy-shadows package**
-  (branch `era2/animation-skinning-proxy-shadows`, awaiting the
-  owner's GO): the **deterministic animation core** (`animation.rs`
+  (PR #33, MERGED 2026-11-24 — the owner's GO; the branch deleted on
+  merge): the **deterministic animation core** (`animation.rs`
   — the pure-data clip model, joint rotations through the existing
   libm-free `sin_cos_turn` machinery, signed i16 turn
   interpolation, the column-major hierarchy composition, and the
@@ -202,8 +320,8 @@ ARM64) with a five-job CI:
   AABB — presentation only: the interactive camera never enters the spine,
   a fingerprint, or any measured claim, and the scripted route's
   measurement series print only with the mode off), and the Era-2
-  **animated population** (the same branch as the renderer's Era-2
-  paragraph above): the placement table's PHASE column (the 8
+  **animated population** (merged with the renderer's Era-2 paragraph
+  in PR #33): the placement table's PHASE column (the 8
   crosswalk waiters stand, the 16 crossers and strollers walk at
   hand-spread u16 phase fractions of the 1.1 s stride — no
   lockstep marching), the per-frame walk evaluation
@@ -213,7 +331,25 @@ ARM64) with a five-job CI:
   writing into a retained buffer the renderer repacks per frame
   (zero per-frame allocation on both sides), and the walking
   `--corner --populated` route (plus `--populated --shadows`
-  together through the shadowed populated path).
+  together through the shadowed populated path). Era 2 package A
+  part 4 REPLACED the demo route's source with BEHAVIOR STATE: the
+  `corner_routes` module (the corner's walking lanes as pure data —
+  eight far-segment flank loops with lanes exactly 0.75 m apart at
+  dyadic 4.375/5.125, two crosswalk pacers at the original
+  crossers' spots, the waiters byte-identical; the swept-validity
+  battery measuring every sample unconditionally with the margins
+  as measured minimums; the 663-frame temporal campaign pinning
+  the double-run byte-identity, the locomotion digests, and the
+  pairwise clearance — walker pairs ≥ 0.75 with the measured
+  minimum EXACTLY the lane separation, waiter pairs ≥ 0.7 the
+  original cardinal rule) and the demo's `LocomotionCrowd`
+  (render-then-step at the deterministic clock: `advance_batch`
+  at dt = 1/60, `corner_instances_into` into the retained instance
+  buffer, the locomotion pose evaluation into the retained pose
+  buffer — 0 host allocations per warmed moving frame,
+  `renderer.allocations()` constant, both MEASURED). The
+  phase-column path remains pub where gates pin it (the skinning
+  oracle, the populated shadow-map gate).
 
 The **integrated campaign demo** (`--demo-persist`) is the vertical slice:
 one authoritative, persistently-orchestrated 1000-NPC / 8-region campaign
@@ -258,18 +394,66 @@ for the combined candidate.
 
 | CI partition | Linux | Windows |
 |---|---:|---:|
-| Main shard (`--workspace --exclude engine-slice`) | 1237 | 1186 |
-| Heavy shard (`-p engine-slice --features crash-test-seams`) | 591 | 590 |
-| **Combined** | **1828** | **1776** |
+| Main shard (`--workspace --exclude engine-slice`) | 1295 | 1244 |
+| Heavy shard (`-p engine-slice --features crash-test-seams`) | 599 | 598 |
+| **Combined** | **1894** | **1842** |
 
 The macOS job has its own partition. Main has two ignored tests and 33
-result lines. Heavy has thirty-one ignored tests and 62 result lines. The
-Era-1 table row was settled at `main` @ `406aceb` (2026-11-24): it carries the Era-1
-ladder's merged endpoint (PRs #13–#19; #20 was docs-only), matching the
-workflow's enforced pins at that exact tree — main 1188 Linux / 1137
-Windows with 2 ignored / 33 result lines, renderer release 111/2, heavy
-582 Linux / 581 Windows with 17 ignored / 62 result lines — each value
-confirmed by the green five-job CI runs on that tree, never a guess.
+result lines. Heavy has thirty-one ignored tests and 62 result lines.
+The table is settled at the Era-2 package A part-4 tree
+(`era2/npc-ai-rendering-bridge`, 2026-11-25, stacked on part 3 —
+the rendering bridge): heavy **599 Linux MEASURED with the
+workflow's own awk on this exact tree** (599 passed / 31 ignored /
+62 result lines, zero failures — the part-3 workflow pin's 591
+plus the corner_routes battery's 8 platform-uniform engine-slice
+lib tests); Windows **598** = 590 + the same 8 (the
+platform-uniform inference — pure f32 arithmetic and struct
+equality, no cfg gates, no Vulkan; to be confirmed by this
+candidate's CI run, the count corrected from actuals on a
+mismatch, never a test weakened); main **1295 Linux MEASURED with
+the workflow's own awk on this exact tree** (1295 passed / 2
+ignored / 33 result lines, zero failures — engine-core untouched
+by part 4) with Windows **1244** (part 3's own pin: 1226 + the
+npc_locomotion battery's 18 platform-uniform engine-core lib
+tests, the same inference discipline); renderer release 160/2
+UNCHANGED. The prior settlements, superseded in order: the part-3
+tree (`era2/npc-ai-locomotion-batch`, 2026-11-25 — the locomotion
+batch): the WORKFLOW's pins moved to main 1295/1244 with heavy
+591/590 unchanged (engine-slice gained only the test-free
+benchmark route), Linux 1295/2/33 MEASURED with the workflow's
+own awk on that tree — but the §4 TABLE's part-2 row (main
+1277/1226) was left stale by that package and is corrected here
+from the measured actuals; the part-2 tree
+(`era2/npc-ai-spine-integration`, 2026-11-25, stacked on the #38
+reconciliation — `d9a034d`'s code plus this package): main **1277
+Linux MEASURED with the workflow's own awk on this exact tree**
+(1277 passed / 2 ignored / 33 result lines, zero failures — the
+part-1 baseline 1263 plus npc_execution's 14 platform-uniform
+engine-core lib tests); Windows **1226** = 1212 + the same 14 (the
+platform-uniform inference — pure spine/IEEE arithmetic, no cfg
+gates, no Vulkan; to be confirmed by that candidate's CI run, the
+count corrected from actuals on a mismatch, never a test weakened);
+renderer release 160/2 and heavy 591 Linux / 590 Windows with 31
+ignored / 62 result lines UNCHANGED (the package touches engine-core
+only), `d9a034d`
+(2026-11-25, PR #37's merge — the Era-2 package A part-1 landing,
+the owner's GO at 02:02Z; the merge-commit run `45530057475` green
+on all five jobs enforcing main 1263/1212, its own push history the
+pin discipline on record: the first candidate `d47620e` failed the
+main-shard exact-count gate — run `45528096205`: expected 1237, the
+tree measured 1263 — and the correction commit `d104094` re-pinned
+from the measured actual on both platforms, run `45529070104`
+green), `e4842d6` (2026-11-24, the Era-2
+mission's merged endpoint — PR #33's merge commit `5d991dd`, where
+the green five-job run `45512576593` enforced main 1237/1186 with
+renderer release 160/2 and heavy 591/590, followed by the three
+docs-only merges #34/#35/#36 under the workflow's path filter), the
+Era-1 ladder's endpoint at `406aceb` (PR #28's reconciliation: main
+1188/1137, renderer release 111/2, heavy 582/581 with 17 ignored /
+62 result lines), then the eight-PR corrective union's landing
+through PR #29 (main 1208/2/33, renderer release 131/2, heavy
+588/28/62 — the union rehearsal's measured counts), on which #33's
+tree built.
 The per-package growth history that produced those endpoint counts
 (the 6-E scaffold through the Era-1 ladder, each measured at its own
 integrated tree): the Cycle 6-E implementation candidate's Linux
@@ -426,9 +610,10 @@ run; the spec is Astra's 20-finding review,
 `docs/ERA1-RENDERING-REVIEW-286d3e3.md`, merged as #20 — findings 1,
 10 and 11 pre-verified by the home team):** every one of the 20
 findings' corrections AND verification tests is landed across seven
-open, five-job CI-green, NEVER-merged PRs (the owner's GO is the only
-merge authority; the merge-order arithmetic lives in the workflow's
-comment chains and the PR bodies):
+five-job CI-green PRs, every one since MERGED under the owner's GO
+(the only merge authority — the union landing PR #29 carried the
+sequence; the merge-order arithmetic lived in the workflow's comment
+chains and the PR bodies):
 
 - **#21 `corrective/capture-trust`** — findings 1+2: the
   device-to-host visibility barrier and producing-submission/buffer-
@@ -548,10 +733,13 @@ in the PR bodies.
 
 **The Era-2 package 1 record (2026-11-24, branch
 `era2/animation-skinning-proxy-shadows` — the animation + skinning +
-proxy-shadows ladder, all five stages on one branch, awaiting the
-owner's GO; every count below MEASURED on the branch's stage-5 tree
-with the workflow's own awk, cross-checked against CI runs
-45471375791 / 45472428113 / 45478600773 on the staged tips):** the
+proxy-shadows ladder, all five stages on one branch; MERGED as PR #33
+at 2026-11-24T23:45Z (the owner's GO), the merge-commit run
+`45512576593` green on all five jobs at `5d991dd` with these counts
+enforced, the branch deleted on merge; every count below MEASURED on
+the branch's stage-5 tree with the workflow's own awk, cross-checked
+against CI runs 45471375791 / 45472428113 / 45478600773 on the staged
+tips):** the
 count arithmetic, stage by stage — stage 1 (the deterministic
 animation core, `b675377` + the `6b95875` verification repair) adds
 22 platform-uniform engine-renderer lib tests (main AND renderer
@@ -628,6 +816,22 @@ so the relaunch recovers at tick 3300 where the test pins 3054;
 the soak machinery is untouched by this branch; the §3.1 rerun
 PASSED — the documented fsync race, closed as a one-time flake) —
 reported to the supervisor, outside this package's scope.
+The package's post-merge second-device evidence (2026-11-24, the
+23:50 UTC queue-empty session — the full record in PR #33's comment
+trail): the pod's re-provisioned lavapipe (Mesa 25.2.8 / LLVM 20.1.2
+— no pod Vulkan loader existed during the package's own development)
+executed both new gate batteries green, rc=0 first try
+(`render_instanced` 6/6 — the skinning oracle max RGB error 1/255
+with its −10.9/255 self-discrimination control, the animated N-vs-1
+byte-equal with 1,447 pixels moved by the walk, 8 distinct pose
+digests across the 8 measured frames with host allocations 0;
+`render_shadows` 4/4 — the populated map's census reproducing CI run
+`45493567733` digit-for-digit, max |Δdepth| 2.68e-7 under the
+corrected 3.00e-7 tolerance, the static 6-F value reproducing
+digit-for-digit), and the full `--corner --populated --shadows`
+route ran its FIRST EXECUTION ANYWHERE — 601 frames, validation
+warnings/errors 0/0. Raw logs on the pod:
+`~/push-handoff/era2-second-device/`.
 
 (At `a4eb372`, Windows counts were measured before landing; Linux
 counts were inferred at landing and subsequently confirmed by GitHub
@@ -1077,18 +1281,84 @@ landed first — capture-trust (#21), frame-preparation (#22),
 allocations-geometry-gates (#23), architecture-split (#24) — then the
 recursive phase per the owner's directive: the sky off-axis extension
 (#25), finding 19's fallback-format half (#26), and the closing
-check-halves audit (#27). All seven PRs are open and never merged
-(the owner's GO is the only merge authority; the count evidence and
+check-halves audit (#27). All seven PRs are merged under the owner's
+GO (the only merge authority; the count evidence and
 merge-order notes are in §4 and the PR bodies). The cycle's closing
 re-audit (2026-11-24, independently re-verified against source) found
-the recursive queue empty. What awaits the owner: the merge GOs (in
-the documented merge order — with the two #21×#23 merge-time fixes
-and the measured union counts from the 2026-11-24 union rehearsal,
-`corrective/union-rehearsal` / PR #28's comment trail), and the rig
-run for the rig-pending clauses (the discrete-GPU
-capture-visibility behavior and the driver-forced depth-fallback
-paths — the RTX 5070 Ti procedure,
-`docs/WINDOWS-GPU-PROFILING-KIT.md`).
+the recursive queue empty. The merge GOs were given (2026-11-24): the
+union landing PR #29 carried the eight-package sequence with the two
+#21×#23 merge-time fixes and the measured union counts (the
+2026-11-24 union rehearsal, `corrective/union-rehearsal` / PR #28's
+comment trail), with #30–#32's stacked coverage and PR #28's own
+reconciliation following. The rig run for the rig-pending clauses
+(the discrete-GPU capture-visibility behavior and the driver-forced
+depth-fallback paths — the RTX 5070 Ti procedure,
+`docs/WINDOWS-GPU-PROFILING-KIT.md`) remains the owner's.
+
+**The Era-2 mission (2026-11-24, the overnight autonomous run) —
+MERGED whole.** Package 1 (the animation + skinning + proxy-shadows
+ladder, PR #33) and the three recursive-phase documents (the NPC AI
+design pass #34, the physics middleware decision #35, the audio
+subsystem map #36) all took the owner's GO in one wave
+(2026-11-24T23:45Z), the #33 merge-commit CI green on all five jobs
+with the exact-count pins enforced. What awaits the owner now: the
+rig commands — `cargo run -p engine-slice --release -- --corner
+--populated --shadows` and its `--free-look` variant walk the moving
+corner (24 NPCs, 16 walking at hand-spread phases, per-NPC soft
+shadows that walk with them, 2 sedans); the Era-1 rig-pending clauses
+above; the documented follow-ups (the shadowed-HDR variant — `--post`
+with `--populated --shadows` draws the proxies unshadowed-in-HDR, PR
+#33's body; the skinned family's pass-independent ownership transfer
+that would restore the flat replacement tuple — the
+renderer-architecture follow-up PR #33's body records; the s6_soak
+fsync-race test-only seam, §8); and the three documents' owner
+decisions (the NPC AI design pass's unratified boundaries, T-06's
+physics middleware recommendation awaiting ratification in
+`docs/DECISIONS.md`, the audio subsystem map's groundwork
+priorities).
+
+**The Era-2 package A arc (2026-11-25, the overnight continuation
+beyond the mission file's terminal queue — the design pass as the
+implementation brief): parts 1-2 MERGED/DELIVERED, parts 3-4
+DELIVERED.** Part 1: the NPC AI deterministic cores (PR #37, the
+owner's GO at 02:02Z; the design pass's §3–§6 as three additive
+pure engine-core modules — §2's record carries the contracts and
+pins). Part 2: the spine integration (`era2/npc-ai-spine-integration`,
+stacked on the #38 reconciliation — §6.2's contract on the real
+queue, the spine untouched; §2's record carries the machinery, the
+battery, and the measured pins). Part 3: the locomotion batch
+(`era2/npc-ai-locomotion-batch`, stacked on part 2 — §4.3's
+near-lane batch + §4.2's Full-tier locomotion integration; §2's
+record carries the machinery, the battery, the measured digest
+pin, and the §8.5 measurement). Part 4: the rendering bridge
+(`era2/npc-ai-rendering-bridge`, stacked on part 3 — §7's contract
+landed: the corner demo's populated route reads BEHAVIOR STATE,
+the locomotion population stepped per presented frame at the
+deterministic clock (render-then-step, dt = 1/60) with the
+instances and pose blocks re-evaluated into retained buffers —
+zero per-frame allocation, MEASURED: 0 host allocations per warmed
+moving frame and `renderer.allocations()` constant across the
+warmed animated window; the corner's walking lanes as pure data —
+eight far-segment flank loops with lanes exactly 0.75 m apart (the
+different-NPC margin met by construction, dyadic coordinates), two
+crosswalk pacers at the original crossers' exact spots, the
+waiters byte-identical; the swept-validity battery repaired to
+measure every sample unconditionally (the WIP's min-coord filter
+silently dropped the road-side lanes and every pacer sample — the
+weakened-gate class, barred) and the 663-frame temporal campaign
+pinned (double-run byte-identical, the locomotion digest at
+0/33/66/300/600/662, pairwise walker clearance ≥ 0.75 — the
+measured minimum EXACTLY the lane separation — and waiter-waiter
+≥ 0.7, the original table's cardinal rule); the render_instanced
+gates re-pinned on the locomotion source (the moving-crowd 26-vs-2
+byte equality, the frame-0 static fixtures, the allocation
+constancy under motion); heavy shard 591 → 599 Linux MEASURED
+with the workflow's own awk, main shard untouched at 1295/2/33).
+The remaining part, in the design pass's own order: the
+**composition gates** (§8.4 — the named verification strategy,
+including the allocation-counting gate on the warmed behavior
+path over the composed world). The design pass's §9
+open-questions list still awaits the owner.
 
 ## 10. The authoritative coordination ledger
 
@@ -1114,6 +1384,17 @@ paths — the RTX 5070 Ti procedure,
   `docs/`); this index carries the technical status, the ledger carries the
   campaign/operational state.
 
+**Present state (verified 2026-11-24, the post-merge session):** the
+ledger directory is absent from the current pod provisioning
+(`/home/coder/sektor7-coordination/` does not exist — the pod was
+re-provisioned, taking the directive files with it). The durability
+clause above anticipated the reset half: this index and the
+repository's own records (commit messages, `docs/`, the PR trails on
+GitHub) are the surviving technical authority — matching the standing
+mission rule that all durable state lives in the repo, branches, and
+PRs. The overnight supervisor's operational records live at the pod
+root (`OVERNIGHT-STATUS.md`, outside the repo by the same charter).
+
 ---
 
 ## The capability-readiness matrix
@@ -1130,8 +1411,8 @@ not implemented** / **not yet designed**.
 | Shader/material architecture | Prototype only | Hand-written build-time naga shaders; no material system |
 | GPU resource streaming | Not yet designed | F-04 deferred; host-visible copies only |
 | Instanced/indirect draws | **Implemented (6-E + 6-E2)** | The Cycle 6-E implementation landed 2026-11-23 on the scaffold's deterministic core (the libm-free turn-fraction transforms, the byte-pinned packing, the proxy meshes, the `instanced_proxy.wgsl` shader): the instance-rate vertex input, the lazily-created zero-per-frame-allocation instance buffer (allocations constant across warmed populated frames), one draw call per populated kind (the populated corner route: **26 instances — the full 24-NPC + 2-vehicle placement table, the ladder's population package `corner_population`, pure data with a placement-validity battery and its own packed-bytes FNV pin — in 2 calls**), the N-vs-1 pixel-equivalence gate (`tests/render_instanced.rs`, byte-equal frames for BOTH the 13-instance fixture and the shipped 24+2 table, per-pixel 6-B oracle checks at 0/255 max error on lavapipe), the draw-call pins, and the `--corner --populated` demo mode — see `docs/CYCLE6-6E-BRIEF.md`. The Cycle 6-E2 package (2026-11-23, riding the population branch) added the indirect submission: `ProxyDrawMode::Indirect` — one `vkCmdDrawIndirect` per populated kind with the counts read from GPU memory, the pure byte-pinned `proxy_indirect` command core (FNV cross-platform pin, `firstVertex`/`firstInstance` pinned zero — no `drawIndirectFirstInstance` feature), a lazily-created per-frame-slot mapped command buffer (one-time +1 device_memory, pinned; the direct path's counters untouched), byte-equal frames across per-object/direct/indirect submissions (the third `render_instanced` gate, with an oracle wall through the indirect path), and the populated route's default submission now indirect (`--proxy-instanced` selects the direct 6-E shape). GPU-side count AUTHORSHIP (compute/culling writing the counts) remains deferred to the GPU-culling package. The rig measurement commands live in the 6-E/6-E2 PRs (lavapipe is correctness evidence only) |
-| Directional shadows | **Implemented (6-F)** | The Cycle 6-F implementation landed 2026-11-23: the deterministic core (the light-space orthographic cascade, the compare-time slope-scaled bias model, the CPU raycaster oracle — pure IEEE, unit-pinned) + the depth-only pass + the shadowed lit pipeline sampling the map (hard shadows, one cascade, the corner scene). The gates: the map's known-answer (every texel vs the raycaster, max |Δdepth| 2.7e-7 on lavapipe) and the pixel equivalence (a shadowed ground patch renders exactly `albedo·ambient`, a lit patch the unshadowed equation, the unshadowed path pixel-identical) — `tests/render_shadows.rs`, executed by the CI's Linux Vulkan step. The `--corner --shadows` demo mode runs the full route. PCF/softening, cascaded splits, and proxy shadows are open |
-| NPC/world representation (LOD) | Partially implemented | The region director, four LOD levels, activation/reconstruction — validated at 1000 NPCs / 8 regions; game-scale behaviors undesigned |
+| Directional shadows | **Implemented (6-F + Era-1 PCF + Era-2 proxy shadows)** | The Cycle 6-F implementation landed 2026-11-23: the deterministic core (the light-space orthographic cascade, the compare-time slope-scaled bias model, the CPU raycaster oracle — pure IEEE, unit-pinned) + the depth-only pass + the shadowed lit pipeline sampling the map (one cascade, the corner scene — PCF-softened since Era-1 package 2). The gates: the map's known-answer (every texel vs the raycaster, max |Δdepth| 2.7e-7 on lavapipe) and the pixel equivalence (a shadowed ground patch renders exactly `albedo·ambient`, a lit patch the unshadowed equation, the unshadowed path pixel-identical) — `tests/render_shadows.rs`, executed by the CI's Linux Vulkan step. The `--corner --shadows` demo mode runs the full route. PCF softening (Era-1 package 2, the 3×3 `shadow_filter` tap table shared verbatim with the CPU oracle) and proxy shadows (Era-2, PR #33 — the populated path casting AND receiving, the skinned per-NPC depth casts) are landed; cascaded splits remain open |
+| NPC/world representation (LOD) | Partially implemented | The region director, four LOD levels, activation/reconstruction — validated at 1000 NPCs / 8 regions; the NPC AI design pass merged (#34) with its deterministic cores landed (PR #37: the behavior selector machinery, the schedule layer, the perception layer — pure, pinned), the spine integration landed (package A part 2: commitment wakes as spine events, the witness census, the honest re-arm — pinned by the integration battery), and the locomotion batch landed (package A part 3: routes as pure data with authored turns, the hand-spread draws, the position bridge, the identity-ordered zero-allocation batch step, the pinned-blocked collision composition — pinned by the 18-test battery with the campaign gates over a real spine, §8.5's p99 measurement discharged: 4.7 µs/tick at the corner's 24 walkers, 70.7 µs/tick at the 1,000-walker pathological case on this pod); the rendering bridge and composed gates remain (package A's remaining parts) |
 | Physics and collision | Prototype only | The Cycle-1 kinematic player prototype (`engine-core` player module: swept-AABB collision, fixed-step movement, FP/TP cameras) — headless/offscreen validated, collide-what-you-see; reversible and explicitly NOT a ratified production physics backend (§8) |
 | Combat and gameplay systems | Partially implemented (demo-scale prototype, validated) | The Cycle 2–5 line: `engine-core` combat resolution (`resolve_attack`, pure, allocation-free) + the adversary cadence model + the encounter composition with cover/HUD/cues in `engine-slice` — pinned by the combat_world (21) and encounter_world (30) batteries with byte-identical scenario traces; game-scale gameplay systems (progression, economy, AI beyond the cadence prototype) remain undesigned |
 | Networking and replication | In-session boundaries **designed (unratified)** | The player-facing multiplayer and governance rules are **ratified** in `docs/MULTIPLAYER-SPEC.md`; the campaign-level authority/persistence research lives in `docs/MULTIPLAYER-ARCHITECTURE-RESEARCH.md` (unapproved); the **in-session architecture** — sim placement, input ordering, replication scope, divergence detection, session lifecycle — is designed in `docs/CYCLE6-6D-SESSION-REPLICATION-BOUNDARIES.md` (**unratified**; owner decision list §9); transport/provider selection remains undesigned (T-06 deferral) |

@@ -1494,3 +1494,172 @@ pub fn run_entity_scale_benchmark() {
         }
     }
 }
+
+/// Era 2 package A part 3: the locomotion-batch scale benchmark —
+/// `npc_locomotion::advance_batch` over the present population, the
+/// §8.5 measurement plan's first two numbers (p99 per-tick cost at
+/// the corner's 24-NPC scale and at the 1,000-near pathological
+/// all-present case, with and without the near-tier collision
+/// query). Pod results, observational (never CI thresholds, never
+/// physical-rig claims); the double-run determinism proof is asserted
+/// like the entity-scale benchmark's.
+pub fn run_locomotion_scale() {
+    use engine_core::npc_locomotion::{
+        LOOPING, NpcLocomotion, Route, RouteLeg, advance_batch, start_route,
+    };
+
+    println!("Locomotion-batch scale benchmark — the §4.3 near-lane batch step");
+    println!("  pod results, observational (never CI thresholds, never physical-rig claims)");
+
+    // The shared sidewalk loop: a 24-unit square (perimeter 96) at
+    // 1.4 units/s walking speed, 1.54 units per stride (the demo's
+    // 1.1 s walk cycle), 0.5 spread width, 400 turn units/tick.
+    let sidewalk = Route::new(
+        [0.0, 0.0],
+        vec![
+            RouteLeg {
+                to: [24.0, 0.0],
+                turn: 0,
+            },
+            RouteLeg {
+                to: [24.0, 24.0],
+                turn: 16384,
+            },
+            RouteLeg {
+                to: [0.0, 24.0],
+                turn: 32768,
+            },
+            RouteLeg {
+                to: [0.0, 0.0],
+                turn: 49152,
+            },
+        ],
+        1.4,
+        0.5,
+        1.54,
+        400,
+        true,
+        0,
+    )
+    .expect("the sidewalk loop closes");
+    let routes = [sidewalk];
+
+    // The 60 Hz fixed tick.
+    let dt = 1.0f32 / 60.0;
+    // The humanoid box (the near-tier kinematic query's shape).
+    const NPC_HALF: f32 = 0.25;
+    const NPC_HEIGHT: f32 = 1.75;
+
+    // A world with one blocker ON the loop's first leg (x = 12 on
+    // the z = 0 band — the box spans z ∈ [−0.5, 0.5], overlapping
+    // every walker of that leg): the blocked lane every leg-0 walker
+    // pins against (the pinned-blocked idempotence path, measured).
+    let blocked_world =
+        engine_core::player::CollisionWorld::new(0.0).with_box([12.0, 0.0, 0.0], 1.0, 2.0);
+    // A world whose boxes sit BESIDE the path (z = ±2, clear of the
+    // ±0.75 walker box — queries all miss: the no-hit query cost).
+    let clear_world = engine_core::player::CollisionWorld::new(0.0)
+        .with_box([12.0, 0.0, 2.0], 1.0, 2.0)
+        .with_box([12.0, 0.0, -2.0], 1.0, 2.0);
+
+    /// One measured configuration: warms `WARM` ticks, records
+    /// `MEASURED` ticks of the batch step, and returns the samples
+    /// plus the terminal states (the determinism double-run's
+    /// comparison). `at` is the shared start waypoint.
+    fn measure(
+        routes: &[Route],
+        population: usize,
+        seeds_from: u32,
+        at: u32,
+        world: Option<&engine_core::player::CollisionWorld>,
+        dt: f32,
+    ) -> (engine_core::timing::TimingSamples, Vec<NpcLocomotion>) {
+        const WARM: u64 = 256;
+        const MEASURED: u64 = 2048;
+        let mut states: Vec<NpcLocomotion> = (0..population)
+            .map(|i| {
+                start_route(0, &routes[0], seeds_from + i as u32, at, LOOPING)
+                    .expect("the stroll arms")
+            })
+            .collect();
+        let present = vec![true; population];
+        for _ in 0..WARM {
+            advance_batch(
+                routes,
+                &mut states,
+                &present,
+                dt,
+                world,
+                NPC_HALF,
+                NPC_HEIGHT,
+            );
+        }
+        let mut samples = engine_core::timing::TimingSamples::default();
+        for _ in 0..MEASURED {
+            let started = std::time::Instant::now();
+            advance_batch(
+                routes,
+                &mut states,
+                &present,
+                dt,
+                world,
+                NPC_HALF,
+                NPC_HEIGHT,
+            );
+            samples.record(started.elapsed());
+        }
+        (samples, states)
+    }
+
+    let report = |label: &str, population: usize, samples: &engine_core::timing::TimingSamples| {
+        let p50 = samples.percentile_ms(0.50);
+        let p99 = samples.percentile_ms(0.99);
+        let max = samples.max_ms();
+        let per_npc_us = p99 * 1000.0 / population as f64;
+        println!(
+            "  {label}: {population} NPCs, {} samples — p50 {p50:.4} ms, p99 {p99:.4} ms, max {max:.4} ms, p99 per-NPC {per_npc_us:.4} us",
+            samples.sample_count(),
+        );
+    };
+
+    // The corner shape: 24 walkers on the first band, one blocking
+    // collider on it (the realistic blocked lane — cost is identical
+    // wherever the walkers start).
+    let (samples, states_a) = measure(&routes, 24, 1, 0, Some(&blocked_world), dt);
+    let (_, states_b) = measure(&routes, 24, 1, 0, Some(&blocked_world), dt);
+    assert_eq!(states_a, states_b, "the corner batch is deterministic");
+    report("corner-blocked (24 walkers, one pinned lane)", 24, &samples);
+
+    // The pathological all-present case, no hits: 1,000 walkers
+    // spread over the four waypoints, boxes beside the path (every
+    // query misses).
+    let (samples, states_a) = measure(&routes, 1000, 100, 2, Some(&clear_world), dt);
+    let (_, states_b) = measure(&routes, 1000, 100, 2, Some(&clear_world), dt);
+    assert_eq!(states_a, states_b, "the all-present batch is deterministic");
+    report("all-present-1000 (queries miss)", 1000, &samples);
+
+    // The pathological blocked case: 1,000 walkers all started on
+    // leg 0 against the ON-path blocker — every one of them reaches
+    // the box (12 units at ~0.0233 units/tick ≈ 515 ticks, well
+    // inside the 2,048-tick window) and stays pinned: the maximum
+    // collision cost, every walker depenetrating every tick.
+    let (samples, states_a) = measure(&routes, 1000, 200, 0, Some(&blocked_world), dt);
+    let (_, states_b) = measure(&routes, 1000, 200, 0, Some(&blocked_world), dt);
+    assert_eq!(states_a, states_b, "the all-blocked batch is deterministic");
+    report(
+        "all-present-1000-blocked (every walker pinned)",
+        1000,
+        &samples,
+    );
+
+    // The no-collision counterfactual at scale (the pure arithmetic).
+    let (samples, states_a) = measure(&routes, 1000, 300, 3, None, dt);
+    let (_, states_b) = measure(&routes, 1000, 300, 3, None, dt);
+    assert_eq!(
+        states_a, states_b,
+        "the no-collision batch is deterministic"
+    );
+    report("all-present-1000 (no collision query)", 1000, &samples);
+
+    println!("  determinism: DOUBLE-RUN IDENTICAL (every configuration)");
+}
