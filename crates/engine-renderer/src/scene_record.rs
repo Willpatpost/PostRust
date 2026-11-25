@@ -217,9 +217,9 @@ pub(crate) unsafe fn record_corner_scene(
             "the shadowed-proxy ensure discipline makes a populated shadowed frame's \
              missing shadowed-proxy state unreachable",
         );
-        let skinned = pipes.skinned.as_ref().expect(
+        let retained = ctx.skinned_retained.as_ref().expect(
             "the skinned ensure discipline makes a populated frame's \
-             missing skinned state unreachable",
+             missing retained state unreachable",
         );
         let proxy_state = pipes.proxy.as_ref().expect(
             "the proxy ensure discipline makes a populated shadowed frame's \
@@ -241,7 +241,7 @@ pub(crate) unsafe fn record_corner_scene(
                     upload.npc_material,
                     slot,
                     shadow_state.frame_stride(),
-                    skinned.pose_offset(slot),
+                    retained.pose_offset(slot),
                 );
             let skinned_bind = crate::vulkan::proxy_draw::SkinnedSetBind {
                 layout: skinned_layout,
@@ -320,7 +320,11 @@ pub(crate) unsafe fn record_corner_scene(
             // mirror), so a populated npc kind's set is Some.
             let skinned_state = pipes.skinned.as_ref().expect(
                 "the skinned ensure discipline makes a populated frame's \
-                 missing skinned state unreachable",
+                 missing skinned pipelines unreachable",
+            );
+            let retained = ctx.skinned_retained.as_ref().expect(
+                "the skinned ensure discipline makes a populated frame's \
+                 missing retained state unreachable",
             );
             let skinned_pipeline = targets.proxy_skinned.unwrap_or_else(|| {
                 debug_assert!(
@@ -330,12 +334,12 @@ pub(crate) unsafe fn record_corner_scene(
                 skinned_state.pipeline()
             });
             let skinned_bind = crate::vulkan::proxy_draw::SkinnedSetBind {
-                layout: skinned_state.pipeline_layout(),
-                set: skinned_state
+                layout: retained.pipeline_layout(),
+                set: retained
                     .set(upload.npc_material)
                     .unwrap_or(vk::DescriptorSet::null()),
                 frame_offset: slot as u32 * corner_resources.dynamic_stride(),
-                pose_offset: skinned_state.pose_offset(slot),
+                pose_offset: retained.pose_offset(slot),
             };
             let vehicle_bind = crate::vulkan::proxy_draw::VehicleSetBind {
                 layout: pipes.proxy_layout,
