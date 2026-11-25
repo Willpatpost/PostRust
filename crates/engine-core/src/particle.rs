@@ -269,6 +269,32 @@ impl Emitter {
         self.overflow_total = 0;
     }
 
+    /// Refreshes the spawn volume IN PLACE (the listener-following
+    /// spawn box — the demo refreshes it every frame as the camera
+    /// moves). Validates exactly as construction (the same refusal
+    /// strings); the stream, the accumulator, and the live pool are
+    /// UNTOUCHED — only where future spawns land changes. [Document
+    /// why: the emitter's config is otherwise immutable; the rain
+    /// volume follows the listener per the mission's
+    /// listener-relative discipline.]
+    pub fn set_volume(&mut self, volume: SpawnVolume) -> Result<(), &'static str> {
+        // Validate exactly as construction
+        let validated = EmitterConfig {
+            volume,
+            rate: self.config.rate,
+            base_velocity: self.config.base_velocity,
+            velocity_jitter: self.config.velocity_jitter,
+            lifetime: self.config.lifetime,
+            gravity: self.config.gravity,
+            drag_factor: self.config.drag_factor,
+            kill_y: self.config.kill_y,
+            seed: self.config.seed,
+        };
+        validated.validate()?;
+        self.config.volume = volume;
+        Ok(())
+    }
+
     /// One fixed-order tick. Phase 1, spawn: the accumulator gains
     /// `dt * rate`, clamps at [`SPAWN_ACCUMULATOR_CAP`], then drains
     /// one unit at a time — each unit spawns while the pool has
@@ -917,4 +943,61 @@ mod tests {
     /// The measured-actual campaign digest (the fixed campaign,
     /// folded at ticks 60, 120, ..., 600).
     const PINNED_CAMPAIGN_DIGEST: u64 = 16_840_467_954_493_462_700;
+
+    /// THE REFUSED REFRESH PRESERVES STATE (the volume refresh
+    /// contract: the listener-relative volume is validated before
+    /// patching; a refused refresh returns the construction refusal
+    /// AND leaves the state untouched — the digest before == after).
+    #[test]
+    fn refused_refresh_preserves_state() {
+        let mut emitter = Emitter::new(rain_like_campaign(0xC0FFEE)).unwrap();
+        // Drive 60 ticks to get a non-trivial state
+        for _ in 0..60 {
+            emitter.tick(1.0 / 60.0);
+        }
+        // Fold the state before
+        let mut before = Fingerprinter::new();
+        emitter.fold_state(&mut before);
+        let before_digest = before.finish();
+        // Attempt a refused refresh (inverted volume)
+        let bad_volume = SpawnVolume {
+            min: [20.0, 12.0, 20.0],
+            max: [-20.0, 16.0, -20.0],
+        };
+        assert_eq!(
+            emitter.set_volume(bad_volume),
+            Err("particle/volume-min-above-max-x")
+        );
+        // Fold the state after — must be identical
+        let mut after = Fingerprinter::new();
+        emitter.fold_state(&mut after);
+        let after_digest = after.finish();
+        assert_eq!(
+            before_digest, after_digest,
+            "the refused refresh left the state untouched"
+        );
+    }
+
+    /// THE NO-OP REFRESH PRESERVES THE STREAM (the volume refresh
+    /// contract: a no-op refresh — same min/max — leaves the stream
+    /// undisturbed; the next spawn draws from the SAME stream position
+    /// as it would have without the call).
+    #[test]
+    fn no_op_refresh_preserves_stream_position() {
+        let mut a = Emitter::new(rain_like_campaign(0xC0FFEE)).unwrap();
+        let mut b = Emitter::new(rain_like_campaign(0xC0FFEE)).unwrap();
+        // Drive both 60 ticks
+        for _ in 0..60 {
+            a.tick(1.0 / 60.0);
+            b.tick(1.0 / 60.0);
+        }
+        // The no-op refresh: same volume
+        let volume = rain_like_campaign(0xC0FFEE).volume;
+        assert!(b.set_volume(volume).is_ok());
+        // Drive one more tick — the spawns must match
+        let ra = a.tick(1.0 / 60.0);
+        let rb = b.tick(1.0 / 60.0);
+        assert_eq!(ra, rb, "the no-op refresh preserved the stream");
+        assert_eq!(a.particles(), b.particles(), "particle states match");
+    }
 }

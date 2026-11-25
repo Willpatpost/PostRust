@@ -543,6 +543,41 @@ ARM64) with a five-job CI:
   end-to-end: `--populated`, `--populated --behavior` (the exit
   summary reproducing 82 wakes / 9 arrivals digit-for-digit), and
   `--populated --shadows`, all 601 frames with validation 0/0).
+  The **Era-2 package C weather layer** (2026-11-25, PR #51's
+  stage 4+5, `corner_weather.rs`): the `--corner --populated
+  --weather rain` route — the deterministic rain field over the
+  living corner. The demo's `RainLayer` (the LocomotionCrowd
+  pattern): the engine-core `Emitter` (the weather model's
+  `rain_emitter_config` over the demo's authored `RainPolicy`:
+  rate 480/s, terminal fall ~9 m/s via gravity 9.81 + drag
+  0.982, lifetimes 0.9–1.4 s, the kill plane at the ground) with
+  the warm start (132 ticks — the first presented frame is
+  already wet), the per-frame listener-following spawn box
+  (x/z-quantized to 4 m cells so the field never slides with the
+  camera, refreshed through the ADDITIVE `Emitter::set_volume` —
+  the immutable-config gap the stage closed, validated exactly as
+  construction), the render-then-step fixed clock (dt = 1/60),
+  and the billboard streaks (the turn derived PHYSICALLY as
+  t = −yaw·65536/τ — `instance_columns` maps the mesh's +Z
+  normal to (sin t, 0, cos t); the camera at yaw θ looks along
+  (sin θ, 0, −cos θ); no quarter-turn offset — the first draft's
+  +16384 turned every streak edge-on, caught in the line review),
+  the tint riding the day/night cycle's `atmosphere_at` ambient,
+  `RAIN_MATERIAL` 0 (the asphalt noise texture), `RAIN_ALPHA`
+  0.35. The exit summary's census line: MEASURED
+  spawned=6360 died=6049 refused=0 final-active=311
+  volume-refreshes=21 over the 601-frame route (the conservation
+  exact, the pool-bound proof at the demo boundary). The stage-5
+  gates (`tests/render_weather.rs`, the five #[ignore]d lavapipe
+  gates + the packer's typed-refusal lib test): the ink-count
+  (MEASURED 492 differing bytes vs the rainless baseline, floor
+  200), the warmed both-counter allocation constancy (12
+  distinct captures — the field moves), the double-run
+  byte-equality, the rain-kind N-vs-1, and the populated-shadowed
+  composition smoke — all green on the pod's lavapipe. The
+  coordination record (four actors, two sessions, the contract
+  consolidation) lives in PR #51's trail and the pod-root
+  OVERNIGHT-STATUS.md.
 
 The **integrated campaign demo** (`--demo-persist`) is the vertical slice:
 one authoritative, persistently-orchestrated 1000-NPC / 8-region campaign
