@@ -317,6 +317,12 @@ pub struct Renderer {
     /// HDR render pass object) — the post CHAIN itself stays
     /// optional.
     wet: bool,
+    /// The rain-ripple field's packed uniform (Era-2 package C
+    /// recursive item 1): a fixed-size Copy, written by
+    /// `set_ripple_field` and copied into every wet frame's
+    /// `WetCamera` — zero per-frame allocation (the sticky-setting
+    /// precedent's frame-data lane).
+    ripple: vulkan::reflection_draw::RippleUniformData,
 }
 
 /// The Era-1 sky layer's frame description (the sticky `set_sky`
@@ -334,6 +340,16 @@ pub struct SkyFrame {
     /// normalizes it (the CPU core's contract).
     pub disc_dir: [f32; 3],
 }
+
+/// The ripple uv gain: the world-space gradient (slope ~ a0/w ≈
+/// 2.9 at the authored policy) scaled into screen-uv units — 0.0016
+/// ≈ 2 presentation texels at 1280 (the visible wobble; PROVISIONAL
+/// pending the stage-3 ink measurement, tuned before any gate floor
+/// is pinned).
+pub const RIPPLE_UV_GAIN: f32 = 0.0016;
+/// The ripple roughen gain: the bump coverage's dimming of the
+/// Schlick blend (0.5 = the peak coverage halves the mirror).
+pub const RIPPLE_ROUGHEN_GAIN: f32 = 0.5;
 
 impl Renderer {
     pub fn new(window: &SdlWindow, config: RenderConfig) -> Result<Renderer, RendererError> {
@@ -439,6 +455,7 @@ impl Renderer {
             sky: None,
             post: false,
             wet: false,
+            ripple: vulkan::reflection_draw::RippleUniformData::empty(),
         })
     }
 
@@ -982,9 +999,24 @@ impl Renderer {
         self.wet
     }
 
+    /// Sets the rain-ripple field for subsequent wet frames (None
+    /// clears — the empty uniform; the rainless wet path stays
+    /// byte-identical to Era-1's). The field is PACKED NOW, in fixed
+    /// order: rows[0] = (count, policy speed, policy width,
+    /// RIPPLE_UV_GAIN); rows[1] = (RIPPLE_ROUGHEN_GAIN, 0, 0, 0);
+    /// rows[2 + i] = (center_x, center_z, age, the faded amplitude
+    /// amplitude * (1.0 - age / lifetime) — the fade applied at read
+    /// time in the pinned order, never stored in the core).
+    pub fn set_ripple_field(&mut self, field: Option<&engine_core::ripple::RippleField>) {
+        self.ripple = pack_ripple_field(field);
+    }
+
     /// The wet reflection's camera description (the sticky
     /// setting's frame data — the true camera the mirrored math
-    /// consumes).
+    /// consumes, plus the packed ripple uniform the ground re-draw
+    /// perturbs with — the sticky `set_ripple_field` state rides the
+    /// per-frame camera description; `vulkan::render_frame`'s flat
+    /// parameter list does NOT change).
     fn wet_camera(
         &self,
         view_proj: &[[f32; 4]; 4],
@@ -995,6 +1027,7 @@ impl Renderer {
             view_proj: *view_proj,
             eye,
             light,
+            ripple: self.ripple,
         })
     }
 
@@ -1226,5 +1259,164 @@ impl Drop for Renderer {
         self.swapchain.destroy(&self.ctx);
         self.pipes.destroy(&self.ctx);
         self.ctx.destroy();
+    }
+}
+
+/// The ripple field's uniform packing (the pure core behind
+/// [`Renderer::set_ripple_field`] — device-free, the unit test's
+/// target). Fixed order, one pass, zero allocation: rows[0] =
+/// (active count — exact for ≤ 32, the pool's bound, policy speed,
+/// policy width, [`RIPPLE_UV_GAIN`]); rows[1] =
+/// ([`RIPPLE_ROUGHEN_GAIN`], 0, 0, 0); rows[2 + i] = (center_x,
+/// center_z, age, amplitude * (1.0 - age / lifetime) — the fade at
+/// read time, the core's pinned order). `None` packs the EMPTY
+/// uniform (all zeros — the shader's identity no-op, the rainless
+/// wet path's byte-identity).
+fn pack_ripple_field(
+    field: Option<&engine_core::ripple::RippleField>,
+) -> vulkan::reflection_draw::RippleUniformData {
+    let Some(field) = field else {
+        return vulkan::reflection_draw::RippleUniformData::empty();
+    };
+    let policy = field.policy();
+    let mut rows = [[0.0f32; 4]; vulkan::reflection_draw::RIPPLE_UNIFORM_ROWS];
+    rows[0] = [
+        field.active_count() as f32,
+        policy.speed,
+        policy.width,
+        RIPPLE_UV_GAIN,
+    ];
+    rows[1] = [RIPPLE_ROUGHEN_GAIN, 0.0, 0.0, 0.0];
+    for (i, ring) in field.rings().iter().enumerate() {
+        rows[2 + i] = [
+            ring.center[0],
+            ring.center[1],
+            ring.age,
+            ring.amplitude * (1.0 - ring.age / policy.lifetime),
+        ];
+    }
+    vulkan::reflection_draw::RippleUniformData { rows }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The test-authored ripple policy (the demo's
+    /// corner_weather::RIPPLE_POLICY numbers, verbatim): lifetime
+    /// 2.5 s, expansion 0.8 m/s, band half-width 0.35 m, peak
+    /// amplitude 1.0, one ring per landing drop.
+    fn ripple_policy() -> engine_core::ripple::RipplePolicy {
+        engine_core::ripple::RipplePolicy {
+            lifetime: 2.5,
+            speed: 0.8,
+            width: 0.35,
+            amplitude: 1.0,
+            decimation: 1,
+        }
+    }
+
+    /// THE PACKING KNOWN ANSWERS (the pure core behind
+    /// `set_ripple_field` — device-free; `set_ripple_field` is this
+    /// function's one-line delegation, so the None branch below IS
+    /// the `set_ripple_field(None)` branch): a RippleField driven
+    /// by hand, every expected value written as the SAME f32
+    /// expression the packing performs. The layout contract is the
+    /// shader's (ground_reflect.wgsl's RippleField block,
+    /// term-for-term): rows[0] = (count, speed, width, uv gain),
+    /// rows[1] = (roughen gain, 0, 0, 0), rows[2 + i] = (center_x,
+    /// center_z, age, faded amplitude).
+    #[test]
+    fn ripple_uniform_packing_known_answers() {
+        let dt = 1.0f32 / 60.0f32;
+        let mut field =
+            engine_core::ripple::RippleField::new(ripple_policy()).expect("the policy validates");
+        // One observed kill death at a known position, then one
+        // tick: the ring's age is exactly `0.0 + dt`.
+        assert_eq!(field.observe_death([-3.5, 1.7, 8.25]), None);
+        let report = field.tick(dt);
+        assert_eq!(report.active, 1);
+        let packed = pack_ripple_field(Some(&field));
+        assert_eq!(
+            packed.rows[0],
+            [1.0, 0.8, 0.35, RIPPLE_UV_GAIN],
+            "rows[0]: the live count and the policy's speed/width over the uv gain"
+        );
+        assert_eq!(
+            packed.rows[1],
+            [RIPPLE_ROUGHEN_GAIN, 0.0, 0.0, 0.0],
+            "rows[1]: the roughen gain"
+        );
+        let age = 0.0f32 + dt;
+        assert_eq!(
+            packed.rows[2],
+            [-3.5, 8.25, age, 1.0f32 * (1.0f32 - age / 2.5f32)],
+            "rows[2]: the landing column, the accumulated age, the faded amplitude"
+        );
+        // The unused ring rows stay zero (the shader reads only
+        // rings[0..count] — the tail is never observed, but the
+        // packing's full-row initialization keeps it exact zeros).
+        for row in &packed.rows[3..] {
+            assert_eq!(*row, [0.0; 4], "the unused ring rows are zero");
+        }
+
+        // More deaths + ticks: the count row and the per-ring ages.
+        // Ring 0 has aged 3 ticks; rings 1 and 2 (observed after
+        // tick 1) have aged 2 — each age is its OWN f32
+        // accumulation, replicated here in the tick order, never
+        // n*dt directly.
+        assert_eq!(field.observe_death([1.0, 1.7, -2.0]), None);
+        assert_eq!(field.observe_death([2.5, 1.7, 4.0]), None);
+        let mut age_first = 0.0f32;
+        let mut age_rest = 0.0f32;
+        age_first += dt; // tick 1 (ring 0 alive, rings 1/2 not yet born)
+        age_first += dt; // tick 2 (all three alive)
+        age_rest += dt;
+        age_first += dt; // tick 3
+        age_rest += dt;
+        let _report = field.tick(dt); // tick 2
+        let report = field.tick(dt); // tick 3
+        assert_eq!(report.active, 3);
+        let packed = pack_ripple_field(Some(&field));
+        assert_eq!(packed.rows[0][0], 3.0, "three live rings");
+        assert_eq!(packed.rows[0][1], 0.8);
+        assert_eq!(packed.rows[0][2], 0.35);
+        assert_eq!(packed.rows[0][3], RIPPLE_UV_GAIN);
+        assert_eq!(
+            packed.rows[2],
+            [
+                -3.5,
+                8.25,
+                age_first,
+                1.0f32 * (1.0f32 - age_first / 2.5f32)
+            ],
+            "ring 0: three accumulated ticks"
+        );
+        assert_eq!(
+            packed.rows[3],
+            [1.0, -2.0, age_rest, 1.0f32 * (1.0f32 - age_rest / 2.5f32)],
+            "ring 1: two accumulated ticks"
+        );
+        assert_eq!(
+            packed.rows[4],
+            [2.5, 4.0, age_rest, 1.0f32 * (1.0f32 - age_rest / 2.5f32)],
+            "ring 2: two accumulated ticks"
+        );
+        for row in &packed.rows[5..] {
+            assert_eq!(*row, [0.0; 4]);
+        }
+
+        // set_ripple_field(None) — the exact branch it runs — packs
+        // the EMPTY uniform (all zeros; the shader's count gate
+        // makes it the bit-identity no-op).
+        let cleared = pack_ripple_field(None);
+        assert_eq!(
+            cleared,
+            vulkan::reflection_draw::RippleUniformData::empty(),
+            "None clears to the empty uniform"
+        );
+        for row in &cleared.rows {
+            assert_eq!(*row, [0.0; 4], "the empty rows are all zeros");
+        }
     }
 }

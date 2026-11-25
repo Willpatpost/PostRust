@@ -380,14 +380,19 @@ mod tests {
     /// constants, and the quantized listener volume at eye
     /// [-5.0, 1.7, 13.0] — derived: qx = round(-5/4)*4 = -4,
     /// qz = round(13/4)*4 = 12, half-extent 20, the 12 m band above
-    /// the eye — the box [-24.0, 1.7, -8.0] to [16.0, 13.7, 28.0].
-    /// Through `rain_emitter_config` the band rides the observed
+    /// the eye — the box [-24.0, 1.7, -8.0] to [16.0, 13.7, 32.0]
+    /// (12 + 20 = 32; the stage-1 fixture's 28.0 was an arithmetic
+    /// slip in the derivation write-up — the corrective re-pins the
+    /// digest below for the true box; the kill counts are
+    /// UNAFFECTED, kills are y-dynamics only — the RainLayer's
+    /// warm window measured the same 5 on both boxes). Through
+    /// `rain_emitter_config` the band rides the observed
     /// ceiling (spawn y in [13.7, 25.7]) and the kill plane sits at
     /// the observed floor (y = 1.7).
     fn demo_rain_emitter() -> Emitter {
         let observed = SpawnVolume {
             min: [-24.0, 1.7, -8.0],
-            max: [16.0, 13.7, 28.0],
+            max: [16.0, 13.7, 32.0],
         };
         let config = rain_emitter_config(
             Weather::rain(1.0),
@@ -985,7 +990,18 @@ mod tests {
     /// The measured-actual campaign digest (the fixed campaign's
     /// field state, folded at campaign ticks 60, 120, ..., 600 —
     /// measured 2026-11-25, cross-platform by f32 determinism).
-    const PINNED_CAMPAIGN_DIGEST: u64 = 8_954_201_978_366_776_380;
+    /// RE-PINNED with cause (the z-extent corrective): the stage-1
+    /// fixture's observed box carried an arithmetic slip in the
+    /// derivation write-up (max z 28.0; the true quantized box is
+    /// max z 32.0 — qz + 20). The z draws change, so the digest
+    /// moved from 8954201978366776380 to the value below; the kill
+    /// counts are UNAFFECTED (kills are y-dynamics only — the
+    /// RainLayer's warm window measured the same 5 kill deaths on
+    /// both boxes), and the fixture now IS the demo's exact emitter
+    /// (the RainLayer's own campaign digest — engine-slice's
+    /// ripple_campaign_digest_pin — pins the SAME u64: one
+    /// campaign, two proofs, one digest).
+    const PINNED_CAMPAIGN_DIGEST: u64 = 6_501_874_864_611_424_535;
 
     /// Reset replays identically (the particle reset pattern): drive
     /// 300 ticks (folding every 60th), reset BOTH halves, replay in

@@ -43,6 +43,29 @@ struct FrameParams {
 @group(0) @binding(3)
 var<uniform> frame: FrameParams;
 
+// THE RIPPLE FIELD (Era-2 package C recursive item 1 — the rain
+// ripples on the wet ground): the live ring set as a uniform block
+// at binding 4 (the binding map's free slot — 0/2/3 are the
+// reflection view, sampler, and frame block; binding 1 remaps onto
+// descriptor 0 and is unusable, the header's transport note).
+// LAYOUT (must match the CPU packer in reflection_draw.rs
+// term-for-term): params0 = (live count, expansion speed m/s,
+// band width m, uv gain); params1 = (roughen gain, 0, 0, 0);
+// rings[i] = (center_x, center_z, age s, current amplitude).
+// THE EMPTY FIELD IS A NO-OP BY IEEE IDENTITY (the identity gate's
+// proof): count 0 skips the loop, uv_offset stays (0,0) and
+// screen_uv + (0,0) is bit-identical for the positive screen_uv
+// values, roughen stays 0.0 and blend * (1.0 - 0.0 * g) == blend
+// exactly — the rainless wet path renders Era-1's wet frame
+// byte-for-byte.
+struct RippleField {
+    params0: vec4<f32>,
+    params1: vec4<f32>,
+    rings: array<vec4<f32>, 32>,
+};
+@group(0) @binding(4)
+var<uniform> ripple_field: RippleField;
+
 // The position output is `@invariant` (Era-1 review finding 19):
 // this re-draw depth-tests EQUAL (no depth write) against the depth
 // lit_scene.wgsl / lit_scene_shadowed.wgsl wrote for the SAME
@@ -82,7 +105,45 @@ fn fs_main(@location(0) world_normal: vec3<f32>,
     // ground point (1:1 — the target is the frame's extent).
     let extent = vec2<f32>(textureDimensions(reflection_tex));
     let screen_uv = frag.xy / extent;
-    let reflection = textureSample(reflection_tex, reflection_sampler, screen_uv).rgb;
+    // THE RIPPLE PERTURBATION (the design seed's classic water
+    // distortion): each live ring's triangle-bump GRADIENT at this
+    // ground point offsets the reflection sample's screen_uv, and
+    // the bump's height slightly roughens the Schlick blend (a bumpy
+    // surface mirrors less). The band gate `band < width` coincides
+    // EXACTLY with the bump's support (the bump is zero at the
+    // edges), so the gate never cuts a nonzero height — the one
+    // deliberate stylization is the GRADIENT's edge step (a triangle
+    // bump's gradient is piecewise-constant; the stylized hard ring
+    // edge every game water carries — documented, visual policy).
+    var uv_offset = vec2<f32>(0.0, 0.0);
+    var roughen = 0.0f;
+    let ripple_count = i32(ripple_field.params0.x);
+    if (ripple_count > 0) {
+        for (var i = 0; i < ripple_count; i = i + 1) {
+            let ring = ripple_field.rings[i];
+            let delta = vec2<f32>(world_pos.x - ring.x, world_pos.z - ring.y);
+            let dist = sqrt(dot(delta, delta));
+            let radius = ripple_field.params0.y * ring.z;
+            let band = abs(dist - radius);
+            let width = ripple_field.params0.z;
+            if (band < width) {
+                // the signed slope: +amp/width inside the ring line,
+                // - outside (one subtraction and a sign — fixed order)
+                let slope = ring.w / width;
+                let signed = select(slope, -slope, dist > radius);
+                // the radial direction (dist == 0 has none: zero
+                // contribution — the exact center of a ring)
+                let dir = select(vec2<f32>(0.0, 0.0), delta / dist, dist > 0.0);
+                uv_offset = uv_offset + dir * (signed * ripple_field.params0.w);
+                roughen = roughen + ring.w * (1.0 - band / width);
+            }
+        }
+    }
+    let reflection = textureSample(
+        reflection_tex,
+        reflection_sampler,
+        screen_uv + uv_offset,
+    ).rgb;
     // Schlick's blend by view angle — planar.rs ::
     // reflection_blend, term-for-term (the eye from the frame
     // block's spare lanes, the same convention lit_scene carries).
@@ -93,5 +154,10 @@ fn fs_main(@location(0) world_normal: vec3<f32>,
     let one_minus = 1.0 - n_dot_v;
     let pow5 = one_minus * one_minus * one_minus * one_minus * one_minus;
     let blend = 0.02 + 0.98 * pow5;
-    return vec4<f32>(reflection, blend);
+    // The roughening: the ripple peaks dim the mirror (blend scaled
+    // toward zero by the bounded roughen coverage; min clamps the
+    // overlap of many rings; the empty field leaves blend exactly
+    // untouched — 1.0 - 0.0 * g == 1.0, blend * 1.0 == blend).
+    let roughened = blend * (1.0 - min(roughen, 1.0) * ripple_field.params1.x);
+    return vec4<f32>(reflection, roughened);
 }
