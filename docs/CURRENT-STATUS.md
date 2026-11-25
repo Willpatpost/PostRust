@@ -99,8 +99,41 @@ ARM64) with a five-job CI:
   The engine/policy boundary held throughout: the selector MACHINERY,
   the calendar queries, and the census mechanism are engine; the rule
   tables, schedule content, and perception classes are policy authored
-  above. The spine integration, locomotion batch, rendering bridge,
-  and gates follow as package A's remaining parts.
+  above. The **spine integration** (package A part 2, `npc_execution.rs`
+  — §6.2's contract landed on the real queue, additive, the spine
+  itself untouched): the **event payload codecs** (tags 0xA1/0xA2 in
+  bits 63..56, the full-32-bit npc field, the 24-bit arg with the
+  TYPED pack refusal — an unrepresentable arg is `None`, never a
+  silent truncation; the namespace-collision proof against the
+  routine layout pinned by test); `evaluate_wake` (the per-event
+  LAZY need decay — cost per event, not per tick, §4.2's EventDriven
+  shape; the schedule-authority selection from the EVENT's own
+  payload, never a calendar re-derivation; and the HONEST RE-ARM
+  anchored at actual execution — a late wake skips missed
+  occurrences, never fires them in a burst); `evaluate_witness`
+  (§4.1's perception selection boundary — the fired perceptions
+  offered to the rule table, no schedule authority);
+  `enumerate_witnesses` (the §5.1 inverted census into a
+  caller-owned cleared scratch — population order, the LANDED
+  four-tier budget table as the single tier authority, the
+  fail-closed radii); `retain_trace` (§5.2's retention: oldest-first
+  eviction at the tier budget, the zero-budget append refused);
+  and `execution_digest` (the §8.4 gate-2 byte pin over (tick, npc,
+  activity) in `decision_digest`'s exact field order) — pinned by a
+  14-test battery whose five INTEGRATION tests drive a real
+  `Spine::with_reservation` through a test-side `World` (game
+  policy by placement): the seeded double-run byte-identity (stream
+  digest AND world fingerprint), the measured stream-digest pin
+  10778018066104731562, the E-10 synchrony cluster (40 same-tick
+  near commitments absorbed by the reservation, none dropped), the
+  late-arrival honest skip (intended 5, executed 9 under a held
+  reservation — the re-arm jumps the missed 8-occurrence to 11, the
+  chain on time from the shift onward), and the witness census with
+  `depends_on` causality (the dormant NPC inside the radius
+  witnesses nothing). `npc_schedule`'s `Commitment::next_occurrence`
+  made public as the per-entry re-arm anchor (the private logic,
+  byte-identical). The locomotion batch, rendering bridge, and
+  composed gates follow as package A's remaining parts.
 - **`engine-persist`** — the persistence stack: SHA-256 content-addressed
   revision store; `CanonicalMedium` boundary with **two production mediums
   carrying distinct durability contracts** — SQLiteMedium
@@ -296,28 +329,33 @@ for the combined candidate.
 
 | CI partition | Linux | Windows |
 |---|---:|---:|
-| Main shard (`--workspace --exclude engine-slice`) | 1263 | 1212 |
+| Main shard (`--workspace --exclude engine-slice`) | 1277 | 1226 |
 | Heavy shard (`-p engine-slice --features crash-test-seams`) | 591 | 590 |
-| **Combined** | **1854** | **1802** |
+| **Combined** | **1868** | **1816** |
 
 The macOS job has its own partition. Main has two ignored tests and 33
 result lines. Heavy has thirty-one ignored tests and 62 result lines.
-The table is settled at `main` @ `d9a034d` (2026-11-25, PR #37's merge
-— the Era-2 package A part-1 landing, the owner's GO at 02:02Z): the
-merge-commit run `45530057475` green on all five jobs enforcing these
-exact values (main 1263 Linux / 1212 Windows, 2 ignored / 33 result
-lines; renderer release 160/2 and heavy 591 Linux / 590 Windows with
-31 ignored / 62 result lines — both UNCHANGED, the package's 26 new
-tests being engine-core lib tests on the main shard only,
-platform-uniform). The package's own push history is the pin
-discipline on record: the first candidate `d47620e` failed the
-main-shard exact-count gate (run `45528096205`: expected 1237, the
-tree measured 1263 — the 26 new npc_behavior/npc_schedule/
-npc_perception tests), and the correction commit `d104094` re-pinned
-from the measured actual on both platforms (run `45529070104` green;
-Linux and Windows both measured by that candidate's own run) — the
-count corrected from actuals, never a test weakened. The prior
-settlements, superseded in order: `e4842d6` (2026-11-24, the Era-2
+The table is settled at the Era-2 package A part-2 tree
+(`era2/npc-ai-spine-integration`, 2026-11-25, stacked on the #38
+reconciliation — `d9a034d`'s code plus this package): main **1277
+Linux MEASURED with the workflow's own awk on this exact tree**
+(1277 passed / 2 ignored / 33 result lines, zero failures — the
+part-1 baseline 1263 plus npc_execution's 14 platform-uniform
+engine-core lib tests); Windows **1226** = 1212 + the same 14 (the
+platform-uniform inference — pure spine/IEEE arithmetic, no cfg
+gates, no Vulkan; to be confirmed by this candidate's CI run, the
+count corrected from actuals on a mismatch, never a test weakened);
+renderer release 160/2 and heavy 591 Linux / 590 Windows with 31
+ignored / 62 result lines UNCHANGED (the package touches engine-core
+only). The prior settlements, superseded in order: `d9a034d`
+(2026-11-25, PR #37's merge — the Era-2 package A part-1 landing,
+the owner's GO at 02:02Z; the merge-commit run `45530057475` green
+on all five jobs enforcing main 1263/1212, its own push history the
+pin discipline on record: the first candidate `d47620e` failed the
+main-shard exact-count gate — run `45528096205`: expected 1237, the
+tree measured 1263 — and the correction commit `d104094` re-pinned
+from the measured actual on both platforms, run `45529070104`
+green), `e4842d6` (2026-11-24, the Era-2
 mission's merged endpoint — PR #33's merge commit `5d991dd`, where
 the green five-job run `45512576593` enforced main 1237/1186 with
 renderer release 160/2 and heavy 591/590, followed by the three
@@ -1193,20 +1231,22 @@ priorities).
 
 **The Era-2 package A arc (2026-11-25, the overnight continuation
 beyond the mission file's terminal queue — the design pass as the
-implementation brief): part 1 MERGED.** The NPC AI deterministic
-cores (PR #37, the owner's GO at 02:02Z; the design pass's §3–§6 as
-three additive pure engine-core modules — §2's record carries the
-contracts and pins). The remaining parts, in the design pass's own
-order: the **spine integration** (§4.2/§6.2 — due commitments become
-`Schedule::AtLogicalTime` wake events in the NPC's region lane, the
-selector turns them into activities, a time-skip is the queue
-fast-forward over exactly the ticks `next_due` steps through); the
-**locomotion batch** (§4.3 — the near-field lane with f32 positions
-in fixed operation order, the committed location staying coarse);
-the **rendering bridge** (§7 — behavior state to walking pixels
-through PR #33's animation core); and the **composition gates**
-(§8.4 — the named verification strategy). The design pass's §9
-open-questions list still awaits the owner.
+implementation brief): part 1 MERGED, part 2 DELIVERED.** Part 1:
+the NPC AI deterministic cores (PR #37, the owner's GO at 02:02Z;
+the design pass's §3–§6 as three additive pure engine-core modules —
+§2's record carries the contracts and pins). Part 2: the spine
+integration (`era2/npc-ai-spine-integration`, stacked on the #38
+reconciliation — §6.2's contract on the real queue, the spine
+untouched; §2's record carries the machinery, the battery, and the
+measured pins). The remaining parts, in the design pass's own
+order: the **locomotion batch** (§4.3 — the near-field lane with
+f32 positions in fixed operation order, the committed location
+staying coarse); the **rendering bridge** (§7 — behavior state to
+walking pixels through PR #33's animation core); and the
+**composition gates** (§8.4 — the named verification strategy,
+including the allocation-counting gate on the warmed behavior
+path). The design pass's §9 open-questions list still awaits the
+owner.
 
 ## 10. The authoritative coordination ledger
 
@@ -1260,7 +1300,7 @@ not implemented** / **not yet designed**.
 | GPU resource streaming | Not yet designed | F-04 deferred; host-visible copies only |
 | Instanced/indirect draws | **Implemented (6-E + 6-E2)** | The Cycle 6-E implementation landed 2026-11-23 on the scaffold's deterministic core (the libm-free turn-fraction transforms, the byte-pinned packing, the proxy meshes, the `instanced_proxy.wgsl` shader): the instance-rate vertex input, the lazily-created zero-per-frame-allocation instance buffer (allocations constant across warmed populated frames), one draw call per populated kind (the populated corner route: **26 instances — the full 24-NPC + 2-vehicle placement table, the ladder's population package `corner_population`, pure data with a placement-validity battery and its own packed-bytes FNV pin — in 2 calls**), the N-vs-1 pixel-equivalence gate (`tests/render_instanced.rs`, byte-equal frames for BOTH the 13-instance fixture and the shipped 24+2 table, per-pixel 6-B oracle checks at 0/255 max error on lavapipe), the draw-call pins, and the `--corner --populated` demo mode — see `docs/CYCLE6-6E-BRIEF.md`. The Cycle 6-E2 package (2026-11-23, riding the population branch) added the indirect submission: `ProxyDrawMode::Indirect` — one `vkCmdDrawIndirect` per populated kind with the counts read from GPU memory, the pure byte-pinned `proxy_indirect` command core (FNV cross-platform pin, `firstVertex`/`firstInstance` pinned zero — no `drawIndirectFirstInstance` feature), a lazily-created per-frame-slot mapped command buffer (one-time +1 device_memory, pinned; the direct path's counters untouched), byte-equal frames across per-object/direct/indirect submissions (the third `render_instanced` gate, with an oracle wall through the indirect path), and the populated route's default submission now indirect (`--proxy-instanced` selects the direct 6-E shape). GPU-side count AUTHORSHIP (compute/culling writing the counts) remains deferred to the GPU-culling package. The rig measurement commands live in the 6-E/6-E2 PRs (lavapipe is correctness evidence only) |
 | Directional shadows | **Implemented (6-F + Era-1 PCF + Era-2 proxy shadows)** | The Cycle 6-F implementation landed 2026-11-23: the deterministic core (the light-space orthographic cascade, the compare-time slope-scaled bias model, the CPU raycaster oracle — pure IEEE, unit-pinned) + the depth-only pass + the shadowed lit pipeline sampling the map (one cascade, the corner scene — PCF-softened since Era-1 package 2). The gates: the map's known-answer (every texel vs the raycaster, max |Δdepth| 2.7e-7 on lavapipe) and the pixel equivalence (a shadowed ground patch renders exactly `albedo·ambient`, a lit patch the unshadowed equation, the unshadowed path pixel-identical) — `tests/render_shadows.rs`, executed by the CI's Linux Vulkan step. The `--corner --shadows` demo mode runs the full route. PCF softening (Era-1 package 2, the 3×3 `shadow_filter` tap table shared verbatim with the CPU oracle) and proxy shadows (Era-2, PR #33 — the populated path casting AND receiving, the skinned per-NPC depth casts) are landed; cascaded splits remain open |
-| NPC/world representation (LOD) | Partially implemented | The region director, four LOD levels, activation/reconstruction — validated at 1000 NPCs / 8 regions; the NPC AI design pass merged (#34) with its deterministic cores landed (PR #37: the behavior selector machinery, the schedule layer, the perception layer — pure, pinned); the spine integration, locomotion batch, rendering bridge, and gates remain (package A's remaining parts) |
+| NPC/world representation (LOD) | Partially implemented | The region director, four LOD levels, activation/reconstruction — validated at 1000 NPCs / 8 regions; the NPC AI design pass merged (#34) with its deterministic cores landed (PR #37: the behavior selector machinery, the schedule layer, the perception layer — pure, pinned) and the spine integration landed (package A part 2: commitment wakes as spine events, the witness census, the honest re-arm — pinned by the integration battery); the locomotion batch, rendering bridge, and composed gates remain (package A's remaining parts) |
 | Physics and collision | Prototype only | The Cycle-1 kinematic player prototype (`engine-core` player module: swept-AABB collision, fixed-step movement, FP/TP cameras) — headless/offscreen validated, collide-what-you-see; reversible and explicitly NOT a ratified production physics backend (§8) |
 | Combat and gameplay systems | Partially implemented (demo-scale prototype, validated) | The Cycle 2–5 line: `engine-core` combat resolution (`resolve_attack`, pure, allocation-free) + the adversary cadence model + the encounter composition with cover/HUD/cues in `engine-slice` — pinned by the combat_world (21) and encounter_world (30) batteries with byte-identical scenario traces; game-scale gameplay systems (progression, economy, AI beyond the cadence prototype) remain undesigned |
 | Networking and replication | In-session boundaries **designed (unratified)** | The player-facing multiplayer and governance rules are **ratified** in `docs/MULTIPLAYER-SPEC.md`; the campaign-level authority/persistence research lives in `docs/MULTIPLAYER-ARCHITECTURE-RESEARCH.md` (unapproved); the **in-session architecture** — sim placement, input ordering, replication scope, divergence detection, session lifecycle — is designed in `docs/CYCLE6-6D-SESSION-REPLICATION-BOUNDARIES.md` (**unratified**; owner decision list §9); transport/provider selection remains undesigned (T-06 deferral) |
