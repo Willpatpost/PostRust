@@ -204,8 +204,6 @@ pub enum MemoryLaneError {
     KindMismatch,
     /// The episodic trace's observer does not equal the key's witness.
     ObserverMismatch,
-    /// Unknown key (not found in either phase).
-    UnknownKey,
     /// The record is already classified (terminal candidate).
     AlreadyClassified,
     /// Checked i64 overflow in relationship accumulation.
@@ -224,7 +222,6 @@ impl std::fmt::Display for MemoryLaneError {
                     "ObserverMismatch: episodic trace observer != key witness"
                 )
             }
-            MemoryLaneError::UnknownKey => write!(f, "UnknownKey: key not found in ledger"),
             MemoryLaneError::AlreadyClassified => {
                 write!(f, "AlreadyClassified: candidate is already terminal")
             }
