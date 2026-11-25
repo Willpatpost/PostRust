@@ -177,9 +177,10 @@ ARM64) with a five-job CI:
   all-present case p99 **0.0707 ms/tick** with the collision query
   (0.42% of a 60 Hz frame), the all-blocked worst case p99
   0.0497 ms/tick, and the no-query arithmetic p99 0.0184 ms/tick
-  — every configuration double-run identical. The rendering
-  bridge and composed gates follow as package A's remaining
-  parts.
+  — every configuration double-run identical. The rendering bridge
+  has LANDED as package A part 4 (the corner demo's populated route
+  on the locomotion state — see `engine-slice`'s corner_routes
+  paragraph); the composed gates remain as package A's final part.
 - **`engine-persist`** — the persistence stack: SHA-256 content-addressed
   revision store; `CanonicalMedium` boundary with **two production mediums
   carrying distinct durability contracts** — SQLiteMedium
@@ -330,7 +331,25 @@ ARM64) with a five-job CI:
   writing into a retained buffer the renderer repacks per frame
   (zero per-frame allocation on both sides), and the walking
   `--corner --populated` route (plus `--populated --shadows`
-  together through the shadowed populated path).
+  together through the shadowed populated path). Era 2 package A
+  part 4 REPLACED the demo route's source with BEHAVIOR STATE: the
+  `corner_routes` module (the corner's walking lanes as pure data —
+  eight far-segment flank loops with lanes exactly 0.75 m apart at
+  dyadic 4.375/5.125, two crosswalk pacers at the original
+  crossers' spots, the waiters byte-identical; the swept-validity
+  battery measuring every sample unconditionally with the margins
+  as measured minimums; the 663-frame temporal campaign pinning
+  the double-run byte-identity, the locomotion digests, and the
+  pairwise clearance — walker pairs ≥ 0.75 with the measured
+  minimum EXACTLY the lane separation, waiter pairs ≥ 0.7 the
+  original cardinal rule) and the demo's `LocomotionCrowd`
+  (render-then-step at the deterministic clock: `advance_batch`
+  at dt = 1/60, `corner_instances_into` into the retained instance
+  buffer, the locomotion pose evaluation into the retained pose
+  buffer — 0 host allocations per warmed moving frame,
+  `renderer.allocations()` constant, both MEASURED). The
+  phase-column path remains pub where gates pin it (the skinning
+  oracle, the populated shadow-map gate).
 
 The **integrated campaign demo** (`--demo-persist`) is the vertical slice:
 one authoritative, persistently-orchestrated 1000-NPC / 8-region campaign
@@ -375,13 +394,36 @@ for the combined candidate.
 
 | CI partition | Linux | Windows |
 |---|---:|---:|
-| Main shard (`--workspace --exclude engine-slice`) | 1277 | 1226 |
-| Heavy shard (`-p engine-slice --features crash-test-seams`) | 591 | 590 |
-| **Combined** | **1868** | **1816** |
+| Main shard (`--workspace --exclude engine-slice`) | 1295 | 1244 |
+| Heavy shard (`-p engine-slice --features crash-test-seams`) | 599 | 598 |
+| **Combined** | **1894** | **1842** |
 
 The macOS job has its own partition. Main has two ignored tests and 33
 result lines. Heavy has thirty-one ignored tests and 62 result lines.
-The table is settled at the Era-2 package A part-2 tree
+The table is settled at the Era-2 package A part-4 tree
+(`era2/npc-ai-rendering-bridge`, 2026-11-25, stacked on part 3 —
+the rendering bridge): heavy **599 Linux MEASURED with the
+workflow's own awk on this exact tree** (599 passed / 31 ignored /
+62 result lines, zero failures — the part-3 workflow pin's 591
+plus the corner_routes battery's 8 platform-uniform engine-slice
+lib tests); Windows **598** = 590 + the same 8 (the
+platform-uniform inference — pure f32 arithmetic and struct
+equality, no cfg gates, no Vulkan; to be confirmed by this
+candidate's CI run, the count corrected from actuals on a
+mismatch, never a test weakened); main **1295 Linux MEASURED with
+the workflow's own awk on this exact tree** (1295 passed / 2
+ignored / 33 result lines, zero failures — engine-core untouched
+by part 4) with Windows **1244** (part 3's own pin: 1226 + the
+npc_locomotion battery's 18 platform-uniform engine-core lib
+tests, the same inference discipline); renderer release 160/2
+UNCHANGED. The prior settlements, superseded in order: the part-3
+tree (`era2/npc-ai-locomotion-batch`, 2026-11-25 — the locomotion
+batch): the WORKFLOW's pins moved to main 1295/1244 with heavy
+591/590 unchanged (engine-slice gained only the test-free
+benchmark route), Linux 1295/2/33 MEASURED with the workflow's
+own awk on that tree — but the §4 TABLE's part-2 row (main
+1277/1226) was left stale by that package and is corrected here
+from the measured actuals; the part-2 tree
 (`era2/npc-ai-spine-integration`, 2026-11-25, stacked on the #38
 reconciliation — `d9a034d`'s code plus this package): main **1277
 Linux MEASURED with the workflow's own awk on this exact tree**
@@ -389,11 +431,11 @@ Linux MEASURED with the workflow's own awk on this exact tree**
 part-1 baseline 1263 plus npc_execution's 14 platform-uniform
 engine-core lib tests); Windows **1226** = 1212 + the same 14 (the
 platform-uniform inference — pure spine/IEEE arithmetic, no cfg
-gates, no Vulkan; to be confirmed by this candidate's CI run, the
+gates, no Vulkan; to be confirmed by that candidate's CI run, the
 count corrected from actuals on a mismatch, never a test weakened);
 renderer release 160/2 and heavy 591 Linux / 590 Windows with 31
 ignored / 62 result lines UNCHANGED (the package touches engine-core
-only). The prior settlements, superseded in order: `d9a034d`
+only), `d9a034d`
 (2026-11-25, PR #37's merge — the Era-2 package A part-1 landing,
 the owner's GO at 02:02Z; the merge-commit run `45530057475` green
 on all five jobs enforcing main 1263/1212, its own push history the
@@ -1277,7 +1319,7 @@ priorities).
 
 **The Era-2 package A arc (2026-11-25, the overnight continuation
 beyond the mission file's terminal queue — the design pass as the
-implementation brief): parts 1-2 MERGED/DELIVERED, part 3
+implementation brief): parts 1-2 MERGED/DELIVERED, parts 3-4
 DELIVERED.** Part 1: the NPC AI deterministic cores (PR #37, the
 owner's GO at 02:02Z; the design pass's §3–§6 as three additive
 pure engine-core modules — §2's record carries the contracts and
@@ -1288,13 +1330,35 @@ battery, and the measured pins). Part 3: the locomotion batch
 (`era2/npc-ai-locomotion-batch`, stacked on part 2 — §4.3's
 near-lane batch + §4.2's Full-tier locomotion integration; §2's
 record carries the machinery, the battery, the measured digest
-pin, and the §8.5 measurement). The remaining parts, in the design
-pass's own order: the **rendering bridge** (§7 — behavior state to
-walking pixels through PR #33's animation core) and the
+pin, and the §8.5 measurement). Part 4: the rendering bridge
+(`era2/npc-ai-rendering-bridge`, stacked on part 3 — §7's contract
+landed: the corner demo's populated route reads BEHAVIOR STATE,
+the locomotion population stepped per presented frame at the
+deterministic clock (render-then-step, dt = 1/60) with the
+instances and pose blocks re-evaluated into retained buffers —
+zero per-frame allocation, MEASURED: 0 host allocations per warmed
+moving frame and `renderer.allocations()` constant across the
+warmed animated window; the corner's walking lanes as pure data —
+eight far-segment flank loops with lanes exactly 0.75 m apart (the
+different-NPC margin met by construction, dyadic coordinates), two
+crosswalk pacers at the original crossers' exact spots, the
+waiters byte-identical; the swept-validity battery repaired to
+measure every sample unconditionally (the WIP's min-coord filter
+silently dropped the road-side lanes and every pacer sample — the
+weakened-gate class, barred) and the 663-frame temporal campaign
+pinned (double-run byte-identical, the locomotion digest at
+0/33/66/300/600/662, pairwise walker clearance ≥ 0.75 — the
+measured minimum EXACTLY the lane separation — and waiter-waiter
+≥ 0.7, the original table's cardinal rule); the render_instanced
+gates re-pinned on the locomotion source (the moving-crowd 26-vs-2
+byte equality, the frame-0 static fixtures, the allocation
+constancy under motion); heavy shard 591 → 599 Linux MEASURED
+with the workflow's own awk, main shard untouched at 1295/2/33).
+The remaining part, in the design pass's own order: the
 **composition gates** (§8.4 — the named verification strategy,
 including the allocation-counting gate on the warmed behavior
-path). The design pass's §9 open-questions list still awaits the
-owner.
+path over the composed world). The design pass's §9
+open-questions list still awaits the owner.
 
 ## 10. The authoritative coordination ledger
 

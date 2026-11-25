@@ -212,6 +212,24 @@ impl<'a> FixturePopulation<'a> {
             },
         }
     }
+
+    fn new_with_poses(
+        npc: &'a [ProxyInstance],
+        vehicle: &'a [ProxyInstance],
+        poses: &'a [[[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS]],
+        npc_material: u32,
+        vehicle_material: u32,
+    ) -> Self {
+        FixturePopulation {
+            population: ProxyPopulation {
+                npc,
+                npc_poses: poses,
+                npc_material,
+                vehicle,
+                vehicle_material,
+            },
+        }
+    }
 }
 
 /// The shorthand the gates pass inline (the temporary lives through
@@ -223,6 +241,16 @@ fn populated<'a>(
     vehicle_material: u32,
 ) -> FixturePopulation<'a> {
     FixturePopulation::new(npc, vehicle, npc_material, vehicle_material)
+}
+
+fn populated_locomotion<'a>(
+    npc: &'a [ProxyInstance],
+    vehicle: &'a [ProxyInstance],
+    poses: &'a [[[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS]],
+    npc_material: u32,
+    vehicle_material: u32,
+) -> FixturePopulation<'a> {
+    FixturePopulation::new_with_poses(npc, vehicle, poses, npc_material, vehicle_material)
 }
 
 /// One populated capture in the given submission mode.
@@ -980,12 +1008,19 @@ fn full_corner_population_matches_per_object_pixels() {
         (matrix, [-3.5, 18.0, -3.5])
     };
     let light = day_preset();
-    let (npc, vehicle) = engine_slice::corner_population::corner_population();
+    // The new locomotion population (the rendering bridge, era2/npc-ai-rendering-bridge).
+    let (routes, states, present) = engine_slice::corner_routes::corner_population_locomotion();
+    let tints = engine_slice::corner_population::corner_npc_tints();
+    let npc = engine_slice::corner_routes::corner_instances(&states, &tints);
+    let (_, vehicle) = engine_slice::corner_population::corner_population();
     let total = npc.len() + vehicle.len();
     assert_eq!((npc.len(), vehicle.len(), total), (24, 2, 26));
     // The demo's caller policy: NPCs with the facade set, vehicles
     // with the dark stone set (corner_demo's documented choice).
-    let population = populated(&npc, &vehicle, 1, 2); // the fixture (owns its rest blocks)
+    // The population holds its own rest blocks.
+    let mut poses = Vec::new();
+    engine_slice::corner_routes::evaluate_population_poses_locomotion(&states, &mut poses);
+    let population = populated_locomotion(&npc, &vehicle, &poses, 1, 2);
 
     // THE FULL-TABLE EQUIVALENCE: 26 single-instance draws vs one
     // instanced draw per kind — byte-equal frames.
@@ -1082,32 +1117,53 @@ fn full_corner_population_matches_per_object_pixels() {
     }
     println!("warmed full-table populated allocations: {warm:?}");
 
-    // THE ANIMATED REGIME (the Era-2 stage-5 allocation gate — the
-    // battery's third): the shipped population's OWN phase column
-    // drives the walk. Every warmed frame evaluates the pose blocks
-    // for presented frame k (advancing — `evaluate_population_poses`,
-    // the demo's own per-frame path), repacks, and renders; BOTH
-    // allocation counters hold exactly across the warmed window —
-    // the renderer's Vulkan objects (`allocations()`) AND the
-    // host-allocation counter (finding 10's `HostAllocScope`,
-    // wrapping the evaluation AND the render together: the walk
-    // evaluation reuses its retained buffer and the renderer's
-    // instance/pose repacks reuse theirs, so a warmed animated frame
-    // allocates nothing on either side). And the frames GENUINELY
-    // DIFFER: the packed pose bytes' FNV-1a digest per frame — at
-    // least 3 distinct among the measured window (MEASURED
-    // CPU-side at this tree: frames 0..16 give 16 distinct digests;
-    // the 16 walkers' hand-spread phases never coincide).
+    // THE ANIMATED REGIME (the Era-2 stage-5 allocation gate, REBUILT on
+    // the rendering bridge's locomotion source — part 4): the crowd's
+    // OWN behavior state drives the walk. Every warmed frame runs the
+    // DEMO's exact per-frame path — `advance_batch` at dt = 1/60, the
+    // instances re-packed in place through `corner_instances_into`, the
+    // pose blocks re-evaluated into the retained buffer, then the render
+    // — and BOTH allocation counters hold exactly across the warmed
+    // window: the renderer's Vulkan objects (`allocations()`) AND the
+    // host-allocation counter (finding 10's `HostAllocScope`, wrapping
+    // THE STEP AND THE RENDER TOGETHER: the batch step allocates
+    // nothing, the instance re-pack is field writes, the pose
+    // evaluation reuses its retained buffer, and the renderer's
+    // instance/pose repacks reuse theirs — a warmed animated frame
+    // allocates nothing on either side). And the crowd GENUINELY
+    // MOVES: the packed pose bytes' FNV-1a digest per frame — at least
+    // 3 distinct among the measured window — and the locomotion
+    // states' (position, phase) pairs never coincide (the old
+    // phase-column clause's replacement: the 16 walkers' distinct
+    // speed and phase draws).
     {
-        let phases = engine_slice::corner_population::corner_population_phases();
+        let mut animated_states = states.clone();
+        let mut animated_instances = npc.clone();
         let mut blocks = Vec::new();
         // The warmup: the first evaluation grows the retained block
-        // buffer (24 blocks × 704 bytes) and the first frames pay
-        // any first-touch costs — all BEFORE the snapshot.
-        for k in 0..4u64 {
-            engine_slice::corner_population::evaluate_population_poses(k, &phases, &mut blocks);
+        // buffer (24 blocks × 704 bytes) and the first frames pay any
+        // first-touch costs — all BEFORE the snapshot.
+        for _ in 0..4u64 {
+            engine_core::npc_locomotion::advance_batch(
+                &routes,
+                &mut animated_states,
+                &present,
+                1.0 / 60.0,
+                None,
+                0.3,
+                1.75,
+            );
+            engine_slice::corner_routes::corner_instances_into(
+                &animated_states,
+                &tints,
+                &mut animated_instances,
+            );
+            engine_slice::corner_routes::evaluate_population_poses_locomotion(
+                &animated_states,
+                &mut blocks,
+            );
             let animated = ProxyPopulation {
-                npc: &npc,
+                npc: &animated_instances,
                 npc_poses: &blocks,
                 npc_material: 1,
                 vehicle: &vehicle,
@@ -1128,7 +1184,72 @@ fn full_corner_population_matches_per_object_pixels() {
         );
         let mut digests = std::collections::BTreeSet::new();
         for k in 4..12u64 {
-            engine_slice::corner_population::evaluate_population_poses(k, &phases, &mut blocks);
+            // THE NEVER-COINCIDE CLAUSE (at the gate's frames): no two
+            // states share (position, stride_phase), and the walkers'
+            // phases are all distinct (16 distinct draws — the crowd
+            // does not march in lockstep).
+            let mut phases_seen = std::collections::BTreeSet::new();
+            for state in &animated_states {
+                if state.speed > 0.0 {
+                    phases_seen.insert(state.stride_phase.to_bits());
+                }
+            }
+            assert_eq!(
+                phases_seen.len(),
+                16,
+                "the 16 walkers' stride phases are distinct at frame {k}"
+            );
+            for (i, a) in animated_states.iter().enumerate() {
+                for b in animated_states.iter().skip(i + 1) {
+                    assert!(
+                        a.position != b.position || a.stride_phase != b.stride_phase,
+                        "states {i} and another coincide at frame {k}"
+                    );
+                }
+            }
+            let scope = common::HostAllocScope::new();
+            engine_core::npc_locomotion::advance_batch(
+                &routes,
+                &mut animated_states,
+                &present,
+                1.0 / 60.0,
+                None,
+                0.3,
+                1.75,
+            );
+            engine_slice::corner_routes::corner_instances_into(
+                &animated_states,
+                &tints,
+                &mut animated_instances,
+            );
+            engine_slice::corner_routes::evaluate_population_poses_locomotion(
+                &animated_states,
+                &mut blocks,
+            );
+            let animated = ProxyPopulation {
+                npc: &animated_instances,
+                npc_poses: &blocks,
+                npc_material: 1,
+                vehicle: &vehicle,
+                vehicle_material: 2,
+            };
+            let outcome = renderer
+                .render_corner_populated(&matrix, eye, light, &animated, size)
+                .unwrap();
+            let allocs = scope.count();
+            drop(scope);
+            assert!(outcome.presented);
+            assert_eq!(
+                allocs, 0,
+                "no host allocations in the warmed animated frame {k} \
+                 (the step, the re-pack, the evaluation, and the renderer's \
+                 repack all reuse their buffers)"
+            );
+            assert_eq!(
+                renderer.allocations(),
+                animated_warm,
+                "warmed animated allocations constant at frame {k}"
+            );
             // The frame's pose digest (the FNV-1a form the lib
             // battery's byte pins use).
             let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1140,30 +1261,6 @@ fn full_corner_population_matches_per_object_pixels() {
                 }
             }
             digests.insert(hash);
-            let animated = ProxyPopulation {
-                npc: &npc,
-                npc_poses: &blocks,
-                npc_material: 1,
-                vehicle: &vehicle,
-                vehicle_material: 2,
-            };
-            let scope = common::HostAllocScope::new();
-            let outcome = renderer
-                .render_corner_populated(&matrix, eye, light, &animated, size)
-                .unwrap();
-            let allocs = scope.count();
-            drop(scope);
-            assert!(outcome.presented);
-            assert_eq!(
-                allocs, 0,
-                "no host allocations in the warmed animated frame {k} \
-                 (the evaluation reuses its buffer; the renderer's repack too)"
-            );
-            assert_eq!(
-                renderer.allocations(),
-                animated_warm,
-                "warmed animated allocations constant at frame {k}"
-            );
         }
         println!(
             "animated regime: {} distinct pose digests across the 8 measured \
@@ -1247,10 +1344,17 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
         (matrix, [-3.5, 18.0, -3.5])
     };
     let light = day_preset();
-    let (npc, vehicle) = engine_slice::corner_population::corner_population();
+    // The locomotion population at frame 0 (the rendering bridge's
+    // initial placements — the same source the full-table gate pins).
+    let (_, states_i, _) = engine_slice::corner_routes::corner_population_locomotion();
+    let tints_i = engine_slice::corner_population::corner_npc_tints();
+    let npc = engine_slice::corner_routes::corner_instances(&states_i, &tints_i);
+    let (_, vehicle) = engine_slice::corner_population::corner_population();
     let total = npc.len() + vehicle.len();
     assert_eq!((npc.len(), vehicle.len(), total), (24, 2, 26));
-    let population = populated(&npc, &vehicle, 1, 2); // the fixture (owns its rest blocks)
+    let mut poses_i = Vec::new();
+    engine_slice::corner_routes::evaluate_population_poses_locomotion(&states_i, &mut poses_i);
+    let population = populated_locomotion(&npc, &vehicle, &poses_i, 1, 2);
 
     // THE THREE-WAY EQUIVALENCE: per-object (26 draws) vs direct
     // instanced (2) vs indirect (2) — byte-equal frames.
@@ -2514,39 +2618,33 @@ fn skinned_pose_matches_the_cpu_oracle() {
     );
 }
 
-/// THE ERA-2 ANIMATED N-VS-1 GATE (stage 5, gate 4): the 6-E
-/// equivalence proof UNDER MOTION — the gate fixture population
-/// (10 NPCs + 3 vehicles, the same placements/turns/scales/tints as
-/// `instanced_draws_match_per_object_pixels_and_pin_counts`) with
-/// the npcs WALKING: pose blocks evaluated at frame 33 through the
-/// demo's own `evaluate_population_poses`, submitted as N
-/// single-instance draws (13) versus ONE instanced draw per kind
-/// (2) — byte-equal captured frames (the `assert_frames_equal`
-/// discipline). This proves the SKINNED path's submission
-/// equivalence under motion: the per-object mode binds each draw's
-/// pose slot from its own instance row while the instanced mode
-/// reads the pose index from the packed instance bytes, so a
-/// submission bug that addresses poses by anything but the row's
-/// own `pose_index` moves pixels here.
+/// THE ERA-2 ANIMATED N-VS-1 GATE (stage 5, gate 4 — REBUILT on the
+/// rendering bridge's locomotion source, part 4): the 6-E equivalence
+/// proof UNDER MOTION over the corner's REAL population — the 24-NPC
+/// crowd advanced 33 frames through the demo's own per-frame path
+/// (`advance_batch` at dt = 1/60, the instances re-packed in place,
+/// the pose blocks re-evaluated), submitted as N single-instance
+/// draws (26) versus ONE instanced draw per kind (2) — byte-equal
+/// captured frames (the `assert_frames_equal` discipline). This
+/// proves the SKINNED path's submission equivalence under motion:
+/// the per-object mode binds each draw's pose slot from its own
+/// instance row while the instanced mode reads the pose index from
+/// the packed instance bytes, so a submission bug that addresses
+/// poses by anything but the row's own `pose_index` moves pixels
+/// here.
 ///
-/// THE POSE COLUMN (a conscious extension of the rest fixture):
-/// every fixture npc carries a DISTINCT pose index (its list
-/// position — the shipped table's own identity mapping) and a
-/// DISTINCT walk phase (i·6554/65536 of the stride, ten spread
-/// phases, min gap 6554 > 1024 — the placement table's own 1/64
-/// spread discipline). At the rest pose all blocks are bit-exact
-/// identity so the index is invisible; UNDER MOTION distinct blocks
-/// make the pose-slot addressing load-bearing — a shared block 0
-/// (the rest fixture's shape) would leave a pose-addressing bug
-/// byte-equal in both modes and pass vacuously.
+/// THE POSE COLUMN (the crowd's own): every npc carries its list
+/// position as its pose index (the sequential identity mapping) and
+/// the 16 walkers' speed/phase draws spread them across the stride —
+/// asserted distinct at the gate's frame, so the pose-slot
+/// addressing is load-bearing (a shared block would leave a
+/// pose-addressing bug byte-equal in both modes and pass vacuously).
 ///
-/// THE MOTION CONTROL: the same population at the REST pose through
-/// the same camera must be pixel-different (at frame 33 — the walk
-/// clip's keyframe 4 — both elbows flex +0.03 turn ≈ 10.8°, swinging
-/// the lower-arm silhouettes multiple pixels at this framing, and
-/// the lit surfaces' normals rotate with the pose; a walk that
-/// silently evaluated to rest would render byte-identical and fail
-/// here).
+/// THE MOTION CONTROL: the SAME frame-33 placements at the REST pose
+/// through the same camera must be pixel-different (the placements
+/// held, the poses dropped to rest — the differential isolates the
+/// walk's silhouette and lit-color motion; a walk that silently
+/// evaluated to rest would render byte-identical and fail here).
 #[test]
 #[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
 fn animated_population_matches_per_object_pixels() {
@@ -2576,27 +2674,55 @@ fn animated_population_matches_per_object_pixels() {
 
     let (matrix, eye) = gate_camera(1.0);
     let light = day_preset();
-    let (mut npc, vehicle) = gate_population();
+    // THE REAL POPULATION UNDER MOTION: the corner's own crowd,
+    // advanced 33 frames through the demo's exact per-frame path.
+    let (routes, mut states, present) = engine_slice::corner_routes::corner_population_locomotion();
+    let tints = engine_slice::corner_population::corner_npc_tints();
+    let mut npc = engine_slice::corner_routes::corner_instances(&states, &tints);
+    let (_, vehicle) = engine_slice::corner_population::corner_population();
     let total = npc.len() + vehicle.len();
-    // The pose column: npc i walks at phase i·6554 with block i.
-    for (index, instance) in npc.iter_mut().enumerate() {
-        instance.pose_index = index as u32;
-    }
-    let phases: Vec<_> = (0..npc.len())
-        .map(|index| engine_slice::corner_population::Phase::Walk((index * 6554) as u16))
-        .collect();
+    assert_eq!((npc.len(), vehicle.len(), total), (24, 2, 26));
     let mut blocks = Vec::new();
-    engine_slice::corner_population::evaluate_population_poses(33, &phases, &mut blocks);
+    for _ in 0..33 {
+        engine_core::npc_locomotion::advance_batch(
+            &routes,
+            &mut states,
+            &present,
+            1.0 / 60.0,
+            None,
+            0.3,
+            1.75,
+        );
+        engine_slice::corner_routes::corner_instances_into(&states, &tints, &mut npc);
+        engine_slice::corner_routes::evaluate_population_poses_locomotion(&states, &mut blocks);
+    }
     assert_eq!(blocks.len(), npc.len());
-    // The walk is real: the blocks differ pairwise (the spread
-    // phases) and from rest.
+    // The walk is real: some walker is off rest, the 16 walkers'
+    // phases are distinct, and no two states share (position, phase).
     let rest_block = engine_renderer::animation::rest_pose_block();
     assert!(
         blocks.iter().any(|b| *b != rest_block),
         "frame 33 is off the rest pose"
     );
-    for (a, b) in blocks.iter().zip(blocks.iter().skip(1)) {
-        assert_ne!(a, b, "the fixture's walk phases are distinct");
+    let mut walker_phases: Vec<u32> = states
+        .iter()
+        .filter(|s| s.speed > 0.0)
+        .map(|s| s.stride_phase.to_bits())
+        .collect();
+    walker_phases.sort_unstable();
+    walker_phases.dedup();
+    assert_eq!(
+        walker_phases.len(),
+        16,
+        "the 16 walkers' stride phases are distinct at frame 33"
+    );
+    for (i, a) in states.iter().enumerate() {
+        for b in states.iter().skip(i + 1) {
+            assert!(
+                a.position != b.position || a.stride_phase != b.stride_phase,
+                "states {i} and another coincide at frame 33"
+            );
+        }
     }
     let walked = ProxyPopulation {
         npc: &npc,
@@ -2606,7 +2732,7 @@ fn animated_population_matches_per_object_pixels() {
         vehicle_material: 2,
     };
 
-    // THE EQUIVALENCE UNDER MOTION: 13 single-instance draws vs one
+    // THE EQUIVALENCE UNDER MOTION: 26 single-instance draws vs one
     // instanced draw per kind — byte-equal frames.
     let (reference, reference_calls) = capture_populated(
         &mut renderer,
@@ -2634,7 +2760,7 @@ fn animated_population_matches_per_object_pixels() {
         instanced_calls, 2,
         "the instanced path submits one draw per populated kind"
     );
-    assert_frames_equal(&reference, &instanced, "13 draws vs 2 instanced, walking");
+    assert_frames_equal(&reference, &instanced, "26 draws vs 2 instanced, walking");
     // The animated capture is itself deterministic.
     let (repeat, repeat_calls) = capture_populated(
         &mut renderer,
@@ -2648,9 +2774,10 @@ fn animated_population_matches_per_object_pixels() {
     assert_eq!(repeat_calls, 2);
     assert_frames_equal(&instanced, &repeat, "animated instanced repeat capture");
 
-    // THE MOTION CONTROL: the same placements at the REST pose
-    // through the same camera — the walk must visibly move the
-    // frame (the elbows' 10.8° flex and the lit normals' rotation).
+    // THE MOTION CONTROL: the SAME frame-33 placements at the REST
+    // pose through the same camera — the walk must visibly move the
+    // frame (the placements held, the poses dropped; the elbows' flex
+    // and the lit normals' rotation carry the differential).
     let rest_blocks: Vec<_> = (0..npc.len())
         .map(|_| engine_renderer::animation::rest_pose_block())
         .collect();

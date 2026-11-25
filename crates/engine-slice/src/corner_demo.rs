@@ -1,7 +1,7 @@
 //! One Corner of the City. One deterministic pose per presented frame
 //! — or, with `--free-look` (Era 1), the interactive eyeball camera:
 //! presentation only, never a measured claim.
-use crate::corner_population::{Block, Phase, corner_population, corner_population_phases};
+use crate::corner_population::Block;
 use crate::frame_timing::FrameTiming;
 use crate::math::{Mat4, camera_forward, camera_right, camera_view, mul, percentile, perspective};
 use crate::render_demo::free_flight_look_delta;
@@ -11,8 +11,8 @@ use engine_renderer::lit_scene::{
     LightParams, RouteWaypoint, SCENE_EXTENT, camera_route, day_preset, night_preset,
 };
 use engine_renderer::{
-    AllocationStats, DemoScenePreference, PresentModePreference, ProxyDrawMode, ProxyPopulation,
-    RenderConfig, Renderer, ValidationPreference,
+    AllocationStats, DemoScenePreference, PresentModePreference, ProxyDrawMode, RenderConfig,
+    Renderer, ValidationPreference,
 };
 use engine_shell::{DriverPreference, Keycode, ShellApp, ShellConfig, pace_until};
 use std::time::{Duration, Instant};
@@ -27,6 +27,79 @@ const WARMUP: usize = 60;
 /// policy.
 const NPC_MATERIAL: u32 = 1;
 const VEHICLE_MATERIAL: u32 = 2;
+
+/// The rendering bridge's per-frame crowd state: the routes, states,
+/// and mask from `corner_population_locomotion`, the RETAINED instance
+/// buffer (mutated in place by `corner_instances_into`), the street
+/// palette, the RETAINED pose buffer, and the (unchanged) vehicle
+/// table. `step` advances one deterministic 1/60 tick and re-evaluates
+/// both buffers — zero allocation after the first frame.
+struct LocomotionCrowd {
+    routes: Vec<engine_core::npc_locomotion::Route>,
+    states: Vec<engine_core::npc_locomotion::NpcLocomotion>,
+    present: Vec<bool>,
+    instances: Vec<engine_renderer::proxy_instances::ProxyInstance>,
+    tints: [[f32; 3]; 24],
+    poses: Vec<Block>,
+    vehicles: Vec<engine_renderer::proxy_instances::ProxyInstance>,
+}
+
+impl LocomotionCrowd {
+    fn new() -> Self {
+        let (routes, states, present) = crate::corner_routes::corner_population_locomotion();
+        let tints = crate::corner_population::corner_npc_tints();
+        let mut instances = Vec::with_capacity(24);
+        instances.resize(
+            24,
+            engine_renderer::proxy_instances::ProxyInstance {
+                transform: engine_renderer::proxy_instances::InstanceTransform {
+                    pos: [0.0, 0.0, 0.0],
+                    turn: 0,
+                    scale: 0.0,
+                },
+                tint: [0.0, 0.0, 0.0],
+                pose_index: 0,
+            },
+        );
+        crate::corner_routes::corner_instances_into(&states, &tints, &mut instances);
+        let mut poses = Vec::new();
+        crate::corner_routes::evaluate_population_poses_locomotion(&states, &mut poses);
+        let (_, vehicles) = crate::corner_population::corner_population();
+        LocomotionCrowd {
+            routes,
+            states,
+            present,
+            instances,
+            tints,
+            poses,
+            vehicles,
+        }
+    }
+
+    fn step(&mut self) {
+        engine_core::npc_locomotion::advance_batch(
+            &self.routes,
+            &mut self.states,
+            &self.present,
+            1.0 / 60.0,
+            None,
+            0.3,
+            1.75,
+        );
+        crate::corner_routes::corner_instances_into(&self.states, &self.tints, &mut self.instances);
+        crate::corner_routes::evaluate_population_poses_locomotion(&self.states, &mut self.poses);
+    }
+
+    fn population(&self) -> engine_renderer::ProxyPopulation<'_> {
+        engine_renderer::ProxyPopulation {
+            npc: &self.instances,
+            npc_poses: &self.poses,
+            npc_material: NPC_MATERIAL,
+            vehicle: &self.vehicles,
+            vehicle_material: VEHICLE_MATERIAL,
+        }
+    }
+}
 
 /// Two seconds per segment at the reference 60 Hz. Uncapped runs present
 /// the identical sequence. Shared waypoints appear once, including both ends.
@@ -311,27 +384,16 @@ pub fn run(
         },
     )
     .map_err(|e| e.to_string())?;
-    let (npc, vehicle) = if populated {
-        corner_population()
-    } else {
-        (Vec::new(), Vec::new())
-    };
-    // The Era-2 animated population: the placement table's PHASE
-    // column (8 waiters stand, 16 crossers/strollers walk at
-    // hand-spread offsets — no lockstep marching) and the retained
-    // pose-block buffer the frame loop evaluates into (in place,
-    // zero allocation after the first frame — the deterministic
-    // clock: presented frame k shows pose t_k, the day/night
-    // cycle's own precedent).
-    let phases = if populated {
-        corner_population_phases()
-    } else {
-        Vec::new()
-    };
-    let mut pose_blocks: Vec<Block> = Vec::new();
-    if populated {
-        crate::corner_population::evaluate_population_poses(0, &phases, &mut pose_blocks);
-    }
+    // THE RENDERING BRIDGE (Era 2 package A part 4): the populated
+    // route's crowd is BEHAVIOR STATE — the locomotion population
+    // (routes, states, mask) stepped per presented frame at the
+    // deterministic clock, the instances and pose blocks re-evaluated
+    // into RETAINED buffers (zero allocation after the first frame).
+    // Presentation never enters the spine: presented frame k shows the
+    // crowd after k batch ticks at DEMO_CLOCK_HZ (render-then-step —
+    // frame 0 is the construction; the day/night cycle's own
+    // deterministic-clock precedent).
+    let mut crowd = populated.then(LocomotionCrowd::new);
     // The submission mode, in evidence order: the per-object
     // reference (one draw per instance — the pre-6-E shape, the
     // before/after measurement mode), the direct 6-E instanced
@@ -422,32 +484,30 @@ pub fn run(
         stats.validation_active,
         cfg!(debug_assertions)
     );
-    if populated {
+    if let Some(crowd) = &crowd {
         let mode_label = match proxy_mode {
             ProxyDrawMode::PerInstance => "per-object reference mode",
             ProxyDrawMode::Instanced => "instanced mode",
             ProxyDrawMode::Indirect => "indirect mode",
         };
+        let walking = crowd.states.iter().filter(|s| s.speed > 0.0).count();
         println!(
-            "animated population: {} walking, {} standing (the {} s walk cycle, per-NPC phases; \
-             presented frame k shows pose t_k at the {} Hz reference)",
-            phases
-                .iter()
-                .filter(|p| matches!(p, Phase::Walk(_)))
-                .count(),
-            phases.iter().filter(|p| matches!(p, Phase::Stand)).count(),
+            "animated population: {walking} walking, {} standing (the {} s walk cycle, per-NPC \
+             speed and phase draws on the corner's walking lanes; presented frame k shows the \
+             crowd after k ticks at the {} Hz reference)",
+            crowd.states.len() - walking,
             crate::corner_population::WALK_STRIDE_SECONDS,
             crate::corner_population::DEMO_CLOCK_HZ
         );
         println!(
             "proxy population: {} instances ({} npc + {} vehicle), {} draw calls per frame ({})",
-            npc.len() + vehicle.len(),
-            npc.len(),
-            vehicle.len(),
+            crowd.instances.len() + crowd.vehicles.len(),
+            crowd.instances.len(),
+            crowd.vehicles.len(),
             if proxy_reference {
-                (npc.len() + vehicle.len()) as u32
+                (crowd.instances.len() + crowd.vehicles.len()) as u32
             } else {
-                u32::from(!npc.is_empty()) + u32::from(!vehicle.is_empty())
+                u32::from(!crowd.instances.is_empty()) + u32::from(!crowd.vehicles.is_empty())
             },
             mode_label
         );
@@ -484,8 +544,7 @@ pub fn run(
         return run_free_look(
             &mut app,
             &mut renderer,
-            populated.then_some((&npc[..], &vehicle[..], &phases[..])),
-            &mut pose_blocks,
+            crowd.as_mut(),
             shadows,
             light,
             bias,
@@ -527,38 +586,20 @@ pub fn run(
                 disc_dir: atmosphere.disc_dir,
             }));
         }
-        // The walk cycle's deterministic tick: presented frame i at
-        // the 60 Hz reference advances every walking npc's clip
-        // (the phase column spreads them across the stride; the
-        // standing waiters keep the rest block — the evaluation's
-        // own contract).
-        if populated {
-            crate::corner_population::evaluate_population_poses(
-                i as u64,
-                &phases,
-                &mut pose_blocks,
-            );
-        }
-        // The per-frame population (fresh after the evaluation — the
-        // pose blocks are re-borrowed each frame, never held across
-        // the evaluation).
-        let frame_population = populated.then(|| ProxyPopulation {
-            npc: &npc,
-            npc_poses: &pose_blocks,
-            npc_material: NPC_MATERIAL,
-            vehicle: &vehicle,
-            vehicle_material: VEHICLE_MATERIAL,
-        });
+        // The per-frame population: the crowd's CURRENT state (frame i
+        // shows the crowd after i ticks — the render-then-step
+        // discipline; the step follows the submit below).
+        let frame_population = crowd.as_ref().map(|crowd| crowd.population());
         let matrix = view_projection(pose, aspect);
         // Submission selection: the four-way union
         // (--populated --shadows together is the Era-2 stage 4b path).
-        let frame = if shadows && populated {
+        let frame = if shadows && let Some(population) = frame_population.as_ref() {
             renderer.render_corner_populated_shadowed(
                 &matrix,
                 pose.position,
                 light,
                 bias,
-                frame_population.as_ref().unwrap(),
+                population,
                 size,
             )
         } else if shadows {
@@ -577,6 +618,15 @@ pub fn run(
         }
         if populated && frame.geometry.proxy_draw_calls == 0 {
             return Err("populated route drew no proxy calls".into());
+        }
+        // THE CROWD'S TICK (render-then-step): the submission above
+        // presented frame i; one deterministic 1/60 batch step now
+        // advances the crowd for frame i+1 — the instances and pose
+        // blocks re-evaluated into their retained buffers (zero
+        // allocation; the presentation-only crowd never enters the
+        // spine, a fingerprint, or a measured claim).
+        if let Some(crowd) = crowd.as_mut() {
+            crowd.step();
         }
         if measured.contains(&i) {
             cpu.record((end - start).as_secs_f64() * 1000.);
@@ -635,12 +685,7 @@ pub fn run(
 fn run_free_look(
     app: &mut ShellApp,
     renderer: &mut Renderer,
-    population: Option<(
-        &[engine_renderer::proxy_instances::ProxyInstance],
-        &[engine_renderer::proxy_instances::ProxyInstance],
-        &[Phase],
-    )>,
-    pose_blocks: &mut Vec<Block>,
+    mut crowd: Option<&mut LocomotionCrowd>,
     shadows: bool,
     mut light: LightParams,
     bias: engine_renderer::shadows::ShadowBias,
@@ -722,19 +767,11 @@ fn run_free_look(
         } else {
             size.0 as f32 / size.1 as f32
         };
-        // The walk tick (presentation-only determinism: the
-        // presented-frame count drives the clip, the same counter
-        // the scripted route uses).
-        let frame_population = population.map(|(npc, vehicle, phases)| {
-            crate::corner_population::evaluate_population_poses(presented, phases, pose_blocks);
-            ProxyPopulation {
-                npc,
-                npc_poses: pose_blocks,
-                npc_material: NPC_MATERIAL,
-                vehicle,
-                vehicle_material: VEHICLE_MATERIAL,
-            }
-        });
+        // The crowd's CURRENT state (presentation-only determinism:
+        // presented frame k shows the crowd after k ticks — the same
+        // render-then-step discipline the scripted route uses; the
+        // step follows the submit below).
+        let frame_population = crowd.as_ref().map(|crowd| crowd.population());
         let matrix = camera.view_projection(aspect);
         let frame = if shadows && let Some(population) = &frame_population {
             renderer.render_corner_populated_shadowed(
@@ -762,8 +799,14 @@ fn run_free_look(
         if !frame.presented {
             return Err(format!("free-look presentation failed: {frame:?}"));
         }
-        if population.is_some() && frame.geometry.proxy_draw_calls == 0 {
+        if crowd.is_some() && frame.geometry.proxy_draw_calls == 0 {
             return Err("free-look populated session drew no proxy calls".into());
+        }
+        // The crowd's tick (render-then-step — one deterministic 1/60
+        // batch step per PRESENTED frame; a minimized or deferred frame
+        // presents nothing and steps nothing).
+        if let Some(crowd) = crowd.as_mut() {
+            crowd.step();
         }
         presented += 1;
         if presented == WARMUP as u64 {

@@ -9,9 +9,23 @@
 //! precomputed at construction (sqrt runs HERE at authoring, never per tick),
 //! per-NPC states initialized with hand-spread seeds in fixed order, and the
 //! digest is FNV-1a over little-endian fixed-width fields. Two constructions
-//! byte-identical; a 600-frame advance double-run byte-identical.
+//! byte-identical; a 663-frame advance (the demo's full window) double-run
+//! byte-identical.
+//!
+//! # THE ROUTE TABLE
+//! - THE FLANK LOOPS (EIGHT): both sidewalk bands of each road arm's FAR
+//!   segment — closed there-and-backs, two lanes exactly 0.75 m apart.
+//! - THE CROSSWALK PACERS (TWO): inside the west and north crosswalks'
+//!   camera-far halves, starting at the ORIGINAL crossers' exact positions.
+//! - THE WAITERS (8): no route — standing states at the original placement
+//!   table's entries, byte-identical.
+//!
+//! THE CORNER RING IS RETIRED: a closed circuit around the intersection
+//! must cross roads, the scene's only crosswalks are the camera's own
+//! (west and north), and a camera-safe ring is not a ring — the honest
+//! camera-safe crowd is the flanks + pacers + the waiters' standing.
 
-use crate::corner_population::WALK_STRIDE_SECONDS;
+use crate::corner_population::{Block, WALK_STRIDE_SECONDS};
 use engine_core::npc_locomotion::{LOOPING, NpcLocomotion, Route, RouteLeg, start_route};
 use engine_renderer::lit_scene::camera_route;
 use engine_renderer::proxy_instances::{InstanceTransform, ProxyInstance};
@@ -21,7 +35,7 @@ use engine_renderer::proxy_instances::{InstanceTransform, ProxyInstance};
 /// lower legs smaller; rounded up to 0.36 for safety margin).
 const FOOTPRINT: f32 = 0.36;
 /// The building masses begin where BOTH coordinates reach 6 m (the corner
-/// blocks; the road edge is 4 m, the sidewalk ring spans between).
+/// blocks; the road edge is 4 m, the sidewalk spans between).
 const BUILDING_LINE: f32 = 6.0;
 /// The road edge (min(|x|,|z|) < 4 is road).
 const ROAD_EDGE: f32 = 4.0;
@@ -32,81 +46,39 @@ const STRIDE_LENGTH: f32 = 1.54;
 /// Heading turn rate (u16 turn units per tick).
 const TURN_RATE: u16 = 400;
 
-/// THE CAMERA SPLINE CLEARANCE (the margin from lit_scene::camera_route's
-/// waypoint polyline — the line the demo interpolates). Every swept position
-/// must stay ≥ this from the route. The demo's camera_route has 6 segments
-/// with the west arm near z=0 and the north arm near x=0; the margin is
-/// measured from the closest point on each segment.
-const CAMERA_MARGIN: f32 = 0.8;
-
-/// The route table: the corner's walking lanes. Every lane is a pure data
-/// description: origin, legs with destinations and headings, speed, spread,
-/// stride, turn rate, and loop flag. The lane geometry is precomputed at
-/// construction (the per-leg lengths, unit vectors, perpendiculars) —
-/// `sqrt` runs HERE, not per tick.
-///
-/// LANE ORGANIZATION:
-/// - CORNER_RING: ONE closed route hugging the intersection at |lane| = 5.0
-/// - ARM_BANDS: FOUR there-and-back routes along each road arm's flank bands
-/// - CROSSWALK_PACING: TWO 2-leg loops at the crosswalks' centers
-/// - WAITERS: 8 stand-alone states at the crosswalk ends (no route, standing)
-///
-/// Every lane clears the building masses (min(|x|,|z|) < 6) by ≥ 0.72 m
-/// and the camera route by ≥ CAMERA_MARGIN.
-///
-/// LANE ADJUSTMENTS: if a battery test fails, ADJUST THE LANE (not the
-/// margin) and document the cause in the comment above the lane.
-// ------------------------------------------------------- corner ring
-/// The corner ring: ONE closed route, the square hugging the intersection
-/// at |x| = |z| = 5.0. Four legs of length 10.0 between the corners
-/// (±5.0, ±5.0), turns at the corners (multiples of 16384). The ring is
-/// a LOOPING route that walks the sidewalk band (min(|x|,|z|) = 5.0 ∈ [4, 6]).
-///
-/// LEGS (counter-clockwise from the SE corner):
-/// - leg 0: (5.0, -5.0) → (-5.0, -5.0) along z = -5.0 (westbound)
-/// - leg 1: (-5.0, -5.0) → (-5.0, 5.0) along x = -5.0 (northbound)
-/// - leg 2: (-5.0, 5.0) → (5.0, 5.0) along z = 5.0 (eastbound)
-/// - leg 3: (5.0, 5.0) → (5.0, -5.0) along x = 5.0 (southbound)
-///
-/// The ring's centerline at |coord| = 5.0. With spread_width = 0.28, the
-/// swept band is [4.72, 5.28], which fits exactly within the valid sidewalk band
-/// [4.72, 5.28] (5.0 - 0.28 = 4.72 ≥ 4.72 and 5.0 + 0.28 = 5.28 ≤ 5.28) ✓.
-///
-/// The ring clears the building masses (min(|x|,|z|) ≥ 6) by 6 - 5.0 = 1.0 m
-/// (≥ 0.72 m). The camera route's west arm runs at z≈0 through x ∈ [-8, -2];
-/// at x = -5.0, z = -5.0, the closest point is (-5.0, 0) on the west arm's
-/// segment, distance = 5.0 m (≥ 0.8 m). The north arm runs at x≈0 through
-/// z ∈ [2, 8]; at x = -5.0, z = 5.0, distance = 5.0 m (≥ 0.8 m). The other
-/// two corners are symmetric. The ring is CLEAR.
-///
-/// NOTE: The sweep battery checks every sampled point on the centerline.
-/// At the midpoints of the legs (e.g., (0, -5.0)), min_coord = 0, which
-/// violates the battery's [4.72, 5.28] constraint. To fix this, the ring
-/// legs are adjusted to stay within the valid band: leg 0 goes from
-/// (5.0, -5.0) to (-5.0, -5.0) but only the portion where |x| ≥ 4.72 is
-/// included. This is achieved by缩短 the legs so they don't reach the axes.
-// ------------------------------------------------------- the flank loops
-/// THE LANE GEOMETRY (the battery's authored answer): each road arm's
-/// FAR flank segment carries a closed there-and-back loop — two lanes
-/// 0.72 m apart (2 x FOOTPRINT: opposite-direction walkers pass with
-/// footprints exactly clear), spanning [6.5, 10.5] from the
-/// intersection (the near-corner sidewalk belongs to the waiters:
-/// the flank's nearest lane point clears every waiter by >= 0.83 m).
-/// The road-side lane sits at |coord| 4.40 (>= ROAD_EDGE + FOOTPRINT
-/// = 4.36); the building-side lane at 5.12 (quadrant_distance =
-/// 6.00 - 5.12 = 0.88 >= 0.5 + FOOTPRINT = 0.86 — the original
-/// placement battery's own convention). The lateral spread is 0 on
-/// the flanks (the 0.78 m band cannot host 0.72-separated lanes AND
-/// a spread; the crowd's de-lockstep lives in the speed jitter and
-/// phase draws, and the PACERS carry the lateral spread).
-const FLANK_ROAD_SIDE: f32 = 4.40;
-const FLANK_BUILDING_SIDE: f32 = 5.12;
+// ------------------------------------------------------- the flank lanes
+/// 35/8 — DYADIC, exact in f32. The road-side lane's |coord|: it clears
+/// ROAD_EDGE + FOOTPRINT = 4.36 by 0.015 (measured margin 0.0149998665).
+const FLANK_ROAD_SIDE: f32 = 4.375;
+/// 41/8 — DYADIC, exact in f32. The building-side lane's |coord|: its
+/// quadrant distance 6.0 − 5.125 = 0.875 clears 0.5 + FOOTPRINT = 0.86
+/// by 0.015 (measured margin 0.014999986).
+const FLANK_BUILDING_SIDE: f32 = 5.125;
+/// The near end of the flank span — the near-corner sidewalk (min(|x|,|z|)
+/// ∈ [4, 6] beside the intersection box) belongs to the waiters.
 const FLANK_NEAR: f32 = 6.5;
+/// The far end of the flank span.
 const FLANK_FAR: f32 = 10.5;
+/// The flanks carry NO lateral spread: the 0.78 m sidewalk band
+/// ([4.36, 5.14]) hosts the 0.75 lane pair with 0.015 of margin at BOTH
+/// edges — nothing remains for a spread. The de-lockstep lives in the
+/// speed and phase draws; the pacers carry the lateral spread.
 const FLANK_SPREAD: f32 = 0.0;
+/// The pacers' lateral spread: the swept band ±0.3 stays inside the
+/// crosswalk strips' ±0.64 footprint-clear band (the original crosser
+/// convention).
+const PACER_SPREAD: f32 = 0.3;
 
-/// The N-S road's west flank, NORTH segment (the west band above the
-/// E-W road): road-side lane northbound, building-side southbound.
+// THE LANE-SEPARATION DERIVATION: the two flank lanes are EXACTLY 0.75
+// apart (5.125 − 4.375 — both dyadic, so the subtraction is exact in f32).
+// 0.75 is the battery's different-NPC walker margin MET BY CONSTRUCTION:
+// when two walkers pass on opposite lanes the computed distance is
+// sqrt(0.75² + dz²) ≥ 0.75 exactly (IEEE sqrt is correctly rounded and
+// monotone; the lane coordinates stay exact because a cardinal leg's unit
+// vector has a zero component and the flank spread is 0). The measured
+// walker-involved minimum over the demo's full 663-frame window is EXACTLY
+// 0.75 — the passing separation itself, not luck.
+
 fn ns_west_north_flank() -> Route {
     Route::new(
         [-FLANK_ROAD_SIDE, FLANK_NEAR],
@@ -114,7 +86,7 @@ fn ns_west_north_flank() -> Route {
             RouteLeg {
                 to: [-FLANK_ROAD_SIDE, FLANK_FAR],
                 turn: 0,
-            }, // northbound
+            }, // northbound, road-side
             RouteLeg {
                 to: [-FLANK_BUILDING_SIDE, FLANK_FAR],
                 turn: 49152,
@@ -122,7 +94,7 @@ fn ns_west_north_flank() -> Route {
             RouteLeg {
                 to: [-FLANK_BUILDING_SIDE, FLANK_NEAR],
                 turn: 32768,
-            }, // southbound
+            }, // southbound, building-side
             RouteLeg {
                 to: [-FLANK_ROAD_SIDE, FLANK_NEAR],
                 turn: 16384,
@@ -138,41 +110,74 @@ fn ns_west_north_flank() -> Route {
     .expect("the N-S west north flank closes exactly")
 }
 
-/// The E-W road's north flank, WEST segment (the north band left of
-/// the N-S road): road-side lane westbound, building-side eastbound.
-fn ew_north_west_flank() -> Route {
+/// The N-S road's west flank, SOUTH segment (road-side lane southbound,
+/// building-side northbound).
+fn ns_west_south_flank() -> Route {
     Route::new(
-        [-FLANK_NEAR, FLANK_ROAD_SIDE],
+        [-FLANK_ROAD_SIDE, -FLANK_NEAR],
         vec![
             RouteLeg {
-                to: [-FLANK_FAR, FLANK_ROAD_SIDE],
-                turn: 49152,
-            }, // westbound
-            RouteLeg {
-                to: [-FLANK_FAR, FLANK_BUILDING_SIDE],
-                turn: 0,
-            }, // the far connector, north
-            RouteLeg {
-                to: [-FLANK_NEAR, FLANK_BUILDING_SIDE],
-                turn: 16384,
-            }, // eastbound
-            RouteLeg {
-                to: [-FLANK_NEAR, FLANK_ROAD_SIDE],
+                to: [-FLANK_ROAD_SIDE, -FLANK_FAR],
                 turn: 32768,
-            }, // the near connector, south
+            }, // southbound
+            RouteLeg {
+                to: [-FLANK_BUILDING_SIDE, -FLANK_FAR],
+                turn: 16384,
+            }, // the far connector, east
+            RouteLeg {
+                to: [-FLANK_BUILDING_SIDE, -FLANK_NEAR],
+                turn: 0,
+            }, // northbound
+            RouteLeg {
+                to: [-FLANK_ROAD_SIDE, -FLANK_NEAR],
+                turn: 49152,
+            }, // the near connector, west
         ],
         WALK_SPEED,
         FLANK_SPREAD,
         STRIDE_LENGTH,
         TURN_RATE,
         true,
-        1,
+        2,
     )
-    .expect("the E-W north west flank closes exactly")
+    .expect("the N-S west south flank closes exactly")
 }
 
-/// The N-S road's east flank, SOUTH segment (the east band below the
-/// E-W road): road-side lane southbound, building-side northbound.
+/// The N-S road's east flank, NORTH segment (road-side lane northbound,
+/// building-side southbound).
+fn ns_east_north_flank() -> Route {
+    Route::new(
+        [FLANK_ROAD_SIDE, FLANK_NEAR],
+        vec![
+            RouteLeg {
+                to: [FLANK_ROAD_SIDE, FLANK_FAR],
+                turn: 0,
+            }, // northbound, road-side
+            RouteLeg {
+                to: [FLANK_BUILDING_SIDE, FLANK_FAR],
+                turn: 16384,
+            }, // the far connector, east
+            RouteLeg {
+                to: [FLANK_BUILDING_SIDE, FLANK_NEAR],
+                turn: 32768,
+            }, // southbound, building-side
+            RouteLeg {
+                to: [FLANK_ROAD_SIDE, FLANK_NEAR],
+                turn: 49152,
+            }, // the near connector, west
+        ],
+        WALK_SPEED,
+        FLANK_SPREAD,
+        STRIDE_LENGTH,
+        TURN_RATE,
+        true,
+        3,
+    )
+    .expect("the N-S east north flank closes exactly")
+}
+
+/// The N-S road's east flank, SOUTH segment (road-side lane southbound,
+/// building-side northbound).
 fn ns_east_south_flank() -> Route {
     Route::new(
         [FLANK_ROAD_SIDE, -FLANK_NEAR],
@@ -183,29 +188,128 @@ fn ns_east_south_flank() -> Route {
             }, // southbound
             RouteLeg {
                 to: [FLANK_BUILDING_SIDE, -FLANK_FAR],
-                turn: 16384,
-            }, // the far connector, east
+                turn: 49152,
+            }, // the far connector, west
             RouteLeg {
                 to: [FLANK_BUILDING_SIDE, -FLANK_NEAR],
                 turn: 0,
             }, // northbound
             RouteLeg {
                 to: [FLANK_ROAD_SIDE, -FLANK_NEAR],
-                turn: 49152,
-            }, // the near connector, west
+                turn: 16384,
+            }, // the near connector, east
         ],
         WALK_SPEED,
         FLANK_SPREAD,
         STRIDE_LENGTH,
         TURN_RATE,
         true,
-        1,
+        4,
     )
     .expect("the N-S east south flank closes exactly")
 }
 
-/// The E-W road's south flank, EAST segment (the south band right of
-/// the N-S road): road-side lane eastbound, building-side westbound.
+/// The E-W road's north flank, WEST segment (road-side lane westbound,
+/// building-side eastbound).
+fn ew_north_west_flank() -> Route {
+    Route::new(
+        [-FLANK_NEAR, FLANK_ROAD_SIDE],
+        vec![
+            RouteLeg {
+                to: [-FLANK_FAR, FLANK_ROAD_SIDE],
+                turn: 49152,
+            }, // westbound, road-side
+            RouteLeg {
+                to: [-FLANK_FAR, FLANK_BUILDING_SIDE],
+                turn: 0,
+            }, // the far connector, north
+            RouteLeg {
+                to: [-FLANK_NEAR, FLANK_BUILDING_SIDE],
+                turn: 16384,
+            }, // eastbound, building-side
+            RouteLeg {
+                to: [-FLANK_NEAR, FLANK_ROAD_SIDE],
+                turn: 32768,
+            }, // the near connector, south
+        ],
+        WALK_SPEED,
+        FLANK_SPREAD,
+        STRIDE_LENGTH,
+        TURN_RATE,
+        true,
+        5,
+    )
+    .expect("the E-W north west flank closes exactly")
+}
+
+/// The E-W road's north flank, EAST segment (road-side lane eastbound,
+/// building-side westbound).
+fn ew_north_east_flank() -> Route {
+    Route::new(
+        [FLANK_NEAR, FLANK_ROAD_SIDE],
+        vec![
+            RouteLeg {
+                to: [FLANK_FAR, FLANK_ROAD_SIDE],
+                turn: 16384,
+            }, // eastbound
+            RouteLeg {
+                to: [FLANK_FAR, FLANK_BUILDING_SIDE],
+                turn: 0,
+            }, // the far connector, north
+            RouteLeg {
+                to: [FLANK_NEAR, FLANK_BUILDING_SIDE],
+                turn: 49152,
+            }, // westbound
+            RouteLeg {
+                to: [FLANK_NEAR, FLANK_ROAD_SIDE],
+                turn: 32768,
+            }, // the near connector, south
+        ],
+        WALK_SPEED,
+        FLANK_SPREAD,
+        STRIDE_LENGTH,
+        TURN_RATE,
+        true,
+        6,
+    )
+    .expect("the E-W north east flank closes exactly")
+}
+
+/// The E-W road's south flank, WEST segment (road-side lane westbound,
+/// building-side eastbound).
+fn ew_south_west_flank() -> Route {
+    Route::new(
+        [-FLANK_NEAR, -FLANK_ROAD_SIDE],
+        vec![
+            RouteLeg {
+                to: [-FLANK_FAR, -FLANK_ROAD_SIDE],
+                turn: 49152,
+            }, // westbound
+            RouteLeg {
+                to: [-FLANK_FAR, -FLANK_BUILDING_SIDE],
+                turn: 32768,
+            }, // the far connector, south
+            RouteLeg {
+                to: [-FLANK_NEAR, -FLANK_BUILDING_SIDE],
+                turn: 16384,
+            }, // eastbound
+            RouteLeg {
+                to: [-FLANK_NEAR, -FLANK_ROAD_SIDE],
+                turn: 0,
+            }, // the near connector, north
+        ],
+        WALK_SPEED,
+        FLANK_SPREAD,
+        STRIDE_LENGTH,
+        TURN_RATE,
+        true,
+        7,
+    )
+    .expect("the E-W south west flank closes exactly")
+}
+
+/// The E-W road's south flank, EAST segment (road-side lane eastbound,
+/// building-side westbound).
 fn ew_south_east_flank() -> Route {
     Route::new(
         [FLANK_NEAR, -FLANK_ROAD_SIDE],
@@ -232,17 +336,17 @@ fn ew_south_east_flank() -> Route {
         STRIDE_LENGTH,
         TURN_RATE,
         true,
-        1,
+        8,
     )
     .expect("the E-W south east flank closes exactly")
 }
 
-// ------------------------------------------------------- the crosswalk pacers
+// ------------------------------------------------------- the crosswalk pacers (2)
 /// The crosswalk pacing loops: the two crossers pace INSIDE their
 /// crosswalks' camera-far halves (the west crosswalk's north half at
-/// x = -4.85, z in [1.0, 2.6] — >= 1.0 m from the camera spline's
+/// x = -5.0, z ∈ [1.5, 2.6] — >= 1.0 m from the camera spline's
 /// z ~ 0 west-arm line; the north crosswalk's east half at z = 5.0,
-/// x in [1.0, 2.6] — >= 1.0 m from the x ~ 0 north-arm line). The
+/// x in [1.5, 2.6] — >= 1.0 m from the x ~ 0 north-arm line). The
 /// about-face at each end is the turn blend's rate-limited rotation
 /// (a pedestrian pausing to look before crossing). The 0.3 lateral
 /// spread keeps the swept band inside the crosswalk strip
@@ -250,19 +354,17 @@ fn ew_south_east_flank() -> Route {
 /// battery's crosser convention). The FULL crossing (the whole road
 /// arm) crosses the camera spline by construction and belongs to the
 /// composed-crowd package (noted, not done).
-const PACER_SPREAD: f32 = 0.3;
-
 /// The west crosswalk pacer.
 fn west_crosswalk_pacer() -> Route {
     Route::new(
-        [-4.85, 1.0],
+        [-5.0, 1.5],
         vec![
             RouteLeg {
-                to: [-4.85, 2.6],
+                to: [-5.0, 2.6],
                 turn: 0,
             }, // northbound pace
             RouteLeg {
-                to: [-4.85, 1.0],
+                to: [-5.0, 1.5],
                 turn: 32768,
             }, // the about-face, south
         ],
@@ -271,7 +373,7 @@ fn west_crosswalk_pacer() -> Route {
         STRIDE_LENGTH,
         TURN_RATE,
         true,
-        2,
+        9,
     )
     .expect("the west pacer closes exactly")
 }
@@ -279,14 +381,14 @@ fn west_crosswalk_pacer() -> Route {
 /// The north crosswalk pacer.
 fn north_crosswalk_pacer() -> Route {
     Route::new(
-        [1.0, 5.0],
+        [1.5, 5.0],
         vec![
             RouteLeg {
                 to: [2.6, 5.0],
                 turn: 16384,
             }, // eastbound pace
             RouteLeg {
-                to: [1.0, 5.0],
+                to: [1.5, 5.0],
                 turn: 49152,
             }, // the about-face, west
         ],
@@ -295,86 +397,107 @@ fn north_crosswalk_pacer() -> Route {
         STRIDE_LENGTH,
         TURN_RATE,
         true,
-        2,
+        10,
     )
     .expect("the north pacer closes exactly")
 }
 
-/// The route table: the four far-arm flank loops (indices 0-3) then
-/// the two crosswalk pacers (indices 4-5). Every lane is pure data;
-/// the swept-validity battery below is the acceptance.
+// ------------------------------------------------------- route table (10 routes total)
+/// THE ROUTE TABLE:
+/// Routes 0-7: the 8 flank loops (N-S west north, N-S west south,
+/// N-S east north, N-S east south, E-W north west, E-W north east,
+/// E-W south west, E-W south east)
+/// Routes 8-9: the 2 crosswalk pacers (west, north)
 fn corner_routes() -> Vec<Route> {
     vec![
         ns_west_north_flank(),
-        ew_north_west_flank(),
+        ns_west_south_flank(),
+        ns_east_north_flank(),
         ns_east_south_flank(),
+        ew_north_west_flank(),
+        ew_north_east_flank(),
+        ew_south_west_flank(),
         ew_south_east_flank(),
         west_crosswalk_pacer(),
         north_crosswalk_pacer(),
     ]
 }
 
-// ------------------------------------------------------- waiters (stand alone)
-/// The 8 waiters stand at the ORIGINAL placement table's positions
-/// (corner_population.rs's NPC_TABLE, byte-identical — the static
-/// gates' waiter pixels unchanged): the crosswalk ends, facing the
-/// road they wait to cross. The flank loops' nearest lane points
-/// clear them by >= 0.83 m; the pacers clear them by >= 1.9 m.
+// ------------------------------------------------------- waiters (8)
+/// The 8 waiters stand at the ORIGINAL placement table's entries
+/// (`corner_population::NPC_TABLE`'s waiter rows, byte-identical in
+/// position, turn, and order — the frame-0 waiter pixels are therefore
+/// unchanged): the crosswalk ends, facing the road they wait to cross.
+/// The swept bands' nearest approach to any waiter is 0.8003907 m (the
+/// battery's measured minimum) — the E-W south-band loops' near
+/// connectors passing the north crosswalk's east-end pair.
 const WAITER_POSITIONS: [[f32; 2]; 8] = [
     [-5.0, -4.5],
-    [-5.1, 4.5],
-    [-4.5, 5.1],
-    [4.5, 5.1],
     [-5.7, -4.8],
+    [-5.1, 4.5],
     [-5.7, 4.9],
+    [-4.5, 5.1],
     [-4.9, 5.7],
+    [4.5, 5.1],
     [4.9, 5.7],
 ];
 
+const WAITER_TURNS: [u16; 8] = [0, 0, 32768, 32768, 16384, 16384, 49152, 49152];
+
+// ------------------------------------------------------- population constructor
+/// The corner's locomotion population: the routes, the 24 states in
+/// NPC_TABLE order, and the present mask (all true — the vehicles are a
+/// separate, unchanged table).
+///
+/// - WAITERS 0-7: standing states authored directly at
+///   [`WAITER_POSITIONS`]/[`WAITER_TURNS`]. A waiter is world-placed
+///   policy, not route-walking: `advance_batch` skips speed ≤ 0 states
+///   before reading their route fields, so the inert (route 0, leg 0,
+///   destination 0) shape carries no semantics — the authored position
+///   and facing are the state's whole truth.
+/// - CROSSERS 8-9: `start_route` at the pacing loops' starts (the
+///   original crossers' exact positions and facings), seeds 200+i,
+///   LOOPING.
+/// - STROLLERS 10-23: the plan below, seeds 300+i, LOOPING.
+///
+/// THE STROLLER DISTRIBUTION AND ITS DRIFT BOUND: same-loop pairs start
+/// at OPPOSITE-lane waypoints — half the 9.5 m perimeter (4.75 m) apart.
+/// Per-NPC speed_scale ∈ [0.9, 1.1) (the seed's own stream) bounds the
+/// worst-case relative drift at 0.2 × 1.4 = 0.28 m/s; over the demo's
+/// full 663-frame window (11.05 s) that closes ≤ 3.09 m, leaving
+/// ≥ 1.66 m of along-loop gap — the pair never reaches the same point,
+/// and the closest physical approach is the opposite-lane passing
+/// separation, EXACTLY 0.75 m (measured at frame 512: the E-W
+/// north-east loop's pair, draws 0.9052/1.0163 — the largest relative
+/// drift in the table). This repairs the WIP's quarter-perimeter
+/// distribution, whose connector-adjacent pairs started 0.75 m apart
+/// with 2.8 m of closable drift — a collision hole the WIP's battery
+/// never measured.
 pub fn corner_population_locomotion() -> (Vec<Route>, Vec<NpcLocomotion>, Vec<bool>) {
     let routes = corner_routes();
 
     // The 24 states in NPC_TABLE order.
     let mut states: Vec<NpcLocomotion> = Vec::with_capacity(24);
 
-    // -- Waiters (8): stand at their re-authored positions.
-    //   The placement table's turns:
-    //   west south: turn 0 (facing north)
-    //   west north: turn 32768 (facing south)
-    //   north west: turn 16384 (facing east)
-    //   north east: turn 49152 (facing west)
-    //   repeated for the second waiter at each end.
-    let waiter_turns = [0, 32768, 16384, 49152, 0, 32768, 16384, 49152];
+    // -- Waiters (8): standing states at the authored positions.
     for i in 0..8 {
         let [x, z] = WAITER_POSITIONS[i];
-        // The appearance seed for waiter i is 100+i.
-        let appearance_seed = 100 + i as u32;
-        // The destination = leg means standing (speed 0.0).
-        // Use the first route for the dummy route (it won't be used for walking).
-        let route = &routes[0];
-        // The dummy-route validity probe (standing at waypoint 0 with
-        // destination 0 is the legal standing shape; the state below
-        // carries the authored position and facing).
-        start_route(0, route, appearance_seed, 0, 0)
-            .expect("the waiter's standing shape is a legal start");
         states.push(NpcLocomotion {
             position: [x, z],
-            facing: waiter_turns[i],
+            facing: WAITER_TURNS[i],
             route: 0,
             leg: 0,
             leg_distance: 0.0,
             destination: 0,
             speed: 0.0,
-            speed_scale: 1.0,  // not used (standing)
-            lateral: 0.0,      // not used (standing)
-            stride_phase: 0.0, // not used (standing)
+            speed_scale: 1.0,  // inert (standing)
+            lateral: 0.0,      // inert (standing)
+            stride_phase: 0.0, // inert (standing)
         });
     }
 
     // -- Crossers (2): on the pacing loops.
-    //   Crosser 8: west_crosswalk_pacer (routes[5]), at waypoint 0, LOOPING.
-    //   Crosser 9: north_crosswalk_pacer (routes[6]), at waypoint 0, LOOPING.
-    for (i, route_idx) in [4u32, 5u32].iter().enumerate() {
+    for (i, route_idx) in [8u32, 9u32].iter().enumerate() {
         let appearance_seed = 200 + i as u32;
         let state = start_route(
             *route_idx,
@@ -387,28 +510,25 @@ pub fn corner_population_locomotion() -> (Vec<Route>, Vec<NpcLocomotion>, Vec<bo
         states.push(state);
     }
 
-    // -- Strollers (14): 4/4/3/3 over the four far-arm flank loops,
-    //   each loop's walkers spread over its four corner waypoints (a
-    //   quarter-perimeter apart; the same-lane pairs — waypoints 0
-    //   and 2 — half a perimeter apart: the 9.44 m loop at drift
-    //   <= 0.28 m/s over the 600-frame window closes at most 2.8 m,
-    //   leaving >= 1.9 m of same-lane gap, well above the 0.72
-    //   passing bound — derived in the battery's test).
+    // -- Strollers (14): the plan (route index, start waypoint) — six
+    //   loops carry TWO strollers at opposite-lane waypoints (0 and 2,
+    //   half a perimeter apart; the drift bound above), the two
+    //   camera-far south-band loops carry ONE.
     let stroller_configs = [
         (0u32, 0u32),
-        (0, 1),
         (0, 2),
-        (0, 3), // N-S west north flank (4)
         (1, 0),
-        (1, 1),
         (1, 2),
-        (1, 3), // E-W north west flank (4)
         (2, 0),
-        (2, 1),
-        (2, 2), // N-S east south flank (3)
+        (2, 2),
         (3, 0),
-        (3, 1),
-        (3, 2), // E-W south east flank (3)
+        (3, 2),
+        (4, 0),
+        (4, 2),
+        (5, 0),
+        (5, 2),
+        (6, 0),
+        (7, 0),
     ];
 
     for (i, &(route_idx, waypoint)) in stroller_configs.iter().enumerate() {
@@ -435,19 +555,24 @@ pub fn corner_population_locomotion() -> (Vec<Route>, Vec<NpcLocomotion>, Vec<bo
 /// state.position[1]], turn: state.facing, scale: 1.0 }` (the 0.02 feet
 /// seam, the table's convention), tint from the authored palette (the
 /// street palette is unchanged), pose_index i (sequential).
-pub fn corner_instances(states: &[NpcLocomotion], table_tints: &[[f32; 3]]) -> Vec<ProxyInstance> {
-    // The tints come from the placement table (NPC_TABLE's tints).
-    // The spec says: "the table's tints, carried over".
+pub fn corner_instances_into(
+    states: &[NpcLocomotion],
+    table_tints: &[[f32; 3]],
+    out: &mut [ProxyInstance],
+) {
     assert_eq!(
         states.len(),
         table_tints.len(),
         "states and tints are parallel"
     );
+    assert_eq!(
+        states.len(),
+        out.len(),
+        "states and output instances are parallel"
+    );
 
-    states
-        .iter()
-        .enumerate()
-        .map(|(i, state)| ProxyInstance {
+    for (i, state) in states.iter().enumerate() {
+        out[i] = ProxyInstance {
             transform: InstanceTransform {
                 pos: [state.position[0], 0.02, state.position[1]],
                 turn: state.facing,
@@ -455,16 +580,34 @@ pub fn corner_instances(states: &[NpcLocomotion], table_tints: &[[f32; 3]]) -> V
             },
             tint: table_tints[i],
             pose_index: i as u32,
-        })
-        .collect()
+        };
+    }
 }
 
-/// One NPC's pose block from its locomotion state (the rendering bridge):
-/// standing (speed == 0) → rest_pose_block(); walking → sample_pose(&clip,
-/// state.stride_phase * WALK_STRIDE_SECONDS) then compose/skin EXACTLY as
-/// `evaluate_population_poses` does (same call sequence — byte-compatible
-/// clip evaluation).
-pub fn evaluate_locomotion_pose(state: &NpcLocomotion) -> Block {
+/// The allocating convenience form (tests): builds the Vec then calls the into form.
+pub fn corner_instances(states: &[NpcLocomotion], table_tints: &[[f32; 3]]) -> Vec<ProxyInstance> {
+    let mut out = Vec::with_capacity(states.len());
+    out.resize(
+        states.len(),
+        ProxyInstance {
+            transform: InstanceTransform {
+                pos: [0.0, 0.0, 0.0],
+                turn: 0,
+                scale: 0.0,
+            },
+            tint: [0.0, 0.0, 0.0],
+            pose_index: 0,
+        },
+    );
+    corner_instances_into(states, table_tints, &mut out);
+    out
+}
+
+/// Evaluates the population's pose blocks IN PLACE (one block per NPC,
+/// pose-index order — entry i's block is block i, matching the table's
+/// sequential pose_index pin), reusing the buffer's capacity. Zero allocation
+/// after the first frame.
+pub fn evaluate_population_poses_locomotion(states: &[NpcLocomotion], out: &mut Vec<Block>) {
     use engine_renderer::animation::{
         compose_joint_matrices, humanoid_skeleton, rest_pose_block, sample_pose, skin_matrices,
         walk_clip,
@@ -473,86 +616,75 @@ pub fn evaluate_locomotion_pose(state: &NpcLocomotion) -> Block {
     let clip = walk_clip();
     let skeleton = humanoid_skeleton();
 
-    if state.speed == 0.0 {
-        // Standing: the rest pose.
-        rest_pose_block()
-    } else {
-        // Walking: sample the pose at (phase * stride), then skin.
-        let t = state.stride_phase * WALK_STRIDE_SECONDS;
-        let pose = sample_pose(&clip, t);
-        let joint_worlds = compose_joint_matrices(&skeleton, &pose);
-        skin_matrices(&joint_worlds, &skeleton)
-    }
-}
-
-/// Evaluates the population's pose blocks IN PLACE (one block per NPC,
-/// pose-index order — entry i's block is block i), reusing the buffer's
-/// capacity. Zero allocation after the first frame.
-pub fn evaluate_population_poses_locomotion(states: &[NpcLocomotion], out: &mut Vec<Block>) {
     out.clear();
     out.reserve(states.len());
+
     for state in states {
-        out.push(evaluate_locomotion_pose(state));
+        let block = if state.speed == 0.0 {
+            // Standing: the rest pose.
+            rest_pose_block()
+        } else {
+            // Walking: sample the pose at (phase * stride), then skin.
+            let t = state.stride_phase * WALK_STRIDE_SECONDS;
+            let pose = sample_pose(&clip, t);
+            let joint_worlds = compose_joint_matrices(&skeleton, &pose);
+            skin_matrices(&joint_worlds, &skeleton)
+        };
+        out.push(block);
     }
 }
 
-// ------------------------------------------------------- types
-/// One pose block: 11 column-major skin matrices (the packed-pose stride's
-/// unit — the animation core's HUMANOID_JOINTS).
-pub type Block = [[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS];
-
 // ------------------------------------------------------- swept-validity battery
-/// THE SWEEP GRID STEP (the battery samples routes at this resolution).
-const SWEEP_STEP: f32 = 0.25;
-
-/// One swept sample: a position and the NPC index that owns it.
-#[derive(Debug, Clone, Copy)]
+/// One sampled swept position, tagged with the route it belongs to
+/// (the swept LANE COMPLEX is the unit: same-route different-NPC
+/// coexistence is the temporal campaign's job, not the sweep's).
 struct SweepSample {
+    route: usize,
     pos: [f32; 2],
-    npc: usize,
 }
 
-/// Samples a route's swept band at SWEEP_STEP resolution, including the
-/// lateral offset at ±spread_width (the swept band's edges).
-///
-/// Note: we skip the last point of each leg to avoid duplicate sampling at corners.
-/// We only sample points where the swept band stays within the valid band.
-fn sample_route_swept(route: &Route) -> Vec<SweepSample> {
+/// Samples every route's legs at 0.25-unit steps INCLUDING both
+/// endpoints, at the centerline and at +-spread_width when the
+/// route carries a spread (flanks: spread 0 -> centerline only).
+fn sample_route_swept(routes: &[Route]) -> Vec<SweepSample> {
     let mut result = Vec::new();
 
-    for leg_idx in 0..route.leg_count() {
-        let leg_from = route.leg_from(leg_idx);
-        let leg_to = route.leg_to(leg_idx);
-        let leg_length = route.leg_length(leg_idx);
+    for (route_idx, route) in routes.iter().enumerate() {
+        // The swept band's offsets, computed once per route (no
+        // per-step allocation — the battery runs on every push).
+        let spread = route.spread_width();
+        let offsets: [f32; 3] = if spread == 0.0 {
+            [0.0, 0.0, 0.0]
+        } else {
+            [0.0, spread, -spread]
+        };
+        let offset_count = if spread == 0.0 { 1 } else { 3 };
+        for leg_idx in 0..route.leg_count() {
+            let leg_from = route.leg_from(leg_idx);
+            let leg_to = route.leg_to(leg_idx);
+            let leg_length = route.leg_length(leg_idx);
 
-        // The unit direction and perpendicular.
-        let dx = leg_to[0] - leg_from[0];
-        let dz = leg_to[1] - leg_from[1];
-        let inv_length = 1.0 / leg_length;
-        let unit = [dx * inv_length, dz * inv_length];
-        let perp = [unit[1], -unit[0]];
+            // The unit direction and perpendicular.
+            let dx = leg_to[0] - leg_from[0];
+            let dz = leg_to[1] - leg_from[1];
+            let inv_length = 1.0 / leg_length;
+            let unit = [dx * inv_length, dz * inv_length];
+            let perp = [unit[1], -unit[0]];
 
-        // Sample at SWEEP_STEP intervals along the leg.
-        let num_steps = (leg_length / SWEEP_STEP) as usize;
-        for step in 0..num_steps {
-            let t = step as f32 / num_steps as f32;
-            let pos_along = [leg_from[0] + t * dx, leg_from[1] + t * dz];
+            // Sample at 0.25-unit intervals along the leg.
+            let num_steps = (leg_length / 0.25) as usize;
+            for step in 0..=num_steps {
+                let t = step as f32 / num_steps as f32;
+                let pos_along = [leg_from[0] + t * dx, leg_from[1] + t * dz];
 
-            // The route's spread_width.
-            let spread = route.spread_width();
-
-            // Sample at center, +spread, and -spread (the swept band).
-            // Only include samples where min_coord >= 4.72
-            for offset in &[0.0, spread, -spread] {
-                let swept_pos = [
-                    pos_along[0] + offset * perp[0],
-                    pos_along[1] + offset * perp[1],
-                ];
-                let min_coord = swept_pos[0].abs().min(swept_pos[1].abs());
-                if (4.72..=5.28).contains(&min_coord) {
+                for &offset in &offsets[..offset_count] {
+                    let swept_pos = [
+                        pos_along[0] + offset * perp[0],
+                        pos_along[1] + offset * perp[1],
+                    ];
                     result.push(SweepSample {
+                        route: route_idx,
                         pos: swept_pos,
-                        npc: 0, // will be filled in by the caller
                     });
                 }
             }
@@ -562,215 +694,173 @@ fn sample_route_swept(route: &Route) -> Vec<SweepSample> {
     result
 }
 
-/// The crosswalk pacer test: they must stay within their crosswalk strips
-/// with ≥ 0.72 m from the road edges' through-traffic lanes.
-fn check_crosswalk_margin(sample: SweepSample) -> bool {
-    let [x, z] = sample.pos;
-
-    // The west crosswalk pacer: x = -5.0, z ∈ [1.0, 2.6]
-    // The north crosswalk pacer: z = 5.0, x ∈ [1.0, 2.6]
-    // The road edges: |z| < 4 for E-W road, |x| < 4 for N-S road.
-    // The pacer bands must be ≥ 0.72 m from the road edge at |z| = 4 or |x| = 4.
-
-    // West pacer at x = -5.0: the road edge is at |z| = 4.
-    // The pacer's z ∈ [1.0, 2.6], so min distance to road edge is min(|1.0-4|, |2.6-4|) = 1.4 m.
-    if (x + 4.85).abs() < 0.01 && (1.0..=2.6).contains(&z) {
-        let dist_to_road = (z - 4.0).abs().min((z + 4.0).abs());
-        return dist_to_road >= 0.72;
-    }
-
-    // North pacer at z = 5.0: the road edge is at |x| = 4.
-    // The pacer's x ∈ [1.0, 2.6], so min distance to road edge is min(|1.0-4|, |2.6-4|) = 1.4 m.
-    if (z - 5.0).abs() < 0.01 && (1.0..=2.6).contains(&x) {
-        let dist_to_road = (x - 4.0).abs().min((x + 4.0).abs());
-        return dist_to_road >= 0.72;
-    }
-
-    true // not a pacer sample, or the pacer is in its band
+/// The sweep's measured minimums (the evidence the tests pin).
+#[derive(Debug)]
+pub struct SweepSummary {
+    pub samples: usize,
+    /// Different routes' swept bands, center-to-center. Margin >= 0.75.
+    pub cross_route_min: f32,
+    /// Any swept sample vs any waiter position. Margin >= 0.75.
+    pub waiter_min: f32,
+    /// Any swept sample vs the camera polyline. Margin >= 0.8.
+    pub camera_min: f32,
+    /// min(|x|,|z|) - (ROAD_EDGE + FOOTPRINT) over sidewalk samples.
+    pub road_margin: f32,
+    /// quadrant_distance - (0.5 + FOOTPRINT) over sidewalk samples.
+    pub building_margin: f32,
+    /// Any swept sample vs the VEHICLE_TABLE boxes. Margin >= 1.0.
+    pub sedan_min: f32,
+    /// Pacer samples outside their crosswalk bands (0 expected).
+    pub pacer_band_violations: u32,
 }
 
-/// The camera spline margin test: every swept position must be ≥ CAMERA_MARGIN
-/// from the camera_route's spline.
-fn check_camera_margin(sample: SweepSample) -> bool {
-    let [x, z] = sample.pos;
-    let pos = [x, z];
+/// The sedans' axis-aligned half extents at their turns.
+const SEDAN_HALF_WIDTH: f32 = 0.98;
+const SEDAN_HALF_LENGTH: f32 = 2.20;
 
-    // Sample the camera_route at the same resolution as the demo's route_poses.
-    let route = camera_route();
-    let mut best = f32::INFINITY;
-
-    for window in route.windows(2) {
-        let a = [window[0].position[0], window[0].position[2]];
-        let b = [window[1].position[0], window[1].position[2]];
-        best = best.min(point_segment_distance(pos, a, b));
+/// The sedan boxes with their half extents (from corner_population's VEHICLE_TABLE).
+/// Westbound at (9, 2) turn 49152 → half extents (2.20, 0.98).
+/// Northbound at (2, 9) turn 0 → (0.98, 2.20).
+fn sedan_box(turn: u16, pos: [f32; 2]) -> ([f32; 2], [f32; 2]) {
+    // At turn 0 or 32768: half_width in x, half_length in z
+    // At turn 16384 or 49152: half_length in x, half_width in z
+    if turn == 0 || turn == 32768 {
+        ([pos[0], pos[1]], [SEDAN_HALF_WIDTH, SEDAN_HALF_LENGTH])
+    } else {
+        ([pos[0], pos[1]], [SEDAN_HALF_LENGTH, SEDAN_HALF_WIDTH])
     }
-
-    best >= CAMERA_MARGIN
 }
 
-/// The walker-to-waiter margin test: every walker sample must be ≥ 0.75 m
-/// from every waiter's position.
-fn check_walker_to_waiter(samples: &[SweepSample]) -> bool {
-    for sample in samples {
-        if sample.npc >= 8 {
-            // This is a walker (npc 8+), check against waiters (npc 0-7).
-            for waiter_pos in WAITER_POSITIONS.iter() {
-                let dx = sample.pos[0] - waiter_pos[0];
-                let dz = sample.pos[1] - waiter_pos[1];
-                let dist = (dx * dx + dz * dz).sqrt();
-                if dist < 0.75 {
-                    return false;
-                }
-            }
-        }
-    }
-
-    true
+fn point_box_distance(px: f32, pz: f32, cx: f32, cz: f32, hx: f32, hz: f32) -> f32 {
+    let dx = (px - cx).abs() - hx;
+    let dz = (pz - cz).abs() - hz;
+    (dx.max(0.0) * dx.max(0.0) + dz.max(0.0) * dz.max(0.0)).sqrt()
 }
 
-/// THE BATTERY VERDICT (the sweep test results).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BatteryVerdict {
-    /// All tests passed.
-    Green,
-    /// At least one test failed.
-    Red(&'static str),
-}
+/// The swept-validity battery: samples every route's swept band (see
+/// [`sample_route_swept`]) and measures every margin. PURE measurement —
+/// the caller (the lib battery) asserts the gates; a violation shows up
+/// as a margin at or below its bound (a lane creeping into the road
+/// produces a NEGATIVE `road_margin`, not a skipped sample — every
+/// flank sample is measured unconditionally).
+pub fn sweep_battery(routes: &[Route]) -> SweepSummary {
+    let samples = sample_route_swept(routes);
+    let sample_count = samples.len();
 
-/// The swept-validity battery: samples every route at SWEEP_STEP steps
-/// along one full loop (plus each NPC's lateral offset at ±spread_width),
-/// and checks:
-/// - walker-to-walker margin (≥ 0.75 m)
-/// - walker-to-waiter margin (≥ 0.75 m)
-/// - walker-to-collision-geometry (sidewalk band, crosswalk strips)
-/// - walker-to-camera-spline (≥ CAMERA_MARGIN)
-///
-/// If a constraint fails, ADJUST THE LANE (not the margin) and document
-/// the cause in the route's comment.
-pub fn sweep_battery(routes: &[Route], _states: &[NpcLocomotion]) -> BatteryVerdict {
-    // Sample all routes.
-    let mut all_samples: Vec<SweepSample> = Vec::new();
-
-    for (route_idx, route) in routes.iter().enumerate() {
-        // Each route's NPCs (indices route_idx * 2 and route_idx * 2 + 1).
-        // The distribution: 0: ring(8), 1: north_flank(2), 2: south_flank(2),
-        // 3: east_flank(2), 4: west_flank(2), 5: west_pacer(1), 6: north_pacer(1).
-        // We'll assign NPCs based on the route's position in the table.
-        let npc_offset = match route_idx {
-            0 => 0,  // ring: waiters 0-7, strollers 10-15 (6 of them)
-            1 => 16, // north_flank: strollers 16-17
-            2 => 18, // south_flank: strollers 18-19
-            3 => 20, // east_flank: strollers 20-21
-            4 => 22, // west_flank: strollers 22-23
-            5 => 8,  // west_pacer: crossers 8
-            6 => 9,  // north_pacer: crossers 9
-            _ => 0,
-        };
-
-        let samples = sample_route_swept(route);
-
-        // Track seen positions to avoid duplicate samples at corners
-        let mut seen_positions: Vec<[f32; 2]> = Vec::new();
-        for sample in samples.iter() {
-            // Check if this position is too close to a previously seen position
-            let is_duplicate = seen_positions.iter().any(|p| {
-                let dx = p[0] - sample.pos[0];
-                let dz = p[1] - sample.pos[1];
-                (dx * dx + dz * dz).sqrt() < 0.1
-            });
-
-            if !is_duplicate {
-                seen_positions.push(sample.pos);
-                // All samples from the same route are assigned the same base NPC
-                let npc_idx = npc_offset;
-                all_samples.push(SweepSample {
-                    pos: sample.pos,
-                    npc: npc_idx as usize,
-                });
-            }
-        }
-    }
-
-    // Check all margins.
-    // Building + road margin: the ORIGINAL placement battery's
-    // conventions (corner_population.rs's tests), extended to swept
-    // positions: a sidewalk sample's footprint stays off the road
-    // (min(|x|,|z|) >= ROAD_EDGE + FOOTPRINT = 4.36) and clear of
-    // every building quadrant by >= 0.5 m edge-to-edge
-    // (quadrant_distance >= 0.5 + FOOTPRINT = 0.86); a pacer sample
-    // stays inside its crosswalk band (the original crosser
-    // predicates). The flank lanes are authored at 4.40 / 5.12 —
-    // the exact constants that satisfy both with positive margin.
-    for sample in &all_samples {
-        let [x, z] = sample.pos;
-        let min_coord = x.abs().min(z.abs());
-        let in_west_band = (x + 5.0).abs() <= 1.0 - FOOTPRINT && z.abs() <= ROAD_EDGE - FOOTPRINT;
-        let in_north_band = (z - 5.0).abs() <= 1.0 - FOOTPRINT && x.abs() <= ROAD_EDGE - FOOTPRINT;
-        let sidewalk_ok =
-            min_coord >= ROAD_EDGE + FOOTPRINT && quadrant_distance(x, z) >= 0.5 + FOOTPRINT;
-        if !sidewalk_ok && !in_west_band && !in_north_band {
-            eprintln!(
-                "building/road margin failure: ({:.4}, {:.4}) min_coord = {:.4}",
-                x, z, min_coord
-            );
-            eprintln!("All samples:");
-            for s in &all_samples {
-                let [sx, sz] = s.pos;
-                eprintln!("  ({:.4}, {:.4}) min={:.4}", sx, sz, sx.abs().min(sz.abs()));
-            }
-            return BatteryVerdict::Red("building margin");
-        }
-    }
-
-    // Crosswalk margin (for pacers).
-    for sample in &all_samples {
-        if !check_crosswalk_margin(*sample) {
-            return BatteryVerdict::Red("crosswalk margin");
-        }
-    }
-
-    // Camera margin.
-    for sample in &all_samples {
-        if !check_camera_margin(*sample) {
-            return BatteryVerdict::Red("camera margin");
-        }
-    }
-
-    // Walker-to-walker margin.
-    // Note: samples are at SWEEP_STEP (0.25 m) intervals, so the minimum spacing
-    // between unique positions is about 0.25 m. We use a margin of 0.721 m to
-    // account for route placement and sample grid.
-    for (i, a) in all_samples.iter().enumerate() {
-        for b in all_samples.iter().skip(i + 1) {
-            if a.npc != b.npc {
+    // --- cross_route_min: pairwise over samples with DIFFERENT route tags
+    let mut cross_route_min = f32::INFINITY;
+    for (i, a) in samples.iter().enumerate() {
+        for b in samples.iter().skip(i + 1) {
+            if a.route != b.route {
                 let dx = a.pos[0] - b.pos[0];
                 let dz = a.pos[1] - b.pos[1];
                 let dist = (dx * dx + dz * dz).sqrt();
-                if dist < 0.73 {
-                    eprintln!(
-                        "walker-to-walker violation: NPC {} at ({:.2}, {:.2}) and NPC {} at ({:.2}, {:.2}), dist = {:.2}",
-                        a.npc, a.pos[0], a.pos[1], b.npc, b.pos[0], b.pos[1], dist
-                    );
-                    return BatteryVerdict::Red("walker-to-walker margin");
-                }
+                cross_route_min = cross_route_min.min(dist);
             }
         }
     }
 
-    // Walker-to-waiter margin.
-    if !check_walker_to_waiter(&all_samples) {
-        return BatteryVerdict::Red("walker-to-waiter margin");
+    // --- waiter_min: every sample vs every waiter position
+    let mut waiter_min = f32::INFINITY;
+    for sample in &samples {
+        for waiter_pos in WAITER_POSITIONS.iter() {
+            let dx = sample.pos[0] - waiter_pos[0];
+            let dz = sample.pos[1] - waiter_pos[1];
+            let dist = (dx * dx + dz * dz).sqrt();
+            waiter_min = waiter_min.min(dist);
+        }
     }
 
-    BatteryVerdict::Green
+    // --- camera_min: every sample vs the camera_route's segments
+    let mut camera_min = f32::INFINITY;
+    let camera_route = camera_route();
+    for window in camera_route.windows(2) {
+        let a = [window[0].position[0], window[0].position[2]];
+        let b = [window[1].position[0], window[1].position[2]];
+        for sample in &samples {
+            let dist = point_segment_distance(sample.pos, a, b);
+            camera_min = camera_min.min(dist);
+        }
+    }
+
+    // --- road_margin and building_margin: EVERY flank sample (routes
+    // 0-7), measured UNCONDITIONALLY — a lane that creeps into the road
+    // or a building mass shows up as a negative margin, never as a
+    // skipped sample (the WIP's filter excluded exactly the violations
+    // it existed to detect; that class of weakened gate is barred).
+    let mut road_margin = f32::INFINITY;
+    let mut building_margin = f32::INFINITY;
+    for sample in &samples {
+        if sample.route < 8 {
+            let [x, z] = sample.pos;
+            let min_coord = x.abs().min(z.abs());
+            road_margin = road_margin.min(min_coord - (ROAD_EDGE + FOOTPRINT));
+            building_margin = building_margin.min(quadrant_distance(x, z) - (0.5 + FOOTPRINT));
+        }
+    }
+
+    // --- sedan_min: every sample vs the two vehicle boxes
+    let mut sedan_min = f32::INFINITY;
+    // Westbound at (9, 2) turn 49152
+    let (wb_pos, wb_ext) = sedan_box(49152, [9.0, 2.0]);
+    // Northbound at (2, 9) turn 0
+    let (nb_pos, nb_ext) = sedan_box(0, [2.0, 9.0]);
+
+    for sample in &samples {
+        let d1 = point_box_distance(
+            sample.pos[0],
+            sample.pos[1],
+            wb_pos[0],
+            wb_pos[1],
+            wb_ext[0],
+            wb_ext[1],
+        );
+        let d2 = point_box_distance(
+            sample.pos[0],
+            sample.pos[1],
+            nb_pos[0],
+            nb_pos[1],
+            nb_ext[0],
+            nb_ext[1],
+        );
+        sedan_min = sedan_min.min(d1.min(d2));
+    }
+
+    // --- pacer_band_violations: samples from routes 8-9 must be in their crosswalk bands
+    let mut pacer_band_violations = 0u32;
+    for sample in &samples {
+        if sample.route == 8 {
+            // West pacer: x = -5.0, z ∈ [1.5, 2.6]
+            let [x, z] = sample.pos;
+            let in_band = (x + 5.0).abs() <= 1.0 - FOOTPRINT && z.abs() <= ROAD_EDGE - FOOTPRINT;
+            if !in_band {
+                pacer_band_violations += 1;
+            }
+        } else if sample.route == 9 {
+            // North pacer: z = 5.0, x ∈ [1.5, 2.6]
+            let [x, z] = sample.pos;
+            let in_band = (z - 5.0).abs() <= 1.0 - FOOTPRINT && x.abs() <= ROAD_EDGE - FOOTPRINT;
+            if !in_band {
+                pacer_band_violations += 1;
+            }
+        }
+    }
+
+    SweepSummary {
+        samples: sample_count,
+        cross_route_min,
+        waiter_min,
+        camera_min,
+        road_margin,
+        building_margin,
+        sedan_min,
+        pacer_band_violations,
+    }
 }
 
 // ------------------------------------------------------- helpers
 /// The distance from (x, z) to the nearest building-quadrant region
-/// {|u| >= 6 AND |v| >= 6} — the ORIGINAL placement battery's
-/// convention (corner_population.rs's tests), carried over verbatim
-/// (a point; the sign reflection folds all four quadrants into the
-/// northeast one).
+/// {|u| >= 6 AND |v| >= 6}.
 fn quadrant_distance(x: f32, z: f32) -> f32 {
     let mut best = f32::INFINITY;
     for (sx, sz) in [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
@@ -801,49 +891,15 @@ fn point_segment_distance(point: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
 mod tests {
     use super::*;
 
-    /// THE PLACEMENT-TABLE TINTS (from corner_population.rs, carried over).
-    /// The street palette (deliberately not a gradient or a seeded generator — pure data).
-    const NPC_TINTS: [[f32; 3]; 24] = [
-        // Crosswalk waiters (8).
-        [0.85, 0.70, 0.55],
-        [0.20, 0.45, 0.75],
-        [0.90, 0.35, 0.20],
-        [0.35, 0.75, 0.30],
-        [0.75, 0.30, 0.60],
-        [0.95, 0.80, 0.40],
-        [0.15, 0.55, 0.85],
-        [0.60, 0.60, 0.65],
-        // Crossers (2).
-        [0.45, 0.80, 0.75],
-        [0.70, 0.20, 0.20],
-        // Sidewalk strollers (14).
-        [0.55, 0.40, 0.30],
-        [0.80, 0.50, 0.30],
-        [0.30, 0.30, 0.35],
-        [0.90, 0.75, 0.60],
-        [0.25, 0.60, 0.40],
-        [0.85, 0.60, 0.70],
-        [0.40, 0.40, 0.55],
-        [0.95, 0.55, 0.30],
-        [0.65, 0.75, 0.30],
-        [0.50, 0.65, 0.80],
-        [0.80, 0.35, 0.45],
-        [0.30, 0.70, 0.55],
-        [0.70, 0.65, 0.50],
-        [0.55, 0.30, 0.65],
-    ];
-
     /// THE ROUTE CONSTRUCTION: every route constructs successfully.
     #[test]
-    fn routes_construct() {
+    fn routes_construct_and_close() {
         let routes = corner_routes();
-        assert_eq!(
-            routes.len(),
-            6,
-            "the route table has 6 routes — four flanks and two pacers"
-        );
-        for (i, route) in routes.iter().enumerate() {
-            assert!(route.leg_count() > 0, "route {i} has legs");
+        assert_eq!(routes.len(), 10, "the route table has 10 routes");
+
+        // Routes 0-7: flanks have 4 legs
+        for (i, route) in routes.iter().enumerate().take(8) {
+            assert_eq!(route.leg_count(), 4, "flank route {i} has 4 legs");
             assert!(route.speed() > 0.0, "route {i} has positive speed");
             assert!(
                 route.spread_width() >= 0.0,
@@ -852,91 +908,323 @@ mod tests {
             assert!(route.stride_length() > 0.0, "route {i} has positive stride");
             assert!(route.loops(), "route {i} loops");
         }
+
+        // Routes 8-9: pacers have 2 legs
+        for (i, route) in routes.iter().enumerate().skip(8) {
+            assert_eq!(route.leg_count(), 2, "pacer route {i} has 2 legs");
+        }
+
+        // The policy tags: table index + 1 (the routes' diagnostic
+        // identity — the digest never reads them, the authoring pins them).
+        for (i, route) in routes.iter().enumerate() {
+            assert_eq!(route.policy_tag(), i as u32 + 1, "route {i}'s tag");
+        }
+
+        // Spot-pin route 0's leg coordinates and turns
+        let route0 = &routes[0];
+        assert_eq!(route0.leg_from(0), [-FLANK_ROAD_SIDE, FLANK_NEAR]);
+        assert_eq!(route0.leg_to(0), [-FLANK_ROAD_SIDE, FLANK_FAR]);
+        assert_eq!(route0.leg_from(1), [-FLANK_ROAD_SIDE, FLANK_FAR]);
+        assert_eq!(route0.leg_to(1), [-FLANK_BUILDING_SIDE, FLANK_FAR]);
+        assert_eq!(route0.leg_from(2), [-FLANK_BUILDING_SIDE, FLANK_FAR]);
+        assert_eq!(route0.leg_to(2), [-FLANK_BUILDING_SIDE, FLANK_NEAR]);
+        assert_eq!(route0.leg_from(3), [-FLANK_BUILDING_SIDE, FLANK_NEAR]);
+        assert_eq!(route0.leg_to(3), [-FLANK_ROAD_SIDE, FLANK_NEAR]);
+
+        // Spot-pin route 8's leg coordinates and turns (west pacer)
+        let route8 = &routes[8];
+        assert_eq!(route8.leg_from(0), [-5.0, 1.5]);
+        assert_eq!(route8.leg_to(0), [-5.0, 2.6]);
+        assert_eq!(route8.leg_from(1), [-5.0, 2.6]);
+        assert_eq!(route8.leg_to(1), [-5.0, 1.5]);
     }
 
     /// THE POPULATION CONSTRUCTOR: builds the routes, 24 states, and mask.
     #[test]
-    fn population_locomotion_construction() {
+    fn population_construction_is_pinned() {
         let (routes, states, present) = corner_population_locomotion();
 
-        assert_eq!(
-            routes.len(),
-            6,
-            "the route table has 6 routes — four flanks and two pacers"
-        );
+        assert_eq!(routes.len(), 10, "the route table has 10 routes");
         assert_eq!(states.len(), 24, "the population has 24 NPCs");
         assert_eq!(present.len(), 24, "the present mask has 24 entries");
         assert!(present.iter().all(|p| *p), "all NPCs are present");
 
-        // The waiters (0-7) stand.
+        // Waiters 0-7: standing states, byte-identical to the ORIGINAL
+        // placement table's waiter rows (position, turn, order) — the
+        // frame-0 waiter pixels are unchanged (the pixel-preservation
+        // claim, asserted against corner_population's own table).
+        let (shipped, _) = crate::corner_population::corner_population();
         for i in 0..8 {
             assert_eq!(states[i].speed, 0.0, "waiter {i} stands (speed 0.0)");
             assert_eq!(
                 states[i].position, WAITER_POSITIONS[i],
-                "waiter {i} at re-authored position"
+                "waiter {i} position"
+            );
+            assert_eq!(states[i].facing, WAITER_TURNS[i], "waiter {i} facing");
+            assert_eq!(
+                states[i].position,
+                [shipped[i].transform.pos[0], shipped[i].transform.pos[2]],
+                "waiter {i} stands at the shipped table's position"
+            );
+            assert_eq!(
+                states[i].facing, shipped[i].transform.turn,
+                "waiter {i} faces the shipped table's turn"
             );
         }
 
-        // The crossers (8-9) are on the pacing loops.
-        for state in &states[8..10] {
-            assert!(state.speed > 0.0, "the crosser walks (speed > 0.0)");
-            assert_eq!(state.destination, LOOPING, "the crosser loops");
-        }
+        // Crossers 8-9: at the pacing starts — the ORIGINAL crossers'
+        // exact positions and facings — walking, LOOPING.
+        assert_eq!(states[8].position, [-5.0, 1.5]);
+        assert_eq!(states[8].facing, 0);
+        assert_eq!(states[8].route, 8);
+        assert!(states[8].speed > 0.0);
+        assert_eq!(states[8].destination, LOOPING);
 
-        // The strollers (10-23) are on the flank loops.
-        for state in &states[10..] {
-            assert!(state.speed > 0.0, "the stroller walks (speed > 0.0)");
-            assert_eq!(state.destination, LOOPING, "the stroller loops");
+        assert_eq!(states[9].position, [1.5, 5.0]);
+        assert_eq!(states[9].facing, 16384);
+        assert_eq!(states[9].route, 9);
+        assert!(states[9].speed > 0.0);
+        assert_eq!(states[9].destination, LOOPING);
+
+        // Strollers 10-23: the plan's (route, waypoint) pairs — the
+        // waypoint is the state's departing leg (start_route's own
+        // contract), so opposite-lane pairs show legs 0 and 2.
+        let expected_plan = [
+            (0u32, 0u32),
+            (0, 2),
+            (1, 0),
+            (1, 2),
+            (2, 0),
+            (2, 2),
+            (3, 0),
+            (3, 2),
+            (4, 0),
+            (4, 2),
+            (5, 0),
+            (5, 2),
+            (6, 0),
+            (7, 0),
+        ];
+        for (i, &(expected_route, expected_waypoint)) in expected_plan.iter().enumerate() {
+            let state = &states[10 + i];
+            assert_eq!(state.route, expected_route, "stroller {} route", 10 + i);
+            assert_eq!(
+                state.leg,
+                expected_waypoint,
+                "stroller {} starts at waypoint {}",
+                10 + i,
+                expected_waypoint
+            );
+            assert!(state.speed > 0.0, "stroller {} walks", 10 + i);
+            assert_eq!(state.destination, LOOPING, "stroller {} loops", 10 + i);
         }
     }
 
-    /// THE CONSTRUCTION DETERMINISM: two calls byte-identical.
+    /// THE CONSTRUCTION DETERMINISM: two calls byte-identical, every
+    /// field (the draws included — the seeds' own streams).
     #[test]
-    fn population_locomotion_determinism() {
+    fn construction_determinism_double_run() {
         let (routes_a, states_a, present_a) = corner_population_locomotion();
         let (routes_b, states_b, present_b) = corner_population_locomotion();
 
         assert_eq!(routes_a.len(), routes_b.len(), "routes count");
-        for (a, b) in routes_a.iter().zip(routes_b.iter()) {
-            assert_eq!(a.leg_count(), b.leg_count(), "route legs");
-            assert_eq!(a.speed(), b.speed(), "route speed");
-            assert_eq!(a.spread_width(), b.spread_width(), "route spread");
-            assert_eq!(a.stride_length(), b.stride_length(), "route stride");
-            assert_eq!(a.loops(), b.loops(), "route loops");
+        for (i, (a, b)) in routes_a.iter().zip(routes_b.iter()).enumerate() {
+            assert_eq!(a.leg_count(), b.leg_count(), "route {i} legs");
+            assert_eq!(a.speed(), b.speed(), "route {i} speed");
+            assert_eq!(a.spread_width(), b.spread_width(), "route {i} spread");
+            assert_eq!(a.stride_length(), b.stride_length(), "route {i} stride");
+            assert_eq!(a.turn_rate(), b.turn_rate(), "route {i} turn rate");
+            assert_eq!(a.loops(), b.loops(), "route {i} loops");
+            assert_eq!(a.policy_tag(), b.policy_tag(), "route {i} tag");
+            for leg in 0..a.leg_count() {
+                assert_eq!(a.leg_from(leg), b.leg_from(leg), "route {i} leg {leg} from");
+                assert_eq!(a.leg_to(leg), b.leg_to(leg), "route {i} leg {leg} to");
+                assert_eq!(a.leg_turn(leg), b.leg_turn(leg), "route {i} leg {leg} turn");
+                assert_eq!(
+                    a.leg_length(leg),
+                    b.leg_length(leg),
+                    "route {i} leg {leg} length"
+                );
+            }
         }
 
         assert_eq!(states_a.len(), states_b.len(), "states count");
-        for (a, b) in states_a.iter().zip(states_b.iter()) {
-            assert_eq!(a.position, b.position, "state position");
-            assert_eq!(a.facing, b.facing, "state facing");
-            assert_eq!(a.speed, b.speed, "state speed");
-            assert_eq!(a.destination, b.destination, "state destination");
+        for (i, (a, b)) in states_a.iter().zip(states_b.iter()).enumerate() {
+            assert_eq!(a.position, b.position, "npc {i} position");
+            assert_eq!(a.facing, b.facing, "npc {i} facing");
+            assert_eq!(a.route, b.route, "npc {i} route");
+            assert_eq!(a.leg, b.leg, "npc {i} leg");
+            assert_eq!(a.leg_distance, b.leg_distance, "npc {i} leg_distance");
+            assert_eq!(a.destination, b.destination, "npc {i} destination");
+            assert_eq!(a.speed, b.speed, "npc {i} speed");
+            assert_eq!(a.speed_scale, b.speed_scale, "npc {i} speed_scale");
+            assert_eq!(a.lateral, b.lateral, "npc {i} lateral");
+            assert_eq!(a.stride_phase, b.stride_phase, "npc {i} stride_phase");
         }
 
         assert_eq!(present_a, present_b, "present mask");
     }
 
-    /// THE SWEEP BATTERY: all constraints pass.
+    /// THE SWEEP BATTERY GREEN: all constraints pass with measured margins
+    /// (the MEASURED column is this tree's own run; movement beyond
+    /// rounding is an investigation, never a silent repin).
     #[test]
-    fn sweep_battery_passes() {
-        let (routes, states, _) = corner_population_locomotion();
-        let verdict = sweep_battery(&routes, &states);
+    fn sweep_battery_green() {
+        let (routes, _, _) = corner_population_locomotion();
+        let summary = sweep_battery(&routes);
 
-        assert_eq!(verdict, BatteryVerdict::Green, "the sweep battery passes");
+        println!("SweepSummary: {summary:?}");
+
+        assert!(
+            summary.cross_route_min >= 0.75,
+            "cross_route_min >= 0.75, measured 1.9445436: {summary:?}"
+        );
+        assert!(
+            summary.waiter_min >= 0.75,
+            "waiter_min >= 0.75, measured 0.8003907: {summary:?}"
+        );
+        assert!(
+            summary.camera_min >= 0.8,
+            "camera_min >= 0.8, measured 1.5: {summary:?}"
+        );
+        assert!(
+            summary.road_margin > 0.0,
+            "road_margin > 0.0, measured 0.0149998665: {summary:?}"
+        );
+        assert!(
+            summary.building_margin > 0.0,
+            "building_margin > 0.0, measured 0.014999986: {summary:?}"
+        );
+        assert!(
+            summary.sedan_min >= 1.0,
+            "sedan_min >= 1.0, measured 1.395: {summary:?}"
+        );
+        assert_eq!(
+            summary.pacer_band_violations, 0,
+            "the pacers stay inside their crosswalk bands: {summary:?}"
+        );
+        assert!(summary.samples > 0, "the sweep sampled the routes");
+    }
+
+    /// THE TEMPORAL CAMPAIGN (the spec's missing pin, at the DEMO's full
+    /// window): a double-constructed population advanced 663 frames at
+    /// dt = 1/60 (the demo's render-then-step discipline — presented
+    /// frame k shows the crowd after k ticks, and the loop's 663rd step
+    /// follows the last render) is byte-identical run-to-run; the
+    /// locomotion stream's FNV-1a digest pins at sampled frames; and the
+    /// population NEVER collides:
+    /// - walker-involved pairs (either NPC speed > 0) >= 0.75 — the
+    ///   battery's different-NPC margin. MEASURED minimum EXACTLY 0.75
+    ///   (frame 512, the E-W north-east loop's pair — the lane design's
+    ///   passing separation, met by construction, not luck).
+    /// - waiter-waiter pairs >= 0.7 — the ORIGINAL placement table's own
+    ///   cardinal-facing rule (they stand at cardinal turns forever, so
+    ///   the 0.72 arbitrary-orientation circle is unreachable). MEASURED
+    ///   0.7211102 (waiters 2 and 3, the original table's own spacing).
+    #[test]
+    fn locomotion_campaign_is_deterministic_and_clear() {
+        use engine_core::npc_locomotion::{LocomotionSample, advance_batch, locomotion_digest};
+
+        let dt = 1.0 / 60.0;
+        let (routes_a, mut states_a, present_a) = corner_population_locomotion();
+        let (routes_b, mut states_b, present_b) = corner_population_locomotion();
+
+        let mut walker_min = f32::INFINITY;
+        let mut waiter_min = f32::INFINITY;
+        // Frame k = the state after k advances (the demo's render-then-step:
+        // frame 0 is the construction; the 663rd step follows the last
+        // render). The checks read the frame's state BEFORE stepping it.
+        for k in 0..=662u64 {
+            // THE DOUBLE-RUN: both populations hold identical states at
+            // every rendered frame.
+            for i in 0..24 {
+                assert_eq!(
+                    (
+                        states_a[i].position,
+                        states_a[i].facing,
+                        states_a[i].leg,
+                        states_a[i].stride_phase
+                    ),
+                    (
+                        states_b[i].position,
+                        states_b[i].facing,
+                        states_b[i].leg,
+                        states_b[i].stride_phase
+                    ),
+                    "the double-run diverged at frame {k}, npc {i}"
+                );
+            }
+
+            // THE DIGEST PINS (frame k = the state after k advances).
+            if matches!(k, 0 | 33 | 66 | 300 | 600 | 662) {
+                let samples: Vec<LocomotionSample> = states_a
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| LocomotionSample {
+                        npc: i as u32,
+                        position: s.position,
+                        facing: s.facing,
+                        stride_phase: s.stride_phase,
+                        leg: s.leg,
+                    })
+                    .collect();
+                let digest = locomotion_digest(&samples);
+                let pinned = match k {
+                    0 => 5_555_165_838_415_353_039,
+                    33 => 15_857_914_442_065_508_438,
+                    66 => 7_884_320_277_839_605_183,
+                    300 => 2_298_866_077_436_191_627,
+                    600 => 3_676_128_144_009_102_166,
+                    _ => 1_541_710_115_810_823_099,
+                };
+                assert_eq!(digest, pinned, "the locomotion digest moved at frame {k}");
+            }
+
+            // THE PAIRWISE CLEARANCE (every frame, all 276 pairs).
+            for i in 0..24 {
+                for j in (i + 1)..24 {
+                    let dx = states_a[i].position[0] - states_a[j].position[0];
+                    let dz = states_a[i].position[1] - states_a[j].position[1];
+                    let distance = (dx * dx + dz * dz).sqrt();
+                    if states_a[i].speed > 0.0 || states_a[j].speed > 0.0 {
+                        walker_min = walker_min.min(distance);
+                        assert!(
+                            distance >= 0.75,
+                            "walkers {i} and {j} closed to {distance} at frame {k}"
+                        );
+                    } else {
+                        waiter_min = waiter_min.min(distance);
+                        assert!(
+                            distance >= 0.7,
+                            "waiters {i} and {j} closed to {distance} at frame {k}"
+                        );
+                    }
+                }
+            }
+
+            advance_batch(&routes_a, &mut states_a, &present_a, dt, None, 0.3, 1.75);
+            advance_batch(&routes_b, &mut states_b, &present_b, dt, None, 0.3, 1.75);
+        }
+        println!(
+            "locomotion campaign: 663 frames double-run byte-identical; walker-involved \
+             minimum {walker_min}, waiter-waiter minimum {waiter_min}"
+        );
     }
 
     /// THE INSTANCES CONSTRUCTOR: produces valid proxy instances.
     #[test]
-    fn corner_instances_construct() {
+    fn instances_and_into_form() {
         let (_, states, _) = corner_population_locomotion();
-        let instances = corner_instances(&states, &NPC_TINTS);
+        let tints = crate::corner_population::corner_npc_tints();
+        let instances_allocating = corner_instances(&states, &tints);
 
-        assert_eq!(instances.len(), 24, "one instance per NPC");
-        for (i, instance) in instances.iter().enumerate() {
+        // Test the allocating form's fields
+        assert_eq!(instances_allocating.len(), 24, "one instance per NPC");
+        for (i, instance) in instances_allocating.iter().enumerate() {
             let state = &states[i];
             assert_eq!(
                 instance.transform.pos[0], state.position[0],
-                "instance {i} x matches state"
+                "instance {i} x"
             );
             assert_eq!(
                 instance.transform.pos[1], 0.02,
@@ -944,102 +1232,148 @@ mod tests {
             );
             assert_eq!(
                 instance.transform.pos[2], state.position[1],
-                "instance {i} z matches state"
+                "instance {i} z"
             );
-            assert_eq!(
-                instance.transform.turn, state.facing,
-                "instance {i} turn matches state"
-            );
-            assert_eq!(instance.transform.scale, 1.0, "instance {i} scale is 1.0");
-            assert_eq!(
-                instance.pose_index, i as u32,
-                "instance {i} pose_index is sequential"
-            );
-            assert_eq!(
-                instance.tint, NPC_TINTS[i],
-                "instance {i} tint matches table"
-            );
+            assert_eq!(instance.transform.turn, state.facing, "instance {i} turn");
+            assert_eq!(instance.transform.scale, 1.0, "instance {i} scale");
+            assert_eq!(instance.pose_index, i as u32, "instance {i} pose_index");
+            assert_eq!(instance.tint, tints[i], "instance {i} tint");
         }
+
+        // Test the into form: pre-build, mutate, outputs equal
+        let mut instances_into = Vec::with_capacity(24);
+        instances_into.resize(
+            24,
+            ProxyInstance {
+                transform: InstanceTransform {
+                    pos: [0.0, 0.0, 0.0],
+                    turn: 0,
+                    scale: 0.0,
+                },
+                tint: [0.0, 0.0, 0.0],
+                pose_index: 0,
+            },
+        );
+
+        corner_instances_into(&states, &tints, &mut instances_into);
+
+        assert_eq!(
+            instances_into, instances_allocating,
+            "into form equals allocating"
+        );
+        assert_eq!(instances_into.len(), 24, "into form length");
+        assert_eq!(
+            instances_into.capacity(),
+            24,
+            "into form capacity unchanged"
+        );
+
+        // Call twice to verify no realloc
+        let capacity = instances_into.capacity();
+        corner_instances_into(&states, &tints, &mut instances_into);
+        assert_eq!(
+            instances_into.capacity(),
+            capacity,
+            "no realloc on second call"
+        );
     }
 
-    /// THE POSE EVALUATION: byte-compatible with evaluate_population_poses.
+    /// THE POSE EVALUATION LOCOMOTION: matches the phase-column path.
     #[test]
-    fn evaluate_locomotion_pose_compatibility() {
-        use engine_renderer::animation::{rest_pose_block, sample_pose, walk_clip};
+    fn pose_evaluation_matches_the_phase_column_path() {
+        use engine_renderer::animation::{
+            compose_joint_matrices, rest_pose_block, sample_pose, skin_matrices, walk_clip,
+        };
 
         let (_, mut states, _) = corner_population_locomotion();
+        let mut blocks = Vec::new();
 
-        // Test a standing state (waiter 0).
-        let block_stand = evaluate_locomotion_pose(&states[0]);
+        // Standing waiter → bit-exact rest_pose_block()
+        evaluate_population_poses_locomotion(&[states[0]], &mut blocks);
         let rest = rest_pose_block();
-        assert_eq!(block_stand, rest, "standing NPC evaluates to rest pose");
+        assert_eq!(blocks[0], rest, "standing NPC evaluates to rest pose");
 
-        // Test a walking state (crosser 8).
+        // Forged phase tests
         states[8].stride_phase = 0.0;
-        let block_walk_0 = evaluate_locomotion_pose(&states[8]);
+        evaluate_population_poses_locomotion(&[states[8]], &mut blocks);
         let t = 0.0 * WALK_STRIDE_SECONDS;
-        let pose = sample_pose(&walk_clip(), t);
-        let joint_worlds = engine_renderer::animation::compose_joint_matrices(
-            &engine_renderer::animation::humanoid_skeleton(),
-            &pose,
-        );
-        let expected = engine_renderer::animation::skin_matrices(
-            &joint_worlds,
-            &engine_renderer::animation::humanoid_skeleton(),
-        );
-        assert_eq!(
-            block_walk_0, expected,
-            "walking NPC evaluates correctly at phase 0"
-        );
+        let clip = walk_clip();
+        let skeleton = engine_renderer::animation::humanoid_skeleton();
+        let pose = sample_pose(&clip, t);
+        let joint_worlds = compose_joint_matrices(&skeleton, &pose);
+        let expected = skin_matrices(&joint_worlds, &skeleton);
+        assert_eq!(blocks[0], expected, "walking NPC at phase 0");
 
-        // Test phase 0.5.
         states[8].stride_phase = 0.5;
-        let block_walk_5 = evaluate_locomotion_pose(&states[8]);
+        evaluate_population_poses_locomotion(&[states[8]], &mut blocks);
         let t = 0.5 * WALK_STRIDE_SECONDS;
-        let pose = sample_pose(&walk_clip(), t);
-        let joint_worlds = engine_renderer::animation::compose_joint_matrices(
-            &engine_renderer::animation::humanoid_skeleton(),
-            &pose,
-        );
-        let expected = engine_renderer::animation::skin_matrices(
-            &joint_worlds,
-            &engine_renderer::animation::humanoid_skeleton(),
-        );
-        assert_eq!(
-            block_walk_5, expected,
-            "walking NPC evaluates correctly at phase 0.5"
-        );
+        let pose = sample_pose(&clip, t);
+        let joint_worlds = compose_joint_matrices(&skeleton, &pose);
+        let expected = skin_matrices(&joint_worlds, &skeleton);
+        assert_eq!(blocks[0], expected, "walking NPC at phase 0.5");
+
+        // The population function's blocks for the REAL construction are byte-identical across two calls
+        let (_, states2, _) = corner_population_locomotion();
+        let mut blocks1 = Vec::new();
+        let mut blocks2 = Vec::new();
+        evaluate_population_poses_locomotion(&states2, &mut blocks1);
+        evaluate_population_poses_locomotion(&states2, &mut blocks2);
+        assert_eq!(blocks1, blocks2, "population pose blocks byte-identical");
     }
 
-    /// THE POSE EVALUATION IN PLACE: reuses buffer capacity, zero allocation.
+    /// THE POSE BYTES FNV PINS: the packed pose bytes' FNV-1a at frames 0, 33, 300.
     #[test]
-    fn evaluate_population_poses_locomotion_capacity() {
+    fn pose_bytes_fnv_pins() {
+        use engine_renderer::animation::pack_pose_bytes;
+
         let (_, states, _) = corner_population_locomotion();
         let mut blocks = Vec::new();
 
-        // The first call grows the buffer.
-        evaluate_population_poses_locomotion(&states, &mut blocks);
-        let capacity = blocks.capacity();
-        assert_eq!(blocks.len(), 24, "one block per NPC");
+        let mut digest = |k: u64| -> u64 {
+            // Advance k frames
+            let mut states_copy = states.clone();
+            let (routes, _, present) = corner_population_locomotion();
+            for _ in 0..k {
+                engine_core::npc_locomotion::advance_batch(
+                    &routes,
+                    &mut states_copy,
+                    &present,
+                    1.0 / 60.0,
+                    None,
+                    0.3,
+                    1.75,
+                );
+            }
 
-        // The second call reuses the buffer.
-        evaluate_population_poses_locomotion(&states, &mut blocks);
-        assert_eq!(blocks.capacity(), capacity, "no reallocation");
-        assert_eq!(blocks.len(), 24, "one block per NPC");
+            evaluate_population_poses_locomotion(&states_copy, &mut blocks);
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for block in &blocks {
+                let bytes = pack_pose_bytes(block);
+                for &byte in bytes.iter() {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            hash
+        };
+
+        let frame0 = digest(0);
+        let frame33 = digest(33);
+        let frame300 = digest(300);
+
+        println!("POSE_FNV_0={frame0}");
+        println!("POSE_FNV_33={frame33}");
+        println!("POSE_FNV_300={frame300}");
+
+        // The measured-actual FNV-1a digests (the placeholder-pin discipline: measured at this tree)
+        const PINNED_0: u64 = 3836824830651730592;
+        const PINNED_33: u64 = 14640098374474969127;
+        const PINNED_300: u64 = 15375200366290321505;
+
+        assert_eq!(frame0, PINNED_0, "frame 0's pose-bytes digest moved");
+        assert_eq!(frame33, PINNED_33, "frame 33's pose-bytes digest moved");
+        assert_eq!(frame300, PINNED_300, "frame 300's pose-bytes digest moved");
     }
 
-    /// THE POSE DETERMINISM: same inputs → byte-identical outputs.
-    #[test]
-    fn evaluate_locomotion_pose_determinism() {
-        let (_, mut states, _) = corner_population_locomotion();
-
-        let block_a = evaluate_locomotion_pose(&states[8]);
-        let block_b = evaluate_locomotion_pose(&states[8]);
-        assert_eq!(block_a, block_b, "same state produces identical blocks");
-
-        // Test with a modified state.
-        states[8].stride_phase = 0.25;
-        let block_c = evaluate_locomotion_pose(&states[8]);
-        assert_ne!(block_c, block_a, "different phase produces different block");
-    }
+    // Import helpers from engine_core for advance_batch (used in pose_bytes_fnv_pins test)
 }

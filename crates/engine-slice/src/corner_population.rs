@@ -215,6 +215,12 @@ pub fn corner_population_phases() -> Vec<Phase> {
 /// lives in engine-renderer's animation core).
 pub const WALK_STRIDE_SECONDS: f32 = 1.1;
 
+/// The placement table's street palette, in NPC_TABLE order (the
+/// locomotion population's tint column — carried over byte-identical).
+pub fn corner_npc_tints() -> [[f32; 3]; 24] {
+    NPC_TABLE.map(|e| e.tint)
+}
+
 /// The demo clock's reference rate: the scripted route advances the
 /// walk at the presented-frame count over 60 Hz (the day/night
 /// cycle's own deterministic-clock precedent — frame k always shows
