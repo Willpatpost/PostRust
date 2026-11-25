@@ -520,11 +520,15 @@ npc_memory_lane lib battery's three and the new
 tests/npc_memory_lane.rs binary's seven, its result line 62 → 63;
 ignored 33 UNCHANGED — the S6 fuzz gate is a NORMAL test, 310 ms
 measured on the pod, no #[ignore]); Windows 1262/617 = the same
-platform-uniform deltas (pure integer/BTree arithmetic, spine +
-std-fs + pipeline flow, no cfg gates, no Vulkan; to be confirmed by
-this candidate's CI run, the count corrected from actuals on a
-mismatch, never a test weakened); renderer release 160/2 UNCHANGED
-(engine-renderer untouched by the package). The prior settlement,
+platform-uniform deltas, **CONFIRMED by this candidate's own CI run
+45625263643** (green on all five jobs, first push — the run's own
+exact-count gates enforced the measured counts on both platforms:
+`main shard: 1313 passed, 2 ignored, 33` and `heavy shard: 618
+passed, 33 ignored, 63` on ubuntu-latest, `main shard: 1262 passed,
+2 ignored, 33` and `heavy shard: 617 passed, 33 ignored, 63` on
+windows-latest, the S6 fuzz gate `s6_fuzz_memory_lane_i1_through_i3_exactly_once
+... ok` as an ordinary test on the runner); renderer release 160/2
+UNCHANGED (engine-renderer untouched by the package). The prior settlement,
 superseded: the shadowed-HDR populated-variant tree
 (`era2/shadowed-hdr-populated`, 2026-11-25, stacked on the part-6 tip
 — the composition gate): heavy **608 Linux MEASURED with the
