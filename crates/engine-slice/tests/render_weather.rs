@@ -461,18 +461,19 @@ fn ripple_reflection_gate() {
         "ripple reflection ink: {differing_bytes} differing bytes, {ink} differing pixels \
          ({lower_ink} in the lower half)"
     );
-    // MEASURED on this pod's lavapipe: PENDING the first CI run's
-    // --nocapture print above — the floors below are the
-    // CONSERVATIVE START, to be corrected from the run's own
-    // actuals (the repo's established pattern: the ink-count gate's
-    // 492-byte measurement against its 200 floor). The roughen term
-    // alone guarantees ink wherever a band covers ground (the
-    // Schlick blend scales by up to faded-amplitude x
-    // RIPPLE_ROUGHEN_GAIN 0.5 — eight annuli of 0.6–1.15 m outer
-    // radius at 2.5–11.5 m from the camera cover far more than the
-    // floors), so the true count is expected well above them.
-    const RIPPLE_BYTE_FLOOR: usize = 100;
-    const RIPPLE_PIXEL_FLOOR: usize = 25;
+    // MEASURED on this pod's lavapipe (the gate's first true
+    // execution, run 45719424168's lavapipe battery): 248,261
+    // differing bytes, 97,620 differing pixels, ALL 97,620 in the
+    // lower half (100% ground region — the camera puts the
+    // horizon ~40% from the top and every ring projects below it).
+    // The forced field's 8 amplitude-1.0 rings perturb the
+    // reflection sample across ~10.6% of the frame; the floors sit
+    // at ~40% of the measurement — load-bearing (a regression that
+    // kills most of the perturbation fails them) while holding
+    // wide margin under the full-strength actual (the ink-count
+    // gate's 492-vs-200 discipline).
+    const RIPPLE_BYTE_FLOOR: usize = 100_000;
+    const RIPPLE_PIXEL_FLOOR: usize = 39_000;
     assert!(
         differing_bytes >= RIPPLE_BYTE_FLOOR,
         "the forced ripple field moved at least {RIPPLE_BYTE_FLOOR} bytes of the capture \
