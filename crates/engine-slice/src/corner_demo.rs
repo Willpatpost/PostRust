@@ -71,6 +71,7 @@ impl LocomotionCrowd {
                     scale: 0.0,
                 },
                 tint: [0.0, 0.0, 0.0],
+                alpha: 1.0,
                 pose_index: 0,
             },
         );
@@ -107,6 +108,7 @@ impl LocomotionCrowd {
                     scale: 0.0,
                 },
                 tint: [0.0, 0.0, 0.0],
+                alpha: 1.0,
                 pose_index: 0,
             },
         );
@@ -202,6 +204,13 @@ impl LocomotionCrowd {
             npc_material: NPC_MATERIAL,
             vehicle: &self.vehicles,
             vehicle_material: VEHICLE_MATERIAL,
+            // The rain kind is EMPTY on the demo path at the
+            // renderer-kind stage: the Era-2 package C's weather
+            // wiring (the demo stage) populates it; an empty kind
+            // may carry any material index (it draws nothing — 0
+            // here, the first corner material).
+            rain: &[],
+            rain_material: 0,
         }
     }
 }

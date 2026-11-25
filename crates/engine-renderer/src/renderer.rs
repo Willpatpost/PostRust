@@ -38,15 +38,24 @@ pub struct SceneLayer<'a> {
     pub view_proj: &'a [[f32; 4]; 4],
 }
 
-/// One proxy population for a populated corner frame: the NPC and
-/// vehicle instance lists, the npc kind's evaluated POSE BLOCKS (the
-/// Era-2 skinning input), and the per-kind material indices into the
-/// corner scene's material table (which specular/shininess set each
-/// kind draws with — CALLER policy, not engine policy; the demo and
-/// the equivalence gate document their choices). The renderer packs
-/// both lists into its retained instance buffer in the fixed
-/// npc-then-vehicle order, and the pose blocks into its retained
-/// pose byte buffer in POSE-INDEX order.
+/// One proxy population for a populated corner frame: the NPC,
+/// vehicle, and RAIN instance lists (the Era-2 package C third
+/// kind), the npc kind's evaluated POSE BLOCKS (the Era-2 skinning
+/// input), and the per-kind material indices into the corner
+/// scene's material table (which specular/shininess set each kind
+/// draws with — CALLER policy, not engine policy; the demo and the
+/// equivalence gate document their choices). The renderer packs the
+/// lists into its retained instance buffer in the fixed
+/// npc-then-vehicle-then-rain order (rain LAST), and the pose
+/// blocks into its retained pose byte buffer in POSE-INDEX order.
+///
+/// THE SHADOW EXCLUSION (the Era-2 package C documented contract):
+/// rain casts no shadows — translucent streaks have no silhouette —
+/// so the shadowed populated path (`render_corner_populated_shadowed`)
+/// submits only the npc and vehicle kinds through the shadow depth
+/// pass; the rain kind rides the LIT pass alone (drawn through the
+/// unlit blended particle pipeline, which receives no shadows by
+/// construction).
 #[derive(Debug, Clone, Copy)]
 pub struct ProxyPopulation<'a> {
     pub npc: &'a [crate::proxy_instances::ProxyInstance],
@@ -62,6 +71,17 @@ pub struct ProxyPopulation<'a> {
     pub npc_material: u32,
     pub vehicle: &'a [crate::proxy_instances::ProxyInstance],
     pub vehicle_material: u32,
+    /// The rain kind's instance list (the Era-2 package C — the
+    /// translucent streaks, submitted LAST in the fixed kind order;
+    /// the instances' `alpha` field carries the per-streak
+    /// coverage). Empty on the dry path — byte-identical to the
+    /// pre-package frames.
+    pub rain: &'a [crate::proxy_instances::ProxyInstance],
+    /// The rain kind's material index into the corner table (its
+    /// set binds the streak texture's albedo/sampler). An EMPTY rain
+    /// kind may carry any index (validated only when populated,
+    /// exactly like the other kinds).
+    pub rain_material: u32,
 }
 
 /// How proxy instances are submitted (the 6-E equivalence gate's
@@ -583,17 +603,22 @@ impl Renderer {
         let material_table = crate::lit_scene::materials().len() as u32;
         if population.npc_material >= material_table
             || population.vehicle_material >= material_table
+            || population.rain_material >= material_table
         {
             return Err(RendererError::Vulkan(format!(
                 "proxy material index outside the corner material table \
-                 ({} materials, npc {}, vehicle {})",
-                material_table, population.npc_material, population.vehicle_material
+                 ({} materials, npc {}, vehicle {}, rain {})",
+                material_table,
+                population.npc_material,
+                population.vehicle_material,
+                population.rain_material
             )));
         }
         crate::proxy_instances::repack_populations(
             &mut self.instance_bytes,
             population.npc,
             population.vehicle,
+            population.rain,
         )
         .map_err(RendererError::ProxyPack)?;
         // The pose contract, validated BEFORE any frame state is
@@ -627,8 +652,10 @@ impl Renderer {
             pose_bytes: &self.pose_bytes,
             npc_count: population.npc.len() as u32,
             vehicle_count: population.vehicle.len() as u32,
+            rain_count: population.rain.len() as u32,
             npc_material: population.npc_material,
             vehicle_material: population.vehicle_material,
+            rain_material: population.rain_material,
             mode: self.proxy_draw_mode,
         };
         let sky = self.sky_params(view_proj);
@@ -743,10 +770,15 @@ impl Renderer {
     /// together path): the proxy instances CAST their shadows
     /// through the shadowed depth pass AND receive shadows through
     /// the shadowed lit pipeline, all through the same one-cascade
-    /// cascade (the deterministic core's `cascade_for`). The safe
-    /// layer's repacked instance and pose blocks are uploaded after
-    /// the slot's fence wait, before the command recording begins —
-    /// the proxy_instances and animation patterns. The proxy
+    /// cascade (the deterministic core's `cascade_for`). THE RAIN
+    /// KIND EXCLUDED FROM THE CAST: translucent streaks have no
+    /// silhouette, so the shadow depth pass submits only the npc and
+    /// vehicle kinds — rain rides the LIT pass alone (the unlit
+    /// blended particle pipeline receives no shadows by
+    /// construction). The safe layer's repacked instance and pose
+    /// blocks are uploaded after the slot's fence wait, before the
+    /// command recording begins — the proxy_instances and animation
+    /// patterns. The proxy
     /// population is validated BEFORE any frame state is touched: a
     /// typed refusal (over-capacity total, invalid field, or a
     /// material index outside the corner table) renders nothing and
@@ -768,17 +800,22 @@ impl Renderer {
         let material_table = crate::lit_scene::materials().len() as u32;
         if population.npc_material >= material_table
             || population.vehicle_material >= material_table
+            || population.rain_material >= material_table
         {
             return Err(RendererError::Vulkan(format!(
                 "proxy material index outside the corner material table \
-                 ({} materials, npc {}, vehicle {})",
-                material_table, population.npc_material, population.vehicle_material
+                 ({} materials, npc {}, vehicle {}, rain {})",
+                material_table,
+                population.npc_material,
+                population.vehicle_material,
+                population.rain_material
             )));
         }
         crate::proxy_instances::repack_populations(
             &mut self.instance_bytes,
             population.npc,
             population.vehicle,
+            population.rain,
         )
         .map_err(RendererError::ProxyPack)?;
         // The pose contract, validated BEFORE any frame state is
@@ -844,8 +881,10 @@ impl Renderer {
             pose_bytes: &self.pose_bytes,
             npc_count: population.npc.len() as u32,
             vehicle_count: population.vehicle.len() as u32,
+            rain_count: population.rain.len() as u32,
             npc_material: population.npc_material,
             vehicle_material: population.vehicle_material,
+            rain_material: population.rain_material,
             mode: self.proxy_draw_mode,
         };
         let outcome = vulkan::render_frame(

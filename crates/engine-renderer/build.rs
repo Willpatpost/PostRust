@@ -60,6 +60,11 @@ fn main() {
     // docs/CYCLE6-6E-BRIEF.md): the same one-module/both-entry-
     // points form, the same binding set as lit_scene (0-3).
     compile_wgsl("instanced_proxy.wgsl", "instanced_proxy.spv");
+    // The Era-2 package C particle shader (the rain kind — the third
+    // populated kind): unlit tinted blended quads, the same binding
+    // set as the lit family (0-2 declared; the header documents the
+    // choice and the depth/blend contract).
+    compile_wgsl("particle.wgsl", "particle.spv");
     // The Cycle 6-F shadow shaders (see
     // docs/AUTONOMOUS-CYCLE-PROTOCOL.md §2 item 2): the depth-only
     // pass (one uniform: the light matrix) and the shadowed lit

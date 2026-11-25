@@ -545,6 +545,8 @@ fn post_pixels_match_post_rs_and_the_disc_blooms() {
         npc_material: 1,
         vehicle: &vehicle,
         vehicle_material: 2,
+        rain: &[],
+        rain_material: 0,
     };
     renderer.request_frame_capture().unwrap();
     let populated_frame = renderer
@@ -2506,6 +2508,8 @@ fn shadowed_populated_composes_through_the_hdr_chain() {
         npc_material: 1,
         vehicle: &vehicle,
         vehicle_material: 2,
+        rain: &[],
+        rain_material: 0,
     };
     renderer.request_frame_capture().unwrap();
     let composed = renderer
@@ -2828,6 +2832,7 @@ fn check_torso_wall_through_the_chain(
             scale: 1.0,
         },
         tint: [0.9, 0.7, 0.6],
+        alpha: 1.0,
         pose_index: 0,
     };
     let single = [instance];
@@ -2838,6 +2843,8 @@ fn check_torso_wall_through_the_chain(
         npc_material: 1,
         vehicle: &[],
         vehicle_material: 0,
+        rain: &[],
+        rain_material: 0,
     };
     renderer.request_frame_capture().unwrap();
     let frame = renderer

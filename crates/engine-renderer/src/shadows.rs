@@ -1543,6 +1543,7 @@ mod tests {
                 scale: 1.0,
             },
             tint: [1.0; 3],
+            alpha: 1.0,
             pose_index: 0,
         };
         let occluder = NpcOccluder::new(&npc, &blocks);
@@ -1614,6 +1615,7 @@ mod tests {
                 scale: 1.0,
             },
             tint: [1.0; 3],
+            alpha: 1.0,
             pose_index: 0,
         };
         let npcs = [NpcOccluder::new(&npc, &blocks)];
@@ -1666,6 +1668,7 @@ mod tests {
                 scale: 1.0,
             },
             tint: [1.0; 3],
+            alpha: 1.0,
             pose_index: 0,
         };
         let two = [
@@ -1702,6 +1705,7 @@ mod tests {
                 scale: 1.0,
             },
             tint: [1.0; 3],
+            alpha: 1.0,
             pose_index: 0,
         };
         let npcs = [NpcOccluder::new(&npc, &blocks)];
@@ -1726,6 +1730,7 @@ mod tests {
                 scale: 1.0,
             },
             tint: [1.0; 3],
+            alpha: 1.0,
             pose_index: 0,
         };
         let vehicles = [VehicleOccluder::new(&vehicle)];
@@ -1763,6 +1768,7 @@ mod tests {
                 scale: 1.0,
             },
             tint: [1.0; 3],
+            alpha: 1.0,
             pose_index: 0,
         };
         let npc_table = [

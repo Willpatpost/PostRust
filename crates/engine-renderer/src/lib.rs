@@ -44,7 +44,6 @@ pub mod animation;
 pub mod config;
 pub use vulkan::{descriptors, textures};
 pub mod glyph_atlas;
-pub mod particle;
 mod lit_mesh;
 pub mod lit_scene;
 pub mod overlay;

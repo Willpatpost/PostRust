@@ -63,6 +63,15 @@ pub(crate) struct SceneTargetPipelines {
     /// Main pass: `Some(pipes.proxy_pipeline)`; HDR pass: `Some(self.proxy_hdr)`.
     /// (The VEHICLE kind's pipeline — the npc kind's is `proxy_skinned`.)
     pub proxy: Option<vk::Pipeline>,
+    /// The RAIN kind's pipeline handle (the unlit blended particle
+    /// variant — the Era-2 package C third populated kind). Main
+    /// pass: `Some(pipes.rain_pipeline)`; HDR pass: the post state's
+    /// lazily-ensured `rain_hdr` (the belt-check below stays for the
+    /// lazy first-frame window, the sky shape). Rain NEVER binds a
+    /// shadowed variant: the translucent streaks receive no shadows,
+    /// so both the ordinary and the shadowed arm draw them through
+    /// this same pipeline with the corner material set.
+    pub proxy_rain: Option<vk::Pipeline>,
     /// The SKINNED proxy pipeline handle (the npc kind's — this
     /// render pass's variant). Main pass: `pipes.skinned.map(|s| s.pipeline())`;
     /// HDR pass: the skinned state's `skinned_hdr` (ensured at the
@@ -142,7 +151,7 @@ pub(crate) unsafe fn record_corner_scene(
     shadowed: Option<&shadow_draw::ShadowFrameParams>,
     sky: Option<&sky_draw::SkyFrameParams>,
     proxy: Option<&crate::vulkan::proxy_draw::ProxyFrameUpload<'_>>,
-    proxy_sets: Option<[vk::DescriptorSet; 2]>,
+    proxy_sets: Option<[vk::DescriptorSet; 3]>,
 ) -> Option<u32> {
     // 1. sky draw — the main pass's `if let (Some(sky_state), Some(params))`
     //    and HDR's `if let (Some(sky_state), Some(params), Some(pipeline))`.
@@ -254,21 +263,63 @@ pub(crate) unsafe fn record_corner_scene(
                 slot,
                 shadow_state.frame_stride(),
             );
-            let vehicle_bind = crate::vulkan::proxy_draw::VehicleSetBind {
+            let vehicle_bind = crate::vulkan::proxy_draw::PlainSetBind {
                 layout: vehicle_layout,
                 set: vehicle_set,
                 frame_offset: vehicle_frame,
             };
+            // The rain kind's bind: the CORNER material set, never a
+            // shadowed variant — rain receives no shadows (the
+            // translucent streaks' unlit blended pipeline reads only
+            // view_proj from the corner FrameParams). The corner
+            // region holds this frame's camera (the safe layer
+            // always supplies corner_params on a populated frame —
+            // both render_corner_populated paths build it), so the
+            // corner dynamic stride is the right offset here even on
+            // the shadowed arm. The frame flow validated the set
+            // alongside the other kinds'; the null fallback is the
+            // never-bound belt-check shape (an empty rain kind draws
+            // nothing).
+            let rain_set = proxy_sets.map(|sets| sets[2]).unwrap_or_else(|| {
+                debug_assert!(
+                    upload.rain_count == 0,
+                    "a populated frame carries the validated corner sets"
+                );
+                vk::DescriptorSet::null()
+            });
+            let rain_bind = crate::vulkan::proxy_draw::PlainSetBind {
+                layout: pipes.proxy_layout,
+                set: rain_set,
+                frame_offset: slot as u32 * corner_resources.dynamic_stride(),
+            };
+            // The rain pipeline for THIS pass (the unlit blended
+            // particle object — never a shadowed variant). The
+            // fallback mirrors the ordinary arm's skinned fallback:
+            // the main-pass object when the HDR variant is not yet
+            // ensured, never bound because a populated rain kind
+            // implies the ensure ran (the debug_assert fires first
+            // in debug builds).
+            let rain_pipeline = targets.proxy_rain.unwrap_or_else(|| {
+                debug_assert!(
+                    upload.rain_count == 0,
+                    "a populated rain kind needs this pass's rain pipeline"
+                );
+                pipes.rain_pipeline
+            });
             let pipelines = crate::vulkan::proxy_draw::ProxyPipelines {
                 vehicle: targets.shadowed_proxy_vehicle.unwrap(),
                 npc: targets.shadowed_proxy_skinned.unwrap(),
+                rain: rain_pipeline,
             };
             // SAFETY: the per-kind pipelines are bound with their own
             // layouts inside their render pass (the draw does the
             // binding); the sets are the shadowed-populated state's
-            // own (material-validated at the safe layer); this slot's
-            // instance AND pose regions hold this frame's bytes
-            // (written above, after the fence wait).
+            // own (material-validated at the safe layer), EXCEPT the
+            // rain kind's — the corner set the frame flow validated
+            // (rain receives no shadows, so it never binds the
+            // shadowed family); this slot's instance AND pose
+            // regions hold this frame's bytes (written above, after
+            // the fence wait).
             proxy_state.draw(
                 ctx,
                 cmd,
@@ -277,6 +328,7 @@ pub(crate) unsafe fn record_corner_scene(
                 &pipelines,
                 &skinned_bind,
                 &vehicle_bind,
+                &rain_bind,
             )
         } else {
             0
@@ -341,14 +393,38 @@ pub(crate) unsafe fn record_corner_scene(
                 frame_offset: slot as u32 * corner_resources.dynamic_stride(),
                 pose_offset: retained.pose_offset(slot),
             };
-            let vehicle_bind = crate::vulkan::proxy_draw::VehicleSetBind {
+            let vehicle_bind = crate::vulkan::proxy_draw::PlainSetBind {
                 layout: pipes.proxy_layout,
                 set: sets[1],
                 frame_offset: slot as u32 * corner_resources.dynamic_stride(),
             };
+            // The rain kind's bind (the Era-2 package C third kind):
+            // the rain material's corner set through the SAME
+            // PlainSetBind shape as the vehicle kind — one dynamic
+            // offset at binding 2 (the corner FrameParams region the
+            // unlit particle shader's view_proj reads).
+            let rain_bind = crate::vulkan::proxy_draw::PlainSetBind {
+                layout: pipes.proxy_layout,
+                set: sets[2],
+                frame_offset: slot as u32 * corner_resources.dynamic_stride(),
+            };
+            // The rain pipeline for THIS pass — the main pass's own
+            // object, or the HDR variant ensured at the first
+            // populated post frame. The fallback mirrors the skinned
+            // fallback above: the main-pass object when the HDR
+            // variant is not yet ensured, never bound because a
+            // populated rain kind implies the ensure ran.
+            let rain_pipeline = targets.proxy_rain.unwrap_or_else(|| {
+                debug_assert!(
+                    upload.rain_count == 0,
+                    "a populated rain kind needs this pass's rain pipeline"
+                );
+                pipes.rain_pipeline
+            });
             let pipelines = crate::vulkan::proxy_draw::ProxyPipelines {
                 vehicle: proxy_pipeline,
                 npc: skinned_pipeline,
+                rain: rain_pipeline,
             };
             // SAFETY: the per-kind pipelines are bound with their own
             // layouts inside their render pass (the draw does the
@@ -363,6 +439,7 @@ pub(crate) unsafe fn record_corner_scene(
                 &pipelines,
                 &skinned_bind,
                 &vehicle_bind,
+                &rain_bind,
             );
             // The recorded count and the pure submission model must
             // agree (the unit test pins the model; this co-pins the
@@ -372,7 +449,8 @@ pub(crate) unsafe fn record_corner_scene(
                 crate::vulkan::proxy_draw::proxy_draw_call_count(
                     upload.mode,
                     upload.npc_count,
-                    upload.vehicle_count
+                    upload.vehicle_count,
+                    upload.rain_count
                 )
             );
             calls = recorded;

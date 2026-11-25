@@ -214,6 +214,45 @@ pub fn sedan_mesh() -> Vec<ProxyVertex> {
     v
 }
 
+/// The rain streak quad (Era-2 package C — the rain kind's mesh):
+/// ONE vertical quad, two triangles, six vertices, centered at the
+/// origin — extent X ±0.012 m (a thin streak), Y ±0.28 m (the
+/// streak length), Z 0; normal +Z everywhere; UVs covering the full
+/// texture (0..1 — the streak texture's ALPHA shapes the quad, so
+/// every corner maps the whole tile; the `quad()` helper's planar
+/// pos/4.0 mapping cannot cover 0..1 at this size, hence the
+/// hand-written emission in the helper's winding convention — CCW
+/// about the +Z normal).
+///
+/// THE BILLBOARD DISCIPLINE: the DEMO turns every rain instance to
+/// face the camera (one shared turn per frame — the population
+/// builder's policy, not this mesh's), and the thin-X/long-Y shape
+/// reads as a falling streak from any side. The size is the
+/// visual-policy constant chosen for the corner's scale (documented
+/// here; nothing else references it).
+pub fn rain_streak_mesh() -> Vec<ProxyVertex> {
+    const HALF_X: f32 = 0.012;
+    const HALF_Y: f32 = 0.28;
+    let corner = |x: f32, y: f32, u: f32, v: f32| ProxyVertex {
+        pos: [x, y, 0.0],
+        normal: [0.0, 0.0, 1.0],
+        uv: [u, v],
+    };
+    // CCW about +Z (the quad() helper's front-face order):
+    // bottom-left, bottom-right, top-right, top-left.
+    let corners = [
+        corner(-HALF_X, -HALF_Y, 0.0, 0.0),
+        corner(HALF_X, -HALF_Y, 1.0, 0.0),
+        corner(HALF_X, HALF_Y, 1.0, 1.0),
+        corner(-HALF_X, HALF_Y, 0.0, 1.0),
+    ];
+    let mut vertices = Vec::with_capacity(6);
+    for i in [0, 1, 2, 0, 2, 3] {
+        vertices.push(corners[i]);
+    }
+    vertices
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +398,58 @@ mod tests {
         assert_eq!(
             digest, PINNED_FNV,
             "the sedan full-vertex digest moved: a vertex-shape or \
+             triangle-ordering change — an investigation, never a silent repin"
+        );
+    }
+
+    /// The rain streak quad: the same determinism/count discipline
+    /// at 6 vertices (ONE quad — two triangles), with the documented
+    /// thin-X/long-Y extents, the +Z normal, and full-texture UVs.
+    #[test]
+    fn rain_streak_mesh_deterministic_pinned_count() {
+        let a = rain_streak_mesh();
+        let b = rain_streak_mesh();
+        assert_eq!(a.len(), 6, "one quad = two triangles = six vertices");
+        let bits = |m: &[ProxyVertex]| -> Vec<u32> {
+            m.iter()
+                .flat_map(|u| [u.pos[0].to_bits(), u.pos[1].to_bits(), u.pos[2].to_bits()])
+                .collect()
+        };
+        assert_eq!(bits(&a), bits(&b));
+        for u in &a {
+            assert_eq!(u.normal, [0.0, 0.0, 1.0], "the streak faces +Z");
+            assert!(u.pos[0].abs() <= 0.012 && u.pos[0].abs() > 0.0);
+            assert!(u.pos[1].abs() <= 0.28);
+            assert_eq!(u.pos[2], 0.0, "the quad is planar at Z 0");
+            assert!(
+                u.uv[0] == 0.0 || u.uv[0] == 1.0,
+                "the UVs cover the full texture width"
+            );
+            assert!(
+                u.uv[1] == 0.0 || u.uv[1] == 1.0,
+                "the UVs cover the full texture height"
+            );
+        }
+    }
+
+    /// The rain streak full-vertex digest: the same discipline at 6
+    /// vertices — pos, normal, AND uv across the whole quad, folded
+    /// with the file's FNV-1a (the cross-platform determinism proof
+    /// the other two meshes pin).
+    #[test]
+    fn rain_streak_mesh_full_vertex_digest_pin() {
+        let mesh = rain_streak_mesh();
+        assert_eq!(mesh.len(), 6, "one quad = two triangles = six vertices");
+        let digest = vertex_digest_fnv(&mesh);
+        // The measured-actual FNV-1a of the complete vertex set.
+        // Run once with a temporary println to obtain the actual, then
+        // pin it. A later mismatch is an investigation, never a silent
+        // repin. Measured at the Era-2 package C (rain) renderer-kind
+        // stage's first test run on this pod.
+        const PINNED_FNV: u64 = 18284880733001066661;
+        assert_eq!(
+            digest, PINNED_FNV,
+            "the rain streak full-vertex digest moved: a vertex-shape or \
              triangle-ordering change — an investigation, never a silent repin"
         );
     }

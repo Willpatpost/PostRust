@@ -584,6 +584,7 @@ pub fn corner_instances_into(
                 scale: 1.0,
             },
             tint: table_tints[i],
+            alpha: 1.0,
             pose_index: i as u32,
         };
     }
@@ -601,6 +602,7 @@ pub fn corner_instances(states: &[NpcLocomotion], table_tints: &[[f32; 3]]) -> V
                 scale: 0.0,
             },
             tint: [0.0, 0.0, 0.0],
+            alpha: 1.0,
             pose_index: 0,
         },
     );
@@ -1280,6 +1282,7 @@ mod tests {
                     scale: 0.0,
                 },
                 tint: [0.0, 0.0, 0.0],
+                alpha: 1.0,
                 pose_index: 0,
             },
         );
