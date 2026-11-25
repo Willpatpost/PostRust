@@ -46,6 +46,9 @@
 //! engine-slice demo application.
 
 pub mod adversary;
+pub mod audio_mix;
+pub mod audio_synth;
+pub mod audio_triggers;
 pub mod clock;
 pub mod collision;
 pub mod combat;

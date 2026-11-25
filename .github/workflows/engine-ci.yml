@@ -535,8 +535,8 @@ jobs:
           # delta (to be confirmed by this candidate's CI run — a
           # mismatch is corrected from actuals, never by weakening a
           # test).
-          expected=1313
-          if [ "$(uname -s)" != "Linux" ]; then expected=1262; fi
+          expected=1339
+          if [ "$(uname -s)" != "Linux" ]; then expected=1288; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
