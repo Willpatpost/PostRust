@@ -61,10 +61,12 @@ pub mod npc_memory;
 pub mod npc_perception;
 pub mod npc_schedule;
 pub mod npc_world_save;
+pub mod particle;
 pub mod player;
 pub mod spine;
 pub mod timing;
 pub mod weapons;
+pub mod weather;
 pub mod wire;
 
 mod sha256;
