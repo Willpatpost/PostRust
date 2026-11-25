@@ -1187,20 +1187,38 @@ The following audit finding remains genuinely open:
 - The entity-scale benchmark's 5k/20k dead-chain read-through (§7): the
   historical at-scale evidence is one-1000-chain steady state.
 - **The s6_soak late-window fsync race (flake C, 2026-11-23, macOS run
-  45104773498):** `deterministic_late_window_hard_exit_control_recovers`
-  assumes the tick-3300 publication's WAL fsync cannot complete within
+  45104773498) — CLOSED 2026-11-25 (the
+  `corrective/s6-soak-late-window-seam` package):**
+  `deterministic_late_window_hard_exit_control_recovers`
+  assumed the tick-3300 publication's WAL fsync cannot complete within
   the five sim ticks before the controlled hard exit ("the pure-sim
   ticks between always outrun the fsync") — but a 726 ms runner stall
   on the sim path let the fsync land first (the campaign recovered at
   tick 3300, not the asserted 3054). A genuine wall-clock race in the
   test's SETUP, not an engine defect (recovery, conservation, and
-  close integrity all held). The principled fix — a test-only
-  fsync-timing control (a fault-seam delay in the journal path making
-  the in-flight state deterministic) — is an open engine-persist
-  package; until then the test may flake rarely on contended runners
-  (the third 2026-11-23 runner-timing flake; see
-  `docs/AUTONOMOUS-CYCLE-PROTOCOL.md` §3.1 for the rerun-once
-  protocol).
+  close integrity all held). **The principled fix LANDED** (the
+  shape §8 specified, one refinement: the seam sits at the demo's
+  publication boundary, not inside engine-persist — the worker's
+  EXISTING `ParkExecutingAppend` fault is the deterministic barrier,
+  so the production persistence stack is untouched): the demo's
+  hidden `--park-publication-at-tick` arms the I/O worker's append
+  park AT the scripted publication's own scenario tick (before its
+  append job is submitted), so the worker parks INSIDE the job's
+  dispatch — the publication admitted and started (past the poison
+  and cancellation boundaries), its store execution never begun,
+  nothing of its transaction durable — and the paired hard exit at
+  3305 kills the parked worker with the process. The in-flight state
+  is now PROVABLE on every runner (the safety argument: the
+  original test's own passing state held the worker busy inside
+  that same append for the whole 3301-3305 window — those five
+  ticks need no blocking worker dependency, so the parked case
+  cannot deadlock). The test's child arms the seam at 3300; the
+  3054 recovery and every close assertion unchanged; three
+  consecutive runs green on this pod (69.6/69.5/69.7 s) plus the
+  full s6_soak battery 34/34; no test-count movement anywhere (the
+  field/flag is test-free harness code). The rerun-once protocol
+  (AUTONOMOUS-CYCLE-PROTOCOL §3.1) remains for any OTHER runner
+  flake, but this one is retired by construction.
 - Sustained-load scale is QUALIFIED with composition-dependent
   interpretations (sustainable at 1k across scenarios; at 5k the full and
   mixed compositions genuinely overload the 200/tick budget while
@@ -1368,8 +1386,10 @@ end-to-end, gated by the full-chain known answers — the rig command
 `--corner --populated --shadows --post` walks the HDR-shadowed
 corner, composing with `--behavior` and `--free-look`; the skinned family's pass-independent ownership transfer
 that would restore the flat replacement tuple — the
-renderer-architecture follow-up PR #33's body records; the s6_soak
-fsync-race test-only seam, §8); and the three documents' owner
+renderer-architecture follow-up PR #33's body records; ~~the s6_soak
+fsync-race test-only seam~~ — CLOSED 2026-11-25 by the
+`corrective/s6-soak-late-window-seam` package, §8's record); and the
+three documents' owner
 decisions (the NPC AI design pass's unratified boundaries, T-06's
 physics middleware recommendation awaiting ratification in
 `docs/DECISIONS.md`, the audio subsystem map's groundwork
@@ -1557,6 +1577,34 @@ implemented the fixtures and repaired the round's working halves
 (the hand-rolled bias copy → the demo's own `demo_bias()`, the
 allocation delta re-measured and re-pinned from (3,3,16,1) to the
 actual (6,4,16,0) with the staging-memory decomposition).
+
+**The s6_soak late-window seam (2026-11-25, the follow-on package —
+§8's open flake fix closed, branch
+`corrective/s6-soak-late-window-seam`, stacked on the shadowed-HDR
+tip):** the third recorded 2026-11-23 runner-timing flake retired by
+construction. The demo's hidden `--park-publication-at-tick <t>`
+(#[doc(hidden)], the `--abort-after-tick`/`--poison-at-tick`
+precedent — engine-slice's demo-layer seam class, not the B4
+crossing's cfg-gated statics) arms the I/O worker's EXISTING
+`ParkExecutingAppend` fault at the scripted publication's own
+scenario tick, just before its append job is submitted: the worker
+parks inside the job's dispatch (admitted and started, past the
+poison and cancellation boundaries, no store execution — nothing
+of the transaction durable), and the paired hard exit kills the
+parked worker with the process. The production persistence stack is
+untouched (the fix's one refinement over §8's sketched shape: the
+seam sits at the demo's publication boundary, not inside
+engine-persist — the barrier machinery already existed in the
+worker). The §7D control test arms it at 3300; the 3054 recovery
+and every close assertion unchanged; MEASURED on this pod: three
+consecutive green runs (69.6/69.5/69.7 s — the determinism proof)
+plus the full s6_soak battery 34/34, fmt/clippy clean, the main
+shard 1295/2/33 unchanged, and NO count movement anywhere (the
+field/flag is test-free harness code; no workflow pin touched).
+The transcription round went to the coder subagent (the mission's
+delegation rule) and verified clean against the spec on the first
+read — including the one construction site the orchestrator's own
+pre-check missed (s6_evidence.rs).
 
 ## 10. The authoritative coordination ledger
 
