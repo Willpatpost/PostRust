@@ -9,8 +9,11 @@
 //! capture sequences), the rain-kind N-vs-1 submission equivalence
 //! (PerInstance vs Instanced through the third-kind path), the
 //! full composition smoke (the populated SHADOWED day/night
-//! raining corner — validation 0/0, the rain ink present), and
-//! the packer's typed overflow refusal (a plain lib test).
+//! raining corner — validation 0/0, the rain ink present), the
+//! packer's typed overflow refusal (a plain lib test), and the
+//! ripple reflection gate (the forced hand-authored ripple field's
+//! perturbation ink on the wet ground — the
+//! setter→uniform→shader wire's visual acceptance).
 //!
 //! `#[ignore]`d like the other lavapipe gates: it requires
 //! `SDL_VIDEODRIVER=offscreen` plus a software Vulkan ICD
@@ -29,6 +32,7 @@
 
 mod common;
 
+use engine_core::ripple::{RippleField, RippleRing};
 use engine_renderer::lit_scene::{LightParams, day_preset};
 use engine_renderer::proxy_instances::{InstanceTransform, ProxyInstance};
 use engine_renderer::{
@@ -36,7 +40,9 @@ use engine_renderer::{
     ValidationPreference,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
-use engine_slice::corner_weather::{RAIN_ALPHA, RAIN_MATERIAL, RainLayer, yaw_to_turn};
+use engine_slice::corner_weather::{
+    RAIN_ALPHA, RAIN_MATERIAL, RIPPLE_POLICY, RainLayer, yaw_to_turn,
+};
 
 const SIZE: (u32, u32) = (1280, 720);
 const BIAS: engine_renderer::shadows::ShadowBias = engine_renderer::shadows::ShadowBias {
@@ -269,24 +275,234 @@ fn rain_ink_broadside_at_presentation_extent() {
         "rain broadside ink: {ink} pixels of {} changed ({sky_ink} in the sky region)",
         width * height
     );
-    // MEASURED on this pod's lavapipe, this tree, this campaign:
-    // 1660 pixels total, 1350 in the sky region (the deterministic
-    // campaign's own bytes — the double-run discipline pins the
-    // count). The floors hold wide margins below the measurement
-    // (28% / 33%) while sitting ~7x above the collapsed state (the
-    // edge-on billboard regression measures ~164 pixels — the
-    // mining source's 8-frame fresh-capture gate); the mining
-    // source's own vantage measured 2476/2187.
+    // MEASURED on this pod's lavapipe, this tree, this campaign -
+    // RE-PINNED at the volume-refresh corrective: the landed
+    // package C installed the OBSERVED BOX as the spawn volume
+    // (collapsing the spawn band to eye level: drops materialized
+    // at eye height, big near-camera streaks - the 1660/1350 the
+    // gate originally pinned). The rain-ripples branch's corrective
+    // re-derives the quantized BAND above the observed volume
+    // (rain_emitter_config's own form - drops fall from above, the
+    // physically-correct model); the steady-state coverage at this
+    // vantage is now 473 pixels total, 282 in the sky region (the
+    // 60% sky majority holds - rain still falls in front of the
+    // background). The floors sit ~70% under the measurement while
+    // staying ~2x above the edge-on collapse (~164 pixels - the
+    // mining source's 8-frame fresh-capture gate).
     assert!(
-        ink > 1_200,
+        ink > 330,
         "broadside rain coverage: {ink} changed pixels at the presentation extent \
-         (measured 1660 at the steady state; the edge-on collapse measures ~164)"
+         (measured 473 at the steady state after the volume-refresh corrective; \
+         the edge-on collapse measures ~164)"
     );
     assert!(
-        sky_ink > 900,
-        "the sky region carries {sky_ink} of the ink (measured 1350 — rain falls \
+        sky_ink > 190,
+        "the sky region carries {sky_ink} of the ink (measured 282 - rain falls \
          in front of the background)"
     );
+}
+
+/// One raining WET campaign at the gate camera with the ripple
+/// uniform pinned per frame (the `raining_capture` shape plus the
+/// sticky setter — the presentation bridge: the field state itself
+/// is deterministic sim state (the campaign digest pins it), the
+/// setter only copies it into the frame's uniform). `frames` warm
+/// frames, then the captured presentation frame.
+fn ripple_campaign(
+    renderer: &mut Renderer,
+    matrix: &[[f32; 4]; 4],
+    yaw: f32,
+    light: LightParams,
+    ripple: Option<&RippleField>,
+    frames: usize,
+) -> engine_renderer::CapturedFrame {
+    let mut layer = RainLayer::new(GATE_EYE);
+    for _ in 0..frames {
+        layer.update_and_build(GATE_EYE, yaw, 0.0);
+        let population = layer.population();
+        renderer.set_ripple_field(ripple);
+        renderer
+            .render_corner_populated(matrix, GATE_EYE, light, &population, SIZE)
+            .unwrap();
+    }
+    renderer.request_frame_capture().unwrap();
+    let population = layer.population();
+    renderer.set_ripple_field(ripple);
+    assert!(
+        renderer
+            .render_corner_populated(matrix, GATE_EYE, light, &population, SIZE)
+            .unwrap()
+            .presented
+    );
+    renderer.take_frame_capture().unwrap().unwrap()
+}
+
+/// THE RIPPLE REFLECTION GATE (Era-2 package C recursive item 1's
+/// presentation acceptance — the setter→uniform→shader wire): the
+/// SAME warmed raining WET campaign at the gate camera, the ripple
+/// uniform pinned `None` (the empty uniform — the shader's identity
+/// no-op, the rainless ripple path's byte-identity) vs a FORCED
+/// hand-authored field (the demo's `RIPPLE_POLICY` with eight rings
+/// hand-placed on the road cross in the camera's ground view —
+/// `RippleField::author_ring`, the core's additive authoring path;
+/// the field here is PRESENTATION state, not simulation: the
+/// RainLayer's own field is never consulted, the deterministic sim
+/// side is digest-pinned in engine-core). The rain instances are
+/// byte-identical across both campaigns (the same seed, the same
+/// 60-frame drive — the double-run asserts pin it), so the diff
+/// isolates the ripple perturbation alone: the triangle-bump
+/// gradient's uv shift plus the roughened Schlick blend on the wet
+/// ground re-draw. THE GROUND-REGION CHECK (the broadside gate's
+/// sky-region discipline inverted): the reflection draws on the
+/// ground, which this camera maps to the LOWER half of the frame —
+/// the majority of the ink must live there.
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe)"]
+fn ripple_reflection_gate() {
+    let _guard = sdl_lock();
+    let (_app, mut renderer) = app_and_renderer("ripple reflection gate");
+
+    let (matrix, yaw) = gate_matrix();
+    let light = day_preset();
+
+    // The wet path must be ON for both captures — the ripple
+    // uniform rides the wet ground re-draw (a dry frame never
+    // samples it; without this the gate would measure wet-vs-dry,
+    // not ripple-vs-none).
+    renderer.set_wet(true);
+    renderer.set_proxy_draw_mode(ProxyDrawMode::Instanced);
+
+    // The forced field: the DEMO's policy with eight hand-authored
+    // rings on the open road cross in the camera's ground view (the
+    // building masses start 6 m off-axis, so every ring's band
+    // stays on visible ground; the camera sits on the north road at
+    // [0, 1.7, 15] looking at the intersection). Ages spread
+    // 0.35–1.0 s for radii 0.28–0.8 m at speed 0.8 m/s; amplitude
+    // the policy's 1.0 unit scale (the renderer's gains consume
+    // it); every ring projects into the frame's lower half (the
+    // eye at 1.7 m looking slightly down — the horizon sits ~40%
+    // from the top).
+    let forced = {
+        let mut field =
+            RippleField::new(RIPPLE_POLICY).expect("the demo's ripple policy validates");
+        let rings: [([f32; 2], f32); 8] = [
+            ([-1.0, 3.5], 0.55),
+            ([0.0, 7.0], 0.4),
+            ([2.0, 9.5], 0.8),
+            ([-2.5, 11.5], 1.0),
+            ([3.5, 5.0], 0.5),
+            ([-4.0, 6.5], 0.9),
+            ([1.0, 12.5], 0.6),
+            ([-0.5, 5.5], 0.35),
+        ];
+        for (center, age) in rings {
+            assert!(
+                field
+                    .author_ring(RippleRing {
+                        center,
+                        age,
+                        amplitude: 1.0,
+                    })
+                    .expect("the authored ring is valid data")
+                    .is_none(),
+                "the pool has room (8 of {})",
+                engine_core::ripple::RIPPLE_POOL_BOUND
+            );
+        }
+        assert_eq!(field.active_count(), rings.len());
+        field
+    };
+
+    // The baseline: ripple None (the empty uniform — the shader's
+    // identity no-op), double-run (byte-identical — the baseline
+    // discipline).
+    let none_a = ripple_campaign(&mut renderer, &matrix, yaw, light, None, 60);
+    let none_b = ripple_campaign(&mut renderer, &matrix, yaw, light, None, 60);
+    assert_eq!(
+        none_a.bytes, none_b.bytes,
+        "the None-ripple campaign double-runs byte-identical"
+    );
+
+    // The forced field, double-run (the authored field is static
+    // across the campaign — deterministic by construction).
+    let ripple_a = ripple_campaign(&mut renderer, &matrix, yaw, light, Some(&forced), 60);
+    let ripple_b = ripple_campaign(&mut renderer, &matrix, yaw, light, Some(&forced), 60);
+    assert_eq!(
+        ripple_a.bytes, ripple_b.bytes,
+        "the forced-ripple campaign double-runs byte-identical"
+    );
+
+    // The metrics: differing bytes AND differing pixels (a pixel
+    // counts once — the broadside gate's pixel discipline), plus
+    // the lower-half split for the ground-region check.
+    assert_eq!(none_a.bytes.len(), ripple_a.bytes.len());
+    let (width, height) = (SIZE.0 as usize, SIZE.1 as usize);
+    let mut differing_bytes = 0usize;
+    for (a, b) in none_a.bytes.iter().zip(ripple_a.bytes.iter()) {
+        differing_bytes += usize::from(a != b);
+    }
+    let mut ink = 0usize;
+    let mut lower_ink = 0usize;
+    let lower_half = width * height / 2;
+    for (index, (a, b)) in none_a
+        .bytes
+        .chunks(4)
+        .zip(ripple_a.bytes.chunks(4))
+        .enumerate()
+    {
+        if a != b {
+            ink += 1;
+            if index >= lower_half {
+                lower_ink += 1;
+            }
+        }
+    }
+    println!(
+        "ripple reflection ink: {differing_bytes} differing bytes, {ink} differing pixels \
+         ({lower_ink} in the lower half)"
+    );
+    // MEASURED on this pod's lavapipe: PENDING the first CI run's
+    // --nocapture print above — the floors below are the
+    // CONSERVATIVE START, to be corrected from the run's own
+    // actuals (the repo's established pattern: the ink-count gate's
+    // 492-byte measurement against its 200 floor). The roughen term
+    // alone guarantees ink wherever a band covers ground (the
+    // Schlick blend scales by up to faded-amplitude x
+    // RIPPLE_ROUGHEN_GAIN 0.5 — eight annuli of 0.6–1.15 m outer
+    // radius at 2.5–11.5 m from the camera cover far more than the
+    // floors), so the true count is expected well above them.
+    const RIPPLE_BYTE_FLOOR: usize = 100;
+    const RIPPLE_PIXEL_FLOOR: usize = 25;
+    assert!(
+        differing_bytes >= RIPPLE_BYTE_FLOOR,
+        "the forced ripple field moved at least {RIPPLE_BYTE_FLOOR} bytes of the capture \
+         (got {differing_bytes}) — the perturbation never reached the wet ground re-draw: \
+         check the setter→uniform→shader wire"
+    );
+    assert!(
+        ink >= RIPPLE_PIXEL_FLOOR,
+        "the forced ripple field moved at least {RIPPLE_PIXEL_FLOOR} pixels (got {ink})"
+    );
+    // The ground region (the broadside gate's sky-region check
+    // inverted): the ripple perturbs the wet ground re-draw, which
+    // this camera maps below the midline — a majority of the ink
+    // must live in the lower half, never the sky.
+    assert!(
+        lower_ink * 2 > ink,
+        "the ripple ink lives on the wet ground: {lower_ink} of {ink} differing pixels \
+         in the lower half (the reflection draws on the ground, not the sky)"
+    );
+
+    // The composition stays clean: the ripple uniform path (the
+    // shader's binding-4 block, the CPU packer's layout twin)
+    // trips no validation.
+    let stats = renderer.stats();
+    assert_eq!(
+        stats.validation_errors, 0,
+        "no validation errors: {:?}",
+        stats.recent_validation
+    );
+    assert_eq!(stats.validation_warnings, 0, "no validation warnings");
 }
 
 /// THE WARMED RAINING ALLOCATION CONSTANCY: both counters —

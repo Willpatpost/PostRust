@@ -295,15 +295,40 @@ impl Emitter {
         Ok(())
     }
 
-    /// One fixed-order tick. Phase 1, spawn: the accumulator gains
-    /// `dt * rate`, clamps at [`SPAWN_ACCUMULATOR_CAP`], then drains
-    /// one unit at a time — each unit spawns while the pool has
-    /// room and COUNTS a typed drop when it does not (never a
-    /// silent drop; the drain is structurally bounded by the cap).
-    /// Phase 2, integrate: every active particle steps through THE
-    /// PINNED INTEGRATION ORDER, the death test runs, and survivors
-    /// compact stably into the prefix. The report must be observed.
+    /// One fixed-order tick (the no-observer form: this is exactly
+    /// [`Emitter::tick_observing_kill_deaths`] with a no-op
+    /// observer — one code path, one arithmetic; the digest pins
+    /// rest on the delegation).
     pub fn tick(&mut self, dt: f32) -> TickReport {
+        self.tick_observing_kill_deaths(dt, |_| {})
+    }
+
+    /// One fixed-order tick, observing every KILL-PLANE death's
+    /// position as it happens (the rain-ripple derivation's hook:
+    /// a raindrop that reaches the kill plane is a drop hitting the
+    /// ground — the ripple field spawns its ring at that death's
+    /// position, in death order). The closure fires ONLY for
+    /// kill-plane deaths (a lifetime death mid-air is not a
+    /// landing), with the particle's POST-INTEGRATION position
+    /// (where it died), in the integration sweep's fixed order.
+    /// Behavior-identical to [`Emitter::tick`] — `tick` is this
+    /// method with a no-op observer (one code path, one arithmetic;
+    /// the digest pins rest on it).
+    ///
+    /// Phase 1, spawn: the accumulator gains `dt * rate`, clamps at
+    /// [`SPAWN_ACCUMULATOR_CAP`], then drains one unit at a time —
+    /// each unit spawns while the pool has room and COUNTS a typed
+    /// drop when it does not (never a silent drop; the drain is
+    /// structurally bounded by the cap). Phase 2, integrate: every
+    /// active particle steps through THE PINNED INTEGRATION ORDER,
+    /// the death test runs, every kill-plane death is observed
+    /// BEFORE the compaction write decision, and survivors compact
+    /// stably into the prefix. The report must be observed.
+    pub fn tick_observing_kill_deaths<F: FnMut([f32; 3])>(
+        &mut self,
+        dt: f32,
+        mut on_kill_death: F,
+    ) -> TickReport {
         let mut spawned: u32 = 0;
         let mut dropped: u32 = 0;
         self.spawn_accumulator += dt * self.config.rate;
@@ -337,8 +362,18 @@ impl Emitter {
             p.position[2] += p.velocity[2] * dt;
             // 4. life
             p.life -= dt;
-            // 5. death test
-            let dead = p.life <= 0.0 || kill_y.is_some_and(|k| p.position[1] <= k);
+            // 5. death test: dead iff the lifetime expired OR the
+            //    kill plane was reached. A kill-plane death (the
+            //    kill condition holds — alone or alongside an
+            //    expired lifetime; a particle can satisfy both, it
+            //    is a kill death iff the kill condition holds) is
+            //    observed BEFORE the compaction write decision, at
+            //    the post-integration position, in sweep order.
+            let kill_death = kill_y.is_some_and(|k| p.position[1] <= k);
+            if kill_death {
+                on_kill_death(p.position);
+            }
+            let dead = p.life <= 0.0 || kill_death;
             if !dead {
                 self.particles[write] = p;
                 write += 1;
@@ -588,6 +623,210 @@ mod tests {
             emitter.overflow_total(),
             0,
             "no drops anywhere in this test"
+        );
+    }
+
+    /// THE KILL-DEATH OBSERVATION (the ripple derivation's hook):
+    /// the observer fires ONLY for kill-plane deaths, in the
+    /// integration sweep's fixed order, at the POST-INTEGRATION
+    /// position — and `tick` delegates to
+    /// `tick_observing_kill_deaths(dt, |_| {})` behavior-identically
+    /// (the delegation-equivalence form over a 300-tick rain-like
+    /// campaign).
+    ///
+    /// EMITTER A (the kill cohort): five particles spawn on the
+    /// prime tick (dt 1.0 x rate 5.0 makes the accumulator exactly
+    /// 5.0 — five spawns, drained to exactly 0.0; the window's
+    /// 5/60-per-tick gain stays under one unit, so nothing
+    /// respawns), fall at a fixed -20 m/s from the y = 21 line
+    /// (zero gravity, drag 1.0 — the velocity is the constant
+    /// -20.0), and ALL die at the kill plane y = 0 on the SAME
+    /// tick (the volume's y is a point — the five integrate
+    /// identically). The death tick and death y are derived by
+    /// REPLICATING the accumulation (the known_answer_kill_plane
+    /// pattern: f32 position accumulation is NOT k*dt, so the test
+    /// runs the same loop); each observed death's x/z must equal
+    /// the pre-death pool's x/z AT THE SAME INDEX (zero horizontal
+    /// velocity — x/z never move; the sweep is in pool order, so
+    /// the observed order is the pool's order).
+    ///
+    /// EMITTER B (the lifetime cohort): the same fall, no kill
+    /// plane, lifetime 0.05 s — every particle expires mid-air ON
+    /// ITS SPAWN TICK (0.05 - 1.0 < 0, position y = 1.0 > 0) and
+    /// the observer stays SILENT.
+    ///
+    /// EMITTER C (the both-conditions cohort): the same fall,
+    /// lifetime 0.05 s, kill plane ABOVE the spawn line (25 > 21) —
+    /// every particle dies with BOTH conditions true (life < 0 AND
+    /// post-integration y = 1.0 <= 25) and the observer FIRES: a
+    /// death is a kill death iff the kill condition holds.
+    #[test]
+    fn kill_death_observation_known_answer_and_delegation_equivalence() {
+        let dt = 1.0f32 / 60.0f32;
+        let fall = -20.0f32;
+        // --- EMITTER A: five kill-plane deaths in sweep order ---
+        let config_a = EmitterConfig {
+            volume: SpawnVolume {
+                min: [-4.0, 21.0, 0.0],
+                max: [4.0, 21.0, 0.0],
+            },
+            rate: 5.0,
+            base_velocity: [0.0, fall, 0.0],
+            velocity_jitter: [0.0; 3],
+            lifetime: [100.0, 100.0],
+            gravity: 0.0,
+            drag_factor: 1.0,
+            kill_y: Some(0.0),
+            seed: 0x01A,
+        };
+        // The hand derivation: the spawn tick's own integration
+        // first (dt 1.0 — the accumulator's exact five units, then
+        // silence), then the 1/60 fall until the plane.
+        let mut y = 21.0f32;
+        y += fall * 1.0f32;
+        assert_eq!(y, 1.0f32, "alive after the spawn tick: {y} > 0");
+        let mut death_tick = 0u32;
+        while y > 0.0 {
+            death_tick += 1;
+            y += fall * dt;
+        }
+        assert!(death_tick >= 1, "the fall reaches the plane");
+        let death_y = y; // the post-integration y at the death tick
+
+        let mut emitter = Emitter::new(config_a).expect("the config validates");
+        let mut observed: Vec<[f32; 3]> = Vec::new();
+        let report = emitter.tick_observing_kill_deaths(1.0f32, |p| observed.push(p));
+        assert_eq!(report.spawned, 5, "the prime tick's exact five units");
+        assert_eq!(
+            report.active, 5,
+            "y = 1.0 > 0: nobody dies on the spawn tick"
+        );
+        assert!(observed.is_empty(), "no death yet: the observer is silent");
+        for t in 1..death_tick {
+            let report = emitter.tick_observing_kill_deaths(dt, |p| observed.push(p));
+            assert_eq!(report.spawned, 0, "tick {t}: no respawn inside the window");
+            assert_eq!(report.active, 5, "tick {t}: still above the kill plane");
+            assert!(observed.is_empty(), "tick {t}: still silent");
+        }
+        // The pre-death pool: the sweep's order source (the x/z the
+        // deaths must report — they never move horizontally).
+        let pre_death: Vec<[f32; 3]> = emitter.particles().iter().map(|p| p.position).collect();
+        assert_eq!(pre_death.len(), 5);
+        let report = emitter.tick_observing_kill_deaths(dt, |p| observed.push(p));
+        assert_eq!(report.spawned, 0);
+        assert_eq!(
+            report.active, 0,
+            "the whole cohort died EXACTLY when y <= 0"
+        );
+        assert_eq!(
+            observed.len(),
+            5,
+            "every kill-plane death observed, none doubled"
+        );
+        for (i, position) in observed.iter().enumerate() {
+            assert_eq!(
+                *position,
+                [pre_death[i][0], death_y, pre_death[i][2]],
+                "death {i}: the post-integration position, in sweep order"
+            );
+        }
+
+        // --- EMITTER B: lifetime deaths only — the observer stays
+        // silent (a mid-air expiry is not a landing) ---
+        let config_b = EmitterConfig {
+            volume: SpawnVolume {
+                min: [-4.0, 21.0, 0.0],
+                max: [4.0, 21.0, 0.0],
+            },
+            rate: 5.0,
+            base_velocity: [0.0, fall, 0.0],
+            velocity_jitter: [0.0; 3],
+            lifetime: [0.05, 0.05],
+            gravity: 0.0,
+            drag_factor: 1.0,
+            kill_y: None,
+            seed: 0x01B,
+        };
+        let mut emitter_b = Emitter::new(config_b).expect("the config validates");
+        let mut observed_b: Vec<[f32; 3]> = Vec::new();
+        let report_b = emitter_b.tick_observing_kill_deaths(1.0f32, |p| observed_b.push(p));
+        assert_eq!(report_b.spawned, 5, "the same prime tick");
+        assert_eq!(
+            report_b.active, 0,
+            "lifetime 0.05 - dt 1.0 < 0: expired on the spawn tick"
+        );
+        assert!(
+            observed_b.is_empty(),
+            "a lifetime death mid-air is not a landing"
+        );
+        for _ in 0..3 {
+            emitter_b.tick_observing_kill_deaths(dt, |p| observed_b.push(p));
+        }
+        assert!(observed_b.is_empty(), "the silence holds");
+
+        // --- EMITTER C: BOTH conditions true — the kill condition
+        // governs (a death is a kill death iff it holds) ---
+        let config_c = EmitterConfig {
+            volume: SpawnVolume {
+                min: [-2.0, 21.0, 3.0],
+                max: [-2.0, 21.0, 3.0],
+            },
+            rate: 5.0,
+            base_velocity: [0.0, fall, 0.0],
+            velocity_jitter: [0.0; 3],
+            lifetime: [0.05, 0.05],
+            gravity: 0.0,
+            drag_factor: 1.0,
+            kill_y: Some(25.0), // ABOVE the spawn line: reached immediately
+            seed: 0x01C,
+        };
+        let mut emitter_c = Emitter::new(config_c).expect("the config validates");
+        let mut observed_c: Vec<[f32; 3]> = Vec::new();
+        let report_c = emitter_c.tick_observing_kill_deaths(1.0f32, |p| observed_c.push(p));
+        assert_eq!(report_c.spawned, 5, "the same prime tick");
+        assert_eq!(
+            report_c.active, 0,
+            "life 0.05 - 1.0 < 0 AND y 1.0 <= 25: both conditions"
+        );
+        assert_eq!(
+            observed_c.len(),
+            5,
+            "the kill condition holds: all five observed"
+        );
+        for position in &observed_c {
+            assert_eq!(
+                *position,
+                [-2.0, 21.0f32 + fall * 1.0f32, 3.0],
+                "the post-integration position of a both-conditions death"
+            );
+        }
+
+        // --- THE DELEGATION EQUIVALENCE: `tick` is
+        // `tick_observing_kill_deaths(dt, |_| {})` — identical
+        // reports and identical final pools over a 300-tick
+        // rain-like campaign.
+        let mut plain = Emitter::new(rain_like_campaign(0xD1E6)).unwrap();
+        let mut observing = Emitter::new(rain_like_campaign(0xD1E6)).unwrap();
+        for t in 1..=300u32 {
+            assert_eq!(
+                plain.tick(dt),
+                observing.tick_observing_kill_deaths(dt, |_| {}),
+                "tick {t}: the no-op observer changes nothing"
+            );
+        }
+        assert_eq!(
+            plain.particles(),
+            observing.particles(),
+            "identical final pools"
+        );
+        let mut hash_plain = Fingerprinter::new();
+        plain.fold_state(&mut hash_plain);
+        let mut hash_observing = Fingerprinter::new();
+        observing.fold_state(&mut hash_observing);
+        assert_eq!(
+            hash_plain.finish(),
+            hash_observing.finish(),
+            "identical final digests"
         );
     }
 

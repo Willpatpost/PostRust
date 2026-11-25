@@ -89,15 +89,43 @@ use std::ops::Range;
 /// compatibility with the post state's HDR pass rests on it).
 const REFLECTION_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
+/// The ripple uniform's row count: params0, params1, then
+/// RIPPLE_POOL_BOUND rings (engine-core's bound — the shader's
+/// array size and this layout are ONE contract).
+pub(crate) const RIPPLE_UNIFORM_ROWS: usize = 2 + engine_core::ripple::RIPPLE_POOL_BOUND;
+
+/// The packed ripple uniform (the GPU view of engine-core's
+/// RippleField): rows[0] = (live count, speed, width, uv gain),
+/// rows[1] = (roughen gain, 0, 0, 0), rows[2 + i] = (center_x,
+/// center_z, age, current amplitude). Copy-sized, zero-allocation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RippleUniformData {
+    pub rows: [[f32; 4]; RIPPLE_UNIFORM_ROWS],
+}
+
+impl RippleUniformData {
+    /// The empty field (count 0 — the shader's loop never runs, the
+    /// identity gate's no-op; also the rainless wet path's state).
+    pub(crate) fn empty() -> Self {
+        Self {
+            rows: [[0.0; 4]; RIPPLE_UNIFORM_ROWS],
+        }
+    }
+}
+
 /// The wet frame's camera description (the renderer layer builds
 /// it from its own arguments — the true view-projection, eye, and
 /// light — before the frame flow packages them into the corner or
 /// shadowed FrameParams; the reflection pass's mirrored math
-/// consumes it directly).
+/// consumes it directly). The ripple field rides along as the
+/// packed uniform the ground re-draw reads (the per-frame camera
+/// description's own lane — `render_frame`'s flat parameter list
+/// never changes).
 pub(crate) struct WetCamera {
     pub view_proj: [[f32; 4]; 4],
     pub eye: [f32; 3],
     pub light: LightParams,
+    pub ripple: RippleUniformData,
 }
 
 /// The extent-bound half: the per-slot reflection targets and the
@@ -155,6 +183,15 @@ pub(crate) struct ReflectionResources {
     params_mapped: *mut core::ffi::c_void,
     params_stride: u32,
     tail_stride: u32,
+    /// The ripple uniform's per-slot stride (the same align
+    /// discipline as params_stride — the ripple regions are dynamic
+    /// uniform descriptors).
+    ripple_stride: u32,
+    /// The ripple regions' base byte offset inside the SAME params
+    /// buffer: after the per-slot FrameParams regions and the
+    /// immutable material tail (binding 4's descriptor write points
+    /// here; the per-frame dynamic offset adds slot × stride).
+    ripple_base: u32,
     targets: Option<ReflectionTargets>,
 }
 
@@ -188,6 +225,8 @@ impl ReflectionResources {
             params_mapped: core::ptr::null_mut(),
             params_stride: 0,
             tail_stride: 0,
+            ripple_stride: 0,
+            ripple_base: 0,
             targets: None,
         };
         if let Err(error) = partial.build(ctx, corner, hdr_pass, main_render_pass) {
@@ -220,8 +259,22 @@ impl ReflectionResources {
             .max(align)
             .next_multiple_of(align)) as u32;
         let tail_stride = (size_of::<[f32; 4]>() as u64).max(align) as u32;
+        // The ripple uniform's per-slot regions (Era-2 package C
+        // recursive item 1): the same buffer, sized with the same
+        // align discipline as params_stride. The regions live AFTER
+        // the material tail — NO new Vulkan object rides the ripple
+        // (the Era-1 wet allocation delta pin (7,2,8,2) in
+        // tests/render_reflection.rs is untouched: one buffer, one
+        // mapped memory, the same pools and sets — binding 4 is a
+        // write into the EXISTING ground sets).
+        let ripple_stride = ((RIPPLE_UNIFORM_ROWS as u64 * 16)
+            .max(align)
+            .next_multiple_of(align)) as u32;
+        let ripple_base = slots as u64 * u64::from(params_stride)
+            + material_count as u64 * u64::from(tail_stride);
         let total = u64::from(params_stride) * slots as u64
-            + u64::from(tail_stride) * material_count as u64;
+            + u64::from(tail_stride) * material_count as u64
+            + u64::from(ripple_stride) * slots as u64;
         let (params_buffer, params_memory, params_mapped) =
             create_mapped_buffer(ctx, vk::BufferUsageFlags::UNIFORM_BUFFER, total)?;
         self.params_buffer = params_buffer;
@@ -229,6 +282,8 @@ impl ReflectionResources {
         self.params_mapped = params_mapped;
         self.params_stride = params_stride;
         self.tail_stride = tail_stride;
+        self.ripple_stride = ripple_stride;
+        self.ripple_base = ripple_base as u32;
         // The immutable material tail, written once (the corner's
         // own values, from the same engine table).
         // SAFETY: disjoint aligned tail in coherent memory, written
@@ -247,6 +302,26 @@ impl ReflectionResources {
                     .byte_add(offset)
                     .cast::<[f32; 4]>()
                     .write(params);
+            }
+        }
+        // The ripple span, ZEROED at construction (the belt): mapped
+        // memory is not guaranteed zeroed, and the FIRST frames of a
+        // rainless wet session read the uniform before any
+        // `set_ripple_field` call — write_frame writes the region
+        // before every GPU read too (the suspenders; both documented).
+        // The span is whole slots × stride in vec4 rows, starting at
+        // ripple_base (the stride is a multiple of 16 — the align
+        // discipline's power-of-two align and the 544-byte minimum).
+        // SAFETY: disjoint aligned span in coherent memory, written
+        // once before any submission.
+        unsafe {
+            let rows = slots as u64 * u64::from(ripple_stride) / 16;
+            for row in 0..rows {
+                let offset = (ripple_base + row * 16) as usize;
+                self.params_mapped
+                    .byte_add(offset)
+                    .cast::<[f32; 4]>()
+                    .write([0.0f32; 4]);
             }
         }
 
@@ -319,7 +394,8 @@ impl ReflectionResources {
         // --- the ground re-draw's layout: 0 = the reflection view,
         // 2 = the sampler, 3 = the corner's own frame buffer
         // (ground_reflect.wgsl's documented map — binding 1 is the
-        // atlas share, unusable).
+        // atlas share, unusable), 4 = the ripple field (this state's
+        // own params buffer, the free slot the shader documents).
         let sampled = vk::DescriptorType::SAMPLED_IMAGE;
         let ground_bindings = [
             vk::DescriptorSetLayoutBinding::default()
@@ -337,6 +413,16 @@ impl ReflectionResources {
                 .descriptor_type(dynamic)
                 .descriptor_count(1)
                 .stage_flags(both),
+            // The ripple field (Era-2 package C recursive item 1):
+            // UNIFORM_BUFFER_DYNAMIC like binding 3 (the per-slot
+            // regions in this state's own params buffer), FRAGMENT
+            // only — the perturbation never touches the vertex
+            // stage.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(dynamic)
+                .descriptor_count(1)
+                .stage_flags(frag),
         ];
         // SAFETY: fresh object; the partial state owns it.
         self.ground_layout = {
@@ -658,6 +744,8 @@ impl ReflectionResources {
             self.params_buffer,
             self.params_stride,
             self.tail_stride,
+            self.ripple_base,
+            self.ripple_stride,
             depth_format,
         )?);
         Ok(())
@@ -667,7 +755,10 @@ impl ReflectionResources {
     /// reflection pass's own camera math: the mirrored
     /// view-projection and the mirrored eye, planar.rs's functions;
     /// the light unchanged — a directional light's reflection is
-    /// the lit mirrored world).
+    /// the lit mirrored world) AND this slot's ripple region (the
+    /// packed uniform from the camera description — the ground
+    /// re-draw's binding 4 reads it; written every frame, before
+    /// any GPU read, the construction-time zeroing's suspenders).
     ///
     /// # Safety
     /// `slot` must be owned (its fence wait passed).
@@ -685,6 +776,22 @@ impl ReflectionResources {
                 .byte_add(base as usize)
                 .cast::<FrameParams>()
                 .write(mirrored);
+        }
+        // The ripple half: this slot's region in the same mapped
+        // buffer, after the material tail (ripple_base), at the
+        // ripple stride — the fixed-size Copy write, zero
+        // allocation. The same slot-ownership proof as the
+        // mirrored-params write above (the fence wait owns the
+        // slot; the regions are disjoint per slot and from the
+        // FrameParams regions and the material tail).
+        let ripple_offset = self.ripple_base + slot as u32 * self.ripple_stride;
+        // SAFETY: as above — this slot's ripple region, disjoint,
+        // written after the fence wait.
+        unsafe {
+            self.params_mapped
+                .byte_add(ripple_offset as usize)
+                .cast::<[[f32; 4]; RIPPLE_UNIFORM_ROWS]>()
+                .write(camera.ripple.rows);
         }
     }
 
@@ -887,7 +994,14 @@ impl ReflectionResources {
         // reflection view and the corner's own frame region (the
         // TRUE camera — the ground's own draw); the EQUAL depth
         // lands exactly on the ground's own depth (the same
-        // view-projection, the same vertices).
+        // view-projection, the same vertices). The TWO dynamic
+        // offsets apply to the set's dynamic bindings in ascending
+        // binding order — binding 3 (the corner's frame buffer,
+        // base offset 0, so slot x frame_stride) then binding 4
+        // (this state's ripple region, base offset ripple_base
+        // already in the descriptor write, so slot x ripple_stride
+        // — the effective offset is ripple_base + slot x stride,
+        // inside the buffer's sized span).
         unsafe {
             ctx.device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
@@ -897,7 +1011,10 @@ impl ReflectionResources {
                 self.ground_pipeline_layout,
                 0,
                 &[targets.ground_sets[slot]],
-                &[slot as u32 * corner.frame_stride()],
+                &[
+                    slot as u32 * corner.frame_stride(),
+                    slot as u32 * self.ripple_stride,
+                ],
             );
             ctx.device
                 .cmd_bind_vertex_buffers(cmd, 0, &[vertices], &[0]);
@@ -956,6 +1073,8 @@ impl ReflectionTargets {
         params_buffer: vk::Buffer,
         params_stride: u32,
         tail_stride: u32,
+        ripple_base: u32,
+        ripple_stride: u32,
         depth_format: vk::Format,
     ) -> Result<ReflectionTargets, RendererError> {
         let mut partial = ReflectionTargets {
@@ -984,6 +1103,8 @@ impl ReflectionTargets {
             params_buffer,
             params_stride,
             tail_stride,
+            ripple_base,
+            ripple_stride,
             swapchain_generation,
             depth_format,
         ) {
@@ -1006,6 +1127,8 @@ impl ReflectionTargets {
         params_buffer: vk::Buffer,
         params_stride: u32,
         tail_stride: u32,
+        ripple_base: u32,
+        ripple_stride: u32,
         _swapchain_generation: u64,
         depth_format: vk::Format,
     ) -> Result<(), RendererError> {
@@ -1189,7 +1312,9 @@ impl ReflectionTargets {
         }
         // --- the ground re-draw's per-slot sets: the reflection
         // view, the linear sampler, THE CORNER's own frame buffer
-        // (the TRUE camera — the ground's own draw reads it).
+        // (the TRUE camera — the ground's own draw reads it), and
+        // THIS state's ripple regions at binding 4 (the same buffer
+        // the mirrored FrameParams live in — no new Vulkan object).
         let sampled = vk::DescriptorType::SAMPLED_IMAGE;
         let ground_sizes = [
             vk::DescriptorPoolSize {
@@ -1202,7 +1327,9 @@ impl ReflectionTargets {
             },
             vk::DescriptorPoolSize {
                 ty: dynamic,
-                descriptor_count: 2,
+                // Two dynamic bindings per set now (3 = the corner
+                // frame, 4 = the ripple field) x 2 slots.
+                descriptor_count: 4,
             },
         ];
         // SAFETY: as above.
@@ -1216,6 +1343,22 @@ impl ReflectionTargets {
             let buffer = [vk::DescriptorBufferInfo::default()
                 .buffer(corner.frame_buffer())
                 .range(size_of::<FrameParams>() as u64)];
+            // The ripple region's base write: binding 4 points at
+            // THIS state's params buffer at ripple_base (the
+            // per-frame dynamic offset adds slot x ripple_stride —
+            // binding 3's base offset is 0, this one's is
+            // ripple_base, both in their own writes). The stride
+            // contract the record-time dynamic offset and the
+            // construction-time zeroing both rely on: at least the
+            // packed uniform's size, a multiple of 16 (the align
+            // discipline's power-of-two align over the 544-byte
+            // block).
+            debug_assert!(ripple_stride >= (RIPPLE_UNIFORM_ROWS * 16) as u32);
+            debug_assert!(ripple_stride.is_multiple_of(16));
+            let ripple = [vk::DescriptorBufferInfo::default()
+                .buffer(params_buffer)
+                .offset(u64::from(ripple_base))
+                .range((RIPPLE_UNIFORM_ROWS * 16) as u64)];
             let writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_set(ground_sets[slot])
@@ -1232,6 +1375,11 @@ impl ReflectionTargets {
                     .dst_binding(3)
                     .descriptor_type(dynamic)
                     .buffer_info(&buffer),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(ground_sets[slot])
+                    .dst_binding(4)
+                    .descriptor_type(dynamic)
+                    .buffer_info(&ripple),
             ];
             // SAFETY: as above.
             unsafe { ctx.device.update_descriptor_sets(&writes, &[]) };
