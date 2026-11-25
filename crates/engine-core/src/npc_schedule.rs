@@ -89,12 +89,18 @@ impl Commitment {
         }
     }
 
-    /// The smallest due tick STRICTLY GREATER than `tick`, if one is
-    /// representable. Checked arithmetic throughout: an occurrence
-    /// beyond the u64 tick space is `None` (no further occurrence —
-    /// the saturation framing `clock.rs` documents, here as absence
-    /// rather than a frozen clock).
-    fn next_due_after(&self, tick: Tick) -> Option<Tick> {
+    /// The next occurrence STRICTLY AFTER `tick` — the per-entry
+    /// re-arm anchor the execution layer chains wake events on
+    /// (design §6.2: the wake's follow-up chain). Checked
+    /// arithmetic throughout: `None` when no further occurrence is
+    /// representable (a one-shot past its start; an occurrence
+    /// beyond the u64 tick space — the `clock.rs` saturation
+    /// framing, here as absence rather than a frozen clock).
+    ///
+    /// Recurring (`start + k·period`, `k ≥ 0`): the next multiple of
+    /// the period past `tick`, anchored at `start`. One-shot:
+    /// `None` once `tick` has reached `start`.
+    pub fn next_occurrence(&self, tick: Tick) -> Option<Tick> {
         if tick.as_u64() < self.start.as_u64() {
             // Both cadences fire at `start` before anything later.
             return Some(self.start);
@@ -271,7 +277,7 @@ pub fn due_commitments(schedule: &NpcSchedule, tick: Tick) -> DueIndices<'_> {
 pub fn next_due(schedule: &NpcSchedule, tick: Tick) -> Option<Tick> {
     let mut best: Option<Tick> = None;
     for entry in schedule.entries.iter() {
-        if let Some(candidate) = entry.next_due_after(tick) {
+        if let Some(candidate) = entry.next_occurrence(tick) {
             best = Some(match best {
                 None => candidate,
                 Some(current) if candidate < current => candidate,

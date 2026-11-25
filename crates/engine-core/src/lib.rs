@@ -55,6 +55,7 @@ pub mod fingerprint;
 pub mod interaction;
 pub mod lod;
 pub mod npc_behavior;
+pub mod npc_execution;
 pub mod npc_perception;
 pub mod npc_schedule;
 pub mod npc_world_save;

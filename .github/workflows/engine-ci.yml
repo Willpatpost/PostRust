@@ -459,8 +459,39 @@ jobs:
           # this shard's non-ignored battery is untouched.
           # 1237/2/33 re-MEASURED with this step's own awk on the
           # stage-5 tree.
-          expected=1263
-          if [ "$(uname -s)" != "Linux" ]; then expected=1212; fi
+          #
+          # Era 2 package A part 1 (the NPC AI deterministic cores,
+          # 2026-11-25, PR #37, the owner's GO): +26 platform-uniform
+          # engine-core lib tests (npc_behavior 7, npc_schedule 10,
+          # npc_perception 9); the first push failed this gate with
+          # the then-pin 1237 (run 45528096205) and the correction
+          # commit re-pinned from the measured actual — the count
+          # corrected, never a test weakened (the record: d104094,
+          # runs 45528096205 red / 45529070104 green / the merge run
+          # 45530057475 green). 1237 + 26 = 1263 Linux / 1186 + 26 =
+          # 1212 Windows, both measured by that candidate's own runs.
+          #
+          # Era 2 package A part 2 (the NPC AI spine integration,
+          # 2026-11-25, PR era2/npc-ai-spine-integration):
+          # +14 platform-uniform engine-core lib tests (npc_execution:
+          # 9 machinery tests — the codec round-trips/refusals, the
+          # lazy-decay exact-f32 known answer, the re-arm anchoring,
+          # the corrupted-index refusal, the witness selection, the
+          # census geometry with the inclusive boundary and the
+          # Dormant exclusion, the fail-closed radii, the retention
+          # eviction, the digest sensitivity; 5 integration tests —
+          # the seeded double-run byte-identity, the stream digest
+          # pin, the E-10 synchrony cluster absorbed by the near
+          # reservation, the late-arrival honest skip, the witness
+          # census with depends_on causality). Pure spine/IEEE
+          # arithmetic, no cfg gates, no Vulkan. 1263 + 14 = 1277
+          # Linux MEASURED with this step's own awk on the package
+          # tree; Windows 1212 + 14 = 1226 = the same platform-
+          # uniform delta (to be confirmed by this candidate's CI
+          # run — a mismatch is corrected from actuals, never by
+          # weakening a test).
+          expected=1277
+          if [ "$(uname -s)" != "Linux" ]; then expected=1226; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
