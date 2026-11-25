@@ -43,6 +43,69 @@ pub fn reflection_blend(n_dot_v: f32) -> f32 {
     REFLECTION_R0 + (1.0 - REFLECTION_R0) * pow5
 }
 
+/// THE RIPPLE ORACLE (the CPU mirror of ground_reflect.wgsl's
+/// ripple perturbation, term-for-term — the lit_surface_color
+/// discipline applied to the ripple field; the technique mined
+/// from PR #54's `perturb` with credit). Given the SAME packed
+/// uniform rows the shader reads (reflection_draw's
+/// RippleUniformData) and a ground point (x, z), returns the
+/// (uv_offset, roughen) the shader computes at that point. The
+/// GPU/CPU sqrt may differ by ULPs — the known-answer gates
+/// compare under the reflection gates' documented tolerance class,
+/// never bit-exactly.
+///
+/// THE ROW CONTRACT (the shader's layout, term-for-term):
+/// rows[0] = (live count, expansion speed m/s, band width m, uv
+/// gain); rows[1] = (roughen gain, ..); rows[2 + i] = (center_x,
+/// center_z, age s, current amplitude). A `rows` shorter than
+/// 2 + count PANICS at the ring read — fail-visible, never a
+/// silent wrong answer (the shader's pool bound makes the
+/// well-formed case impossible to trip). The arithmetic mirrors
+/// the WGSL in its exact order: the count gate, the pool-order
+/// ring loop, `dist = sqrt(dx² + dz²)`, `radius = speed × age`,
+/// `band = |dist − radius|` gated `band < width` (the bump's own
+/// support), the signed slope `amp / width` (positive inside the
+/// ring line, negative outside — the triangle gradient's
+/// piecewise-constant stylization), the radial direction with the
+/// `dist == 0` zero-contribution select, `uv_offset += dir ×
+/// (signed × uv_gain)`, `roughen += amp × (1 − band / width)`.
+/// Pure function, no allocation.
+pub fn ripple_perturbation(rows: &[[f32; 4]], ground: [f32; 2]) -> ([f32; 2], f32) {
+    let mut uv_offset = [0.0f32; 2];
+    let mut roughen = 0.0f32;
+    // The count gate (the shader's `if (ripple_count > 0)` — the
+    // empty field's identity: the loop never runs, the zeros stand).
+    let count = rows[0][0] as i32;
+    if count > 0 {
+        for i in 0..count as usize {
+            let ring = rows[2 + i];
+            let delta = [ground[0] - ring[0], ground[1] - ring[1]];
+            let dist = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+            let radius = rows[0][1] * ring[2];
+            let band = (dist - radius).abs();
+            let width = rows[0][2];
+            if band < width {
+                // The signed slope: +amp/width inside the ring line,
+                // − outside (one subtraction and a sign — fixed
+                // order, the shader's select).
+                let slope = ring[3] / width;
+                let signed = if dist > radius { -slope } else { slope };
+                // The radial direction (dist == 0 has none: zero
+                // contribution — the exact center of a ring).
+                let dir = if dist > 0.0 {
+                    [delta[0] / dist, delta[1] / dist]
+                } else {
+                    [0.0, 0.0]
+                };
+                let push = dir.map(|component| component * (signed * rows[0][3]));
+                uv_offset = [uv_offset[0] + push[0], uv_offset[1] + push[1]];
+                roughen += ring[3] * (1.0 - band / width);
+            }
+        }
+    }
+    (uv_offset, roughen)
+}
+
 /// The mirrored world's view-projection (package 7, the reflection
 /// pass's own matrix): `view_proj × M` in the repo's column-major
 /// convention — the reflection pass renders the MIRRORED world
@@ -131,6 +194,168 @@ mod tests {
         // Clamped inputs do not explode.
         assert_eq!(reflection_blend(-0.5), reflection_blend(0.0));
         assert_eq!(reflection_blend(1.5), REFLECTION_R0);
+    }
+
+    /// THE ORACLE KNOWN ANSWERS (hand-computed, the #54 `perturb`
+    /// lesson folded in): one ring at the origin, the demo's
+    /// authored policy (speed 0.8 m/s, width 0.35 m, amplitude 1.0,
+    /// lifetime 2.5 s), aged 60 ticks — the age is the ACCUMULATED
+    /// 60 x dt (the accumulation loop replicated, never 60*dt —
+    /// f32 accumulation is the pinned form). The radius is
+    /// speed x age; the packed row's amplitude is the fade-at-read
+    /// expression. Probes: ON the ring line (the sign boundary —
+    /// the gradient is MAXIMUM at the apex, the sign at the exact
+    /// peak is ULP-arbitrary, so the FLIP is asserted either
+    /// side), inside the band (positive x direction), outside the
+    /// peak (negative), OUTSIDE the band (exactly zero — the gate),
+    /// and the exact center (the direction select).
+    #[test]
+    fn ripple_oracle_known_answers() {
+        // The accumulated 60-tick age (the replication loop).
+        let dt = 1.0f32 / 60.0f32;
+        let mut age = 0.0f32;
+        for _ in 0..60 {
+            age += dt;
+        }
+        // The packed rows exactly as the renderer's packing builds
+        // them: rows[0] = (count, speed, width, uv gain),
+        // rows[2] = (center_x, center_z, age, faded amplitude).
+        let faded = 1.0f32 * (1.0f32 - age / 2.5f32);
+        let mut rows = [[0.0f32; 4]; 2 + engine_core::ripple::RIPPLE_POOL_BOUND];
+        rows[0] = [1.0, 0.8, 0.35, crate::renderer::RIPPLE_UV_GAIN];
+        rows[1] = [crate::renderer::RIPPLE_ROUGHEN_GAIN, 0.0, 0.0, 0.0];
+        rows[2] = [0.0, 0.0, age, faded];
+        let radius = 0.8f32 * age;
+        let width = 0.35f32;
+        let slope = faded / width;
+        let push = slope * crate::renderer::RIPPLE_UV_GAIN;
+
+        // ON the ring line (the positive x axis, dist == radius):
+        // the apex — the magnitude is the full slope x gain and the
+        // roughen is the full faded amplitude (band == 0 up to the
+        // sqrt's ULPs). The SIGN here is ULP-arbitrary (which side
+        // of the apex dist lands on) — the flip is asserted below.
+        let (uv, roughen) = ripple_perturbation(&rows, [radius, 0.0]);
+        assert!(
+            (uv[0].abs() - push).abs() < 1e-5 * push,
+            "the apex carries the full gradient: uv {uv:?} vs push {push}"
+        );
+        assert!(uv[1].abs() < 1e-7, "the push is radial (x axis): {uv:?}");
+        assert!(
+            (roughen - faded).abs() < 1e-6 * faded,
+            "the apex roughen is the faded amplitude: {roughen} vs {faded}"
+        );
+
+        // INSIDE the band (dist < radius, positive x direction):
+        // the signed slope is POSITIVE — the push points away from
+        // the center (+x).
+        let (uv, roughen) = ripple_perturbation(&rows, [radius - width * 0.5, 0.0]);
+        assert!(uv[0] > 0.0, "inside the ring line the push is +x: {uv:?}");
+        assert!(
+            (uv[0].abs() - push).abs() < 1e-5 * push,
+            "the triangle gradient is piecewise-constant: {uv:?} vs push {push}"
+        );
+        assert!(uv[1].abs() < 1e-7, "radial on the x axis: {uv:?}");
+        assert!(
+            roughen > 0.0 && roughen < faded,
+            "inside the band the coverage is a positive fraction: {roughen}"
+        );
+
+        // OUTSIDE the peak (dist > radius, still inside the band):
+        // the signed slope flips NEGATIVE — the push points back
+        // toward the center (-x). THE #54 LESSON: the gradient is
+        // MAXIMUM at the apex and its sign at the exact peak is
+        // ULP-arbitrary — the flip is proven EITHER SIDE, never at
+        // the boundary itself.
+        let (uv, _) = ripple_perturbation(&rows, [radius + width * 0.5, 0.0]);
+        assert!(uv[0] < 0.0, "outside the ring line the push is -x: {uv:?}");
+        assert!(
+            (uv[0].abs() - push).abs() < 1e-5 * push,
+            "the same magnitude, the opposite sign: {uv:?} vs push {push}"
+        );
+
+        // OUTSIDE the band: the gate `band < width` fails — the
+        // contribution is EXACTLY zero (no arithmetic runs).
+        let (uv, roughen) = ripple_perturbation(&rows, [radius + width + 0.1, 0.0]);
+        assert_eq!(uv, [0.0, 0.0], "outside the band: the exact gate zero");
+        assert_eq!(roughen, 0.0, "outside the band: no coverage");
+
+        // THE EXACT CENTER (dist == 0): the mature ring's radius
+        // (≈ 0.79 m) exceeds the width, so the gate itself zeroes
+        // this point.
+        let (uv, roughen) = ripple_perturbation(&rows, [0.0, 0.0]);
+        assert_eq!(
+            uv,
+            [0.0, 0.0],
+            "the center: the gate's zero (radius > width)"
+        );
+        assert_eq!(roughen, 0.0);
+
+        // THE DIRECTION SELECT's own proof (the gate OPEN at the
+        // center): a YOUNG ring — 2 accumulated ticks, radius ≈
+        // 0.027 m < width — whose band covers the center. The push
+        // would be maximal there (the inside slope); the
+        // `dist == 0` select zeroes the direction, so the uv
+        // contribution is EXACTLY [0, 0] while the roughen
+        // (direction-free) stays positive.
+        let mut young_age = 0.0f32;
+        for _ in 0..2 {
+            young_age += dt;
+        }
+        let young_faded = 1.0f32 * (1.0f32 - young_age / 2.5f32);
+        let mut young_rows = [[0.0f32; 4]; 2 + engine_core::ripple::RIPPLE_POOL_BOUND];
+        young_rows[0] = rows[0];
+        young_rows[2] = [0.0, 0.0, young_age, young_faded];
+        let young_radius = 0.8f32 * young_age;
+        assert!(
+            young_radius < width,
+            "the young ring's band covers its own center"
+        );
+        let (uv, roughen) = ripple_perturbation(&young_rows, [0.0, 0.0]);
+        assert_eq!(
+            uv,
+            [0.0, 0.0],
+            "dist == 0 has no radial direction: the select's exact zero"
+        );
+        let expected_roughen = young_faded * (1.0f32 - young_radius / width);
+        assert!(
+            roughen > 0.0 && (roughen - expected_roughen).abs() < 1e-6 * expected_roughen,
+            "the coverage is direction-free and positive at the center: {roughen} vs \
+             {expected_roughen}"
+        );
+    }
+
+    /// THE IDENTITY GATE's CPU HALF: the empty field (count 0) is a
+    /// BIT-IDENTICAL no-op — the oracle returns exactly
+    /// ([0.0, 0.0], 0.0) for every ground point, both for the
+    /// all-zero rows (the never-set uniform) and the realistic
+    /// rainless rows (a live policy's params with count 0 — every
+    /// ring expired; the loop never runs, the params are never
+    /// read).
+    #[test]
+    fn empty_field_is_the_bit_identity() {
+        let zero_rows = [[0.0f32; 4]; 2 + engine_core::ripple::RIPPLE_POOL_BOUND];
+        let mut param_rows = [[0.0f32; 4]; 2 + engine_core::ripple::RIPPLE_POOL_BOUND];
+        param_rows[0] = [0.0, 0.8, 0.35, crate::renderer::RIPPLE_UV_GAIN];
+        param_rows[1] = [crate::renderer::RIPPLE_ROUGHEN_GAIN, 0.0, 0.0, 0.0];
+        for ground in [
+            [0.0, 0.0],
+            [12.5, -7.25],
+            [-40.0, 33.0],
+            [0.001, 999.0],
+            [1234.5, -1234.5],
+        ] {
+            assert_eq!(
+                ripple_perturbation(&zero_rows, ground),
+                ([0.0, 0.0], 0.0),
+                "the all-zero rows are the exact identity at {ground:?}"
+            );
+            assert_eq!(
+                ripple_perturbation(&param_rows, ground),
+                ([0.0, 0.0], 0.0),
+                "count 0 skips the loop regardless of the params at {ground:?}"
+            );
+        }
     }
 
     /// THE PLANAR PROPERTY (what the reflection pass rests on): the

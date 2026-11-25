@@ -281,6 +281,18 @@ impl LocomotionCrowd {
         self.rain.as_ref().map(|r| r.exit_summary())
     }
 
+    /// Returns the rain layer's ripple census line (the rain line's
+    /// own shape — printed alongside it at exit).
+    fn ripple_exit_summary(&self) -> Option<String> {
+        self.rain.as_ref().map(|r| r.ripple_exit_summary())
+    }
+
+    /// Returns the rain layer's folded ripple state for the digest
+    /// pin (None when the rain layer is off).
+    fn ripple_fold_state(&self) -> Option<u64> {
+        self.rain.as_ref().map(|r| r.fold_ripple_state())
+    }
+
     /// Returns the rain layer's folded state for the digest pin.
     fn rain_fold_state(&self) -> Option<u64> {
         self.rain.as_ref().map(|r| r.fold_state())
@@ -830,6 +842,21 @@ pub fn run(
         // shows the crowd after i ticks — the render-then-step
         // discipline; the step follows the submit below).
         let frame_population = crowd.as_ref().map(|crowd| crowd.population());
+        // The rain-ripple field (Era-2 package C recursive item 1):
+        // packed into the renderer's sticky wet state BEFORE the
+        // submission — frame i renders the ripple field as of the
+        // PREVIOUS frame's update (render-then-step, the same
+        // discipline the rain instances above follow; the crowd's
+        // update_rain follows the submit). None (no rain layer) or a
+        // dry session clears it — the empty uniform, the wet path's
+        // Era-1 byte-identity.
+        if wet {
+            renderer.set_ripple_field(
+                crowd
+                    .as_ref()
+                    .and_then(|c| c.rain.as_ref().map(|r| r.ripple_field())),
+            );
+        }
         let matrix = view_projection(pose, aspect);
         // Submission selection: the four-way union
         // (--populated --shadows together is the Era-2 stage 4b path).
@@ -931,8 +958,14 @@ pub fn run(
         if let Some(summary) = crowd.rain_exit_summary() {
             println!("{}", summary);
         }
+        if let Some(summary) = crowd.ripple_exit_summary() {
+            println!("{}", summary);
+        }
         if let Some(digest) = crowd.rain_fold_state() {
             println!("rain digest: {}", digest);
+        }
+        if let Some(digest) = crowd.ripple_fold_state() {
+            println!("ripple digest: {}", digest);
         }
     }
     let peak = peak_resident_kib().map_or_else(|| "unavailable".into(), |v| format!("{v} KiB"));
@@ -1090,6 +1123,19 @@ fn run_free_look(
         // render-then-step discipline the scripted route uses; the
         // step follows the submit below).
         let frame_population = crowd.as_ref().map(|crowd| crowd.population());
+        // The rain-ripple field (Era-2 package C recursive item 1),
+        // under the same render-then-step discipline as above: frame
+        // k renders the ripple field as of the previous presented
+        // frame's update. free-look does not carry the `wet` flag —
+        // the renderer's own sticky setting IS the state (set at
+        // startup from the flag; reading it back is exact).
+        if renderer.wet() {
+            renderer.set_ripple_field(
+                crowd
+                    .as_ref()
+                    .and_then(|c| c.rain.as_ref().map(|r| r.ripple_field())),
+            );
+        }
         let matrix = camera.view_projection(aspect);
         let frame = if shadows && let Some(population) = &frame_population {
             renderer.render_corner_populated_shadowed(
