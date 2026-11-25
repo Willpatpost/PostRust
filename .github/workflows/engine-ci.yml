@@ -490,8 +490,31 @@ jobs:
           # uniform delta (to be confirmed by this candidate's CI
           # run — a mismatch is corrected from actuals, never by
           # weakening a test).
-          expected=1277
-          if [ "$(uname -s)" != "Linux" ]; then expected=1226; fi
+          #
+          # Era 2 package A part 3 (the locomotion batch,
+          # 2026-11-25, PR era2/npc-ai-locomotion-batch):
+          # +18 platform-uniform engine-core lib tests (npc_locomotion:
+          # the construction geometry/refusals, the start_route known
+          # state with the draw-reconstruction proof and its refusals,
+          # the exact-binary advance known answer, the crossing
+          # remainder carry, the destination arrival snap-and-stand,
+          # the loop wrap cycle, the set_destination semantics, the
+          # shortest-way turn blend with the wrap case, the lateral
+          # fade window's exact smoothstep values and the
+          # corner-continuity proof, the pinned-blocked collision
+          # idempotence with the frozen phase and the counterfactual,
+          # the committed-cell known answers, the clip bands, the
+          # digest purity/sensitivity, the batch skip semantics, and
+          # the two campaign gates over a real spine — the double-run
+          # byte-identity and the locomotion digest pin). Pure IEEE
+          # arithmetic, no cfg gates, no Vulkan. 1277 + 18 = 1295
+          # Linux MEASURED with this step's own awk on the package
+          # tree; Windows 1226 + 18 = 1244 = the same platform-
+          # uniform delta (to be confirmed by this candidate's CI
+          # run — a mismatch is corrected from actuals, never by
+          # weakening a test).
+          expected=1295
+          if [ "$(uname -s)" != "Linux" ]; then expected=1244; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)

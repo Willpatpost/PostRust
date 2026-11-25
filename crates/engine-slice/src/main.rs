@@ -114,6 +114,7 @@ Headless modes
 Benchmarks
   --benchmark-render | --benchmark-encounter | --benchmark-persistence
   --benchmark-instrumentation | --benchmark-entity-scale | --benchmark-sustained-load
+  --benchmark-locomotion
   --benchmark-perf-sweep <cell> | --sustained-load-full-matrix
   --sustained-load-capacity-envelope
 
@@ -193,6 +194,17 @@ fn main() {
         // the double-run determinism proof (pod results,
         // observational; never CI thresholds).
         engine_slice::benchmark::run_entity_scale_benchmark();
+        return;
+    }
+
+    if std::env::args().any(|arg| arg == "--benchmark-locomotion") {
+        // Era 2 package A part 3: the §8.5 locomotion measurement —
+        // the near-lane batch step's p99 per-tick cost at the
+        // corner's 24-walker scale and the 1,000-walker pathological
+        // all-present case (hit, miss, and no-query collision
+        // variants), with the double-run determinism proof (pod
+        // results, observational; never CI thresholds).
+        engine_slice::benchmark::run_locomotion_scale();
         return;
     }
 
