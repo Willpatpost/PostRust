@@ -8,6 +8,27 @@ A fresh development or review agent should be able to determine the actual
 current status, active authority, source of truth, known limitations, and next
 work from THIS file alone.
 
+- **Extended for the owner's sign-off walk on 2026-11-27:** the
+  owner ran the maximal composition route (`--corner --populated
+  --behavior --shadows --weather rain --wet --day-night 20 --post
+  --free-look --audio` — every corner feature live at once) and the
+  era's separate visual routes: the composition runs clean (the
+  owner's judgment: "it looks fine"), and **the audit's held-open
+  visual question is ANSWERED: natural-intensity ripples are NOT
+  owner-visible on bare wet asphalt** — consistent with the
+  audit's own prediction (~0.19 expected simultaneously-visible
+  impacts at the corner's ring budget; the forced-field gates
+  prove the displacement reaches the framebuffer at ±22/255
+  measured sweep, but a ~2 px sample shift at campaign ring
+  density sits below the perceptual threshold without a dark
+  water patch and a tracked reflected feature to frame it).
+  Puddles do not exist yet (the prototype was the audit's one
+  endorsed-but-unbuilt item). **The puddle package is now the
+  foregrounded next work item** — the audit's question-7
+  specification (6–10 authored standing-water patches, the
+  still-water composition, ring confinement, and its acceptance
+  table) is the path to readable impacts; the sign-off walk's
+  negative result is the package's motivating evidence.
 - **Reconciled for the Era-2 audit remediation's completion on
   2026-11-26:** the independent audit at `959889d`
   (`docs/ERA2-LIVING-WORLD-AUDIT-959889d.md`) held Era-2 sign-off
