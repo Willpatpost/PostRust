@@ -2131,6 +2131,7 @@ mod tests {
                 need: None,
                 base_priority: 0,
                 applies_below: 0.0,
+                witness: None,
             }];
             LocoWorld {
                 routine: NpcRoutine {

@@ -456,7 +456,9 @@ mod tests {
         .expect("full rain derives");
         let mut emitter = Emitter::new(config).expect("the derived config validates");
         for tick in 1..=240u32 {
-            let report = emitter.tick(dt);
+            let report = emitter
+                .tick(dt)
+                .expect("the demo dt is finite and nonnegative");
             assert!(
                 report.active > 0,
                 "tick {tick}: the steady state is nonempty"

@@ -184,9 +184,6 @@ pub struct RainLayer {
     spawned: u64,
     died: u64,
     refused: u64,
-    /// The previous tick's active count (the census arithmetic's
-    /// carry: died_this_tick = previous_active + accepted − active).
-    previous_active: u32,
     final_active: u32,
     volume_refresh_count: u64,
     /// The ripple field (Era-2 package C recursive item 1): every
@@ -254,24 +251,24 @@ impl RainLayer {
         let mut warm_refusals: u64 = 0;
         let mut warm_kill_deaths: u64 = 0;
         for _ in 0..132 {
-            let report = emitter.tick_observing_kill_deaths(1.0 / 60.0, |position| {
-                warm_kill_deaths += 1;
-                // The typed spawn refusal, counted at the site
-                // (never swallowed — unreachable at this policy's
-                // 8.5x headroom, counted anyway; the field's own
-                // refused_total counts the same events, so the two
-                // are equal by construction).
-                if let Some(overflow) = ripples.observe_death(position) {
-                    warm_refusals += u64::from(overflow.dropped);
-                }
-            });
-            let refused_this_tick = report.overflow.map(|o| u64::from(o.dropped)).unwrap_or(0);
-            let accepted = u64::from(report.spawned) - refused_this_tick;
-            died += (previous_active + accepted).saturating_sub(u64::from(report.active));
-            spawned += u64::from(report.spawned);
-            refused += refused_this_tick;
+            let report = emitter
+                .tick_observing_kill_deaths(1.0 / 60.0, |position| {
+                    warm_kill_deaths += 1;
+                    // The typed spawn refusal, counted at the site
+                    // (never swallowed — unreachable at this policy's
+                    // 8.5x headroom, counted anyway; the field's own
+                    // refused_total counts the same events, so the two
+                    // are equal by construction).
+                    if let Some(overflow) = ripples.observe_death(position) {
+                        warm_refusals += u64::from(overflow.dropped);
+                    }
+                })
+                .expect("the warm-start dt is finite and nonnegative");
+            record_census(&mut spawned, &mut died, &mut refused, &report);
             previous_active = u64::from(report.active);
-            ripples.tick(1.0 / 60.0);
+            ripples
+                .tick(1.0 / 60.0)
+                .expect("the warm-start dt is finite and nonnegative");
         }
 
         let warm_active = previous_active as u32;
@@ -288,7 +285,6 @@ impl RainLayer {
             spawned,
             died,
             refused,
-            previous_active: warm_active,
             final_active: warm_active,
             volume_refresh_count: 0,
             ripples,
@@ -378,8 +374,12 @@ impl RainLayer {
                 if let Some(overflow) = self.ripples.observe_death(position) {
                     ripple_refused_this_tick += overflow.dropped;
                 }
-            });
-        let ripple_report = self.ripples.tick(1.0 / 60.0);
+            })
+            .expect("the demo's dt is finite and nonnegative");
+        let ripple_report = self
+            .ripples
+            .tick(1.0 / 60.0)
+            .expect("the demo's dt is finite and nonnegative");
         assert_eq!(
             ripple_report.refused, ripple_refused_this_tick,
             "the ripple report's refusal carry must agree with the site's count"
@@ -387,18 +387,15 @@ impl RainLayer {
         self.ripple_spawned += self.ripples.spawned() - ripple_spawned_before;
         self.ripple_expired += self.ripples.expired() - ripple_expired_before;
         self.ripple_refused += u64::from(ripple_refused_this_tick);
-        let refused_this_tick = report.overflow.map(|o| u64::from(o.dropped)).unwrap_or(0);
-        let accepted = u64::from(report.spawned) - refused_this_tick;
-        // THE CENSUS ARITHMETIC (the conservation law's per-tick
-        // form): active_new = previous_active + accepted − died,
-        // so died = previous_active + accepted − active_new —
-        // saturating (a pathological report can only make this
-        // zero, never negative).
-        self.died +=
-            (u64::from(self.previous_active) + accepted).saturating_sub(u64::from(report.active));
-        self.spawned += u64::from(report.spawned);
-        self.refused += refused_this_tick;
-        self.previous_active = report.active;
+        // THE CENSUS (finding 16's correction): the shared
+        // accumulator's law — the emitter's admitted count and its
+        // own death observation, consumed directly.
+        record_census(
+            &mut self.spawned,
+            &mut self.died,
+            &mut self.refused,
+            &report,
+        );
         self.final_active = report.active;
 
         // 3. THE PACK — a pure read of the COMPLETED tick (finding
@@ -506,6 +503,25 @@ impl RainLayer {
         self.ripples.fold_state(&mut hash);
         hash.finish()
     }
+}
+
+/// THE CENSUS ACCUMULATOR (finding 16's correction — one law, both
+/// windows): attempted = admitted + refused, and admitted = expired
+/// plus live for an initially empty pool. The emitter's `spawned` IS
+/// the admitted count (incremented only on admission) and `deaths`
+/// is the emitter's own observation — never the retired
+/// `spawned − refused` derivation that subtracted refusals from the
+/// already-admitted count before deriving deaths and underflowed on
+/// a zero-admission saturation tick (0 admitted − ≥1 refused).
+fn record_census(
+    spawned: &mut u64,
+    died: &mut u64,
+    refused: &mut u64,
+    report: &engine_core::particle::TickReport,
+) {
+    *spawned += u64::from(report.spawned);
+    *died += u64::from(report.deaths);
+    *refused += report.overflow.map(|o| u64::from(o.dropped)).unwrap_or(0);
 }
 
 /// The observed column's height above the eye (the OBSERVATION
@@ -1009,10 +1025,13 @@ mod tests {
 
     /// The census conservation (the conservation law over the
     /// layer's OWN tracked counters — NOT an identity derived from
-    /// itself): spawned == died + final-active + refused, and the
-    /// authored policy holds refused == 0 (the street steady state
-    /// holds ~624 live drops and the climb ceiling's lifetime cap
-    /// ~912, both under the 1024 pool bound).
+    /// itself): attempted = admitted + refused, and admitted = died
+    /// plus final-active for an initially empty pool (finding 16's
+    /// correction: `spawned` is the emitter's admitted count and
+    /// `died` its own death observation, so the identities hold
+    /// term-for-term; the authored policy holds refused == 0 — the
+    /// street steady state holds ~624 live drops and the climb
+    /// ceiling's lifetime cap ~912, both under the 1024 pool bound).
     #[test]
     fn census_conservation() {
         let mut layer = RainLayer::new(FIRST_EYE);
@@ -1021,8 +1040,15 @@ mod tests {
         }
         assert_eq!(
             layer.spawned,
+            layer.died + u64::from(layer.final_active),
+            "admitted == died + final-active (an initially empty pool; the layer's \
+             own counters)"
+        );
+        assert_eq!(
+            layer.spawned + layer.refused,
             layer.died + u64::from(layer.final_active) + layer.refused,
-            "spawned == died + final-active + refused (the layer's own counters)"
+            "attempted == admitted + refused (both sides composed of the observable \
+             counters)"
         );
         assert_eq!(
             layer.refused, 0,
@@ -1032,6 +1058,88 @@ mod tests {
         assert!(
             layer.died > 0,
             "a 600-tick campaign sees deaths (every street-level drop lands)"
+        );
+    }
+
+    /// THE SATURATION AND MIXED CENSUS (finding 16's deciding test,
+    /// layer side): a full pool that admits ZERO and refuses one
+    /// (the retired arithmetic's exact underflow shape — it computed
+    /// `admitted − refused` = 0 − 1 and panicked in debug builds,
+    /// corrupting the census in release) now records honestly, and
+    /// a mixed tick (admissions, refusals, and deaths together)
+    /// holds the same identities. The reports are authored directly
+    /// (the emitter's report is plain data) and driven through the
+    /// SAME accumulator the warm start and the ordinary update use.
+    #[test]
+    fn census_saturation_and_mixed_ticks_never_underflow() {
+        let mut spawned: u64 = 0;
+        let mut died: u64 = 0;
+        let mut refused: u64 = 0;
+        // THE SATURATION TICK: a full pool (active == the bound),
+        // zero admissions, one typed refusal, five deaths — the
+        // shape the retired `spawned − refused` arithmetic
+        // underflowed on (0 − 1).
+        let saturation = engine_core::particle::TickReport {
+            spawned: 0,
+            overflow: Some(engine_core::particle::SpawnOverflow { dropped: 1 }),
+            active: engine_core::particle::PARTICLE_POOL_BOUND as u32 - 5,
+            deaths: 5,
+        };
+        record_census(&mut spawned, &mut died, &mut refused, &saturation);
+        assert_eq!(spawned, 0, "zero admissions recorded");
+        assert_eq!(refused, 1, "the refusal counted, never silent");
+        assert_eq!(
+            died, 5,
+            "the deaths are the emitter's own count (no underflow)"
+        );
+        // THE PER-TICK IDENTITY holds on the saturation report:
+        // active_before + admitted == deaths + active.
+        assert_eq!(
+            u64::from(saturation.active + saturation.deaths),
+            u64::from(engine_core::particle::PARTICLE_POOL_BOUND as u32),
+            "the saturation report is internally consistent"
+        );
+        // THE MIXED TICKS, from an initially empty pool: a fill
+        // tick, then a tick that mixes admissions (into freed
+        // slots), refusals (above them), and deaths in one report.
+        let mut spawned: u64 = 0;
+        let mut died: u64 = 0;
+        let mut refused: u64 = 0;
+        let fill = engine_core::particle::TickReport {
+            spawned: 1000,
+            overflow: None,
+            active: 450,
+            deaths: 550,
+        };
+        record_census(&mut spawned, &mut died, &mut refused, &fill);
+        let mixed = engine_core::particle::TickReport {
+            spawned: 40,
+            overflow: Some(engine_core::particle::SpawnOverflow { dropped: 960 }),
+            active: 460,
+            deaths: 30,
+        };
+        // The mixed tick's own per-tick identity:
+        // active_before + admitted == deaths + active.
+        assert_eq!(
+            u64::from(mixed.active + mixed.deaths),
+            u64::from(fill.active) + u64::from(mixed.spawned),
+            "the mixed report is internally consistent"
+        );
+        record_census(&mut spawned, &mut died, &mut refused, &mixed);
+        assert_eq!(spawned, 1040);
+        assert_eq!(died, 580);
+        assert_eq!(refused, 960);
+        // THE CUMULATIVE IDENTITIES from the empty start:
+        // attempted == admitted + refused; admitted == deaths + live.
+        assert_eq!(
+            spawned + refused,
+            1040 + 960,
+            "attempted == admitted + refused"
+        );
+        assert_eq!(
+            spawned,
+            died + u64::from(mixed.active),
+            "admitted == deaths + live (an initially empty pool)"
         );
     }
 

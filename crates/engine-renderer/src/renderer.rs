@@ -1416,7 +1416,9 @@ mod tests {
         // One observed kill death at a known position, then one
         // tick: the ring's age is exactly `0.0 + dt`.
         assert_eq!(field.observe_death([-3.5, 1.7, 8.25]), None);
-        let report = field.tick(dt);
+        let report = field
+            .tick(dt)
+            .expect("the fixture dt is finite and nonnegative");
         assert_eq!(report.active, 1);
         let packed = pack_ripple_field(Some(&field), RippleDebugMode::Off);
         assert_eq!(
@@ -1470,8 +1472,12 @@ mod tests {
         age_rest += dt;
         age_first += dt; // tick 3
         age_rest += dt;
-        let _report = field.tick(dt); // tick 2
-        let report = field.tick(dt); // tick 3
+        let _report = field
+            .tick(dt)
+            .expect("the fixture dt is finite and nonnegative"); // tick 2
+        let report = field
+            .tick(dt)
+            .expect("the fixture dt is finite and nonnegative"); // tick 3
         assert_eq!(report.active, 3);
         let packed = pack_ripple_field(Some(&field), RippleDebugMode::Off);
         assert_eq!(packed.rows[0][0], 3.0, "three live rings");

@@ -144,12 +144,22 @@ pub struct EmitterConfig {
 /// failure).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TickReport {
-    /// Particles spawned this tick.
+    /// Particles ADMITTED this tick (incremented only when a spawn
+    /// unit found pool room — the admission count, never the
+    /// attempt count; attempts are `spawned + overflow.dropped`).
     pub spawned: u32,
     /// Spawn attempts dropped above the pool bound this tick.
     pub overflow: Option<SpawnOverflow>,
     /// Active particles after the tick.
     pub active: u32,
+    /// Particles that DIED this tick (kill-plane and lifetime
+    /// deaths together) — the emitter's OWN observation, exposed for
+    /// the census check (finding 16's correction: deaths are no
+    /// longer re-derived downstream by subtracting refusals from
+    /// admissions). The identity:
+    /// `active_before + spawned == deaths + active` (an admitted
+    /// particle is live or dead by the tick's end).
+    pub deaths: u32,
 }
 
 /// One emitter: its configuration, spawn stream, and bounded pool.
@@ -180,6 +190,19 @@ impl EmitterConfig {
     /// through [`le_total`]/[`gt_total`], which decide over
     /// `partial_cmp` so a NaN side never passes (a NaN has no
     /// ordering), and the scalar gates check `is_finite` directly.
+    ///
+    /// FINITENESS OF ENDPOINTS AND DERIVED SPANS (finding 17's
+    /// correction — the ordering-only gates once admitted
+    /// infinities): every volume and lifetime ENDPOINT must be
+    /// finite (a volume with both X bounds +∞ passed the ordering
+    /// gate and made `max − min` NaN at spawn), and every DERIVED
+    /// SPAN (`max − min` per axis, `lifetime[1] − lifetime[0]`)
+    /// must be finite too (a finite endpoint pair can overflow the
+    /// subtraction to ±∞, which poisons the spawn draw the same
+    /// way). The ordering gates run FIRST so a NaN keeps its own
+    /// pinned refusal reason; the finiteness gates catch what
+    /// ordering cannot. Construction and [`Emitter::set_volume`]
+    /// both validate through this function.
     pub fn validate(&self) -> Result<(), &'static str> {
         if !le_total(self.volume.min[0], self.volume.max[0]) {
             return Err("particle/volume-min-above-max-x");
@@ -195,6 +218,29 @@ impl EmitterConfig {
         }
         if !gt_total(self.lifetime[0], 0.0) {
             return Err("particle/lifetime-min-not-positive");
+        }
+        // ENDPOINT FINITENESS: the ±∞ pairs the ordering gates
+        // admit (+∞ ≤ +∞ holds; −∞ ≤ +∞ holds).
+        for axis in 0..3 {
+            if !self.volume.min[axis].is_finite() || !self.volume.max[axis].is_finite() {
+                return Err("particle/volume-endpoint-non-finite");
+            }
+        }
+        if !self.lifetime[0].is_finite() || !self.lifetime[1].is_finite() {
+            return Err("particle/lifetime-endpoint-non-finite");
+        }
+        // DERIVED-SPAN FINITENESS: a finite endpoint pair can
+        // overflow the subtraction to ±∞ (min −max at the f32
+        // extremes), and the spawn draw multiplies by the span —
+        // the same nonfinite poisoning, refused at admission. (The
+        // lifetime pair needs no span gate: the positivity and
+        // ordering gates above already bound its difference below
+        // the f32 maximum — the volume's min may be negative, the
+        // lifetime's low bound may not.)
+        for axis in 0..3 {
+            if !(self.volume.max[axis] - self.volume.min[axis]).is_finite() {
+                return Err("particle/volume-span-non-finite");
+            }
         }
         if !self.rate.is_finite() || self.rate < 0.0 {
             return Err("particle/rate-negative-or-non-finite");
@@ -305,7 +351,15 @@ impl Emitter {
     /// [`Emitter::tick_observing_kill_deaths`] with a no-op
     /// observer — one code path, one arithmetic; the digest pins
     /// rest on the delegation).
-    pub fn tick(&mut self, dt: f32) -> TickReport {
+    ///
+    /// THE TYPED DT REFUSAL (finding 17's correction): a non-finite
+    /// or NEGATIVE `dt` is refused at admission —
+    /// `Err("particle/tick-duration-non-finite-or-negative")` —
+    /// with NO state advancement (the accumulator, pool, and stream
+    /// are untouched; a NaN step once poisoned the accumulator
+    /// forever and made lifetimes immortal). Zero is legal (a
+    /// paused clock).
+    pub fn tick(&mut self, dt: f32) -> Result<TickReport, &'static str> {
         self.tick_observing_kill_deaths(dt, |_| {})
     }
 
@@ -333,13 +387,24 @@ impl Emitter {
     /// the death test runs, every kill-plane death is observed
     /// BEFORE the compaction write decision, and survivors compact
     /// stably into the prefix. The report must be observed.
+    ///
+    /// THE TYPED DT REFUSAL (finding 17's correction, identical to
+    /// [`Emitter::tick`]'s): a non-finite or negative `dt` is
+    /// refused at admission with NO state advancement.
     pub fn tick_observing_kill_deaths<F: FnMut([f32; 3])>(
         &mut self,
         dt: f32,
         mut on_kill_death: F,
-    ) -> TickReport {
+    ) -> Result<TickReport, &'static str> {
+        // DT ADMISSION (first — before any state is touched): finite
+        // and nonnegative, or the tick is refused typed and the
+        // emitter is byte-identical to before the call.
+        if !dt.is_finite() || dt < 0.0 {
+            return Err("particle/tick-duration-non-finite-or-negative");
+        }
         let mut spawned: u32 = 0;
         let mut dropped: u32 = 0;
+        let active_before = self.active;
         self.spawn_accumulator += dt * self.config.rate;
         if self.spawn_accumulator > SPAWN_ACCUMULATOR_CAP {
             self.spawn_accumulator = SPAWN_ACCUMULATOR_CAP;
@@ -396,11 +461,19 @@ impl Emitter {
         }
         self.active = write;
         self.overflow_total += dropped;
-        TickReport {
+        // THE DEATH OBSERVATION (finding 16's correction): deaths are
+        // counted HERE — the pre-integration pool (after this tick's
+        // spawns landed, since spawn precedes integration) minus the
+        // post-compaction prefix. `active_before + spawned ==
+        // deaths + active` is the census identity the layer consumes
+        // directly, never re-derived by subtracting refusals.
+        let deaths = (active_before + spawned as usize - write) as u32;
+        Ok(TickReport {
             spawned,
             overflow: (dropped > 0).then_some(SpawnOverflow { dropped }),
             active: self.active as u32,
-        }
+            deaths,
+        })
     }
 
     /// Folds every ACTIVE particle's `position.to_bits()` and
@@ -568,7 +641,9 @@ mod tests {
             seed: 1,
         };
         let mut emitter = Emitter::new(config).expect("the config validates");
-        let report = emitter.tick(dt);
+        let report = emitter
+            .tick(dt)
+            .expect("the fixture dt is finite and nonnegative");
         assert!(report.spawned >= 1, "the rate spawns on the first tick");
         assert_eq!(report.active, report.spawned, "nothing dies");
         let p = &emitter.particles()[0];
@@ -617,7 +692,9 @@ mod tests {
             seed: 2,
         };
         let mut emitter = Emitter::new(config).expect("the config validates");
-        emitter.tick(dt);
+        emitter
+            .tick(dt)
+            .expect("the fixture dt is finite and nonnegative");
         let p = &emitter.particles()[0];
         assert_eq!(
             p.velocity[1],
@@ -664,7 +741,9 @@ mod tests {
         assert!(death_tick >= 1, "the fall reaches the plane");
 
         let mut emitter = Emitter::new(config).expect("the config validates");
-        let report = emitter.tick(1.0f32);
+        let report = emitter
+            .tick(1.0f32)
+            .expect("the fixture dt is finite and nonnegative");
         assert_eq!(report.spawned, 1, "dt 1.0 x rate 1.0: exactly one unit");
         assert_eq!(report.active, 1);
         assert_eq!(
@@ -673,11 +752,15 @@ mod tests {
             "the known spawn-tick position"
         );
         for t in 1..death_tick {
-            let report = emitter.tick(dt);
+            let report = emitter
+                .tick(dt)
+                .expect("the fixture dt is finite and nonnegative");
             assert_eq!(report.spawned, 0, "tick {t}: no respawn inside the window");
             assert_eq!(report.active, 1, "tick {t}: still above the kill plane");
         }
-        let report = emitter.tick(dt);
+        let report = emitter
+            .tick(dt)
+            .expect("the fixture dt is finite and nonnegative");
         assert_eq!(report.spawned, 0);
         assert_eq!(report.active, 0, "dead EXACTLY when position[1] <= kill_y");
         assert_eq!(
@@ -764,7 +847,9 @@ mod tests {
 
         let mut emitter = Emitter::new(config_a).expect("the config validates");
         let mut observed: Vec<[f32; 3]> = Vec::new();
-        let report = emitter.tick_observing_kill_deaths(1.0f32, |p| observed.push(p));
+        let report = emitter
+            .tick_observing_kill_deaths(1.0f32, |p| observed.push(p))
+            .expect("the fixture dt is finite and nonnegative");
         assert_eq!(report.spawned, 5, "the prime tick's exact five units");
         assert_eq!(
             report.active, 5,
@@ -772,7 +857,9 @@ mod tests {
         );
         assert!(observed.is_empty(), "no death yet: the observer is silent");
         for t in 1..death_tick {
-            let report = emitter.tick_observing_kill_deaths(dt, |p| observed.push(p));
+            let report = emitter
+                .tick_observing_kill_deaths(dt, |p| observed.push(p))
+                .expect("the fixture dt is finite and nonnegative");
             assert_eq!(report.spawned, 0, "tick {t}: no respawn inside the window");
             assert_eq!(report.active, 5, "tick {t}: still above the kill plane");
             assert!(observed.is_empty(), "tick {t}: still silent");
@@ -781,7 +868,9 @@ mod tests {
         // deaths must report — they never move horizontally).
         let pre_death: Vec<[f32; 3]> = emitter.particles().iter().map(|p| p.position).collect();
         assert_eq!(pre_death.len(), 5);
-        let report = emitter.tick_observing_kill_deaths(dt, |p| observed.push(p));
+        let report = emitter
+            .tick_observing_kill_deaths(dt, |p| observed.push(p))
+            .expect("the fixture dt is finite and nonnegative");
         assert_eq!(report.spawned, 0);
         assert_eq!(
             report.active, 0,
@@ -820,7 +909,9 @@ mod tests {
         };
         let mut emitter_b = Emitter::new(config_b).expect("the config validates");
         let mut observed_b: Vec<[f32; 3]> = Vec::new();
-        let report_b = emitter_b.tick_observing_kill_deaths(1.0f32, |p| observed_b.push(p));
+        let report_b = emitter_b
+            .tick_observing_kill_deaths(1.0f32, |p| observed_b.push(p))
+            .expect("the fixture dt is finite and nonnegative");
         assert_eq!(report_b.spawned, 5, "the same prime tick");
         assert_eq!(
             report_b.active, 0,
@@ -831,7 +922,9 @@ mod tests {
             "a lifetime death mid-air is not a landing"
         );
         for _ in 0..3 {
-            emitter_b.tick_observing_kill_deaths(dt, |p| observed_b.push(p));
+            emitter_b
+                .tick_observing_kill_deaths(dt, |p| observed_b.push(p))
+                .expect("the fixture dt is finite and nonnegative");
         }
         assert!(observed_b.is_empty(), "the silence holds");
 
@@ -853,7 +946,9 @@ mod tests {
         };
         let mut emitter_c = Emitter::new(config_c).expect("the config validates");
         let mut observed_c: Vec<[f32; 3]> = Vec::new();
-        let report_c = emitter_c.tick_observing_kill_deaths(1.0f32, |p| observed_c.push(p));
+        let report_c = emitter_c
+            .tick_observing_kill_deaths(1.0f32, |p| observed_c.push(p))
+            .expect("the fixture dt is finite and nonnegative");
         assert_eq!(report_c.spawned, 5, "the same prime tick");
         assert_eq!(
             report_c.active, 0,
@@ -882,8 +977,12 @@ mod tests {
         let mut observing = Emitter::new(rain_like_campaign(0xD1E6)).unwrap();
         for t in 1..=300u32 {
             assert_eq!(
-                plain.tick(dt),
-                observing.tick_observing_kill_deaths(dt, |_| {}),
+                plain
+                    .tick(dt)
+                    .expect("the fixture dt is finite and nonnegative"),
+                observing
+                    .tick_observing_kill_deaths(dt, |_| {})
+                    .expect("the fixture dt is finite and nonnegative"),
                 "tick {t}: the no-op observer changes nothing"
             );
         }
@@ -1025,17 +1124,23 @@ mod tests {
 
         let mut emitter = Emitter::new(config).expect("the config validates");
         let mut observed: Vec<[f32; 3]> = Vec::new();
-        let report = emitter.tick_observing_kill_deaths(1.0f32, |p| observed.push(p));
+        let report = emitter
+            .tick_observing_kill_deaths(1.0f32, |p| observed.push(p))
+            .expect("the fixture dt is finite and nonnegative");
         assert_eq!(report.spawned, 5, "the prime tick's exact five units");
         assert_eq!(report.active, 5, "alive after the spawn tick");
         assert!(observed.is_empty(), "no death yet: the observer is silent");
         for t in 1..death_tick {
-            let report = emitter.tick_observing_kill_deaths(dt, |p| observed.push(p));
+            let report = emitter
+                .tick_observing_kill_deaths(dt, |p| observed.push(p))
+                .expect("the fixture dt is finite and nonnegative");
             assert_eq!(report.spawned, 0, "tick {t}: no respawn inside the window");
             assert_eq!(report.active, 5, "tick {t}: still above the kill plane");
             assert!(observed.is_empty(), "tick {t}: still silent");
         }
-        let report = emitter.tick_observing_kill_deaths(dt, |p| observed.push(p));
+        let report = emitter
+            .tick_observing_kill_deaths(dt, |p| observed.push(p))
+            .expect("the fixture dt is finite and nonnegative");
         assert_eq!(report.spawned, 0);
         assert_eq!(report.active, 0, "the whole cohort died at the plane");
         assert_eq!(observed.len(), 5, "every kill-plane death observed");
@@ -1059,7 +1164,13 @@ mod tests {
         let mut a = Emitter::new(rain_like_campaign(0xC0FFEE)).unwrap();
         let mut b = Emitter::new(rain_like_campaign(0xC0FFEE)).unwrap();
         for t in 1..=600u32 {
-            assert_eq!(a.tick(dt), b.tick(dt), "tick {t}: identical reports");
+            assert_eq!(
+                a.tick(dt)
+                    .expect("the fixture dt is finite and nonnegative"),
+                b.tick(dt)
+                    .expect("the fixture dt is finite and nonnegative"),
+                "tick {t}: identical reports"
+            );
             if t % 60 == 0 {
                 assert_eq!(a.particles(), b.particles(), "tick {t}: identical prefixes");
                 let mut ha = Fingerprinter::new();
@@ -1082,11 +1193,16 @@ mod tests {
         let mut control = Emitter::new(rain_like_campaign(1)).unwrap();
         for _ in 0..60 {
             assert_eq!(
-                a.tick(dt),
-                control.tick(dt),
+                a.tick(dt)
+                    .expect("the fixture dt is finite and nonnegative"),
+                control
+                    .tick(dt)
+                    .expect("the fixture dt is finite and nonnegative"),
                 "the control: same seed, same reports"
             );
-            let _report_b = b.tick(dt);
+            let _report_b = b
+                .tick(dt)
+                .expect("the fixture dt is finite and nonnegative");
         }
         assert_eq!(a.particles(), control.particles(), "the control holds");
         assert_ne!(
@@ -1148,7 +1264,9 @@ mod tests {
             let expected_spawned = units.min(capacity);
             let expected_dropped = units - expected_spawned;
             active += expected_spawned as usize; // lifetime 100 s: nobody dies in 3 ticks
-            let report = emitter.tick(dt);
+            let report = emitter
+                .tick(dt)
+                .expect("the fixture dt is finite and nonnegative");
             assert_eq!(
                 report.spawned, expected_spawned,
                 "tick {tick}: spawned derived"
@@ -1206,12 +1324,16 @@ mod tests {
             seed: 0x057A_B1E5,
         };
         let mut emitter = Emitter::new(config).expect("the config validates");
-        let report = emitter.tick(1.0f32);
+        let report = emitter
+            .tick(1.0f32)
+            .expect("the fixture dt is finite and nonnegative");
         assert_eq!(report.spawned, 5);
         assert_eq!(report.active, 5);
         let mut previous: Vec<[f32; 3]> = emitter.particles().iter().map(|p| p.position).collect();
         for t in 1..=11u32 {
-            let report = emitter.tick(dt);
+            let report = emitter
+                .tick(dt)
+                .expect("the fixture dt is finite and nonnegative");
             assert_eq!(report.spawned, 0, "tick {t}: no respawn inside the window");
             let current: Vec<[f32; 3]> = emitter.particles().iter().map(|p| p.position).collect();
             let mut scan = 0usize;
@@ -1338,7 +1460,9 @@ mod tests {
         let mut emitter = Emitter::new(rain_like_campaign(0xC0FFEE)).unwrap();
         let mut first = Fingerprinter::new();
         for t in 1..=300u32 {
-            let _report = emitter.tick(dt);
+            let _report = emitter
+                .tick(dt)
+                .expect("the fixture dt is finite and nonnegative");
             if t % 60 == 0 {
                 emitter.fold_state(&mut first);
             }
@@ -1349,8 +1473,12 @@ mod tests {
         let mut replay = Fingerprinter::new();
         for t in 1..=300u32 {
             assert_eq!(
-                emitter.tick(dt),
-                control.tick(dt),
+                emitter
+                    .tick(dt)
+                    .expect("the fixture dt is finite and nonnegative"),
+                control
+                    .tick(dt)
+                    .expect("the fixture dt is finite and nonnegative"),
                 "tick {t}: replay == fresh"
             );
             if t % 60 == 0 {
@@ -1381,7 +1509,9 @@ mod tests {
         let mut emitter = Emitter::new(rain_like_campaign(0xC0FFEE)).unwrap();
         let mut hasher = Fingerprinter::new();
         for t in 1..=600u32 {
-            let report = emitter.tick(dt);
+            let report = emitter
+                .tick(dt)
+                .expect("the fixture dt is finite and nonnegative");
             assert_eq!(
                 report.overflow, None,
                 "tick {t}: the campaign never overflows"
@@ -1411,7 +1541,9 @@ mod tests {
         let mut emitter = Emitter::new(rain_like_campaign(0xC0FFEE)).unwrap();
         // Drive 60 ticks to get a non-trivial state
         for _ in 0..60 {
-            emitter.tick(1.0 / 60.0);
+            emitter
+                .tick(1.0 / 60.0)
+                .expect("the fixture dt is finite and nonnegative");
         }
         // Fold the state before
         let mut before = Fingerprinter::new();
@@ -1446,15 +1578,21 @@ mod tests {
         let mut b = Emitter::new(rain_like_campaign(0xC0FFEE)).unwrap();
         // Drive both 60 ticks
         for _ in 0..60 {
-            a.tick(1.0 / 60.0);
-            b.tick(1.0 / 60.0);
+            a.tick(1.0 / 60.0)
+                .expect("the fixture dt is finite and nonnegative");
+            b.tick(1.0 / 60.0)
+                .expect("the fixture dt is finite and nonnegative");
         }
         // The no-op refresh: same volume
         let volume = rain_like_campaign(0xC0FFEE).volume;
         assert!(b.set_volume(volume).is_ok());
         // Drive one more tick — the spawns must match
-        let ra = a.tick(1.0 / 60.0);
-        let rb = b.tick(1.0 / 60.0);
+        let ra = a
+            .tick(1.0 / 60.0)
+            .expect("the fixture dt is finite and nonnegative");
+        let rb = b
+            .tick(1.0 / 60.0)
+            .expect("the fixture dt is finite and nonnegative");
         assert_eq!(ra, rb, "the no-op refresh preserved the stream");
         assert_eq!(a.particles(), b.particles(), "particle states match");
     }
@@ -1491,7 +1629,9 @@ mod tests {
             configs.iter().map(|c| Emitter::new(*c).unwrap()).collect();
         for _ in 0..128 {
             for emitter in &mut together {
-                let report = emitter.tick(dt);
+                let report = emitter
+                    .tick(dt)
+                    .expect("the fixture dt is finite and nonnegative");
                 assert!(
                     report.overflow.is_none(),
                     "the fixture's rates never saturate the pool"
@@ -1503,7 +1643,9 @@ mod tests {
         for (i, config) in configs.iter().enumerate() {
             let mut alone = Emitter::new(*config).unwrap();
             for _ in 0..128 {
-                alone.tick(dt);
+                alone
+                    .tick(dt)
+                    .expect("the fixture dt is finite and nonnegative");
             }
             let composed = &together[i];
             assert_eq!(
@@ -1520,5 +1662,296 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// THE NONFINITE-CONFIGURATION REFUSALS (finding 17's deciding
+    /// tests): infinities and extreme finite spans are refused at
+    /// construction AND at replacement (set_volume validates through
+    /// the same gates) — typed, never a panic, never a nonfinite
+    /// particle inside the deterministic state.
+    #[test]
+    fn nonfinite_configurations_are_refused_typed() {
+        let base = || rain_like_campaign(9);
+        assert_eq!(base().validate(), Ok(()), "the baseline passes");
+        // A volume with both X bounds +INFINITY: the ordering gate
+        // `+inf <= +inf` passes — the endpoint finiteness gate
+        // refuses (the audit's exact witness: max − min became NaN
+        // at spawn).
+        let mut bad = base();
+        bad.volume.min[0] = f32::INFINITY;
+        bad.volume.max[0] = f32::INFINITY;
+        assert_eq!(
+            bad.validate(),
+            Err("particle/volume-endpoint-non-finite"),
+            "the +inf/+inf X pair the ordering gate admitted"
+        );
+        assert!(
+            Emitter::new(bad).is_err(),
+            "the refusal blocks construction"
+        );
+        // Mixed infinities (−inf min, +inf max: ordered, still
+        // refused) and a single-sided infinity, per axis.
+        for axis in 0..3 {
+            let mut bad = base();
+            bad.volume.min[axis] = f32::NEG_INFINITY;
+            bad.volume.max[axis] = f32::INFINITY;
+            assert_eq!(
+                bad.validate(),
+                Err("particle/volume-endpoint-non-finite"),
+                "axis {axis}: the −inf/+inf pair"
+            );
+            let mut bad = base();
+            bad.volume.max[axis] = f32::INFINITY;
+            assert_eq!(
+                bad.validate(),
+                Err("particle/volume-endpoint-non-finite"),
+                "axis {axis}: the single-sided +inf max"
+            );
+        }
+        // Infinite lifetime endpoints.
+        let mut bad = base();
+        bad.lifetime = [1.0, f32::INFINITY];
+        assert_eq!(bad.validate(), Err("particle/lifetime-endpoint-non-finite"));
+        // AN EXTREME FINITE SPAN: min −max at the f32 extremes —
+        // both endpoints finite and ordered, but max − min
+        // overflows to +inf, which the spawn draw would multiply
+        // by.
+        let mut bad = base();
+        bad.volume.min[1] = -f32::MAX;
+        bad.volume.max[1] = f32::MAX;
+        assert_eq!(
+            bad.validate(),
+            Err("particle/volume-span-non-finite"),
+            "the finite-pair span overflow"
+        );
+        assert!(
+            Emitter::new(bad).is_err(),
+            "the span refusal blocks construction"
+        );
+        // The same refusal at REPLACEMENT (set_volume validates
+        // exactly as construction).
+        let mut emitter = Emitter::new(base()).unwrap();
+        let mut infinite_volume = base().volume;
+        infinite_volume.min[0] = f32::INFINITY;
+        infinite_volume.max[0] = f32::INFINITY;
+        assert_eq!(
+            emitter.set_volume(infinite_volume),
+            Err("particle/volume-endpoint-non-finite"),
+            "the replacement path refuses infinities identically"
+        );
+        let mut overflowing_volume = base().volume;
+        overflowing_volume.min[2] = -f32::MAX;
+        overflowing_volume.max[2] = f32::MAX;
+        assert_eq!(
+            emitter.set_volume(overflowing_volume),
+            Err("particle/volume-span-non-finite"),
+            "the replacement path refuses the span overflow identically"
+        );
+        // The extreme finite span on the LIFETIME pair needs no
+        // gate of its own: the positivity and ordering gates bound
+        // the difference below the f32 maximum (a positive ordered
+        // pair cannot overflow its own subtraction) — asserted here
+        // so the asymmetry with the volume (whose min may be
+        // negative) stays a documented law, not an accident.
+        let mut wide = base();
+        wide.lifetime = [f32::MIN_POSITIVE, f32::MAX];
+        assert!(
+            wide.validate().is_ok(),
+            "a positive ordered lifetime pair's span is always finite (no gate needed)"
+        );
+        // A NaN still refuses through the ordering gates (the pinned
+        // reason, unchanged).
+        let mut bad = base();
+        bad.volume.min[1] = f32::NAN;
+        assert_eq!(bad.validate(), Err("particle/volume-min-above-max-y"));
+    }
+
+    /// THE TYPED DT REFUSAL (finding 17's deciding test): NaN,
+    /// negative, and infinite tick durations are refused at
+    /// admission with NO state advancement — the emitter's folded
+    /// state and its stream position are byte-identical before and
+    /// after the refused call (a NaN step once poisoned the
+    /// accumulator forever).
+    #[test]
+    fn tick_duration_refusals_advance_nothing() {
+        let dt = 1.0f32 / 60.0f32;
+        let mut emitter = Emitter::new(rain_like_campaign(0xBAD)).unwrap();
+        for _ in 0..60 {
+            emitter
+                .tick(dt)
+                .expect("the fixture dt is finite and nonnegative");
+        }
+        let mut before = Fingerprinter::new();
+        emitter.fold_state(&mut before);
+        let before_digest = before.finish();
+        let before_active = emitter.active_count();
+        for bad_dt in [f32::NAN, -dt, -1.0, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                emitter.tick(bad_dt),
+                Err("particle/tick-duration-non-finite-or-negative"),
+                "dt {bad_dt}: refused typed"
+            );
+            assert_eq!(
+                emitter.tick_observing_kill_deaths(bad_dt, |_| panic!("no observation")),
+                Err("particle/tick-duration-non-finite-or-negative"),
+                "dt {bad_dt}: the observing form refuses identically"
+            );
+        }
+        // NO STATE ADVANCEMENT: identical folded state, identical
+        // active count, and the next VALID tick produces exactly the
+        // report an uninterrupted campaign would have.
+        let mut after = Fingerprinter::new();
+        emitter.fold_state(&mut after);
+        assert_eq!(
+            before_digest,
+            after.finish(),
+            "the refused ticks left the pool untouched"
+        );
+        assert_eq!(before_active, emitter.active_count());
+        let mut control = Emitter::new(rain_like_campaign(0xBAD)).unwrap();
+        for _ in 0..60 {
+            control
+                .tick(dt)
+                .expect("the fixture dt is finite and nonnegative");
+        }
+        assert_eq!(
+            emitter.tick(dt).expect("the next valid dt admits"),
+            control.tick(dt).expect("the control's dt admits"),
+            "the stream and accumulator resume exactly where the refusals found them"
+        );
+        // Zero is legal (a paused clock): it admits, spawns nothing
+        // (rate × 0), kills nothing (life −= 0), and advances
+        // nothing.
+        let paused = emitter.tick(0.0).expect("zero dt is a paused clock");
+        assert_eq!(paused.spawned, 0);
+        assert_eq!(paused.deaths, 0);
+        assert_eq!(paused.active, emitter.active_count() as u32);
+    }
+
+    /// THE DEATH OBSERVATION AND THE CENSUS IDENTITIES (finding 16's
+    /// deciding tests, emitter side): a SATURATION tick with zero
+    /// admissions and refusals must leave an honest census — never
+    /// the retired downstream arithmetic that subtracted refusals
+    /// from admissions and underflowed (0 admitted − 1000 refused) —
+    /// and a MIXED tick (admissions and refusals together, with
+    /// deaths) holds the same identities. The identities, checked at
+    /// every tick from an initially empty pool:
+    /// `active_before + admitted == deaths + active` (per tick) and
+    /// `admitted == deaths + live` (cumulative), with
+    /// `attempted == admitted + refused` beside them.
+    #[test]
+    fn deaths_are_exposed_and_the_census_holds_at_saturation() {
+        let dt = 1.0f32 / 60.0f32;
+
+        // CAMPAIGN A — the saturating fill (the existing overflow
+        // fixture's shape): rate 100_000 caps the accumulator at
+        // 1_000 units/tick, lifetime 100 s (nobody dies). Tick 1:
+        // 1_000 admitted; tick 2: the last 24 slots admit beside 976
+        // refusals (the MIXED tick); tick 3 on: zero admissions,
+        // 1_000 refusals (the SATURATION tick — the exact shape the
+        // old layer arithmetic underflowed on).
+        let config = EmitterConfig {
+            volume: SpawnVolume {
+                min: [0.0; 3],
+                max: [0.0; 3],
+            },
+            rate: 100_000.0,
+            base_velocity: [0.0; 3],
+            velocity_jitter: [0.0; 3],
+            lifetime: [100.0, 100.0],
+            gravity: 0.0,
+            drag_factor: 1.0,
+            kill_y: None,
+            seed: 0x5A7,
+        };
+        let mut emitter = Emitter::new(config).expect("the config validates");
+        let mut total_admitted: u64 = 0;
+        let mut total_refused: u64 = 0;
+        let mut total_deaths: u64 = 0;
+        let mut saw_saturation = false;
+        let mut saw_mixed = false;
+        for tick in 1..=4u32 {
+            let report = emitter
+                .tick(dt)
+                .expect("the fixture dt is finite and nonnegative");
+            // THE PER-TICK IDENTITY: active_before + admitted ==
+            // deaths + active (the layer's census arithmetic, now
+            // supplied by the emitter's own death count — computing
+            // deaths as `spawned − refused` on the saturation tick
+            // is the retired 0 − 1000 underflow).
+            let active_before = total_admitted - total_deaths;
+            assert_eq!(
+                u64::from(report.active + report.deaths),
+                active_before + u64::from(report.spawned),
+                "tick {tick}: active_before + admitted == deaths + active"
+            );
+            if report.spawned == 0 {
+                let dropped = report.overflow.expect("a full pool refuses").dropped;
+                assert!(
+                    dropped > 0,
+                    "tick {tick}: the saturation shape (zero admissions, typed refusals)"
+                );
+                saw_saturation = true;
+            } else if report.overflow.is_some_and(|o| o.dropped > 0) {
+                saw_mixed = true;
+            }
+            total_admitted += u64::from(report.spawned);
+            total_refused += u64::from(report.overflow.map(|o| o.dropped).unwrap_or(0));
+            total_deaths += u64::from(report.deaths);
+            assert_eq!(
+                total_admitted,
+                total_deaths + emitter.active_count() as u64,
+                "tick {tick}: admitted == deaths + live (an initially empty pool)"
+            );
+        }
+        assert!(
+            saw_saturation,
+            "the campaign reached the full-pool zero-admission tick"
+        );
+        assert!(saw_mixed, "the fill ramp crossed a mixed tick");
+        assert!(total_refused > 0, "refusals were counted, never silent");
+        assert_eq!(emitter.active_count(), PARTICLE_POOL_BOUND);
+
+        // CAMPAIGN B — the churning drain (deaths alongside
+        // admissions and refusals): the same rate against a lifetime
+        // in [0.03, 0.05] s (~2-3 ticks) — the cohort dies while the
+        // pool refills, so ticks mix admitted, refused, and died
+        // counts, and the identities hold with nonzero deaths on
+        // both sides.
+        let mut churn_config = config;
+        churn_config.lifetime = [0.03, 0.05];
+        churn_config.seed = 0x5A8;
+        let mut churning = Emitter::new(churn_config).expect("the config validates");
+        let mut churn_admitted: u64 = 0;
+        let mut churn_deaths: u64 = 0;
+        let mut churn_refused: u64 = 0;
+        for tick in 1..=12u32 {
+            let report = churning
+                .tick(dt)
+                .expect("the fixture dt is finite and nonnegative");
+            let active_before = churn_admitted - churn_deaths;
+            assert_eq!(
+                u64::from(report.active + report.deaths),
+                active_before + u64::from(report.spawned),
+                "churn tick {tick}: active_before + admitted == deaths + active"
+            );
+            churn_admitted += u64::from(report.spawned);
+            churn_deaths += u64::from(report.deaths);
+            churn_refused += u64::from(report.overflow.map(|o| o.dropped).unwrap_or(0));
+            assert_eq!(
+                churn_admitted,
+                churn_deaths + churning.active_count() as u64,
+                "churn tick {tick}: admitted == deaths + live"
+            );
+        }
+        assert!(
+            churn_deaths > 0,
+            "the churning campaign's deaths are exposed ({churn_deaths} total)"
+        );
+        assert!(
+            churn_refused > 0,
+            "the churning campaign's fill ramp refused above the pool ({churn_refused} \
+             total) — the mixed shape, counted never silent"
+        );
     }
 }

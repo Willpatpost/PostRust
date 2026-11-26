@@ -148,6 +148,10 @@ pub struct RippleField {
     /// report must carry them across the boundary; cleared by
     /// tick).
     refused_since_tick: u32,
+    /// Cumulative INVALID LANDING observations (finding 17): kill
+    /// deaths refused at [`Self::observe_death`] for a non-finite
+    /// XZ center — counted, never silently dropped.
+    invalid_landings: u64,
 }
 
 impl RipplePolicy {
@@ -195,6 +199,7 @@ impl RippleField {
             expired: 0,
             refused_total: 0,
             refused_since_tick: 0,
+            invalid_landings: 0,
         })
     }
 
@@ -229,6 +234,18 @@ impl RippleField {
         self.refused_total
     }
 
+    /// Cumulative INVALID LANDING observations (finding 17's
+    /// correction — the observable refusal for invalid landing
+    /// coordinates in the death observer): kill deaths whose
+    /// reported XZ center was non-finite. Such an observation is
+    /// REFUSED whole — no ring, no decimation advance, no other
+    /// state change — and counted here (fail-visible; the count is
+    /// zero on every finite-data path, and the death path now
+    /// refuses exactly what [`Self::author_ring`] always has).
+    pub fn invalid_landings(&self) -> u64 {
+        self.invalid_landings
+    }
+
     /// Back to the constructed state: the pool empties, the census
     /// counters and the decimation counter clear — the determinism
     /// proof's tool (drive, reset, replay: byte-identical).
@@ -240,6 +257,7 @@ impl RippleField {
         self.expired = 0;
         self.refused_total = 0;
         self.refused_since_tick = 0;
+        self.invalid_landings = 0;
     }
 
     /// THE SPAWN PATH (the observe order: deaths arrive in the
@@ -255,7 +273,22 @@ impl RippleField {
     /// AT the world receiver, so no drift bound is needed). A full
     /// pool REFUSES typed (the ring is NOT spawned, the state is
     /// otherwise untouched) — never a silent drop.
+    ///
+    /// THE INVALID-LANDING REFUSAL (finding 17's correction): a
+    /// non-finite XZ center (the ring's only spatial inputs — Y is
+    /// the plane by definition) is refused OBSERVABLY — the
+    /// [`Self::invalid_landings`] counter increments, nothing else
+    /// in the state advances (no decimation step, no ring), and the
+    /// call returns `None` — the same finite-data law
+    /// [`Self::author_ring`] has always enforced, now on the death
+    /// path too.
     pub fn observe_death(&mut self, position: [f32; 3]) -> Option<RippleSpawnOverflow> {
+        // The invalid-landing refusal, first and whole (no state
+        // advancement on refusal).
+        if !position[0].is_finite() || !position[2].is_finite() {
+            self.invalid_landings += 1;
+            return None;
+        }
         self.deaths_since_ring += 1;
         if self.deaths_since_ring < self.policy.decimation {
             return None; // counted, not yet a ring
@@ -334,7 +367,18 @@ impl RippleField {
     /// observed between ticks), `active` is the post-compaction
     /// count. Zero allocation; the fixed-size array is walked in
     /// place.
-    pub fn tick(&mut self, dt: f32) -> RippleTickReport {
+    ///
+    /// THE TYPED DT REFUSAL (finding 17's correction): a non-finite
+    /// or NEGATIVE `dt` is refused at admission —
+    /// `Err("ripple/tick-duration-non-finite-or-negative")` — with
+    /// NO state advancement (a NaN step once aged rings by NaN,
+    /// making them immortal; a negative step would un-age them).
+    /// Zero is legal (a paused clock).
+    pub fn tick(&mut self, dt: f32) -> Result<RippleTickReport, &'static str> {
+        // DT ADMISSION (first — before any state is touched).
+        if !dt.is_finite() || dt < 0.0 {
+            return Err("ripple/tick-duration-non-finite-or-negative");
+        }
         // 1. Age sweep, pool order.
         for ring in &mut self.rings[..self.active] {
             ring.age += dt;
@@ -357,10 +401,10 @@ impl RippleField {
         //    boundary, then clears).
         let refused = self.refused_since_tick;
         self.refused_since_tick = 0;
-        RippleTickReport {
+        Ok(RippleTickReport {
             refused,
             active: self.active as u32,
-        }
+        })
     }
 
     /// Folds every ACTIVE ring's `center[0].to_bits()`,
@@ -573,7 +617,9 @@ mod tests {
         // ring's age after n ticks is the SAME f32 accumulation.
         let mut replica = 0.0f32;
         for t in 1..=ticks_to_death {
-            let report = field.tick(dt);
+            let report = field
+                .tick(dt)
+                .expect("the fixture dt is finite and nonnegative");
             replica += dt;
             if t < ticks_to_death {
                 assert_eq!(report.active, 1, "tick {t}: still alive");
@@ -627,7 +673,9 @@ mod tests {
         );
         // One tick: the age is the exact f32 expression the sweep
         // performs.
-        let report = field.tick(dt);
+        let report = field
+            .tick(dt)
+            .expect("the fixture dt is finite and nonnegative");
         assert_eq!(report.active, 1);
         assert_eq!(report.refused, 0);
         assert_eq!(field.rings()[0].age, 0.0f32 + dt, "one tick of aging");
@@ -684,7 +732,9 @@ mod tests {
             "authoring observes no death (the private counter's white-box read)"
         );
         // One tick ages the authored rings like any other.
-        let report = field.tick(dt);
+        let report = field
+            .tick(dt)
+            .expect("the fixture dt is finite and nonnegative");
         assert_eq!(report.active, 2);
         assert_eq!(report.refused, 0);
         assert_eq!(field.rings()[0].age, 0.25f32 + dt, "the aged authored ring");
@@ -726,7 +776,9 @@ mod tests {
             }),
             Ok(None)
         );
-        let report = field.tick(dt);
+        let report = field
+            .tick(dt)
+            .expect("the fixture dt is finite and nonnegative");
         assert_eq!(report.active, 2, "the at-lifetime ring expired");
         assert_eq!(field.expired(), 1);
         assert_eq!(
@@ -756,7 +808,9 @@ mod tests {
             "the refusal is typed"
         );
         assert_eq!(field.refused_total(), 1, "counted, never silently dropped");
-        let report = field.tick(dt);
+        let report = field
+            .tick(dt)
+            .expect("the fixture dt is finite and nonnegative");
         assert_eq!(report.refused, 1, "the report carries the authored refusal");
         assert_eq!(report.active, RIPPLE_POOL_BOUND as u32);
     }
@@ -875,10 +929,14 @@ mod tests {
         );
         // The report carries the refusal across the observe/tick
         // boundary, then clears.
-        let report = field.tick(1.0 / 60.0);
+        let report = field
+            .tick(1.0 / 60.0)
+            .expect("the fixture dt is finite and nonnegative");
         assert_eq!(report.refused, 1, "the report carries the refusal");
         assert_eq!(report.active, RIPPLE_POOL_BOUND as u32);
-        let report = field.tick(1.0 / 60.0);
+        let report = field
+            .tick(1.0 / 60.0)
+            .expect("the fixture dt is finite and nonnegative");
         assert_eq!(report.refused, 0, "cleared by the previous tick");
         assert_eq!(report.active, RIPPLE_POOL_BOUND as u32);
         assert_eq!(
@@ -915,7 +973,9 @@ mod tests {
             // The pre-tick prefix (a spawn appends — trivially
             // order-preserving); the tick compacts.
             let previous: Vec<[f32; 2]> = field.rings().iter().map(|r| r.center).collect();
-            let report = field.tick(dt);
+            let report = field
+                .tick(dt)
+                .expect("the fixture dt is finite and nonnegative");
             let current: Vec<[f32; 2]> = field.rings().iter().map(|r| r.center).collect();
             let mut scan = 0usize;
             for center in &current {
@@ -974,7 +1034,9 @@ mod tests {
                     "step {step}: the pool has room"
                 );
             }
-            let report = field.tick(dt);
+            let report = field
+                .tick(dt)
+                .expect("the fixture dt is finite and nonnegative");
             assert_eq!(
                 report.refused, 0,
                 "step {step}: the happy path refuses nothing"
@@ -1014,7 +1076,9 @@ mod tests {
             );
         }
         // The report carries all three refusals in one tick.
-        let report = field.tick(dt);
+        let report = field
+            .tick(dt)
+            .expect("the fixture dt is finite and nonnegative");
         assert_eq!(
             report.refused, 3,
             "the three refusals cross the boundary together"
@@ -1023,7 +1087,9 @@ mod tests {
         // Phase 3 — the full cohort expires; the law holds at every
         // tick to the empty end.
         for step in 0..24u32 {
-            let report = field.tick(dt);
+            let report = field
+                .tick(dt)
+                .expect("the fixture dt is finite and nonnegative");
             let attempts = field.spawned() + field.refused_total();
             let outcomes = field.expired() + field.active_count() as u64 + field.refused_total();
             assert_eq!(attempts, outcomes, "expiry step {step}: the law holds");
@@ -1061,20 +1127,28 @@ mod tests {
         }
 
         /// One tick of the pinned composition order. Returns both
-        /// reports (the caller compares them across runs).
+        /// reports (the caller compares them across runs); both dt
+        /// admissions are unwrapped here — the campaign's dt is the
+        /// demo's constant.
         fn step(&mut self, dt: f32) -> (TickReport, RippleTickReport) {
             let kill_deaths = &mut self.kill_deaths;
             let field = &mut self.field;
-            let tick_report = self.emitter.tick_observing_kill_deaths(dt, |position| {
-                *kill_deaths += 1;
-                let overflow = field.observe_death(position);
-                assert!(
-                    overflow.is_none(),
-                    "the demo campaign never fills the ripple pool (~3.7 live rings at \
-                     steady state, 8.5x headroom)"
-                );
-            });
-            let ripple_report = self.field.tick(dt);
+            let tick_report = self
+                .emitter
+                .tick_observing_kill_deaths(dt, |position| {
+                    *kill_deaths += 1;
+                    let overflow = field.observe_death(position);
+                    assert!(
+                        overflow.is_none(),
+                        "the demo campaign never fills the ripple pool (~3.7 live rings at \
+                         steady state, 8.5x headroom)"
+                    );
+                })
+                .expect("the campaign dt is finite and nonnegative");
+            let ripple_report = self
+                .field
+                .tick(dt)
+                .expect("the campaign dt is finite and nonnegative");
             (tick_report, ripple_report)
         }
 
@@ -1260,5 +1334,111 @@ mod tests {
             run.kill_deaths, control.kill_deaths,
             "replay == fresh census"
         );
+    }
+
+    /// THE TYPED DT REFUSAL (finding 17's deciding test): NaN,
+    /// negative, and infinite tick durations are refused at
+    /// admission with NO state advancement — a NaN step once aged
+    /// every ring by NaN (immortal rings on every future expiry
+    /// test), a negative step would un-age them.
+    #[test]
+    fn tick_duration_refusals_advance_nothing() {
+        let dt = 1.0f32 / 60.0f32;
+        let mut policy = ripple_policy();
+        policy.lifetime = 10.0; // nothing expires inside the window
+        let mut field = RippleField::new(policy).expect("the policy validates");
+        assert_eq!(field.observe_death([1.0, 0.0, 2.0]), None);
+        assert_eq!(field.observe_death([3.0, 0.0, 4.0]), None);
+        field
+            .tick(dt)
+            .expect("the fixture dt is finite and nonnegative");
+        let mut before_hash = Fingerprinter::new();
+        field.fold_state(&mut before_hash);
+        let before_digest = before_hash.finish();
+        for bad_dt in [f32::NAN, -dt, -1.0, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                field.tick(bad_dt),
+                Err("ripple/tick-duration-non-finite-or-negative"),
+                "dt {bad_dt}: refused typed"
+            );
+        }
+        // NO STATE ADVANCEMENT: the folded ring state is identical,
+        // and the next VALID tick ages the rings exactly one step
+        // (matching a control that never saw the refusals).
+        let mut after = Fingerprinter::new();
+        field.fold_state(&mut after);
+        assert_eq!(
+            before_digest,
+            after.finish(),
+            "the refused ticks left the rings untouched"
+        );
+        let mut control = RippleField::new(policy).expect("the policy validates");
+        assert_eq!(control.observe_death([1.0, 0.0, 2.0]), None);
+        assert_eq!(control.observe_death([3.0, 0.0, 4.0]), None);
+        control
+            .tick(dt)
+            .expect("the fixture dt is finite and nonnegative");
+        assert_eq!(
+            field.tick(dt).expect("the next valid dt admits"),
+            control.tick(dt).expect("the control's dt admits"),
+            "the ages resume exactly where the refusals found them"
+        );
+        // Zero is legal (a paused clock): nothing ages, nothing
+        // expires, the report is honest.
+        let paused = field.tick(0.0).expect("zero dt is a paused clock");
+        assert_eq!(paused.active, field.active_count() as u32);
+        assert_eq!(paused.refused, 0);
+    }
+
+    /// THE INVALID-LANDING REFUSAL (finding 17's deciding test): a
+    /// nonfinite XZ center in the death observer is refused
+    /// OBSERVABLY — the invalid_landings counter increments, no ring
+    /// is stored, the decimation counter does not advance (no state
+    /// advancement on refusal), and a subsequent VALID death takes
+    /// exactly the path it would have taken without the refusal —
+    /// the finite-data law author_ring always enforced, now on the
+    /// death path.
+    #[test]
+    fn observe_death_refuses_nonfinite_landings_observably() {
+        let mut field = RippleField::new(ripple_policy()).expect("the policy validates");
+        // The baseline: decimation 1, one valid death spawns a ring.
+        assert_eq!(field.observe_death([1.0, 0.0, 2.0]), None);
+        assert_eq!(field.active_count(), 1);
+        // The refusals, each counted: NaN and both infinities, on
+        // either XZ lane (Y is the plane by definition and never
+        // consulted).
+        for bad in [
+            [f32::NAN, 0.0, 2.0],
+            [1.0, 0.0, f32::NAN],
+            [f32::INFINITY, 0.0, 2.0],
+            [1.0, 0.0, f32::NEG_INFINITY],
+        ] {
+            assert_eq!(
+                field.observe_death(bad),
+                None,
+                "the invalid landing {bad:?} refuses the ring"
+            );
+        }
+        assert_eq!(
+            field.invalid_landings(),
+            4,
+            "every invalid landing is counted, never silently dropped"
+        );
+        assert_eq!(field.active_count(), 1, "no ring was stored");
+        assert_eq!(field.spawned(), 1, "the census did not move");
+        // NO STATE ADVANCEMENT: the decimation counter is untouched
+        // — a subsequent VALID death spawns exactly as it would have
+        // without the refusals (the counter never saw them).
+        assert_eq!(field.observe_death([5.0, 0.0, 6.0]), None);
+        assert_eq!(field.active_count(), 2, "the valid death spawned");
+        assert_eq!(field.spawned(), 2);
+        // The finite baseline holds: zero invalid landings on every
+        // finite-data path (the control).
+        let mut control = RippleField::new(ripple_policy()).expect("the policy validates");
+        assert_eq!(control.observe_death([1.0, 0.0, 2.0]), None);
+        assert_eq!(control.invalid_landings(), 0);
+        // Reset clears the counter with the rest of the census.
+        field.reset();
+        assert_eq!(field.invalid_landings(), 0);
     }
 }

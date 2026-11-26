@@ -168,6 +168,7 @@ const IDLE_RULE: Rule = Rule {
     need: None,
     base_priority: 0,
     applies_below: 0.0,
+    witness: None,
 };
 
 /// The behavior scale world.
@@ -563,7 +564,8 @@ fn run_witness_cost() {
                         &rules,
                         &mut rng,
                         &rates,
-                    );
+                    )
+                    .expect("the bench's authored table validates at admission");
                     rngs[idx] = rng;
                     retain_trace(&mut memories[idx], trace, budget);
                 }
@@ -610,18 +612,116 @@ fn run_activation_crossover() {
     println!("  pod results, observational (never CI thresholds, never physical-rig claims)");
     println!();
 
-    // The dormancy span: reactivation at T1 = k·600 with EXACTLY k
-    // missed occurrences per entry per NPC (the factory's authored
-    // arithmetic) — 125 NPCs × 2 entries × k pending events.
+    // THE k SEMANTICS (finding 8's correction, documented and
+    // asserted): k is the missed occurrences PER ENTRY over the
+    // dormancy span (0, k·600] — 2k per NPC at this factory's two
+    // entries per NPC, i.e. 250·k pending events across the 125-NPC
+    // population. The old closing summary mislabeled k itself as
+    // events per NPC; every print below names the unit.
+    //
+    // The dormancy span: reactivation at T1 = k·600 + 1 with EXACTLY
+    // k missed occurrences per entry per NPC (the factory's authored
+    // arithmetic, asserted below on the real `next_occurrence`
+    // machinery) — 125 NPCs × 2 entries × k pending events.
     let k_values = [1u64, 2, 4, 8, 16, 32, 64];
     const REPS: usize = 64;
+
+    // The authored arithmetic, asserted (the k-semantics gate): entry
+    // 0's occurrences in (0, k·600] are exactly 600, 1200, …, k·600;
+    // entry 1's exactly 300, 900, …, 300+(k−1)·600 = k·600−300 — k
+    // each, and the next occurrence past the span is the re-arm both
+    // strategies arm (the due equality the section enforces).
+    for &k in &k_values {
+        let schedules = crossover_schedules();
+        let entry0 = &schedules[0].entries[0];
+        let entry1 = &schedules[0].entries[1];
+        for j in 1..=k {
+            assert_eq!(
+                entry0.next_occurrence(Tick((j - 1) * 600)),
+                Some(Tick(j * 600)),
+                "k {k}: entry 0's j-th occurrence is j·600 (k is occurrences PER ENTRY)"
+            );
+            assert_eq!(
+                entry1.next_occurrence(Tick(300 + (j - 1) * 600)),
+                Some(Tick(300 + j * 600)),
+                "k {k}: entry 1's j-th occurrence is 300+(j−1)·600 (k is occurrences \
+                 PER ENTRY)"
+            );
+        }
+        assert_eq!(
+            entry0.next_occurrence(Tick(k * 600)),
+            Some(Tick((k + 1) * 600)),
+            "k {k}: entry 0's post-span re-arm due"
+        );
+        assert_eq!(
+            entry1.next_occurrence(Tick(300 + (k - 1) * 600)),
+            Some(Tick(300 + k * 600)),
+            "k {k}: entry 1's post-span re-arm due"
+        );
+    }
+
+    /// One strategy's post-activation outcome, for the cross-strategy
+    /// comparison (finding 8: the differing outcomes are REPORTED
+    /// beside the two costs — the strategies are deliberately
+    /// different reconstructors, never silently equated).
+    struct ActivationOutcome {
+        /// Live events on the queue after the activation window.
+        pending: u64,
+        /// Executions the world performed (replay: the whole missed
+        /// burst; synthesis: none — its evaluations are loop-side).
+        wake_executions: u64,
+        /// Per-NPC needs bits, folded in population order.
+        needs_digest: u64,
+        /// Per-NPC current activity (rule + kind + payload), folded
+        /// in population order.
+        activity_digest: u64,
+    }
+
+    /// Folds a world's routine lane into the outcome shape.
+    fn world_outcome(world: &BehaviorScaleWorld, pending: u64) -> ActivationOutcome {
+        let mut needs = Fingerprinter::new();
+        let mut activities = Fingerprinter::new();
+        for i in 0..world.schedules.len() {
+            for need in world.routines[i].needs {
+                needs.write_u32(need.to_bits());
+            }
+            let current = world.routines[i].current;
+            activities.write_u32(current.rule);
+            match current.kind {
+                ActivityKind::Idle => activities.write_u8(0),
+                ActivityKind::MoveTo { route, waypoint } => {
+                    activities.write_u8(1);
+                    activities.write_u32(route);
+                    activities.write_u32(waypoint);
+                }
+                ActivityKind::Fulfill { commitment } => {
+                    activities.write_u8(2);
+                    activities.write_u32(commitment);
+                }
+                ActivityKind::React { class, subject } => {
+                    activities.write_u8(3);
+                    activities.write_u32(class);
+                    activities.write_u32(subject.0);
+                }
+            }
+        }
+        ActivationOutcome {
+            pending,
+            wake_executions: world.wake_executions,
+            needs_digest: needs.finish(),
+            activity_digest: activities.finish(),
+        }
+    }
 
     /// The REPLAY policy: the missed occurrences re-execute through
     /// the real queue. The spine's clock advances QUIETLY to T1 first
     /// (nothing armed — the dormancy), then the k·250 past-due events
     /// arm and drain: the timed window is the arm + the late
     /// execution burst, the E-09 replay cost (∝ pending events).
-    fn replay_once(k: u64) -> u128 {
+    /// Returns the PAIRED end-to-end sample (the whole activation as
+    /// one duration) and the post-activation outcome for the
+    /// cross-strategy comparison.
+    fn replay_once(k: u64) -> (u128, ActivationOutcome) {
         let world = BehaviorScaleWorld::new(crossover_schedules());
         let mut spine = Spine::with_reservation(world, BUDGET, RESERVE);
         // The reactivation tick is STRICTLY past every missed
@@ -681,27 +781,71 @@ fn run_activation_crossover() {
             250 * k,
             "every replay event arrives late (past-due arming) at k {k}"
         );
+        // THE QUEUE-CONSERVATION ASSERTION on the paired campaigns
+        // (finding 8's correction): every replayed occurrence
+        // re-armed exactly once beyond the window — k live re-arms
+        // per entry (250·k total, the k-fold duplicate of the 250
+        // dues synthesis arms).
         assert_eq!(
             spine.pending_count() as u64,
             250 * k,
             "every replayed occurrence re-armed exactly once beyond the window at k {k}"
         );
-        elapsed.as_nanos()
+        assert_eq!(
+            spine.pending_count() as u64,
+            k * 250,
+            "k is occurrences per entry: 250 keys × k re-arms at k {k}"
+        );
+        // THE CROSS-STRATEGY DUE EQUALITY (finding 8's correction):
+        // every replay re-arm lands at the SAME due the synthesis
+        // policy arms — `next_occurrence` at the window's end tick
+        // equals `next_occurrence` at T1 (the drain window stays
+        // inside the 299-tick inter-occurrence gap, asserted above),
+        // so both strategies' post-activation calendars agree per
+        // NPC per entry on (wake key, due). What differs — and is
+        // reported beside the costs below, never equated — is the
+        // COUNT: replay holds k re-arms per entry at that due,
+        // synthesis one.
+        let schedules = crossover_schedules();
+        let window_end = k * 600 + 1 + drain;
+        for schedule in &schedules {
+            assert_eq!(
+                schedule.entries[0].next_occurrence(Tick(window_end)),
+                Some(Tick((k + 1) * 600)),
+                "k {k}: entry 0's post-window re-arm due equals synthesis's armed due"
+            );
+            assert_eq!(
+                schedule.entries[1].next_occurrence(Tick(window_end)),
+                Some(Tick(300 + k * 600)),
+                "k {k}: entry 1's post-window re-arm due equals synthesis's armed due"
+            );
+        }
+        let outcome = world_outcome(spine.world(), spine.pending_count() as u64);
+        (elapsed.as_nanos(), outcome)
     }
 
     /// The SYNTHESIS policy (the production activation shape): per
     /// NPC, ONE `evaluate_wake` at T1 (the single lazy decay over the
     /// whole dormancy span — THE synthesis, through the REAL
     /// function) plus each entry's `next_occurrence` re-arm jump;
-    /// then the 250 arms on a PRE-CONSTRUCTED spine. Returns the
-    /// per-NPC-loop nanos and the arm-loop nanos separately, and the
-    /// authored re-arm dues for the double-run comparison.
-    fn synthesis_once(k: u64) -> (u128, u128, Vec<(Tick, u64)>, u64) {
+    /// then the 250 arms on a PRE-CONSTRUCTED spine. THE PAIRED
+    /// END-TO-END SAMPLE (finding 8's correction): the whole
+    /// activation — loop AND arm — is ONE timed sample, so the
+    /// percentiles below are percentiles of per-run sums, never a
+    /// sum of separately-computed component percentiles (a sum of
+    /// p50s is not the p50 of sums). The component timings are
+    /// still returned for the decomposition line, reported as
+    /// components only. Also returns the authored re-arm dues (the
+    /// double-run determinism proof) and the synthesis-side outcome
+    /// (the loop's routine lanes) for the cross-strategy comparison.
+    fn synthesis_once(k: u64) -> (u128, u128, u128, Vec<(Tick, u64)>, ActivationOutcome) {
+        let total_started = std::time::Instant::now();
         let schedules = crossover_schedules();
         let rates = [0.001; MAX_NEEDS];
         let rules = [IDLE_RULE];
         let mut arms: Vec<(Tick, u64)> = Vec::with_capacity(250);
         let mut needs_digest = Fingerprinter::new();
+        let mut activity_digest = Fingerprinter::new();
         let loop_started = std::time::Instant::now();
         for (i, schedule) in schedules.iter().enumerate() {
             let mut rng = NpcRng::for_npc(NpcId(1000 + i as u32));
@@ -727,6 +871,25 @@ fn run_activation_crossover() {
             };
             for need in outcome.routine_after.needs {
                 needs_digest.write_u32(need.to_bits());
+            }
+            let current = outcome.routine_after.current;
+            activity_digest.write_u32(current.rule);
+            match current.kind {
+                ActivityKind::Idle => activity_digest.write_u8(0),
+                ActivityKind::MoveTo { route, waypoint } => {
+                    activity_digest.write_u8(1);
+                    activity_digest.write_u32(route);
+                    activity_digest.write_u32(waypoint);
+                }
+                ActivityKind::Fulfill { commitment } => {
+                    activity_digest.write_u8(2);
+                    activity_digest.write_u32(commitment);
+                }
+                ActivityKind::React { class, subject } => {
+                    activity_digest.write_u8(3);
+                    activity_digest.write_u32(class);
+                    activity_digest.write_u32(subject.0);
+                }
             }
             let next0 = schedule.entries[0].next_occurrence(Tick(k * 600 + 1));
             let next1 = schedule.entries[1].next_occurrence(Tick(k * 600 + 1));
@@ -772,64 +935,109 @@ fn run_activation_crossover() {
                 .expect("arming is legal");
         }
         let arm_nanos = arm_started.elapsed().as_nanos();
-        (loop_nanos, arm_nanos, arms, needs_digest.finish())
+        let total_nanos = total_started.elapsed().as_nanos();
+        // THE QUEUE-CONSERVATION ASSERTION on the paired campaign
+        // (finding 8's correction): the synthesis arms 250 future
+        // commitments — one live chain per entry, nothing executed
+        // inside the activation window (its evaluations are
+        // loop-side, not queue-side).
+        assert_eq!(
+            spine.pending_count(),
+            250,
+            "synthesis arms exactly one live chain per entry at k {k}"
+        );
+        assert_eq!(
+            spine.stats().executed,
+            0,
+            "the synthesis window executes nothing (the evaluations are loop-side)"
+        );
+        let outcome = ActivationOutcome {
+            pending: spine.pending_count() as u64,
+            wake_executions: spine.world().wake_executions,
+            needs_digest: needs_digest.finish(),
+            activity_digest: activity_digest.finish(),
+        };
+        (total_nanos, loop_nanos, arm_nanos, arms, outcome)
     }
 
     let mut crossover_k: Option<u64> = None;
     for &k in &k_values {
         // REPLAY: REPS repetitions into TimingSamples (fresh state
-        // per repetition, constructed outside the timed window).
+        // per repetition, constructed outside the timed window) —
+        // each repetition ONE paired end-to-end sample (arm + drain
+        // together).
         let mut replay_samples = engine_core::timing::TimingSamples::default();
-        for _ in 0..REPS {
-            replay_samples.record(std::time::Duration::from_nanos(replay_once(k) as u64));
+        let mut replay_outcome: Option<ActivationOutcome> = None;
+        for rep in 0..REPS {
+            let (nanos, outcome) = replay_once(k);
+            replay_samples.record(std::time::Duration::from_nanos(nanos as u64));
+            if rep == 0 {
+                replay_outcome = Some(outcome);
+            }
         }
+        let replay_outcome = replay_outcome.expect("rep 0 ran");
 
-        // SYNTHESIS: the per-NPC loop and the arm loop measured
-        // separately, REPS repetitions each.
+        // SYNTHESIS: REPS repetitions, each ONE paired end-to-end
+        // sample (the per-NPC loop AND the arm loop timed together —
+        // finding 8's correction: the percentiles below are
+        // percentiles of per-run sums). The component timings are
+        // recorded separately for the decomposition line only.
+        let mut synth_samples = engine_core::timing::TimingSamples::default();
         let mut loop_samples = engine_core::timing::TimingSamples::default();
         let mut arm_samples = engine_core::timing::TimingSamples::default();
         let mut first_arms: Option<Vec<(Tick, u64)>> = None;
-        let mut first_needs: Option<u64> = None;
+        let mut first_outcome: Option<ActivationOutcome> = None;
         for rep in 0..REPS {
-            let (loop_nanos, arm_nanos, arms, needs) = synthesis_once(k);
+            let (total_nanos, loop_nanos, arm_nanos, arms, outcome) = synthesis_once(k);
+            synth_samples.record(std::time::Duration::from_nanos(total_nanos as u64));
             loop_samples.record(std::time::Duration::from_nanos(loop_nanos as u64));
             arm_samples.record(std::time::Duration::from_nanos(arm_nanos as u64));
             if rep == 0 {
                 first_arms = Some(arms);
-                first_needs = Some(needs);
+                first_outcome = Some(outcome);
             } else if rep == 1 {
-                // DOUBLE-RUN identity: the decayed needs digest and
-                // the re-arm dues are byte-identical across fresh
-                // constructions.
+                // DOUBLE-RUN DETERMINISM (not an equivalence claim —
+                // finding 8's correction: the old gate framed this
+                // synthesis-vs-synthesis comparison as the
+                // strategies' equivalence; it is only each policy's
+                // own determinism, and the CROSS-strategy comparison
+                // is reported below): the re-arm dues and the
+                // routine lanes are byte-identical across fresh
+                // constructions of the same policy.
                 assert_eq!(
                     first_arms.as_ref().expect("rep 0 ran"),
                     &arms,
                     "synthesis re-arm dues identical across runs at k {k}"
                 );
                 assert_eq!(
-                    first_needs.expect("rep 0 ran"),
-                    needs,
+                    first_outcome.as_ref().expect("rep 0 ran").needs_digest,
+                    outcome.needs_digest,
                     "synthesis needs digest identical across runs at k {k}"
                 );
             }
         }
+        let synth_outcome = first_outcome.expect("rep 0 ran");
 
         let replay_p50 = replay_samples.percentile_ms(0.50);
         let replay_p99 = replay_samples.percentile_ms(0.99);
+        // THE PERCENTILE-OF-SUMS (finding 8's correction): the
+        // synthesis p50/p99 are percentiles over the paired
+        // per-run totals — never loop_p50 + arm_p50 (a sum of
+        // component percentiles is not the percentile of sums).
+        let synth_p50 = synth_samples.percentile_ms(0.50);
+        let synth_p99 = synth_samples.percentile_ms(0.99);
         let loop_p50 = loop_samples.percentile_ms(0.50);
-        let loop_p99 = loop_samples.percentile_ms(0.99);
         let arm_p50 = arm_samples.percentile_ms(0.50);
-        let arm_p99 = arm_samples.percentile_ms(0.99);
-        let synth_p50 = loop_p50 + arm_p50;
-        let synth_p99 = loop_p99 + arm_p99;
         let pending = 250 * k;
 
         println!(
-            "activation cell: k {} ({} pending events, 125 NPCs × 2 entries)",
-            k, pending
+            "activation cell: k {} ({} missed occurrences PER ENTRY — {} pending events, \
+             125 NPCs × 2 entries × k)",
+            k, k, pending
         );
         println!(
-            "  replay p50/p99 {:.3}/{:.3} ms per activation ({} reps, {} events executed + {} late arrivals asserted)",
+            "  replay p50/p99 {:.3}/{:.3} ms per activation ({} reps, {} events executed + \
+             {} late arrivals asserted)",
             replay_p50,
             replay_p99,
             REPS,
@@ -837,13 +1045,50 @@ fn run_activation_crossover() {
             250 * k
         );
         println!(
-            "  synthesis p50/p99 {:.3}/{:.3} ms per activation (per-NPC loop {:.3}/{:.3} + arm loop {:.3}/{:.3}, {} reps)",
-            synth_p50, synth_p99, loop_p50, loop_p99, arm_p50, arm_p99, REPS
+            "  synthesis p50/p99 {:.3}/{:.3} ms per activation — percentiles of PAIRED \
+             per-run totals ({} reps; component medians for decomposition only: per-NPC \
+             loop {:.3}, arm loop {:.3})",
+            synth_p50, synth_p99, REPS, loop_p50, arm_p50
+        );
+        // THE CROSS-STRATEGY COMPARISON, reported beside the two
+        // costs (finding 8's correction — the documented-approximation
+        // branch: the two policies are deliberately DIFFERENT
+        // reconstructors, so their outcomes are reported, never
+        // equated). The structural equalities that DO hold are
+        // asserted inside the campaigns above: equal wake-key
+        // coverage (every NPC × entry live in both) and equal due
+        // ticks per entry (both re-arm at (k+1)·600 and 300+k·600).
+        // The differences, with their causes:
+        // - LIVE-CHAIN COUNT: replay leaves 250·k pending (k honest
+        //   re-arms per entry — one per replayed occurrence, all at
+        //   the same due), synthesis 250 (one per entry).
+        // - EXECUTIONS: replay re-executes every missed occurrence
+        //   (250·k evaluations, k per entry); synthesis performs ONE
+        //   evaluation per NPC (the production activation shape:
+        //   the lazy-decay jump over the whole span) — the routine
+        //   lanes and stream differ BY DESIGN.
+        println!(
+            "  post-activation queues: replay {} live (k re-arms per entry at the same \
+             dues), synthesis {} live (one per entry) — NOT interchangeable, reported",
+            replay_outcome.pending, synth_outcome.pending
+        );
+        println!(
+            "  outcome divergence beside the costs: executions {} vs {}, needs digest \
+             {} vs {}, activity digest {} vs {} — synthesis is the cheaper approximate \
+             reconstruction (one evaluation per NPC), accepted deliberately",
+            replay_outcome.wake_executions,
+            synth_outcome.wake_executions,
+            replay_outcome.needs_digest,
+            synth_outcome.needs_digest,
+            replay_outcome.activity_digest,
+            synth_outcome.activity_digest
         );
         if synth_p50 < replay_p50 && crossover_k.is_none() {
             crossover_k = Some(k);
             println!(
-                "  crossover: synthesis becomes cheaper at k = {} ({} pending events/NPC — E-09's harness measured 7.6-12.4)",
+                "  crossover: synthesis becomes cheaper at k = {} missed occurrences per \
+                 entry ({} pending events per NPC = 2k — E-09's harness measured \
+                 7.6-12.4)",
                 k,
                 2 * k
             );
@@ -853,11 +1098,15 @@ fn run_activation_crossover() {
     }
     match crossover_k {
         Some(k) => println!(
-            "  E-09 crossover on the real machinery: k = {} (the smallest measured pending-events-per-NPC where synthesis beats replay)",
-            k
+            "  E-09 crossover on the real machinery: k = {} missed occurrences per entry \
+             ({} pending events per NPC) — the smallest measured per-entry miss count \
+             where synthesis beats replay",
+            k,
+            2 * k
         ),
         None => println!(
-            "  E-09 crossover on the real machinery: NOT REACHED within k ≤ {} — replay stays cheaper across the measured range",
+            "  E-09 crossover on the real machinery: NOT REACHED within k ≤ {} missed \
+             occurrences per entry — replay stays cheaper across the measured range",
             k_values[k_values.len() - 1]
         ),
     }
