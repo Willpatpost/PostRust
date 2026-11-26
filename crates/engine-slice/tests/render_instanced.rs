@@ -2870,12 +2870,17 @@ fn animated_population_matches_per_object_pixels() {
 /// One sampled tick (e.g. 150 — mid-rhythm, some crossers mid-crossing, some
 /// stood): the 26-vs-2 byte equality across PerInstance/Instanced, the
 /// repeat capture, the rest-pose motion control. THE ALLOCATION-COUNTING
-/// GATE: the warmup (a few composed ticks + renders), the snapshot, then
-/// ≥ 8 measured composed frames with `HostAllocScope` wrapping THE WHOLE
-/// COMPOSED STEP AND RENDER (spine.run_tick + composed_tick + instances +
-/// poses + render): **0 host allocations per warmed composed frame**;
-/// `renderer.allocations()` constant; the pose digests distinct across
-/// the measured frames.
+/// GATE (the audit's finding 5 corrective): the warmup (a few composed
+/// ticks + renders), the snapshot, then ≥ 8 measured composed frames with
+/// the attribution split into DEDICATED SCOPES — `spine.run_tick`
+/// measured alone (the engine-core index-churn events, counted and
+/// reported honestly, never claimed as zero), then the composed tick +
+/// instances + poses + render measured alone: **0 host allocations
+/// attributable to the crowd and renderer on every warmed composed
+/// frame, wake or not**; `renderer.allocations()` constant; the pose
+/// digests distinct across the measured frames. The long-haul campaign
+/// past the old 256/512 wake-log boundaries lives in
+/// `composed_wake_campaign_past_log_boundaries_allocates_nothing` below.
 #[test]
 #[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
 fn composed_population_matches_per_object_pixels() {
@@ -2926,8 +2931,13 @@ fn composed_population_matches_per_object_pixels() {
     let total = npc.len() + vehicle.len();
     assert_eq!((npc.len(), vehicle.len(), total), (24, 2, 26));
 
-    // Build the behavior world and arm all entries.
-    let world = engine_slice::corner_behavior::CornerCrowdWorld::new(states, present.clone());
+    // Build the behavior world and arm all entries. THE ROLLING
+    // MODE (finding 5's correction): the demo's actual construction
+    // since the corrective — the same schedules, wakes, and states,
+    // the behavior stream folded into the rolling digest rather
+    // than retained (this gate measures the demo's exact path).
+    let world =
+        engine_slice::corner_behavior::CornerCrowdWorld::new_rolling(states, present.clone());
     let mut spine = engine_core::spine::Spine::with_reservation(world, 64, 32);
 
     // Arm EVERY schedule entry.
@@ -3100,6 +3110,11 @@ fn composed_population_matches_per_object_pixels() {
         let animated_warm = renderer.allocations();
 
         let mut digests = std::collections::BTreeSet::new();
+        // THE HONEST AGGREGATES (the attribution clause): the spine's
+        // own index-churn events counted in their DEDICATED scope,
+        // reported exactly — never hidden inside a zero claim.
+        let mut spine_alloc_events: u64 = 0;
+        let mut wake_frames: u64 = 0;
         for k in 4..12u64 {
             // THE NEVER-COINCIDE CLAUSE (at the gate's frames).
             {
@@ -3127,22 +3142,31 @@ fn composed_population_matches_per_object_pixels() {
                     }
                 }
             }
-            // THE SPINE-CHURN ALLOWANCE (the investigation's finding,
-            // documented): `Spine::schedule`'s unfinished-index
-            // (BTreeSet) node churn allocates on an amortized cadence
-            // (MEASURED: 1 event per ~7 insertions in this campaign's
-            // shape — the direct-schedule probe isolated it; the
-            // engine's own spine_allocations pin carries the same
-            // nonzero-warm discipline, 9 events / 3024 bytes over its
-            // scenario). It is engine-core internals, out of this
-            // package's scope. The composed path's OWN machinery —
-            // evaluate_wake, the seam, advance_batch, the retained
-            // instance/pose re-packs, the renderer's repack —
-            // allocates NOTHING: a frame with NO wake execution
-            // measures EXACTLY zero (the attribution clause below).
+            // THE SPINE-CHURN ATTRIBUTION (the investigation's
+            // finding, documented — and now attributed with a
+            // DEDICATED COUNTER rather than an allowance): the
+            // spine's `Spine::schedule` unfinished-index (BTreeSet)
+            // node churn allocates on an amortized cadence (MEASURED:
+            // 1 event per ~7 insertions in this campaign's shape —
+            // the direct-schedule probe isolated it; the engine's
+            // own spine_allocations pin carries the same
+            // nonzero-warm discipline). It is engine-core internals,
+            // out of this package's scope, and it is measured in its
+            // OWN scope below — so the crowd-and-renderer claim can
+            // be EXACT (the audit's finding 5: a wake-frame
+            // "allowance" could absorb a crowd-side allocation the
+            // spine never made; a dedicated counter cannot).
             let wakes_before = spine.world().wake_executions;
-            let scope = common::HostAllocScope::new();
+            let spine_scope = common::HostAllocScope::new();
             spine.run_tick();
+            let spine_allocs = spine_scope.count();
+            drop(spine_scope);
+            // THE CROWD AND RENDERER SCOPE: the composed tick, the
+            // retained instance/pose re-packs, and the submission —
+            // the composed path's OWN machinery (evaluate_wake, the
+            // seam, advance_batch, the re-packs, the renderer's
+            // repack), which allocates NOTHING.
+            let scope = common::HostAllocScope::new();
             let world = spine.world_mut();
             world.composed_tick(1.0 / 60.0);
             engine_slice::corner_routes::corner_instances_into(
@@ -3167,21 +3191,31 @@ fn composed_population_matches_per_object_pixels() {
                 .render_corner_populated(&matrix, eye, light, &animated, size)
                 .unwrap();
             let allocs = scope.count();
-            let wakes_this_frame = world.wake_executions - wakes_before;
             drop(scope);
+            let wakes_this_frame = spine.world().wake_executions - wakes_before;
             assert!(outcome.presented);
+            // THE EXACT CLAIM — wake frame or not: the crowd and
+            // renderer allocate NOTHING on any warmed composed frame.
+            assert_eq!(
+                allocs, 0,
+                "the crowd and renderer allocate nothing on any warmed composed \
+                 frame — wake or not (the seam, the batch, the retained re-packs, \
+                 and the renderer's repack all reuse their state) at frame {k}"
+            );
+            // The spine's own events, attributed and reported.
+            spine_alloc_events += spine_allocs;
             if wakes_this_frame == 0 {
                 assert_eq!(
-                    allocs, 0,
-                    "a composed frame with NO wake execution allocates nothing \
-                     (the seam, the batch, the retained re-packs, and the \
-                     renderer's repack all reuse their state) at frame {k}"
+                    spine_allocs, 0,
+                    "a composed frame with NO wake execution sees the spine \
+                     allocate nothing either at frame {k}"
                 );
             } else {
+                wake_frames += 1;
                 assert!(
-                    allocs <= 1,
+                    spine_allocs <= 1,
                     "a wake frame carries at most the spine's one index-churn \
-                     event (the documented engine-core allowance): {allocs} at frame {k}"
+                     event (the documented engine-core allowance): {spine_allocs} at frame {k}"
                 );
             }
             assert_eq!(
@@ -3202,9 +3236,11 @@ fn composed_population_matches_per_object_pixels() {
         }
         println!(
             "composed regime: {} distinct pose digests across the 8 measured \
-             frames (floor 3), renderer allocations {animated_warm:?}, host \
-             allocations 0 on non-wake frames (the spine's documented \
-             index-churn allowance alone may appear on a wake frame)",
+             frames (floor 3), renderer allocations {animated_warm:?}; crowd+renderer \
+             host allocations 0 on EVERY measured frame (wake or not); the spine's \
+             own index-churn events: {spine_alloc_events} across {wake_frames} wake \
+             frames (engine-core internals, attributed to their own scope — reported \
+             honestly, never claimed as zero)",
             digests.len()
         );
         assert!(
@@ -3260,7 +3296,259 @@ fn composed_population_matches_per_object_pixels() {
     );
     println!(
         "composed population gate: {total} instances, per-object {reference_calls} draws == instanced \
-         {instanced_calls} draws, byte-equal frames, zero per-frame allocation across \
-         warmed frames"
+         {instanced_calls} draws, byte-equal frames, zero crowd+renderer per-frame \
+         allocation across warmed frames (the spine's own index-churn events \
+         attributed to their dedicated scope and reported above)"
+    );
+}
+
+/// The Era-2 audit finding 5 deciding gate (the allocation half; the
+/// determinism half — the rolling digest equaling the complete
+/// stream's execution digest — lives in engine-slice's
+/// `corner_behavior` lib tests, runnable without a GPU): the running
+/// demo's composed crowd driven PAST the old wake-log boundaries —
+/// the 256-entry stream reservation and its 512 growth point — with
+/// REAL wakes (4200 composed ticks, 589 wake executions by the
+/// cadence arithmetic), under the thread-local allocator with the
+/// spine's own allocation attributed separately (a DEDICATED
+/// COUNTER: `spine.run_tick` measured in its own scope, the crowd +
+/// renderer in theirs — a wake-frame allowance can no longer absorb
+/// a crowd-side allocation the spine never made).
+///
+/// The crowd and renderer are required to allocate EXACTLY ZERO on
+/// every measured frame, wake or not. The spine's own documented
+/// index-churn events are counted and reported honestly at the exit
+/// — engine-core internals with their own pin, never claimed as
+/// zero here. The ROLLING stream (finding 5's correction) retains no
+/// per-entry history, so the old boundaries are crossed with nothing
+/// to grow. The warmed Vulkan allocation set is pinned constant (the
+/// existing exact pin, retained).
+///
+/// Runtime note: 4200 rendered frames at 256×256 on lavapipe with
+/// validation on — minutes, not seconds; an explicitly-run gate.
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
+fn composed_wake_campaign_past_log_boundaries_allocates_nothing() {
+    let _guard = sdl_lock();
+    let mut app = ShellApp::new(ShellConfig {
+        title: "Era-2 audit finding 5 wake campaign".into(),
+        width: 256,
+        height: 256,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    })
+    .unwrap();
+    let mut renderer = Renderer::new(
+        app.window(),
+        RenderConfig {
+            demo_scene: DemoScenePreference::Corner,
+            validation: ValidationPreference::On,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let size = app.window().size_in_pixels();
+    assert_eq!(size, (256, 256));
+    assert!(renderer.stats().validation_active);
+    let _ = app.frame();
+
+    // The sibling gate's camera stand: above the road cross looking
+    // down at the intersection center — every placement group inside
+    // the frustum, no building mass between.
+    let (matrix, eye) = {
+        let matrix = engine_slice::corner_demo::view_projection(
+            engine_renderer::lit_scene::RouteWaypoint {
+                position: [-3.5, 18.0, -3.5],
+                look_at: [0.5, 0.0, 0.5],
+            },
+            1.0,
+        );
+        (matrix, [-3.5, 18.0, -3.5])
+    };
+    let light = day_preset();
+
+    // THE ROLLING WORLD (the demo's actual construction since
+    // finding 5's correction) and the retained buffers (the demo's
+    // own shape).
+    let (_routes, states, present) = engine_slice::corner_routes::corner_population_locomotion();
+    let tints = engine_slice::corner_population::corner_npc_tints();
+    let (_, vehicle) = engine_slice::corner_population::corner_population();
+    let world = engine_slice::corner_behavior::CornerCrowdWorld::new_rolling(states, present);
+    let mut spine = engine_core::spine::Spine::with_reservation(world, 64, 32);
+
+    // Arm EVERY schedule entry at its own first occurrence (the
+    // demo's and the fixture campaigns' own arming).
+    {
+        let world = spine.world();
+        let mut specs: Vec<engine_core::event::EventSpec> = Vec::new();
+        for npc in 0..24 {
+            let schedule = &world.schedules[npc];
+            for (entry_idx, entry) in schedule.entries.iter().enumerate() {
+                let payload =
+                    engine_core::npc_execution::wake_payload(npc as u32, entry_idx as u32)
+                        .expect("the entry index packs");
+                specs.push(engine_core::event::EventSpec {
+                    class: engine_slice::corner_behavior::WAKE_CLASS,
+                    schedule: engine_core::event::Schedule::AtLogicalTime { due: entry.start },
+                    payload,
+                    field: entry.activity.field,
+                    depends_on: Vec::new(),
+                });
+            }
+        }
+        let _ = world;
+        for spec in specs {
+            spine.schedule(spec).expect("arming is legal");
+        }
+    }
+
+    let mut composed_instances =
+        engine_slice::corner_routes::corner_instances(&spine.world().states, &tints);
+    let mut composed_poses = Vec::new();
+    engine_slice::corner_routes::evaluate_population_poses_locomotion(
+        &spine.world().states,
+        &mut composed_poses,
+    );
+
+    // 4200 composed ticks ≈ 589 real wakes — past the old 256-entry
+    // reservation and its 512 growth point (the corner_behavior
+    // campaign test derives the count). 8 warmup frames, then the
+    // Vulkan snapshot, then EVERY remaining frame measured.
+    const TICKS: u64 = 4200;
+    const WARMUP: u64 = 8;
+    for _ in 0..WARMUP {
+        spine.run_tick();
+        let world = spine.world_mut();
+        world.composed_tick(1.0 / 60.0);
+        engine_slice::corner_routes::corner_instances_into(
+            &world.states,
+            &tints,
+            &mut composed_instances,
+        );
+        engine_slice::corner_routes::evaluate_population_poses_locomotion(
+            &world.states,
+            &mut composed_poses,
+        );
+        let animated = ProxyPopulation {
+            npc: &composed_instances,
+            npc_poses: &composed_poses,
+            npc_material: 1,
+            vehicle: &vehicle,
+            vehicle_material: 2,
+            rain: &[],
+            rain_material: 0,
+        };
+        let outcome = renderer
+            .render_corner_populated(&matrix, eye, light, &animated, size)
+            .unwrap();
+        assert!(outcome.presented);
+    }
+    let vulkan_warm = renderer.allocations();
+
+    let mut spine_alloc_events: u64 = 0;
+    let mut wake_frames: u64 = 0;
+    let mut frames_measured: u64 = 0;
+    for k in WARMUP..TICKS {
+        // THE DEDICATED COUNTERS: the spine's own allocation measured
+        // alone, the crowd + renderer measured alone.
+        let wakes_before = spine.world().wake_executions;
+        let spine_scope = common::HostAllocScope::new();
+        spine.run_tick();
+        let spine_allocs = spine_scope.count();
+        drop(spine_scope);
+        let scope = common::HostAllocScope::new();
+        let world = spine.world_mut();
+        world.composed_tick(1.0 / 60.0);
+        engine_slice::corner_routes::corner_instances_into(
+            &world.states,
+            &tints,
+            &mut composed_instances,
+        );
+        engine_slice::corner_routes::evaluate_population_poses_locomotion(
+            &world.states,
+            &mut composed_poses,
+        );
+        let animated = ProxyPopulation {
+            npc: &composed_instances,
+            npc_poses: &composed_poses,
+            npc_material: 1,
+            vehicle: &vehicle,
+            vehicle_material: 2,
+            rain: &[],
+            rain_material: 0,
+        };
+        let outcome = renderer
+            .render_corner_populated(&matrix, eye, light, &animated, size)
+            .unwrap();
+        let allocs = scope.count();
+        drop(scope);
+        assert!(outcome.presented);
+        let wakes_this_frame = spine.world().wake_executions - wakes_before;
+
+        // THE EXACT CLAIM (the audit's finding 5 deciding assertion):
+        // zero allocations attributable to the crowd and renderer, on
+        // every measured frame — wake or not, past both old
+        // boundaries.
+        frames_measured += 1;
+        assert_eq!(
+            allocs, 0,
+            "the crowd and renderer allocate nothing at frame {k} — wake or not, \
+             past the old 256/512 wake-log boundaries"
+        );
+        // The spine's own events, attributed and reported.
+        spine_alloc_events += spine_allocs;
+        if wakes_this_frame == 0 {
+            assert_eq!(
+                spine_allocs, 0,
+                "a non-wake spine tick allocates nothing at frame {k}"
+            );
+        } else {
+            wake_frames += 1;
+        }
+        assert_eq!(
+            renderer.allocations(),
+            vulkan_warm,
+            "warmed Vulkan allocations constant at frame {k} (the existing exact pin)"
+        );
+    }
+
+    let world = spine.world();
+    // PAST BOTH OLD BOUNDARIES with real wakes, and the bounded
+    // record held: nothing retained, the rolling digest carries the
+    // stream.
+    assert!(
+        world.stream_entries > 512,
+        "the campaign crossed the old 256-entry reservation AND its 512 \
+         growth point: {} wake entries",
+        world.stream_entries
+    );
+    assert!(
+        world.stream.is_empty(),
+        "the rolling mode retains no per-entry history — nothing grew past \
+         the boundaries"
+    );
+    // The pathological-tick counters stay zero on the authored table
+    // (finding 4's guards, fail-visible here too).
+    assert_eq!(world.guard_settles, 0, "no crossing-guard settlement");
+    assert_eq!(world.phase_clamps, 0, "no stride-phase clamp");
+    assert_eq!(world.retarget_refusals, 0, "the seam never refuses");
+    assert_eq!(
+        renderer.stats().validation_errors,
+        0,
+        "{:?}",
+        renderer.stats().recent_validation
+    );
+    // THE HONEST REPORT: the crowd/renderer claim is exact zero; the
+    // spine's own index-churn events are counted and stated, never
+    // folded into the zero.
+    println!(
+        "wake campaign: {TICKS} composed frames ({frames_measured} measured), {} wake \
+         frames, {} wake entries — past the old 256-entry reservation and its 512 \
+         growth point; crowd+renderer host allocations 0 on every measured frame; \
+         the spine's own index-churn events: {spine_alloc_events} across the \
+         {wake_frames} wake frames (engine-core internals, attributed to their \
+         dedicated scope, reported honestly — never claimed as zero); renderer \
+         allocations constant at {vulkan_warm:?}",
+        wake_frames, world.stream_entries
     );
 }

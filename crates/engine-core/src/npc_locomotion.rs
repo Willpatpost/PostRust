@@ -20,6 +20,22 @@
 //! fixed route table, fixed seeds, and a fixed tick delta produce the
 //! same locomotion stream forever — pinned by digest.
 //!
+//! # THE FINITE-ARITHMETIC CONTRACT (every loop terminates)
+//! No input admitted by `Route::new` can stall the tick. The stride
+//! phase's wrap into [0, 1) is ONE `floor` and ONE subtraction —
+//! never a repeated `-= 1.0`, which does not terminate once the
+//! phase reaches 2^24 (the f32 spacing there is 2.0 or coarser, so
+//! subtracting 1.0 rounds back to the same float; a valid authored
+//! stride of 2^-30 against a distance of 1.0 puts the phase at 2^30).
+//! The reduction is exact everywhere exactness is possible and
+//! byte-identical to the repeated subtraction it replaces (the
+//! arithmetic proof lives at step 9 below); a non-finite phase
+//! (distance/stride overflowing f32 on valid authored inputs) is
+//! clamped to 0.0 and counted fail-visibly. The crossing loop is
+//! bounded by [`MAX_CROSSINGS_PER_TICK`], and distance past the
+//! bound is DROPPED with the state settled at the last admitted
+//! crossing — never carried for extrapolation off the leg.
+//!
 //! # THE ENGINE/POLICY BOUNDARY (the design's rule, §4.1/§4.3)
 //! This module ships the locomotion MACHINERY: the route/leg data
 //! model, the batch step, the turn blend, the lateral spread, the
@@ -76,8 +92,13 @@ use crate::player::CollisionWorld;
 pub const LOOPING: u32 = u32::MAX;
 /// The maximum waypoint crossings one batch tick may consume (the
 /// pathological guard: a huge dt against tiny legs). Distance past
-/// this bound's crossings is dropped, deterministically — the NPC
-/// stands at the crossing it reached, and the next tick resumes.
+/// this bound's crossings is dropped, deterministically — the state
+/// SETTLES at the last admitted crossing (the NPC stands at the
+/// waypoint it reached: `leg_distance` 0 on the leg it entered, an
+/// on-route position), and the next tick resumes the walk. The
+/// `guard_settles` counter in [`BatchSummary`] reports the
+/// settlement fail-visibly; ordinary authored trajectories never
+/// reach the bound.
 pub const MAX_CROSSINGS_PER_TICK: u32 = 16;
 /// The lateral-fade window: the fraction of each leg's start/end over
 /// which the lateral offset eases to zero — the no-pop-at-corners
@@ -516,6 +537,18 @@ pub struct BatchSummary {
     pub arrivals: u32,
     /// Collision-blocked ticks this tick.
     pub blocked: u32,
+    /// Crossing-guard settlements this tick: a pathological tick
+    /// whose distance crossed more than [`MAX_CROSSINGS_PER_TICK`]
+    /// legs had its excess distance dropped and its state settled
+    /// at the last admitted crossing. Fail-visible diagnostics —
+    /// ordinary authored trajectories never fire it.
+    pub guard_settles: u32,
+    /// Stride-phase clamps this tick: the distance/stride increment
+    /// overflowed f32 (valid authored inputs can do it — a giant
+    /// speed over a tiny stride), so the phase was clamped to 0.0.
+    /// Fail-visible diagnostics — ordinary authored trajectories
+    /// never fire it.
+    pub phase_clamps: u32,
 }
 
 /// THE BATCH STEP (§4.3's data-oriented lane): advances every PRESENT
@@ -534,13 +567,20 @@ pub struct BatchSummary {
 ///
 /// # THE PER-NPC FIXED ORDER (pinned line by line)
 /// 1. `distance = speed · speed_scale · dt` (left-to-right);
-/// 2. `before = leg_distance` (the blocked-revert anchor);
+/// 2. the blocked-revert anchor: the (leg, leg_distance) PAIR — a
+///    crossing may advance the leg within the tick, and the honest
+///    revert must restore both or the pre-step distance lands on the
+///    WRONG leg's unit vector;
 /// 3. `leg_distance += distance`;
 /// 4. the crossing loop (≤ MAX_CROSSINGS_PER_TICK): while
 ///    `leg_distance >= leg_length`, subtract the length and advance
 ///    `leg` (wrapping on loops; a destination arrival snaps position
 ///    to the AUTHORED waypoint bytes, zeroes leg_distance, drops
-///    speed to 0, and reports `arrived`);
+///    speed to 0, and reports `arrived`). If the bound exhausted
+///    with distance still at or beyond the leg's end, the excess is
+///    dropped and the state SETTLES at the last admitted crossing
+///    (leg_distance 0 — the waypoint reached, on-route; counted in
+///    `guard_settles`);
 /// 5. `position = leg_from + leg_distance · unit` (distance times
 ///    the unit vector — exact for binary fixtures);
 /// 6. the lateral offset: `lateral · spread_width · fade(t)` along
@@ -548,13 +588,15 @@ pub struct BatchSummary {
 ///    `min(t, 1−t)/LATERAL_FADE_WINDOW`;
 /// 7. collision: `depenetration` over the NPC box at the candidate;
 ///    a push moves x/z only (ground-constrained kinematics), reverts
-///    `leg_distance` to `before` (honest no-progress), and freezes
-///    the phase;
+///    the (leg, leg_distance) pair to the pre-step values (honest
+///    no-progress), and freezes the phase;
 /// 8. the facing blend toward the leg's authored turn (integer u16,
 ///    shortest way, `turn_rate` per tick) — standing NPCs never
 ///    turn, blocked NPCs still do;
 /// 9. the stride phase: `+= distance / stride_length`, wrapped into
-///    [0, 1) — frozen when blocked or standing (no foot slide).
+///    [0, 1) by ONE floor and ONE subtraction (the finite-
+///    arithmetic contract in the module header) — frozen when
+///    blocked or standing (no foot slide).
 #[allow(clippy::too_many_arguments)]
 pub fn advance_batch(
     routes: &[Route],
@@ -594,7 +636,13 @@ pub fn advance_batch(
         // 1. The per-tick distance, fixed order.
         let distance = state.speed * state.speed_scale * dt;
 
-        // 2. The blocked-revert anchor.
+        // 2. The blocked-revert anchor: the (leg, distance) PAIR. A
+        //    crossing may advance `leg` within this tick; the honest
+        //    revert must restore BOTH, or the pre-step distance
+        //    lands on the WRONG leg's unit vector — a walker
+        //    teleported off its route by an obstruction immediately
+        //    past a corner.
+        let before_leg = state.leg;
         let before = state.leg_distance;
 
         // 3. Advance along the leg.
@@ -661,6 +709,31 @@ pub fn advance_batch(
             }
         }
 
+        // 4b. THE CROSSING-GUARD SETTLEMENT. If the
+        // MAX_CROSSINGS_PER_TICK bound exhausted with distance still
+        // at or beyond the current leg's end, the excess is DROPPED
+        // and the state settles at the last admitted crossing: the
+        // NPC stands at the waypoint it reached (leg_distance 0 on
+        // the leg it entered — an on-route position), and the next
+        // tick resumes the walk. The pre-corrective defect kept the
+        // unconsumed distance in the state, so step 5 extrapolated
+        // `leg_from + leg_distance · unit` past the leg's end by
+        // that whole distance — a walker off its route with the
+        // `leg_distance < leg_length` invariant broken. Ordinary
+        // trajectories never fire this (the loop breaks with
+        // `leg_distance < length`); the guard's counter reports it
+        // fail-visibly. The `speed > 0` guard is the same one step 5
+        // carries: every arrival path (and the corrupted-state
+        // clause above) has already zeroed the speed and may have
+        // parked `leg` at leg_count, where per_leg has no entry.
+        if state.speed > 0.0 {
+            let geom = route.per_leg[state.leg as usize];
+            if state.leg_distance >= geom.length {
+                state.leg_distance = 0.0;
+                summary.guard_settles += 1;
+            }
+        }
+
         // 5-9. Position, lateral, collision, facing, phase — all
         // skipped when the arrival snap already stood the NPC.
         let mut blocked = false;
@@ -703,10 +776,17 @@ pub fn advance_batch(
                     match world.depenetration(min, max) {
                         Some(push) => {
                             blocked = true;
-                            // The honest no-progress revert: the next
+                            // The honest no-progress revert: the
+                            // (leg, distance) PAIR — the pre-tick leg
+                            // AND the pre-tick distance — so the next
                             // blocked tick recomputes the identical
-                            // candidate and push — pinned-blocked
-                            // idempotence.
+                            // crossing, candidate, and push
+                            // (pinned-blocked idempotence), and the
+                            // state never interprets the pre-step
+                            // distance on a leg it does not belong
+                            // to (a corner crossing must not strand
+                            // the old distance on the new leg).
+                            state.leg = before_leg;
                             state.leg_distance = before;
                             [candidate[0] + push[0], candidate[1] + push[2]]
                         }
@@ -732,11 +812,37 @@ pub fn advance_batch(
 
             // 9. The stride phase from DISTANCE, frozen when blocked
             // (the no-foot-slide rule: feet do not cycle against a
-            // wall).
+            // wall). THE FINITE-ARITHMETIC CONTRACT: the wrap into
+            // [0, 1) is ONE floor and ONE subtraction — never a
+            // repeated `-= 1.0`, which does not terminate once the
+            // phase reaches 2^24 (the f32 spacing at 2^24 is 2.0, so
+            // subtracting 1.0 rounds back to the same float; a valid
+            // authored stride of 2^-30 against a distance of 1.0
+            // puts the phase at 2^30, and the tick never returned).
+            // The reduction is EXACT everywhere exactness is
+            // possible, and byte-identical to the repeated
+            // subtraction it replaces: for a phase in [1, 2^24)
+            // every integer up to the phase and every multiple of
+            // the phase's own ulp in [0, 1) are representable, so
+            // both `floor` and the subtraction are exact — the
+            // repeated subtraction was the same exact difference
+            // taken one unit at a time. At 2^24 and beyond a finite
+            // f32 is itself an integer, so `phase − floor(phase)` is
+            // exactly 0.0 — the value the unbounded loop would have
+            // reached had the arithmetic been unbounded. A
+            // NON-FINITE phase (distance/stride overflowing f32 —
+            // valid authored inputs can do it: a giant speed over a
+            // tiny stride) is clamped to 0.0 and counted in
+            // `phase_clamps`, fail-visible.
             if !blocked {
                 state.stride_phase += distance / route.stride_length();
-                while state.stride_phase >= 1.0 {
-                    state.stride_phase -= 1.0;
+                if state.stride_phase.is_finite() {
+                    if state.stride_phase >= 1.0 {
+                        state.stride_phase -= state.stride_phase.floor();
+                    }
+                } else {
+                    state.stride_phase = 0.0;
+                    summary.phase_clamps += 1;
                 }
             }
         }
@@ -2272,5 +2378,377 @@ mod tests {
         // MEASURED on this exact tree (the campaign of test 17, 200
         // ticks, 600 samples): the pin — never silently re-pinned.
         assert_eq!(digest, 852983358677453085, "the locomotion digest pin");
+    }
+
+    /// Test 19 (the audit's finding 4 deciding test, part 1): a
+    /// VALID tiny stride cannot stall the tick. `Route::new` admits
+    /// any positive finite stride; a stride of 2^-30 against a
+    /// distance of 1.0 puts the phase at 2^30, where the f32 spacing
+    /// is 128 — the pre-corrective repeated `-= 1.0` rounded back to
+    /// the same float and the tick NEVER RETURNED. The bounded
+    /// reduction (one floor, one subtraction) completes and leaves
+    /// the phase in [0, 1).
+    #[test]
+    fn tiny_stride_tick_completes_phase_bounded() {
+        // Exactly 2^-30 (exponent 127−30, unit mantissa).
+        let tiny_stride = f32::from_bits(0x3080_0000);
+        assert_eq!(tiny_stride, 1.0 / (1024.0 * 1024.0 * 1024.0));
+        let route = Route::new(
+            [0.0, 0.0],
+            vec![RouteLeg {
+                to: [64.0, 0.0],
+                turn: 0,
+            }],
+            8.0,
+            0.0,
+            tiny_stride,
+            0,
+            false,
+            0,
+        )
+        .expect("a tiny stride is valid authored data");
+        let mut state = start_route(0, &route, 1, 0, 1).expect("the walk");
+        state.speed_scale = 1.0; // the arithmetic isolation (test 3 pins the draw)
+        state.stride_phase = 0.0;
+        state.lateral = 0.0;
+
+        // BOUNDED COMPLETION: ten ticks at 1.0 unit each — every
+        // tick's phase increment is 1.0/2^-30 = 2^30, a float whose
+        // exact fractional part is 0. The loop below returns (the
+        // pre-corrective code hung on the FIRST tick's wrap).
+        for _ in 0..10 {
+            step1(&route, &mut state, 0.125, None);
+            assert!(
+                (0.0..1.0).contains(&state.stride_phase),
+                "the phase is bounded in [0, 1): {}",
+                state.stride_phase
+            );
+        }
+        // 2^30's exact fractional part is 0.0 — the reduction's
+        // documented answer, and the value the unbounded repeated
+        // subtraction would have reached.
+        assert_eq!(state.stride_phase, 0.0);
+        // The walk itself advanced normally: ten units, on-route.
+        assert_eq!(state.leg_distance, 10.0);
+        assert_eq!(state.position, [10.0, 0.0]);
+        assert_eq!(state.speed, 8.0, "the walk is unaffected by the wrap");
+
+        // The clamp: an increment that overflows f32 (distance 1.0
+        // over the smallest subnormal stride, 2^-149 — the exact
+        // quotient 2^149 exceeds f32::MAX) is non-finite — clamped
+        // to 0.0 and counted fail-visibly.
+        let overflow_route = Route::new(
+            [0.0, 0.0],
+            vec![RouteLeg {
+                to: [64.0, 0.0],
+                turn: 0,
+            }],
+            8.0,
+            0.0,
+            f32::from_bits(1),
+            0,
+            false,
+            0,
+        )
+        .expect("the smallest subnormal stride is valid authored data");
+        let mut state = start_route(0, &overflow_route, 1, 0, 1).expect("the walk");
+        state.speed_scale = 1.0;
+        state.stride_phase = 0.0;
+        let summary = step1(&overflow_route, &mut state, 0.125, None);
+        assert_eq!(summary.phase_clamps, 1, "the overflow clamped, counted");
+        assert_eq!(state.stride_phase, 0.0, "the clamp's documented value");
+        assert_eq!(state.leg_distance, 1.0, "the walk itself is unaffected");
+
+        // THE EQUIVALENCE PIN (byte-identity for ordinary phases):
+        // for increments whose phase stays below 2^24, the reduction
+        // equals the naive repeated subtraction EXACTLY — the same
+        // bytes the pre-corrective wrap produced.
+        for stride in [0.5f32, 1.0, 2.0, 7.0] {
+            let route = Route::new(
+                [0.0, 0.0],
+                vec![RouteLeg {
+                    to: [64.0, 0.0],
+                    turn: 0,
+                }],
+                8.0,
+                0.0,
+                stride,
+                0,
+                false,
+                0,
+            )
+            .expect("the walk");
+            let mut state = start_route(0, &route, 1, 0, 1).expect("the walk");
+            state.speed_scale = 1.0;
+            state.lateral = 0.0;
+            state.stride_phase = 0.3;
+            // The naive wrap, computed beside the engine (it
+            // terminates for these small phases by the same
+            // exactness argument the reduction's proof carries).
+            let mut naive = 0.3f32;
+            for _ in 0..17 {
+                step1(&route, &mut state, 0.125, None);
+                naive += 1.0 / stride;
+                while naive >= 1.0 {
+                    naive -= 1.0;
+                }
+                assert_eq!(
+                    state.stride_phase, naive,
+                    "stride {stride}: the reduction equals the repeated subtraction"
+                );
+            }
+        }
+    }
+
+    /// Test 20 (the audit's finding 4 deciding test, part 2): a tick
+    /// crossing 17 unit legs SETTLES at the last admitted crossing,
+    /// never extrapolating off the route. MAX_CROSSINGS_PER_TICK is
+    /// 16; the 17-crossing tick's excess distance is DROPPED — the
+    /// NPC stands at the waypoint the 16th crossing reached, on an
+    /// on-route position, and the next tick resumes the walk. The
+    /// pre-corrective defect kept the unconsumed distance in the
+    /// state and let step 5 extrapolate `leg_from +
+    /// leg_distance · unit` past the leg's end by that whole
+    /// distance.
+    #[test]
+    fn crossing_guard_settles_at_last_admitted_crossing() {
+        // Fixture A (the audit's literal shape): a 2×2 square LOOP of
+        // eight unit legs (perimeter 8), walked at 17.5 units/tick —
+        // 17 crossings needed, 16 admitted, the 17th's 1.5 units
+        // dropped (17.5 − 16 admitted).
+        let square = Route::new(
+            [0.0, 0.0],
+            vec![
+                RouteLeg {
+                    to: [1.0, 0.0],
+                    turn: 0,
+                },
+                RouteLeg {
+                    to: [2.0, 0.0],
+                    turn: 0,
+                },
+                RouteLeg {
+                    to: [2.0, 1.0],
+                    turn: 16384,
+                },
+                RouteLeg {
+                    to: [2.0, 2.0],
+                    turn: 16384,
+                },
+                RouteLeg {
+                    to: [1.0, 2.0],
+                    turn: 32768,
+                },
+                RouteLeg {
+                    to: [0.0, 2.0],
+                    turn: 32768,
+                },
+                RouteLeg {
+                    to: [0.0, 1.0],
+                    turn: 49152,
+                },
+                RouteLeg {
+                    to: [0.0, 0.0],
+                    turn: 49152,
+                },
+            ],
+            140.0,
+            0.0,
+            1.0,
+            0,
+            true,
+            0,
+        )
+        .expect("the unit-leg square loop closes exactly");
+        let mut state = start_route(0, &square, 1, 0, LOOPING).expect("the stroll");
+        state.speed_scale = 1.0; // 140 · 1.0 · 0.125 = 17.5 units/tick, exact
+        state.stride_phase = 0.0;
+        state.lateral = 0.0;
+
+        let summary = step1(&square, &mut state, 0.125, None);
+        // The guard fired, fail-visibly.
+        assert_eq!(
+            summary.guard_settles, 1,
+            "the 17th crossing's excess dropped"
+        );
+        assert_eq!(summary.arrivals, 0, "a settlement is not an arrival");
+        // 16 admitted crossings from leg 0 wrap twice: leg 16 mod 8
+        // = 0, the last admitted crossing DEPARTED waypoint 0 — the
+        // NPC stands there, on-route, with the state invariant held.
+        assert_eq!(state.leg, 0, "the last admitted crossing's leg");
+        assert_eq!(state.leg_distance, 0.0, "settled AT the crossing");
+        assert_eq!(state.position, [0.0, 0.0], "the waypoint, byte-exact");
+        assert_eq!(state.speed, 140.0, "the walk resumes next tick");
+        // The phase advanced by the tick's whole distance (17.5
+        // strides) and wrapped into [0, 1).
+        assert_eq!(state.stride_phase, 0.5);
+        assert!((0.0..1.0).contains(&state.stride_phase));
+        // The pre-corrective defect's answer, for the record: the
+        // position would have extrapolated to (0,0) + 1.5·(1,0) =
+        // (1.5, 0) with leg_distance 1.5 ≥ leg_length on leg 0 —
+        // off the settled state's invariant, the excess carried.
+
+        // The second tick settles identically (the walk resumes and
+        // re-crosses 17 legs).
+        let summary = step1(&square, &mut state, 0.125, None);
+        assert_eq!(summary.guard_settles, 1);
+        assert_eq!((state.leg, state.leg_distance), (0, 0.0));
+
+        // Fixture B (the visibly off-route case): an OPEN staircase
+        // of 17 unit legs turning every leg, walked to its end
+        // (destination 17) at 17.5 units/tick. Tick 1 admits 16
+        // crossings → leg 16 with 1.5 units unconsumed → the guard
+        // settles at waypoint 16 = (8, 8). The pre-corrective defect
+        // extrapolated to (8,8) + 1.5·(1,0) = (9.5, 8) — half a unit
+        // PAST the route's end waypoint (9, 8), off the route.
+        let staircase: Vec<RouteLeg> = (0..17u16)
+            .map(|i| RouteLeg {
+                to: if i % 2 == 0 {
+                    [f32::from(i / 2 + 1), f32::from(i / 2)]
+                } else {
+                    [f32::from(i.div_ceil(2)), f32::from(i.div_ceil(2))]
+                },
+                turn: if i % 2 == 0 { 0 } else { 16384 },
+            })
+            .collect();
+        let route = Route::new([0.0, 0.0], staircase, 140.0, 0.0, 1.0, 0, false, 0)
+            .expect("the 17-leg staircase is valid");
+        assert_eq!(route.leg_count(), 17);
+        assert_eq!(route.leg_from(16), [8.0, 8.0], "waypoint 16");
+        let mut state = start_route(0, &route, 1, 0, 17).expect("walk to the end");
+        state.speed_scale = 1.0;
+        state.stride_phase = 0.0;
+        state.lateral = 0.0;
+
+        let summary = step1(&route, &mut state, 0.125, None);
+        assert_eq!(summary.guard_settles, 1);
+        assert_eq!(
+            summary.arrivals, 0,
+            "the end is one crossing past the bound"
+        );
+        assert_eq!(state.leg, 16, "the last admitted crossing's leg");
+        assert_eq!(state.leg_distance, 0.0, "settled AT the crossing");
+        assert_eq!(
+            state.position,
+            [8.0, 8.0],
+            "waypoint 16 — on-route, byte-exact"
+        );
+        assert_eq!(state.speed, 140.0, "the walk resumes next tick");
+        assert_eq!(state.stride_phase, 0.5, "17.5 strides wrapped");
+
+        // Tick 2: the resumed walk crosses the final leg and
+        // ARRIVES at the authored end waypoint — the settlement
+        // deferred, not lost.
+        let summary = step1(&route, &mut state, 0.125, None);
+        assert_eq!(summary.guard_settles, 0, "17.5 from leg 16 crosses once");
+        assert_eq!(summary.arrivals, 1, "the end-waypoint arrival");
+        assert_eq!(state.position, [9.0, 8.0], "the authored end bytes");
+        assert_eq!(state.speed, 0.0);
+        assert_eq!(state.leg, 17, "standing AT the end waypoint");
+    }
+
+    /// Test 21 (the audit's finding 4 deciding test, part 3): an
+    /// obstruction immediately past a corner rolls the state back as
+    /// a (leg, distance) PAIR. The pre-corrective defect restored
+    /// only the pre-step distance while KEEPING the crossed leg —
+    /// the next position evaluated the old distance on the NEW
+    /// leg's unit vector, teleporting the walker off its route (and
+    /// past the obstruction) by the whole pre-step distance.
+    #[test]
+    fn collision_rollback_restores_leg_and_distance_pair() {
+        let route = Route::new(
+            [0.0, 0.0],
+            vec![
+                RouteLeg {
+                    to: [8.0, 0.0],
+                    turn: 0,
+                },
+                RouteLeg {
+                    to: [8.0, 8.0],
+                    turn: 16384,
+                },
+            ],
+            2.0,
+            0.0,
+            1.0,
+            100,
+            false,
+            0,
+        )
+        .expect("the corner walk");
+        // The obstruction: a 1×1-footprint box standing immediately
+        // past the corner (x ∈ [7.5, 8.5], z ∈ [0, 1]) — the NPC box
+        // (half 0.25) at the corner waypoint (8, 0) overlaps it.
+        let world = CollisionWorld::new(0.0).with_box([8.0, 0.0, 0.5], 1.0, 2.0);
+        let mut state = NpcLocomotion {
+            position: [7.75, 0.0],
+            facing: 0,
+            route: 0,
+            leg: 0,
+            leg_distance: 7.75,
+            destination: 2,
+            speed: 2.0,
+            speed_scale: 1.0,
+            lateral: 0.0,
+            stride_phase: 0.5,
+        };
+
+        // The tick crosses the corner (8.0 >= 8.0 → leg 1, remainder
+        // 0) and the candidate — the corner waypoint itself — sits in
+        // the obstruction: blocked.
+        let summary = step1(&route, &mut state, 0.125, Some(&world));
+        assert_eq!(summary.blocked, 1);
+        // THE PAIR: leg 0 AND distance 7.75 both restored. The
+        // pre-corrective state kept leg 1 with distance 7.75 — the
+        // next tick would have evaluated (8, 7.75), 7.75 units up
+        // the return leg, deep past the obstruction and off the
+        // walk.
+        assert_eq!(state.leg, 0, "the pre-crossing leg restored");
+        assert_eq!(state.leg_distance, 7.75, "the pre-step distance restored");
+        // The depenetrated candidate: pushed south out of the box
+        // (the minimal-axis push, |3−SKIN−0.25| ≈ 0.25), x still at
+        // the corner.
+        assert_eq!(state.position[0], 8.0);
+        assert!(
+            state.position[1] < -0.24 && state.position[1] > -0.26,
+            "pushed clear of the obstruction: {}",
+            state.position[1]
+        );
+        // The phase frozen in [0, 1).
+        assert_eq!(state.stride_phase, 0.5, "no foot slide");
+        assert!((0.0..1.0).contains(&state.stride_phase));
+
+        // Idempotence: repeated blocked ticks recompute the
+        // identical crossing, candidate, and push — the
+        // pinned-blocked shape held AT the corner.
+        let pinned = state;
+        for _ in 0..5 {
+            step1(&route, &mut state, 0.125, Some(&world));
+        }
+        assert_eq!(state.position, pinned.position, "pinned at the corner");
+        assert_eq!(state.leg, 0, "the pair holds");
+        assert_eq!(state.leg_distance, 7.75);
+        assert_eq!(state.stride_phase, 0.5, "still frozen");
+        assert_eq!(state.speed, 2.0, "the walk resumes when the path clears");
+
+        // The counterfactual: the same tick without the obstruction
+        // completes the crossing on-route.
+        let mut free = NpcLocomotion {
+            position: [7.75, 0.0],
+            facing: 0,
+            route: 0,
+            leg: 0,
+            leg_distance: 7.75,
+            destination: 2,
+            speed: 2.0,
+            speed_scale: 1.0,
+            lateral: 0.0,
+            stride_phase: 0.5,
+        };
+        step1(&route, &mut free, 0.125, None);
+        assert_eq!(free.leg, 1, "the crossing completes");
+        assert_eq!(free.leg_distance, 0.0);
+        assert_eq!(free.position, [8.0, 0.0], "the corner waypoint, on-route");
+        assert_eq!(free.stride_phase, 0.75, "0.5 + 0.25 — the stride advanced");
     }
 }
