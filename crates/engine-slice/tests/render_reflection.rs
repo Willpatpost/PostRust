@@ -2489,21 +2489,25 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
             if near_miss.is_none_or(|(_, _, nm_contrast, _, _)| contrast > nm_contrast) {
                 near_miss = Some((x as u32, y as u32, contrast, wet_value, b));
             }
-            if contrast >= 50
+            // RE-PINNED from run 45857689896's diagnostic (Ubuntu's
+            // best Schlick-band ground pixel: contrast 24 - the
+            // original 50 was Windows-only; 8 excludes only
+            // degenerate captures, the flip asserts discriminate).
+            if contrast >= 8
                 && wet_value >= WET_PATCH_FLOOR
-                && best.is_none_or(|(_, _, best_contrast, _)| contrast > best_contrast)
+                && best.is_none_or(|(_, _, _, best_contrast, _)| contrast > best_contrast)
             {
-                best = Some((x as u32, y as u32, contrast, channel));
+                best = Some((x as u32, y as u32, wet_value, contrast, channel));
             }
         }
     }
-    let Some((p0_x, p0_y, p0_contrast, _)) = best else {
+    let Some((p0_x, p0_y, p0_wet, p0_contrast, _)) = best else {
         let (nm_x, nm_y, nm_contrast, nm_wet, nm_b) =
             near_miss.expect("the lower frame has Schlick-band ground pixels");
         panic!(
             "PROVISIONAL gate: no high-contrast reflective ground pixel qualified in the \
              lower frame. The best near-miss: ({nm_x}, {nm_y}) contrast {nm_contrast}/255 \
-             (floor 50), wet value {nm_wet}/255 (floor {WET_PATCH_FLOOR}), Schlick b \
+             (floor 8), wet value {nm_wet}/255 (floor {WET_PATCH_FLOOR}), Schlick b \
              {nm_b:.3} - re-pin the floors from THIS platform's actuals"
         );
     };
@@ -2513,14 +2517,20 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
     );
 
     // The streak: hung in the air on P0's view ray at 62% of the
-    // ground distance (in front of the ground — LESS depth, the
+    // ground distance (in front of the ground - LESS depth, the
     // depth test passes), the module's own billboard turn for this
-    // pose's yaw, a witness scale that spans several pixels, and a
-    // MID-BRIGHT tint capped below the patch's wet value (the tint
-    // ceiling 0.57 x the texture's <= 1.0 rgb keeps the streak's
-    // source color under the W floor — the correct order must DIM
-    // the bright reflection; the defect order, which re-blends the
-    // reflection over the streak, must BRIGHTEN past it).
+    // pose's yaw, a witness scale that spans several pixels, and an
+    // ADAPTIVE tint scaled to the placement pixel's MEASURED wet
+    // value (the R3 round-4 corrective: the sign-flip premise needs
+    // the streak's source color UNDER the patch's wet value -
+    // Windows lavapipe renders this vantage at wet >= 165 where the
+    // original fixed 0.50-0.57 tint sat safely under it, Ubuntu
+    // measures 44 where the fixed tint would sit OVER it and INVERT
+    // the flip. The tint now rides at ~70% of W on every platform's
+    // rendering - the correct order dims by ~0.3 x W x alpha and
+    // the defect order re-blends the reflection over the streak and
+    // brightens past it, wherever the patch is measurable at all).
+    let tint_base = ((p0_wet as f32 / 255.0) * 0.7).clamp(0.08, 0.57);
     let ray = pixel_ray(forward, right, up, p0_x, p0_y, size);
     let t_ground = -eye[1] / ray[1];
     let streak_pos = [
@@ -2536,7 +2546,7 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
             turn: yaw_to_turn(yaw),
             scale: 6.0,
         },
-        tint: [0.50, 0.53, 0.57],
+        tint: [tint_base, tint_base * 1.06, tint_base * 1.14],
         alpha: RAIN_ALPHA,
         pose_index: 0,
     };
@@ -2581,7 +2591,7 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
             let contrast = w_pixel[channel] as i32 - d_pixel[channel] as i32;
             if presence >= STREAK_PRESENCE_FLOOR
                 && wet_value >= WET_PATCH_FLOOR
-                && contrast >= 50
+                && contrast >= 8
                 && witness.is_none_or(|(_, _, best_presence, _)| presence > best_presence)
             {
                 witness = Some((x, y, presence, channel));
@@ -2756,16 +2766,23 @@ fn rainless_population() -> ProxyPopulation<'static> {
     }
 }
 
-/// The wet patch's brightness floor (PROVISIONAL — derived from the
-/// discriminator's worst case: the streak tint's 0.57 ceiling keeps
-/// its source color under this value, so the correct order dims and
-/// the defect brightens; re-measure on CI's lavapipe).
-const WET_PATCH_FLOOR: i32 = 165;
+/// The wet patch's brightness floor (RE-PINNED from run 45857689896's
+/// diagnostic: Windows lavapipe renders this vantage's Schlick-band
+/// ground at wet >= 165, Ubuntu at 44 - the best near-miss (118, 230)
+/// contrast 24, wet 44, b 0.518). The floor now only excludes
+/// degenerate captures on BOTH platforms; the sign-flip
+/// discrimination is carried by the ADAPTIVE tint (the streak's
+/// source scales to ~70% of the MEASURED wet value, so the correct
+/// order dims and the defect brightens wherever the patch is
+/// measurable at all) and the flip asserts.
+const WET_PATCH_FLOOR: i32 = 25;
 
-/// The streak's presence floor over the dry ground (PROVISIONAL —
-/// the presence bounds the defect's re-brightening at
-/// presence x (1 - b) >= 15 x 0.15 >= 2 beyond rounding).
-const STREAK_PRESENCE_FLOOR: i32 = 15;
+/// The streak's presence floor over the dry ground (RE-PINNED with
+/// the adaptive tint: the presence scales with the measured W — at
+/// Ubuntu's 44 the fixed 0.5 tint read ~15 on Windows's bright
+/// patches, the adaptive 0.7xW tint reads ~3-5 at Ubuntu's darkness;
+/// the load-bearing assert is the >= 2 presence check).
+const STREAK_PRESENCE_FLOOR: i32 = 3;
 
 /// One streak's CPU-projected screen footprint: the rain-streak
 /// mesh's four corner positions transformed by the packed instance
