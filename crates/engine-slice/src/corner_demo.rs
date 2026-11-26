@@ -51,14 +51,74 @@ const AUDIO_CLASS_MAPPINGS: [ClassMapping; 1] = [ClassMapping {
     sound_class: SOUND_CLASS_FOOTSTEP,
 }];
 
-/// The footstep interval (seconds per step). PRESENTATION-SIDE
-/// timing, NOT deterministic state: which footstep fires when is the
-/// audible rendering's business (the audio map's constraint 1.1:
-/// "the audible rendering is outside the contract") — this constant
-/// and the accumulator it drives never enter the spine, a
-/// fingerprint, or a measured claim. 0.65 s is a reasonable walk
-/// cadence at the crowd's strolling speeds.
-const AUDIO_STEP_INTERVAL: f32 = 0.65;
+/// One presented frame's footstep observations from the COMMITTED
+/// locomotion states — finding 10's corrective: the contacts derive
+/// from CROSSINGS OF THE COMMITTED WALKING PHASE, never from a
+/// reset-on-stand accumulator. A footstep fires when NPC i's
+/// `stride_phase` crosses a HALF-STRIDE boundary (0.5, or the wrap
+/// at 1.0) between the previous and current observation — two
+/// contacts per stride cycle, the cadence the animation core's own
+/// `WALK_STRIDE_SECONDS` (1.1 s over the 1.54 m stride at 1.4 m/s)
+/// implies, individually scaled by each NPC's own `speed_scale`.
+///
+/// WHY THE COMMITTED PHASE (not a presentation-side accumulator):
+/// the locomotion state already carries the phase, it is updated
+/// only while actually walking (`npc_locomotion` step 9 — distance
+/// over stride, frozen when blocked, the no-foot-slide rule), and it
+/// is KEPT EXACTLY across a stand→resume (the behavior seam's own
+/// known answer: no redraw, no reset). Cadence therefore follows
+/// ACTUAL movement — distance walked, individual speed scale, and
+/// each NPC's own seed-drawn phase (the same phase the visible walk
+/// pose samples, so the audible contacts track the rendered feet) —
+/// and two walkers that stop and restart on the same tick resume
+/// from their OWN frozen phases: the pre-corrective accumulator
+/// reset both to zero every standing frame, synchronizing them
+/// forever; the committed phase cannot synchronize them.
+///
+/// PRESENTATION-SIDE and READ-ONLY (the audio map's constraint 1.1:
+/// "the audible rendering is outside the contract"): this function
+/// never mutates the spine's states; `last_phases` is the demo's own
+/// previous-frame tracker, `f32::NAN` before an NPC's first
+/// observation (the priming frame records without firing, so the
+/// first audible frame can never invent a crossing that never
+/// happened). Neither the tracker nor the observations enter the
+/// spine, a fingerprint, or a measured claim.
+fn project_footstep_observations(
+    states: &[engine_core::npc_locomotion::NpcLocomotion],
+    position_of: impl Fn(usize) -> [f32; 3],
+    last_phases: &mut [f32],
+    observations: &mut Vec<ActivityObservation>,
+) {
+    for (i, state) in states.iter().enumerate() {
+        let previous = last_phases[i];
+        last_phases[i] = state.stride_phase;
+        // The priming frame: record without firing.
+        if !previous.is_finite() {
+            continue;
+        }
+        // Standing is silence — and the tracker keeps the frozen
+        // committed phase, so a resume continues from it (the
+        // anti-synchronization property; see the headless tests).
+        if state.speed <= 0.0 {
+            continue;
+        }
+        // The half-stride boundary crossing: the committed phase
+        // lives in [0, 1), so `phase * 2` floors to 0 or 1 and a
+        // change between observations is a crossing of 0.5 (0 → 1)
+        // or the wrap (1 → 0). A blocked walker's phase is frozen,
+        // so a walker pinned against a wall is audibly still too.
+        let before = (previous * 2.0) as i32;
+        let after = (state.stride_phase * 2.0) as i32;
+        if before != after {
+            observations.push(ActivityObservation {
+                emitter: SoundEmitter::Npc(NpcId(i as u32)),
+                activity_class: WALKING_ACTIVITY_CLASS,
+                position: position_of(i),
+                tier: LodLevel::Full,
+            });
+        }
+    }
+}
 
 /// The rendering bridge's per-frame crowd state: the routes, states,
 /// and mask from `corner_population_locomotion`, the RETAINED instance
@@ -1059,22 +1119,24 @@ fn run_free_look(
     } else {
         None
     };
-    // The per-NPC step accumulator (fixed [f32; 24] — the crowd's NPC
-    // count). PRESENTATION-SIDE timing, NOT deterministic state:
-    // which footstep fires when is the audible rendering's business
-    // The per-NPC phase offset (the rig-walk corrective: the walk
-    // cycle's own anti-lockstep pattern — "per-NPC phase offsets so
-    // the crowd does not march in lockstep" — applied to the AUDIO
-    // step cycle; without it, all 24 accumulators start at zero and
-    // fire simultaneously every interval, producing one mass click
-    // at a constant tempo from everywhere at once). NPC i starts at
-    // i/24 of the interval, so the 24 footsteps spread evenly across
-    // the cadence. PRESENTATION-SIDE TIMING outside the contract
-    // (the audio map's constraint 1.1: "the audible rendering is
-    // outside the contract") - this array never enters the spine, a
-    // fingerprint, or a measured claim.
-    let mut step_accumulators: [f32; 24] =
-        std::array::from_fn(|i| (i as f32 / 24.0) * AUDIO_STEP_INTERVAL);
+    // The per-NPC committed-phase tracker (finding 10's corrective —
+    // see `project_footstep_observations`): `last_phases[i]` carries
+    // NPC i's committed `stride_phase` as of the previous observed
+    // frame, `f32::NAN` before the first observation (the priming
+    // frame). It is NEVER reset on a standing frame — the committed
+    // phase itself freezes when the NPC stands (`npc_locomotion`
+    // step 9 runs only at speed > 0, and the behavior seam's
+    // stand→resume keeps the phase exactly), so two walkers that
+    // stop and restart on the same tick resume from their OWN
+    // frozen phases and can never re-synchronize. The rig-walk
+    // corrective's anti-lockstep property survives the same way:
+    // `start_route` draws each walker's initial phase from its own
+    // seed, so the 24 walkers' contacts spread across the cadence
+    // without any presentation-side offset. PRESENTATION-SIDE TIMING
+    // outside the contract (the audio map's constraint 1.1: "the
+    // audible rendering is outside the contract") — this array never
+    // enters the spine, a fingerprint, or a measured claim.
+    let mut last_phases: [f32; 24] = [f32::NAN; 24];
     // The observation/trigger buffers, retained across frames (zero
     // allocation after the first audio frame — the crowd's own
     // retained-buffer discipline).
@@ -1228,36 +1290,23 @@ fn run_free_look(
         // nothing accumulates nothing — feet only move on presented
         // frames).
         if let (Some(audio), Some(crowd)) = (audio_device.as_mut(), crowd.as_ref()) {
+            let crowd: &LocomotionCrowd = crowd;
             observations.clear();
-            // The step accumulator: each WALKING NPC (speed > 0 from
-            // the crowd states — the same states the rendering bridge
-            // re-packs) accumulates the tick's own dt (the
-            // deterministic 1/60 the crowd stepped, so footsteps stay
-            // in lockstep with the visible walking — never the wall
-            // clock, which uncapped presentation decouples); past the
-            // step interval one footstep observation fires and the
-            // accumulator resets. A standing NPC resets (no
-            // half-steps carry across a stand).
-            for (i, state) in crowd.states().iter().enumerate() {
-                if state.speed > 0.0 {
-                    step_accumulators[i] += 1.0 / 60.0;
-                    if step_accumulators[i] >= AUDIO_STEP_INTERVAL {
-                        step_accumulators[i] = 0.0;
-                        observations.push(ActivityObservation {
-                            emitter: SoundEmitter::Npc(NpcId(i as u32)),
-                            activity_class: WALKING_ACTIVITY_CLASS,
-                            // The instance position — the same
-                            // [x, 0.02, z] the rendering bridge reads.
-                            position: crowd.instances[i].transform.pos,
-                            // Free-look is the near field: the Full
-                            // LOD tier projects.
-                            tier: LodLevel::Full,
-                        });
-                    }
-                } else {
-                    step_accumulators[i] = 0.0;
-                }
-            }
+            // Finding 10's corrective: the footstep contacts derive
+            // from crossings of the COMMITTED walking phase (see
+            // `project_footstep_observations`) — read-only over the
+            // crowd's states, cadence following actual movement, and
+            // stop→restart can never synchronize walkers. The
+            // observation position is the instance position — the
+            // same [x, 0.02, z] the rendering bridge packs (the
+            // instances were re-packed by the step above, so the
+            // audible contact is at the visible walker).
+            project_footstep_observations(
+                crowd.states(),
+                |i| crowd.instances[i].transform.pos,
+                &mut last_phases,
+                &mut observations,
+            );
             // The projection (the pure trigger core) then the device
             // submission. The typed overflow refusal is observed
             // fail-visibly — unreachable at the crowd's 24-NPC scale
@@ -1270,19 +1319,31 @@ fn run_free_look(
                     overflow.dropped
                 );
             }
-            audio.submit_triggers(&triggers);
-            // The listener: the camera's own basis — camera_forward/
-            // camera_right are the rotation matrix's columns, so they
-            // arrive pre-normalized and orthogonal (the Listener
-            // contract); the falloff is the slice's spatial policy
-            // (reference distance 4, rolloff 1).
-            audio.set_listener(Listener {
-                position: camera.position,
-                forward: camera_forward(camera.yaw, camera.pitch, 0.),
-                right: camera_right(camera.yaw, camera.pitch, 0.),
-                ref_distance: 4.0,
-                rolloff: 1.0,
-            });
+            // Finding 9's corrective: THE ATOMIC PUBLICATION — the
+            // trigger batch and the listener snapshot go to the
+            // device TOGETHER, in ONE command-cell acquisition (the
+            // old wiring published the triggers, unlocked, then
+            // published the listener in a SECOND acquisition, so a
+            // callback draining in between spatialized the new
+            // triggers against the OLD camera, and batched frames
+            // collapsed onto the latest listener). Each drained
+            // batch is now panned against the listener it was
+            // published with. The listener itself: the camera's own
+            // basis — camera_forward/camera_right are the rotation
+            // matrix's columns, so they arrive pre-normalized and
+            // orthogonal (the Listener contract); the falloff is the
+            // slice's spatial policy (reference distance 4, rolloff
+            // 1).
+            audio.submit_triggers(
+                &triggers,
+                Listener {
+                    position: camera.position,
+                    forward: camera_forward(camera.yaw, camera.pitch, 0.),
+                    right: camera_right(camera.yaw, camera.pitch, 0.),
+                    ref_distance: 4.0,
+                    rolloff: 1.0,
+                },
+            );
         }
         presented += 1;
         if presented == WARMUP as u64 {
@@ -1331,9 +1392,10 @@ fn run_free_look(
     if let Some(audio) = &audio_device {
         let stats = audio.stats();
         println!(
-            "audio: underruns {}, worst callback {} ns, voices active {}, \
-             voices stolen {}, triggers dropped {}; residency {} bytes",
-            stats.underruns,
+            "audio: callbacks {}, write rejections {}, worst callback {} ns, \
+             voices active {}, voices stolen {}, triggers dropped {}; residency {} bytes",
+            stats.callbacks,
+            stats.write_rejections,
             stats.worst_callback_ns,
             stats.voices_active,
             stats.voices_stolen,
@@ -1480,5 +1542,251 @@ mod tests {
         }
         assert_eq!(camera.pitch, FREE_LOOK_PITCH_LIMIT);
         assert!(camera.pitch < std::f32::consts::FRAC_PI_2);
+    }
+
+    // ------------------------------------------------- finding 10
+    // The footstep projection's headless deciding tests: trigger
+    // ticks and positions compared directly against hand-built
+    // committed locomotion states (the projection is read-only, so
+    // no spine is needed — the states are the same Copy type the
+    // crowd owns).
+
+    /// A walking state fixture at an authored phase (the committed
+    /// fields the projection reads: speed and stride_phase; the rest
+    /// are inert shape).
+    fn walking_state(phase: f32, speed: f32) -> engine_core::npc_locomotion::NpcLocomotion {
+        engine_core::npc_locomotion::NpcLocomotion {
+            position: [0.0, 0.0],
+            facing: 0,
+            route: 0,
+            leg: 0,
+            leg_distance: 0.0,
+            destination: 1,
+            speed,
+            speed_scale: 1.0,
+            lateral: 0.0,
+            stride_phase: phase,
+        }
+    }
+
+    /// Advances one committed tick the way `npc_locomotion` step 9
+    /// does (phase += distance / stride, wrapped into [0, 1), frozen
+    /// at speed 0) — the tests' own model of the committed walk, so
+    /// the projection is exercised against the state's real
+    /// arithmetic at the crowd's own constants (1.4 m/s, 1.54 m
+    /// stride, 1/60 tick).
+    fn advance_phase(state: &mut engine_core::npc_locomotion::NpcLocomotion) {
+        const STRIDE_LENGTH: f32 = 1.54;
+        if state.speed > 0.0 {
+            state.stride_phase += state.speed / 60.0 / STRIDE_LENGTH;
+            if state.stride_phase >= 1.0 {
+                state.stride_phase -= state.stride_phase.floor();
+            }
+        }
+    }
+
+    /// The half-stride boundary known answers: the priming frame
+    /// records without firing; ordinary in-half movement does not
+    /// fire; the 0.5 crossing fires; the wrap fires; a standing NPC
+    /// (frozen phase) never fires. The observation carries the
+    /// walker's identity, the instance position, the walking class,
+    /// and the Full tier.
+    #[test]
+    fn footstep_contacts_fire_on_half_stride_crossings() {
+        let mut states = [walking_state(0.9, 1.4)];
+        let mut last_phases = [f32::NAN; 1];
+        let mut observations = Vec::new();
+        let position_of = |i: usize| [10.0 + i as f32, 0.02, -3.0];
+        // Priming: the first observation records, never fires.
+        project_footstep_observations(&states, position_of, &mut last_phases, &mut observations);
+        assert!(observations.is_empty(), "the priming frame does not fire");
+        // Ordinary movement inside a half-stride: no contact.
+        advance_phase(&mut states[0]);
+        project_footstep_observations(&states, position_of, &mut last_phases, &mut observations);
+        assert!(observations.is_empty(), "no boundary, no contact");
+        // The 0.5 crossing: one contact, carrying identity and
+        // position.
+        states[0].stride_phase = 0.49;
+        last_phases[0] = 0.49;
+        advance_phase(&mut states[0]);
+        assert!(states[0].stride_phase > 0.5, "the fixture crossed 0.5");
+        project_footstep_observations(&states, position_of, &mut last_phases, &mut observations);
+        assert_eq!(observations.len(), 1, "the 0.5 crossing fires");
+        assert_eq!(
+            observations[0].emitter,
+            SoundEmitter::Npc(NpcId(0)),
+            "the walker's identity"
+        );
+        assert_eq!(
+            observations[0].position,
+            [10.0, 0.02, -3.0],
+            "the instance position the rendering bridge packs"
+        );
+        assert_eq!(observations[0].activity_class, WALKING_ACTIVITY_CLASS);
+        assert_eq!(observations[0].tier, LodLevel::Full);
+        observations.clear();
+        // The wrap: 0.99 → 0.01 is the 1.0 boundary — one contact.
+        states[0].stride_phase = 0.99;
+        last_phases[0] = 0.99;
+        advance_phase(&mut states[0]);
+        assert!(states[0].stride_phase < 0.5, "the fixture wrapped");
+        project_footstep_observations(&states, position_of, &mut last_phases, &mut observations);
+        assert_eq!(observations.len(), 1, "the wrap crossing fires");
+        observations.clear();
+        // Standing: the committed phase freezes, so nothing crosses.
+        states[0].speed = 0.0;
+        for _ in 0..10 {
+            advance_phase(&mut states[0]);
+            project_footstep_observations(
+                &states,
+                position_of,
+                &mut last_phases,
+                &mut observations,
+            );
+            assert!(observations.is_empty(), "standing is silence");
+        }
+    }
+
+    /// FINDING 10's DECIDING TEST — stop → simultaneous restart must
+    /// NOT synchronize. Two walkers with different committed phases
+    /// (the seed draws), walking the same speed, both STOP on the
+    /// same tick, stand, then both RESUME on the same tick. The
+    /// pre-corrective accumulator reset to zero on every standing
+    /// frame, so the two struck together on every interval after the
+    /// restart; the committed-phase derivation keeps each walker's
+    /// OWN frozen phase across the stand, so the two fire sequences
+    /// stay offset — never the same trigger tick — while both keep
+    /// walking (cadence preserved) and the stand itself is silent.
+    #[test]
+    fn stop_and_simultaneous_restart_never_synchronizes_walkers() {
+        let mut states = [walking_state(0.2, 1.4), walking_state(0.75, 1.4)];
+        let mut last_phases = [f32::NAN; 2];
+        let mut observations = Vec::new();
+        let position_of = |i: usize| [i as f32, 0.02, 0.0];
+        let npc_of = |observation: &ActivityObservation| match observation.emitter {
+            SoundEmitter::Npc(NpcId(id)) => id as usize,
+            SoundEmitter::World(_) => usize::MAX,
+        };
+        let mut fires: [Vec<u64>; 2] = [Vec::new(), Vec::new()];
+        let mut tick: u64 = 0;
+        // Prime, then walk 30 ticks (both fire, never together —
+        // phases 0.2 and 0.75 are 0.55 of a cycle apart, which at
+        // 0.0151515 cycles/tick is never an integer number of ticks
+        // from a shared half-stride boundary).
+        project_footstep_observations(&states, position_of, &mut last_phases, &mut observations);
+        for _ in 0..30 {
+            tick += 1;
+            for state in &mut states {
+                advance_phase(state);
+            }
+            observations.clear();
+            project_footstep_observations(
+                &states,
+                position_of,
+                &mut last_phases,
+                &mut observations,
+            );
+            for observation in &observations {
+                fires[npc_of(observation)].push(tick);
+            }
+        }
+        assert!(
+            !fires[0].is_empty() && !fires[1].is_empty(),
+            "both walk audibly"
+        );
+        assert!(
+            fires[0].iter().all(|tick| !fires[1].contains(tick)),
+            "different phases never share a trigger tick while walking"
+        );
+        // Both STOP on the same tick; the stand is silent.
+        for state in &mut states {
+            state.speed = 0.0;
+        }
+        for _ in 0..20 {
+            tick += 1;
+            for state in &mut states {
+                advance_phase(state);
+            }
+            observations.clear();
+            project_footstep_observations(
+                &states,
+                position_of,
+                &mut last_phases,
+                &mut observations,
+            );
+            assert!(observations.is_empty(), "the simultaneous stand is silence");
+        }
+        // Both RESUME on the same tick, the same speed: each
+        // continues from its OWN frozen phase — the fire sequences
+        // stay offset (this is the assertion the reset-on-stand
+        // accumulator could never hold).
+        for state in &mut states {
+            state.speed = 1.4;
+        }
+        for _ in 0..100 {
+            tick += 1;
+            for state in &mut states {
+                advance_phase(state);
+            }
+            observations.clear();
+            project_footstep_observations(
+                &states,
+                position_of,
+                &mut last_phases,
+                &mut observations,
+            );
+            for observation in &observations {
+                fires[npc_of(observation)].push(tick);
+            }
+        }
+        let walker_a_after_resume = fires[0].iter().filter(|&&t| t > 50).count();
+        let walker_b_after_resume = fires[1].iter().filter(|&&t| t > 50).count();
+        assert!(
+            walker_a_after_resume >= 2 && walker_b_after_resume >= 2,
+            "both keep their cadence after the simultaneous restart"
+        );
+        assert!(
+            fires[0].iter().all(|tick| !fires[1].contains(tick)),
+            "the simultaneous restart never synchronizes the walkers"
+        );
+    }
+
+    /// Cadence follows ACTUAL movement: two walkers at the same
+    /// phase but different effective speeds (the crowd's own
+    /// speed_scale spread, 1.0 vs 1.1 × the 1.4 m/s base over the
+    /// 1.54 m stride) produce different contact counts over the
+    /// same window — 250 ticks gives 3.79 cycles (7 half-stride
+    /// contacts) against 4.17 cycles (8 contacts), the exact
+    /// arithmetic of the committed phase advance.
+    #[test]
+    fn different_stride_speeds_produce_different_cadences() {
+        let mut states = [walking_state(0.0, 1.4), walking_state(0.0, 1.4 * 1.1)];
+        let mut last_phases = [f32::NAN; 2];
+        let mut observations = Vec::new();
+        let position_of = |_: usize| [0.0, 0.02, 0.0];
+        let mut slower_fires = 0;
+        let mut faster_fires = 0;
+        project_footstep_observations(&states, position_of, &mut last_phases, &mut observations);
+        for _ in 0..250 {
+            for state in &mut states {
+                advance_phase(state);
+            }
+            observations.clear();
+            project_footstep_observations(
+                &states,
+                position_of,
+                &mut last_phases,
+                &mut observations,
+            );
+            for observation in &observations {
+                match observation.emitter {
+                    SoundEmitter::Npc(NpcId(0)) => slower_fires += 1,
+                    SoundEmitter::Npc(NpcId(1)) => faster_fires += 1,
+                    SoundEmitter::Npc(_) | SoundEmitter::World(_) => unreachable!(),
+                }
+            }
+        }
+        assert_eq!(slower_fires, 7, "3.79 cycles → 7 half-stride contacts");
+        assert_eq!(faster_fires, 8, "4.17 cycles → 8 half-stride contacts");
     }
 }

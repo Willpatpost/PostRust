@@ -56,14 +56,32 @@
 //!   trigger projection's `TRIGGER_POOL_BOUND`), the f32 mix
 //!   scratch, the i16 output scratch, and the resident bed PCM are
 //!   all built at construction (asset time, where allocation is
-//!   legal). The callback allocates nothing, waits on no lock (the
-//!   command cell is drained with `try_lock` — a failed attempt
-//!   defers the drain by one device period; it never blocks), and
-//!   does bounded work (at most the fixed ring's worth of voice
-//!   starts plus a fixed chunk of mixing per invocation).
-//! - **Fail-visible counters (§4):** underruns (a refused put — SDL
-//!   plays silence for the shortfall), worst callback cost in
-//!   nanoseconds, the live voice count, voice steals, and dropped
+//!   legal). The callback allocates nothing on the Rust side (the
+//!   in-file test seam MEASURES this under contention and across
+//!   multi-chunk requests, through the identical callback body with
+//!   a test sink; the one boundary exception is SDL's own
+//!   error-string construction inside the pinned sdl3 crate on a
+//!   REJECTED write — failure path only, stated at the sink). It
+//!   waits on no lock (the command cell is drained with `try_lock`
+//!   — a failed attempt defers the drain by one device period; it
+//!   never blocks), and does bounded work (at most the fixed ring's
+//!   worth of voice starts plus a fixed chunk of mixing per
+//!   invocation).
+//! - **The atomic publication (the finding-9 law):** the trigger
+//!   batch and the listener snapshot publish TOGETHER, in ONE
+//!   command-cell acquisition, and keep that association through
+//!   the bounded queue — every drained trigger is spatialized
+//!   against the listener it was published with (emission-time
+//!   spatialization: the gains are fixed when the voice starts, so
+//!   a transient can never spend its entire audible lifetime on the
+//!   wrong side of a turned camera, and a callback that drains two
+//!   batched frames never collapses both onto the latest listener).
+//! - **Fail-visible counters (§4):** write rejections (the device
+//!   stream refused a mixed chunk — SDL plays silence for the
+//!   shortfall; NOT a device-underrun count — SDL's callback API
+//!   does not expose actual underruns), the callback count and the
+//!   worst callback cost in nanoseconds (the separate timing
+//!   metrics), the live voice count, voice steals, and dropped
 //!   triggers are Relaxed atomics — the truncation-counter pattern;
 //!   [`AudioStats`] reads them.
 //! - **Lazy + typed degradation (§1.5, §4.6):** [`AudioDevice::try_new`]
@@ -609,14 +627,34 @@ impl std::error::Error for AudioError {}
 /// truncation-counter pattern: every anomaly is COUNTED, never
 /// swallowed). All counters are Relaxed atomics written on the audio
 /// thread and read here — diagnostics, never synchronization.
+///
+/// WHAT EACH STAT MEANS, PRECISELY (the finding-11 naming
+/// corrective): SDL's callback API does not expose actual device
+/// underruns (periods where the hardware ran out of buffered
+/// audio), so no counter here claims that name. `write_rejections`
+/// counts what IS observable on our side of the boundary: mixed
+/// chunks the device stream refused. `callbacks` and
+/// `worst_callback_ns` are the separate timing/deadline metrics —
+/// the worst cost is only meaningful against the invocation count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioStats {
-    /// Device underruns: callback invocations where SDL refused the
-    /// mixed chunk (the device then plays silence for the shortfall).
-    /// Zero across warmed frames is the §4.1 gate.
-    pub underruns: u64,
+    /// Callback invocations observed (the denominator behind
+    /// `worst_callback_ns` — the deadline metric's context).
+    pub callbacks: u64,
+    /// Writes the device stream REFUSED (SDL's put returned an
+    /// error): the rejected chunk's already-mixed audio is DROPPED —
+    /// the device plays silence for those frames — and the callback
+    /// stops submitting for that invocation; the next invocation
+    /// mixes and submits afresh (the dropped frames are never
+    /// re-submitted: their voices' cursors advanced when the chunk
+    /// was rendered). This is a count of refused writes on OUR side
+    /// of the device boundary, NOT of device underruns (SDL's
+    /// callback API does not expose those). Zero across warmed
+    /// frames is the §4.1 gate.
+    pub write_rejections: u64,
     /// The worst (maximum) callback wall cost in nanoseconds — the
-    /// §4.2 gate's tail metric, budgeted against the device period.
+    /// §4.2 gate's tail metric, budgeted against the device period
+    /// and read against [`AudioStats::callbacks`].
     pub worst_callback_ns: u64,
     /// Voices currently audible (the one-shot pool plus the bed, if
     /// playing).
@@ -630,22 +668,39 @@ pub struct AudioStats {
     pub triggers_dropped: u64,
 }
 
-/// The command cell's payload: the listener snapshot plus the bounded
-/// trigger ring (fixed slots, head/count indices — no allocation on
-/// either side; the slots are overwritten in place).
-struct SharedCommands {
+/// One queued command (the finding-9 atomic publication): a trigger
+/// AND the listener snapshot it must be spatialized against, paired
+/// at publication and kept together through the bounded queue. The
+/// pair is plain `Copy` data, so the ring stays allocation-free on
+/// both sides; the listener repeats within one batch (the
+/// publication's snapshot), which is the documented cost of keeping
+/// the association per-slot.
+#[derive(Debug, Clone, Copy)]
+struct QueuedSound {
+    trigger: SoundTrigger,
     listener: Listener,
-    ring: Box<[SoundTrigger; TRIGGER_QUEUE_CAPACITY]>,
-    /// The oldest queued trigger's slot.
+}
+
+/// The command cell's payload: the bounded queue of
+/// (trigger, listener) pairs (fixed slots, head/count indices — no
+/// allocation on either side; the slots are overwritten in place).
+/// There is deliberately NO separate "current listener" field: the
+/// listener reaches the mixer ONLY as part of a publication, so a
+/// trigger can never be drained against a listener from a different
+/// frame.
+struct SharedCommands {
+    ring: Box<[QueuedSound; TRIGGER_QUEUE_CAPACITY]>,
+    /// The oldest queued command's slot.
     head: usize,
-    /// The queued trigger count (`head + count` is the next write).
+    /// The queued command count (`head + count` is the next write).
     count: usize,
 }
 
 /// The audio-thread counters (Relaxed — fail-visible diagnostics,
 /// never synchronization).
 struct AudioCounters {
-    underruns: AtomicU64,
+    callbacks: AtomicU64,
+    write_rejections: AtomicU64,
     worst_callback_ns: AtomicU64,
     voices_active: AtomicU32,
     voices_stolen: AtomicU64,
@@ -667,21 +722,24 @@ impl SharedAudio {
         // The ring's placeholder slot: an unmapped class (0), so even
         // a never-written slot drained by a bug is silence, not a
         // crash.
-        let placeholder = SoundTrigger {
-            class: 0,
-            emitter: SoundEmitter::World(0),
-            position: [0.0; 3],
-            tier: LodLevel::Full,
+        let placeholder = QueuedSound {
+            trigger: SoundTrigger {
+                class: 0,
+                emitter: SoundEmitter::World(0),
+                position: [0.0; 3],
+                tier: LodLevel::Full,
+            },
+            listener: Listener::default(),
         };
         SharedAudio {
             commands: Mutex::new(SharedCommands {
-                listener: Listener::default(),
                 ring: Box::new([placeholder; TRIGGER_QUEUE_CAPACITY]),
                 head: 0,
                 count: 0,
             }),
             counters: AudioCounters {
-                underruns: AtomicU64::new(0),
+                callbacks: AtomicU64::new(0),
+                write_rejections: AtomicU64::new(0),
                 worst_callback_ns: AtomicU64::new(0),
                 voices_active: AtomicU32::new(0),
                 voices_stolen: AtomicU64::new(0),
@@ -690,13 +748,17 @@ impl SharedAudio {
         }
     }
 
-    /// The producer side (main thread): appends triggers to the ring,
-    /// bounded, counting refusals fail-visibly. Mutex poisoning is
-    /// recovered by taking the cell's payload anyway — the slots are
-    /// plain Copy data, structurally valid through any panic (and
-    /// the callback cannot panic: every path is a bounds-checked walk
-    /// over fixed buffers, no unwrap, no division).
-    fn submit(&self, triggers: &[SoundTrigger]) {
+    /// The producer side (main thread): THE ATOMIC PUBLICATION — the
+    /// trigger batch and the listener snapshot enter the cell in ONE
+    /// lock acquisition and are queued as (trigger, listener) pairs,
+    /// so the association survives any interleaving of producer and
+    /// callback drain. Bounded, counting refusals fail-visibly.
+    /// Mutex poisoning is recovered by taking the cell's payload
+    /// anyway — the slots are plain Copy data, structurally valid
+    /// through any panic (and the callback cannot panic: every path
+    /// is a bounds-checked walk over fixed buffers, no unwrap, no
+    /// division).
+    fn submit(&self, triggers: &[SoundTrigger], listener: Listener) {
         let mut commands = self
             .commands
             .lock()
@@ -709,18 +771,9 @@ impl SharedAudio {
                 continue;
             }
             let slot = (commands.head + commands.count) % TRIGGER_QUEUE_CAPACITY;
-            commands.ring[slot] = trigger;
+            commands.ring[slot] = QueuedSound { trigger, listener };
             commands.count += 1;
         }
-    }
-
-    /// The producer side: publishes the listener snapshot the next
-    /// drain will pan against.
-    fn set_listener(&self, listener: Listener) {
-        self.commands
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .listener = listener;
     }
 }
 
@@ -839,7 +892,11 @@ impl MixerCore {
     /// callback cannot cause) DEFERS the drain by one device period —
     /// the audio thread never waits on a lock (§1.2's "no locks on
     /// contended paths" read as no BLOCKING; the producer's critical
-    /// section is a bounded copy of Copy slots, microseconds).
+    /// section is a bounded copy of Copy slots, microseconds). Each
+    /// drained command carries its OWN listener snapshot (the
+    /// finding-9 atomic publication): a drain that empties two
+    /// batched frames spatializes each against the listener that
+    /// frame was published with, never a single latest one.
     fn drain_commands(&mut self) {
         // The Arc clone releases the self borrow so `start_voice`
         // can take `&mut self` while the guard lives (a refcount
@@ -848,12 +905,11 @@ impl MixerCore {
         let Ok(mut commands) = shared.commands.try_lock() else {
             return;
         };
-        let listener = commands.listener;
         while commands.count > 0 {
-            let trigger = commands.ring[commands.head];
+            let command = commands.ring[commands.head];
             commands.head = (commands.head + 1) % TRIGGER_QUEUE_CAPACITY;
             commands.count -= 1;
-            self.start_voice(trigger, listener);
+            self.start_voice(command.trigger, command.listener);
         }
     }
 
@@ -974,41 +1030,80 @@ impl MixerCore {
     }
 }
 
-impl AudioCallback<i16> for MixerCore {
-    /// THE AUDIO THREAD (§1.2's strictest discipline): drains the
-    /// command cell (try_lock — never waits), mixes the requested
-    /// sample count in bounded chunks through the pre-allocated
-    /// scratch, hands each chunk to SDL, and publishes the counters.
-    /// No allocation (everything touched is pre-allocated; SDL's own
-    /// internal put handling is SDL's, inside its locked queue), no
-    /// blocking, no unbounded walk (chunk ≤ [`MIX_CHUNK_FRAMES`];
-    /// drain ≤ the fixed ring). SDL requests whole stereo frames —
-    /// an odd trailing sample count (never observed) is ignored
-    /// rather than mixed into a half frame.
-    fn callback(&mut self, stream: &mut AudioStream, requested: i32) {
+impl MixerCore {
+    /// THE CALLBACK BODY (finding 11's test seam): the identical
+    /// code SDL's audio thread runs, with the device boundary
+    /// abstracted to a boolean sink — `put(chunk)` stands in for
+    /// `AudioStream::put_data_i16` and answers whether the device
+    /// stream took the bytes. The in-file device tests drive THIS
+    /// body (never a copy) with recording and refusing sinks, under
+    /// contention and across multi-chunk requests, which is how the
+    /// allocation law and the rejected-write behavior are measured
+    /// without SDL.
+    ///
+    /// The rejected-write behavior, made explicit: the refused
+    /// chunk's already-mixed frames are DROPPED (the device plays
+    /// silence for them; they are never re-submitted — the voices'
+    /// cursors advanced when the chunk was rendered), the loop
+    /// stops submitting for THIS invocation, the refusal is counted
+    /// in [`AudioStats::write_rejections`], and the next invocation
+    /// drains and mixes afresh. Counted, never silent.
+    fn run_callback(&mut self, requested: i32, put: &mut dyn FnMut(&[i16]) -> bool) {
         let started = Instant::now();
         self.drain_commands();
-        let mut underruns: u64 = 0;
+        let mut rejections: u64 = 0;
         let mut remaining = requested.max(0) as usize;
         while remaining >= 2 {
             let frames = (remaining / 2).min(MIX_CHUNK_FRAMES);
             let samples = frames * 2;
             self.render_chunk(frames);
-            if stream.put_data_i16(&self.out[..samples]).is_err() {
-                // SDL refused the chunk: the device plays silence for
-                // the shortfall — the underrun, counted fail-visibly.
-                underruns += 1;
+            if !put(&self.out[..samples]) {
+                rejections += 1;
                 break;
             }
             remaining -= samples;
         }
         let counters = &self.shared.counters;
-        counters.underruns.fetch_add(underruns, Ordering::Relaxed);
+        counters.callbacks.fetch_add(1, Ordering::Relaxed);
+        counters
+            .write_rejections
+            .fetch_add(rejections, Ordering::Relaxed);
         counters
             .worst_callback_ns
             .fetch_max(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let active = self.voices.iter().filter(|voice| voice.active).count() as u32;
         counters.voices_active.store(active, Ordering::Relaxed);
+    }
+}
+
+impl AudioCallback<i16> for MixerCore {
+    /// THE AUDIO THREAD (§1.2's strictest discipline): the whole body
+    /// lives in [`MixerCore::run_callback`] (drain with `try_lock`,
+    /// bounded multi-chunk mixing through the pre-allocated
+    /// scratch, counters). No allocation on the Rust side, no
+    /// blocking, no unbounded walk (chunk ≤ [`MIX_CHUNK_FRAMES`];
+    /// drain ≤ the fixed ring). SDL requests whole stereo frames —
+    /// an odd trailing sample count (never observed) is ignored
+    /// rather than mixed into a half frame.
+    ///
+    /// THE SDL BOUNDARY, STATED HONESTLY (finding 11a): this sink is
+    /// the ONE place the pinned sdl3 crate's wrapper touches the
+    /// device, and its safe API offers no put that cannot fail —
+    /// `put_data_i16` returns `Result`, and on a REJECTED write the
+    /// wrapper constructs an owned error string BEFORE this closure
+    /// sees the failure. That is one Rust allocation on the audio
+    /// thread, on the failure path only: the success path (every
+    /// ordinary callback) allocates nothing on the Rust side —
+    /// measured through the identical body with a test sink by the
+    /// device tests below. A rejection can occur when SDL refuses
+    /// the put (per SDL's `SDL_PutAudioStreamData` contract: an
+    /// error return, in practice a stream that is no longer
+    /// functional); SDL copies the submitted bytes internally into
+    /// its own locked queue (SDL's memory, not Rust's allocator).
+    fn callback(&mut self, stream: &mut AudioStream, requested: i32) {
+        self.run_callback(requested, &mut |samples| {
+            stream.put_data_i16(samples).is_ok()
+        });
     }
 }
 
@@ -1070,7 +1165,7 @@ impl AudioDevice {
         let shared = Arc::new(SharedAudio::new());
         let core = MixerCore::new(Arc::clone(&shared));
         let resident_bytes =
-            core.resident_bytes() + (TRIGGER_QUEUE_CAPACITY * size_of::<SoundTrigger>()) as u64;
+            core.resident_bytes() + (TRIGGER_QUEUE_CAPACITY * size_of::<QueuedSound>()) as u64;
         let spec = AudioSpec {
             freq: Some(DEVICE_SAMPLE_RATE),
             channels: Some(DEVICE_CHANNELS),
@@ -1094,29 +1189,29 @@ impl AudioDevice {
         })
     }
 
-    /// The trigger consumer (the main thread, once per tick): appends
-    /// the projection's bounded output to the ring the callback
-    /// drains at ITS start. Bounded and fail-visible — refusals land
-    /// in [`AudioStats::triggers_dropped`].
-    pub fn submit_triggers(&mut self, triggers: &[SoundTrigger]) {
-        self.shared.submit(triggers);
+    /// The producer side (the main thread, once per tick): THE ATOMIC
+    /// PUBLICATION — the projection's bounded trigger batch and the
+    /// listener snapshot enter the command cell in ONE lock
+    /// acquisition, queued as pairs the callback drains together
+    /// (emission-time spatialization: each drained trigger is panned
+    /// and attenuated against the listener it was published with —
+    /// the camera/pose layer's data, gains derived AT the callback,
+    /// never in the trigger core). Bounded and fail-visible —
+    /// refusals land in [`AudioStats::triggers_dropped`].
+    pub fn submit_triggers(&mut self, triggers: &[SoundTrigger], listener: Listener) {
+        self.shared.submit(triggers, listener);
     }
 
-    /// Publishes the listener snapshot the next drain pans and
-    /// attenuates against (the camera/pose layer's data — the gains
-    /// are derived AT the callback, never in the trigger core).
-    pub fn set_listener(&mut self, listener: Listener) {
-        self.shared.set_listener(listener);
-    }
-
-    /// The fail-visible diagnostics (§4's gates): underruns, the
-    /// worst callback cost, the live voice count, and the two
-    /// refusals (steals, drops). Relaxed reads — diagnostics, never
-    /// synchronization.
+    /// The fail-visible diagnostics (§4's gates): the callback count,
+    /// write rejections, the worst callback cost, the live voice
+    /// count, and the two refusals (steals, drops). Relaxed reads —
+    /// diagnostics, never synchronization. See [`AudioStats`] for
+    /// what each counter means precisely.
     pub fn stats(&self) -> AudioStats {
         let counters = &self.shared.counters;
         AudioStats {
-            underruns: counters.underruns.load(Ordering::Relaxed),
+            callbacks: counters.callbacks.load(Ordering::Relaxed),
+            write_rejections: counters.write_rejections.load(Ordering::Relaxed),
             worst_callback_ns: counters.worst_callback_ns.load(Ordering::Relaxed),
             voices_active: counters.voices_active.load(Ordering::Relaxed),
             voices_stolen: counters.voices_stolen.load(Ordering::Relaxed),
@@ -1142,10 +1237,119 @@ impl AudioDevice {
     }
 }
 
+/// The host-allocation counting seam for the in-file device tests
+/// (finding 11a's measurement): a `#[global_allocator]` wrapper
+/// around `std::alloc::System` that counts `alloc`/`alloc_zeroed`
+/// calls on the CURRENT THREAD while a [`HostAllocScope`] guard is
+/// alive. This is the same pattern — and the same SAFETY argument —
+/// as `engine-slice`'s `tests/common/mod.rs` host counter, placed
+/// here (inside `#[cfg(test)]`) so the callback body's allocation
+/// law can be measured through the identical code without SDL and
+/// without a new test binary.
+///
+/// SAFETY (the `unsafe impl GlobalAlloc`): every method delegates
+/// to `std::alloc::System` unchanged, inheriting its guarantees;
+/// the counting state is `thread_local!` `Cell`s incremented with
+/// no allocation inside the allocator path (no reentrancy hazard);
+/// `thread_local!` access inside `alloc` is sound for the
+/// pre-initialized non-const thread-local form used here (the
+/// fast-path check reads a `Cell<bool>` without destructors, so no
+/// registration/alloc can occur on first access). The workspace
+/// denies `unsafe_code`; this test-support module needs the one
+/// `unsafe impl GlobalAlloc` a counting allocator IS — the scoped
+/// allow keeps the deny everywhere else (the shipped library code
+/// carries none).
+#[cfg(test)]
+mod host_alloc_seam {
+    #![allow(unsafe_code)]
+
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static MEASURING: Cell<bool> = const { Cell::new(false) };
+        static ALLOC_COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    #[global_allocator]
+    static HOST_ALLOC_COUNTER: HostAllocCounter = HostAllocCounter;
+
+    /// Enables allocation counting for the current thread until
+    /// dropped. The count starts at zero on creation; `count()` reads
+    /// it at any point inside the scope.
+    pub struct HostAllocScope;
+
+    impl HostAllocScope {
+        pub fn new() -> Self {
+            ALLOC_COUNT.with(|c| c.set(0));
+            MEASURING.with(|m| m.set(true));
+            HostAllocScope
+        }
+
+        /// The allocations counted so far in this scope.
+        pub fn count(&self) -> u64 {
+            ALLOC_COUNT.with(|c| c.get())
+        }
+    }
+
+    impl Drop for HostAllocScope {
+        fn drop(&mut self) {
+            MEASURING.with(|m| m.set(false));
+        }
+    }
+
+    struct HostAllocCounter;
+
+    unsafe impl GlobalAlloc for HostAllocCounter {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            MEASURING.with(|m| {
+                if m.get() {
+                    ALLOC_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
+                }
+            });
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
+            unsafe { System.realloc(ptr, old_layout, new_size) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            MEASURING.with(|m| {
+                if m.get() {
+                    ALLOC_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
+                }
+            });
+            unsafe { System.alloc_zeroed(layout) }
+        }
+    }
+}
+
 #[cfg(test)]
 mod device_tests {
+    //! THE TEST SEAM (the documented choice for findings 9 and 11):
+    //! the tests drive [`MixerCore`] DIRECTLY — the real
+    //! [`SharedAudio`] publications, the real `drain_commands`, the
+    //! real `render_chunk`, and (since finding 11) the real
+    //! [`MixerCore::run_callback`] callback body with a boolean sink
+    //! standing in for SDL's `put_data_i16`. This is the identical
+    //! code SDL's audio thread runs, minus SDL itself — no device,
+    //! no audio thread, no window — so the per-batch pan
+    //! association, the nonblocking drain, the allocation law, and
+    //! the rejected-write behavior are all decidable headlessly.
+    //! What the seam deliberately does NOT cover is SDL's side of
+    //! the sink (its internal copy and its error-string
+    //! construction on a rejected write) — that boundary is stated
+    //! in the `callback` implementation's documentation.
+    use super::host_alloc_seam::HostAllocScope;
     use super::*;
     use engine_core::npc_behavior::NpcId;
+    use std::sync::atomic::AtomicBool;
+    use std::thread;
 
     fn core() -> (MixerCore, Arc<SharedAudio>) {
         let shared = Arc::new(SharedAudio::new());
@@ -1195,14 +1399,14 @@ mod device_tests {
         assert!(out.iter().all(|&sample| sample == 0));
     }
 
-    /// The footstep path end to end (no device needed): submit →
+    /// The footstep path end to end (no device needed): publish →
     /// drain → render produces real energy, and a HARD-RIGHT source
     /// is silent in the LEFT channel (the pan law's known answer —
     /// pan +1 is the (0, 1) gain pair).
     #[test]
     fn footstep_renders_panned_energy() {
         let (mut mixer, shared) = core();
-        shared.submit(&[footstep_at([5.0, 0.0, 0.0])]);
+        shared.submit(&[footstep_at([5.0, 0.0, 0.0])], Listener::default());
         mixer.drain_commands();
         let out = render_collect(&mut mixer, 256);
         let left: i64 = (0..256).map(|frame| out[frame * 2].abs() as i64).sum();
@@ -1211,17 +1415,20 @@ mod device_tests {
         assert!(right > 1000, "the burst is audible (energy {right})");
     }
 
-    /// The listener snapshot publishes: moving the listener pans the
-    /// same world source the other way (the `pan_from_listener`
-    /// offset known answer, through the device path).
+    /// The listener snapshot publishes WITH the batch (finding 9's
+    /// atomic publication): a moved listener pans the same world
+    /// source the other way (the `pan_from_listener` offset known
+    /// answer, through the paired device path).
     #[test]
     fn the_listener_snapshot_repanns() {
         let (mut mixer, shared) = core();
-        shared.set_listener(Listener {
-            position: [10.0, 0.0, 0.0],
-            ..Listener::default()
-        });
-        shared.submit(&[footstep_at([0.0, 0.0, 0.0])]);
+        shared.submit(
+            &[footstep_at([0.0, 0.0, 0.0])],
+            Listener {
+                position: [10.0, 0.0, 0.0],
+                ..Listener::default()
+            },
+        );
         mixer.drain_commands();
         let out = render_collect(&mut mixer, 256);
         // The source at the origin is hard LEFT of the moved listener.
@@ -1241,8 +1448,8 @@ mod device_tests {
     fn double_reference_distance_is_exactly_half_as_loud() {
         let (mut near, near_shared) = core();
         let (mut far, far_shared) = core();
-        near_shared.submit(&[footstep_at([0.0, 0.0, 4.0])]); // at the reference
-        far_shared.submit(&[footstep_at([0.0, 0.0, 8.0])]); // double, dead ahead
+        near_shared.submit(&[footstep_at([0.0, 0.0, 4.0])], Listener::default()); // at the reference
+        far_shared.submit(&[footstep_at([0.0, 0.0, 8.0])], Listener::default()); // double, dead ahead
         near.drain_commands();
         far.drain_commands();
         let near_out = render_collect(&mut near, 3840); // the whole burst
@@ -1266,7 +1473,7 @@ mod device_tests {
     #[test]
     fn the_bed_is_resident_idempotent_and_loop_clean() {
         let (mut mixer, shared) = core();
-        shared.submit(&[ambience(), ambience()]);
+        shared.submit(&[ambience(), ambience()], Listener::default());
         mixer.drain_commands();
         let beds = mixer
             .voices
@@ -1309,7 +1516,7 @@ mod device_tests {
         let triggers: Vec<SoundTrigger> = (0..VOICE_COUNT + 6)
             .map(|i| footstep_at([i as f32, 0.0, 0.0]))
             .collect();
-        shared.submit(&triggers);
+        shared.submit(&triggers, Listener::default());
         mixer.drain_commands();
         let active = mixer.voices.iter().filter(|voice| voice.active).count();
         assert_eq!(active, VOICE_COUNT, "the pool is the bound");
@@ -1335,7 +1542,7 @@ mod device_tests {
         let triggers: Vec<SoundTrigger> = (0..TRIGGER_QUEUE_CAPACITY + 44)
             .map(|i| footstep_at([i as f32, 0.0, 0.0]))
             .collect();
-        shared.submit(&triggers);
+        shared.submit(&triggers, Listener::default());
         assert_eq!(
             shared.counters.triggers_dropped.load(Ordering::Relaxed),
             44,
@@ -1357,7 +1564,10 @@ mod device_tests {
         let (mut mixer, shared) = core();
         let before = mixer.resident_bytes();
         assert!(before > 0);
-        shared.submit(&[footstep_at([1.0, 0.0, 1.0]), ambience()]);
+        shared.submit(
+            &[footstep_at([1.0, 0.0, 1.0]), ambience()],
+            Listener::default(),
+        );
         mixer.drain_commands();
         render_collect(&mut mixer, 8192);
         assert_eq!(mixer.resident_bytes(), before);
@@ -1368,13 +1578,303 @@ mod device_tests {
     #[test]
     fn unmapped_classes_are_silence() {
         let (mut mixer, shared) = core();
-        shared.submit(&[SoundTrigger {
-            class: 999,
-            ..footstep_at([1.0, 0.0, 0.0])
-        }]);
+        shared.submit(
+            &[SoundTrigger {
+                class: 999,
+                ..footstep_at([1.0, 0.0, 0.0])
+            }],
+            Listener::default(),
+        );
         mixer.drain_commands();
         assert!(mixer.voices.iter().all(|voice| !voice.active));
         let out = render_collect(&mut mixer, 64);
         assert!(out.iter().all(|&sample| sample == 0));
+    }
+
+    /// FINDING 9's DECIDING TEST — the delayed drain. Two batches
+    /// publish with two OPPOSITE listener headings (the same
+    /// listener position, the basis turned 180°: north is the
+    /// default forward +Z / right +X; south is forward −Z /
+    /// right −X), with NO drain between the publications — the
+    /// drain is delayed across both, the batched-callback regime.
+    /// The same world source at [5, 0, 0] is hard RIGHT of the north
+    /// listener (pan +1, gains exactly (0, 0.8)) and hard LEFT of
+    /// the south one (pan −1, gains exactly (0.8, 0)) — the pan
+    /// endpoints are bit-exact table nodes. Each batch's transient
+    /// must pan according to ITS OWN listener: a drain that used the
+    /// LATEST listener for both would leave one voice pair entirely
+    /// on one side; a drain that used a stale older snapshot (here,
+    /// the cell's initial default) would miss the south batch's
+    /// side. Both failure modes are caught twice — at the voice
+    /// gains (per-batch attribution) and in the mixed PCM energy.
+    #[test]
+    fn a_delayed_drain_spatializes_each_batch_against_its_own_listener() {
+        let (mut mixer, shared) = core();
+        let north = Listener {
+            position: [-3.0, 0.0, 0.0],
+            ..Listener::default()
+        };
+        let south = Listener {
+            position: [3.0, 0.0, 0.0],
+            forward: [0.0, 0.0, -1.0],
+            right: [-1.0, 0.0, 0.0],
+            ..Listener::default()
+        };
+        // Two publications, no drain between (the delay).
+        shared.submit(&[footstep_at([5.0, 0.0, 0.0])], north);
+        shared.submit(&[footstep_at([5.0, 0.0, 0.0])], south);
+        // ONE drain after both.
+        mixer.drain_commands();
+        // Per-batch attribution at the voice gains: exactly one
+        // hard-right voice (left gain exactly 0 — the north batch)
+        // and exactly one hard-left voice (right gain exactly 0 —
+        // the south batch).
+        let mut hard_right = 0;
+        let mut hard_left = 0;
+        for voice in &mixer.voices {
+            if !voice.active || voice.looping {
+                continue;
+            }
+            if voice.gain.0 == 0.0 {
+                hard_right += 1;
+            }
+            if voice.gain.1 == 0.0 {
+                hard_left += 1;
+            }
+        }
+        assert_eq!(
+            hard_right, 1,
+            "the north-listener batch is hard right (left gain exactly 0)"
+        );
+        assert_eq!(
+            hard_left, 1,
+            "the south-listener batch is hard left (right gain exactly 0)"
+        );
+        // And in the mixed PCM: BOTH channels carry real energy —
+        // the left channel is exactly the south batch's burst, the
+        // right exactly the north batch's (a single-listener drain
+        // would leave one channel exactly silent).
+        let out = render_collect(&mut mixer, 256);
+        let left: i64 = (0..256).map(|frame| out[frame * 2].abs() as i64).sum();
+        let right: i64 = (0..256).map(|frame| out[frame * 2 + 1].abs() as i64).sum();
+        assert!(
+            left > 1000,
+            "the south batch's transient is audible left (energy {left})"
+        );
+        assert!(
+            right > 1000,
+            "the north batch's transient is audible right (energy {right})"
+        );
+    }
+
+    /// FINDING 9, the interleaved regime: a drain runs BETWEEN the
+    /// two publications (the ordinary per-period cadence). The first
+    /// batch's gains are FIXED at its voice start (emission-time
+    /// spatialization), so the second publication cannot re-pan it,
+    /// and the second batch pans against its own snapshot.
+    #[test]
+    fn an_interleaved_drain_keeps_each_batch_with_its_own_listener() {
+        let (mut mixer, shared) = core();
+        let north = Listener::default();
+        let south = Listener {
+            forward: [0.0, 0.0, -1.0],
+            right: [-1.0, 0.0, 0.0],
+            ..Listener::default()
+        };
+        shared.submit(&[footstep_at([5.0, 0.0, 0.0])], north);
+        mixer.drain_commands();
+        let first = render_collect(&mut mixer, 256);
+        let left: i64 = (0..256).map(|frame| first[frame * 2].abs() as i64).sum();
+        let right: i64 = (0..256)
+            .map(|frame| first[frame * 2 + 1].abs() as i64)
+            .sum();
+        assert_eq!(left, 0, "the north batch is right-only");
+        assert!(right > 1000, "the north batch is audible (energy {right})");
+        // The turn: the same source published against the south
+        // listener, drained on a later period. The FIRST voice keeps
+        // the gains fixed at its start (emission-time
+        // spatialization — the later publication cannot re-pan it);
+        // the new voice is hard left.
+        shared.submit(&[footstep_at([5.0, 0.0, 0.0])], south);
+        mixer.drain_commands();
+        let mut fixed_right = 0;
+        let mut hard_left = 0;
+        for voice in &mixer.voices {
+            if !voice.active || voice.looping {
+                continue;
+            }
+            if voice.gain.0 == 0.0 && voice.gain.1 > 0.0 {
+                fixed_right += 1;
+            }
+            if voice.gain.1 == 0.0 && voice.gain.0 > 0.0 {
+                hard_left += 1;
+            }
+        }
+        assert_eq!(
+            fixed_right, 1,
+            "the north batch's gains stay fixed at their voice start"
+        );
+        assert_eq!(hard_left, 1, "the south batch is hard left");
+    }
+
+    /// The nonblocking drain law, preserved by the atomic
+    /// publication: while the producer holds the command cell
+    /// (mid-publication), the drain takes nothing and RETURNS — a
+    /// blocking lock would deadlock this very test (its timeout is
+    /// the non-blocking proof). The queued pair stays for the next
+    /// period, and that later drain spatializes it against ITS OWN
+    /// listener, not whatever the producer is publishing now.
+    #[test]
+    fn a_busy_command_cell_defers_the_drain_without_blocking() {
+        let (mut mixer, shared) = core();
+        shared.submit(&[footstep_at([1.0, 0.0, 0.0])], Listener::default());
+        let guard = shared
+            .commands
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        mixer.drain_commands();
+        assert!(
+            mixer.voices.iter().all(|voice| !voice.active),
+            "the drain deferred one period (nothing started)"
+        );
+        assert_eq!(guard.count, 1, "the publication is still queued");
+        drop(guard);
+        mixer.drain_commands();
+        assert!(
+            mixer.voices.iter().any(|voice| voice.active),
+            "the deferred publication drains on the next period"
+        );
+    }
+
+    /// FINDING 11a — the allocation law MEASURED (not inferred from
+    /// residency): the IDENTICAL callback body
+    /// ([`MixerCore::run_callback`]) runs under the host-allocation
+    /// counting seam, under PRODUCER CONTENTION (a thread hammering
+    /// the command cell's lock, so some drains take the cell and
+    /// some defer — both paths measured), across MULTI-CHUNK
+    /// requests (five-plus chunks plus an odd trailing sample, the
+    /// ignored-half-frame path), on both the success path and the
+    /// rejected-write path. Zero Rust allocations, exactly, on both.
+    /// What this deliberately cannot see is SDL's side of the real
+    /// sink (its internal copy, and its error-string construction on
+    /// a rejected write) — that boundary is documented at the
+    /// `callback` implementation.
+    #[test]
+    fn the_callback_body_allocates_nothing_under_contention() {
+        let (mut mixer, shared) = core();
+        shared.submit(
+            &[footstep_at([3.0, 0.0, -2.0]), ambience()],
+            Listener::default(),
+        );
+        // The contender: allocation-free lock hammering on the
+        // command cell (spawned BEFORE the measured scopes — thread
+        // spawn itself allocates, outside the measurement).
+        let stop = Arc::new(AtomicBool::new(false));
+        let contender_shared = Arc::clone(&shared);
+        let contender_stop = Arc::clone(&stop);
+        let contender = thread::spawn(move || {
+            while !contender_stop.load(Ordering::Relaxed) {
+                if let Ok(guard) = contender_shared.commands.try_lock() {
+                    drop(guard);
+                }
+            }
+        });
+        // Seam self-check: the counter must actually COUNT (a
+        // deliberate allocation inside a scope reads back ≥ 1 —
+        // without this, a dead seam would pass the zero assertions
+        // below vacuously).
+        let scope = HostAllocScope::new();
+        let probe: Vec<u8> = Vec::with_capacity(1024);
+        let probe_count = scope.count();
+        drop(probe);
+        assert!(
+            probe_count >= 1,
+            "the counting seam counts a known allocation (read {probe_count})"
+        );
+        // The success path: 64 invocations, multi-chunk requests
+        // with an odd trailing sample count.
+        let scope = HostAllocScope::new();
+        let mut accepting = |_: &[i16]| true;
+        for _ in 0..64 {
+            mixer.run_callback((MIX_CHUNK_FRAMES as i32) * 5 + 7, &mut accepting);
+        }
+        let success_allocations = scope.count();
+        // The rejected-write path: our side of the failure boundary.
+        let scope = HostAllocScope::new();
+        mixer.run_callback((MIX_CHUNK_FRAMES as i32) * 3, &mut |_: &[i16]| false);
+        let rejection_allocations = scope.count();
+        stop.store(true, Ordering::Relaxed);
+        contender.join().expect("the contender finishes");
+        assert_eq!(
+            success_allocations, 0,
+            "the callback body's success path allocates nothing (contented, multi-chunk)"
+        );
+        assert_eq!(
+            rejection_allocations, 0,
+            "our side of the rejected-write path allocates nothing"
+        );
+        // The measured runs really were the callback body: the
+        // counters moved (contention made some drains defer, so the
+        // trigger may have drained on any invocation — the voice
+        // count proves at least one drain landed).
+        assert!(
+            shared.counters.callbacks.load(Ordering::Relaxed) >= 65,
+            "the measured invocations counted themselves"
+        );
+        assert!(
+            shared.counters.write_rejections.load(Ordering::Relaxed) >= 1,
+            "the rejecting sink's refusal is counted"
+        );
+        assert!(
+            mixer
+                .voices
+                .iter()
+                .any(|voice| voice.active && voice.looping),
+            "the bed voice drained and started during the measured runs"
+        );
+    }
+
+    /// FINDING 11c — the rejected write, tested separately: the
+    /// refusal is COUNTED (never silent), the already-mixed chunk is
+    /// DROPPED (the device plays silence for it; the frames are
+    /// never re-submitted — the voices' cursors advanced when the
+    /// chunk was rendered), the drain still ran BEFORE the put (the
+    /// queued publication became a voice — the refusal is on the
+    /// output side only), and the NEXT invocation continues
+    /// normally without another refusal.
+    #[test]
+    fn a_rejected_write_is_counted_dropped_and_the_next_callback_continues() {
+        let (mut mixer, shared) = core();
+        shared.submit(&[ambience()], Listener::default());
+        mixer.run_callback(512, &mut |_: &[i16]| false);
+        assert_eq!(
+            shared.counters.write_rejections.load(Ordering::Relaxed),
+            1,
+            "the refusal is counted, never silent"
+        );
+        assert_eq!(shared.counters.callbacks.load(Ordering::Relaxed), 1);
+        assert!(
+            mixer
+                .voices
+                .iter()
+                .any(|voice| voice.active && voice.looping),
+            "the drain ran before the put: the trigger became a voice"
+        );
+        // The recovery: the next invocation with a healthy sink
+        // continues — no retry of the dropped frames (they are gone;
+        // the bed loops, so the continuation is audible), and no
+        // second refusal is invented.
+        mixer.run_callback(MIX_CHUNK_FRAMES as i32 * 2, &mut |_: &[i16]| true);
+        assert_eq!(
+            shared.counters.write_rejections.load(Ordering::Relaxed),
+            1,
+            "exactly one refusal, counted once"
+        );
+        assert_eq!(shared.counters.callbacks.load(Ordering::Relaxed), 2);
+        let out = render_collect(&mut mixer, 256);
+        assert!(
+            out.iter().any(|&sample| sample != 0),
+            "audio flows again after the recovery"
+        );
     }
 }
