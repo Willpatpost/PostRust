@@ -569,8 +569,18 @@ jobs:
           # first-strike pin 1405/1354, which had absorbed only
           # the +5 — corrected from actuals here, never a test
           # weakened).
-          expected=1406
-          if [ "$(uname -s)" != "Linux" ]; then expected=1355; fi
+          # ERA 2 AUDIT R6 (2026-11-26): the polish package (the
+          # witness matcher, the identity wire seam, the versioned
+          # diagnostics, the paired E-09, the census identities,
+          # the validation refusals) adds 12 platform-uniform
+          # engine-core lib tests: 1406 + 12 = 1418 Linux / 1355 +
+          # 12 = 1367 Windows (Windows MEASURED locally with this
+          # step's own awk on the exact tree; Linux the
+          # platform-uniform inference, to be confirmed by this
+          # candidate's run — a mismatch is corrected from
+          # actuals, never a test weakened).
+          expected=1418
+          if [ "$(uname -s)" != "Linux" ]; then expected=1367; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -1826,8 +1836,8 @@ jobs:
           # ink gate: ignored 38 -> 39 (the #[ignore]d lavapipe
           # class, riding the existing render_weather binary);
           # passed counts and result lines unchanged.
-          expected=643
-          if [ "$(uname -s)" != "Linux" ]; then expected=642; fi
+          expected=645
+          if [ "$(uname -s)" != "Linux" ]; then expected=644; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
@@ -1841,7 +1851,7 @@ jobs:
           # are engine-renderer lib tests — the main shard's).
           # Linux 582/14/59 MEASURED locally with this step's own
           # awk; Windows 581/14/59 platform-uniform.
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 40 / 64)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 46 / 64)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           # Era 1 package 3 (the sky, 2026-11-23): the NEW
           # tests/render_sky.rs binary carries ONE #[ignore]d
@@ -1997,7 +2007,21 @@ jobs:
           # double-run, the rain-kind N-vs-1, the composition smoke —
           # executed by the NEW weather-gates Linux Vulkan step).
           # MEASURED with this step's own awk on this exact tree.
-          [ "$ignored" -eq 46 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 39"; exit 1; }
+          # ERA 2 AUDIT R6 (2026-11-26): the polish package adds 2
+          # platform-uniform engine-slice lib tests (the footstep
+          # projection family's pair — see the R6 commit): 643 + 2
+          # = 645 Linux / 642 + 2 = 644 Windows (Windows MEASURED
+          # locally with this step's own awk on the exact tree —
+          # 644 passed / 46 ignored / 64 result lines; Linux the
+          # platform-uniform inference, to be confirmed by this
+          # candidate's run). The ignored count (46) and the
+          # result lines (64) are UNCHANGED. The failure messages
+          # below now name the actual pins (the audit's stale-note
+          # class: the echo said 40 and the mismatch message 39
+          # while the predicate correctly required 46 — the same
+          # stale-163 correction the renderer release battery got
+          # at R4).
+          [ "$ignored" -eq 46 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 46"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
