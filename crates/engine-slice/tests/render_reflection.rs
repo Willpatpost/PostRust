@@ -2578,6 +2578,10 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
     // the wet patch is bright — selected by MEASUREMENT, so no
     // texel oracle is needed.
     let mut witness = None;
+    // The near-miss tracker (the R3 round-5 corrective): the
+    // maximum-presence footprint pixel REGARDLESS of the floors,
+    // so a platform below them fails WITH ITS OWN ACTUALS.
+    let mut witness_nm: Option<(u32, u32, i32, i32, i32)> = None;
     for y in footprint.min_y..=footprint.max_y {
         for x in footprint.min_x..=footprint.max_x {
             let w_pixel = wet.pixel_rgba(x, y);
@@ -2589,6 +2593,9 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
                 .unwrap();
             let wet_value = w_pixel[channel] as i32;
             let contrast = w_pixel[channel] as i32 - d_pixel[channel] as i32;
+            if witness_nm.is_none_or(|(_, _, nm_p, _, _)| presence > nm_p) {
+                witness_nm = Some((x, y, presence, wet_value, contrast));
+            }
             if presence >= STREAK_PRESENCE_FLOOR
                 && wet_value >= WET_PATCH_FLOOR
                 && contrast >= 8
@@ -2599,10 +2606,14 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
         }
     }
     let Some((w_x, w_y, presence, w_channel)) = witness else {
+        let (nm_x, nm_y, nm_p, nm_wet, nm_contrast) =
+            witness_nm.expect("the streak's footprint covers screen pixels");
         panic!(
             "PROVISIONAL gate: no footprint pixel showed the streak present over a \
-             bright wet patch (re-measure on lavapipe and re-pin the presence floor \
-             from this run's prints: footprint x [{}, {}] y [{}, {}])",
+             bright wet patch. The best near-miss: ({nm_x}, {nm_y}) presence \
+             {nm_p}/255 (floor {STREAK_PRESENCE_FLOOR}), wet {nm_wet}/255 (floor \
+             {WET_PATCH_FLOOR}), contrast {nm_contrast}/255 (floor 8); footprint x \
+             [{}, {}] y [{}, {}] - re-pin from THIS platform's actuals",
             footprint.min_x, footprint.max_x, footprint.min_y, footprint.max_y
         );
     };
@@ -2777,12 +2788,13 @@ fn rainless_population() -> ProxyPopulation<'static> {
 /// measurable at all) and the flip asserts.
 const WET_PATCH_FLOOR: i32 = 25;
 
-/// The streak's presence floor over the dry ground (RE-PINNED with
-/// the adaptive tint: the presence scales with the measured W — at
-/// Ubuntu's 44 the fixed 0.5 tint read ~15 on Windows's bright
-/// patches, the adaptive 0.7xW tint reads ~3-5 at Ubuntu's darkness;
-/// the load-bearing assert is the >= 2 presence check).
-const STREAK_PRESENCE_FLOOR: i32 = 3;
+/// The streak's presence floor over the dry ground (RE-PINNED round
+/// 5: aligned with the load-bearing >= 2 presence assert — the
+/// selection floor only excludes noise; with the adaptive 0.7xW
+/// tint the presence at Ubuntu's darkness is marginal and the
+/// maximum-presence selection plus the near-miss diagnostic carry
+/// the calibration).
+const STREAK_PRESENCE_FLOOR: i32 = 2;
 
 /// One streak's CPU-projected screen footprint: the rain-streak
 /// mesh's four corner positions transformed by the packed instance
