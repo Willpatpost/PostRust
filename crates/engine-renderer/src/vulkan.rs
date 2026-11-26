@@ -1103,8 +1103,26 @@ impl InstanceExtensionPlan {
             .into_owned();
         let advertised = loader_advertised.contains(&portability);
         let sdl_requires_portability = sdl_required.contains(&portability);
+        // THE OFFSCREEN-SURFACE PARITY (the local-lavapipe
+        // corrective): SDL's offscreen driver advertises
+        // VK_EXT_headless_surface itself on Linux, but on Windows
+        // it names no window-system surface at all - starving the
+        // instance of the only surface path an offscreen window
+        // can use (the surface path's offscreen branch then fails
+        // with "VK_EXT_headless_surface extension is not enabled").
+        // When the SDL side carries NO surface extension but the
+        // loader advertises the headless one (lavapipe always
+        // does), add it. A windowed SDL list (win32/metal/xlib
+        // surfaces) is never touched, and a real-GPU loader that
+        // lacks the headless extension is unchanged.
+        let headless = "VK_EXT_headless_surface".to_string();
+        let mut required: Vec<String> = sdl_required.to_vec();
+        if !required.iter().any(|e| e.contains("surface")) && loader_advertised.contains(&headless)
+        {
+            required.push(headless);
+        }
         InstanceExtensionPlan {
-            sdl_required: dedup_keep_first(sdl_required),
+            sdl_required: dedup_keep_first(&required),
             portability_enumeration: advertised || sdl_requires_portability,
             validation: want_validation,
         }
@@ -5378,6 +5396,35 @@ mod policy_tests {
             plan.extensions(),
             strings(&["VK_KHR_surface", "VK_EXT_headless_surface"])
         );
+    }
+
+    #[test]
+    fn offscreen_sdl_without_a_surface_gets_headless_from_the_loader() {
+        // THE WINDOWS OFFSCREEN PARITY: SDL's offscreen driver on
+        // Windows names no window-system surface; the loader
+        // (lavapipe) offers the headless one - the plan must add
+        // it (the surface path's offscreen branch requires it).
+        let plan = InstanceExtensionPlan::select(
+            &[],
+            &strings(&["VK_KHR_surface", "VK_EXT_headless_surface"]),
+            false,
+        );
+        assert_eq!(plan.extensions(), strings(&["VK_EXT_headless_surface"]));
+        // A windowed SDL list is never touched.
+        let windowed = InstanceExtensionPlan::select(
+            &strings(&["VK_KHR_surface", "VK_KHR_win32_surface"]),
+            &strings(&["VK_KHR_surface", "VK_EXT_headless_surface"]),
+            false,
+        );
+        assert_eq!(
+            windowed.extensions(),
+            strings(&["VK_KHR_surface", "VK_KHR_win32_surface"])
+        );
+        // No loader offer, no addition (the real-GPU offscreen case
+        // is unchanged - it still fails at the surface path, as
+        // before).
+        let gpu = InstanceExtensionPlan::select(&[], &strings(&["VK_KHR_surface"]), false);
+        assert!(gpu.extensions().is_empty());
     }
 
     #[test]

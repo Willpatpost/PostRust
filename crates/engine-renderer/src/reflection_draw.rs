@@ -13,8 +13,14 @@
 //! planar.rs's unit test pins it bit-equal), so the ground's
 //! screen footprint samples the mirrored scene behind it at the
 //! SAME texel: the ground re-draw reads the reflection target at
-//! `frag_coord / extent` — no projection math in the shader at
-//! all. The mirrored buildings live BELOW the plane in this form,
+//! `frag_coord / extent`, plus the rain ripple's PROJECTED
+//! perturbation (Era-2 finding 19's corrective — the shader
+//! projects the ground point and its world tangent displacement
+//! through the frame block's TRUE view-projection; the mirror
+//! fixes the plane, so the true VP and the target's mirrored VP
+//! agree bit-exactly on both points — planar.rs's
+//! `projected_offset_is_mirror_equivalent_on_the_plane` pins the
+//! license). The mirrored buildings live BELOW the plane in this form,
 //! so the pass draws ONLY the building ranges (materials 1 and 2)
 //! — the ground itself would occlude its own reflection (the
 //! mirror surface is the glass, never a rendered object in the
@@ -95,8 +101,10 @@ const REFLECTION_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 pub(crate) const RIPPLE_UNIFORM_ROWS: usize = 2 + engine_core::ripple::RIPPLE_POOL_BOUND;
 
 /// The packed ripple uniform (the GPU view of engine-core's
-/// RippleField): rows[0] = (live count, speed, width, uv gain),
-/// rows[1] = (roughen gain, 0, 0, 0), rows[2 + i] = (center_x,
+/// RippleField): rows[0] = (live count, speed, width,
+/// tangent-displacement gain m), rows[1] = (roughen gain, the
+/// TEST-ONLY RippleDebugMode lane — renderer.rs's separation knobs,
+/// 0.0 in every production frame, 0, 0), rows[2 + i] = (center_x,
 /// center_z, age, current amplitude). Copy-sized, zero-allocation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct RippleUniformData {

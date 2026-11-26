@@ -3,7 +3,9 @@
 // sampling the planar-reflection target at the SAME screen
 // position (the mirrored view-projection maps every ground point
 // to exactly its true clip position — the planar property
-// planar.rs's unit test pins), blended by Schlick's
+// planar.rs's unit test pins), plus the rain-ripple perturbation's
+// PROJECTED displacement (Era-2 finding 19's corrective — see the
+// projection block in fs_main), blended by Schlick's
 // angle-based factor — planar.rs :: reflection_blend mirrored
 // term-for-term:
 //   b(n_dot_v) = 0.02 + 0.98 * (1 - n_dot_v)^5
@@ -50,14 +52,19 @@ var<uniform> frame: FrameParams;
 // descriptor 0 and is unusable, the header's transport note).
 // LAYOUT (must match the CPU packer in reflection_draw.rs
 // term-for-term): params0 = (live count, expansion speed m/s,
-// band width m, uv gain); params1 = (roughen gain, 0, 0, 0);
-// rings[i] = (center_x, center_z, age s, current amplitude).
+// band width m, tangent-displacement gain m); params1 = (roughen
+// gain, TEST-ONLY debug mode, 0, 0); rings[i] = (center_x,
+// center_z, age s, current amplitude).
 // THE EMPTY FIELD IS A NO-OP BY IEEE IDENTITY (the identity gate's
-// proof): count 0 skips the loop, uv_offset stays (0,0) and
-// screen_uv + (0,0) is bit-identical for the positive screen_uv
-// values, roughen stays 0.0 and blend * (1.0 - 0.0 * g) == blend
-// exactly — the rainless wet path renders Era-1's wet frame
-// byte-for-byte.
+// proof): count 0 skips the loop AND the projection, uv_offset
+// stays (0,0) and screen_uv + (0,0) is bit-identical for the
+// positive screen_uv values, roughen stays 0.0 and blend * (1.0 -
+// 0.0 * g) == blend exactly — the rainless wet path renders Era-1's
+// wet frame byte-for-byte. Pixels inside a live field but OUTSIDE
+// every ring's band gate keep the same identity value-exactly: the
+// zero world_offset projects to a (0, -0.0) uv difference and
+// screen_uv + (0, -0.0) == screen_uv in IEEE arithmetic (x + (-0.0)
+// is x for every finite x, +0.0 included).
 struct RippleField {
     params0: vec4<f32>,
     params1: vec4<f32>,
@@ -107,18 +114,33 @@ fn fs_main(@location(0) world_normal: vec3<f32>,
     let screen_uv = frag.xy / extent;
     // THE RIPPLE PERTURBATION (the design seed's classic water
     // distortion): each live ring's triangle-bump GRADIENT at this
-    // ground point offsets the reflection sample's screen_uv, and
-    // the bump's height slightly roughens the Schlick blend (a bumpy
-    // surface mirrors less). The band gate `band < width` coincides
-    // EXACTLY with the bump's support (the bump is zero at the
-    // edges), so the gate never cuts a nonzero height — the one
-    // deliberate stylization is the GRADIENT's edge step (a triangle
-    // bump's gradient is piecewise-constant; the stylized hard ring
-    // edge every game water carries — documented, visual policy).
+    // ground point displaces the reflection SAMPLE in world units,
+    // and the bump's height slightly roughens the Schlick blend (a
+    // bumpy surface mirrors less). The band gate `band < width`
+    // coincides EXACTLY with the bump's support (the bump is zero
+    // at the edges), so the gate never cuts a nonzero height — the
+    // one deliberate stylization is the GRADIENT's edge step (a
+    // triangle bump's gradient is piecewise-constant; the stylized
+    // hard ring edge every game water carries — documented, visual
+    // policy).
     var uv_offset = vec2<f32>(0.0, 0.0);
     var roughen = 0.0f;
     let ripple_count = i32(ripple_field.params0.x);
     if (ripple_count > 0) {
+        // THE TEST-ONLY DEBUG MODE (params1.y — renderer.rs's
+        // RippleDebugMode, the Era-2 audit finding 15b separation
+        // fixtures): 0 = the shipped path (the production packing
+        // always writes 0), 1 = the UV/displacement term suppressed
+        // (blend only), 2 = the blend/roughen term suppressed
+        // (displacement only). The knobs exist so the ink gate can
+        // isolate each term's visible contribution; they NEVER
+        // appear in a production frame.
+        let debug_mode = i32(ripple_field.params1.y);
+        // THE WORLD TANGENT DISPLACEMENT (finding 19's corrective):
+        // the gradient's push stays in WORLD meters — a radial
+        // tangent vector at this ground point — NEVER in screen
+        // units. The projection below converts it.
+        var world_offset = vec2<f32>(0.0, 0.0);
         for (var i = 0; i < ripple_count; i = i + 1) {
             let ring = ripple_field.rings[i];
             let delta = vec2<f32>(world_pos.x - ring.x, world_pos.z - ring.y);
@@ -134,10 +156,49 @@ fn fs_main(@location(0) world_normal: vec3<f32>,
                 // the radial direction (dist == 0 has none: zero
                 // contribution — the exact center of a ring)
                 let dir = select(vec2<f32>(0.0, 0.0), delta / dist, dist > 0.0);
-                uv_offset = uv_offset + dir * (signed * ripple_field.params0.w);
-                roughen = roughen + ring.w * (1.0 - band / width);
+                if (debug_mode != 1) {
+                    world_offset = world_offset + dir * (signed * ripple_field.params0.w);
+                }
+                if (debug_mode != 2) {
+                    roughen = roughen + ring.w * (1.0 - band / width);
+                }
             }
         }
+        // THE PROJECTION INTO SCREEN UV (finding 19's corrective):
+        // the ground point P and the displaced point P + d (d stays
+        // in the ground plane — a tangent displacement, world_pos.y
+        // untouched) both project through the frame's TRUE
+        // view-projection, the w-divide lands them in authored NDC,
+        // and the difference — with the established Y convention
+        // (authored NDC +y is screen-UP; screen_uv's frag.xy is
+        // framebuffer y-DOWN, the vertex-boundary epilogue's flip
+        // replayed here: u = (ndc_x + 1)/2, v = (1 - ndc_y)/2) — is
+        // the sample offset in the SAME units screen_uv lives in.
+        // This is the camera-correctness: turning the camera 180°
+        // flips the screen direction of the same world push, pitch
+        // foreshortens it, and perspective scales it by distance.
+        // WHY THE TRUE VP IS "THE SAME VP THE REFLECTION TARGET WAS
+        // RENDERED WITH": the target renders through the mirrored
+        // view-projection (view_proj × M), and the mirror fixes the
+        // ground plane — every point ON the plane (P and P + d both,
+        // d being tangent) maps to BIT-IDENTICAL clip positions
+        // under either matrix (planar.rs's
+        // mirrored_view_projection_fixes_the_ground_plane pins it),
+        // so the frame block's true view_proj (binding 3, the same
+        // uniform the vertex stage already reads) needs NO new
+        // uniform lane. The zero world_offset projects to exactly
+        // (0, -0.0) — value-identical sampling (the header's
+        // identity note).
+        let clip_p = frame.view_proj * vec4<f32>(world_pos, 1.0);
+        let clip_q = frame.view_proj * vec4<f32>(
+            world_pos.x + world_offset.x,
+            world_pos.y,
+            world_pos.z + world_offset.y,
+            1.0,
+        );
+        let ndc_p = clip_p.xy / clip_p.w;
+        let ndc_q = clip_q.xy / clip_q.w;
+        uv_offset = vec2<f32>(0.5, -0.5) * (ndc_q - ndc_p);
     }
     let reflection = textureSample(
         reflection_tex,
