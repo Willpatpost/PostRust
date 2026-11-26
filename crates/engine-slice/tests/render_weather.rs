@@ -1342,8 +1342,33 @@ fn ripple_natural_sequence_gate() {
             }
         }
         landings.extend(new_rings.iter().map(|ring| ring.center));
+        // The degenerate-projection rejection (the round-5
+        // corrective): a landing AT the camera's feet projects its
+        // band disc through the camera plane - the box explodes to
+        // the whole frame (round 4 measured support x [0, 1279] y
+        // [0, 719] for a ring 1.5 m from the eye), which makes
+        // both the containment assert and the contribution check
+        // vacuous. Such landings are real but unmeasurable by the
+        // box method - record and keep driving (the forced-field
+        // gates prove the displacement display elsewhere).
+        if max_x - min_x > 0.5 * SIZE.0 as f32 || max_y - min_y > 0.5 * SIZE.1 as f32 {
+            flat_landings.push((new_rings[0].center, -1));
+            println!(
+                "natural sequence: a landing at {:?} sits at the camera - its \
+                 projected support is degenerate (x [{min_x:.0}, {max_x:.0}] y \
+                 [{min_y:.0}, {max_y:.0}]) - continuing the drive",
+                new_rings[0].center
+            );
+            assert!(
+                renderer
+                    .render_corner_populated(&matrix, GATE_EYE, light, &population, SIZE)
+                    .unwrap()
+                    .presented
+            );
+            continue;
+        }
         // The support must intersect the frame (a landing behind
-        // the camera or off-frame cannot show displayed change —
+        // the camera or off-frame cannot show displayed change -
         // keep driving).
         if max_x < 0.0 || min_x >= SIZE.0 as f32 || max_y < 0.0 || min_y >= SIZE.1 as f32 {
             assert!(
