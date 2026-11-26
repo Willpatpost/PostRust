@@ -1315,6 +1315,16 @@ mod host_alloc_seam {
         }
 
         unsafe fn realloc(&self, ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
+            // THE REALLOC COUNT (the sign-off review's finding 22
+            // corrective — the identical gap the slice seam carried):
+            // a warmed buffer growing inside the callback body is
+            // allocation churn the pre-corrective counter never saw.
+            // Every realloc while measuring counts as one event.
+            MEASURING.with(|m| {
+                if m.get() {
+                    ALLOC_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
+                }
+            });
             unsafe { System.realloc(ptr, old_layout, new_size) }
         }
 
@@ -1397,6 +1407,35 @@ mod device_tests {
         mixer.drain_commands();
         let out = render_collect(&mut mixer, 256);
         assert!(out.iter().all(|&sample| sample == 0));
+    }
+
+    /// THE SEAM'S REALLOC SELF-TEST (the sign-off review's finding
+    /// 22 corrective): an existing allocation grown under
+    /// measurement MUST move the counter — the pre-corrective seam
+    /// forwarded `realloc` to System uncounted, so a warmed buffer
+    /// could grow inside the callback body while the gate read
+    /// zero. A fresh alloc then a growth both count.
+    #[test]
+    fn the_seam_counts_realloc_growth() {
+        let scope = HostAllocScope::new();
+        let before = scope.count();
+        let mut grown: Vec<u8> = Vec::with_capacity(8);
+        grown.push(0);
+        let after_alloc = scope.count();
+        // Grow far past the capacity: at least one realloc fires.
+        for i in 0..4096 {
+            grown.push(i as u8);
+        }
+        let after_grow = scope.count();
+        assert!(
+            after_grow > after_alloc,
+            "the growth's reallocations are counted (alloc {after_alloc}, grown {after_grow})"
+        );
+        assert!(
+            after_alloc >= before,
+            "the fresh alloc itself counted (before {before}, after {after_alloc})"
+        );
+        drop(grown);
     }
 
     /// The footstep path end to end (no device needed): publish →

@@ -3302,6 +3302,85 @@ fn composed_population_matches_per_object_pixels() {
     );
 }
 
+/// THE MATCHED CONTROL WORLD (the sign-off review's finding 22
+/// corrective): the composed crowd's wake path with ONLY the
+/// recording (the stream fold and its counters) and the retarget
+/// skipped — the same authored schedules, the same `evaluate_wake`
+/// lane evolution (routines/rngs/decay anchors update identically,
+/// so the re-arms stay identical), the same `schedule_at`
+/// structural cost. The real spine's per-frame scope minus this
+/// control's is the world callback's OWN attributable work.
+struct ControlCrowdWorld {
+    schedules: Vec<engine_core::npc_schedule::NpcSchedule>,
+    routines: Vec<engine_core::npc_behavior::NpcRoutine>,
+    rngs: Vec<engine_core::npc_behavior::NpcRng>,
+    last_decay_tick: Vec<engine_core::clock::Tick>,
+    rules: Vec<engine_core::npc_behavior::Rule>,
+    rates: [f32; engine_core::npc_behavior::MAX_NEEDS],
+    wake_executions: u64,
+}
+
+impl engine_core::spine::World for ControlCrowdWorld {
+    fn execute(
+        &mut self,
+        event: &engine_core::event::Event,
+        ctx: &mut engine_core::spine::ExecCtx,
+    ) {
+        if event.class != engine_slice::corner_behavior::WAKE_CLASS {
+            return;
+        }
+        let Some((npc, commitment)) = engine_core::npc_execution::wake_payload_parts(event.payload)
+        else {
+            return;
+        };
+        if npc >= 24 {
+            return;
+        }
+        let npc_idx = npc as usize;
+        if commitment as usize >= self.schedules[npc_idx].entries.len() {
+            return;
+        }
+        let mut rng = self.rngs[npc_idx];
+        let routine = self.routines[npc_idx];
+        let Some(outcome) = engine_core::npc_execution::evaluate_wake(
+            &self.schedules[npc_idx],
+            commitment,
+            ctx.executed_tick(),
+            self.last_decay_tick[npc_idx],
+            &routine,
+            &self.rules,
+            &mut rng,
+            &self.rates,
+        ) else {
+            return;
+        };
+        // The identical lane evolution — the re-arms depend on it.
+        self.routines[npc_idx] = outcome.routine_after;
+        self.rngs[npc_idx] = rng;
+        self.last_decay_tick[npc_idx] = ctx.executed_tick();
+        self.wake_executions += 1;
+        // THE IDENTICAL RE-ARM (the structural cost the differential
+        // cancels): the same commitment index at the same next wake.
+        if let Some(next) = outcome.next_wake {
+            let payload = engine_core::npc_execution::wake_payload(npc, commitment).expect("packs");
+            ctx.schedule_at(
+                next,
+                engine_slice::corner_behavior::WAKE_CLASS,
+                payload,
+                Vec::new(),
+            );
+        }
+        // SKIPPED (the attributable difference the gate measures):
+        // the stream fold, the stream counters, the retarget, and
+        // the locomotion states — the recording and crowd work.
+    }
+
+    fn fingerprint(&self, fp: &mut engine_core::fingerprint::Fingerprinter) {
+        fp.write_str("engine-slice/control-crowd-world/1");
+        fp.write_u64(self.wake_executions);
+    }
+}
+
 /// The Era-2 audit finding 5 deciding gate (the allocation half; the
 /// determinism half — the rolling digest equaling the complete
 /// stream's execution digest — lives in engine-slice's
@@ -3314,6 +3393,21 @@ fn composed_population_matches_per_object_pixels() {
 /// COUNTER: `spine.run_tick` measured in its own scope, the crowd +
 /// renderer in theirs — a wake-frame allowance can no longer absorb
 /// a crowd-side allocation the spine never made).
+///
+/// THE MATCHED CONTROL (the sign-off review's finding 22
+/// corrective): a sibling spine whose world runs the IDENTICAL wake
+/// path — the same authored schedules, the same `evaluate_wake`
+/// lane evolution, the same re-arms — but skips ONLY the recording
+/// (the stream fold and counters) and the retarget. The real
+/// spine's per-frame scope minus the control's is the world
+/// callback's OWN attributable work, required ZERO on every frame
+/// (the pre-corrective gate summed the wake-frame scope unattributed
+/// — the spine's structural `schedule_at` storage growth and any
+/// callback-side allocation rode the same allowance). The control's
+/// re-arms are verified IDENTICAL per frame (the wake-count
+/// equality), and the counters now count `realloc` growth (the
+/// finding 22 seam corrective — a warmed buffer growing under
+/// measurement is visible).
 ///
 /// The crowd and renderer are required to allocate EXACTLY ZERO on
 /// every measured frame, wake or not. The spine's own documented
@@ -3376,8 +3470,28 @@ fn composed_wake_campaign_past_log_boundaries_allocates_nothing() {
     let world = engine_slice::corner_behavior::CornerCrowdWorld::new_rolling(states, present);
     let mut spine = engine_core::spine::Spine::with_reservation(world, 64, 32);
 
+    // THE MATCHED CONTROL (finding 22's attribution): the sibling
+    // spine over the control world — the same authored schedules and
+    // lane state (cloned from the same construction), armed with the
+    // same initial wake specs, stepped alongside EVERY real tick so
+    // the event streams stay identical.
+    let control_world = {
+        let reference = &spine.world();
+        ControlCrowdWorld {
+            schedules: reference.schedules.clone(),
+            routines: reference.routines.clone(),
+            rngs: reference.rngs.clone(),
+            last_decay_tick: reference.last_decay_tick.clone(),
+            rules: reference.rules.clone(),
+            rates: reference.rates,
+            wake_executions: 0,
+        }
+    };
+    let mut control = engine_core::spine::Spine::with_reservation(control_world, 64, 32);
+
     // Arm EVERY schedule entry at its own first occurrence (the
-    // demo's and the fixture campaigns' own arming).
+    // demo's and the fixture campaigns' own arming) — the real spine
+    // and the control identically.
     {
         let world = spine.world();
         let mut specs: Vec<engine_core::event::EventSpec> = Vec::new();
@@ -3401,6 +3515,31 @@ fn composed_wake_campaign_past_log_boundaries_allocates_nothing() {
             spine.schedule(spec).expect("arming is legal");
         }
     }
+    {
+        let world = control.world();
+        let mut specs: Vec<engine_core::event::EventSpec> = Vec::new();
+        for npc in 0..24 {
+            let schedule = &world.schedules[npc];
+            for (entry_idx, entry) in schedule.entries.iter().enumerate() {
+                let payload =
+                    engine_core::npc_execution::wake_payload(npc as u32, entry_idx as u32)
+                        .expect("the entry index packs");
+                specs.push(engine_core::event::EventSpec {
+                    class: engine_slice::corner_behavior::WAKE_CLASS,
+                    schedule: engine_core::event::Schedule::AtLogicalTime { due: entry.start },
+                    payload,
+                    field: entry.activity.field,
+                    depends_on: Vec::new(),
+                });
+            }
+        }
+        let _ = world;
+        for spec in specs {
+            control
+                .schedule(spec)
+                .expect("the control's arming is legal");
+        }
+    }
 
     let mut composed_instances =
         engine_slice::corner_routes::corner_instances(&spine.world().states, &tints);
@@ -3418,6 +3557,7 @@ fn composed_wake_campaign_past_log_boundaries_allocates_nothing() {
     const WARMUP: u64 = 8;
     for _ in 0..WARMUP {
         spine.run_tick();
+        control.run_tick();
         let world = spine.world_mut();
         world.composed_tick(1.0 / 60.0);
         engine_slice::corner_routes::corner_instances_into(
@@ -3446,16 +3586,26 @@ fn composed_wake_campaign_past_log_boundaries_allocates_nothing() {
     let vulkan_warm = renderer.allocations();
 
     let mut spine_alloc_events: u64 = 0;
+    let mut control_alloc_events: u64 = 0;
     let mut wake_frames: u64 = 0;
     let mut frames_measured: u64 = 0;
     for k in WARMUP..TICKS {
-        // THE DEDICATED COUNTERS: the spine's own allocation measured
-        // alone, the crowd + renderer measured alone.
+        // THE DEDICATED COUNTERS (finding 22's attribution): the real
+        // spine's scope (its own machinery PLUS the world callback's
+        // work), the control's scope (the identical machinery plus
+        // the callback's SKIPPED-work twin — the same structural
+        // schedule_at cost, the same evaluate_wake lane evolution),
+        // the crowd + renderer measured alone.
         let wakes_before = spine.world().wake_executions;
+        let control_wakes_before = control.world().wake_executions;
         let spine_scope = common::HostAllocScope::new();
         spine.run_tick();
         let spine_allocs = spine_scope.count();
         drop(spine_scope);
+        let control_scope = common::HostAllocScope::new();
+        control.run_tick();
+        let control_allocs = control_scope.count();
+        drop(control_scope);
         let scope = common::HostAllocScope::new();
         let world = spine.world_mut();
         world.composed_tick(1.0 / 60.0);
@@ -3484,6 +3634,15 @@ fn composed_wake_campaign_past_log_boundaries_allocates_nothing() {
         drop(scope);
         assert!(outcome.presented);
         let wakes_this_frame = spine.world().wake_executions - wakes_before;
+        let control_wakes_this_frame = control.world().wake_executions - control_wakes_before;
+
+        // THE IDENTICAL RE-ARMS (the control's validity): the sibling
+        // fires the same wakes on the same frames — the differential
+        // below compares the same work.
+        assert_eq!(
+            control_wakes_this_frame, wakes_this_frame,
+            "the control's re-arms are identical at frame {k}"
+        );
 
         // THE EXACT CLAIM (the audit's finding 5 deciding assertion):
         // zero allocations attributable to the crowd and renderer, on
@@ -3495,8 +3654,23 @@ fn composed_wake_campaign_past_log_boundaries_allocates_nothing() {
             "the crowd and renderer allocate nothing at frame {k} — wake or not, \
              past the old 256/512 wake-log boundaries"
         );
-        // The spine's own events, attributed and reported.
+        // THE WORLD CALLBACK'S OWN ATTRIBUTABLE WORK (finding 22's
+        // corrective): the real spine's scope minus the matched
+        // control's is exactly the callback's recording + retarget
+        // work — required ZERO on every frame, wake or not (the
+        // pre-corrective gate summed the wake-frame scope
+        // unattributed: the spine's structural storage growth and a
+        // callback-side allocation rode the same allowance).
+        let attributable = spine_allocs.saturating_sub(control_allocs);
+        assert_eq!(
+            attributable, 0,
+            "the world callback's own work allocates nothing at frame {k} \
+             (real {spine_allocs}, control {control_allocs})"
+        );
+        // The spines' own events (structural, engine-core internals
+        // with their own pin), attributed and reported honestly.
         spine_alloc_events += spine_allocs;
+        control_alloc_events += control_allocs;
         if wakes_this_frame == 0 {
             assert_eq!(
                 spine_allocs, 0,
@@ -3539,16 +3713,144 @@ fn composed_wake_campaign_past_log_boundaries_allocates_nothing() {
         renderer.stats().recent_validation
     );
     // THE HONEST REPORT: the crowd/renderer claim is exact zero; the
-    // spine's own index-churn events are counted and stated, never
-    // folded into the zero.
+    // world callback's attributable work is exact zero (the matched
+    // control's differential); the spines' own index-churn events
+    // are counted and stated, never folded into either zero.
     println!(
         "wake campaign: {TICKS} composed frames ({frames_measured} measured), {} wake \
          frames, {} wake entries — past the old 256-entry reservation and its 512 \
          growth point; crowd+renderer host allocations 0 on every measured frame; \
-         the spine's own index-churn events: {spine_alloc_events} across the \
-         {wake_frames} wake frames (engine-core internals, attributed to their \
-         dedicated scope, reported honestly — never claimed as zero); renderer \
-         allocations constant at {vulkan_warm:?}",
+         the world callback's attributable work 0 (the matched control's \
+         differential — real spine scope {spine_alloc_events}, control \
+         {control_alloc_events}, the structural schedule_at cost the two share); \
+         renderer allocations constant at {vulkan_warm:?}",
         wake_frames, world.stream_entries
+    );
+}
+
+/// THE HOST SEAM'S REALLOC SELF-TEST (the sign-off review's finding
+/// 22 corrective): an existing allocation grown under measurement
+/// MUST move the counter — the pre-corrective seam forwarded
+/// `realloc` to System uncounted, so a warmed scratch buffer could
+/// grow inside a measured scope while the gate read zero.
+#[test]
+fn the_host_scope_counts_realloc_growth() {
+    let scope = common::HostAllocScope::new();
+    let before = scope.count();
+    let mut grown: Vec<u8> = Vec::with_capacity(8);
+    grown.push(0);
+    let after_alloc = scope.count();
+    for i in 0..4096 {
+        grown.push(i as u8);
+    }
+    let after_grow = scope.count();
+    assert!(
+        after_grow > after_alloc,
+        "the growth's reallocations are counted (alloc {after_alloc}, grown {after_grow})"
+    );
+    assert!(
+        after_alloc >= before,
+        "the fresh alloc itself counted (before {before}, after {after_alloc})"
+    );
+    drop(grown);
+}
+
+/// THE DIFFERENTIAL'S TEETH (finding 22's negative control): a
+/// deliberate callback-side allocation MUST break the matched
+/// control's attribution — two sibling spines over minimal worlds
+/// sharing the identical event stream, one whose world allocates on
+/// execute; the differential (real minus control) catches it. This
+/// is the pre-corrective gate's blind spot proven closed: a
+/// per-wake allocation in the world callback can no longer ride the
+/// spine's structural allowance.
+#[test]
+fn a_deliberate_callback_allocation_breaks_the_differential() {
+    /// The control: executes, counts, never allocates.
+    struct QuietWorld {
+        executions: u64,
+    }
+    impl engine_core::spine::World for QuietWorld {
+        fn execute(
+            &mut self,
+            _event: &engine_core::event::Event,
+            _ctx: &mut engine_core::spine::ExecCtx,
+        ) {
+            self.executions += 1;
+        }
+        fn fingerprint(&self, fp: &mut engine_core::fingerprint::Fingerprinter) {
+            fp.write_str("engine-slice/quiet-world/1");
+            fp.write_u64(self.executions);
+        }
+    }
+
+    /// The poisoned twin: the identical shape, but every execute
+    /// allocates (the deliberate callback-side allocation).
+    struct AllocatingWorld {
+        executions: u64,
+        leak: Vec<u8>,
+    }
+    impl engine_core::spine::World for AllocatingWorld {
+        fn execute(
+            &mut self,
+            _event: &engine_core::event::Event,
+            _ctx: &mut engine_core::spine::ExecCtx,
+        ) {
+            self.executions += 1;
+            self.leak.push(self.executions as u8);
+        }
+        fn fingerprint(&self, fp: &mut engine_core::fingerprint::Fingerprinter) {
+            fp.write_str("engine-slice/allocating-world/1");
+            fp.write_u64(self.executions);
+        }
+    }
+
+    let mut quiet = engine_core::spine::Spine::with_reservation(QuietWorld { executions: 0 }, 8, 8);
+    let mut poisoned = engine_core::spine::Spine::with_reservation(
+        AllocatingWorld {
+            executions: 0,
+            leak: Vec::new(),
+        },
+        8,
+        8,
+    );
+    let spec_shape = || engine_core::event::EventSpec {
+        class: engine_core::event::EventClass(1),
+        schedule: engine_core::event::Schedule::AtLogicalTime {
+            due: engine_core::clock::Tick(1),
+        },
+        payload: 0,
+        field: engine_core::event::Field::Near,
+        depends_on: Vec::new(),
+    };
+    quiet
+        .schedule(spec_shape())
+        .expect("the quiet arming is legal");
+    poisoned
+        .schedule(spec_shape())
+        .expect("the poisoned arming is legal");
+    let quiet_scope = common::HostAllocScope::new();
+    quiet.run_tick();
+    let quiet_allocs = quiet_scope.count();
+    drop(quiet_scope);
+    let poisoned_scope = common::HostAllocScope::new();
+    poisoned.run_tick();
+    let poisoned_allocs = poisoned_scope.count();
+    drop(poisoned_scope);
+    assert_eq!(
+        quiet.world().executions,
+        1,
+        "the control executed its event"
+    );
+    assert_eq!(
+        poisoned.world().executions,
+        1,
+        "the poisoned twin executed the same event"
+    );
+    let attributable = poisoned_allocs.saturating_sub(quiet_allocs);
+    assert!(
+        attributable > 0,
+        "the deliberate callback-side allocation is attributable (quiet \
+         {quiet_allocs}, poisoned {poisoned_allocs}, differential {attributable}) — \
+         the gate's per-frame assertion would fail on exactly this shape"
     );
 }

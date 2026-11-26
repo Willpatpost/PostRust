@@ -79,6 +79,19 @@ unsafe impl GlobalAlloc for HostAllocCounter {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
+        // THE REALLOC COUNT (the sign-off review's finding 22
+        // corrective): a warmed scratch vector growing under
+        // measurement is allocation churn the pre-corrective
+        // counter never saw (the event forwarded to System
+        // uncounted — a buffer could grow while the gate read
+        // zero). Every realloc inside a measuring scope counts as
+        // one event, exactly like a fresh alloc (the conservative,
+        // fail-visible direction: an in-place shrink counts too).
+        MEASURING.with(|m| {
+            if m.get() {
+                ALLOC_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
+            }
+        });
         unsafe { System.realloc(ptr, old_layout, new_size) }
     }
 
