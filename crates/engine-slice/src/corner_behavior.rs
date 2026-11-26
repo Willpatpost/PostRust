@@ -362,6 +362,7 @@ impl CornerCrowdWorld {
             need: None,
             base_priority: 0,
             applies_below: 0.0,
+            witness: None,
         }];
         let rates = [0.001; MAX_NEEDS];
         let stream = if mode == StreamMode::Full {
@@ -445,6 +446,72 @@ impl CornerCrowdWorld {
         }
 
         summary
+    }
+
+    /// THE VERSIONED DIAGNOSTIC DIGEST (finding 7's correction — a
+    /// diagnostic BESIDE the compatibility `fingerprint` the World
+    /// trait carries below, never a replacement: the spine's
+    /// fingerprint contract is untouched, and every existing pin
+    /// over it stands). The compatibility fingerprint folds the
+    /// kind DISCRIMINANT only and omits needs, RNG position, decay
+    /// anchors, and locomotion — two worlds fulfilling different
+    /// commitments could hash alike at that boundary. This digest
+    /// folds the complete future-behavior state, versioned like
+    /// R1's journal (a future field list is a new version tag,
+    /// never a silent move): per NPC in order — the current
+    /// activity WITH its variant payload (route/waypoint,
+    /// commitment, class+subject), every need's bits,
+    /// route_progress, the RNG stream position, the decay anchor,
+    /// and the full locomotion state (position, facing, route, leg,
+    /// leg_distance, destination, speed, speed_scale, lateral,
+    /// stride_phase) — then the present mask and the counters.
+    /// Pure, fixed order, read-only.
+    pub fn diagnostic_digest(&self) -> u64 {
+        let mut fp = engine_core::fingerprint::Fingerprinter::new();
+        fp.write_str("engine-slice/corner-behavior-diagnostic/1");
+        for i in 0..24 {
+            fp.write_u32(self.routines[i].current.rule);
+            match self.routines[i].current.kind {
+                ActivityKind::Idle => fp.write_u8(0),
+                ActivityKind::MoveTo { route, waypoint } => {
+                    fp.write_u8(1);
+                    fp.write_u32(route);
+                    fp.write_u32(waypoint);
+                }
+                ActivityKind::Fulfill { commitment } => {
+                    fp.write_u8(2);
+                    fp.write_u32(commitment);
+                }
+                ActivityKind::React { class, subject } => {
+                    fp.write_u8(3);
+                    fp.write_u32(class);
+                    fp.write_u32(subject.0);
+                }
+            }
+            for need in self.routines[i].needs {
+                fp.write_u32(need.to_bits());
+            }
+            fp.write_u32(self.routines[i].route_progress);
+            fp.write_u64(self.rngs[i].state_bits());
+            fp.write_tick(self.last_decay_tick[i]);
+            let state = self.states[i];
+            fp.write_u32(state.position[0].to_bits());
+            fp.write_u32(state.position[1].to_bits());
+            fp.write_u32(u32::from(state.facing));
+            fp.write_u32(state.route);
+            fp.write_u32(state.leg);
+            fp.write_u32(state.leg_distance.to_bits());
+            fp.write_u32(state.destination);
+            fp.write_u32(state.speed.to_bits());
+            fp.write_u32(state.speed_scale.to_bits());
+            fp.write_u32(state.lateral.to_bits());
+            fp.write_u32(state.stride_phase.to_bits());
+            fp.write_u8(u8::from(self.present[i]));
+        }
+        fp.write_u64(self.wake_executions);
+        fp.write_u64(self.arrivals);
+        fp.write_u64(self.stepped);
+        fp.finish()
     }
 }
 
@@ -603,6 +670,9 @@ mod tests {
         guard_settles: u64,
         phase_clamps: u64,
         fingerprint: u64,
+        /// The versioned diagnostic digest (finding 7) — beside the
+        /// compatibility fingerprint, never part of it.
+        diagnostic: u64,
     }
 
     /// Runs the composed campaign for `ticks` from a fresh double
@@ -645,6 +715,7 @@ mod tests {
             guard_settles: world.guard_settles,
             phase_clamps: world.phase_clamps,
             fingerprint: fp.finish(),
+            diagnostic: world.diagnostic_digest(),
         }
     }
 
@@ -774,6 +845,13 @@ mod tests {
             a.fingerprint, b.fingerprint,
             "the world fingerprint is byte-identical"
         );
+        // ... and the versioned diagnostic digest (finding 7) beside
+        // it: the complete future-behavior state is byte-identical
+        // too.
+        assert_eq!(
+            a.diagnostic, b.diagnostic,
+            "the diagnostic digest is byte-identical"
+        );
         // THE ROLLING-FOLD CROSS-CHECK (finding 5's correction): the
         // digest the demo mode carries equals execution_digest over
         // the retained stream — the two encodings cannot drift.
@@ -863,6 +941,111 @@ mod tests {
     const PIN_EXEC_33: u64 = 14_695_981_039_346_656_037;
     const PIN_EXEC_300: u64 = 17_642_371_054_831_568_059;
     const PIN_EXEC_662: u64 = 2_580_761_500_374_851_303;
+
+    /// THE DIAGNOSTIC DIGEST'S DISCRIMINANTS (finding 7's deciding
+    /// test): vary ONLY a commitment payload, a need bit, an RNG
+    /// stream position, or a locomotion phase — the compatibility
+    /// fingerprint (deliberately discriminant-only, preserved
+    /// untouched) stays IDENTICAL while the versioned diagnostic
+    /// digest distinguishes the worlds. Each perturbation is the
+    /// audit's own witness shape: two worlds fulfilling different
+    /// commitments hashed alike at the compatibility boundary. The
+    /// perturbation happens at the TERMINAL read (after behavior is
+    /// done) so exactly one field differs between the paired worlds.
+    #[test]
+    fn diagnostic_digest_distinguishes_what_the_fingerprint_omits() {
+        fn run_then(mutate: &dyn Fn(&mut CornerCrowdWorld)) -> (u64, u64) {
+            let (_, states, present) = corner_population_locomotion();
+            let mut spine = Spine::with_reservation(CornerCrowdWorld::new(states, present), 64, 32);
+            arm_all_entries(&mut spine);
+            for _ in 0..663 {
+                spine.run_tick();
+                spine.world_mut().composed_tick(1.0 / 60.0);
+            }
+            mutate(spine.world_mut());
+            let world = spine.world();
+            let mut fp = engine_core::fingerprint::Fingerprinter::new();
+            world.fingerprint(&mut fp);
+            (fp.finish(), world.diagnostic_digest())
+        }
+        let no_op = |_: &mut CornerCrowdWorld| {};
+        let baseline = run_then(&no_op);
+        let repeat = run_then(&no_op);
+        assert_eq!(
+            baseline, repeat,
+            "the unperturbed double-run: both digests identical"
+        );
+
+        // (a) ONLY a commitment payload: the same Fulfill
+        // discriminant, a different commitment index (the audit's
+        // "two worlds fulfilling different commitments").
+        let payload_a = run_then(&|world: &mut CornerCrowdWorld| {
+            world.routines[5].current = engine_core::npc_behavior::Activity {
+                kind: ActivityKind::Fulfill { commitment: 0 },
+                rule: 5,
+            };
+        });
+        let payload_b = run_then(&|world: &mut CornerCrowdWorld| {
+            world.routines[5].current = engine_core::npc_behavior::Activity {
+                kind: ActivityKind::Fulfill { commitment: 1 },
+                rule: 5,
+            };
+        });
+        assert_eq!(
+            payload_a.0, payload_b.0,
+            "the compatibility fingerprint cannot see the payload (the audit's \
+             witness — preserved untouched)"
+        );
+        assert_ne!(
+            payload_a.1, payload_b.1,
+            "the diagnostic distinguishes the commitment payload"
+        );
+
+        // (b) ONLY a need bit (the decay lane the fingerprint omits).
+        let need_a = run_then(&|world: &mut CornerCrowdWorld| {
+            world.routines[5].needs[2] = 0.5;
+        });
+        let need_b = run_then(&|world: &mut CornerCrowdWorld| {
+            world.routines[5].needs[2] = 0.25;
+        });
+        assert_eq!(
+            need_a.0, need_b.0,
+            "the compatibility fingerprint cannot see the needs"
+        );
+        assert_ne!(
+            need_a.1, need_b.1,
+            "the diagnostic distinguishes the need bit"
+        );
+
+        // (c) ONLY an RNG stream position (one extra draw consumed).
+        let rng_a = run_then(&no_op);
+        let rng_b = run_then(&|world: &mut CornerCrowdWorld| {
+            world.rngs[5].next_unit();
+        });
+        assert_eq!(
+            rng_a.0, rng_b.0,
+            "the compatibility fingerprint cannot see the RNG position"
+        );
+        assert_ne!(
+            rng_a.1, rng_b.1,
+            "the diagnostic distinguishes the RNG position"
+        );
+
+        // (d) ONLY a locomotion phase (the locomotion state the
+        // fingerprint delegates to the separate locomotion pin).
+        let phase_a = run_then(&no_op);
+        let phase_b = run_then(&|world: &mut CornerCrowdWorld| {
+            world.states[5].stride_phase = (world.states[5].stride_phase + 0.5) % 1.0;
+        });
+        assert_eq!(
+            phase_a.0, phase_b.0,
+            "the compatibility fingerprint cannot see the locomotion phase"
+        );
+        assert_ne!(
+            phase_a.1, phase_b.1,
+            "the diagnostic distinguishes the locomotion phase"
+        );
+    }
 
     /// THE ROLLING STREAM CAMPAIGN (the audit's finding 5 deciding
     /// test, the determinism half; the allocation half lives in the

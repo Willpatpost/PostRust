@@ -38,7 +38,7 @@ use crate::clock::Tick;
 use crate::lod::LodLevel;
 use crate::npc_behavior::{
     Activity, ActivityKind, MAX_NEEDS, NpcId, NpcRng, NpcRoutine, Rule, WorldView, decay_needs,
-    select_activity,
+    select_activity, validate_rule_table,
 };
 use crate::npc_perception::{NpcRecord, PerceptionTrace, perceive, perception_budget};
 use crate::npc_schedule::NpcSchedule;
@@ -134,7 +134,10 @@ pub struct WakeOutcome {
 ///    fires them in a burst.
 ///
 /// Returns None (fail closed) iff `commitment` ≥ schedule.entries.len()
-/// — the corrupted-input refusal.
+/// — the corrupted-input refusal — or the rule table fails
+/// [`validate_rule_table`] (finding 6's admission refusal: a
+/// policy-authored out-of-range need index never reaches the
+/// selector's both passes).
 ///
 /// # CONTRACT
 /// The caller tracks per-NPC `last_decay_tick` and sets it to
@@ -153,6 +156,12 @@ pub fn evaluate_wake(
 ) -> Option<WakeOutcome> {
     // Fail closed on corrupted input: commitment index out of range.
     if commitment as usize >= schedule.entries.len() {
+        return None;
+    }
+    // Fail closed on an inadmissible rule table (finding 6's
+    // admission refusal — an out-of-range need index is refused
+    // here, typed, before the selector can ever index with it).
+    if validate_rule_table(rules).is_err() {
         return None;
     }
 
@@ -207,11 +216,21 @@ pub struct WitnessOutcome {
 }
 
 /// Evaluates a witness wake: lazy decay (as above), then the view
-/// carrying the FIRED perceptions — the newest ≤ MAX_PERCEPTIONS
-/// entries of the witness's memory, in the memory's fixed order —
-/// and NO due commitment (a witness wake is not a calendar event).
-/// The selector offers the perceptions to the rule table like any
-/// other input (the engine imposes no fear semantics — §4.1).
+/// carrying the FIRED perceptions — the NEWEST ≤ MAX_PERCEPTIONS
+/// entries of the witness's memory (the LAST bounded entries of the
+/// supplied slice, in the slice's own fixed order — finding 6's
+/// suffix correction: the implementation once took the FIRST
+/// entries, silently dropping the newest) — and NO due commitment
+/// (a witness wake is not a calendar event). The selector offers
+/// the perceptions to the rule table like any other input (the
+/// engine imposes no fear semantics — §4.1); a rule with a witness
+/// matcher can gate on a fired class and bind its observed subject
+/// (npc_behavior's matcher contract).
+///
+/// Returns `None` (fail closed) iff the rule table fails
+/// [`validate_rule_table`] (finding 6's admission refusal) — the
+/// typed refusal the wake path has always had, on the witness path
+/// too.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_witness(
     routine: &NpcRoutine,
@@ -221,7 +240,11 @@ pub fn evaluate_witness(
     rules: &[Rule],
     rng: &mut NpcRng,
     rates: &[f32; MAX_NEEDS],
-) -> WitnessOutcome {
+) -> Option<WitnessOutcome> {
+    // The admission refusal (fail closed, typed — never a panic in
+    // the selector's passes).
+    validate_rule_table(rules).ok()?;
+
     // Lazy decay (same as wake).
     let elapsed = executed_tick
         .as_u64()
@@ -235,11 +258,13 @@ pub fn evaluate_witness(
     let mut routine_after = *routine;
     decay_needs(&mut routine_after, rates, elapsed);
 
-    // The view: perceptions from the memory (fixed order), no due
+    // The view: the NEWEST bounded SUFFIX of the supplied slice (the
+    // last ≤ MAX_PERCEPTIONS entries, fixed order), no due
     // commitment (a witness wake is not a calendar event).
     let mut view = WorldView::default();
     let count = perceptions.len().min(crate::npc_behavior::MAX_PERCEPTIONS);
-    for (i, &(class, subject)) in perceptions.iter().take(count).enumerate() {
+    let suffix_start = perceptions.len() - count;
+    for (i, &(class, subject)) in perceptions[suffix_start..].iter().enumerate() {
         view.perceptions[i] = (class, subject);
     }
     view.perception_count = count as u8;
@@ -249,10 +274,10 @@ pub fn evaluate_witness(
     let activity = select_activity(&routine_after, &view, rules, rng);
     routine_after.current = activity;
 
-    WitnessOutcome {
+    Some(WitnessOutcome {
         activity,
         routine_after,
-    }
+    })
 }
 
 /// Enumerates a significant event's witness set into the CALLER-OWNED
@@ -544,6 +569,7 @@ mod tests {
                 need: None,
                 base_priority: 5,
                 applies_below: 1.0,
+                witness: None,
             },
             Rule {
                 activity: ActivityKind::MoveTo {
@@ -553,6 +579,7 @@ mod tests {
                 need: Some(0),
                 base_priority: 10,
                 applies_below: 0.8,
+                witness: None,
             },
         ];
         // rate 0.125 is a power of two: 1.0 − 0.125·4 = 0.5 EXACTLY
@@ -690,6 +717,7 @@ mod tests {
                 need: None,
                 base_priority: 5,
                 applies_below: 1.0,
+                witness: None,
             },
             Rule {
                 activity: ActivityKind::MoveTo {
@@ -699,6 +727,7 @@ mod tests {
                 need: Some(0),
                 base_priority: 10,
                 applies_below: 0.6,
+                witness: None,
             },
         ];
         // Need 0 at 0.4: the MoveTo rule applies (0.4 < 0.6) and
@@ -717,7 +746,8 @@ mod tests {
             &rules,
             &mut rng_a,
             &[0.0; MAX_NEEDS],
-        );
+        )
+        .expect("the authored table validates");
         assert_eq!(
             first.activity.kind,
             ActivityKind::MoveTo {
@@ -739,7 +769,8 @@ mod tests {
             &rules,
             &mut rng_b,
             &[0.0; MAX_NEEDS],
-        );
+        )
+        .expect("the authored table validates");
         assert_eq!(
             second.activity.kind,
             ActivityKind::Idle,
@@ -758,10 +789,207 @@ mod tests {
             &rules,
             &mut rng_c,
             &[0.0; MAX_NEEDS],
-        );
+        )
+        .expect("the authored table validates");
         assert_eq!(
             first.activity, third.activity,
             "bit-identical across evaluations"
+        );
+    }
+
+    /// THE WITNESS MATCHER THROUGH THE EVALUATOR (finding 6's
+    /// deciding test at the execution boundary): hold needs, seed,
+    /// and table fixed; change ONLY the fired class or subject —
+    /// the authored reaction changes, and the observed subject is
+    /// bound through the evaluator exactly as through the selector.
+    #[test]
+    fn witness_evaluation_reacts_to_the_fired_class_and_subject() {
+        let rules = [
+            Rule {
+                activity: ActivityKind::Idle,
+                need: None,
+                base_priority: 5,
+                applies_below: 1.0,
+                witness: None,
+            },
+            Rule {
+                activity: ActivityKind::React {
+                    class: 5,
+                    subject: NpcId(0),
+                },
+                need: None,
+                base_priority: 50,
+                applies_below: 1.0,
+                witness: Some(crate::npc_behavior::WitnessMatcher { class: 5 }),
+            },
+        ];
+        let rates = [0.0; MAX_NEEDS];
+        let evaluate = |perceptions: &[(u32, NpcId)]| {
+            let mut rng = NpcRng::for_npc(NpcId(21));
+            evaluate_witness(
+                &fresh_routine(),
+                perceptions,
+                Tick(0),
+                Tick(0),
+                &rules,
+                &mut rng,
+                &rates,
+            )
+            .expect("the authored table validates")
+        };
+        // Empty observation: the idle baseline.
+        assert_eq!(
+            evaluate(&[]).activity.kind,
+            ActivityKind::Idle,
+            "an empty observation is distinguishable from the fired class"
+        );
+        // The class fires: the reaction carries the OBSERVED subject.
+        assert_eq!(
+            evaluate(&[(5, NpcId(42))]).activity.kind,
+            ActivityKind::React {
+                class: 5,
+                subject: NpcId(42)
+            },
+            "the observed subject is bound"
+        );
+        // ONLY the subject changes: the binding follows.
+        assert_eq!(
+            evaluate(&[(5, NpcId(8))]).activity.kind,
+            ActivityKind::React {
+                class: 5,
+                subject: NpcId(8)
+            },
+            "a different observed subject changes the authored reaction"
+        );
+        // ONLY the class changes: the gate stays shut.
+        assert_eq!(
+            evaluate(&[(6, NpcId(42))]).activity.kind,
+            ActivityKind::Idle,
+            "a different fired class changes the authored reaction (back to \
+             the baseline — the matcher matched nothing)"
+        );
+    }
+
+    /// THE NEWEST SUFFIX (finding 6's deciding test): five entries
+    /// supplied, MAX_PERCEPTIONS 4 — the view must carry the LAST
+    /// four (the newest), never the first four. The sole matching
+    /// perception sits LAST; a take-first implementation reads the
+    /// oldest four and never sees it.
+    #[test]
+    fn witness_evaluation_takes_the_newest_bounded_suffix() {
+        let rules = [Rule {
+            activity: ActivityKind::React {
+                class: 5,
+                subject: NpcId(0),
+            },
+            need: None,
+            base_priority: 50,
+            applies_below: 1.0,
+            witness: Some(crate::npc_behavior::WitnessMatcher { class: 5 }),
+        }];
+        // Five entries: classes 1..=4 then the sole class-5 match
+        // LAST, at index 4 — inside the newest four, outside the
+        // oldest four.
+        let perceptions = [
+            (1u32, NpcId(10)),
+            (2, NpcId(11)),
+            (3, NpcId(12)),
+            (4, NpcId(13)),
+            (5, NpcId(14)),
+        ];
+        let mut rng = NpcRng::for_npc(NpcId(22));
+        let outcome = evaluate_witness(
+            &fresh_routine(),
+            &perceptions,
+            Tick(0),
+            Tick(0),
+            &rules,
+            &mut rng,
+            &[0.0; MAX_NEEDS],
+        )
+        .expect("the authored table validates");
+        assert_eq!(
+            outcome.activity.kind,
+            ActivityKind::React {
+                class: 5,
+                subject: NpcId(14)
+            },
+            "the sole matching perception is LAST in a five-entry input — only \
+             the newest-bounded suffix sees it"
+        );
+        // The bound holds: a class-1-only input (the oldest entry of
+        // the five) is OUTSIDE the suffix once newer entries exist —
+        // moving the class-1 match to the front of five entries does
+        // not fire a class-1 matcher.
+        let rules_front = [Rule {
+            activity: ActivityKind::React {
+                class: 1,
+                subject: NpcId(0),
+            },
+            need: None,
+            base_priority: 50,
+            applies_below: 1.0,
+            witness: Some(crate::npc_behavior::WitnessMatcher { class: 1 }),
+        }];
+        let mut rng = NpcRng::for_npc(NpcId(22));
+        let outcome = evaluate_witness(
+            &fresh_routine(),
+            &perceptions,
+            Tick(0),
+            Tick(0),
+            &rules_front,
+            &mut rng,
+            &[0.0; MAX_NEEDS],
+        )
+        .expect("the authored table validates");
+        assert_eq!(
+            outcome.activity.kind,
+            ActivityKind::Idle,
+            "the oldest entry (class 1, index 0) is evicted by the newer four — \
+             the suffix is the NEWEST bounded entries"
+        );
+    }
+
+    /// THE ADMISSION REFUSAL through both evaluators (finding 6):
+    /// an out-of-range need index fails the table at admission —
+    /// typed on the wake path (the existing corrupted-input refusal
+    /// channel) and on the witness path (the new one).
+    #[test]
+    fn both_evaluators_fail_closed_on_an_out_of_range_need_index() {
+        let rules = [Rule {
+            activity: ActivityKind::Idle,
+            need: Some(u8::MAX),
+            base_priority: 5,
+            applies_below: 1.0,
+            witness: None,
+        }];
+        let mut rng = NpcRng::for_npc(NpcId(23));
+        assert!(
+            evaluate_wake(
+                &recurring_schedule(),
+                0,
+                Tick(0),
+                Tick(0),
+                &fresh_routine(),
+                &rules,
+                &mut rng,
+                &[0.0; MAX_NEEDS],
+            )
+            .is_none(),
+            "the wake evaluation fails closed on the inadmissible table"
+        );
+        assert!(
+            evaluate_witness(
+                &fresh_routine(),
+                &[(5, NpcId(1))],
+                Tick(0),
+                Tick(0),
+                &rules,
+                &mut rng,
+                &[0.0; MAX_NEEDS],
+            )
+            .is_none(),
+            "the witness evaluation fails closed on the inadmissible table"
         );
     }
 
@@ -1054,7 +1282,8 @@ mod tests {
                     &self.rules,
                     &mut rng,
                     &self.rates,
-                );
+                )
+                .expect("the authored table validates at admission");
                 self.npcs[npc_i].routine = outcome.routine_after;
                 self.npcs[npc_i].rng = rng;
                 self.npcs[npc_i].last_decay_tick = ctx.executed_tick();
@@ -1225,6 +1454,7 @@ mod tests {
                 need: None,
                 base_priority: 5,
                 applies_below: 1.0,
+                witness: None,
             },
             Rule {
                 activity: ActivityKind::MoveTo {
@@ -1234,6 +1464,7 @@ mod tests {
                 need: Some(0),
                 base_priority: 10,
                 applies_below: 0.8,
+                witness: None,
             },
             Rule {
                 activity: ActivityKind::React {
@@ -1243,6 +1474,7 @@ mod tests {
                 need: Some(3),
                 base_priority: 8,
                 applies_below: 0.6,
+                witness: None,
             },
         ]
         .to_vec();
@@ -1581,6 +1813,7 @@ mod tests {
             need: None,
             base_priority: 5,
             applies_below: 1.0,
+            witness: None,
         }];
         let rates = [0.0; MAX_NEEDS];
 
@@ -1756,6 +1989,7 @@ mod tests {
                 need: None,
                 base_priority: 5,
                 applies_below: 1.0,
+                witness: None,
             }],
             rates: [0.0; MAX_NEEDS],
             significant: Vec::new(),

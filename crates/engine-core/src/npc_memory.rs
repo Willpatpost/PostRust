@@ -1040,6 +1040,47 @@ impl MemoryLane {
         }
         hasher.finish()
     }
+
+    /// THE VERSIONED DIAGNOSTIC DIGEST (finding 7's correction — a
+    /// diagnostic BESIDE the compatibility `digest` above, never a
+    /// replacement for it; versioned like R1's journal, so a future
+    /// field list is a new version tag, never a silent move of this
+    /// one): folds everything the compatibility digest omits but
+    /// future behavior depends on — the ledger, the classifications,
+    /// the live maps (as above), PLUS the ACTIVE and DORMANT
+    /// membership sets and the produced counters. Deactivating a
+    /// never-seen witness changes later capture MATERIALIZATION
+    /// while leaving the compatibility digest identical (the
+    /// audit's witness); this digest distinguishes those worlds.
+    /// Field order is fixed: the version tag, the ledger digest,
+    /// each classification, each live witness, each active member,
+    /// each dormant member, each produced counter — map order
+    /// throughout.
+    #[must_use]
+    pub fn diagnostic_digest(&self) -> u64 {
+        let mut hasher = Fingerprinter::new();
+        hasher.write_str("engine-core/npc-memory-lane-diagnostic/1");
+        hasher.write_u64(self.ledger.digest());
+        for (key, &decision) in &self.classifications {
+            hasher.write_bytes(&key.canonical_bytes());
+            hasher.write_u8(u8::from(decision));
+        }
+        for (&witness, mem) in &self.live {
+            hasher.write_u32(witness);
+            hasher.write_u64(mem.digest());
+        }
+        for &witness in &self.active {
+            hasher.write_u32(witness);
+        }
+        for &witness in &self.dormant {
+            hasher.write_u32(witness);
+        }
+        for (&witness, &produced) in &self.produced {
+            hasher.write_u32(witness);
+            hasher.write_u64(produced);
+        }
+        hasher.finish()
+    }
 }
 
 #[cfg(test)]
@@ -1090,6 +1131,78 @@ mod tests {
             delta,
             tick,
         }
+    }
+
+    /// THE DORMANCY DISCRIMINANT (finding 7's deciding test): two
+    /// lanes identical except ONE deactivated never-seen witness.
+    /// The compatibility `digest` cannot tell them apart (the
+    /// ledger, classifications, and live maps are all unchanged —
+    /// the audit's witness); the VERSIONED diagnostic digest can.
+    /// And the materialization consequence the diagnostic predicts
+    /// is real: a subsequent capture for that witness materializes
+    /// live in one lane and stays ledger-only in the other.
+    #[test]
+    fn diagnostic_digest_distinguishes_dormancy_the_compatibility_digest_cannot() {
+        let record = |witness: u32| {
+            make_record(
+                1,
+                witness,
+                MemoryKind::Episodic,
+                make_episodic(witness, 5, TEST_TICK, 7),
+                TEST_TICK,
+            )
+        };
+        let mut plain = MemoryLane::new();
+        let mut deactivated = MemoryLane::new();
+        // A never-seen witness 9 is deactivated in the second lane:
+        // no representation existed (the honest `false`), but the
+        // dormant membership is now state a future capture obeys.
+        assert!(
+            !deactivated.deactivate(9),
+            "no representation existed to discard"
+        );
+        // The compatibility digest is IDENTICAL — the exact blind
+        // spot the audit named (asserted as the demonstrated BEFORE
+        // state, never re-derived anywhere as an equality gate on
+        // future behavior).
+        assert_eq!(
+            plain.digest(),
+            deactivated.digest(),
+            "the compatibility digest cannot see dormancy membership (the audit's \
+             witness — preserved untouched)"
+        );
+        // The versioned diagnostic digest distinguishes the worlds.
+        assert_ne!(
+            plain.diagnostic_digest(),
+            deactivated.diagnostic_digest(),
+            "the diagnostic sees the dormant bit"
+        );
+        // Purity: the diagnostic is a pure function of the state.
+        assert_eq!(
+            plain.diagnostic_digest(),
+            MemoryLane::new().diagnostic_digest(),
+            "two identically-constructed lanes agree"
+        );
+        // THE MATERIALIZATION CONSEQUENCE the diagnostic predicts:
+        // a capture for witness 9 materializes live in the plain
+        // lane and stays ledger-only in the deactivated lane.
+        plain
+            .capture_and_apply(record(9), 8)
+            .expect("the record validates");
+        deactivated
+            .capture_and_apply(record(9), 8)
+            .expect("the record validates");
+        assert!(plain.live(9).is_some(), "the active witness materializes");
+        assert!(
+            deactivated.live(9).is_none(),
+            "the dormant witness stays ledger-only (materialization waits for \
+             activation)"
+        );
+        assert!(deactivated.is_dormant(9));
+        // Post-capture the two lanes differ on the live maps too —
+        // both digests now distinguish; the diagnostic did it FIRST,
+        // before any capture made the difference visible.
+        assert_ne!(plain.digest(), deactivated.digest());
     }
 
     /// Test 1: key canonical byte layout pinned
