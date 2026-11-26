@@ -1410,6 +1410,10 @@ fn ripple_natural_sequence_gate() {
 
     let dt = 1.0f32 / 60.0f32;
     let mut layer = RainLayer::new(GATE_EYE);
+    // The camera basis for the inverse-ray support test (the finding
+    // 25 term-separation's per-pixel distance check — the same
+    // aspect-corrected ray the signed-movement gate uses).
+    let (forward, right, up) = gate_basis();
     // The off-screen landings observed (the PROVISIONAL panic's own
     // diagnostics).
     let mut landings: Vec<[f32; 2]> = Vec::new();
@@ -1628,6 +1632,108 @@ fn ripple_natural_sequence_gate() {
         // nothing is honestly unobservable and the drive CONTINUES;
         // contribution-without-ink is the real failure.
         if ink >= 1 {
+            // THE TERM SEPARATION (the sign-off review's finding 25
+            // corrective): one displayed pixel from the production
+            // capture proves WIRING, not displacement — a
+            // dimming-only newborn (the roughen term alive, the UV
+            // term dead) passes exactly the same check. The
+            // qualifying birth's field pair is captured through the
+            // debug modes — the DISPLACEMENT-ONLY pair (the live
+            // field vs the before-field, the UV term alone, the
+            // rainless population so no streak noise rides either
+            // arm) must carry its own ink: the newborn's SAMPLE
+            // DISPLACEMENT, not its dimming, is what moved pixels.
+            let disp_with = ripple_mode_capture(
+                &mut renderer,
+                &matrix,
+                light,
+                Some(layer.ripple_field()),
+                RippleDebugMode::DisplacementOnly,
+            );
+            let disp_without = ripple_mode_capture(
+                &mut renderer,
+                &matrix,
+                light,
+                Some(&before_field),
+                RippleDebugMode::DisplacementOnly,
+            );
+            let mut disp_ink = 0usize;
+            let mut support_violations = 0usize;
+            for (index, (a, b)) in disp_without
+                .bytes
+                .chunks(4)
+                .zip(disp_with.bytes.chunks(4))
+                .enumerate()
+            {
+                let rgb_delta = (0..3)
+                    .map(|ch| (a[ch] as i32 - b[ch] as i32).abs())
+                    .max()
+                    .unwrap();
+                if rgb_delta >= 2 {
+                    disp_ink += 1;
+                    // THE INVERSE-RAY SUPPORT TEST: the differing
+                    // pixel's ground distance from the birth center
+                    // sits inside the newborn's band (the aspect-
+                    // corrected inverse projection — the pre-R4
+                    // compressed ray made this check impossible).
+                    let x = (index % SIZE.0 as usize) as u32;
+                    let y = (index / SIZE.0 as usize) as u32;
+                    if let Some(ground) = pixel_ground(forward, right, up, x, y) {
+                        let dist = ((ground[0] - new_rings[0].center[0]).powi(2)
+                            + (ground[2] - new_rings[0].center[1]).powi(2))
+                        .sqrt();
+                        let outer = RIPPLE_POLICY.speed * new_rings[0].age + RIPPLE_POLICY.width;
+                        if dist > outer + 0.25 {
+                            support_violations += 1;
+                        }
+                    }
+                }
+            }
+            let blend_with = ripple_mode_capture(
+                &mut renderer,
+                &matrix,
+                light,
+                Some(layer.ripple_field()),
+                RippleDebugMode::BlendOnly,
+            );
+            let blend_without = ripple_mode_capture(
+                &mut renderer,
+                &matrix,
+                light,
+                Some(&before_field),
+                RippleDebugMode::BlendOnly,
+            );
+            let mut blend_ink = 0usize;
+            for (a, b) in blend_without
+                .bytes
+                .chunks(4)
+                .zip(blend_with.bytes.chunks(4))
+            {
+                let rgb_delta = (0..3)
+                    .map(|ch| (a[ch] as i32 - b[ch] as i32).abs())
+                    .max()
+                    .unwrap();
+                if rgb_delta >= 2 {
+                    blend_ink += 1;
+                }
+            }
+            println!(
+                "natural term separation: displacement-only {disp_ink} pixels, \
+                 blend-only {blend_ink} pixels ({support_violations} support \
+                 violations) — the newborn's UV term vs its roughen term"
+            );
+            assert_eq!(
+                support_violations, 0,
+                "the displacement-only ink sits inside the newborn's projected band"
+            );
+            assert!(
+                disp_ink >= 1,
+                "the natural newborn's UV DISPLACEMENT alone moves displayed pixels \
+                 ({disp_ink} displacement-only pixels vs {blend_ink} blend-only) — a \
+                 dimming-only newborn (the finding 25 defect shape: the roughen term \
+                 alive, the UV term dead) fails exactly here while the production \
+                 capture still showed ink"
+            );
             sequence = Some(new_rings.clone());
             break;
         }

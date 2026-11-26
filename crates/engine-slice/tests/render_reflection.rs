@@ -56,12 +56,18 @@ const BIAS: ShadowBias = ShadowBias {
 
 /// The binary's SDL serialization (the engine-shell test pattern —
 /// render_instanced's own copy). The guard is declared FIRST so it
-/// drops LAST.
+/// drops LAST. Poison-tolerant (the R4 round-7 corrective's sibling,
+/// applied here after the finding 24 gate's calibration panics
+/// cascaded): a gate's assertion panic must not cascade into every
+/// other gate's PoisonError — each gate reports ITS OWN verdict. The
+/// mutex serializes SDL process-global setup; an assertion failure
+/// while holding it never corrupts that state.
 fn sdl_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap()
+    match LOCK.get_or_init(|| std::sync::Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 /// The camera basis for a pose (the sky gate's own helper).
@@ -93,6 +99,32 @@ fn pixel_ray(
     });
     let length = (ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]).sqrt();
     ray.map(|component| component / length)
+}
+
+/// The CPU Schlick reflection blend at one pixel's ground point (the
+/// finding 24 both-predictions calibration): the ray's intersection
+/// with the receiver plane, the eye's view vector, the clamped Y
+/// cosine, `planar::reflection_blend` — the same model the placement
+/// scan and the weather gates use.
+fn local_blend(
+    forward: [f32; 3],
+    right: [f32; 3],
+    up: [f32; 3],
+    eye: [f32; 3],
+    x: u32,
+    y: u32,
+    size: (u32, u32),
+) -> f32 {
+    let ray = pixel_ray(forward, right, up, x, y, size);
+    if ray[1] >= -1e-4 {
+        return 0.02;
+    }
+    let t = -eye[1] / ray[1];
+    let ground = [eye[0] + ray[0] * t, 0.0, eye[2] + ray[2] * t];
+    let view = [eye[0] - ground[0], eye[1] - ground[1], eye[2] - ground[2]];
+    let view_length = (view[0] * view[0] + view[1] * view[1] + view[2] * view[2]).sqrt();
+    let n_dot_v = (view[1] / view_length).clamp(0.0, 1.0);
+    reflection_blend(n_dot_v)
 }
 
 /// One reflected-ray hit on the corner boxes (the slab test — the
@@ -1877,19 +1909,40 @@ fn wet_targets_honor_the_negotiated_depth_format() {
             renderer.set_wet(true);
 
             // MEASURED: on the 2026-11-24 lavapipe run, wet_differ =
-            // 34848 of 34848 lower-half pixels (264x132 — the wet
+            // 34848 of 34848 lower-half pixels (264x132 - the wet
             // redraw changes every lower-half pixel at this pose;
             // the first-frame gates' own D32 differential at this
-            // extent is 34190 — same magnitude, sky+post content)
+            // extent is 34190 - same magnitude, sky+post content).
+            // THE EXTENT GUARD (the poison-fix exposure): a windowed
+            // surface clamps the swapchain to the WINDOW's extent
+            // (the rig's 256x256 - the requested 264 is honored only
+            // on the offscreen/lavapipe surface), so the pixel loops
+            // derive their bounds from the CAPTURE's own extent -
+            // the CI path exercises the full 264 checks, the rig's
+            // windowed path the window's, both with the same floors.
+            let extent = (capture_new.width, capture_new.height);
+            if extent != new_size {
+                println!(
+                    "wet fallback {forced_name}: the windowed surface clamped the extent \
+                     to {}x{} (the requested {new_size:?}) - the checks continue at the \
+                     window's extent (the lavapipe/CI path runs the full 264)",
+                    extent.0, extent.1
+                );
+            }
             let mut wet_differ = 0usize;
-            for y in new_size.1 / 2..new_size.1 {
-                for x in 0..new_size.0 {
+            for y in extent.1 / 2..extent.1 {
+                for x in 0..extent.0 {
                     wet_differ +=
                         usize::from(capture_new.pixel_rgba(x, y) != wet_off.pixel_rgba(x, y));
                 }
             }
             println!(
-                "wet fallback {forced_name} at 264: {wet_differ} lower-half pixels differ wet-vs-off (resize rebuild)"
+                "wet fallback {forced_name} at {}: {wet_differ} lower-half pixels differ wet-vs-off (resize rebuild)",
+                if extent == new_size {
+                    "264"
+                } else {
+                    "the window extent"
+                }
             );
             assert!(
                 wet_differ >= 8000,
@@ -2027,12 +2080,16 @@ fn wet_targets_honor_the_negotiated_depth_format() {
             renderer.set_post(true);
 
             // MEASURED: on the 2026-11-24 lavapipe run, post_differ =
-            // 73984 of 73984 pixels (272x272 — the ACES tonemap +
+            // 73984 of 73984 pixels (272x272 - the ACES tonemap +
             // bloom signature changes every pixel; the first-frame
-            // gate's own post differential at 264 is 69696 = all)
+            // gate's own post differential at 264 is 69696 = all).
+            // THE EXTENT GUARD (the step-2 sibling): the windowed
+            // surface clamps to the window's extent - the loops
+            // derive their bounds from the capture's own.
+            let large_extent = (combined_large.width, combined_large.height);
             let mut post_differ = 0usize;
-            for y in 0..larger_size.1 {
-                for x in 0..larger_size.0 {
+            for y in 0..large_extent.1 {
+                for x in 0..large_extent.0 {
                     post_differ +=
                         usize::from(combined_large.pixel_rgba(x, y) != no_post.pixel_rgba(x, y));
                 }
@@ -2059,10 +2116,12 @@ fn wet_targets_honor_the_negotiated_depth_format() {
 
             // MEASURED: on the 2026-11-24 lavapipe run, wet_differ =
             // 36251 of 36960 lower-half pixels (the 709 unchanged are
-            // opaque building pixels the wet redraw never touches)
+            // opaque building pixels the wet redraw never touches).
+            // THE EXTENT GUARD: the capture's own extent (the step-2
+            // sibling).
             let mut wet_differ = 0usize;
-            for y in larger_size.1 / 2..larger_size.1 {
-                for x in 0..larger_size.0 {
+            for y in large_extent.1 / 2..large_extent.1 {
+                for x in 0..large_extent.0 {
                     wet_differ +=
                         usize::from(combined_large.pixel_rgba(x, y) != no_wet.pixel_rgba(x, y));
                 }
@@ -2595,6 +2654,10 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
     // maximum-presence footprint pixel REGARDLESS of the floors,
     // so a platform below them fails WITH ITS OWN ACTUALS.
     let mut witness_nm: Option<(u32, u32, i32, i32, i32)> = None;
+    // The separation near-miss (the finding 24 selection's own
+    // diagnostic): the best b·presence − contrast pixel, the
+    // quantity the discrimination turns on.
+    let mut witness_nm_sep: Option<(u32, u32, i32, i32, f32)> = None;
     for y in footprint.min_y.saturating_sub(4)..=(footprint.max_y + 4).min(height as u32 - 1) {
         for x in footprint.min_x.saturating_sub(4)..=(footprint.max_x + 4).min(width as u32 - 1) {
             let w_pixel = wet.pixel_rgba(x, y);
@@ -2609,24 +2672,58 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
             if witness_nm.is_none_or(|(_, _, nm_p, _, _)| presence > nm_p) {
                 witness_nm = Some((x, y, presence, wet_value, contrast));
             }
+            // THE DISCRIMINATING WITNESS (the sign-off review's
+            // finding 24 corrective): the sign flip alone is vacuous
+            // wherever the streak's source sits under the dry value
+            // (the review's Ubuntu counterexample: D=19, W=27, S_d=12
+            // — BOTH orders dim). The BOTH-PREDICTIONS form decides
+            // at ANY witness: the correct order's rain-over-wet
+            // delta is bounded to the interval
+            //     [presence - contrast, presence]
+            // (α(src−W) = presence + α(D−W), α ∈ (0,1]), while the
+            // reversed order's receiver-over-rain re-blend predicts
+            // EXACTLY (1-b)·presence — the two are separable
+            // whenever b·|presence| exceeds the contrast by the
+            // margin. The witness is selected on that separation
+            // (the contrast floor is LOW — the interval
+            // discrimination needs the separation, not a wide
+            // patch); the asserts below then require the measured
+            // delta INSIDE the correct interval and AWAY from the
+            // reversed prediction.
+            let b = local_blend(forward, right, up, eye, x, y, size);
+            let separation = b * presence as f32 - contrast as f32;
+            if witness_nm_sep.is_none_or(|(_, _, _, _, s)| separation > s) {
+                witness_nm_sep = Some((x, y, presence, contrast, separation));
+            }
             if presence >= STREAK_PRESENCE_FLOOR
                 && wet_value >= WET_PATCH_FLOOR
-                && contrast >= 8
+                && separation >= 2.5
                 && witness.is_none_or(|(_, _, best_presence, _)| presence > best_presence)
             {
                 witness = Some((x, y, presence, channel));
             }
         }
     }
-    let Some((w_x, w_y, presence, w_channel)) = witness else {
+    let Some((w_x, w_y, _presence, w_channel)) = witness else {
+        if let Some((nm_x, nm_y, nm_p, nm_c, nm_sep)) = witness_nm_sep {
+            panic!(
+                "PROVISIONAL gate: no footprint pixel showed the DISCRIMINATING witness \
+                 (the finding 24 both-predictions separation: b x presence exceeding the \
+                 contrast by 2.5, so the correct order's interval and the reversed \
+                 order's exact prediction are distinguishable at the rounding margin). \
+                 The best-separation pixel: ({nm_x}, {nm_y}) presence {nm_p}/255, \
+                 contrast {nm_c}/255, separation {nm_sep:.1}; footprint x [{}, {}] y \
+                 [{}, {}] - re-pin from THIS platform's actuals",
+                footprint.min_x, footprint.max_x, footprint.min_y, footprint.max_y
+            );
+        }
         let (nm_x, nm_y, nm_p, nm_wet, nm_contrast) =
             witness_nm.expect("the streak's footprint covers screen pixels");
         panic!(
-            "PROVISIONAL gate: no footprint pixel showed the streak present over a \
-             bright wet patch. The best near-miss: ({nm_x}, {nm_y}) presence \
-             {nm_p}/255 (floor {STREAK_PRESENCE_FLOOR}), wet {nm_wet}/255 (floor \
-             {WET_PATCH_FLOOR}), contrast {nm_contrast}/255 (floor 8); footprint x \
-             [{}, {}] y [{}, {}] - re-pin from THIS platform's actuals",
+            "PROVISIONAL gate: no footprint pixel showed any streak presence. The best \
+             near-miss: ({nm_x}, {nm_y}) presence {nm_p}/255 (floor \
+             {STREAK_PRESENCE_FLOOR}), wet {nm_wet}/255 (floor {WET_PATCH_FLOOR}), \
+             contrast {nm_contrast}/255; footprint x [{}, {}] y [{}, {}]",
             footprint.min_x, footprint.max_x, footprint.min_y, footprint.max_y
         );
     };
@@ -2634,29 +2731,48 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
     let w_dry = dry.pixel_rgba(w_x, w_y)[w_channel] as i32;
     let w_streak_wet = streak_wet.pixel_rgba(w_x, w_y)[w_channel] as i32;
     let w_streak_dry = streak_dry.pixel_rgba(w_x, w_y)[w_channel] as i32;
+    // THE BOTH-PREDICTIONS DISCRIMINATION (finding 24's corrective,
+    // asserted): the correct order's rain-over-wet delta is bounded
+    // to the interval [presence - contrast, presence] (the source
+    // and effective alpha pair cancel: α(src−W) = presence + α(D−W),
+    // α ∈ (0,1]); the reversed order's receiver-over-rain re-blend
+    // predicts EXACTLY (1-b)·presence. The witness was selected so
+    // the two are separated by more than rounding — a recorder
+    // drawing in either order lands on its own prediction, never
+    // the other's.
+    let w_b = local_blend(forward, right, up, eye, w_x, w_y, size);
+    let dry_presence = w_streak_dry - w_dry;
+    let contrast = w_wet - w_dry;
+    let measured_delta = w_streak_wet - w_wet;
+    let reversed_prediction = ((1.0 - w_b) * dry_presence as f32) as i32;
     println!(
         "witness ({w_x}, {w_y}) channel {w_channel}: dry {w_dry}, wet {w_wet}, \
-         streak-dry {w_streak_dry} (presence {presence}), streak-wet {w_streak_wet}"
+         streak-dry {w_streak_dry} (signed presence {dry_presence}), streak-wet \
+         {w_streak_wet}; Schlick b {w_b:.3}; the correct order's interval \
+         [{}, {}], the reversed order's exact prediction {reversed_prediction}, \
+         the measured delta {measured_delta}",
+        dry_presence - contrast,
+        dry_presence
+    );
+    assert!(
+        measured_delta >= dry_presence - contrast - 2 && measured_delta <= dry_presence + 2,
+        "the measured delta {measured_delta} lies INSIDE the correct order's interval \
+         [{}, {}] (presence {dry_presence}, contrast {contrast}, rounding tolerance 2) \
+         — a reversed-order recorder lands outside it",
+        dry_presence - contrast,
+        dry_presence
+    );
+    assert!(
+        (measured_delta - reversed_prediction).abs() >= 2,
+        "the measured delta {measured_delta} is separate from the reversed order's \
+         exact prediction {reversed_prediction} (b {w_b:.3}) by more than rounding — \
+         a reversed-order recorder lands ON it"
     );
 
-    // THE ORDERED BLEND (postless): the streak composes UNDER the
-    // wet reflection — the witness channel must DIM below the
-    // no-rain wet value. The tint ceiling (<= 0.57) keeps the
-    // streak's source color under the W floor, so the correct order
-    // dims by (W - S) x alpha >= 2 (the presence floor 15 with the
-    // source-color spread bounds the worst case); the DEFECT order
-    // re-blends the reflection over the streak and brightens by
-    // presence x (1 - b) >= 15 x 0.15 >= 2 — the sign flip.
-    assert!(
-        w_wet - w_streak_wet >= 2,
-        "the ordered blend: the streak DIMS the bright wet patch ({w_wet} -> \
-         {w_streak_wet}) — the defect order re-blends the reflection over it and \
-         brightens (the sign flip is the discriminator)"
-    );
     // The streak is genuinely present over the dry ground (the
-    // audit's known-alpha streak: present means a MEASURABLE
-    // change - with the adaptive tint the streak may sit under
-    // bright ground and DIM it, which is still presence).
+    // calibration measurement the both-predictions discrimination
+    // rests on — either direction; the signed presence feeds the
+    // interval and the reversed prediction above).
     assert!(
         (w_streak_dry - w_dry).abs() >= 2,
         "the streak is present over the dry ground ({w_dry} -> {w_streak_dry})"

@@ -1110,16 +1110,60 @@ impl InstanceExtensionPlan {
         // instance of the only surface path an offscreen window
         // can use (the surface path's offscreen branch then fails
         // with "VK_EXT_headless_surface extension is not enabled").
-        // When the SDL side carries NO surface extension but the
-        // loader advertises the headless one (lavapipe always
-        // does), add it. A windowed SDL list (win32/metal/xlib
-        // surfaces) is never touched, and a real-GPU loader that
-        // lacks the headless extension is unchanged.
+        //
+        // THE SIGN-OFF REVIEW'S FINDING 23 CORRECTIVE, two parts:
+        // (1) THE PREREQUISITE - VK_EXT_headless_surface DEPENDS on
+        // VK_KHR_surface (the instance-extension dependency in its
+        // specification): enabling headless alone produces an
+        // invalid extension list the validation layer flags and a
+        // lenient driver might still accept - the plan now enables
+        // BOTH, each exactly once, whenever it adds the headless
+        // one, and adds NEITHER when the loader cannot supply the
+        // prerequisite (a loader advertising headless without
+        // KHR_surface is itself malformed - the honest behavior is
+        // the SDL list untouched, the surface path failing visibly
+        // at creation, never a spec-invalid instance).
+        // (2) THE PLATFORM CONDITION - the pre-corrective substring
+        // test (`e.contains("surface")`) let SDL's GENERIC
+        // VK_KHR_surface alone satisfy it, blocking the fallback
+        // for a list that names no PLATFORM surface (no
+        // win32/metal/xlib/wayland/android/headless backend) - the
+        // driver-less generic name cannot create any window
+        // surface. The condition now requires an actual platform
+        // backend extension; a windowed SDL list is never touched,
+        // and a real-GPU loader that lacks the headless extension
+        // is unchanged.
+        const PLATFORM_SURFACE_EXTENSIONS: &[&str] = &[
+            "VK_KHR_win32_surface",
+            "VK_KHR_xlib_surface",
+            "VK_KHR_xcb_surface",
+            "VK_KHR_wayland_surface",
+            "VK_KHR_android_surface",
+            "VK_KHR_metal_surface",
+            "VK_KHR_display_surface",
+            "VK_EXT_headless_surface",
+            "VK_MVK_macos_surface",
+            "VK_GGP_stream_descriptor_surface",
+            "VK_NN_vi_surface",
+            "VK_FUCHSIA_imagepipe_surface",
+            "VK_QNX_screen_surface",
+        ];
         let headless = "VK_EXT_headless_surface".to_string();
+        let khr_surface = "VK_KHR_surface".to_string();
         let mut required: Vec<String> = sdl_required.to_vec();
-        if !required.iter().any(|e| e.contains("surface")) && loader_advertised.contains(&headless)
+        let has_platform_surface = required
+            .iter()
+            .any(|e| PLATFORM_SURFACE_EXTENSIONS.contains(&e.as_str()));
+        let can_supply_prerequisite =
+            required.contains(&khr_surface) || loader_advertised.contains(&khr_surface);
+        if !has_platform_surface && loader_advertised.contains(&headless) && can_supply_prerequisite
         {
-            required.push(headless);
+            if !required.contains(&khr_surface) {
+                required.push(khr_surface);
+            }
+            if !required.contains(&headless) {
+                required.push(headless);
+            }
         }
         InstanceExtensionPlan {
             sdl_required: dedup_keep_first(&required),
@@ -5403,13 +5447,19 @@ mod policy_tests {
         // THE WINDOWS OFFSCREEN PARITY: SDL's offscreen driver on
         // Windows names no window-system surface; the loader
         // (lavapipe) offers the headless one - the plan must add
-        // it (the surface path's offscreen branch requires it).
+        // BOTH it and its VK_KHR_surface prerequisite, each exactly
+        // once (the sign-off review's finding 23 corrective: the
+        // pre-corrective plan enabled headless alone - an invalid
+        // extension list under the extension's own dependency).
         let plan = InstanceExtensionPlan::select(
             &[],
             &strings(&["VK_KHR_surface", "VK_EXT_headless_surface"]),
             false,
         );
-        assert_eq!(plan.extensions(), strings(&["VK_EXT_headless_surface"]));
+        assert_eq!(
+            plan.extensions(),
+            strings(&["VK_KHR_surface", "VK_EXT_headless_surface"])
+        );
         // A windowed SDL list is never touched.
         let windowed = InstanceExtensionPlan::select(
             &strings(&["VK_KHR_surface", "VK_KHR_win32_surface"]),
@@ -5425,6 +5475,43 @@ mod policy_tests {
         // before).
         let gpu = InstanceExtensionPlan::select(&[], &strings(&["VK_KHR_surface"]), false);
         assert!(gpu.extensions().is_empty());
+        // THE GENERIC-ONLY LIST (finding 23's second half): SDL
+        // naming just the base VK_KHR_surface carries no platform
+        // backend - the pre-corrective substring test let it block
+        // the fallback; the platform condition now adds the
+        // headless backend beside it.
+        let generic_only = InstanceExtensionPlan::select(
+            &strings(&["VK_KHR_surface"]),
+            &strings(&["VK_KHR_surface", "VK_EXT_headless_surface"]),
+            false,
+        );
+        assert_eq!(
+            generic_only.extensions(),
+            strings(&["VK_KHR_surface", "VK_EXT_headless_surface"]),
+            "the generic-only list gets the headless backend (no platform surface named)"
+        );
+        // A list that already carries headless is untouched (no
+        // duplicate, the prerequisite already implied).
+        let already_headless = InstanceExtensionPlan::select(
+            &strings(&["VK_KHR_surface", "VK_EXT_headless_surface"]),
+            &strings(&["VK_KHR_surface", "VK_EXT_headless_surface"]),
+            false,
+        );
+        assert_eq!(
+            already_headless.extensions(),
+            strings(&["VK_KHR_surface", "VK_EXT_headless_surface"])
+        );
+        // THE LOADER MISSING THE PREREQUISITE: a loader advertising
+        // headless without KHR_surface is itself malformed - the
+        // plan adds NEITHER (the SDL list untouched, the surface
+        // path failing visibly at creation, never a spec-invalid
+        // instance).
+        let malformed_loader =
+            InstanceExtensionPlan::select(&[], &strings(&["VK_EXT_headless_surface"]), false);
+        assert!(
+            malformed_loader.extensions().is_empty(),
+            "no prerequisite, no headless - never an invalid extension list"
+        );
     }
 
     #[test]

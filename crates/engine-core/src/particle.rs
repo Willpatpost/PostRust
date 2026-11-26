@@ -266,6 +266,33 @@ impl EmitterConfig {
         {
             return Err("particle/kill-y-non-finite");
         }
+        // KINEMATIC EXTENT (the sign-off review's finding 26
+        // corrective): finite inputs can integrate to a nonfinite
+        // position — a base velocity of f32::MAX with lifetime 10
+        // crosses infinity on the FIRST step, and no gate above
+        // catches it (MAX is finite, the ordering holds). The
+        // worst-case excursion over one lifetime must stay finite
+        // on every axis — the speed is bounded (drag ≤ 1 never
+        // grows it; the jitter adds at most its own magnitude;
+        // gravity's accumulated displacement is bounded by
+        // g·life² in the worst dt), anchored at the volume's
+        // endpoint magnitudes. Refused at admission, before any
+        // RNG draw, accumulator, or pool mutation — a kill plane
+        // that would terminate the particle early does NOT loosen
+        // the bound (it gates y only; the horizontal axes keep
+        // flying; the conservative direction is fail-visible).
+        let life = self.lifetime[1];
+        for axis in 0..3 {
+            let speed = self.base_velocity[axis].abs() + self.velocity_jitter[axis].abs();
+            let excursion =
+                speed * life + self.volume.max[axis].abs() + self.volume.min[axis].abs();
+            if !excursion.is_finite() {
+                return Err("particle/kinematic-extent-non-finite");
+            }
+        }
+        if !(self.gravity * life * life).is_finite() {
+            return Err("particle/kinematic-extent-non-finite");
+        }
         Ok(())
     }
 }
@@ -1724,6 +1751,49 @@ mod tests {
             Err("particle/volume-span-non-finite"),
             "the finite-pair span overflow"
         );
+        // THE KINEMATIC EXTENT (the sign-off review's finding 26
+        // corrective): every input FINITE and ordered — a base
+        // velocity of f32::MAX with lifetime 10 integrates the
+        // position to infinity on the first step, surviving with
+        // life remaining (the review's exact witness; the
+        // pre-corrective validation admitted it).
+        let mut bad = base();
+        bad.base_velocity = [f32::MAX, 0.0, 0.0];
+        bad.velocity_jitter = [0.0; 3];
+        bad.gravity = 0.0;
+        bad.drag_factor = 1.0;
+        bad.kill_y = None;
+        assert_eq!(
+            bad.validate(),
+            Err("particle/kinematic-extent-non-finite"),
+            "the finite-velocity overflow the endpoint gates missed"
+        );
+        assert!(
+            Emitter::new(bad).is_err(),
+            "the kinematic refusal blocks construction"
+        );
+        // The base-plus-jitter overflow candidate: both halves
+        // finite, the sum's lifetime excursion still overflows.
+        let mut bad = base();
+        bad.base_velocity = [f32::MAX / 2.0, 0.0, 0.0];
+        bad.velocity_jitter = [f32::MAX / 2.0, 0.0, 0.0];
+        bad.gravity = 0.0;
+        bad.kill_y = None;
+        assert_eq!(
+            bad.validate(),
+            Err("particle/kinematic-extent-non-finite"),
+            "the base-plus-jitter excursion overflow"
+        );
+        // Gravity's own accumulated displacement at the extreme
+        // lifetime (g·life² overflows).
+        let mut bad = base();
+        bad.gravity = 1.0;
+        bad.lifetime = [f32::MAX.sqrt(), f32::MAX.sqrt() * 2.0];
+        assert_eq!(
+            bad.validate(),
+            Err("particle/kinematic-extent-non-finite"),
+            "the gravity-displacement overflow"
+        );
         assert!(
             Emitter::new(bad).is_err(),
             "the span refusal blocks construction"
@@ -1748,16 +1818,31 @@ mod tests {
             "the replacement path refuses the span overflow identically"
         );
         // The extreme finite span on the LIFETIME pair needs no
-        // gate of its own: the positivity and ordering gates bound
-        // the difference below the f32 maximum (a positive ordered
-        // pair cannot overflow its own subtraction) — asserted here
-        // so the asymmetry with the volume (whose min may be
-        // negative) stays a documented law, not an accident.
+        // SPAN gate of its own: the positivity and ordering gates
+        // bound the difference below the f32 maximum (a positive
+        // ordered pair cannot overflow its own subtraction) —
+        // asserted here with zeroed motion (the KINEMATIC extent
+        // gate is a separate concern: any nonzero velocity at
+        // lifetime f32::MAX overflows its excursion, by design) so
+        // the asymmetry with the volume (whose min may be negative)
+        // stays a documented law, not an accident.
         let mut wide = base();
         wide.lifetime = [f32::MIN_POSITIVE, f32::MAX];
+        wide.base_velocity = [0.0; 3];
+        wide.velocity_jitter = [0.0; 3];
+        wide.gravity = 0.0;
         assert!(
             wide.validate().is_ok(),
-            "a positive ordered lifetime pair's span is always finite (no gate needed)"
+            "a positive ordered lifetime pair's span is always finite (no span gate needed)"
+        );
+        // The same extreme lifetime WITH motion refuses through the
+        // kinematic gate (the extent, not the span).
+        let mut moving = wide;
+        moving.base_velocity = [2.0, 0.0, 0.0];
+        assert_eq!(
+            moving.validate(),
+            Err("particle/kinematic-extent-non-finite"),
+            "the extreme lifetime with motion overflows the excursion"
         );
         // A NaN still refuses through the ordering gates (the pinned
         // reason, unchanged).
