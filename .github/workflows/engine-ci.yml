@@ -23,6 +23,15 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".github/workflows/engine-ci.yml"
+      # The status index is load-bearing evidence (capabilities,
+      # counts, pins): the branch protection's required checks
+      # demand a green run on every PR, and a docs-only settlement
+      # otherwise never triggers one — the R2-audit-era
+      # reconciliation PRs (post-protection) were unmergeable
+      # without this. The push filter above stays untouched
+      # (post-merge re-runs for docs-only merges stay skipped; the
+      # PR run already validated the tree).
+      - "docs/CURRENT-STATUS.md"
   workflow_dispatch:
 
 jobs:
