@@ -34,7 +34,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
       # (CI-C1, the owner's 2026-11-11 Agent C GO — the workflow-only
@@ -1159,7 +1159,7 @@ jobs:
     name: macos-15 ARM64
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
       # (CI-C1) Rust dependency/build cache, the identical pinned
@@ -1323,7 +1323,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
       - name: Rust build cache

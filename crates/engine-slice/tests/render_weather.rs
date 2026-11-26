@@ -1265,6 +1265,9 @@ fn ripple_natural_sequence_gate() {
     // The off-screen landings observed (the PROVISIONAL panic's own
     // diagnostics).
     let mut landings: Vec<[f32; 2]> = Vec::new();
+    // The flat-content landings (the round-3 content qualification's
+    // diagnostic accumulator: landing center + its measured gradient).
+    let mut flat_landings: Vec<([f32; 2], i32)> = Vec::new();
     let mut sequence: Option<Vec<RippleRing>> = None;
     for _frame in 0..240 {
         // The tick's spawned census (the birth detector — the layer's
@@ -1387,9 +1390,9 @@ fn ripple_natural_sequence_gate() {
                 .presented
         );
         let before = renderer.take_frame_capture().unwrap().unwrap();
-        sequence = Some(new_rings.clone());
         // (the before capture is compared inline below; the borrow
-        // lives in this block)
+        // lives in this block - sequence is set ONLY on the
+        // qualifying birth, after the ink check)
         // THE DISPLAYED CHANGE (finding 15a's qualification): rgb
         // lanes >= 2 — the alpha lane alone never counts.
         let mut ink = 0usize;
@@ -1438,20 +1441,61 @@ fn ripple_natural_sequence_gate() {
         // reflection variation under it; a landing on perfectly
         // flat content measures 0 and the near-miss below carries
         // the actuals for the re-pin).
-        assert!(
-            ink >= 1,
-            "the naturally-born ring changed at least one displayed-rgb pixel (got {ink}, \
-             with {outside} sub-2 drift pixels) — the landing's reflection is flat: \
-             re-pin from this actual (landing {:?})",
+        // THE CONTENT QUALIFICATION (the round-3 corrective): a
+        // displacement can only DISPLAY where the reflected content
+        // varies - Ubuntu lavapipe's first fixed-seed landing sits
+        // on flat content (round 2 measured 0 ink there while
+        // Windows's rendering of the same landing displays). The
+        // birth qualifies ONLY where the BEFORE capture's support
+        // region carries measurable structure (an adjacent-pixel
+        // rgb gradient >= 2): flat-content landings are honestly
+        // unobservable and the drive CONTINUES; content-without-ink
+        // is the real failure (the displacement is not displaying
+        // where it must).
+        if ink >= 1 {
+            sequence = Some(new_rings.clone());
+            break;
+        }
+        let mut gradient = 0i32;
+        for y in inflated_min_y.max(1)..=(inflated_max_y.min(height_cap() - 1)) {
+            for x in inflated_min_x.max(1)..=(inflated_max_x.min(width_cap() - 1)) {
+                let idx = (y as usize * SIZE.0 as usize + x as usize) * 4;
+                for (dx, dy) in [(1i64, 0i64), (0, 1)] {
+                    let nidx = ((y + dy) as usize * SIZE.0 as usize + (x + dx) as usize) * 4;
+                    for ch in 0..3 {
+                        gradient = gradient.max(
+                            (before.bytes[idx + ch] as i32 - before.bytes[nidx + ch] as i32).abs(),
+                        );
+                    }
+                }
+            }
+        }
+        if gradient < 2 {
+            // Flat content under the support: the landing cannot
+            // display anywhere - record and keep driving.
+            flat_landings.push((new_rings[0].center, gradient));
+            println!(
+                "natural sequence: a landing at {:?} sits on flat content \
+                 (max gradient {gradient}) - continuing the drive",
+                new_rings[0].center
+            );
+            continue;
+        }
+        panic!(
+            "the naturally-born ring changed no displayed-rgb pixel over \
+             MEASURABLE content (max gradient {gradient}, {outside} sub-2 drift \
+             pixels) - the displacement is not displaying where it must \
+             (landing {:?})",
             landings
         );
-        break;
     }
     if sequence.is_none() {
         panic!(
-            "PROVISIONAL gate: no natural ring birth projected on-screen in 240 frames \
-             (the observed landings: {landings:?}) — the campaign's kill-death rate or \
-             the drive length needs re-pinning from THIS platform's actuals"
+            "PROVISIONAL gate: no natural ring birth displayed over measurable \
+             content in 240 frames (the observed landings: {landings:?}; the \
+             flat-content landings: {flat_landings:?}) - the campaign's \
+             kill-death rate, the drive length, or the content threshold needs \
+             re-pinning from THIS platform's actuals"
         );
     }
 
