@@ -323,6 +323,11 @@ pub struct Renderer {
     /// `WetCamera` — zero per-frame allocation (the sticky-setting
     /// precedent's frame-data lane).
     ripple: vulkan::reflection_draw::RippleUniformData,
+    /// The TEST-ONLY ripple debug mode (finding 15b's separation
+    /// fixtures — see [`RippleDebugMode`]). Sticky like every other
+    /// presentation setting; `Off` by default and in every
+    /// production frame.
+    ripple_debug: RippleDebugMode,
 }
 
 /// The Era-1 sky layer's frame description (the sticky `set_sky`
@@ -341,15 +346,74 @@ pub struct SkyFrame {
     pub disc_dir: [f32; 3],
 }
 
-/// The ripple uv gain: the world-space gradient (slope ~ a0/w ≈
-/// 2.9 at the authored policy) scaled into screen-uv units — 0.0016
-/// ≈ 2 presentation texels at 1280 (the visible wobble; PROVISIONAL
-/// pending the stage-3 ink measurement, tuned before any gate floor
-/// is pinned).
-pub const RIPPLE_UV_GAIN: f32 = 0.0016;
+/// The ripple tangent-displacement gain (the finding-19 semantics:
+/// METERS of ground-plane push per unit of triangle-bump slope —
+/// the shader projects the push into screen UV, so this constant
+/// converts the unitless slope `amplitude / width` into world
+/// meters, never directly into screen units).
+///
+/// THE RETUNE DERIVATION (the projection changed the gain's units
+/// from raw screen-uv to world meters, so the visible magnitude was
+/// re-derived to keep the audit's measured reference — a unit-
+/// amplitude fresh band (slope a₀/w = 1/0.35 ≈ 2.857) pushing
+/// ~5.85 px horizontally at 1280×720, the pre-corrective tree's
+/// 0.0016/0.35 ≈ 0.00457 normalized ≈ 5.85 px): at the demo/gate
+/// vantage (the eye [0, 1.7, 15] on the north road, the ground
+/// rings 3–13 m out), the projection carries, per world meter of
+/// ground-plane push, `½·focal/extent·extent_px = 565 px/m ÷
+/// view_distance` — square-pixel equal in both axes (640·focal/
+/// aspect == 360·focal at 1280×720). At the representative 8.2 m
+/// ring (the gate's [0, 7] ground point) that is 69 px/m, so a
+/// push of 2.857·g meters spans 197·g px; g = 0.03 gives 5.9 px —
+/// the old visible magnitude, now camera-correct (the nearer
+/// forced rings foreshorten to ~15 px at 3.2 m, the farther ones
+/// compress to ~4 px at 11.7 m — the perspective the raw add
+/// never carried). PROVISIONAL pending the lavapipe ink
+/// measurement, as the pre-corrective value was.
+pub const RIPPLE_UV_GAIN: f32 = 0.03;
 /// The ripple roughen gain: the bump coverage's dimming of the
 /// Schlick blend (0.5 = the peak coverage halves the mirror).
 pub const RIPPLE_ROUGHEN_GAIN: f32 = 0.5;
+
+/// TEST-ONLY ripple debug mode (the Era-2 audit finding 15b
+/// separation fixtures): selects which perturbation term the wet
+/// ground re-draw applies, so the ink gate can isolate the UV
+/// displacement and the blend dimming into separate fixtures.
+/// `Off` is the shipped path — the production packing writes lane
+/// 0.0 into the uniform's rows[1].y and every demo frame runs it;
+/// the two suppressors ride the SAME spare lane the shader reads
+/// (`ground_reflect.wgsl`'s params1.y — the packing's layout
+/// contract, documented test-only). The CPU oracle
+/// (`planar::ripple_perturbation`) mirrors the SHIPPED mode-0 path
+/// term-for-term; the suppressors remove whole terms (never
+/// re-shape them), so a suppressed fixture's surviving term is
+/// still the oracle's own arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RippleDebugMode {
+    /// The shipped path: both the UV displacement and the blend
+    /// roughening active (uniform lane 0.0).
+    #[default]
+    Off,
+    /// The UV/displacement term suppressed (uniform lane 1.0):
+    /// blend only — the roughening dims the mirror, the sample
+    /// position never moves.
+    BlendOnly,
+    /// The blend/roughen term suppressed (uniform lane 2.0):
+    /// displacement only — the sample position moves, the mirror
+    /// never dims.
+    DisplacementOnly,
+}
+
+impl RippleDebugMode {
+    /// The uniform lane value (ground_reflect.wgsl's params1.y).
+    fn uniform_lane(self) -> f32 {
+        match self {
+            Self::Off => 0.0,
+            Self::BlendOnly => 1.0,
+            Self::DisplacementOnly => 2.0,
+        }
+    }
+}
 
 impl Renderer {
     pub fn new(window: &SdlWindow, config: RenderConfig) -> Result<Renderer, RendererError> {
@@ -456,6 +520,7 @@ impl Renderer {
             post: false,
             wet: false,
             ripple: vulkan::reflection_draw::RippleUniformData::empty(),
+            ripple_debug: RippleDebugMode::Off,
         })
     }
 
@@ -1003,12 +1068,23 @@ impl Renderer {
     /// clears — the empty uniform; the rainless wet path stays
     /// byte-identical to Era-1's). The field is PACKED NOW, in fixed
     /// order: rows[0] = (count, policy speed, policy width,
-    /// RIPPLE_UV_GAIN); rows[1] = (RIPPLE_ROUGHEN_GAIN, 0, 0, 0);
-    /// rows[2 + i] = (center_x, center_z, age, the faded amplitude
-    /// amplitude * (1.0 - age / lifetime) — the fade applied at read
-    /// time in the pinned order, never stored in the core).
+    /// RIPPLE_UV_GAIN); rows[1] = (RIPPLE_ROUGHEN_GAIN, the
+    /// [`RippleDebugMode`] lane, 0, 0); rows[2 + i] = (center_x,
+    /// center_z, age, the faded amplitude amplitude * (1.0 - age /
+    /// lifetime) — the fade applied at read time in the pinned
+    /// order, never stored in the core).
     pub fn set_ripple_field(&mut self, field: Option<&engine_core::ripple::RippleField>) {
-        self.ripple = pack_ripple_field(field);
+        self.ripple = pack_ripple_field(field, self.ripple_debug);
+    }
+
+    /// Sets the TEST-ONLY ripple debug mode for subsequent wet
+    /// frames (finding 15b's separation fixtures — see
+    /// [`RippleDebugMode`]). The mode rides the packed uniform's
+    /// rows[1].y spare lane; it NEVER appears in a production frame
+    /// (the default is [`RippleDebugMode::Off`], the shipped path).
+    /// Sticky: applies at the next `set_ripple_field` packing.
+    pub fn set_ripple_debug_mode(&mut self, mode: RippleDebugMode) {
+        self.ripple_debug = mode;
     }
 
     /// The wet reflection's camera description (the sticky
@@ -1267,13 +1343,16 @@ impl Drop for Renderer {
 /// target). Fixed order, one pass, zero allocation: rows[0] =
 /// (active count — exact for ≤ 32, the pool's bound, policy speed,
 /// policy width, [`RIPPLE_UV_GAIN`]); rows[1] =
-/// ([`RIPPLE_ROUGHEN_GAIN`], 0, 0, 0); rows[2 + i] = (center_x,
-/// center_z, age, amplitude * (1.0 - age / lifetime) — the fade at
-/// read time, the core's pinned order). `None` packs the EMPTY
-/// uniform (all zeros — the shader's identity no-op, the rainless
-/// wet path's byte-identity).
+/// ([`RIPPLE_ROUGHEN_GAIN`], the [`RippleDebugMode`] uniform lane,
+/// 0, 0); rows[2 + i] = (center_x, center_z, age, amplitude *
+/// (1.0 - age / lifetime) — the fade at read time, the core's
+/// pinned order). `None` packs the EMPTY uniform (all zeros — the
+/// shader's identity no-op, the rainless wet path's byte-identity;
+/// the debug lane reads 0 there too, but the count gate makes the
+/// question moot).
 fn pack_ripple_field(
     field: Option<&engine_core::ripple::RippleField>,
+    debug: RippleDebugMode,
 ) -> vulkan::reflection_draw::RippleUniformData {
     let Some(field) = field else {
         return vulkan::reflection_draw::RippleUniformData::empty();
@@ -1286,7 +1365,7 @@ fn pack_ripple_field(
         policy.width,
         RIPPLE_UV_GAIN,
     ];
-    rows[1] = [RIPPLE_ROUGHEN_GAIN, 0.0, 0.0, 0.0];
+    rows[1] = [RIPPLE_ROUGHEN_GAIN, debug.uniform_lane(), 0.0, 0.0];
     for (i, ring) in field.rings().iter().enumerate() {
         rows[2 + i] = [
             ring.center[0],
@@ -1323,9 +1402,12 @@ mod tests {
     /// by hand, every expected value written as the SAME f32
     /// expression the packing performs. The layout contract is the
     /// shader's (ground_reflect.wgsl's RippleField block,
-    /// term-for-term): rows[0] = (count, speed, width, uv gain),
-    /// rows[1] = (roughen gain, 0, 0, 0), rows[2 + i] = (center_x,
-    /// center_z, age, faded amplitude).
+    /// term-for-term): rows[0] = (count, speed, width,
+    /// tangent-displacement gain), rows[1] = (roughen gain, the
+    /// RippleDebugMode lane, 0, 0), rows[2 + i] = (center_x,
+    /// center_z, age, faded amplitude). The debug-lane coverage
+    /// (finding 15b's test-only separation knobs) pins each mode's
+    /// lane value beside the default's 0.0.
     #[test]
     fn ripple_uniform_packing_known_answers() {
         let dt = 1.0f32 / 60.0f32;
@@ -1336,7 +1418,7 @@ mod tests {
         assert_eq!(field.observe_death([-3.5, 1.7, 8.25]), None);
         let report = field.tick(dt);
         assert_eq!(report.active, 1);
-        let packed = pack_ripple_field(Some(&field));
+        let packed = pack_ripple_field(Some(&field), RippleDebugMode::Off);
         assert_eq!(
             packed.rows[0],
             [1.0, 0.8, 0.35, RIPPLE_UV_GAIN],
@@ -1345,7 +1427,21 @@ mod tests {
         assert_eq!(
             packed.rows[1],
             [RIPPLE_ROUGHEN_GAIN, 0.0, 0.0, 0.0],
-            "rows[1]: the roughen gain"
+            "rows[1]: the roughen gain over the DEFAULT (Off) debug lane 0.0 — the \
+             shipped path every production frame packs"
+        );
+        // The test-only debug lane (finding 15b's separation
+        // fixtures): each mode's lane value, the packing's own
+        // mapping — the shader's params1.y reads exactly these.
+        assert_eq!(
+            pack_ripple_field(Some(&field), RippleDebugMode::BlendOnly).rows[1],
+            [RIPPLE_ROUGHEN_GAIN, 1.0, 0.0, 0.0],
+            "BlendOnly packs lane 1.0 (the UV term suppressed)"
+        );
+        assert_eq!(
+            pack_ripple_field(Some(&field), RippleDebugMode::DisplacementOnly).rows[1],
+            [RIPPLE_ROUGHEN_GAIN, 2.0, 0.0, 0.0],
+            "DisplacementOnly packs lane 2.0 (the blend term suppressed)"
         );
         let age = 0.0f32 + dt;
         assert_eq!(
@@ -1377,7 +1473,7 @@ mod tests {
         let _report = field.tick(dt); // tick 2
         let report = field.tick(dt); // tick 3
         assert_eq!(report.active, 3);
-        let packed = pack_ripple_field(Some(&field));
+        let packed = pack_ripple_field(Some(&field), RippleDebugMode::Off);
         assert_eq!(packed.rows[0][0], 3.0, "three live rings");
         assert_eq!(packed.rows[0][1], 0.8);
         assert_eq!(packed.rows[0][2], 0.35);
@@ -1409,11 +1505,12 @@ mod tests {
         // set_ripple_field(None) — the exact branch it runs — packs
         // the EMPTY uniform (all zeros; the shader's count gate
         // makes it the bit-identity no-op).
-        let cleared = pack_ripple_field(None);
+        let cleared = pack_ripple_field(None, RippleDebugMode::DisplacementOnly);
         assert_eq!(
             cleared,
             vulkan::reflection_draw::RippleUniformData::empty(),
-            "None clears to the empty uniform"
+            "None clears to the empty uniform — the debug mode cannot leak into it \
+             (all zeros, lane included)"
         );
         for row in &cleared.rows {
             assert_eq!(*row, [0.0; 4], "the empty rows are all zeros");

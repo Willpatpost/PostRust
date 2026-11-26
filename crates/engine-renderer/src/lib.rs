@@ -73,7 +73,8 @@ pub use config::{
     TargetFaultSite, TargetFaultStage, ValidationPreference,
 };
 pub use renderer::{
-    AllocationStats, FrameResult, GeometryStats, ProxyDrawMode, ProxyPopulation, RenderStats,
-    Renderer, SceneLayer, ShadowMapReadback, SkyFrame,
+    AllocationStats, FrameResult, GeometryStats, ProxyDrawMode, ProxyPopulation,
+    RIPPLE_ROUGHEN_GAIN, RIPPLE_UV_GAIN, RenderStats, Renderer, RippleDebugMode, SceneLayer,
+    ShadowMapReadback, SkyFrame,
 };
 pub use vulkan::{CaptureFormat, CapturedFrame, RendererError};
