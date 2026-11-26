@@ -28,7 +28,13 @@
 //!    velocity[1] * dt; position[2] += velocity[2] * dt`.
 //! 4. `life -= dt`.
 //! 5. Death test: dead iff `life <= 0.0` OR (`kill_y` is `Some` and
-//!    `position[1] <= kill_y`).
+//!    `position[1] <= kill_y`). A kill-plane death is observed at
+//!    the IMPACT CROSSING — the linear interpolation between the
+//!    pre-step and post-step positions where the step straddles the
+//!    plane (see [`kill_plane_impact`]) — never at the
+//!    post-integration position below the plane (finding 12's
+//!    impact-XZ correction: the ring lands where the drop crossed
+//!    the world's receiver, not up to one full step past it).
 //!
 //! No transcendental function appears anywhere on a byte path —
 //! gravity and drag are fixed constants (the libm-free law).
@@ -304,13 +310,16 @@ impl Emitter {
     }
 
     /// One fixed-order tick, observing every KILL-PLANE death's
-    /// position as it happens (the rain-ripple derivation's hook:
-    /// a raindrop that reaches the kill plane is a drop hitting the
-    /// ground — the ripple field spawns its ring at that death's
-    /// position, in death order). The closure fires ONLY for
-    /// kill-plane deaths (a lifetime death mid-air is not a
-    /// landing), with the particle's POST-INTEGRATION position
-    /// (where it died), in the integration sweep's fixed order.
+    /// IMPACT position as it happens (the rain-ripple derivation's
+    /// hook: a raindrop that reaches the kill plane is a drop
+    /// hitting the ground — the ripple field spawns its ring at
+    /// that death's impact position, in death order). The closure
+    /// fires ONLY for kill-plane deaths (a lifetime death mid-air
+    /// is not a landing), with the IMPACT position — the linear
+    /// interpolation between the step's pre-integration and
+    /// post-integration positions at the plane crossing (see
+    /// [`kill_plane_impact`]; finding 12's impact-XZ correction) —
+    /// in the integration sweep's fixed order.
     /// Behavior-identical to [`Emitter::tick`] — `tick` is this
     /// method with a no-op observer (one code path, one arithmetic;
     /// the digest pins rest on it).
@@ -350,6 +359,10 @@ impl Emitter {
         let mut write = 0usize;
         for i in 0..self.active {
             let mut p = self.particles[i];
+            // The step's pre-integration endpoint — the
+            // interpolation's left side, captured BEFORE the
+            // integration mutates p (finding 12's impact crossing).
+            let pre_position = p.position;
             // 1. gravity
             p.velocity[1] -= gravity * dt;
             // 2. drag (the per-step multiply, fixed axis order)
@@ -368,10 +381,12 @@ impl Emitter {
             //    expired lifetime; a particle can satisfy both, it
             //    is a kill death iff the kill condition holds) is
             //    observed BEFORE the compaction write decision, at
-            //    the post-integration position, in sweep order.
+            //    the IMPACT CROSSING between the pre-step and
+            //    post-step positions, in sweep order.
             let kill_death = kill_y.is_some_and(|k| p.position[1] <= k);
             if kill_death {
-                on_kill_death(p.position);
+                let impact = kill_plane_impact(pre_position, p.position, kill_y);
+                on_kill_death(impact);
             }
             let dead = p.life <= 0.0 || kill_death;
             if !dead {
@@ -444,6 +459,52 @@ fn le_total(a: f32, b: f32) -> bool {
 /// discipline as [`le_total`].
 fn gt_total(a: f32, b: f32) -> bool {
     matches!(a.partial_cmp(&b), Some(Ordering::Greater))
+}
+
+/// The IMPACT position where one integration step crossed the kill
+/// plane (finding 12's impact-XZ correction). The step's endpoints
+/// are `pre` (the position before the step) and `post` (the
+/// position after it, at or below the plane — the caller only
+/// invokes this for a kill death). When the step STRADDLES the
+/// plane (`pre[1] > kill_y >= post[1]`), the crossing is the linear
+/// interpolation between the endpoints: the fraction
+/// `alpha = (pre.y − kill_y) / (pre.y − post.y)` of the step at
+/// which the drop met the plane, applied to X and Z (the impact's
+/// XZ — what the ripple ring consumes), with Y set to the plane
+/// itself (the crossing's Y is the plane by definition). When the
+/// particle was ALREADY at or below the plane when the step began
+/// (a spawn below the receiver — degenerate authored data), the
+/// crossing happened at or before the step and the honest in-step
+/// estimate is the post-step position.
+///
+/// Pure fixed-order IEEE f32 — no transcendental, byte-identical on
+/// every platform; the particle-state path is UNTOUCHED (the death
+/// test and compaction read the post-integration position exactly
+/// as before — only the OBSERVED impact moves).
+fn kill_plane_impact(pre: [f32; 3], post: [f32; 3], kill_y: Option<f32>) -> [f32; 3] {
+    match kill_y {
+        Some(k) if pre[1] >= k => {
+            let span = pre[1] - post[1];
+            // span > 0 whenever post[1] <= k < pre[1] (the straddling
+            // case this helper exists for); the clamp keeps a
+            // degenerate pair (post[1] == pre[1] cannot reach the
+            // death test, but arithmetic honesty costs nothing)
+            // inside the step.
+            let alpha = if span > 0.0 {
+                ((pre[1] - k) / span).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            [
+                pre[0] + (post[0] - pre[0]) * alpha,
+                k,
+                pre[2] + (post[2] - pre[2]) * alpha,
+            ]
+        }
+        // No kill plane (unreachable from the kill-death branch) or
+        // the degenerate already-below case: the post position.
+        _ => post,
+    }
 }
 
 /// The SplitMix64 finalizer — the same family as the repo's
@@ -628,8 +689,10 @@ mod tests {
 
     /// THE KILL-DEATH OBSERVATION (the ripple derivation's hook):
     /// the observer fires ONLY for kill-plane deaths, in the
-    /// integration sweep's fixed order, at the POST-INTEGRATION
-    /// position — and `tick` delegates to
+    /// integration sweep's fixed order, at the IMPACT CROSSING —
+    /// the linear interpolation between the pre-step and post-step
+    /// positions where the step straddles the plane (finding 12's
+    /// impact-XZ correction) — and `tick` delegates to
     /// `tick_observing_kill_deaths(dt, |_| {})` behavior-identically
     /// (the delegation-equivalence form over a 300-tick rain-like
     /// campaign).
@@ -642,13 +705,15 @@ mod tests {
     /// (zero gravity, drag 1.0 — the velocity is the constant
     /// -20.0), and ALL die at the kill plane y = 0 on the SAME
     /// tick (the volume's y is a point — the five integrate
-    /// identically). The death tick and death y are derived by
-    /// REPLICATING the accumulation (the known_answer_kill_plane
-    /// pattern: f32 position accumulation is NOT k*dt, so the test
-    /// runs the same loop); each observed death's x/z must equal
-    /// the pre-death pool's x/z AT THE SAME INDEX (zero horizontal
-    /// velocity — x/z never move; the sweep is in pool order, so
-    /// the observed order is the pool's order).
+    /// identically). The death tick and the pre-death state are
+    /// derived by REPLICATING the accumulation (the
+    /// known_answer_kill_plane pattern: f32 position accumulation
+    /// is NOT k*dt, so the test runs the same loop); each observed
+    /// death's x/z must equal the pre-death pool's x/z AT THE SAME
+    /// INDEX (zero horizontal velocity — the interpolation
+    /// preserves endpoints that do not move), and its Y is the
+    /// PLANE ITSELF (0.0 — the crossing's Y is the plane by
+    /// definition), never the post-integration y below it.
     ///
     /// EMITTER B (the lifetime cohort): the same fall, no kill
     /// plane, lifetime 0.05 s — every particle expires mid-air ON
@@ -691,7 +756,11 @@ mod tests {
             y += fall * dt;
         }
         assert!(death_tick >= 1, "the fall reaches the plane");
-        let death_y = y; // the post-integration y at the death tick
+        let death_y = y; // the post-integration y at the death tick (below the plane)
+        assert!(
+            death_y <= 0.0 && death_y > fall * dt,
+            "the death step straddles the plane: post-y {death_y} in one step past it"
+        );
 
         let mut emitter = Emitter::new(config_a).expect("the config validates");
         let mut observed: Vec<[f32; 3]> = Vec::new();
@@ -726,8 +795,10 @@ mod tests {
         for (i, position) in observed.iter().enumerate() {
             assert_eq!(
                 *position,
-                [pre_death[i][0], death_y, pre_death[i][2]],
-                "death {i}: the post-integration position, in sweep order"
+                [pre_death[i][0], 0.0, pre_death[i][2]],
+                "death {i}: the IMPACT crossing — y exactly at the plane (never the \
+                 post-integration {death_y}), the x/z the interpolation preserves \
+                 (zero horizontal velocity), in sweep order"
             );
         }
 
@@ -797,7 +868,9 @@ mod tests {
             assert_eq!(
                 *position,
                 [-2.0, 21.0f32 + fall * 1.0f32, 3.0],
-                "the post-integration position of a both-conditions death"
+                "the DEGENERATE crossing of a both-conditions death: the particle \
+                 was already below the plane (21 <= 25) when the step began, so the \
+                 honest in-step impact is the post-integration position"
             );
         }
 
@@ -828,6 +901,152 @@ mod tests {
             hash_observing.finish(),
             "identical final digests"
         );
+    }
+
+    /// THE IMPACT CROSSING, hand-computed (finding 12's impact-XZ
+    /// correction, the helper's own known answers — every expected
+    /// value written as the SAME f32 expression the helper
+    /// performs, bit-exact by construction):
+    /// - the straddling step with LATERAL drift: alpha is the
+    ///   fraction of the step at which the drop met the plane,
+    ///   applied to X and Z, with Y the plane itself;
+    /// - pre exactly ON the plane: alpha 0, the impact is the
+    ///   pre-step XZ at the plane;
+    /// - post exactly ON the plane: alpha 1, the impact is the
+    ///   post-step XZ at the plane;
+    /// - the degenerate already-below pair (emitter C's shape): the
+    ///   post position, verbatim;
+    /// - no kill plane at all: the post position (unreachable from
+    ///   the kill-death branch, honest anyway).
+    #[test]
+    fn kill_plane_impact_known_answers() {
+        // The straddling step with lateral drift: pre y 0.4, post y
+        // -0.2, plane 0 — alpha = 0.4 / 0.6.
+        let pre = [10.0f32, 0.4, -6.0];
+        let post = [10.5f32, -0.2, -6.25];
+        let alpha = 0.4f32 / (0.4f32 - -0.2f32);
+        assert_eq!(
+            kill_plane_impact(pre, post, Some(0.0)),
+            [
+                10.0f32 + (10.5f32 - 10.0f32) * alpha,
+                0.0,
+                -6.0f32 + (-6.25f32 - -6.0f32) * alpha
+            ],
+            "the straddling crossing: the interpolated XZ at the plane"
+        );
+        // Pre exactly on the plane: alpha 0.
+        assert_eq!(
+            kill_plane_impact([1.0, 5.0, 2.0], [1.5, 4.9, 2.5], Some(5.0)),
+            [1.0, 5.0, 2.0],
+            "pre on the plane: the crossing is the step's start"
+        );
+        // Post exactly on the plane: alpha 1.
+        assert_eq!(
+            kill_plane_impact([1.0, 0.3, 2.0], [1.5, 0.0, 2.5], Some(0.0)),
+            [1.5, 0.0, 2.5],
+            "post on the plane: the crossing is the step's end"
+        );
+        // The degenerate already-below pair: the post position.
+        assert_eq!(
+            kill_plane_impact([-2.0, 21.0, 3.0], [-2.0, 1.0, 3.0], Some(25.0)),
+            [-2.0, 1.0, 3.0],
+            "already below at the step's start: the honest in-step estimate is post"
+        );
+        // No kill plane: the post position.
+        assert_eq!(
+            kill_plane_impact([1.0, 2.0, 3.0], [4.0, 5.0, 6.0], None),
+            [4.0, 5.0, 6.0],
+            "no plane: the post position"
+        );
+    }
+
+    /// THE IMPACT CROSSING THROUGH THE REAL PATH, with lateral
+    /// drift (the wiring proof — emitter A's zero-drift cohort
+    /// cannot see a mis-captured pre-step XZ): five identical
+    /// particles fall at a fixed -20 m/s while drifting at
+    /// (3, 0, -5) m/s from the point (4, 21.8, 7), kill plane 0.
+    /// The death tick, the pre-death state, and the expected impact
+    /// are derived by REPLICATING the integration's f32
+    /// accumulation and the helper's own expression — the observed
+    /// deaths must equal that impact exactly, Y at the plane.
+    #[test]
+    fn kill_death_impact_crossing_with_lateral_drift() {
+        let dt = 1.0f32 / 60.0f32;
+        let fall = -20.0f32;
+        let drift = [3.0f32, -5.0f32];
+        let spawn = [4.0f32, 21.8, 7.0];
+        let config = EmitterConfig {
+            volume: SpawnVolume {
+                min: spawn,
+                max: spawn,
+            },
+            rate: 5.0,
+            base_velocity: [drift[0], fall, drift[1]],
+            velocity_jitter: [0.0; 3],
+            lifetime: [100.0, 100.0],
+            gravity: 0.0,
+            drag_factor: 1.0,
+            kill_y: Some(0.0),
+            seed: 0x01D,
+        };
+        // The replica: the spawn tick's own integration first (dt
+        // 1.0 — the accumulator's exact five units, then silence),
+        // then the 1/60 steps until the plane, tracking the DEATH
+        // STEP's pre and post endpoints.
+        let mut pos = spawn;
+        pos[0] += drift[0] * 1.0f32;
+        pos[1] += fall * 1.0f32;
+        pos[2] += drift[1] * 1.0f32;
+        assert!(pos[1] > 0.0, "alive after the spawn tick");
+        let mut death_tick = 0u32;
+        let mut pre;
+        loop {
+            pre = pos;
+            pos = [
+                pos[0] + drift[0] * dt,
+                pos[1] + fall * dt,
+                pos[2] + drift[1] * dt,
+            ];
+            death_tick += 1;
+            if pos[1] <= 0.0 {
+                break;
+            }
+        }
+        assert!(death_tick >= 1, "the drift-fall reaches the plane");
+        assert!(pre[1] > 0.0 && pos[1] <= 0.0, "the death step straddles");
+        // The expected impact: the helper's own expression over the
+        // replicated endpoints.
+        let alpha = (pre[1] / (pre[1] - pos[1])).clamp(0.0, 1.0);
+        let expected = [
+            pre[0] + (pos[0] - pre[0]) * alpha,
+            0.0,
+            pre[2] + (pos[2] - pre[2]) * alpha,
+        ];
+
+        let mut emitter = Emitter::new(config).expect("the config validates");
+        let mut observed: Vec<[f32; 3]> = Vec::new();
+        let report = emitter.tick_observing_kill_deaths(1.0f32, |p| observed.push(p));
+        assert_eq!(report.spawned, 5, "the prime tick's exact five units");
+        assert_eq!(report.active, 5, "alive after the spawn tick");
+        assert!(observed.is_empty(), "no death yet: the observer is silent");
+        for t in 1..death_tick {
+            let report = emitter.tick_observing_kill_deaths(dt, |p| observed.push(p));
+            assert_eq!(report.spawned, 0, "tick {t}: no respawn inside the window");
+            assert_eq!(report.active, 5, "tick {t}: still above the kill plane");
+            assert!(observed.is_empty(), "tick {t}: still silent");
+        }
+        let report = emitter.tick_observing_kill_deaths(dt, |p| observed.push(p));
+        assert_eq!(report.spawned, 0);
+        assert_eq!(report.active, 0, "the whole cohort died at the plane");
+        assert_eq!(observed.len(), 5, "every kill-plane death observed");
+        for (i, position) in observed.iter().enumerate() {
+            assert_eq!(
+                *position, expected,
+                "death {i}: the interpolated crossing — the drifted XZ at the plane, \
+                 never either endpoint (pre {:?}, post {:?})",
+                pre, pos
+            );
+        }
     }
 
     /// THE BYTE-IDENTICAL SEQUENCE: two emitters, same config and

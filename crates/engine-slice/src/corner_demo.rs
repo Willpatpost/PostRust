@@ -806,6 +806,7 @@ pub fn run(
             light,
             bias,
             day_night,
+            night,
             options,
             pace,
             audio,
@@ -844,18 +845,39 @@ pub fn run(
                 disc_dir: atmosphere.disc_dir,
             }));
         }
-        // The per-frame population: the crowd's CURRENT state (frame i
-        // shows the crowd after i ticks — the render-then-step
-        // discipline; the step follows the submit below).
-        let frame_population = crowd.as_ref().map(|crowd| crowd.population());
+        // THE RAIN UPDATE PRECEDES THE SUBMISSION (the audit's
+        // finding 18 corrective — rain and rings present from ONE
+        // completed tick): the layer advances its emitter and
+        // ripple field one tick with THIS frame's camera (the pose
+        // below is the same pose the view matrix renders), then
+        // packs the post-tick instances with this frame's yaw and
+        // atmosphere. The crowd's own locomotion tick stays
+        // render-then-step below (the two disciplines are
+        // deliberately different: the crowd's k-ticks-per-frame
+        // contract predates the rain; the rain's contract is the
+        // single completed tick). For the scripted route the camera
+        // yaw is derived from the route's waypoint (the SAME
+        // expression the view matrix uses — never re-derived
+        // differently); the tint rides the day/night CYCLE position
+        // when the cycle is active (the same t the atmosphere above
+        // consumed — the rain darkens with the sky), else the
+        // static preset (night included — the route distinguishes
+        // it the same way the light preset does).
+        if let Some(crowd) = crowd.as_mut() {
+            let offset = std::array::from_fn(|j| pose.look_at[j] - pose.position[j]);
+            let (yaw, _pitch) = crate::corner_demo::waypoint_orientation(offset);
+            let rain_t = day_night
+                .map(|period| engine_renderer::sky::cycle_position(i as f32 / 60.0, period))
+                .unwrap_or(if night { 1.0 } else { 0.0 });
+            crowd.update_rain(pose.position, yaw, rain_t);
+        }
         // The rain-ripple field (Era-2 package C recursive item 1):
         // packed into the renderer's sticky wet state BEFORE the
-        // submission — frame i renders the ripple field as of the
-        // PREVIOUS frame's update (render-then-step, the same
-        // discipline the rain instances above follow; the crowd's
-        // update_rain follows the submit). None (no rain layer) or a
-        // dry session clears it — the empty uniform, the wet path's
-        // Era-1 byte-identity. The sticky setter is the presentation
+        // submission, from the JUST-COMPLETED tick above — frame i
+        // renders the ripple field and the rain instances of the
+        // SAME tick (the finding-18 corrective; a dry session
+        // clears it — the empty uniform, the wet path's Era-1
+        // byte-identity). The sticky setter is the presentation
         // bridge: the field state itself is deterministic sim state
         // (the campaign digest pins it) — the setter only copies it
         // into the frame's uniform.
@@ -866,6 +888,11 @@ pub fn run(
                     .and_then(|c| c.rain.as_ref().map(|r| r.ripple_field())),
             );
         }
+        // The per-frame population: the crowd's CURRENT state (frame i
+        // shows the crowd after i ticks — the render-then-step
+        // discipline for the NPCs; the rain instances inside are the
+        // just-completed tick's pack from the update above).
+        let frame_population = crowd.as_ref().map(|crowd| crowd.population());
         let matrix = view_projection(pose, aspect);
         // Submission selection: the four-way union
         // (--populated --shadows together is the Era-2 stage 4b path).
@@ -900,24 +927,10 @@ pub fn run(
         // advances the crowd for frame i+1 — the instances and pose
         // blocks re-evaluated into their retained buffers (zero
         // allocation; the presentation-only crowd never enters the
-        // spine, a fingerprint, or a measured claim).
-        // The rain layer is updated here too — it rebuilds instances
-        // from the emitter's current particles and ticks the emitter.
+        // spine, a fingerprint, or a measured claim). The rain
+        // layer's own tick moved ABOVE the submission (finding 18);
+        // only the locomotion batch steps here.
         if let Some(crowd) = crowd.as_mut() {
-            // The rain update: rebuild instances and tick emitter.
-            // For the scripted route, the camera yaw is derived from
-            // the route's waypoint (the SAME expression the view
-            // matrix uses — never re-derived differently); the tint
-            // rides the day/night CYCLE position when the cycle is
-            // active (the same t the atmosphere above consumed —
-            // the rain darkens with the sky), else the static
-            // preset.
-            let offset = std::array::from_fn(|j| pose.look_at[j] - pose.position[j]);
-            let (yaw, _pitch) = crate::corner_demo::waypoint_orientation(offset);
-            let rain_t = day_night
-                .map(|period| engine_renderer::sky::cycle_position(i as f32 / 60.0, period))
-                .unwrap_or(if night { 1.0 } else { 0.0 });
-            crowd.update_rain(pose.position, yaw, rain_t);
             crowd.step();
         }
         if measured.contains(&i) {
@@ -1015,6 +1028,7 @@ fn run_free_look(
     mut light: LightParams,
     bias: engine_renderer::shadows::ShadowBias,
     day_night: Option<f32>,
+    night: bool,
     options: FreeLookOptions,
     pace: Option<Duration>,
     audio: bool,
@@ -1145,21 +1159,52 @@ fn run_free_look(
         } else {
             size.0 as f32 / size.1 as f32
         };
-        // The crowd's CURRENT state (presentation-only determinism:
-        // presented frame k shows the crowd after k ticks — the same
-        // render-then-step discipline the scripted route uses; the
-        // step follows the submit below).
-        let frame_population = crowd.as_ref().map(|crowd| crowd.population());
+        // THE RAIN UPDATE PRECEDES THE SUBMISSION (the audit's
+        // finding 18 corrective — free-look rain and rings present
+        // from ONE completed tick, with THIS frame's camera): the
+        // layer advances its emitter and ripple field one tick,
+        // then packs the post-tick instances with the camera's
+        // CURRENT yaw and the ACTIVE atmosphere. The pre-corrective
+        // order rendered the retained instances first and updated
+        // after — the next frame's ring state ran one simulation
+        // step ahead of the rendered drop snapshot, and the
+        // billboards carried the preceding camera yaw (a witness
+        // could see the old falling drop beside its newly emitted
+        // ring). The crowd's own tick stays render-then-step below;
+        // a DEFERRED frame (the drawable-transition continue below)
+        // advances the rain without presenting it — presentation-
+        // only state in a mode that claims nothing, documented
+        // here rather than silently dropped.
+        // For free-look, the camera yaw is from the FreeLookCamera
+        // (the live interactive camera drives the billboard basis
+        // and the listener — presentation only, never a
+        // fingerprint); the tint rides the cycle's current position
+        // when active (the same t the atmosphere above consumed),
+        // else the STATIC PRESET — night when the session started
+        // --night (the audit's finding 18 palette half: the old
+        // default was always day, painting day-tinted streaks over
+        // a static-night scene; the scripted route already
+        // distinguished night in the same situation).
+        if let Some(crowd) = crowd.as_mut() {
+            let rain_t = day_night
+                .map(|period| {
+                    engine_renderer::sky::cycle_position(
+                        timing.total_sim_advanced().as_secs_f32(),
+                        period,
+                    )
+                })
+                .unwrap_or(if night { 1.0 } else { 0.0 });
+            crowd.update_rain(camera.position, camera.yaw, rain_t);
+        }
         // The rain-ripple field (Era-2 package C recursive item 1),
-        // under the same render-then-step discipline as above: frame
-        // k renders the ripple field as of the previous presented
-        // frame's update. free-look does not carry the `wet` flag —
-        // the renderer's own sticky setting IS the state (set at
-        // startup from the flag; reading it back is exact). The
-        // sticky setter is the presentation bridge: the field state
-        // itself is deterministic sim state (the campaign digest
-        // pins it) — the setter only copies it into the frame's
-        // uniform.
+        // from the JUST-COMPLETED tick above — the frame renders
+        // the ripple field and the rain instances of the SAME tick.
+        // free-look does not carry the `wet` flag — the renderer's
+        // own sticky setting IS the state (set at startup from the
+        // flag; reading it back is exact). The sticky setter is the
+        // presentation bridge: the field state itself is
+        // deterministic sim state (the campaign digest pins it) —
+        // the setter only copies it into the frame's uniform.
         if renderer.wet() {
             renderer.set_ripple_field(
                 crowd
@@ -1167,6 +1212,12 @@ fn run_free_look(
                     .and_then(|c| c.rain.as_ref().map(|r| r.ripple_field())),
             );
         }
+        // The crowd's CURRENT state (presentation-only determinism:
+        // presented frame k shows the crowd after k ticks — the
+        // render-then-step discipline for the NPCs; the rain
+        // instances inside are the just-completed tick's pack from
+        // the update above).
+        let frame_population = crowd.as_ref().map(|crowd| crowd.population());
         let matrix = camera.view_projection(aspect);
         let frame = if shadows && let Some(population) = &frame_population {
             renderer.render_corner_populated_shadowed(
@@ -1199,25 +1250,10 @@ fn run_free_look(
         }
         // The crowd's tick (render-then-step — one deterministic 1/60
         // batch step per PRESENTED frame; a minimized or deferred frame
-        // presents nothing and steps nothing).
-        // The rain layer is updated here too — it rebuilds instances
-        // from the emitter's current particles and ticks the emitter.
+        // presents nothing and steps nothing). The rain layer's own
+        // tick moved ABOVE the submission (finding 18); only the
+        // locomotion batch steps here.
         if let Some(crowd) = crowd.as_mut() {
-            // For free-look, the camera yaw is from the FreeLookCamera
-            // (the live interactive camera drives the billboard basis
-            // and the listener — presentation only, never a
-            // fingerprint); the tint rides the cycle's current
-            // position when active (the same t the atmosphere above
-            // consumed), else the day preset.
-            let rain_t = day_night
-                .map(|period| {
-                    engine_renderer::sky::cycle_position(
-                        timing.total_sim_advanced().as_secs_f32(),
-                        period,
-                    )
-                })
-                .unwrap_or(0.0);
-            crowd.update_rain(camera.position, camera.yaw, rain_t);
             crowd.step();
         }
         // Era 2 package B part 3 — THE AUDIBLE CROWD (after the

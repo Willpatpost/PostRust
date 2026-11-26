@@ -4445,6 +4445,17 @@ pub(crate) fn render_frame(
                     .as_ref()
                     .map(|s| s.plain_shadowed_pipeline()),
             };
+            // The wet receiver's placement (finding 14): the ground
+            // re-draw moved INSIDE the scene recorder, between the
+            // opaque kinds and the translucent rain kind — the
+            // ordered blend (the reflection over the opaque ground,
+            // the rain over the reflection). The recorder's own
+            // comments document the defect this corrects.
+            let ground = if wet.is_some() {
+                scene_record::GroundRedrawPass::Main
+            } else {
+                scene_record::GroundRedrawPass::None
+            };
             match scene_record::record_corner_scene(
                 ctx,
                 pipes,
@@ -4456,6 +4467,7 @@ pub(crate) fn render_frame(
                 sky,
                 proxy,
                 proxy_sets,
+                ground,
             ) {
                 Some(calls) => {
                     outcome.proxy_draw_calls = calls;
@@ -4527,6 +4539,30 @@ pub(crate) fn render_frame(
                             );
                         }
                     }
+
+                    // The Era-1 wet reflection's ground re-draw for
+                    // the NON-CORNER path (the recorder never ran —
+                    // the corner family's redraw lives inside it
+                    // now, finding 14; this else-branch keeps the
+                    // pre-corrective position, after the draws,
+                    // byte-identical for the static-scene frames).
+                    // SAFETY: the command buffer is inside the main
+                    // render pass, past the scene draws; this slot's
+                    // corner FrameParams region holds the true camera
+                    // (the frame flow's write).
+                    if wet.is_some()
+                        && let (Some(reflection_state), Some(corner)) =
+                            (&pipes.reflection, &ctx.corner)
+                    {
+                        reflection_state.record_ground_redraw(
+                            ctx,
+                            corner,
+                            command,
+                            slot,
+                            false,
+                            corner.receiver_range(),
+                        );
+                    }
                 }
             }
 
@@ -4553,32 +4589,15 @@ pub(crate) fn render_frame(
                 ctx.device.cmd_draw(command, outcome.overlay.drawn, 1, 0, 0);
             }
 
-            // The Era-1 wet reflection's ground re-draw (package 7):
-            // inside the MAIN render pass, after the mesh draws —
-            // the ground quad re-rasterized (EQUAL depth) with the
-            // reflection sampled at the same screen position and
-            // the Schlick blend on the alpha stage. The mirrored-
-            // scene pass and its barrier preceded this pass (the
-            // frame flow's recording order, above the post branch).
-            // SAFETY: the command buffer is inside the main render
-            // pass, past the mesh draws; this slot's corner
-            // FrameParams region holds the true camera (the frame
-            // flow's write).
-            if wet.is_some()
-                && let (Some(reflection_state), Some(corner)) = (&pipes.reflection, &ctx.corner)
-            {
-                // SAFETY: the outer recording block's contract (the
-                // command buffer records inside the main render
-                // pass, past the mesh draws).
-                reflection_state.record_ground_redraw(
-                    ctx,
-                    corner,
-                    command,
-                    slot,
-                    false,
-                    corner.receiver_range(),
-                );
-            }
+            // The Era-1 wet reflection's ground re-draw inside the
+            // MAIN pass moved INTO the scene recorder (finding 14:
+            // between the opaque kinds and the translucent rain
+            // kind — the ordered blend; see the recorder's comments
+            // and the GroundRedrawPass::Main argument above). The
+            // non-corner else-branch keeps its own call above. The
+            // mirrored-scene pass and its barrier preceded this pass
+            // (the frame flow's recording order, above the post
+            // branch).
 
             ctx.device.cmd_end_render_pass(command);
         }

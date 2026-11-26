@@ -1358,6 +1358,17 @@ impl PostResources {
                     .as_ref()
                     .and_then(|s| s.plain_shadowed_hdr()),
             };
+            // The wet receiver's placement (finding 14): the ground
+            // re-draw moved INSIDE the scene recorder, between the
+            // opaque kinds and the translucent rain kind — the
+            // ordered blend (the recorder's own comments document
+            // the defect this corrects; the main pass passes its
+            // own Main variant).
+            let ground = if inputs.wet {
+                scene_record::GroundRedrawPass::Hdr
+            } else {
+                scene_record::GroundRedrawPass::None
+            };
             match scene_record::record_corner_scene(
                 ctx,
                 pipes,
@@ -1369,6 +1380,7 @@ impl PostResources {
                 inputs.sky,
                 inputs.proxy,
                 inputs.proxy_sets,
+                ground,
             ) {
                 Some(calls) => {
                     proxy_calls = calls;
@@ -1379,29 +1391,11 @@ impl PostResources {
                     // or self.shadowed_hdr not yet created).
                 }
             }
-            // The Era-1 wet reflection's ground re-draw (package 7):
-            // inside the HDR scene pass, after the mesh draws — the
-            // ground quad re-rasterized (EQUAL depth) with the
-            // reflection sampled at the same screen position and the
-            // Schlick blend on the alpha stage. The mirrored-scene
-            // pass and its barrier preceded this pass (the frame
-            // flow's recording order).
-            // SAFETY: the command buffer is inside the HDR scene
-            // pass, past the mesh draws; this slot's corner
-            // FrameParams region holds the true camera (the frame
-            // flow's write).
-            if inputs.wet
-                && let (Some(reflection_state), Some(corner)) = (&pipes.reflection, &ctx.corner)
-            {
-                reflection_state.record_ground_redraw(
-                    ctx,
-                    corner,
-                    cmd,
-                    slot,
-                    true,
-                    corner.receiver_range(),
-                );
-            }
+            // The Era-1 wet reflection's ground re-draw inside the
+            // HDR scene pass moved INTO the recorder (finding 14 —
+            // see the ground argument above; the mirrored-scene pass
+            // and its barrier preceded this pass, the frame flow's
+            // recording order).
             ctx.device.cmd_end_render_pass(cmd);
         }
 
