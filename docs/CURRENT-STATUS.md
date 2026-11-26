@@ -8,6 +8,49 @@ A fresh development or review agent should be able to determine the actual
 current status, active authority, source of truth, known limitations, and next
 work from THIS file alone.
 
+- **Reconciled for the Era-2 audit remediation's completion on
+  2026-11-26:** the independent audit at `959889d`
+  (`docs/ERA2-LIVING-WORLD-AUDIT-959889d.md`) held Era-2 sign-off
+  open across nineteen findings; all nineteen are now remediated on
+  `main` through six corrective PRs, each green on all five CI jobs
+  and each carrying its own measured evidence in its commits:
+  R1 = findings 1–3 (the memory lane's self-sufficient retries, the
+  reconstructable recovery proof, the retention-order contract; PR
+  #60), R2 = findings 4–5 (the bounded locomotion tick, the bounded
+  wake log; PR #61), R3 = findings 12/13/14/18 (the world receiver
+  plane, the billboard turn, the ordered blend, the one-tick
+  presentation; PR #62), R5 = findings 9–11 (the atomic
+  trigger+listener publication, the committed-phase footsteps, the
+  honest callback stats; PR #63), R4 = findings 15/19 (the
+  camera-correct ripple displacement and the gate truth; PR #64 —
+  whose final round found and fixed a genuine cross-platform test
+  defect: `gate_pixel_ray`'s missing ASPECT factor, which had
+  compressed every inverse-projected ground point 1.778× toward the
+  screen-center column, landing authored ripple rings at the wrong
+  world centers on BOTH platforms — the shader, packing, upload,
+  and forward projection were correct all along; the root-cause
+  chain, traced with an instrumented ladder through the WSL
+  lavapipe parity pod, is recorded in PR #64's commits), and
+  R6 = findings 6/7/8/16/17 (the witness matcher, the identity wire
+  seam and the versioned diagnostics, the paired E-09, the census
+  identities, the validation refusals; PR #65). This pass settles
+  the §4 table at the R6 endpoint `b4da1b9` — main
+  **1418/2/33 Linux, 1367/2/33 Windows**, renderer release
+  **172/2**, heavy **645/46/64 Linux, 644/46/64 Windows** — every
+  count ENFORCED by the exact-count gates of the runs on the exact
+  trees (R4's `45900716161` on `cba6827`, R6's `45901849045` on
+  `8002dad`, both green on all five jobs; both merges
+  fast-forward-shaped — the merge trees are exactly the branch
+  trees those runs validated). STILL OPEN from the audit, by
+  design: the puddle prototype (question 7 — endorsed by the audit
+  once the world-space landings and layer order were correct, both
+  now landed; the package itself awaits the owner's visual
+  acceptance walk), the finding-20 branch-protection process
+  recommendation (an owner settings decision, never made by an
+  agent), and the cross-package warmed combined-view allocation
+  scope (the audit's warm-coverage note — a candidate for the next
+  measurement package). Sign-off returns to the owner and the next
+  audit.
 - **Maintained since:** 2026-11-14 (the post-audit remediation cycle, F-13);
   reconciled for Cycle 1 on 2026-11-15.
 - **Reconciled for the PostRust extraction on 2026-11-20:** the engine moved
@@ -682,13 +725,34 @@ for the combined candidate.
 
 | CI partition | Linux | Windows |
 |---|---:|---:|
-| Main shard (`--workspace --exclude engine-slice`) | 1313 | 1262 |
-| Heavy shard (`-p engine-slice --features crash-test-seams`) | 620 | 619 |
-| **Combined** | **1933** | **1881** |
+| Main shard (`--workspace --exclude engine-slice`) | 1418 | 1367 |
+| Heavy shard (`-p engine-slice --features crash-test-seams`) | 645 | 644 |
+| **Combined** | **2063** | **2011** |
 
 The macOS job has its own partition. Main has two ignored tests and 33
-result lines. Heavy has thirty-nine ignored tests and 64 result
-lines. The table is settled at the landed `main` `04b09b9`
+result lines. Heavy has forty-six ignored tests and 64 result
+lines. The table is settled at the landed `main` `b4da1b9`
+(2026-11-26, PR #65's merge — the Era-2 audit remediation's
+endpoint): main **1418/2/33 Linux, 1367/2/33 Windows**, renderer
+release **172/2**, heavy **645/46/64 Linux, 644/46/64 Windows** —
+every count ENFORCED by the exact-count gates of the runs on the
+exact trees: R4's run `45900716161` on `cba6827` (PR #64 — the
+aspect-factor corrective; its pins main 1406/1355 and renderer
+release 172 measured by that run and by run `45877898296`'s
+zero-failure counts, the stale-163/39/40 failure messages corrected
+to name the actual pins) and R6's run `45901849045` on `8002dad`
+(PR #65 — the polish package; main 1418/1367 and heavy 645/644,
+Windows main MEASURED locally with the step's own awk at 1367/2/33
+on the exact tree, the Linux counts platform-uniform inferences
+CONFIRMED by the run itself) — both green on all five jobs, both
+merges fast-forward-shaped (the merge trees are exactly the branch
+trees those runs validated). The remediation wave's count history
+is on record in each corrective's own `ci:`-prefixed commits
+(every red run's actuals recorded, never a test weakened); R4's
+calibration history — six forced-field floor rounds, then the
+aspect-factor root cause traced through the WSL lavapipe parity
+pod — is on record in PR #64's trail. The prior settlement,
+superseded: the landed `main` `04b09b9`
 (2026-11-25, PR #51's merge — the package C endpoint): main
 **1371/2/33**, renderer release **163/2**, heavy **625/39/64** —
 every count ENFORCED by the exact-count gates of the runs on the
