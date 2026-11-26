@@ -1441,61 +1441,71 @@ fn ripple_natural_sequence_gate() {
         // reflection variation under it; a landing on perfectly
         // flat content measures 0 and the near-miss below carries
         // the actuals for the re-pin).
-        // THE CONTENT QUALIFICATION (the round-3 corrective): a
-        // displacement can only DISPLAY where the reflected content
-        // varies - Ubuntu lavapipe's first fixed-seed landing sits
-        // on flat content (round 2 measured 0 ink there while
-        // Windows's rendering of the same landing displays). The
-        // birth qualifies ONLY where the BEFORE capture's support
-        // region carries measurable structure (an adjacent-pixel
-        // rgb gradient >= 2): flat-content landings are honestly
-        // unobservable and the drive CONTINUES; content-without-ink
-        // is the real failure (the displacement is not displaying
-        // where it must).
+        // THE REFLECTION-CONTRIBUTION QUALIFICATION (the round-4
+        // corrective): the displacement moves ONLY the reflection's
+        // contribution to the pixel - the frame's own gradient is
+        // the WRONG signal (round 3 measured gradient 13 at a
+        // landing whose displacement still displayed nothing: the
+        // variation was diffuse lighting the ripple never touches).
+        // The honest signal is the WET-DRY contrast - exactly what
+        // the receiver-blend gate qualifies on - so the birth
+        // qualifies only where the reflection measurably
+        // contributes (max |wet - dry| >= 2 per channel over the
+        // support); a landing where the reflection contributes
+        // nothing is honestly unobservable and the drive CONTINUES;
+        // contribution-without-ink is the real failure.
         if ink >= 1 {
             sequence = Some(new_rings.clone());
             break;
         }
-        let mut gradient = 0i32;
-        for y in inflated_min_y.max(1)..=(inflated_max_y.min(height_cap() - 1)) {
-            for x in inflated_min_x.max(1)..=(inflated_max_x.min(width_cap() - 1)) {
+        renderer.set_wet(false);
+        renderer.request_frame_capture().unwrap();
+        assert!(
+            renderer
+                .render_corner_populated(&matrix, GATE_EYE, light, &population, SIZE)
+                .unwrap()
+                .presented
+        );
+        let dry = renderer.take_frame_capture().unwrap().unwrap();
+        renderer.set_wet(true);
+        let mut contribution = 0i32;
+        for y in inflated_min_y.max(0)..=(inflated_max_y.min(height_cap())) {
+            for x in inflated_min_x.max(0)..=(inflated_max_x.min(width_cap())) {
                 let idx = (y as usize * SIZE.0 as usize + x as usize) * 4;
-                for (dx, dy) in [(1i64, 0i64), (0, 1)] {
-                    let nidx = ((y + dy) as usize * SIZE.0 as usize + (x + dx) as usize) * 4;
-                    for ch in 0..3 {
-                        gradient = gradient.max(
-                            (before.bytes[idx + ch] as i32 - before.bytes[nidx + ch] as i32).abs(),
-                        );
-                    }
+                for ch in 0..3 {
+                    contribution = contribution
+                        .max((before.bytes[idx + ch] as i32 - dry.bytes[idx + ch] as i32).abs());
                 }
             }
         }
-        if gradient < 2 {
-            // Flat content under the support: the landing cannot
-            // display anywhere - record and keep driving.
-            flat_landings.push((new_rings[0].center, gradient));
+        if contribution < 2 {
+            // The reflection contributes nothing measurable under
+            // this support: the landing cannot display - record and
+            // keep driving.
+            flat_landings.push((new_rings[0].center, contribution));
             println!(
-                "natural sequence: a landing at {:?} sits on flat content \
-                 (max gradient {gradient}) - continuing the drive",
+                "natural sequence: a landing at {:?} sits over an invisible \
+                 reflection (max wet-dry contribution {contribution}) - continuing \
+                 the drive",
                 new_rings[0].center
             );
             continue;
         }
         panic!(
-            "the naturally-born ring changed no displayed-rgb pixel over \
-             MEASURABLE content (max gradient {gradient}, {outside} sub-2 drift \
-             pixels) - the displacement is not displaying where it must \
-             (landing {:?})",
+            "the naturally-born ring changed no displayed-rgb pixel where the \
+             reflection measurably contributes (max wet-dry {contribution}, \
+             {outside} sub-2 drift pixels) - the displacement is not displaying \
+             where it must (landing {:?})",
             landings
         );
     }
     if sequence.is_none() {
         panic!(
-            "PROVISIONAL gate: no natural ring birth displayed over measurable \
-             content in 240 frames (the observed landings: {landings:?}; the \
-             flat-content landings: {flat_landings:?}) - the campaign's \
-             kill-death rate, the drive length, or the content threshold needs \
-             re-pinning from THIS platform's actuals"
+            "PROVISIONAL gate: no natural ring birth displayed over a measurable \
+             reflection in 240 frames (the observed landings: {landings:?}; the \
+             invisible-reflection landings: {flat_landings:?}) - the campaign's \
+             kill-death rate, the drive length, or the contribution threshold \
+             needs re-pinning from THIS platform's actuals"
         );
     }
 
