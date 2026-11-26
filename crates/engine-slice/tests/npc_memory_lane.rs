@@ -31,8 +31,8 @@ use engine_persist::pipeline::CommitPipeline;
 use engine_persist::record::RevisionRecord;
 use engine_slice::npc_memory_lane::{
     ENCOUNTER_TABLE, EncounterKind, MemoryCommitBook, MemoryLaneWorld, PLACES, POPULATION,
-    REGION_NPCS, commit_witness_captures, recover_memory_lane, schedule_encounter,
-    set_region_level,
+    REGION_NPCS, commit_witness_captures, install_recovered_lane, recover_memory_lane,
+    schedule_encounter, set_region_level,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -699,6 +699,420 @@ fn the_last_unacknowledged_capture_retries_on_its_own() {
         "exactly two durable consequences — one per EPISODE, none per retry"
     );
     assert_lane_conservation(&spine, "the self-retry campaign");
+}
+
+/// THE FINDING 20 DECIDING GATE (the sign-off review's own script):
+/// a definite journal rejection leaves the episode's envelope
+/// discarded and its identity recorded in the book; the retry
+/// completes the SAME episode — never a second envelope for the same
+/// records (the defective bridge consumed a fresh episode number and
+/// journaled the leftover envelope under the new plan: two
+/// consequences for one memory set, and a cold reopen that refused
+/// the journal at the identity cross-check). One envelope, one plan,
+/// one consequence; all original records confirmed; the cold reopen
+/// succeeds; the recovered lane materializes its requested tiers.
+#[test]
+fn a_rejected_journal_append_retries_the_same_episode() {
+    let dir = TestDir::new("f20-rejected-append");
+    let mut spine = make_spine();
+    let pipeline = fresh_pipeline(&dir);
+    let mut book = MemoryCommitBook::default();
+
+    // An Altercation at region 0: witness 0 holds three records.
+    schedule_encounter(&mut spine, 1, EncounterKind::Altercation, 0, 0, Tick(5)).unwrap();
+    spine.run_ticks(5);
+
+    // THE REJECTED JOURNAL APPEND: the journal's pre-window fault —
+    // the capture is definitely not committed (nothing written).
+    drop(pipeline);
+    let journal = engine_persist::journal::T1Journal::open_with(
+        dir.journal(),
+        Some(engine_persist::journal::JournalFaultControl::new().arm(
+            engine_persist::journal::JournalFaultPoint::BeforeCaptures,
+            FaultAction::InjectError,
+        )),
+    )
+    .unwrap();
+    let mut faulted =
+        CommitPipeline::open(LocalFileMedium::open(dir.store()).unwrap(), journal).unwrap();
+    let result = commit_witness_captures(&mut spine, &mut faulted, &mut book, 0, true);
+    assert!(result.is_err(), "the rejected journal append propagates");
+
+    // THE STABLE IDENTITY: the book holds the unresolved episode —
+    // nothing claimed (nothing journaled), the membership recorded.
+    let unresolved = book
+        .unresolved
+        .as_ref()
+        .expect("the rejected append records the unresolved episode");
+    assert_eq!(unresolved.episode, 0, "the first episode identity");
+    assert_eq!(unresolved.keys.len(), 3, "the staged membership");
+    assert!(!unresolved.journaled, "nothing is durable for it");
+    assert!(book.claimed.is_empty(), "no key is claimed");
+    assert_eq!(
+        book.episodes, 1,
+        "the episode counter advanced exactly once"
+    );
+    assert_eq!(
+        spine.world().lane.witness_conservation(0),
+        (3, 3, 0),
+        "the records stay pending-unclaimed in the lane"
+    );
+    drop(faulted);
+
+    // THE RETRY (the fault gone, a fresh pipeline over the same
+    // store): completes the SAME episode identity — the defective
+    // bridge staged a SECOND envelope here, journaling the leftover
+    // under a new plan.
+    let mut pipeline = fresh_pipeline(&dir);
+    let keys = commit_witness_captures(&mut spine, &mut pipeline, &mut book, 0, true).unwrap();
+    assert!(
+        keys.is_empty(),
+        "no NEW episode — the completion is the unresolved one"
+    );
+    assert!(book.unresolved.is_none(), "the completion cleared it");
+    assert_eq!(
+        spine.world().lane.witness_conservation(0),
+        (3, 0, 3),
+        "all ORIGINAL keys confirmed by the completion's flush"
+    );
+    assert!(
+        pipeline.is_confirmed(ConsequenceId::new(0, 0, 0)),
+        "exactly the first episode identity confirmed"
+    );
+    assert_eq!(
+        pipeline.confirmed_keys(),
+        vec![ConsequenceId::new(0, 0, 0)],
+        "ONE durable consequence — the retry created no episode"
+    );
+
+    // THE COLD REOPEN: the journal is internally consistent (one
+    // envelope under its own plan — the identity cross-check the
+    // defective bridge's double-staging failed).
+    drop(pipeline);
+    let reopened = fresh_pipeline(&dir);
+    let recovered = recover_memory_lane(&reopened).unwrap();
+    assert_eq!(
+        recovered.book.episodes, 1,
+        "the recovered book's episode counter"
+    );
+    let mut fresh_spine = make_spine();
+    let recovered_book = install_recovered_lane(&mut fresh_spine, recovered);
+    // THE TIER MATERIALIZATION (finding 21's install half): the
+    // recovered lane was all-dormant; the fresh world requests Full
+    // everywhere; the install ACTIVATES the region's witnesses —
+    // the live view exists NOW (the defective install left the
+    // witnesses dormant behind a Full region until an unrelated
+    // tier transition).
+    assert_eq!(
+        fresh_spine.world().lane.witness_conservation(0),
+        (3, 0, 3),
+        "the recovered witness is materialized ACTIVE with its confirmed records"
+    );
+    drop(reopened);
+    drop(recovered_book);
+}
+
+/// THE FINDING 20 AMBIGUOUS-ACK GATE: a canonical submission that
+/// commits durably but never acknowledges (the medium's
+/// post-linearization fault) leaves the lane pending; a later no-op
+/// retry on a FRESH session reconciles from the canonical chain —
+/// the defective bridge's NothingPending path skipped the
+/// confirmation and the episode stayed pending forever.
+#[test]
+fn an_ambiguous_canonical_ack_reconciles_from_the_chain() {
+    let dir = TestDir::new("f20-ambiguous-ack");
+    let mut spine = make_spine();
+    let pipeline = fresh_pipeline(&dir);
+    let mut book = MemoryCommitBook::default();
+
+    schedule_encounter(&mut spine, 1, EncounterKind::Altercation, 0, 0, Tick(5)).unwrap();
+    spine.run_ticks(5);
+
+    // THE AMBIGUOUS CANONICAL APPEND: the journal capture succeeds;
+    // the canonical submission's write is durable but the
+    // acknowledgment is lost (the medium's post-root-sync fault).
+    drop(pipeline);
+    let mut faulted = CommitPipeline::open(
+        LocalFileMedium::open_with(
+            dir.store(),
+            Some(FaultControl::new().arm(FaultPoint::AfterRootDirSync, FaultAction::InjectError)),
+        )
+        .unwrap(),
+        T1Journal::open(dir.journal()).unwrap(),
+    )
+    .unwrap();
+    let keys = commit_witness_captures(&mut spine, &mut faulted, &mut book, 0, true).unwrap();
+    assert_eq!(keys.len(), 3, "the episode staged and journaled");
+    // The ambiguous outcome is NOT an error — the episode is
+    // journaled and claimed; the lane still shows it pending (this
+    // session's view never learned the chain's answer).
+    assert_eq!(
+        spine.world().lane.witness_conservation(0),
+        (3, 3, 0),
+        "claimed-but-pending after the lost acknowledgment"
+    );
+    drop(faulted);
+
+    // THE NO-OP RETRY on a FRESH session (the fault gone): the
+    // flush's confirmed-identity sweep reads the chain — the
+    // ambiguous submission IS the chain's head — and confirms the
+    // episode WITHOUT staging anything (the defective bridge
+    // returned NothingPending and left the lane pending forever).
+    let mut pipeline = fresh_pipeline(&dir);
+    let keys = commit_witness_captures(&mut spine, &mut pipeline, &mut book, 0, true).unwrap();
+    assert!(keys.is_empty(), "zero new events");
+    assert_eq!(
+        spine.world().lane.witness_conservation(0),
+        (3, 0, 3),
+        "the chain-held episode reconciled and confirmed"
+    );
+    assert_eq!(
+        pipeline.confirmed_keys(),
+        vec![ConsequenceId::new(0, 0, 0)],
+        "exactly one durable consequence"
+    );
+    assert_lane_conservation(&spine, "the ambiguous-ack campaign");
+}
+
+/// THE FINDING 21 DECIDING GATE (the sign-off review's own script):
+/// a classification decision taken AFTER the witness's final record
+/// episode is flushed through its OWN journal transaction when
+/// submit observes the mismatch — the decision and the classified
+/// score survive the cold reopen (the defective bridge skipped plan
+/// creation with no fresh records, and the decision vanished), and
+/// a NEW encounter for the same witness on the recovered session
+/// behaves as an uninterrupted one's.
+#[test]
+fn a_late_classification_survives_the_reopen() {
+    let dir = TestDir::new("f21-late-classification");
+    let mut spine = make_spine();
+    let mut pipeline = fresh_pipeline(&dir);
+    let mut book = MemoryCommitBook::default();
+
+    // Witness 0's Altercation: three records (episodic +
+    // relationship + candidate), committed and confirmed (the
+    // candidate UNCLASSIFIED at episode time — the shared score 0).
+    schedule_encounter(&mut spine, 1, EncounterKind::Altercation, 0, 0, Tick(5)).unwrap();
+    spine.run_ticks(5);
+    commit_witness_captures(&mut spine, &mut pipeline, &mut book, 0, true).unwrap();
+    assert_eq!(
+        spine.world().lane.witness_conservation(0),
+        (3, 0, 3),
+        "the record episode confirmed"
+    );
+    assert_eq!(spine.world().lane.reputation_score().unwrap(), 0);
+
+    // THE LATE CLASSIFICATION: the candidate is accepted AFTER the
+    // final record episode — a live decision the journal does not
+    // hold (the plan's sync section was written before it).
+    let candidate_key = MemoryKey {
+        event: 1,
+        witness: 0,
+        kind: MemoryKind::ReputationCandidate,
+    };
+    assert_eq!(
+        spine.world_mut().lane.classify(&candidate_key, true),
+        engine_core::npc_memory::ClassifyOutcome::Classified,
+        "the live decision applies"
+    );
+    let live_score = spine.world().lane.reputation_score().unwrap();
+    assert_eq!(
+        live_score, -3,
+        "the accepted Altercation candidate weighs -3"
+    );
+
+    // THE CLASSIFICATION FLUSH: submit with ZERO new events observes
+    // the sync mismatch and journals the decision as its own
+    // transaction (the defective bridge skipped plan creation here —
+    // the decision was durable only in the live lane).
+    let keys = commit_witness_captures(&mut spine, &mut pipeline, &mut book, 0, true).unwrap();
+    assert!(keys.is_empty(), "no new records — the flush only");
+    let mut confirmed = pipeline.confirmed_keys();
+    confirmed.sort_unstable();
+    assert_eq!(
+        confirmed,
+        vec![ConsequenceId::new(0, 0, 0), ConsequenceId::new(0, 1, 0)],
+        "TWO durable consequences: the record episode AND the classification-sync episode"
+    );
+
+    // THE COLD REOPEN: the decision and the score SURVIVE (the
+    // defective bridge's reopen rebuilt from the last record plan —
+    // the candidate returned unclassified, the score 0).
+    drop(pipeline);
+    let mut reopened = fresh_pipeline(&dir);
+    let recovered = recover_memory_lane(&reopened).unwrap();
+    let mut fresh_spine = make_spine();
+    let mut recovered_book = install_recovered_lane(&mut fresh_spine, recovered);
+    assert_eq!(
+        fresh_spine.world().lane.reputation_score().unwrap(),
+        live_score,
+        "the late classification survives the reopen"
+    );
+    assert_eq!(
+        fresh_spine.world().lane.witness_conservation(0),
+        (3, 0, 3),
+        "the recovered witness is materialized ACTIVE with its confirmed records"
+    );
+
+    // THE CONTINUATION: a NEW encounter for the same ACTIVE witness
+    // on the recovered session — the captures land in the live view
+    // immediately and confirm through the recovered book, exactly as
+    // an uninterrupted session's would.
+    schedule_encounter(
+        &mut fresh_spine,
+        2,
+        EncounterKind::Altercation,
+        0,
+        0,
+        Tick(10),
+    )
+    .unwrap();
+    fresh_spine.run_ticks(10);
+    let new_keys = commit_witness_captures(
+        &mut fresh_spine,
+        &mut reopened,
+        &mut recovered_book,
+        0,
+        true,
+    )
+    .unwrap();
+    assert_eq!(new_keys.len(), 3, "the new encounter's records staged");
+    assert_eq!(
+        fresh_spine.world().lane.witness_conservation(0),
+        (6, 0, 6),
+        "the recovered session continues as an uninterrupted one"
+    );
+    assert_eq!(
+        fresh_spine.world().lane.reputation_score().unwrap(),
+        live_score,
+        "the continuation's unclassified candidate contributes nothing new"
+    );
+    drop(reopened);
+    drop(recovered_book);
+}
+
+/// THE FINDING 20 JOURNALED ARM: an episode whose journal capture
+/// SUCCEEDED but whose apply failed (or whose session died between
+/// the two) is completed by the apply only — the retry never
+/// re-stages or re-journals it. The state is constructed exactly as
+/// the bridge leaves it (the envelope staged, the capture done, the
+/// book's unresolved at the journaled phase), then the next call
+/// finishes it.
+#[test]
+fn a_journaled_unresolved_episode_completes_with_the_apply_only() {
+    let dir = TestDir::new("f20-journaled-unresolved");
+    let mut spine = make_spine();
+    let mut pipeline = fresh_pipeline(&dir);
+    let mut book = MemoryCommitBook::default();
+
+    schedule_encounter(&mut spine, 1, EncounterKind::Altercation, 0, 0, Tick(5)).unwrap();
+    spine.run_ticks(5);
+
+    // THE INTERRUPTED APPLY: the bridge stages and journals the
+    // episode exactly as the staging half does, then the apply
+    // fails — the book records the unresolved episode at the
+    // journaled phase (the transaction IS durable; the keys are
+    // claimed-journaled).
+    let keys: Vec<MemoryKey> = spine
+        .world()
+        .lane
+        .ledger()
+        .pending_keys(0)
+        .into_iter()
+        .collect();
+    assert_eq!(keys.len(), 3);
+    let episode = book.episodes;
+    book.episodes += 1;
+    let consequence = ConsequenceId::new(0, episode, 0);
+    let position = engine_persist::envelope::SourcePosition {
+        head: None,
+        tick: spine.world().last_tick.as_u64(),
+    };
+    let span = engine_persist::consequence::OccurrenceSpan::new(0, keys.len() as u64).unwrap();
+    let envelope = engine_persist::envelope::ConsequenceEnvelope::capture(
+        consequence,
+        vec![engine_persist::envelope::ClassifiedSpan::new(
+            span,
+            engine_persist::envelope::DurabilityClass::DurableEligible,
+        )],
+        engine_persist::envelope::SignalLane::Captured,
+        engine_persist::envelope::CounterValues::default(),
+        engine_persist::envelope::SourceBaseline {
+            counters: engine_persist::envelope::CounterValues::default(),
+            award: engine_persist::consequence::AwardCheckpoint {
+                durable: engine_persist::consequence::Coverage::new(),
+                provisional: engine_persist::consequence::Coverage::new(),
+            },
+        },
+        position,
+    )
+    .unwrap();
+    pipeline.stage(envelope).unwrap();
+    let records: Vec<MemoryRecord> = {
+        let lane = &spine.world().lane;
+        keys.iter()
+            .map(|key| *lane.ledger().record(key).unwrap())
+            .collect()
+    };
+    let plan = engine_slice::npc_memory_lane::MemoryPlan {
+        witness: 0,
+        episode,
+        records,
+        classifications: spine.world().lane.witness_classifications(0),
+    }
+    .encode()
+    .unwrap();
+    pipeline
+        .capture(
+            position,
+            engine_persist::envelope::DurabilityClass::DurableEligible,
+            Vec::new(),
+            vec![engine_persist::journal::FrontierEntry { region: 0, episode }],
+            plan,
+        )
+        .unwrap();
+    // The apply NEVER runs — the book records the journaled
+    // unresolved state exactly as the bridge's failure path does.
+    for key in &keys {
+        book.claimed.insert(*key);
+    }
+    book.unresolved = Some(engine_slice::npc_memory_lane::UnresolvedEpisode {
+        witness: 0,
+        episode,
+        consequence,
+        keys: keys.clone(),
+        journaled: true,
+    });
+
+    // THE COMPLETION: the next call finishes the apply only — no new
+    // envelope, no new journal transaction, the same consequence.
+    let staged = commit_witness_captures(&mut spine, &mut pipeline, &mut book, 0, true).unwrap();
+    assert!(staged.is_empty(), "no new episode");
+    assert!(book.unresolved.is_none(), "the completion cleared it");
+    assert_eq!(
+        spine.world().lane.witness_conservation(0),
+        (3, 0, 3),
+        "the journaled episode applied and confirmed"
+    );
+    assert_eq!(
+        pipeline.confirmed_keys(),
+        vec![consequence],
+        "exactly ONE durable consequence — the completion re-journaled nothing"
+    );
+
+    // THE COLD REOPEN stays consistent.
+    drop(pipeline);
+    let reopened = fresh_pipeline(&dir);
+    let recovered = recover_memory_lane(&reopened).unwrap();
+    let mut fresh_spine = make_spine();
+    let recovered_book = install_recovered_lane(&mut fresh_spine, recovered);
+    assert_eq!(
+        fresh_spine.world().lane.witness_conservation(0),
+        (3, 0, 3),
+        "the reopen reconstructs the journaled-and-confirmed episode"
+    );
+    drop(reopened);
+    drop(recovered_book);
 }
 
 /// THE FINDING 2 DECIDING GATE (the audit's own script): a FRESH

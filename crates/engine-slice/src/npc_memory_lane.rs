@@ -602,14 +602,53 @@ pub fn schedule_encounter(
     }
 }
 
+/// One unresolved episode (the sign-off review's finding 20
+/// corrective): a definite capture failure or a mid-flight apply
+/// failure left an episode incomplete. The book records the
+/// identity and membership; the next call completes IT before any
+/// new episode is staged — one record set always maps to one
+/// envelope, one plan and one consequence, on this session's
+/// pipeline or a fresh one's (an unjournaled episode is honestly
+/// absent from a recovered book, so a fresh session simply stages
+/// it anew under a fresh identity — nothing durable existed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedEpisode {
+    pub witness: u32,
+    pub episode: u64,
+    pub consequence: ConsequenceId,
+    /// The episode's keys in envelope order (the membership the
+    /// completion's plan must carry exactly).
+    pub keys: Vec<MemoryKey>,
+    /// How far the episode got: `false` = the journal append was
+    /// definitely rejected (the envelope was discarded, nothing is
+    /// durable — re-stage and capture); `true` = the capture
+    /// SUCCEEDED and the apply failed (the transaction is journaled
+    /// — complete the apply and the claim only).
+    pub journaled: bool,
+}
+
 /// The commit bookkeeping: per witness, the keys already claimed by a
 /// pipeline episode (in-flight or confirmed — a dropped ack leaves
-/// them claimed-but-pending in the lane, re-submittable), and the
-/// episode counter (each commit's fresh ConsequenceId episode).
+/// them claimed-but-pending in the lane, re-submittable), the
+/// episode counter (each commit's fresh ConsequenceId episode), the
+/// single unresolved episode (finding 20), the per-episode
+/// membership for scoped confirmation (finding 20's confirmation
+/// scope — the confirmed receipt names episode identities, never
+/// "everything claimed"), and the classification sync as of each
+/// witness's last journaled episode (finding 21 — a decision taken
+/// after the final record episode is flushed by its own journal
+/// transaction when submit observes the mismatch).
 #[derive(Debug, Clone, Default)]
 pub struct MemoryCommitBook {
     pub claimed: std::collections::BTreeSet<MemoryKey>,
     pub episodes: u64,
+    pub unresolved: Option<UnresolvedEpisode>,
+    /// episode → (identity, keys) for the episodes this session
+    /// staged or completed (the recovery rebuilds it from the plans).
+    pub episode_keys: std::collections::BTreeMap<u64, (ConsequenceId, Vec<MemoryKey>)>,
+    /// witness → the classification sync as of its last journaled
+    /// episode (the recovery rebuilds it from the plans).
+    pub journaled_classifications: std::collections::BTreeMap<u32, Vec<(MemoryKey, bool)>>,
 }
 
 /// The memory-lane journal plan's domain — the EXPLICIT VERSION
@@ -771,6 +810,24 @@ pub fn commit_witness_captures<M: CanonicalMedium>(
 ) -> Result<Vec<MemoryKey>, PipelineError> {
     let region = (witness as usize) / REGION_NPCS;
 
+    // ---- THE UNRESOLVED COMPLETION (the sign-off review's finding
+    // 20 corrective): a definite journal rejection or a mid-flight
+    // apply failure left one episode incomplete, and the book holds
+    // its stable identity. The completion runs BEFORE any new
+    // episode is staged — the defective bridge consumed a fresh
+    // episode number on retry and staged a SECOND envelope for the
+    // same records, journaling the leftover under the new plan (two
+    // consequences for one memory set, and a cold reopen that
+    // refuses the journal at the identity cross-check). The
+    // completion reuses the recorded identity exactly; an
+    // unjournaled failure re-stages the SAME envelope (the failed
+    // attempt's was discarded before the error propagated — nothing
+    // is double-staged on this pipeline, and a fresh pipeline has
+    // nothing staged at all).
+    if let Some(unresolved) = book.unresolved.take() {
+        complete_unresolved_episode(spine, pipeline, book, unresolved)?;
+    }
+
     // ---- THE STAGING HALF: fresh (unclaimed) pending records only. A
     // previously claimed key's transaction is already durable —
     // re-staging it would be the pipeline's conflicting reuse, and a
@@ -838,7 +895,7 @@ pub fn commit_witness_captures<M: CanonicalMedium>(
             witness,
             episode,
             records,
-            classifications,
+            classifications: classifications.clone(),
         }
         .encode()
         .map_err(PipelineError::Format)?;
@@ -847,8 +904,17 @@ pub fn commit_witness_captures<M: CanonicalMedium>(
         // staged envelope (the durable boundary; the CaptureReceipt is
         // post-fsync by contract). WITHOUT THIS the key is InMemory and
         // mark_applied rightly refuses (AppliedBeforeJournal —
-        // durable-before-live).
-        pipeline.capture(
+        // durable-before-live). A DEFINITE REJECTION (CaptureAborted:
+        // the journal's pre-window failure, or the ambiguous-write
+        // reconciliation establishing NotCommitted) is the finding 20
+        // boundary: the envelope is DISCARDED here (nothing durable
+        // exists for it) and the episode is recorded UNRESOLVED in the
+        // book — the retry completes the same identity, never a second
+        // envelope. Any other error (a conflicting payload, a hard
+        // journal corruption) is the pipeline's fail-closed class:
+        // propagated as-is, no retry state (the pipeline's own
+        // contract forbids retrying those as the same attempt).
+        if let Err(error) = pipeline.capture(
             position,
             DurabilityClass::DurableEligible,
             Vec::new(),
@@ -857,14 +923,64 @@ pub fn commit_witness_captures<M: CanonicalMedium>(
                 episode,
             }],
             plan,
-        )?;
+        ) {
+            if matches!(error, PipelineError::CaptureAborted) {
+                pipeline.discard_staged(&[consequence]);
+                book.unresolved = Some(UnresolvedEpisode {
+                    witness,
+                    episode,
+                    consequence,
+                    keys: keys.clone(),
+                    journaled: false,
+                });
+            }
+            return Err(error);
+        }
 
-        pipeline.mark_applied(&[consequence])?;
-
-        // The claim is established at the episode's capture — before the
-        // submission branch (the confirm loop below reads this set).
+        // The claim is established AT the journal boundary (the
+        // transaction is durable — the keys are claimed-journaled
+        // even if the apply below fails; the finding 20 completion
+        // finishes the apply for exactly this case, and a process
+        // death between the two is healed by the recovery's own
+        // claim-from-plan).
         for key in &keys {
             book.claimed.insert(*key);
+        }
+        book.episode_keys
+            .insert(episode, (consequence, keys.clone()));
+        book.journaled_classifications
+            .insert(witness, classifications);
+
+        // THE APPLY (the live-authoritative boundary). A failure here
+        // leaves the transaction JOURNALED and the keys claimed — the
+        // episode is recorded unresolved at the journaled phase; the
+        // retry completes the apply only (never a second envelope).
+        if let Err(error) = pipeline.mark_applied(&[consequence]) {
+            book.unresolved = Some(UnresolvedEpisode {
+                witness,
+                episode,
+                consequence,
+                keys: keys.clone(),
+                journaled: true,
+            });
+            return Err(error);
+        }
+    }
+
+    // ---- THE CLASSIFICATION FLUSH (the sign-off review's finding 21
+    // corrective): a classification decision taken AFTER the
+    // witness's final record episode is durable only in the live
+    // lane — a cold reopen rebuilds from the last journaled plan and
+    // the decision vanishes (the reported score and the decision
+    // itself). Submit now observes the mismatch between the lane's
+    // current classification sync and the book's last-journaled
+    // snapshot, and flushes the decisions through their OWN journal
+    // transaction — a classification-sync episode (an empty record
+    // set, the unit-marker span, the current sync as the plan).
+    if submit && keys.is_empty() && book.unresolved.is_none() {
+        let current = spine.world().lane.witness_classifications(witness);
+        if !current.is_empty() && book.journaled_classifications.get(&witness) != Some(&current) {
+            flush_witness_classifications(spine, pipeline, book, region, witness, current)?;
         }
     }
 
@@ -876,25 +992,260 @@ pub fn commit_witness_captures<M: CanonicalMedium>(
     // nothing is rolled back); the next submit call — this session's
     // or a recovered one's — re-derives the actionable set from the
     // journal and finishes it.
-    if submit && let CommitOutcome::Confirmed(_) = pipeline.commit_canonical()? {
-        // The canonical confirmation covers EVERY actionable journaled
-        // key — this episode's AND every previously dropped-ack
-        // episode's (any witness: the actionable set is the whole
-        // pipeline's). Every claimed key is journaled, so every
-        // claimed-but-lane-pending key maps to a pipeline-confirmed
-        // consequence here — confirm them all (an already-confirmed
-        // key is a no-op).
-        let claimed: Vec<MemoryKey> = book.claimed.iter().copied().collect();
-        for key in claimed {
-            spine.world_mut().lane.confirm(&key);
+    if submit {
+        // THE CONFIRMED-IDENTITY SWEEP (finding 20's reconciliation
+        // half): the canonical chain is the authority. An ambiguous
+        // submission (Unknown) or a later NothingPending can leave a
+        // transaction the chain verifiably holds while the lane still
+        // shows it pending — the sweep confirms every tracked episode
+        // the chain already confirmed, whatever THIS commit call's
+        // own outcome turns out to be.
+        confirm_chain_held_episodes(spine, pipeline, book);
+
+        // THE SCOPED CONFIRMATION (finding 20's confirmation scope):
+        // the receipt names the confirmed episode IDENTITIES — only
+        // their keys confirm in the lane. The defective bridge
+        // confirmed every claimed key after any successful batch (the
+        // pipeline filters cancelled transactions; a blanket confirm
+        // could confirm a key whose episode was cancelled).
+        if let CommitOutcome::Confirmed(receipt) = pipeline.commit_canonical()? {
+            for id in &receipt.keys {
+                if let Some((_, episode_keys)) = book.episode_keys.get(&id.episode) {
+                    for key in episode_keys {
+                        spine.world_mut().lane.confirm(key);
+                    }
+                    book.episode_keys.remove(&id.episode);
+                }
+            }
+            // A canonical confirmation can also settle episodes the
+            // receipt's identity list carries indirectly (the whole
+            // actionable set commits as one revision) — re-sweep so
+            // the chain's own view is reflected before returning.
+            confirm_chain_held_episodes(spine, pipeline, book);
         }
     }
     // NothingPending / Unknown / StaleParent (or the dropped-ack
     // fault's withheld submit): the pipeline's own outcome
-    // discipline — the keys stay claimed and pending-live; the
+    // discipline — the sweep above already healed anything the chain
+    // verifiably holds; the rest stays claimed and pending-live; the
     // caller re-commits (the honest retry — now self-sufficient:
     // zero new events suffice).
     Ok(keys)
+}
+
+/// Complete one unresolved episode (finding 20's corrective — the
+/// stable identity the next call finishes before staging anything
+/// new). An unjournaled failure re-stages the SAME envelope (its
+/// failed attempt's was discarded; nothing is double-staged) and
+/// captures the plan over the recorded membership; a journaled
+/// failure completes the apply only. Both paths converge on the
+/// claim and the book's episode tracking.
+fn complete_unresolved_episode<M: CanonicalMedium>(
+    spine: &mut Spine<MemoryLaneWorld>,
+    pipeline: &mut CommitPipeline<M>,
+    book: &mut MemoryCommitBook,
+    unresolved: UnresolvedEpisode,
+) -> Result<(), PipelineError> {
+    let UnresolvedEpisode {
+        witness,
+        episode,
+        consequence,
+        keys,
+        journaled,
+    } = unresolved;
+    let region = (witness as usize) / REGION_NPCS;
+
+    if !journaled {
+        // The rejected append: re-stage the identity's envelope and
+        // journal it (the plan over the SAME keys — their records are
+        // still pending-unclaimed in the ledger — plus the CURRENT
+        // classification sync, which heals forward exactly as a
+        // fresh episode's plan would).
+        let span = OccurrenceSpan::new(0, keys.len() as u64)
+            .map_err(|_| PipelineError::Format(SaveError::Integrity("memory-lane/capture-span")))?;
+        let position = SourcePosition {
+            head: None,
+            tick: spine.world().last_tick.as_u64(),
+        };
+        let envelope = ConsequenceEnvelope::capture(
+            consequence,
+            vec![ClassifiedSpan::new(span, DurabilityClass::DurableEligible)],
+            SignalLane::Captured,
+            CounterValues::default(),
+            SourceBaseline {
+                counters: CounterValues::default(),
+                award: AwardCheckpoint {
+                    durable: Coverage::new(),
+                    provisional: Coverage::new(),
+                },
+            },
+            position,
+        )
+        .map_err(PipelineError::Format)?;
+        pipeline.stage(envelope)?;
+
+        let records: Vec<MemoryRecord> = {
+            let lane = &spine.world().lane;
+            keys.iter()
+                .map(|key| {
+                    *lane
+                        .ledger()
+                        .record(key)
+                        .expect("an unresolved episode's key is in the ledger")
+                })
+                .collect()
+        };
+        let classifications = spine.world().lane.witness_classifications(witness);
+        let plan = MemoryPlan {
+            witness,
+            episode,
+            records,
+            classifications: classifications.clone(),
+        }
+        .encode()
+        .map_err(PipelineError::Format)?;
+
+        // The same definite-rejection boundary as the staging half:
+        // a second rejection re-records the unresolved episode (the
+        // identity stays stable across any number of failures).
+        if let Err(error) = pipeline.capture(
+            position,
+            DurabilityClass::DurableEligible,
+            Vec::new(),
+            vec![FrontierEntry {
+                region: region as u32,
+                episode,
+            }],
+            plan,
+        ) {
+            if matches!(error, PipelineError::CaptureAborted) {
+                pipeline.discard_staged(&[consequence]);
+                book.unresolved = Some(UnresolvedEpisode {
+                    witness,
+                    episode,
+                    consequence,
+                    keys,
+                    journaled: false,
+                });
+            }
+            return Err(error);
+        }
+        for key in &keys {
+            book.claimed.insert(*key);
+        }
+        book.episode_keys
+            .insert(episode, (consequence, keys.clone()));
+        book.journaled_classifications
+            .insert(witness, classifications);
+    }
+
+    // The apply: both paths converge (a journaled failure's
+    // transaction is already durable; the claim and the episode
+    // tracking were established at its capture).
+    pipeline.mark_applied(&[consequence])?;
+    if journaled {
+        // The journaled failure's capture already established the
+        // claim and tracking — restore them (the book recorded the
+        // episode unresolved AFTER capturing them).
+        for key in &keys {
+            book.claimed.insert(*key);
+        }
+        book.episode_keys
+            .insert(episode, (consequence, keys.clone()));
+    }
+    Ok(())
+}
+
+/// Flush dirty classification decisions through their OWN journal
+/// transaction (finding 21's corrective): a classification-sync
+/// episode — an empty record set with the unit-marker span (the
+/// envelope's occurrence space is non-empty by contract; the marker
+/// is the recovery's classification-sync shape), the current sync
+/// as the plan. The recovery applies the decisions and terminates
+/// at the same journaled/applied/confirmed boundaries.
+fn flush_witness_classifications<M: CanonicalMedium>(
+    spine: &mut Spine<MemoryLaneWorld>,
+    pipeline: &mut CommitPipeline<M>,
+    book: &mut MemoryCommitBook,
+    region: usize,
+    witness: u32,
+    current: Vec<(MemoryKey, bool)>,
+) -> Result<(), PipelineError> {
+    let episode = book.episodes;
+    book.episodes += 1;
+    let consequence = ConsequenceId::new(region as u32, episode, witness);
+    let position = SourcePosition {
+        head: None,
+        tick: spine.world().last_tick.as_u64(),
+    };
+    // The unit-marker span: the envelope's occurrence space is
+    // non-empty by the pipeline's contract; the classification-sync
+    // episode covers exactly one marker occurrence and no records
+    // (the recovery's membership rule pairs the two).
+    let span = OccurrenceSpan::new(0, 1)
+        .map_err(|_| PipelineError::Format(SaveError::Integrity("memory-lane/flush-span")))?;
+    let envelope = ConsequenceEnvelope::capture(
+        consequence,
+        vec![ClassifiedSpan::new(span, DurabilityClass::DurableEligible)],
+        SignalLane::Captured,
+        CounterValues::default(),
+        SourceBaseline {
+            counters: CounterValues::default(),
+            award: AwardCheckpoint {
+                durable: Coverage::new(),
+                provisional: Coverage::new(),
+            },
+        },
+        position,
+    )
+    .map_err(PipelineError::Format)?;
+    pipeline.stage(envelope)?;
+
+    let plan = MemoryPlan {
+        witness,
+        episode,
+        records: Vec::new(),
+        classifications: current.clone(),
+    }
+    .encode()
+    .map_err(PipelineError::Format)?;
+    pipeline.capture(
+        position,
+        DurabilityClass::DurableEligible,
+        Vec::new(),
+        vec![FrontierEntry {
+            region: region as u32,
+            episode,
+        }],
+        plan,
+    )?;
+    pipeline.mark_applied(&[consequence])?;
+    book.episode_keys.insert(episode, (consequence, Vec::new()));
+    book.journaled_classifications.insert(witness, current);
+    Ok(())
+}
+
+/// Confirm every tracked episode the canonical chain already holds
+/// (finding 20's reconciliation half — the authority is the chain,
+/// never the last submission's outcome).
+fn confirm_chain_held_episodes<M: CanonicalMedium>(
+    spine: &mut Spine<MemoryLaneWorld>,
+    pipeline: &CommitPipeline<M>,
+    book: &mut MemoryCommitBook,
+) {
+    let held: Vec<u64> = book
+        .episode_keys
+        .iter()
+        .filter(|(_, (id, _))| pipeline.is_confirmed(*id))
+        .map(|(episode, _)| *episode)
+        .collect();
+    for episode in held {
+        if let Some((_, keys)) = book.episode_keys.remove(&episode) {
+            for key in keys {
+                spine.world_mut().lane.confirm(&key);
+            }
+        }
+    }
 }
 
 /// The recovered lane and commit book (a fresh session's state,
@@ -954,7 +1305,14 @@ pub fn recover_memory_lane<M: CanonicalMedium>(
             .first()
             .map(|classified| classified.span.hi - classified.span.lo)
             .unwrap_or(0);
-        if span_count != plan.records.len() as u64 {
+        if plan.records.is_empty() {
+            // THE CLASSIFICATION-SYNC EPISODE (finding 21's
+            // corrective): an empty record set with the unit-marker
+            // span — the membership rule pairs the two exactly.
+            if span_count != 1 || plan.classifications.is_empty() {
+                return Err(integrity("memory-lane/plan-flush-membership-mismatch"));
+            }
+        } else if span_count != plan.records.len() as u64 {
             return Err(integrity("memory-lane/plan-membership-mismatch"));
         }
 
@@ -962,6 +1320,7 @@ pub fn recover_memory_lane<M: CanonicalMedium>(
         // ledger (dormant — counted, never materialized). A key
         // claimed by two episodes is a conflicting reuse the pipeline
         // itself refuses; a duplicate plan record is corruption.
+        let mut plan_keys = Vec::with_capacity(plan.records.len());
         for record in &plan.records {
             if record.key.witness != plan.witness {
                 return Err(integrity("memory-lane/plan-record-witness-mismatch"));
@@ -972,6 +1331,7 @@ pub fn recover_memory_lane<M: CanonicalMedium>(
                 Err(_) => return Err(integrity("memory-lane/plan-record-refused")),
             }
             book.claimed.insert(record.key);
+            plan_keys.push(record.key);
         }
 
         // The applicable classification history: the sync section's
@@ -1003,7 +1363,23 @@ pub fn recover_memory_lane<M: CanonicalMedium>(
                     }
                 }
             }
+            // A chain-confirmed episode is settled: the recovered
+            // book does not track it for the flush (the
+            // journaled-but-unconfirmed ones stay tracked — the
+            // flush's reconciliation sweep and scoped confirmation
+            // consume them).
+        } else {
+            book.episode_keys
+                .insert(plan.episode, (envelope.id, plan_keys.clone()));
         }
+
+        // The book's classification snapshot: the LAST journaled
+        // plan per witness wins (journal order; later episodes
+        // re-carry earlier decisions, so the final sync is the
+        // current one — the classification flush's mismatch
+        // detection starts from here).
+        book.journaled_classifications
+            .insert(plan.witness, plan.classifications.clone());
 
         // The next episode number: one past the highest journaled
         // episode (the frontier's monotonic contract).
@@ -1011,6 +1387,44 @@ pub fn recover_memory_lane<M: CanonicalMedium>(
     }
 
     Ok(RecoveredMemoryLane { lane, book })
+}
+
+/// Install a recovered lane into a fresh world AND materialize the
+/// requested tiers (the sign-off review's finding 21 corrective).
+/// The recovered lane starts all-dormant (the session-reopen shape
+/// — the materialization is the [`MemoryLane::activate`] rebuild,
+/// never a silent partial live view), but the fresh world's
+/// requested levels are NOT all dormant, and
+/// [`set_region_level`]'s same-level early return would leave the
+/// mismatch standing: a recovered witness's region says Full while
+/// its memory stays dormant, so captures reach its ledger without
+/// ever materializing the live view — until some unrelated tier
+/// transition happens to fire. The install materializes every
+/// active region's witnesses through the same activation path a
+/// Dormant→active transition takes (the budget-consistent rebuild,
+/// byte-identical to an uninterrupted session's).
+pub fn install_recovered_lane(
+    spine: &mut Spine<MemoryLaneWorld>,
+    recovered: RecoveredMemoryLane,
+) -> MemoryCommitBook {
+    let RecoveredMemoryLane { lane, book } = recovered;
+    spine.world_mut().lane = lane;
+    for region in 0..MEMORY_REGIONS {
+        let level = spine.world().levels[region];
+        if level != LodLevel::Dormant {
+            let budget = perception_budget(tier_level(level));
+            for record in POPULATION
+                .iter()
+                .take((region + 1) * REGION_NPCS)
+                .skip(region * REGION_NPCS)
+            {
+                spine.world_mut().lane.activate(record.id, budget).expect(
+                    "the rebuild's checked accumulation cannot overflow at authored deltas",
+                );
+            }
+        }
+    }
+    book
 }
 
 #[cfg(test)]
