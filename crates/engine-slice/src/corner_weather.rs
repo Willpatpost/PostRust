@@ -32,18 +32,60 @@ use engine_core::weather::{RainPolicy, Weather};
 use engine_renderer::proxy_instances::{InstanceTransform, ProxyInstance};
 
 /// The rain policy's fixed constants (the demo authors these; the
-/// engine carries no rain numbers). The derivation comment: rate ×
-/// mean lifetime < PARTICLE_POOL_BOUND with headroom — 480 × 1.15 =
-/// 552 < 1024, so the happy path never overflows.
+/// engine carries no rain numbers). THE FINDING-12 POLICY
+/// CORRECTION (2026-11-25): the rain now actually falls to the
+/// ground — the three volumes are SEPARATE (the camera-following
+/// OBSERVATION column, the overhead SPAWN BAND derived above it,
+/// and the WORLD RECEIVER PLANE at street level), and the spawn
+/// height, fall parameters, and lifetime are chosen TOGETHER so a
+/// drop born in the band reaches the receiver before expiry. The
+/// pre-corrective policy (band_height 12, lifetime [0.9, 1.4],
+/// kill at the observed floor) killed rain at the initial eye
+/// height: the lowest spawn was 13.7 m, the greatest initial
+/// downward speed 9.15 m/s, the drag terminal ≈ 8.92 m/s, and even
+/// 85 integration steps travel under 13 m before expiry — the
+/// drops could never reach the real ground, and the rare kill
+/// deaths "landed" 1.7 m above the drawn street.
+///
+/// THE COMPATIBLE PARAMETER SET (every number below derives):
+/// - The OBSERVED column (see [`quantized_listener_volume`]): 8 m
+///   above the eye. At the demo's street eyes (y = 1.7) the band
+///   floor sits at 9.7 m above the receiver.
+/// - The BAND: 4 m tall — spawns uniform in y ∈ [9.7, 13.7] at the
+///   street eyes.
+/// - The FALL: base −9.0 m/s with ±0.15 vertical jitter, gravity
+///   9.81 and drag 0.982 per 1/60 step hold the terminal at
+///   −g·dt·d/(1−d) ≈ −8.92 m/s, so a drop's average downward speed
+///   stays within [8.85, 9.15] over the whole fall (the relaxation
+///   from ±0.15 off-terminal decays by 0.982 per step — under 2%
+///   over a 2 s fall).
+/// - The LIFETIME [1.65, 2.15] s EXCEEDS the worst-case fall time:
+///   the highest spawn (13.7 m) at the slowest average speed
+///   (8.85 m/s) lands in 1.548 s < 1.65 s — EVERY street-level drop
+///   reaches the receiver before expiry (the landing is the norm;
+///   midair expiry is the honest absence, reached only when the
+///   camera climbs enough that the band-following spawn height
+///   outgrows the lifetime — the free-look ceiling at eye 30 puts
+///   the band at [38, 42] m, a 4.3–4.7 s fall no lifetime
+///   survives).
+/// - THE POOL BOUND: 480 spawns/s × the mean residence
+///   (fall distance mean 11.7 m / mean speed 9.0 = 1.30 s at the
+///   street eyes; the residence is CAPPED by the lifetime — mean
+///   1.9 s — when the camera climbs) stays under 1024: the street
+///   steady state holds ≈ 624 live drops, the climb ceiling
+///   ≈ 480 × 1.9 = 912, both with headroom (the per-tick gain is
+///   exactly 8.0 — 480/60 in f32 — so the steady state is the
+///   queue's mean, not a burst).
 pub const RAIN_POLICY: RainPolicy = RainPolicy {
     full_rate: 480.0,
-    band_height: 12.0,
+    band_height: 4.0,
     fall_speed: 9.0,
     lateral_jitter: 0.6,
     vertical_jitter: 0.15,
-    lifetime: [0.9, 1.4],
+    lifetime: [1.65, 2.15],
     gravity: 9.81,
     drag_factor: 0.982,
+    receiver_y: engine_renderer::lit_scene::GROUND_Y,
 };
 
 /// The rain emitter seed (per-emitter own-stream rule — the
@@ -54,18 +96,24 @@ pub const RAIN_SEED: u64 = 0xDEADBEEF;
 /// The ripple policy's fixed constants (the demo authors these; the
 /// engine carries no ripple numbers). The derivations:
 /// lifetime 2.5 s and speed 0.8 m/s give a max ring radius of
-/// 2.0 m; the width 0.35 m covers the landing-column drift
-/// (<= ~0.11 m, the approximation's documented bound); amplitude
-/// 1.0 is the unit scale the renderer's gains consume; decimation
-/// 1 = every landing drop leaves a ring (the measured kill-death
-/// rate 1.475/s × 2.5 s ≈ 3.7 live rings — 8.5x headroom under
-/// the 32 bound, NO LOD needed).
+/// 2.0 m; the width 0.35 m covers the residual landing drift (the
+/// impact XZ is computed at the plane crossing between integration
+/// endpoints — finding 12's correction — so the old landing-column
+/// approximation is retired); amplitude 1.0 is the unit scale the
+/// renderer's gains consume. THE FINDING-12 RE-DERIVATION: at the
+/// corrected policy every street-level drop LANDS (the kill-death
+/// rate rises from the old design's 1.475/s to the full spawn rate
+/// 480/s), so decimation 1 would fill the 32-ring pool in a
+/// fraction of a second. Decimation 320 gates the ring births to
+/// 480/320 = 1.5/s — the SAME visible ring density the owner
+/// walked (the old design's measured 1.475 ring/s), 1.5 × 2.5 ≈
+/// 3.8 live rings, 8.5x headroom under the 32 bound, NO LOD.
 pub const RIPPLE_POLICY: engine_core::ripple::RipplePolicy = engine_core::ripple::RipplePolicy {
     lifetime: 2.5,
     speed: 0.8,
     width: 0.35,
     amplitude: 1.0,
-    decimation: 1,
+    decimation: 320,
 };
 
 /// The rain coverage per instance — the authored constant that
@@ -95,29 +143,41 @@ pub const RAIN_MATERIAL: u32 = 0;
 ///   warm kill death observed, the field ticked per warm tick (the
 ///   same pinned composition as the campaign).
 ///
-/// PER FRAME (render-then-step, dt = 1/60 exactly):
+/// PER FRAME (update-then-present, dt = 1/60 exactly — the
+/// finding-18 corrective: rain and rings present from ONE
+/// completed tick):
 /// 1. Volume refresh, LIKE-FOR-LIKE (the corrective): the quantized
 ///    listener box around THIS frame's camera eye (a fixed
 ///    half-extent box, x/z-quantized to 4 m cells), from which the
 ///    BAND is re-derived (rain_emitter_config's own form — the
-///    spawn band ABOVE the observed volume) and compared against
+///    spawn band ABOVE the observed column) and compared against
 ///    the emitter's config volume; a change installs the fresh
 ///    BAND, never the observed box (the landed defect installed the
 ///    observed box once and collapsed the band to eye level — the
-///    corrective's target; see update_and_build's step 1).
-/// 2. Build the instances: for every `particles()` entry — `pos:
-///    p.position`, `turn:` the billboard turn (the derived formula
-///    t = −yaw·65536/τ — see [`yaw_to_turn`]), `scale: 1.0`,
-///    `tint:` the atmosphere-derived color, `pose_index: 0`,
-///    `alpha: RAIN_ALPHA`.
-/// 3. The `TickReport` from the PREVIOUS step's tick observed (census
-///    accumulated; any `SpawnOverflow` counted).
-/// 4. Render with `ProxyPopulation { …, rain: &layer.instances, … }`.
-/// 5. THEN the pinned composition: `emitter.tick_observing_kill_deaths
-///    (1.0/60.0, ripple observe)` — arithmetic-identical to the old
-///    `tick` (the core's one-code-path delegation) — followed by
-///    `ripples.tick(1.0/60.0)`; the reports carried to the next
-///    frame.
+///    corrective's target; see update_and_build's step 1). The
+///    WORLD RECEIVER PLANE never refreshes — it is the scene's
+///    street level, fixed for the layer's whole life (finding 12:
+///    climbing moves only the band, never the receiver).
+/// 2. THE TICK: the pinned composition —
+///    `emitter.tick_observing_kill_deaths(1.0/60.0, ripple
+///    observe)` (arithmetic-identical to `tick`, the core's
+///    one-code-path delegation; every kill-plane death observes its
+///    ripple ring at the IMPACT crossing) followed by
+///    `ripples.tick(1.0/60.0)`; the reports carried into the
+///    census.
+/// 3. THE PACK (a pure read — no simulation advance during it):
+///    for every POST-TICK `particles()` entry — `pos: p.position`,
+///    `turn:` the billboard turn (t = +yaw·65536/τ, computed ONCE
+///    per build — see [`yaw_to_turn`]), `scale: 1.0`, `tint:` the
+///    atmosphere-derived color for THIS frame's cycle position,
+///    `pose_index: 0`, `alpha: RAIN_ALPHA`.
+/// 4. Render with `ProxyPopulation { …, rain: &layer.instances, … }`
+///    — the drops, the billboards' turn, and the ripple uniform all
+///    carry the SAME completed tick's state (the demo calls
+///    update_and_build BEFORE building the frame population; the
+///    crowd's own locomotion tick stays render-then-step — the two
+///    disciplines are deliberately different, documented at the
+///    call sites).
 pub struct RainLayer {
     emitter: Emitter,
     instances: Vec<ProxyInstance>,
@@ -142,6 +202,12 @@ pub struct RainLayer {
     ripple_spawned: u64,
     ripple_expired: u64,
     ripple_refused: u64,
+    /// The KILL-DEATH census (finding 12's measured contact rate):
+    /// every death whose kill condition held — a real landing on
+    /// the world receiver plane, as opposed to a midair lifetime
+    /// expiry (the honest absence). The `died` census above counts
+    /// BOTH; this counter separates the contacts.
+    kill_deaths: u64,
 }
 
 impl RainLayer {
@@ -186,8 +252,10 @@ impl RainLayer {
         let mut refused: u64 = 0;
         let mut previous_active: u64 = 0;
         let mut warm_refusals: u64 = 0;
+        let mut warm_kill_deaths: u64 = 0;
         for _ in 0..132 {
             let report = emitter.tick_observing_kill_deaths(1.0 / 60.0, |position| {
+                warm_kill_deaths += 1;
                 // The typed spawn refusal, counted at the site
                 // (never swallowed — unreachable at this policy's
                 // 8.5x headroom, counted anyway; the field's own
@@ -227,14 +295,21 @@ impl RainLayer {
             ripple_spawned,
             ripple_expired,
             ripple_refused: warm_refusals,
+            kill_deaths: warm_kill_deaths,
         }
     }
 
-    /// Updates the volume and builds instances for one frame, then
-    /// ticks the emitter. `camera_position` is the listener's world
-    /// position; `camera_yaw` is the listener's yaw (for the
-    /// billboard turn); `day_night` is the cycle position for the
-    /// tint derivation. Returns the tick report for census
+    /// Updates the volume, ticks the emitter and ripple field, then
+    /// builds the instances from the COMPLETED tick (the
+    /// finding-18 corrective: the pack is a pure read AFTER the
+    /// simulation advance, never before it — the presented drops,
+    /// their billboard turn, and the ripple field all carry ONE
+    /// tick's state). `camera_position` is the listener's world
+    /// position (drives the observation column and, through it,
+    /// the overhead band — never the world receiver plane);
+    /// `camera_yaw` is the listener's yaw (for the billboard turn,
+    /// computed once per build); `day_night` is the cycle position
+    /// for the tint derivation. Returns the tick report for census
     /// accumulation.
     pub fn update_and_build(
         &mut self,
@@ -245,21 +320,22 @@ impl RainLayer {
         // 1. Volume refresh, LIKE-FOR-LIKE (the corrective): the
         //    emitter's config volume is the BAND rain_emitter_config
         //    derives from an observed box (the spawn band ABOVE the
-        //    observed volume — weather.rs's own contract); the
+        //    observed column — weather.rs's own contract); the
         //    refresh must compare and install the band derived from
         //    the FRESH observed box, never the observed box itself.
         //    THE LANDED DEFECT this corrects: the band-vs-observed
         //    comparison always differed, and the first refresh
         //    installed the OBSERVED box as the spawn volume — the
-        //    rain then spawned at eye level (y in [1.7, 13.7]
-        //    against the kill plane at 1.7), the kill-death
-        //    fraction jumped from the design's 0.34% to ~64%, and
-        //    the ripple pool saturated (measured: 3726 typed
-        //    refusals over the campaign — the stop's evidence). The
-        //    refresh triggers exactly when the quantized observed
-        //    box changes (the same 4 m cell crossings as before —
-        //    the route's volume-refresh count is unchanged); only
-        //    the INSTALLED volume is corrected.
+        //    rain then spawned at eye level, the kill-death
+        //    fraction jumped, and the ripple pool saturated (the
+        //    stop's evidence). The refresh triggers exactly when
+        //    the quantized observed box changes (the same 4 m cell
+        //    crossings as before); only the INSTALLED volume is
+        //    corrected. THE RECEIVER PLANE is never part of the
+        //    refresh: `set_volume` keeps the construction kill_y
+        //    (the world's street level — finding 12's separation),
+        //    so a climbing camera raises the band and leaves the
+        //    ground where it is.
         let observed = quantized_listener_volume(camera_position);
         let band = engine_core::weather::rain_emitter_config(
             Weather::rain(1.0),
@@ -276,45 +352,18 @@ impl RainLayer {
             self.volume_refresh_count += 1;
         }
 
-        // 2. Build the instances.
-        let particles = self.emitter.particles();
-        self.instances.clear();
-        self.instances.reserve(particles.len());
-
-        // The atmosphere tint: the ambient from `atmosphere_at`.
-        // For the demo, we use the day/night preset's ambient.
-        let tint = atmosphere_ambient(day_night);
-
-        for p in particles {
-            self.instances.push(ProxyInstance {
-                transform: InstanceTransform {
-                    pos: p.position,
-                    // The billboard turn: the derived t = −yaw (the
-                    // quad's mesh-authored +Z normal faces the
-                    // camera — see yaw_to_turn's derivation).
-                    turn: yaw_to_turn(camera_yaw),
-                    scale: 1.0,
-                },
-                tint,
-                alpha: RAIN_ALPHA,
-                pose_index: 0,
-            });
-        }
-
-        // 3. The tick (render-then-step: the instances above render
-        //    THIS frame; the tick advances the field for the next).
-        //    The report is OBSERVED — the census accumulates, the
-        //    overflow counts (the fail-visible discipline).
-        //    THE PINNED COMPOSITION ORDER (ripple.rs's campaign
-        //    digest): the emitter ticks FIRST through
-        //    tick_observing_kill_deaths — arithmetic-identical to
-        //    tick (the core's one-code-path delegation) — with
+        // 2. THE TICK (update first — finding 18): the pinned
+        //    composition advances the simulation one completed step
+        //    BEFORE the pack reads it. THE PINNED COMPOSITION ORDER
+        //    (ripple.rs's campaign digest): the emitter ticks FIRST
+        //    through tick_observing_kill_deaths — arithmetic-identical
+        //    to tick (the core's one-code-path delegation) — with
         //    every kill-plane death observing its ripple ring at
-        //    the death position AS IT HAPPENS (mid-tick, in sweep
-        //    order), THEN the ripple field ticks (every live ring
-        //    ages one dt, the newborn included: a ring born this
-        //    tick is dt old at the tick's end). The typed ripple
-        //    spawn refusal is counted at the site (never
+        //    the IMPACT CROSSING position AS IT HAPPENS (mid-tick,
+        //    in sweep order), THEN the ripple field ticks (every
+        //    live ring ages one dt, the newborn included: a ring
+        //    born this tick is dt old at the tick's end). The typed
+        //    ripple spawn refusal is counted at the site (never
         //    swallowed); the ripple census reads the field's own
         //    counters (spawned/expired deltas around the composed
         //    tick) and the ripple report's refusal carry is
@@ -325,6 +374,7 @@ impl RainLayer {
         let report = self
             .emitter
             .tick_observing_kill_deaths(1.0 / 60.0, |position| {
+                self.kill_deaths += 1;
                 if let Some(overflow) = self.ripples.observe_death(position) {
                     ripple_refused_this_tick += overflow.dropped;
                 }
@@ -351,7 +401,55 @@ impl RainLayer {
         self.previous_active = report.active;
         self.final_active = report.active;
 
+        // 3. THE PACK — a pure read of the COMPLETED tick (finding
+        //    18: no simulation advance during the read; the
+        //    instances, their turn, and the ripple uniform all
+        //    carry this tick). The turn and tint are computed ONCE
+        //    per build (finding 13: the turn is a per-population
+        //    constant, never a per-particle derivation).
+        let turn = yaw_to_turn(camera_yaw);
+        let tint = atmosphere_ambient(day_night);
+        let particles = self.emitter.particles();
+        self.instances.clear();
+        self.instances.reserve(particles.len());
+        for p in particles {
+            self.instances.push(ProxyInstance {
+                transform: InstanceTransform {
+                    pos: p.position,
+                    // The billboard turn: the derived t = +yaw (the
+                    // quad's mesh-authored +Z normal faces the
+                    // camera — see yaw_to_turn's derivation).
+                    turn,
+                    scale: 1.0,
+                },
+                tint,
+                alpha: RAIN_ALPHA,
+                pose_index: 0,
+            });
+        }
+
         report
+    }
+
+    /// The world receiver plane this layer's rain dies at (the
+    /// emitter config's kill plane — a world constant for the
+    /// layer's whole life; the finding-12 tests assert it never
+    /// moves while the camera climbs).
+    pub fn receiver_plane(&self) -> f32 {
+        self.emitter
+            .config()
+            .kill_y
+            .expect("the rain config always carries the world receiver plane")
+    }
+
+    /// The whole-lifetime KILL-DEATH count (finding 12's measured
+    /// contact rate): every real landing on the world receiver
+    /// plane, the warm start's included — the midair lifetime
+    /// expiries (the honest absence) are excluded (they live in
+    /// the `died` census and the exit summary's spawn/death
+    /// conservation, not here).
+    pub fn kill_deaths(&self) -> u64 {
+        self.kill_deaths
     }
 
     /// Returns the population for rendering.
@@ -410,10 +508,21 @@ impl RainLayer {
     }
 }
 
+/// The observed column's height above the eye (the OBSERVATION
+/// volume's y-extent — the first of finding 12's three separated
+/// volumes): what the player watches falling. The SPAWN BAND rides
+/// its ceiling (see [`RAIN_POLICY`]'s derivation), and the WORLD
+/// RECEIVER PLANE is elsewhere entirely (the scene's street level
+/// — the kill plane, never derived from this box).
+const OBSERVED_COLUMN_HEIGHT: f32 = 8.0;
+
 /// The quantized listener volume: a fixed half-extent box around the
 /// eye, x/z-quantized to 4 m cells so the field does not slide
-/// continuously. The half-extent is 20 m (the corner scene's width),
-/// y-extent is 12 m above the floor (the band height).
+/// continuously. The half-extent is 20 m (the corner scene's width);
+/// the y-extent is [`OBSERVED_COLUMN_HEIGHT`] above the eye (the
+/// observed column — the band derivation's floor input, and nothing
+/// else: the kill plane is the policy's world receiver, not this
+/// box's floor).
 fn quantized_listener_volume(eye: [f32; 3]) -> SpawnVolume {
     // Quantize x/z to 4 m cells.
     let quantize = |v: f32| -> f32 { (v / 4.0).round() * 4.0 };
@@ -421,22 +530,25 @@ fn quantized_listener_volume(eye: [f32; 3]) -> SpawnVolume {
     let qz = quantize(eye[2]);
     SpawnVolume {
         min: [qx - 20.0, eye[1], qz - 20.0],
-        max: [qx + 20.0, eye[1] + 12.0, qz + 20.0],
+        max: [qx + 20.0, eye[1] + OBSERVED_COLUMN_HEIGHT, qz + 20.0],
     }
 }
 
 /// Converts the camera's yaw (radians, math.rs's convention: zero
-/// looks down −Z, positive rotates toward +X) to the rain quad's
+/// looks down −Z, positive rotates toward −X) to the rain quad's
 /// billboard turn (u16 turn fractions, `instance_columns`'
 /// convention). THE DERIVATION (physical, verified against both
-/// matrices): `instance_columns` maps the streak mesh's +Z normal
-/// to the world direction (sin t, 0, cos t) at turn t; the camera
-/// at yaw θ looks along (sin θ, 0, −cos θ), so the quad faces the
-/// camera when its normal is (−sin θ, 0, cos θ) — i.e. **t = −θ**.
-/// NO quarter-turn offset: at yaw 0 the camera looks down −Z and
-/// the mesh-authored +Z normal already faces it (the first draft's
-/// +16384 turned every streak 90° EDGE-ON — caught in the line
-/// review; the ink gate is the physical arbiter). The quantizer is
+/// matrices — the audit's finding 13 corrective: the sign was
+/// backwards, turning the streaks EDGE-ON at diagonal headings
+/// where the dot product with the intended normal collapses to
+/// cos 2θ = 0 at 45°): `instance_columns` maps the streak mesh's
+/// +Z normal to the world direction (sin t, 0, cos t) at turn t;
+/// the camera at yaw θ looks along (−sin θ, 0, −cos θ)
+/// (math.rs's `camera_forward` — R·(0,0,−1) = −(column 2)), so the
+/// quad faces the camera when its normal is the horizontal
+/// BACKWARD vector (sin θ, 0, cos θ) — i.e. **t = +θ**. NO
+/// quarter-turn offset: at yaw 0 the camera looks down −Z and the
+/// mesh-authored +Z normal already faces it. The quantizer is
 /// correctly-rounded (`.round()` — deterministic IEEE) with the
 /// total saturating cast and `rem_euclid` (negative yaws wrap
 /// forward) — the libm-free law on the packed path: no runtime
@@ -444,7 +556,7 @@ fn quantized_listener_volume(eye: [f32; 3]) -> SpawnVolume {
 pub fn yaw_to_turn(yaw: f32) -> u16 {
     const TAU: f32 = 2.0 * std::f32::consts::PI;
     const SCALE: f32 = 65536.0 / TAU;
-    let turn = (-yaw * SCALE).round();
+    let turn = (yaw * SCALE).round();
     let turn = (turn as i64).rem_euclid(65536);
     turn as u16
 }
@@ -461,32 +573,48 @@ fn atmosphere_ambient(day_night: f32) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine_renderer::proxy_instances::instance_columns;
 
-    /// The warm-start known answer (MEASURED 2026-11-25, and the
-    /// stage-1 engine-core campaign's own warm window — the two
-    /// agree because the warm start never runs update_and_build's
-    /// volume refresh, so the spawn band stays intact): exactly 5
-    /// rings live after RainLayer::new's 132-tick warm start (the
-    /// measured 5 kill deaths during warm start), none expired
-    /// (2.2 s < the 2.5 s lifetime), no refusals. THE 5 IS
-    /// MEASURED; a different number is a STOP-and-report, never a
-    /// re-pin.
+    /// The campaign's fixed first eye (the route's entry waypoint —
+    /// the construction camera).
+    const FIRST_EYE: [f32; 3] = [-5.0, 1.7, 13.0];
+
+    /// The warm-start known answer (RE-MEASURED 2026-11-25 for the
+    /// finding-12 policy corrective — the old design's 5 warm rings
+    /// moved: the receiver plane is now the world's street level
+    /// and every street-level drop lands, so the warm window's
+    /// kill deaths are the landed share of its 1056 spawns, the
+    /// ring births the decimation-320 gate over them). THE PINNED
+    /// NUMBERS ARE MEASURED; a different number is a
+    /// STOP-and-report, never a re-pin.
     #[test]
     fn ripple_warm_start_known_answer() {
-        let layer = RainLayer::new([-5.0, 1.7, 13.0]);
+        let layer = RainLayer::new(FIRST_EYE);
+        println!(
+            "warm start measured: active rings {}, spawned {}, expired {}, refused {}, \
+             emitter active {}",
+            layer.ripple_field().active_count(),
+            layer.ripple_spawned,
+            layer.ripple_expired,
+            layer.ripple_refused,
+            layer.final_active
+        );
         assert_eq!(
             layer.ripple_field().active_count(),
-            5,
-            "the measured 5 warm-start kill deaths leave 5 live rings"
+            WARM_ACTIVE_RINGS,
+            "the measured warm-start ring count"
         );
-        assert_eq!(layer.ripple_spawned, 5, "the warm census counts them");
         assert_eq!(
-            layer.ripple_expired, 0,
-            "2.2 s < the 2.5 s lifetime: nothing expires"
+            layer.ripple_spawned, WARM_RIPPLE_SPAWNED,
+            "the warm census counts them"
+        );
+        assert_eq!(
+            layer.ripple_expired, WARM_RIPPLE_EXPIRED,
+            "2.2 s against the 2.5 s lifetime: the measured expiry"
         );
         assert_eq!(
             layer.ripple_refused, 0,
-            "the warm window never fills the pool"
+            "the warm window never fills the pool (decimation 320: 8.5x headroom)"
         );
         assert_eq!(layer.ripple_field().refused_total(), 0);
         // Every warm ring is younger than the lifetime.
@@ -494,24 +622,35 @@ mod tests {
             assert!(ring.age < RIPPLE_POLICY.lifetime);
             assert_eq!(ring.amplitude, RIPPLE_POLICY.amplitude);
         }
+        // THE RECEIVER (finding 12): the layer's kill plane is the
+        // world's street level from construction on.
+        assert_eq!(layer.receiver_plane(), engine_renderer::lit_scene::GROUND_Y);
     }
 
+    /// The warm-start measured actuals under the finding-12 policy
+    /// (see the test above for the re-pin history): 1 live ring,
+    /// 1 ring born (the decimation-320 gate over the warm window's
+    /// 427 landings), nothing expired (2.2 s < 2.5 s).
+    const WARM_ACTIVE_RINGS: usize = 1;
+    const WARM_RIPPLE_SPAWNED: u64 = 1;
+    const WARM_RIPPLE_EXPIRED: u64 = 0;
+
     /// THE CAMPAIGN DIGEST PIN + THE COMBINED CENSUS (the landed
-    /// record). The discovery story, compressed: the stage-2 stop
-    /// (2026-11-25) measured 132 spawns and a saturated ripple pool
-    /// (3726 typed refusals) where the design model expected 18 and
-    /// ~3.7 live rings; the root cause was the LANDED volume
-    /// refresh's band-vs-observed comparison, whose first fire
-    /// installed the observed box as the spawn volume and collapsed
-    /// the band to eye level (kill deaths ~8.6x the design's rate);
-    /// the corrective re-derived the refresh LIKE-FOR-LIKE (the
-    /// band from the fresh observed box, band-vs-band) and the
-    /// campaign now matches the design model exactly — the numbers
-    /// below are the POST-CORRECTIVE landed actuals.
+    /// record). RE-PINNED with cause (the finding-12 rain-contact
+    /// corrective, 2026-11-25): the rain now falls to the WORLD
+    /// RECEIVER (street level) — the band is the compatible 4 m
+    /// over the 8 m observed column, the lifetime [1.65, 2.15]
+    /// carries every street-level drop to the ground, the impact
+    /// XZ is the interpolated plane crossing, and the ripple
+    /// decimation is 320 over the ~480/s real landings. The census
+    /// and the digest moved from the pre-corrective actuals
+    /// (ripple_spawned 18, digest 6_501_874_864_611_424_535 — the
+    /// old pin's history stays in git); the numbers below are the
+    /// POST-CORRECTIVE landed actuals.
     ///
-    /// THE CONVERGENCE (the corrective's proof, asserted below): at
-    /// the fixed camera the quantized observed box never changes,
-    /// so the like-for-like refresh never fires
+    /// THE CONVERGENCE (the volume-refresh corrective's proof,
+    /// asserted below): at the fixed camera the quantized observed
+    /// box never changes, so the like-for-like refresh never fires
     /// (`volume_refresh_count == 0` over the whole campaign) and the
     /// layer's emitter state stays the construction band throughout
     /// — the layer's campaign IS engine-core's demo-fixture
@@ -522,34 +661,42 @@ mod tests {
     /// independently — a mismatch between them is an investigation,
     /// never a silent divergence).
     ///
-    /// The census: ripple_spawned == 18 over the 132+600 window
-    /// (the design model's measured kill-death total, the warm
-    /// start's 5 included — now the LANDED path's actual) and
-    /// refused == 0 (the pool-bound proof at the demo boundary:
-    /// 1.475/s x 2.5 s ~ 3.7 live rings, 8.5x headroom under the
-    /// 32 bound). A moved number or digest is an investigation,
-    /// never a re-pin without a cause.
+    /// The census: `ripple_spawned` is the decimation-320 gate over
+    /// the campaign's real landings (the warm start's rings
+    /// included) and `refused == 0` is the pool-bound proof at the
+    /// demo boundary (1.5 ring/s x 2.5 s ~ 3.8 live rings, 8.5x
+    /// headroom under the 32 bound). A moved number or digest is an
+    /// investigation, never a re-pin without a cause.
     #[test]
     fn ripple_campaign_digest_pin() {
-        let first_eye = [-5.0, 1.7, 13.0];
-        let mut layer = RainLayer::new(first_eye);
+        let mut layer = RainLayer::new(FIRST_EYE);
         let mut hasher = engine_core::fingerprint::Fingerprinter::new();
         for tick in 1..=600u32 {
-            layer.update_and_build(first_eye, 0.0, 0.0);
+            layer.update_and_build(FIRST_EYE, 0.0, 0.0);
             if tick % 60 == 0 {
                 layer.ripple_field().fold_state(&mut hasher);
             }
         }
-        // The combined census (the design model's measured total —
-        // the post-corrective landed actual).
+        println!(
+            "campaign measured: ripple spawned {} expired {} refused {} died {} spawned {} \
+             final active {} digest {}",
+            layer.ripple_spawned,
+            layer.ripple_expired,
+            layer.ripple_refused,
+            layer.died,
+            layer.spawned,
+            layer.final_active,
+            hasher.finish()
+        );
+        // The combined census (the post-corrective landed actual).
         assert_eq!(
-            layer.ripple_spawned, 18,
-            "the measured kill-death total over the whole 132+600 window (the warm \
-             start's 5 included)"
+            layer.ripple_spawned, CAMPAIGN_RIPPLE_SPAWNED,
+            "the decimation-320 ring total over the whole 132+600 window (the warm \
+             start's rings included)"
         );
         assert_eq!(
             layer.ripple_refused, 0,
-            "the pool-bound proof at the demo boundary (1.475/s x 2.5 s ~ 3.7 << 32)"
+            "the pool-bound proof at the demo boundary (1.5/s x 2.5 s ~ 3.8 << 32)"
         );
         // THE CONVERGENCE's mechanical half: the fixed camera never
         // crosses a 4 m cell, so the like-for-like refresh never
@@ -565,7 +712,6 @@ mod tests {
         // hasher, never a single final fold). MEASURED 2026-11-25,
         // post-corrective — the identical u64 to the core fixture's
         // PINNED_CAMPAIGN_DIGEST.
-        const PINNED_CAMPAIGN_DIGEST: u64 = 6_501_874_864_611_424_535;
         assert_eq!(
             hasher.finish(),
             PINNED_CAMPAIGN_DIGEST,
@@ -573,6 +719,211 @@ mod tests {
              pin (one campaign, two proofs, one digest): an investigation, never a \
              silent repin"
         );
+    }
+
+    /// The campaign's measured actuals under the finding-12 policy
+    /// (see the digest test above for the re-pin history): 16 rings
+    /// born over the 132+600 window (the decimation gate over 5227
+    /// landings), 12 expired, 4 live at exit; the digest is the
+    /// SAME u64 engine-core's fixture digest_pin pins.
+    const CAMPAIGN_RIPPLE_SPAWNED: u64 = 16;
+    const PINNED_CAMPAIGN_DIGEST: u64 = 13_157_441_224_951_405_170;
+
+    /// SUSTAINED NONZERO REAL CONTACTS AT NATURAL INTENSITY (the
+    /// finding-12 deciding test): at the corrected policy every
+    /// street-level drop reaches the world receiver before expiry —
+    /// MEASURED 2026-11-25: 4800 contacts over the 600-tick window,
+    /// 480.0/s — EXACTLY the 480/s spawn rate at the steady state
+    /// (every drop born lands; the warm start itself landed 427).
+    /// The pre-corrective campaign measured 18 kill deaths TOTAL
+    /// (the 0.34% tail); the honest-absence regime would measure
+    /// zero. The floor holds a margin under the measurement.
+    #[test]
+    fn contacts_sustained_at_natural_intensity() {
+        let mut layer = RainLayer::new(FIRST_EYE);
+        let kill_deaths_at_window_start = layer.kill_deaths();
+        for _ in 0..600 {
+            layer.update_and_build(FIRST_EYE, 0.0, 0.0);
+        }
+        let contacts = layer.kill_deaths() - kill_deaths_at_window_start;
+        let seconds = 600.0 / 60.0;
+        println!(
+            "measured contacts: {contacts} over the 600-tick window ({:.1}/s against the \
+             480/s spawn rate; final live pool {})",
+            contacts as f64 / seconds,
+            layer.final_active
+        );
+        assert!(
+            contacts > CONTACTS_FLOOR,
+            "sustained real contacts at natural intensity: {contacts} over 10 s (the \
+             pre-corrective campaign measured 18 kill deaths total; midair expiry \
+             would measure zero)"
+        );
+        // The contacts are REAL ground hits: the receiver stayed at
+        // street level and the ripple pool never refused.
+        assert_eq!(layer.receiver_plane(), engine_renderer::lit_scene::GROUND_Y);
+        assert_eq!(
+            layer.ripple_refused, 0,
+            "the decimation gate holds the pool"
+        );
+    }
+
+    /// The measured-contact floor (a margin under the campaign's
+    /// own measured actual — every street drop lands, so the count
+    /// is the spawned 4800 minus the ~624 live pool and the ramp).
+    const CONTACTS_FLOOR: u64 = 4_000;
+
+    /// THE THREE-VOLUME SEPARATION against ONE FIXED GROUND PLANE
+    /// (finding 12's deciding test — stationary, translated, and
+    /// vertically-moving cameras): the OBSERVED column and the
+    /// overhead BAND follow the eye (a translated camera crosses 4
+    /// m cells and refreshes the band; a climbing camera raises it
+    /// every tick), while the WORLD RECEIVER PLANE never moves —
+    /// contacts keep landing at street level under the stationary
+    /// and translated cameras, and the climb ends in the honest
+    /// absence (the band outgrows the lifetime: midair expiry, zero
+    /// contacts).
+    #[test]
+    fn receiver_plane_fixed_across_stationary_translated_and_climbing_cameras() {
+        // --- Stationary: the fixed camera never refreshes, the
+        //     contacts land, and the receiver stays at street level.
+        let mut layer = RainLayer::new(FIRST_EYE);
+        for _ in 0..120 {
+            layer.update_and_build(FIRST_EYE, 0.0, 0.0);
+            assert_eq!(
+                layer.receiver_plane(),
+                engine_renderer::lit_scene::GROUND_Y,
+                "the receiver is the world's street level, every tick"
+            );
+        }
+        assert_eq!(
+            layer.volume_refresh_count, 0,
+            "the stationary camera never refreshes"
+        );
+        assert!(layer.died > 0, "the stationary camera sees real contacts");
+
+        // --- Translated: the eye crosses 4 m cells in x/z (the y
+        //     held at street level), the band refreshes behind it,
+        //     and the receiver is untouched — the contacts continue
+        //     on the SAME fixed ground plane.
+        for step in 0..120u32 {
+            let eye = [
+                FIRST_EYE[0] + step as f32 * 0.5,
+                FIRST_EYE[1],
+                FIRST_EYE[2] - step as f32 * 0.5,
+            ];
+            layer.update_and_build(eye, 0.0, 0.0);
+            assert_eq!(
+                layer.receiver_plane(),
+                engine_renderer::lit_scene::GROUND_Y,
+                "step {step}: translation never moves the receiver"
+            );
+        }
+        assert!(
+            layer.volume_refresh_count > 0,
+            "the translated camera crosses 4 m cells and refreshes the band \
+             ({} refreshes)",
+            layer.volume_refresh_count
+        );
+        assert!(
+            layer.died > 0,
+            "the translated camera still sees real contacts"
+        );
+
+        // --- Vertically moving: the eye climbs the free-look band
+        //     (1.7 -> 30 m). The band rises with it (a refresh every
+        //     tick — the observed column's y is not quantized), the
+        //     receiver NEVER moves, and past the lifetime's reach
+        //     the contacts stop entirely: drops born in the raised
+        //     band expire midair (the honest absence — zero
+        //     contacts, never a ring).
+        let mut climbing = RainLayer::new(FIRST_EYE);
+        let mut died_high_window = 0u64;
+        let mut rings_high_window = 0u64;
+        for step in 0..400u32 {
+            let eye = [0.0, 1.7 + step as f32 * (30.0 - 1.7) / 400.0, 0.0];
+            climbing.update_and_build(eye, 0.0, 0.0);
+            assert_eq!(
+                climbing.receiver_plane(),
+                engine_renderer::lit_scene::GROUND_Y,
+                "climb step {step}: the world's ground never moves"
+            );
+            if step == 300 {
+                // Past the lifetime's reach: the eye is above 21.5 m,
+                // the band floor above 29.5 m — a fall no lifetime
+                // survives, and the last low-band cohort (spawned
+                // before step ~131) has drained its <= 2.15 s
+                // lifetime. From here on: midair expiry only.
+                died_high_window = climbing.kill_deaths();
+                rings_high_window = climbing.ripple_spawned;
+            }
+        }
+        // The high window (the last 100 ticks, the eye above ~21.9 m):
+        // the street cohort has drained, the raised band's drops
+        // expire midair — ZERO new contacts and ZERO new rings.
+        assert_eq!(
+            climbing.kill_deaths() - died_high_window,
+            0,
+            "the honest absence: past the lifetime's reach the high-band drops \
+             expire midair (zero contacts)"
+        );
+        assert_eq!(
+            climbing.ripple_spawned - rings_high_window,
+            0,
+            "no ring is born from a midair expiry (the observer stays silent)"
+        );
+        assert!(
+            climbing.final_active > 0,
+            "the rain still FALLS visibly at the climb ceiling — the drops expire \
+             midair, they do not vanish at birth"
+        );
+        assert_eq!(
+            climbing.refused, 0,
+            "the climb ceiling's lifetime-capped pool (480 x 1.9 = 912) stays under \
+             the 1024 bound"
+        );
+    }
+
+    /// MIDAIR EXPIRY IS THE HONEST ABSENCE (the finding-12 edge,
+    /// isolated): a layer held at the free-look eye ceiling (30 m —
+    /// the band at [38, 42] m, a 4.3–4.7 s fall no lifetime
+    /// survives) drains its street cohort and then produces ZERO
+    /// contacts — no kill deaths, no rings — while the streaks
+    /// keep falling (lifetime deaths, not landings).
+    #[test]
+    fn midair_expiry_produces_zero_contacts() {
+        let mut layer = RainLayer::new(FIRST_EYE);
+        let high_eye = [0.0, 30.0, 0.0];
+        // The drain: the street cohort lands within its remaining
+        // fall (<= 1.55 s = 93 ticks).
+        for _ in 0..150 {
+            layer.update_and_build(high_eye, 0.0, 0.0);
+        }
+        let kill_deaths_after_drain = layer.kill_deaths();
+        let rings_after_drain = layer.ripple_spawned;
+        assert!(
+            kill_deaths_after_drain > 0,
+            "the street cohort drained onto the receiver"
+        );
+        // The steady high regime: 300 ticks, zero contacts.
+        for _ in 0..300 {
+            layer.update_and_build(high_eye, 0.0, 0.0);
+        }
+        assert_eq!(
+            layer.kill_deaths(),
+            kill_deaths_after_drain,
+            "every high-band drop expires midair: zero contacts (the honest absence)"
+        );
+        assert_eq!(
+            layer.ripple_spawned, rings_after_drain,
+            "the observer stayed silent for every midair expiry"
+        );
+        assert!(
+            layer.final_active > 0,
+            "the high-band drops live out their lifetimes midair ({} active)",
+            layer.final_active
+        );
+        assert_eq!(layer.refused, 0, "the lifetime-capped pool never overflows");
     }
 
     /// The census conservation over the 600-tick campaign (the
@@ -586,16 +937,12 @@ mod tests {
     /// at every 60th tick. The layer's census must also mirror the
     /// field's own counters at every sample (the
     /// delta-accumulation proof). The `refused == 0` half is the
-    /// pool-bound proof on the post-corrective landed path (the
-    /// stage-2 stop's saturated-pool measurement was the defect's
-    /// signature — see ripple_campaign_digest_pin's doc for the
-    /// discovery story).
+    /// pool-bound proof on the post-corrective landed path.
     #[test]
     fn ripple_census_conservation() {
-        let first_eye = [-5.0, 1.7, 13.0];
-        let mut layer = RainLayer::new(first_eye);
+        let mut layer = RainLayer::new(FIRST_EYE);
         for tick in 1..=600u32 {
-            layer.update_and_build(first_eye, 0.0, 0.0);
+            layer.update_and_build(FIRST_EYE, 0.0, 0.0);
             if tick % 60 == 0 {
                 let attempts = layer.ripple_spawned + layer.ripple_refused;
                 let outcomes = layer.ripple_expired
@@ -614,9 +961,8 @@ mod tests {
         }
         assert_eq!(
             layer.ripple_refused, 0,
-            "the pool-bound proof on the post-corrective landed path (the design's \
-             8.5x headroom; the saturated-pool measurement was the pre-corrective \
-             defect's signature)"
+            "the pool-bound proof on the post-corrective landed path (the decimation \
+             gate's 8.5x headroom)"
         );
     }
 
@@ -627,50 +973,51 @@ mod tests {
     /// A moved digest means a math, order, or packing change — an
     /// investigation, never a re-pin without a cause.
     ///
-    /// RE-PINNED with cause (the volume-refresh corrective,
-    /// 2026-11-25): the landed refresh's first fire installed the
-    /// OBSERVED box as the spawn volume, collapsing the band to eye
-    /// level for the whole campaign; the corrective installs the
-    /// BAND derived from the fresh observed box (like-for-like), so
-    /// the trajectory now spawns from the design band
-    /// [13.7, 25.7] and the digest moved from 2833298087568370423
-    /// to the value below (the old pin's history stays in git). At
-    /// the fixed camera the like-for-like refresh never fires —
-    /// the campaign is the construction-band trajectory, the same
+    /// RE-PINNED with cause (the finding-12 rain-contact
+    /// corrective, 2026-11-25): the receiver plane moved to the
+    /// world's street level, the band to the compatible 4 m over
+    /// the 8 m observed column, and the lifetime to [1.65, 2.15] —
+    /// the trajectory's spawn draws, residence, and death ticks all
+    /// moved, so the digest moved from 1705604326501831793 to the
+    /// value below (the old pin's history stays in git). At the
+    /// fixed camera the like-for-like refresh never fires — the
+    /// campaign is the construction-band trajectory, the same
     /// stream engine-core's demo fixture drives.
     #[test]
     fn warm_start_plus_campaign_determinism() {
-        let first_eye = [-5.0, 1.7, 13.0];
-        let first_yaw = 0.0;
-
         let run = || {
-            let mut layer = RainLayer::new(first_eye);
+            let mut layer = RainLayer::new(FIRST_EYE);
             for _ in 0..600 {
-                layer.update_and_build(first_eye, first_yaw, 0.0);
+                layer.update_and_build(FIRST_EYE, 0.0, 0.0);
             }
             layer.fold_state()
         };
         let digest_a = run();
         let digest_b = run();
         assert_eq!(digest_a, digest_b, "the campaign double-runs identical");
-        const PINNED_FNV: u64 = 1705604326501831793;
+        println!("measured rain campaign state digest: {digest_a}");
         assert_eq!(
             digest_a, PINNED_FNV,
             "the rain campaign's state digest moved: a math, order, or packing change"
         );
     }
 
+    /// The rain campaign's measured state digest under the
+    /// finding-12 policy (see the test above for the re-pin
+    /// history).
+    const PINNED_FNV: u64 = 6_471_597_869_140_464_520;
+
     /// The census conservation (the conservation law over the
     /// layer's OWN tracked counters — NOT an identity derived from
     /// itself): spawned == died + final-active + refused, and the
-    /// authored policy holds refused == 0 (rate × mean lifetime ≈
-    /// 552 << the 1024 pool bound).
+    /// authored policy holds refused == 0 (the street steady state
+    /// holds ~624 live drops and the climb ceiling's lifetime cap
+    /// ~912, both under the 1024 pool bound).
     #[test]
     fn census_conservation() {
-        let first_eye = [-5.0, 1.7, 13.0];
-        let mut layer = RainLayer::new(first_eye);
+        let mut layer = RainLayer::new(FIRST_EYE);
         for _ in 0..600 {
-            layer.update_and_build(first_eye, 0.0, 0.0);
+            layer.update_and_build(FIRST_EYE, 0.0, 0.0);
         }
         assert_eq!(
             layer.spawned,
@@ -679,38 +1026,217 @@ mod tests {
         );
         assert_eq!(
             layer.refused, 0,
-            "the happy path has no refusals (rate × lifetime < pool bound)"
+            "the happy path has no refusals (rate x residence < pool bound at every \
+             eye height)"
         );
         assert!(
             layer.died > 0,
-            "a 600-tick campaign sees deaths (the lifetimes are 0.9–1.4 s)"
+            "a 600-tick campaign sees deaths (every street-level drop lands)"
+        );
+    }
+
+    /// THE PACK IS THE COMPLETED TICK (finding 18's core invariant:
+    /// rain and rings present from ONE completed tick — the pack is
+    /// a pure read AFTER the simulation advance). Every tick, the
+    /// packed instance count must equal the tick report's
+    /// post-tick active count; a pack-before-tick regression (the
+    /// pre-corrective order) packs the PRE-tick pool and disagrees
+    /// on every tick with births or deaths — at the corrected
+    /// policy that is every tick of the steady state.
+    #[test]
+    fn packed_instances_carry_the_completed_tick() {
+        let mut layer = RainLayer::new(FIRST_EYE);
+        for tick in 1..=120u32 {
+            let report = layer.update_and_build(FIRST_EYE, 0.0, 0.0);
+            assert_eq!(
+                layer.instances.len(),
+                report.active as usize,
+                "tick {tick}: the packed snapshot IS the completed tick (the landed \
+                 drops left the pack the tick they landed)"
+            );
+        }
+    }
+
+    /// A SUDDEN YAW CHANGE repacks the billboards with the NEW yaw
+    /// (finding 18's view-staleness witness, layer-level half: the
+    /// pack uses THIS call's camera, never the preceding frame's).
+    #[test]
+    fn sudden_yaw_change_repacks_the_billboards() {
+        let mut layer = RainLayer::new(FIRST_EYE);
+        let old_yaw = 0.0f32;
+        let new_yaw = 0.83f32; // an off-cardinal heading, ~47.6 degrees
+        layer.update_and_build(FIRST_EYE, old_yaw, 0.0);
+        let old_turn = yaw_to_turn(old_yaw);
+        assert!(
+            layer.instances.iter().all(|i| i.transform.turn == old_turn),
+            "the first pack carries the first yaw"
+        );
+        layer.update_and_build(FIRST_EYE, new_yaw, 0.0);
+        let new_turn = yaw_to_turn(new_yaw);
+        assert_ne!(old_turn, new_turn, "the witness yaws differ");
+        assert!(
+            layer.instances.iter().all(|i| i.transform.turn == new_turn),
+            "every billboard carries the NEW yaw on the same call that advanced the \
+             simulation — never the preceding frame's"
+        );
+    }
+
+    /// A STATIC-NIGHT POSE tints the pack with the night ambient
+    /// (finding 18's palette half, layer-level: the pack uses the
+    /// ACTIVE atmosphere for this frame — the free-look loop's
+    /// rain_t default fix rides on this contract).
+    #[test]
+    fn static_night_tints_the_pack() {
+        let night = atmosphere_ambient(1.0);
+        let day = atmosphere_ambient(0.0);
+        assert_ne!(
+            night, day,
+            "the night and day ambients differ (the witness)"
+        );
+        let mut layer = RainLayer::new(FIRST_EYE);
+        layer.update_and_build(FIRST_EYE, 0.0, 1.0);
+        assert!(
+            !layer.instances.is_empty(),
+            "the warm-started layer packs streaks on the first update"
+        );
+        assert!(
+            layer.instances.iter().all(|i| i.tint == night),
+            "a static-night pose tints every streak with the night ambient (never the \
+             day default)"
+        );
+        // The day control: the same call at t=0 packs the day tint.
+        layer.update_and_build(FIRST_EYE, 0.0, 0.0);
+        assert!(
+            layer.instances.iter().all(|i| i.tint == day),
+            "the day control packs the day ambient"
+        );
+    }
+
+    /// THE FALLING-TO-LANDED TRANSITION IN ONE FRAME (finding 18's
+    /// single-drop witness, campaign form): on the tick a ring is
+    /// BORN, the drop that caused it is already ABSENT from the
+    /// packed instances — the drop's disappearance and its ring's
+    /// birth present in the SAME frame, from one completed tick.
+    /// (The pre-corrective order packed the pre-tick pool: the
+    /// dying drop rendered for one more frame beside its newborn
+    /// ring.)
+    #[test]
+    fn falling_to_landed_transition_in_one_frame() {
+        let mut layer = RainLayer::new(FIRST_EYE);
+        let rings_before = layer.ripple_spawned;
+        let mut ring_tick = None;
+        for tick in 1..=600u32 {
+            let report = layer.update_and_build(FIRST_EYE, 0.0, 0.0);
+            if layer.ripple_spawned > rings_before && ring_tick.is_none() {
+                ring_tick = Some(tick);
+                assert_eq!(
+                    layer.instances.len(),
+                    report.active as usize,
+                    "the ring-birth tick's pack is the completed tick: the landed drop \
+                     is gone the same frame its ring appears"
+                );
+                assert!(
+                    layer.ripple_field().active_count() > 0,
+                    "the newborn ring is live in the same frame"
+                );
+            }
+        }
+        assert!(
+            ring_tick.is_some(),
+            "the 600-tick campaign births at least one ring (the decimation gate's \
+             1.5/s)"
         );
     }
 
     /// The billboard turn known answers (the TRUE derivation,
-    /// hand-computed): t = −yaw·65536/τ, wrapped forward.
+    /// hand-computed — the finding-13 corrective: t = +yaw·65536/τ,
+    /// wrapped forward; the pre-corrective packer used −yaw, which
+    /// is edge-on at the diagonal headings):
     /// - yaw 0 (the camera looks −Z): the +Z-authored normal already
     ///   faces it → turn 0.
-    /// - yaw π/2 (looks +X): turn −16384 ≡ 49152 (the normal −X).
-    /// - yaw π (looks +Z): turn −32768 ≡ 32768 (the normal −Z).
-    /// - yaw −π/2 (looks −X): turn 16384 (the normal +X).
+    /// - yaw π/2 (looks −X): turn 16384 (the normal +X).
+    /// - yaw π (looks +Z): turn 32768 (the normal −Z).
+    /// - yaw −π/2 (looks +X): turn −16384 ≡ 49152 (the normal −X).
     #[test]
     fn billboard_turn_known_answers() {
         assert_eq!(yaw_to_turn(0.0), 0, "yaw 0 -> turn 0 (normal +Z)");
         assert_eq!(
             yaw_to_turn(std::f32::consts::FRAC_PI_2),
-            49152,
-            "yaw π/2 -> turn 49152 (normal −X, facing the +X-looking camera)"
+            16384,
+            "yaw π/2 -> turn 16384 (normal +X, facing the −X-looking camera)"
         );
         assert_eq!(
             yaw_to_turn(std::f32::consts::PI),
             32768,
-            "yaw π -> turn 32768 (normal −Z)"
+            "yaw π -> turn 32768 (normal −Z, facing the +Z-looking camera)"
         );
         assert_eq!(
             yaw_to_turn(-std::f32::consts::FRAC_PI_2),
-            16384,
-            "yaw −π/2 -> turn 16384 (normal +X)"
+            49152,
+            "yaw −π/2 -> turn 49152 (normal −X, facing the +X-looking camera)"
+        );
+    }
+
+    /// THE BILLBOARD FACES THE CAMERA AT DIAGONAL HEADINGS (finding
+    /// 13's deciding test, the authored-matrix form): the dot of
+    /// the streak mesh's +Z normal — transformed by
+    /// `instance_columns` at the packed turn — with the camera's
+    /// horizontal BACKWARD vector must be ~1 at ±45°, the
+    /// cardinals, and an off-cardinal heading. The pre-corrective
+    /// sign (t = −yaw) gives cos 2θ — ZERO at 45°, the edge-on
+    /// collapse — asserted as the documented failure witness.
+    #[test]
+    fn billboard_faces_the_camera_at_diagonal_headings() {
+        let facing_dot = |yaw: f32| -> f32 {
+            let turn = yaw_to_turn(yaw);
+            let columns = instance_columns(&InstanceTransform {
+                pos: [0.0; 3],
+                turn,
+                scale: 1.0,
+            });
+            // The mesh-authored +Z normal, transformed by the packed
+            // instance matrix (column 2).
+            let normal = [columns[2][0], columns[2][1], columns[2][2]];
+            let forward = crate::math::camera_forward(yaw, 0.0, 0.0);
+            let backward = [-forward[0], 0.0, -forward[2]];
+            normal[0] * backward[0] + normal[1] * backward[1] + normal[2] * backward[2]
+        };
+        // The corrected turn: broadside at every heading (the
+        // quantizer's 1/65536 turn and sin_cos_turn's <= 2e-6 error
+        // keep the dot within 1e-5 of 1).
+        for yaw in [
+            std::f32::consts::FRAC_PI_4,
+            -std::f32::consts::FRAC_PI_4,
+            std::f32::consts::FRAC_PI_2,
+            std::f32::consts::PI,
+            0.83, // off-cardinal, ~47.6 degrees
+            -2.31,
+        ] {
+            let dot = facing_dot(yaw);
+            assert!(
+                dot > 0.999,
+                "yaw {yaw:.3}: the authored transformed normal faces the camera \
+                 (dot {dot:.5})"
+            );
+        }
+        // THE PRE-CORRECTIVE WITNESS (documented, not live): the
+        // negated turn's dot with the intended normal is cos 2θ —
+        // at 45° it is zero (edge-on, the streaks vanish).
+        let edge_on = std::f32::consts::FRAC_PI_4;
+        let wrong_turn = yaw_to_turn(-edge_on);
+        let columns = instance_columns(&InstanceTransform {
+            pos: [0.0; 3],
+            turn: wrong_turn,
+            scale: 1.0,
+        });
+        let normal = [columns[2][0], columns[2][1], columns[2][2]];
+        let forward = crate::math::camera_forward(edge_on, 0.0, 0.0);
+        let backward = [-forward[0], 0.0, -forward[2]];
+        let dot = normal[0] * backward[0] + normal[1] * backward[1] + normal[2] * backward[2];
+        assert!(
+            dot.abs() < 0.001,
+            "the negated turn at 45° is edge-on (dot {dot:.5} = cos 2θ ~ 0) — the \
+             collapse the corrective fixes"
         );
     }
 

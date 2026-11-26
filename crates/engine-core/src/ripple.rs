@@ -246,14 +246,15 @@ impl RippleField {
     /// emitter's sweep order, one call per kill death). The
     /// decimation counter advances; every `decimation`-th death
     /// attempts a ring. An attempt appends at the active prefix's
-    /// end — `center` is the death's x/z under the LANDING-COLUMN
-    /// approximation: the kill plane sits at eye height, and the
-    /// remaining fall's lateral drift (<= 0.6 m/s horizontal vs
-    /// ~9 m/s terminal over <= 1.7 m) is <= ~0.11 m, inside the
-    /// authored ring width 0.35 m — the column, not the point, is
-    /// the policy's own resolution. A full pool REFUSES typed (the
-    /// ring is NOT spawned, the state is otherwise untouched) —
-    /// never a silent drop.
+    /// end — `center` is the death's impact XZ: the emitter's
+    /// kill-plane observation reports the INTERPOLATED CROSSING
+    /// between the death step's integration endpoints (finding
+    /// 12's correction — the old landing-column approximation,
+    /// which estimated the remaining fall's lateral drift from an
+    /// eye-height kill plane, is retired: the impact XZ is computed
+    /// AT the world receiver, so no drift bound is needed). A full
+    /// pool REFUSES typed (the ring is NOT spawned, the state is
+    /// otherwise untouched) — never a silent drop.
     pub fn observe_death(&mut self, position: [f32; 3]) -> Option<RippleSpawnOverflow> {
         self.deaths_since_ring += 1;
         if self.deaths_since_ring < self.policy.decimation {
@@ -407,17 +408,36 @@ mod tests {
     }
 
     /// The DEMO's rain policy (corner_weather::RAIN_POLICY,
-    /// verbatim): the campaign fixture's numbers.
+    /// verbatim — the finding-12 corrective's numbers): the world
+    /// receiver at street level, the 4 m band, and the
+    /// [1.65, 2.15] lifetime that carries every street-level drop
+    /// to the ground (see corner_weather's RAIN_POLICY derivation).
     fn demo_rain_policy() -> RainPolicy {
         RainPolicy {
             full_rate: 480.0,
-            band_height: 12.0,
+            band_height: 4.0,
             fall_speed: 9.0,
             lateral_jitter: 0.6,
             vertical_jitter: 0.15,
-            lifetime: [0.9, 1.4],
+            lifetime: [1.65, 2.15],
             gravity: 9.81,
             drag_factor: 0.982,
+            receiver_y: 0.0,
+        }
+    }
+
+    /// The DEMO's ripple policy (corner_weather::RIPPLE_POLICY,
+    /// verbatim): the finding-12 re-derivation's decimation 320 —
+    /// every street-level drop now lands (480 kill deaths/s), so
+    /// the ring births gate to 480/320 = 1.5/s, the same visible
+    /// density the owner walked, 8.5x headroom under the pool.
+    fn demo_ripple_policy() -> RipplePolicy {
+        RipplePolicy {
+            lifetime: 2.5,
+            speed: 0.8,
+            width: 0.35,
+            amplitude: 1.0,
+            decimation: 320,
         }
     }
 
@@ -426,20 +446,20 @@ mod tests {
     /// seed 0xDEADBEEF, `Weather::rain(1.0)`, RAIN_POLICY's
     /// constants, and the quantized listener volume at eye
     /// [-5.0, 1.7, 13.0] — derived: qx = round(-5/4)*4 = -4,
-    /// qz = round(13/4)*4 = 12, half-extent 20, the 12 m band above
-    /// the eye — the box [-24.0, 1.7, -8.0] to [16.0, 13.7, 32.0]
-    /// (12 + 20 = 32; the stage-1 fixture's 28.0 was an arithmetic
-    /// slip in the derivation write-up — the corrective re-pins the
-    /// digest below for the true box; the kill counts are
-    /// UNAFFECTED, kills are y-dynamics only — the RainLayer's
-    /// warm window measured the same 5 on both boxes). Through
+    /// qz = round(13/4)*4 = 12, half-extent 20, the observed
+    /// column 8 m above the eye — the box [-24.0, 1.7, -8.0] to
+    /// [16.0, 9.7, 32.0] (12 + 20 = 32; the stage-1 fixture's 28.0
+    /// was an arithmetic slip in the derivation write-up — an
+    /// earlier corrective re-pinned the digest for the true box;
+    /// the z draws are unchanged here). Through
     /// `rain_emitter_config` the band rides the observed
-    /// ceiling (spawn y in [13.7, 25.7]) and the kill plane sits at
-    /// the observed floor (y = 1.7).
+    /// ceiling (spawn y in [9.7, 13.7]) and the kill plane sits at
+    /// the WORLD RECEIVER (y = 0 — street level, finding 12's
+    /// separation: never the observed floor at 1.7).
     fn demo_rain_emitter() -> Emitter {
         let observed = SpawnVolume {
             min: [-24.0, 1.7, -8.0],
-            max: [16.0, 13.7, 32.0],
+            max: [16.0, 9.7, 32.0],
         };
         let config = rain_emitter_config(
             Weather::rain(1.0),
@@ -1035,7 +1055,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 emitter: demo_rain_emitter(),
-                field: RippleField::new(ripple_policy()).expect("the policy validates"),
+                field: RippleField::new(demo_ripple_policy()).expect("the policy validates"),
                 kill_deaths: 0,
             }
         }
@@ -1081,9 +1101,10 @@ mod tests {
     /// observed into the field — double-run from scratch: identical
     /// per-tick reports (emitter AND field) and identical field
     /// digests at every 60th campaign tick. The kill-death count
-    /// matches the MEASURED actual: exactly 18 over the whole 732
-    /// ticks (measured 2026-11-25 by replicating the RainLayer
-    /// campaign — 18 kill deaths vs 5286 lifetime deaths; a
+    /// matches the MEASURED actual (the finding-12 policy
+    /// corrective re-measured it: every street-level drop now
+    /// LANDS, so the kill deaths are the spawn count minus the
+    /// final live pool, not the old design's 18-vs-5286 split; a
     /// different number is a STOP-and-investigate, never a re-pin).
     #[test]
     fn fixed_seed_campaign_deterministic() {
@@ -1111,17 +1132,33 @@ mod tests {
                 );
             }
         }
+        println!(
+            "measured kill deaths over 732 ticks: {} (a) / {} (b), final live rings {}",
+            run_a.kill_deaths,
+            run_b.kill_deaths,
+            run_a.field.active_count()
+        );
         assert_eq!(
-            run_a.kill_deaths, 18,
+            run_a.kill_deaths, MEASURED_CAMPAIGN_KILL_DEATHS,
             "the MEASURED kill-death count over the whole 732 ticks"
         );
-        assert_eq!(run_b.kill_deaths, 18, "the double-run agrees");
+        assert_eq!(
+            run_b.kill_deaths, MEASURED_CAMPAIGN_KILL_DEATHS,
+            "the double-run agrees"
+        );
         assert_eq!(
             run_a.field.active_count(),
             run_b.field.active_count(),
             "the double-run's final pools agree"
         );
     }
+
+    /// The measured kill-death actual for the 132 + 600 campaign
+    /// under the finding-12 policy (every street-level drop lands;
+    /// 5227 of the 5856 spawns — the remainder is the final live
+    /// pool plus the warm ramp's in-flight drops; see the digest
+    /// pin below for the re-pin history).
+    const MEASURED_CAMPAIGN_KILL_DEATHS: u64 = 5_227;
 
     /// THE DIGEST PIN: the same campaign (the 132-tick warm start,
     /// then the 600-tick campaign), the FIELD folded at every 60th
@@ -1138,17 +1175,24 @@ mod tests {
             let (tick_report, ripple_report) = run.step(dt);
             assert_eq!(
                 tick_report.overflow, None,
-                "tick {t}: the particle pool never overflows (480 x 1.15 = 552 < 1024)"
+                "tick {t}: the particle pool never overflows (480 x mean residence 1.3 s \
+                 = 624 at the street eyes, lifetime-capped at 480 x 1.9 = 912 when \
+                 climbing — both under the 1024 bound)"
             );
             assert_eq!(
                 ripple_report.refused, 0,
-                "tick {t}: the ripple pool never refuses (8.5x headroom)"
+                "tick {t}: the ripple pool never refuses (decimation 320: 1.5 rings/s \
+                 x 2.5 s ~ 3.8 live, 8.5x headroom)"
             );
             if t > 132 && (t - 132) % 60 == 0 {
                 run.fold(&mut hasher);
             }
         }
-        assert_eq!(run.kill_deaths, 18, "the measured kill-death count");
+        assert_eq!(
+            run.kill_deaths, MEASURED_CAMPAIGN_KILL_DEATHS,
+            "the measured kill-death count"
+        );
+        println!("measured ripple campaign digest: {}", hasher.finish());
         assert_eq!(
             hasher.finish(),
             PINNED_CAMPAIGN_DIGEST,
@@ -1157,20 +1201,21 @@ mod tests {
     }
 
     /// The measured-actual campaign digest (the fixed campaign's
-    /// field state, folded at campaign ticks 60, 120, ..., 600 —
-    /// measured 2026-11-25, cross-platform by f32 determinism).
-    /// RE-PINNED with cause (the z-extent corrective): the stage-1
-    /// fixture's observed box carried an arithmetic slip in the
-    /// derivation write-up (max z 28.0; the true quantized box is
-    /// max z 32.0 — qz + 20). The z draws change, so the digest
-    /// moved from 8954201978366776380 to the value below; the kill
-    /// counts are UNAFFECTED (kills are y-dynamics only — the
-    /// RainLayer's warm window measured the same 5 kill deaths on
-    /// both boxes), and the fixture now IS the demo's exact emitter
-    /// (the RainLayer's own campaign digest — engine-slice's
-    /// ripple_campaign_digest_pin — pins the SAME u64: one
-    /// campaign, two proofs, one digest).
-    const PINNED_CAMPAIGN_DIGEST: u64 = 6_501_874_864_611_424_535;
+    /// field state, folded at campaign ticks 60, 120, ..., 600).
+    /// RE-PINNED with cause (the finding-12 rain-contact
+    /// corrective, 2026-11-25): the receiver plane moved from the
+    /// observed floor (eye height 1.7) to the WORLD receiver
+    /// (street level), the band collapsed from 12 m to the
+    /// compatible 4 m over the 8 m observed column, and the
+    /// lifetime grew to carry every drop to the ground — so the
+    /// impact XZ (now the interpolated plane crossing) and the
+    /// ring population (decimation 320 over 5227 real landings)
+    /// both moved, and the digest moved from
+    /// 6_501_874_864_611_424_535 to the value below (the old pin's
+    /// history stays in git). The fixture remains the demo's exact
+    /// emitter (engine-slice's ripple_campaign_digest_pin pins the
+    /// SAME u64: one campaign, two proofs, one digest).
+    const PINNED_CAMPAIGN_DIGEST: u64 = 13_157_441_224_951_405_170;
 
     /// Reset replays identically (the particle reset pattern): drive
     /// 300 ticks (folding every 60th), reset BOTH halves, replay in
