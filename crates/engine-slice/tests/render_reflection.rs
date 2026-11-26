@@ -2451,6 +2451,8 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
     // captures, with the CPU oracle only narrowing the band.
     let (width, height) = (size.0 as usize, size.1 as usize);
     let mut best = None;
+    // The near-miss tracker's accumulator: (x, y, contrast, wet, b).
+    let mut near_miss: Option<(u32, u32, i32, i32, f32)> = None;
     for y in ((height * 45 / 100)..height).step_by(2) {
         for x in (0..width).step_by(2) {
             let ray = pixel_ray(forward, right, up, x as u32, y as u32, size);
@@ -2477,6 +2479,16 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
                 .max_by_key(|&(_, diff)| diff)
                 .unwrap();
             let wet_value = w_pixel[channel] as i32;
+            // The near-miss tracker (the R3 round-2 corrective): the
+            // best ground pixel in the Schlick band REGARDLESS of the
+            // contrast/wet-value floors, so a platform whose rendering
+            // sits below the provisional floors (Ubuntu lavapipe
+            // measured none qualifying; Windows passed) FAILS WITH ITS
+            // OWN ACTUALS in the message - the re-pin discipline's
+            // measurement half, never a silent qualification collapse.
+            if near_miss.is_none_or(|(_, _, nm_contrast, _, _)| contrast > nm_contrast) {
+                near_miss = Some((x as u32, y as u32, contrast, wet_value, b));
+            }
             if contrast >= 50
                 && wet_value >= WET_PATCH_FLOOR
                 && best.is_none_or(|(_, _, best_contrast, _)| contrast > best_contrast)
@@ -2486,10 +2498,13 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
         }
     }
     let Some((p0_x, p0_y, p0_contrast, _)) = best else {
+        let (nm_x, nm_y, nm_contrast, nm_wet, nm_b) =
+            near_miss.expect("the lower frame has Schlick-band ground pixels");
         panic!(
             "PROVISIONAL gate: no high-contrast reflective ground pixel qualified in the \
-             lower frame (re-measure on lavapipe and re-pin the W-contrast/wet-value \
-             floors from this run's captures)"
+             lower frame. The best near-miss: ({nm_x}, {nm_y}) contrast {nm_contrast}/255 \
+             (floor 50), wet value {nm_wet}/255 (floor {WET_PATCH_FLOOR}), Schlick b \
+             {nm_b:.3} - re-pin the floors from THIS platform's actuals"
         );
     };
     println!(
