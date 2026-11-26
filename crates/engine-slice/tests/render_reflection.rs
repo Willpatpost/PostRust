@@ -2519,16 +2519,21 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
     // The streak: hung in the air on P0's view ray at 62% of the
     // ground distance (in front of the ground - LESS depth, the
     // depth test passes), the module's own billboard turn for this
-    // pose's yaw, a witness scale that spans several pixels, and an
-    // ADAPTIVE tint scaled to the placement pixel's MEASURED wet
-    // value (the R3 round-4 corrective: the sign-flip premise needs
-    // the streak's source color UNDER the patch's wet value -
-    // Windows lavapipe renders this vantage at wet >= 165 where the
-    // original fixed 0.50-0.57 tint sat safely under it, Ubuntu
-    // measures 44 where the fixed tint would sit OVER it and INVERT
-    // the flip. The tint now rides at ~70% of W on every platform's
-    // rendering - the correct order dims by ~0.3 x W x alpha and
-    // the defect order re-blends the reflection over the streak and
+    // pose's yaw, a witness scale that spans several pixels (10 -
+    // the R3 round-6 corrective: at 6 the texture's bright line
+    // fell to ~1 screen pixel, which the Ubuntu rasterizer can
+    // miss or offset outside the CPU-projected footprint while
+    // Windows's hits; 10 makes the line 2-3 pixels - robust to a
+    // rasterizer's coverage rounding), and an ADAPTIVE tint scaled
+    // to the placement pixel's MEASURED wet value (the R3 round-4
+    // corrective: the sign-flip premise needs the streak's source
+    // color UNDER the patch's wet value - Windows lavapipe renders
+    // this vantage at wet >= 165 where the original fixed
+    // 0.50-0.57 tint sat safely under it, Ubuntu measures 44 where
+    // the fixed tint would sit OVER it and INVERT the flip. The
+    // tint now rides at ~70% of W on every platform's rendering -
+    // the correct order dims by ~0.3 x W x alpha_eff and the
+    // defect order re-blends the reflection over the streak and
     // brightens past it, wherever the patch is measurable at all).
     let tint_base = ((p0_wet as f32 / 255.0) * 0.7).clamp(0.08, 0.57);
     let ray = pixel_ray(forward, right, up, p0_x, p0_y, size);
@@ -2544,7 +2549,7 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
         transform: InstanceTransform {
             pos: streak_pos,
             turn: yaw_to_turn(yaw),
-            scale: 6.0,
+            scale: 10.0,
         },
         tint: [tint_base, tint_base * 1.06, tint_base * 1.14],
         alpha: RAIN_ALPHA,
@@ -2575,20 +2580,28 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
 
     // The witness pixel: the footprint pixel where the streak is
     // PRESENT over the dry ground (its texture alpha is real) and
-    // the wet patch is bright — selected by MEASUREMENT, so no
-    // texel oracle is needed.
+    // the wet patch is bright — selected by MEASUREMENT. The scan
+    // window is the CPU-projected footprint EXPANDED by 4 pixels
+    // per side (the round-6 corrective: the GPU raster can sit a
+    // pixel or two off the CPU projection - a coverage rounding
+    // difference between rasterizers, not a determinism defect -
+    // and the streak's thin line must not escape the window), and
+    // the presence is the ABSOLUTE change (a streak whose adaptive
+    // source sits UNDER bright ground DIMS it - that is still
+    // presence; the bright-over-dark premise only holds where the
+    // ground is darker than the source).
     let mut witness = None;
     // The near-miss tracker (the R3 round-5 corrective): the
     // maximum-presence footprint pixel REGARDLESS of the floors,
     // so a platform below them fails WITH ITS OWN ACTUALS.
     let mut witness_nm: Option<(u32, u32, i32, i32, i32)> = None;
-    for y in footprint.min_y..=footprint.max_y {
-        for x in footprint.min_x..=footprint.max_x {
+    for y in footprint.min_y.saturating_sub(4)..=(footprint.max_y + 4).min(height as u32 - 1) {
+        for x in footprint.min_x.saturating_sub(4)..=(footprint.max_x + 4).min(width as u32 - 1) {
             let w_pixel = wet.pixel_rgba(x, y);
             let d_pixel = dry.pixel_rgba(x, y);
             let s_pixel = streak_dry.pixel_rgba(x, y);
             let (channel, presence) = (0..3)
-                .map(|c| (c, s_pixel[c] as i32 - d_pixel[c] as i32))
+                .map(|c| (c, (s_pixel[c] as i32 - d_pixel[c] as i32).abs()))
                 .max_by_key(|&(_, diff)| diff)
                 .unwrap();
             let wet_value = w_pixel[channel] as i32;
@@ -2640,10 +2653,12 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
          {w_streak_wet}) — the defect order re-blends the reflection over it and \
          brightens (the sign flip is the discriminator)"
     );
-    // The streak is genuinely bright over the dark ground (the
-    // audit's known-alpha bright streak, present on the dry patch).
+    // The streak is genuinely present over the dry ground (the
+    // audit's known-alpha streak: present means a MEASURABLE
+    // change - with the adaptive tint the streak may sit under
+    // bright ground and DIM it, which is still presence).
     assert!(
-        w_streak_dry - w_dry >= 2,
+        (w_streak_dry - w_dry).abs() >= 2,
         "the streak is present over the dry ground ({w_dry} -> {w_streak_dry})"
     );
     // The ordered blend's attenuation bound: the dimming cannot
