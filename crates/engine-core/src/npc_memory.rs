@@ -13,6 +13,19 @@
 //! width little-endian at fixed offsets (the `npc_perception` trace pattern
 //! extended).
 //!
+//! # THE ONE RETENTION ORDER (the Era-2 audit's finding 3 corrective)
+//! "Newest" for episodic retention is CANONICAL EVENT-KEY ORDER — the
+//! largest `budget` `MemoryKey`s (event id leading), ONE order maintained
+//! identically by BOTH materialization paths: the live bounded view
+//! inserts each captured episodic entry at its key-ordered position and
+//! evicts the smallest key at the budget, and the activation rebuild
+//! folds `witness_records`' canonical key order through the same
+//! retention. A dormancy round trip (or an active-to-active tier
+//! transition) therefore cannot change which episode a witness
+//! remembers: execution order, reverse event ids, equal ticks and
+//! held-events-released-late all collapse to the one canonical order,
+//! with the event id as the free deterministic equal-tick tie-breaker.
+//!
 //! # THE CAPTURE DISCIPLINE
 //! Capture-at-production: every produced record enters the ledger at the
 //! event itself, so the deactivation's discard of the live representation
@@ -32,8 +45,8 @@
 
 use crate::clock::Tick;
 use crate::fingerprint::Fingerprinter;
-use crate::npc_execution::retain_trace;
 use crate::npc_perception::PerceptionTrace;
+use crate::wire::{Decoder, SaveError};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The record kind tag (the key's third field).
@@ -99,6 +112,27 @@ impl MemoryKey {
         bytes[12] = self.kind.tag();
         bytes
     }
+
+    /// The strict decode of [`Self::canonical_bytes`] (the recovery
+    /// path's reader — fixed offsets, no trailing bytes, an unknown
+    /// kind tag refused, never guessed).
+    pub fn decode(bytes: &[u8]) -> Result<Self, SaveError> {
+        const SECTION: &str = "memory-key";
+        let mut dec = Decoder::new(bytes);
+        let event = dec.read_u64()?;
+        let witness = dec.read_u32()?;
+        let tag = dec.read_u8()?;
+        let kind = MemoryKind::from_tag(tag).ok_or(SaveError::Enum {
+            section: SECTION,
+            discriminant: u64::from(tag),
+        })?;
+        dec.finish()?;
+        Ok(MemoryKey {
+            event,
+            witness,
+            kind,
+        })
+    }
 }
 
 /// One captured memory delta — design §5.3's three writes.
@@ -161,6 +195,18 @@ impl MemoryDelta {
             },
         }
     }
+
+    /// The strict decode of [`Self::canonical_bytes`] (the recovery
+    /// path's reader): the kind tag first, then the kind's fixed-width
+    /// little-endian fields in the canonical order, no trailing bytes.
+    /// The two's-complement i32 fields decode through `u32 as i32`
+    /// (exact, no transcendentals, no endianness ambiguity).
+    pub fn decode(bytes: &[u8]) -> Result<Self, SaveError> {
+        let mut dec = Decoder::new(bytes);
+        let delta = decode_delta(&mut dec)?;
+        dec.finish()?;
+        Ok(delta)
+    }
 }
 
 /// One ledger record: the key, the delta, the logical tick of capture.
@@ -195,6 +241,65 @@ impl MemoryRecord {
         }
         Ok(())
     }
+
+    /// The strict decode of [`Self::canonical_bytes`] (the recovery
+    /// path's reader): the key's fixed offsets, the tick, then the
+    /// delta — validated, no trailing bytes. A kind or observer
+    /// mismatch is an integrity refusal, never a reconstruction.
+    pub fn decode(bytes: &[u8]) -> Result<Self, SaveError> {
+        const SECTION: &str = "memory-record";
+        let mut dec = Decoder::new(bytes);
+        let key = MemoryKey {
+            event: dec.read_u64()?,
+            witness: dec.read_u32()?,
+            kind: {
+                let tag = dec.read_u8()?;
+                MemoryKind::from_tag(tag).ok_or(SaveError::Enum {
+                    section: SECTION,
+                    discriminant: u64::from(tag),
+                })?
+            },
+        };
+        let tick = dec.read_tick()?;
+        let delta = decode_delta(&mut dec)?;
+        dec.finish()?;
+        let record = MemoryRecord { key, delta, tick };
+        record
+            .validate()
+            .map_err(|_| SaveError::Integrity("memory-record/validate"))?;
+        Ok(record)
+    }
+}
+
+/// The delta fields off an in-progress decoder (the shared reader of
+/// [`MemoryDelta::decode`] and [`MemoryRecord::decode`] — one field
+/// order, one place).
+fn decode_delta(dec: &mut Decoder<'_>) -> Result<MemoryDelta, SaveError> {
+    const SECTION: &str = "memory-delta";
+    let tag = dec.read_u8()?;
+    let delta = match MemoryKind::from_tag(tag).ok_or(SaveError::Enum {
+        section: SECTION,
+        discriminant: u64::from(tag),
+    })? {
+        MemoryKind::Episodic => MemoryDelta::Episodic {
+            trace: PerceptionTrace {
+                observer: dec.read_u32()?,
+                perceived: dec.read_u32()?,
+                tick: dec.read_tick()?,
+                class: dec.read_u32()?,
+            },
+        },
+        MemoryKind::Relationship => MemoryDelta::Relationship {
+            actor: dec.read_u32()?,
+            delta: dec.read_u32()? as i32,
+        },
+        MemoryKind::ReputationCandidate => MemoryDelta::ReputationCandidate {
+            actor: dec.read_u32()?,
+            class: dec.read_u32()?,
+            weight: dec.read_u32()? as i32,
+        },
+    };
+    Ok(delta)
 }
 
 /// Error variants for memory lane operations.
@@ -299,13 +404,58 @@ impl CandidatePhase {
     }
 }
 
+/// One retained episodic entry in a witness's live bounded view: the
+/// record's EVENT ID (the retention order's sort key — the witness and
+/// kind are fixed inside one witness's view, so the event id alone IS
+/// the canonical `MemoryKey` order here) beside its trace. The entry
+/// exists because a bare `PerceptionTrace` does not carry the event id
+/// — the one retention order needs the key visible in the live view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpisodicMemory {
+    /// The record's event id (the sort key).
+    pub event: u64,
+    /// The witnessed trace (the payload).
+    pub trace: PerceptionTrace,
+}
+
 /// One witness's live memory — the REPRESENTATION (discarded at
 /// deactivation, rebuilt from the ledger at activation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WitnessMemory {
-    episodic: Vec<PerceptionTrace>,
+    episodic: Vec<EpisodicMemory>,
     relationships: BTreeMap<u32, i64>,
     candidates: BTreeMap<MemoryKey, CandidateRecord>,
+}
+
+/// THE ONE RETENTION ORDER'S LIVE HALF: insert the captured episodic
+/// entry at its event-ordered position and evict the SMALLEST event id
+/// at the budget — the live bounded view maintains canonical event-key
+/// order, exactly the order the activation rebuild folds (the module's
+/// determinism contract; the audit's finding 3 corrective). A budget of
+/// zero retains nothing; a duplicate event id is a no-op
+/// (defense-in-depth — the ledger's capture discipline refuses
+/// duplicates before `apply` ever runs).
+fn retain_episodic(
+    memory: &mut Vec<EpisodicMemory>,
+    event: u64,
+    trace: PerceptionTrace,
+    budget: usize,
+) {
+    if budget == 0 {
+        return;
+    }
+    match memory.binary_search_by(|entry| entry.event.cmp(&event)) {
+        Ok(_) => {}
+        Err(pos) => {
+            memory.insert(pos, EpisodicMemory { event, trace });
+            // Over budget: evict from the FRONT — the smallest event id
+            // (a newly captured smallest key that does not fit the
+            // budget evicts ITSELF here, never a larger key).
+            while memory.len() > budget {
+                memory.remove(0);
+            }
+        }
+    }
 }
 
 impl WitnessMemory {
@@ -329,7 +479,12 @@ impl WitnessMemory {
     ) -> Result<(), MemoryLaneError> {
         match &record.delta {
             MemoryDelta::Episodic { trace } => {
-                retain_trace(&mut self.episodic, *trace, episodic_budget);
+                retain_episodic(
+                    &mut self.episodic,
+                    record.key.event,
+                    *trace,
+                    episodic_budget,
+                );
             }
             MemoryDelta::Relationship { actor, delta } => {
                 let current = self.relationships.entry(*actor).or_insert(0i64);
@@ -384,9 +539,10 @@ impl WitnessMemory {
         }
     }
 
-    /// Read-only access to episodic traces.
+    /// Read-only access to the retained episodic entries, in canonical
+    /// event-key order (the one retention order — ascending event id).
     #[must_use]
-    pub fn episodic(&self) -> &[PerceptionTrace] {
+    pub fn episodic(&self) -> &[EpisodicMemory] {
         &self.episodic
     }
 
@@ -403,16 +559,20 @@ impl WitnessMemory {
     }
 
     /// FNV-1a digest over:
-    /// - episodic traces' canonical_bytes in order
+    /// - episodic traces' canonical_bytes in canonical event order
     /// - each relationship (actor LE, delta LE) in map order
     /// - each candidate (key bytes, actor, class, weight, phase byte) in map order
+    ///
+    /// (The episodic entries' event ids are already covered by the
+    /// LEDGER digest; the witness digest pins the retained view's
+    /// traces and their order.)
     #[must_use]
     pub fn digest(&self) -> u64 {
         let mut hasher = Fingerprinter::new();
 
-        // Episodic traces
-        for trace in &self.episodic {
-            hasher.write_bytes(&trace.canonical_bytes());
+        // Episodic traces in canonical event order
+        for entry in &self.episodic {
+            hasher.write_bytes(&entry.trace.canonical_bytes());
         }
 
         // Relationships in BTreeMap order
@@ -556,6 +716,14 @@ impl MemoryLedger {
     #[must_use]
     pub fn is_captured(&self, key: &MemoryKey) -> bool {
         self.pending.contains_key(key) || self.confirmed.contains_key(key)
+    }
+
+    /// Check if a key is captured in the CONFIRMED phase (the recovery
+    /// comparison's per-key phase predicate — `false` for pending and
+    /// for absent alike, distinguishing the two needs `is_captured`).
+    #[must_use]
+    pub fn is_confirmed(&self, key: &MemoryKey) -> bool {
+        self.confirmed.contains_key(key)
     }
 
     /// FNV-1a digest over every record (pending first then confirmed, each
@@ -727,6 +895,52 @@ impl MemoryLane {
         self.active.insert(witness);
         self.live.insert(witness, fresh);
         Ok(count)
+    }
+
+    /// The durable classification decision for one key, if any (the
+    /// journal sync and the recovery comparison's reader).
+    #[must_use]
+    pub fn classification(&self, key: &MemoryKey) -> Option<bool> {
+        self.classifications.get(key).copied()
+    }
+
+    /// One witness's durable classification decisions in canonical key
+    /// order — the journal's classification-sync section (the
+    /// applicable classification history carried with each episode).
+    #[must_use]
+    pub fn witness_classifications(&self, witness: u32) -> Vec<(MemoryKey, bool)> {
+        self.classifications
+            .iter()
+            .filter(|(key, _)| key.witness == witness)
+            .map(|(key, &decision)| (*key, decision))
+            .collect()
+    }
+
+    /// THE SESSION-REOPEN CAPTURE (the recovery path): capture into the
+    /// ledger and hold the witness DORMANT — counted, never
+    /// materialized (the materialization is the [`Self::activate`]
+    /// rebuild, exactly the captured-before-discard discipline a fresh
+    /// session starts from). THE EXACTLY-ONCE GUARD is the ledger's
+    /// own: a duplicate key is the matching `Already*` no-op.
+    pub fn capture_dormant(
+        &mut self,
+        record: MemoryRecord,
+    ) -> Result<CaptureOutcome, MemoryLaneError> {
+        let witness = record.key.witness;
+        match self.ledger.capture(record)? {
+            CaptureOutcome::Captured => {
+                let count = self.produced.entry(witness).or_insert(0u64);
+                *count = count
+                    .checked_add(1)
+                    .ok_or(MemoryLaneError::ArithmeticOverflow)?;
+                self.active.remove(&witness);
+                self.dormant.insert(witness);
+                Ok(CaptureOutcome::Captured)
+            }
+            already @ (CaptureOutcome::AlreadyPending | CaptureOutcome::AlreadyConfirmed) => {
+                Ok(already)
+            }
+        }
     }
 
     /// THE DURABLE CLASSIFICATION: record the decision AND apply it to
@@ -1373,8 +1587,8 @@ mod tests {
         // Live holds last 2 (oldest evicted)
         let live = lane.live(witness).unwrap();
         assert_eq!(live.episodic().len(), 2);
-        assert_eq!(live.episodic()[0].perceived, 1);
-        assert_eq!(live.episodic()[1].perceived, 2);
+        assert_eq!(live.episodic()[0].trace.perceived, 1);
+        assert_eq!(live.episodic()[1].trace.perceived, 2);
 
         // Deactivate + activate: rebuild has same last 2
         lane.deactivate(witness);
@@ -1383,8 +1597,8 @@ mod tests {
 
         let live = lane.live(witness).unwrap();
         assert_eq!(live.episodic().len(), 2);
-        assert_eq!(live.episodic()[0].perceived, 1);
-        assert_eq!(live.episodic()[1].perceived, 2);
+        assert_eq!(live.episodic()[0].trace.perceived, 1);
+        assert_eq!(live.episodic()[1].trace.perceived, 2);
 
         // Conservation: produced = pending + confirmed
         // We captured 3 records, none confirmed, so all 3 are pending
@@ -1940,5 +2154,225 @@ mod tests {
         assert_eq!(lane.activate(w1, 16).unwrap(), 3);
 
         lane
+    }
+
+    /// Test 19: THE CANONICAL DECODE ROUND-TRIP — every kind's
+    /// `canonical_bytes` decodes back to the identical record, and the
+    /// strict reader refuses trailing bytes and a foreign kind tag
+    /// (the recovery path's reader, pinned at the unit boundary).
+    #[test]
+    fn canonical_bytes_decode_round_trips_and_refuses() {
+        let records = [
+            make_record(
+                0x0807_0605_0403_0201,
+                0x0C0B_0A09,
+                MemoryKind::Episodic,
+                make_episodic(0x0C0B_0A09, 0x0706_0504, TEST_TICK, 0x0A0B_0C0D),
+                TEST_TICK,
+            ),
+            make_record(
+                2,
+                7,
+                MemoryKind::Relationship,
+                make_relationship(7, 0x0302_0100, -0x0706_0504i32),
+                TEST_TICK,
+            ),
+            make_record(
+                3,
+                7,
+                MemoryKind::ReputationCandidate,
+                make_candidate(7, 0x0302_0100, 0x0706_0504, -0x0706_0504i32),
+                TEST_TICK,
+            ),
+        ];
+        for record in &records {
+            let bytes = record.canonical_bytes();
+            assert_eq!(
+                &MemoryRecord::decode(&bytes).unwrap(),
+                record,
+                "the round-trip"
+            );
+            // Trailing bytes are corruption, never noise.
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert!(MemoryRecord::decode(&trailing).is_err(), "trailing refused");
+        }
+        // A foreign kind tag is refused, never guessed.
+        let mut foreign = records[0].canonical_bytes();
+        foreign[12] = 0x7F;
+        assert!(
+            MemoryRecord::decode(&foreign).is_err(),
+            "a foreign kind tag refused"
+        );
+        // A truncated buffer is refused.
+        assert!(
+            MemoryRecord::decode(&records[0].canonical_bytes()[..5]).is_err(),
+            "truncated refused"
+        );
+    }
+
+    /// Test 20: THE ONE RETENTION ORDER (the audit's finding 3
+    /// corrective, at the unit boundary): the live bounded view
+    /// maintains canonical event-key order, so a dormancy round trip
+    /// cannot change which episode a witness remembers — reverse
+    /// event ids, equal ticks and duplicate delivery all hold the one
+    /// order at budgets one and two.
+    #[test]
+    fn the_one_retention_order_survives_the_dormancy_round_trip() {
+        for budget in [1usize, 2] {
+            // REVERSE IDS: event 20 executes first, event 10 second
+            // (the execution stream may deliver an unseen lower id).
+            // The canonical order keeps 20 at budget one — the LARGEST
+            // key, not the last execution.
+            let mut lane = MemoryLane::new();
+            let witness = 7u32;
+            let e20 = make_record(
+                20,
+                witness,
+                MemoryKind::Episodic,
+                make_episodic(witness, 1, Tick(5), 1),
+                Tick(5),
+            );
+            let e10 = make_record(
+                10,
+                witness,
+                MemoryKind::Episodic,
+                make_episodic(witness, 2, Tick(6), 1),
+                Tick(6),
+            );
+            lane.capture_and_apply(e20, budget).unwrap();
+            lane.capture_and_apply(e10, budget).unwrap();
+            let live_before: Vec<EpisodicMemory> = lane.live(witness).unwrap().episodic().to_vec();
+            assert_eq!(
+                live_before.iter().map(|e| e.event).collect::<Vec<_>>(),
+                if budget == 1 { vec![20] } else { vec![10, 20] },
+                "budget {budget}: the live view is in canonical key order"
+            );
+            // The duplicate delivery of event 10 changes nothing.
+            lane.capture_and_apply(e10, budget).unwrap();
+            assert_eq!(
+                lane.live(witness).unwrap().episodic(),
+                live_before.as_slice(),
+                "budget {budget}: the duplicate delivery is a no-op"
+            );
+            // The round trip rebuilds the IDENTICAL retained set.
+            lane.deactivate(witness);
+            lane.activate(witness, budget).unwrap();
+            assert_eq!(
+                lane.live(witness).unwrap().episodic(),
+                live_before.as_slice(),
+                "budget {budget}: reverse ids — the rebuild keeps the same episode"
+            );
+
+            // EQUAL TICKS: events 31 and 30 both at tick 7, delivered
+            // 31 first. The event id is the deterministic tie-breaker
+            // in BOTH paths.
+            let mut lane = MemoryLane::new();
+            let e31 = make_record(
+                31,
+                witness,
+                MemoryKind::Episodic,
+                make_episodic(witness, 3, Tick(7), 1),
+                Tick(7),
+            );
+            let e30 = make_record(
+                30,
+                witness,
+                MemoryKind::Episodic,
+                make_episodic(witness, 4, Tick(7), 1),
+                Tick(7),
+            );
+            lane.capture_and_apply(e31, budget).unwrap();
+            lane.capture_and_apply(e30, budget).unwrap();
+            let live_before: Vec<EpisodicMemory> = lane.live(witness).unwrap().episodic().to_vec();
+            assert_eq!(
+                live_before.iter().map(|e| e.event).collect::<Vec<_>>(),
+                if budget == 1 { vec![31] } else { vec![30, 31] },
+                "budget {budget}: equal ticks tie-break by event id"
+            );
+            lane.deactivate(witness);
+            lane.activate(witness, budget).unwrap();
+            assert_eq!(
+                lane.live(witness).unwrap().episodic(),
+                live_before.as_slice(),
+                "budget {budget}: equal ticks — the rebuild keeps the same episode"
+            );
+
+            // THE HELD EVENT RELEASED LATE: event 5 executes at tick
+            // 100, long after event 50 at tick 50. Execution-time
+            // retention would keep 5; the canonical order keeps 50 in
+            // BOTH paths — the divergence this gate pins away.
+            let mut lane = MemoryLane::new();
+            let e50 = make_record(
+                50,
+                witness,
+                MemoryKind::Episodic,
+                make_episodic(witness, 5, Tick(50), 1),
+                Tick(50),
+            );
+            let e5 = make_record(
+                5,
+                witness,
+                MemoryKind::Episodic,
+                make_episodic(witness, 6, Tick(100), 1),
+                Tick(100),
+            );
+            lane.capture_and_apply(e50, budget).unwrap();
+            lane.capture_and_apply(e5, budget).unwrap();
+            let live_before: Vec<EpisodicMemory> = lane.live(witness).unwrap().episodic().to_vec();
+            assert_eq!(
+                live_before.iter().map(|e| e.event).collect::<Vec<_>>(),
+                if budget == 1 { vec![50] } else { vec![5, 50] },
+                "budget {budget}: the late-held low id is the smallest key"
+            );
+            lane.deactivate(witness);
+            lane.activate(witness, budget).unwrap();
+            assert_eq!(
+                lane.live(witness).unwrap().episodic(),
+                live_before.as_slice(),
+                "budget {budget}: the late release cannot change the remembered episode"
+            );
+        }
+    }
+
+    /// Test 21: the session-reopen capture holds the witness dormant —
+    /// counted in the ledger and conservation, never materialized
+    /// until activate (the recovery path's capture shape).
+    #[test]
+    fn capture_dormant_accumulates_ledger_only() {
+        let mut lane = MemoryLane::new();
+        let witness = 7u32;
+        let r1 = make_record(
+            1,
+            witness,
+            MemoryKind::Episodic,
+            make_episodic(witness, 1, TEST_TICK, 1),
+            TEST_TICK,
+        );
+        let r2 = make_record(
+            2,
+            witness,
+            MemoryKind::Relationship,
+            make_relationship(witness, 1, 5),
+            TEST_TICK,
+        );
+        assert_eq!(lane.capture_dormant(r1).unwrap(), CaptureOutcome::Captured);
+        assert_eq!(lane.capture_dormant(r2).unwrap(), CaptureOutcome::Captured);
+        assert!(
+            lane.is_dormant(witness),
+            "the recovered witness starts dormant"
+        );
+        assert!(lane.live(witness).is_none(), "no silent partial live view");
+        assert_eq!(
+            lane.capture_dormant(r1).unwrap(),
+            CaptureOutcome::AlreadyPending
+        );
+        let (produced, pending, confirmed) = lane.witness_conservation(witness);
+        assert_eq!((produced, pending, confirmed), (2, 2, 0));
+        // The rebuild materializes everything, in the one order.
+        assert_eq!(lane.activate(witness, 16).unwrap(), 2);
+        let live = lane.live(witness).unwrap();
+        assert_eq!(live.episodic().len(), 1);
+        assert_eq!(live.relationships().get(&1), Some(&5));
     }
 }

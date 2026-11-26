@@ -4,18 +4,26 @@
 //! lane, the byte-identical rebuild across deactivate/reactivate
 //! cycles, the composed pending-until-classified reputation, the REAL
 //! pipeline ride (confirmation, the dropped-ack fault, the recovery
-//! read), and THE S6 FUZZ GATE — the design pass §8.4 item 4's "the
-//! S6 fuzz discipline, on the real pipeline" (the S6-lite harness's
-//! op distribution and fault classes, over the real spine, the real
-//! census, and the real CommitPipeline).
+//! read), THE ERA-2 AUDIT'S FINDING 1–3 DECIDING GATES (the
+//! self-sufficient retry with a transient commit failure, the
+//! fresh-world cold reopen comparing individual canonical records,
+//! phases and classified score, and the one retention order through
+//! the composed world's held-event round trip), and THE S6 FUZZ GATE
+//! — the design pass §8.4 item 4's "the S6 fuzz discipline, on the
+//! real pipeline" (the S6-lite harness's op distribution and fault
+//! classes, over the real spine, the real census, and the real
+//! CommitPipeline).
 
 use engine_core::clock::Tick;
 use engine_core::fingerprint::Fingerprinter;
 use engine_core::lod::LodLevel;
-use engine_core::npc_memory::{CaptureOutcome, MemoryKey, MemoryKind, MemoryRecord};
+use engine_core::npc_memory::{
+    CaptureOutcome, EpisodicMemory, MemoryKey, MemoryKind, MemoryRecord,
+};
 use engine_core::spine::Spine;
 use engine_core::spine::World;
 use engine_persist::consequence::ConsequenceId;
+use engine_persist::fault::{FaultAction, FaultControl, FaultPoint};
 use engine_persist::journal::T1Journal;
 use engine_persist::local::LocalFileMedium;
 use engine_persist::medium::{AppendOutcome, CanonicalMedium};
@@ -23,7 +31,8 @@ use engine_persist::pipeline::CommitPipeline;
 use engine_persist::record::RevisionRecord;
 use engine_slice::npc_memory_lane::{
     ENCOUNTER_TABLE, EncounterKind, MemoryCommitBook, MemoryLaneWorld, PLACES, POPULATION,
-    REGION_NPCS, commit_witness_captures, schedule_encounter, set_region_level,
+    REGION_NPCS, commit_witness_captures, recover_memory_lane, schedule_encounter,
+    set_region_level,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -153,15 +162,19 @@ fn witness_census_and_records_known_answers() {
     for witness in [0u32, 1, 2, 3] {
         let live = world.lane.live(witness).expect("the witness is active");
         assert_eq!(live.episodic().len(), 1, "one episodic record per witness");
-        assert_eq!(live.episodic()[0].perceived, actor, "the authored actor");
-        assert_eq!(live.episodic()[0].observer, witness);
         assert_eq!(
-            live.episodic()[0].tick,
+            live.episodic()[0].trace.perceived,
+            actor,
+            "the authored actor"
+        );
+        assert_eq!(live.episodic()[0].trace.observer, witness);
+        assert_eq!(
+            live.episodic()[0].trace.tick,
             Tick(5),
             "the logical execution tick"
         );
         assert_eq!(
-            live.episodic()[0].class,
+            live.episodic()[0].trace.class,
             u32::from(EncounterKind::Greeting.tag())
         );
         assert!(
@@ -577,6 +590,352 @@ fn the_pipeline_ride_confirms_and_recovers() {
     assert!(confirmed.contains(&id0) && confirmed.contains(&id1));
 }
 
+/// THE FINDING 1 DECIDING GATE (the audit's own script): the last
+/// unacknowledged capture retries ON ITS OWN — the same witness after
+/// a withheld submission, with ZERO new events, then a transient
+/// commit failure retried again in a FRESH session over the same
+/// durable state. Exactly one durable consequence per episode (never
+/// one per retry), all original keys confirmed, unchanged reputation.
+#[test]
+fn the_last_unacknowledged_capture_retries_on_its_own() {
+    let dir = TestDir::new("self-retry");
+    let mut spine = make_spine();
+    let mut pipeline = fresh_pipeline(&dir);
+    let mut book = MemoryCommitBook::default();
+
+    // An Altercation at region 0: witness 0 holds three records.
+    schedule_encounter(&mut spine, 1, EncounterKind::Altercation, 0, 0, Tick(5)).unwrap();
+    spine.run_ticks(5);
+
+    // THE WITHHELD SUBMISSION (the dropped-ack fault): journaled,
+    // claimed, never canonically committed.
+    let keys = commit_witness_captures(&mut spine, &mut pipeline, &mut book, 0, false).unwrap();
+    assert_eq!(
+        keys.len(),
+        3,
+        "the episodic + relationship + candidate keys"
+    );
+    let id0 = ConsequenceId::new(0, 0, 0);
+    assert!(
+        !pipeline.is_confirmed(id0),
+        "the dropped ack is unconfirmed"
+    );
+    assert_eq!(
+        spine.world().lane.witness_conservation(0),
+        (3, 3, 0),
+        "claimed-but-pending in the lane"
+    );
+    let reputation_before = spine.world().lane.reputation_score().unwrap();
+
+    // THE SELF-SUFFICIENT RETRY: the SAME witness, submit = true, ZERO
+    // new events. Under the defective bridge this call returned early
+    // (every key already claimed) and the final episode stayed pending
+    // until some OTHER witness committed fresh keys; the flush half
+    // now drives the canonical commit on its own.
+    let keys = commit_witness_captures(&mut spine, &mut pipeline, &mut book, 0, true).unwrap();
+    assert!(
+        keys.is_empty(),
+        "the retry stages no new episode — it flushes the existing one"
+    );
+    assert_eq!(
+        spine.world().lane.witness_conservation(0),
+        (3, 0, 3),
+        "all ORIGINAL keys confirmed by the retry"
+    );
+    assert!(pipeline.is_confirmed(id0));
+    assert_eq!(
+        spine.world().lane.reputation_score().unwrap(),
+        reputation_before,
+        "the retry changes no classification"
+    );
+    // EXACTLY ONE durable consequence — the retry created no episode.
+    assert_eq!(pipeline.confirmed_keys(), vec![id0]);
+
+    // THE TRANSIENT COMMIT FAILURE: a second encounter (witness 1)
+    // committed through a medium whose append fails BEFORE the lock —
+    // a clean, retry-safe injection (nothing durable was written by
+    // the failed attempt; the journal transaction and the claims
+    // stand).
+    schedule_encounter(&mut spine, 2, EncounterKind::Altercation, 0, 0, Tick(10)).unwrap();
+    spine.run_ticks(5);
+    drop(pipeline);
+    let mut faulted = CommitPipeline::open(
+        LocalFileMedium::open_with(
+            dir.store(),
+            Some(FaultControl::new().arm(FaultPoint::BeforeLock, FaultAction::InjectError)),
+        )
+        .unwrap(),
+        T1Journal::open(dir.journal()).unwrap(),
+    )
+    .unwrap();
+    let result = commit_witness_captures(&mut spine, &mut faulted, &mut book, 1, true);
+    assert!(
+        result.is_err(),
+        "the transient canonical failure propagates"
+    );
+    assert_eq!(
+        spine.world().lane.witness_conservation(1),
+        (6, 6, 0),
+        "claimed-but-pending survives the transient failure (both encounters' records)"
+    );
+    drop(faulted);
+
+    // The retry AFTER the transient failure, in a FRESH session over
+    // the same store and journal (the fault is gone): still zero new
+    // events — the flush finishes the episode.
+    let mut pipeline = fresh_pipeline(&dir);
+    let keys = commit_witness_captures(&mut spine, &mut pipeline, &mut book, 1, true).unwrap();
+    assert!(keys.is_empty(), "still no new episode");
+    assert_eq!(
+        spine.world().lane.witness_conservation(1),
+        (6, 0, 6),
+        "the failed canonical commit is finished by the plain retry"
+    );
+    let mut confirmed = pipeline.confirmed_keys();
+    confirmed.sort_unstable();
+    assert_eq!(
+        confirmed,
+        vec![ConsequenceId::new(0, 0, 0), ConsequenceId::new(0, 1, 1)],
+        "exactly two durable consequences — one per EPISODE, none per retry"
+    );
+    assert_lane_conservation(&spine, "the self-retry campaign");
+}
+
+/// THE FINDING 2 DECIDING GATE (the audit's own script): a FRESH
+/// world, lane, book and pipeline reopened over the same store and
+/// journal — the recovery reconstructs INDIVIDUAL canonical records
+/// (not counts), per-key phases, the applicable classification
+/// history and the classified score; it terminates at the journaled
+/// boundary (an uncommitted witness is honestly absent) and the
+/// dropped-ack boundary (journaled-but-unconfirmed recovers pending);
+/// and the recovered book is USABLE (the recovered lane finishes the
+/// dropped-ack episode with zero new events — findings 1 and 2
+/// composed).
+#[test]
+fn cold_reopen_reconstructs_individual_records() {
+    let dir = TestDir::new("cold-reopen");
+    let mut spine = make_spine();
+    let mut pipeline = fresh_pipeline(&dir);
+    let mut book = MemoryCommitBook::default();
+
+    // A mixed campaign: a Theft at region 3 (witnesses 17-23) and an
+    // Altercation at region 0 (witnesses 0-5).
+    schedule_encounter(&mut spine, 1, EncounterKind::Theft, 3, 3, Tick(5)).unwrap();
+    schedule_encounter(&mut spine, 2, EncounterKind::Altercation, 0, 0, Tick(6)).unwrap();
+    spine.run_ticks(6);
+
+    // Classify BEFORE the commits (the decisions ride the episodes'
+    // classification-sync sections): the authored review rule, accept
+    // iff weight ≤ −4 — witnesses 18/19's Theft weights accepted,
+    // witness 0's Altercation weight rejected.
+    let review = |weight: i32| weight <= -4;
+    for (event, witness, weight) in [
+        (1u32, 18u32, ENCOUNTER_TABLE[1].candidate.unwrap().1),
+        (1, 19, ENCOUNTER_TABLE[1].candidate.unwrap().1),
+        (2, 0, ENCOUNTER_TABLE[0].candidate.unwrap().1),
+    ] {
+        let key = MemoryKey {
+            event: u64::from(event),
+            witness,
+            kind: MemoryKind::ReputationCandidate,
+        };
+        assert_eq!(
+            spine.world_mut().lane.classify(&key, review(weight)),
+            engine_core::npc_memory::ClassifyOutcome::Classified
+        );
+    }
+
+    // Commit: witnesses 0 and 18 FULL; witness 19 DROPPED-ACK (the
+    // journaled-but-unconfirmed boundary); witness 20 NEVER COMMITTED
+    // (the unjournaled boundary).
+    commit_witness_captures(&mut spine, &mut pipeline, &mut book, 0, true).unwrap();
+    commit_witness_captures(&mut spine, &mut pipeline, &mut book, 18, true).unwrap();
+    commit_witness_captures(&mut spine, &mut pipeline, &mut book, 19, false).unwrap();
+
+    // The expected state, captured BEFORE the reopen: per witness,
+    // the INDIVIDUAL canonical records with their per-key phases.
+    let snapshot =
+        |spine: &Spine<MemoryLaneWorld>, witness: u32| -> Vec<(MemoryKey, Vec<u8>, bool)> {
+            spine
+                .world()
+                .lane
+                .ledger()
+                .witness_records(witness)
+                .iter()
+                .map(|record| {
+                    (
+                        record.key,
+                        record.canonical_bytes(),
+                        spine.world().lane.ledger().is_confirmed(&record.key),
+                    )
+                })
+                .collect()
+        };
+    let expected: BTreeMap<u32, Vec<(MemoryKey, Vec<u8>, bool)>> =
+        [0u32, 18, 19].map(|w| (w, snapshot(&spine, w))).into();
+    let score_before = spine.world().lane.reputation_score().unwrap();
+    let classifications_before: BTreeMap<u32, Vec<(MemoryKey, bool)>> = [0u32, 18, 19]
+        .map(|w| (w, spine.world().lane.witness_classifications(w)))
+        .into();
+    let claimed_before = book.claimed.clone();
+    let episodes_before = book.episodes;
+
+    // THE COLD REOPEN: a fresh pipeline over the same store and
+    // journal, then a fresh lane and book from the journal's plans
+    // and the chain's confirmed identities — nothing in memory.
+    drop(pipeline);
+    let mut fresh = fresh_pipeline(&dir);
+    let recovered = recover_memory_lane(&fresh).unwrap();
+
+    // INDIVIDUAL canonical records and per-key phases, not counts.
+    for (witness, records) in &expected {
+        let recovered_records: Vec<(MemoryKey, Vec<u8>, bool)> = recovered
+            .lane
+            .ledger()
+            .witness_records(*witness)
+            .iter()
+            .map(|record| {
+                (
+                    record.key,
+                    record.canonical_bytes(),
+                    recovered.lane.ledger().is_confirmed(&record.key),
+                )
+            })
+            .collect();
+        assert_eq!(
+            &recovered_records, records,
+            "witness {witness}'s individual canonical records and phases survive the reopen"
+        );
+    }
+    // The applicable classification history and the classified score.
+    for (witness, decisions) in &classifications_before {
+        assert_eq!(
+            &recovered.lane.witness_classifications(*witness),
+            decisions,
+            "witness {witness}'s classification history survives the reopen"
+        );
+    }
+    assert_eq!(
+        recovered.lane.reputation_score().unwrap(),
+        score_before,
+        "the classified score survives the reopen"
+    );
+    // The commit book: the claimed set and the next episode number.
+    assert_eq!(recovered.book.claimed, claimed_before);
+    assert_eq!(recovered.book.episodes, episodes_before);
+    // The journaled boundary: witness 20's uncommitted captures are
+    // honestly absent (the pipeline's InMemory discipline).
+    assert_eq!(
+        recovered.lane.witness_conservation(20),
+        (0, 0, 0),
+        "an unjournaled capture recovers nothing"
+    );
+    // The dropped-ack boundary: witness 19's keys recover PENDING.
+    let (pending, confirmed_count) = recovered.lane.ledger().witness_counts(19);
+    assert_eq!((pending, confirmed_count), (3, 0));
+    // Every recovered witness starts dormant (the materialization is
+    // the activate rebuild, never a silent partial live view).
+    assert!(recovered.lane.is_dormant(18) && recovered.lane.live(18).is_none());
+
+    // THE RECOVERED BOOK IS USABLE: install the recovered lane in a
+    // fresh world and flush witness 19's dropped-ack episode with
+    // ZERO new events.
+    let mut world = MemoryLaneWorld::new();
+    world.lane = recovered.lane;
+    let mut spine2 = Spine::with_reservation(world, 200, 60);
+    let mut book2 = recovered.book;
+    let keys = commit_witness_captures(&mut spine2, &mut fresh, &mut book2, 19, true).unwrap();
+    assert!(keys.is_empty(), "the recovered state needs no new episode");
+    assert_eq!(
+        spine2.world().lane.witness_conservation(19),
+        (3, 0, 3),
+        "the recovered lane finishes the dropped-ack episode"
+    );
+    assert!(fresh.is_confirmed(ConsequenceId::new(3, 2, 19)));
+}
+
+/// THE FINDING 3 DECIDING GATE (the composed half — the lane-level
+/// reverse-ids/equal-ticks/duplicate gate is npc_memory's test 20):
+/// a held encounter released LATE fires after larger event ids
+/// already executed; the one retention order (canonical event-key
+/// order, maintained by the live bounded view TOO) keeps the same
+/// episodes before and after the dormancy round trip. Under the
+/// defective bridge the live view kept the late-fired SMALL id
+/// (execution order) while the rebuild kept the larger ids (key
+/// order) — the round trip changed which episode the witness
+/// remembers.
+#[test]
+fn the_one_retention_order_through_the_composed_world() {
+    let mut spine = make_spine();
+
+    // Region 1 (witnesses 6-11) at Full: two Greetings, event 30 at
+    // tick 4 and event 20 at tick 5 (REVERSE IDS — the higher id
+    // executes first).
+    schedule_encounter(&mut spine, 30, EncounterKind::Greeting, 1, 1, Tick(4)).unwrap();
+    schedule_encounter(&mut spine, 20, EncounterKind::Greeting, 1, 1, Tick(5)).unwrap();
+    spine.run_ticks(5);
+
+    // EQUAL TICKS at region 2 (witnesses 12-17): events 40 and 35 both
+    // due at tick 20, delivered in the spine's own order — the one
+    // retention order makes the live view independent of it.
+    schedule_encounter(&mut spine, 40, EncounterKind::Greeting, 2, 2, Tick(20)).unwrap();
+    schedule_encounter(&mut spine, 35, EncounterKind::Greeting, 2, 2, Tick(20)).unwrap();
+
+    // Dormancy for region 1: the live view is discarded, and a new
+    // encounter (event 10) targeting the dormant region is HELD.
+    set_region_level(&mut spine, 1, LodLevel::Dormant);
+    schedule_encounter(&mut spine, 10, EncounterKind::Greeting, 1, 1, Tick(8)).unwrap();
+    assert_eq!(
+        spine.held_count(),
+        1,
+        "the dormant region's encounter is held"
+    );
+
+    // Reactivation at EVENT-DRIVEN (budget 2): the rebuild keeps the
+    // two largest keys {20, 30}; the held event then fires LATE (its
+    // due was 8) and its SMALL id 10 is the one the budget evicts —
+    // the canonical order, never the execution order.
+    set_region_level(&mut spine, 1, LodLevel::EventDriven);
+    spine.run_ticks(20);
+    let live = spine.world().lane.live(6).unwrap();
+    assert_eq!(
+        live.episodic().iter().map(|e| e.event).collect::<Vec<_>>(),
+        vec![20, 30],
+        "the late-held event 10 (the smallest key) is evicted, never 20 or 30"
+    );
+
+    // THE ROUND TRIP: the actual retained traces, compared before and
+    // after deactivation/reactivation at the same tier.
+    let before: Vec<EpisodicMemory> = live.episodic().to_vec();
+    set_region_level(&mut spine, 1, LodLevel::Dormant);
+    set_region_level(&mut spine, 1, LodLevel::EventDriven);
+    assert_eq!(
+        spine.world().lane.live(6).unwrap().episodic(),
+        before.as_slice(),
+        "the dormancy round trip keeps the same episodes"
+    );
+
+    // The equal-tick pair at region 2: whatever order the spine
+    // executed them in, the live view holds the canonical order.
+    spine.run_ticks(1);
+    let live = spine.world().lane.live(12).unwrap();
+    assert_eq!(
+        live.episodic().iter().map(|e| e.event).collect::<Vec<_>>(),
+        vec![35, 40],
+        "equal ticks tie-break by event id in the live view"
+    );
+    let before: Vec<EpisodicMemory> = live.episodic().to_vec();
+    set_region_level(&mut spine, 2, LodLevel::Dormant);
+    set_region_level(&mut spine, 2, LodLevel::Full);
+    assert_eq!(
+        spine.world().lane.live(12).unwrap().episodic(),
+        before.as_slice(),
+        "the equal-tick round trip keeps the same episodes"
+    );
+
+    assert_lane_conservation(&spine, "the one-order campaign");
+}
+
 // ---------------------------------------------------------------------------
 // THE S6 FUZZ GATE — the design pass §8.4 item 4's "the S6 fuzz
 // discipline, on the real pipeline": the S6-lite harness's seeded op
@@ -843,7 +1202,7 @@ fn run_campaign(tag: &str, seed: u64) -> CampaignOutcome {
                                     LodLevel::EventDriven => 2,
                                     LodLevel::Dormant => 3,
                                 });
-                            let episodic: Vec<engine_core::npc_perception::PerceptionTrace> = spine
+                            let episodic: Vec<EpisodicMemory> = spine
                                 .world()
                                 .lane
                                 .ledger()
@@ -851,7 +1210,10 @@ fn run_campaign(tag: &str, seed: u64) -> CampaignOutcome {
                                 .iter()
                                 .filter_map(|r| match r.delta {
                                     engine_core::npc_memory::MemoryDelta::Episodic { trace } => {
-                                        Some(trace)
+                                        Some(EpisodicMemory {
+                                            event: r.key.event,
+                                            trace,
+                                        })
                                     }
                                     _ => None,
                                 })

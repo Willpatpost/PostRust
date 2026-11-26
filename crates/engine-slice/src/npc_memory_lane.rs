@@ -1,6 +1,26 @@
 //! The composed memory-lane world (the Era-2 NPC-AI design pass §5.1/§5.3's
 //! composition, part 7 stage 2 — the capture-lane gates' driven half).
 //!
+//! # THE ERA-2 AUDIT'S CORRECTIVE (findings 1–3, Astra's
+//! # highest-value recommendation)
+//! - **Finding 1:** [`commit_witness_captures`] separates STAGING
+//!   fresh records from FLUSHING existing actionable episodes — the
+//!   last unacknowledged capture retries on its own, with zero new
+//!   events, in this session or a fresh one.
+//! - **Finding 2:** the journal plan is VERSIONED (v2,
+//!   [`MEMORY_PLAN_DOMAIN`]/[`MEMORY_PLAN_SCHEMA`]) and carries the
+//!   episode's ordered records and the witness's classification sync;
+//!   [`recover_memory_lane`] rebuilds a fresh lane and book from the
+//!   journal and the canonical chain — individual records, phases and
+//!   the classified score, terminating at the journaled, applied and
+//!   confirmed boundaries. The pipeline's own wire and save formats
+//!   are untouched (the plan is the lane's private, opaque-to-the-
+//!   pipeline blob).
+//! - **Finding 3:** episodic retention is ONE order — canonical
+//!   event-key order — maintained by the live bounded view too
+//!   (engine-core `npc_memory`'s `EpisodicMemory`), so a dormancy
+//!   round trip cannot change which episode a witness remembers.
+//!
 //! # DESIGN REFERENCE
 //! - Game policy by placement (the corner_behavior precedent): the
 //!   world below composes the REAL engine machinery — the spine's
@@ -24,10 +44,14 @@ use engine_core::event::{Event, EventClass, EventId, EventSpec, Field, Schedule}
 use engine_core::fingerprint::Fingerprinter;
 use engine_core::lod::LodLevel;
 use engine_core::npc_execution::enumerate_witnesses;
-use engine_core::npc_memory::{MemoryDelta, MemoryKey, MemoryKind, MemoryLane, MemoryRecord};
+use engine_core::npc_memory::{
+    CaptureOutcome, ClassifyOutcome, ConfirmOutcome, MemoryDelta, MemoryKey, MemoryKind,
+    MemoryLane, MemoryRecord,
+};
 use engine_core::npc_perception::NpcRecord;
 use engine_core::npc_perception::perception_budget;
 use engine_core::spine::{ExecCtx, ObligationView, ScheduleError, Spine, World};
+use engine_core::wire::{Decoder, Encoder};
 use engine_persist::CanonicalMedium;
 use engine_persist::consequence::{AwardCheckpoint, ConsequenceId, Coverage, OccurrenceSpan};
 use engine_persist::envelope::{
@@ -588,6 +612,122 @@ pub struct MemoryCommitBook {
     pub episodes: u64,
 }
 
+/// The memory-lane journal plan's domain — the EXPLICIT VERSION
+/// MARKER of the lane's own recovery material (the blob the pipeline
+/// carries transparently inside the T1 transaction; the pipeline's
+/// own wire and save formats are untouched by this section).
+pub const MEMORY_PLAN_DOMAIN: &str = "sektor7/engine-slice/memory-lane-plan";
+
+/// The plan's schema version. **v2 (the Era-2 audit's finding 2
+/// corrective):** the plan carries the ordered records' full canonical
+/// bytes and the witness's durable classification decisions — episode
+/// identity, membership and the applicable classification history are
+/// recoverable from the journal alone. v1 (the defective build's
+/// unversioned 12 bytes: a witness id and a count) carried none of
+/// it — two different sets of three memories produced the same plan
+/// bytes. The v2 reader refuses v1 bytes fail-closed at the domain
+/// gate; no v1 journal exists outside test directories (the bridge
+/// never shipped beyond them), so there is no compatibility surface
+/// to carry — the version marker is the migration boundary.
+pub const MEMORY_PLAN_SCHEMA: u8 = 2;
+
+/// One plan's documented maximum record count (bounded decode).
+pub const MEMORY_PLAN_MAX_RECORDS: u64 = 1 << 16;
+/// One plan's documented maximum classification-sync count (bounded
+/// decode).
+pub const MEMORY_PLAN_MAX_CLASSIFICATIONS: u64 = 1 << 16;
+/// One journaled record's documented maximum byte length (the largest
+/// canonical record is 13 + 8 + 21 bytes; the bound is generous, the
+/// strict decode enforces the exact shape).
+pub const MEMORY_PLAN_MAX_RECORD_BYTES: u64 = 4096;
+
+/// One journaled episode's recovery material (the T1 transaction's
+/// plan, version 2): the witness, the episode number, the ordered
+/// claimed records' canonical bytes (identity AND membership AND the
+/// payloads — the material a fresh session needs), and the
+/// classification-sync section — the witness's durable decisions as
+/// of this episode (later episodes re-carry earlier decisions, so the
+/// sync heals forward; a decision taken after the witness's FINAL
+/// journaled episode is durable only in the live lane — the recovery
+/// terminates at the journaled, applied and confirmed boundaries,
+/// never beyond them).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryPlan {
+    pub witness: u32,
+    pub episode: u64,
+    pub records: Vec<MemoryRecord>,
+    pub classifications: Vec<(MemoryKey, bool)>,
+}
+
+impl MemoryPlan {
+    /// The canonical encode: the domain tag, the schema byte, the
+    /// witness, the episode, then the length-prefixed records and
+    /// classification-sync entries (the `wire.rs` primitives —
+    /// fixed-width little-endian, bounded on decode).
+    pub fn encode(&self) -> Result<Vec<u8>, SaveError> {
+        let mut enc = Encoder::new();
+        enc.write_str(MEMORY_PLAN_DOMAIN);
+        enc.write_u8(MEMORY_PLAN_SCHEMA);
+        enc.write_u32(self.witness);
+        enc.write_u64(self.episode);
+        enc.write_count(self.records.len());
+        for record in &self.records {
+            enc.write_bytes(&record.canonical_bytes());
+        }
+        enc.write_count(self.classifications.len());
+        for (key, accepted) in &self.classifications {
+            enc.write_bytes(&key.canonical_bytes());
+            enc.write_u8(u8::from(*accepted));
+        }
+        Ok(enc.into_bytes())
+    }
+
+    /// The strict decode (fail-closed: the domain gate refuses a v1
+    /// plan or any foreign blob, the schema must be exactly v2, every
+    /// count is bounded, every record decodes through
+    /// [`MemoryRecord::decode`]'s own strict reader, no trailing
+    /// bytes).
+    pub fn decode(bytes: &[u8]) -> Result<Self, SaveError> {
+        const SECTION: &str = "memory-lane-plan";
+        let mut dec = Decoder::new(bytes);
+        dec.read_domain(MEMORY_PLAN_DOMAIN)?;
+        let schema = dec.read_u8()?;
+        if schema != MEMORY_PLAN_SCHEMA {
+            return Err(SaveError::Version {
+                observed: u32::from(schema),
+                supported: u32::from(MEMORY_PLAN_SCHEMA),
+            });
+        }
+        let witness = dec.read_u32()?;
+        let episode = dec.read_u64()?;
+        let record_count = dec.read_count(MEMORY_PLAN_MAX_RECORDS, SECTION, "record-count")?;
+        let mut records = Vec::with_capacity(record_count as usize);
+        for _ in 0..record_count {
+            let record_bytes = dec.read_bytes(MEMORY_PLAN_MAX_RECORD_BYTES, SECTION)?;
+            records.push(MemoryRecord::decode(record_bytes)?);
+        }
+        let classification_count = dec.read_count(
+            MEMORY_PLAN_MAX_CLASSIFICATIONS,
+            SECTION,
+            "classification-count",
+        )?;
+        let mut classifications = Vec::with_capacity(classification_count as usize);
+        for _ in 0..classification_count {
+            let key_bytes = dec.read_bytes(MemoryKey::KEY_STRIDE as u64, SECTION)?;
+            let key = MemoryKey::decode(key_bytes)?;
+            let accepted = dec.read_u8()? != 0;
+            classifications.push((key, accepted));
+        }
+        dec.finish()?;
+        Ok(MemoryPlan {
+            witness,
+            episode,
+            records,
+            classifications,
+        })
+    }
+}
+
 /// Commit one witness's unclaimed pending records through the REAL
 /// pipeline (the crossing's staged-commit shape, verbatim in order):
 /// stage the capture envelope → the T1 journal CAPTURE (the fsynced
@@ -595,12 +735,33 @@ pub struct MemoryCommitBook {
 /// live claim, the pipeline's AppliedBeforeJournal refusal enforces
 /// it) → mark_applied (the live claim) → commit_canonical (the
 /// canonical confirmation — on Confirmed, each claimed key confirms
-/// in the lane). `submit == false` is the DROPPED-ACK fault: stage +
-/// journal-capture + mark_applied but NO canonical commit — the keys
-/// stay claimed-but-pending in the lane (pending-live: the rebuild
-/// and the reputation are unaffected; a later full commit re-derives
-/// the actionable keys from the journal and confirms them — the
-/// C2 re-delivery). Returns the keys this episode claimed.
+/// in the lane).
+///
+/// **STAGING IS SEPARATE FROM FLUSHING (the Era-2 audit's finding 1
+/// corrective):** staging creates a new episode ONLY for this
+/// witness's fresh (unclaimed) pending records; the flush then runs
+/// whenever `submit` is true — REGARDLESS of whether this call staged
+/// anything — driving `commit_canonical` over the pipeline's WHOLE
+/// actionable set (every previously claimed-but-unconfirmed episode,
+/// this witness's dropped acks and any other's). A withheld
+/// submission therefore retries ON ITS OWN: a second call with
+/// `submit == true` and zero new events flushes the same episode; a
+/// failed canonical commit after claiming (the claims are already
+/// established) has the identical retry path — the final
+/// unacknowledged capture never waits for a fresh record to arrive.
+/// `submit == false` is the DROPPED-ACK fault: stage, journal-capture
+/// and mark_applied but NO canonical commit — the keys stay
+/// claimed-but-pending in the lane (pending-live: the rebuild and the
+/// reputation are unaffected; the C2 re-delivery). Returns ONLY THIS
+/// CALL'S freshly staged keys (a retry's empty return is the
+/// no-new-episode shape, never a refusal — the flush still happened).
+///
+/// **The plan blob (v2 — the finding 2 corrective):** the episode's
+/// journaled plan carries the ordered records' canonical bytes and
+/// the witness's classification-sync section, so a fresh session
+/// recovers episode identity, membership and the applicable
+/// classification history from the journal alone
+/// ([`recover_memory_lane`]).
 pub fn commit_witness_captures<M: CanonicalMedium>(
     spine: &mut Spine<MemoryLaneWorld>,
     pipeline: &mut CommitPipeline<M>,
@@ -610,6 +771,11 @@ pub fn commit_witness_captures<M: CanonicalMedium>(
 ) -> Result<Vec<MemoryKey>, PipelineError> {
     let region = (witness as usize) / REGION_NPCS;
 
+    // ---- THE STAGING HALF: fresh (unclaimed) pending records only. A
+    // previously claimed key's transaction is already durable —
+    // re-staging it would be the pipeline's conflicting reuse, and a
+    // second episode for the same keys would double-count; the retry
+    // is the FLUSH below, never a re-stage.
     let keys: Vec<MemoryKey> = spine
         .world_mut()
         .lane
@@ -619,71 +785,97 @@ pub fn commit_witness_captures<M: CanonicalMedium>(
         .filter(|k| !book.claimed.contains(k))
         .collect();
 
-    if keys.is_empty() {
-        return Ok(Vec::new());
-    }
+    if !keys.is_empty() {
+        let count = keys.len() as u64;
+        let episode = book.episodes;
+        book.episodes += 1;
 
-    let count = keys.len() as u64;
-    let episode = book.episodes;
-    book.episodes += 1;
+        let position = SourcePosition {
+            head: None,
+            tick: spine.world().last_tick.as_u64(),
+        };
+        let consequence = ConsequenceId::new(region as u32, episode, witness);
 
-    let position = SourcePosition {
-        head: None,
-        tick: spine.world().last_tick.as_u64(),
-    };
-    let consequence = ConsequenceId::new(region as u32, episode, witness);
-
-    let span = OccurrenceSpan::new(0, count)
-        .map_err(|_| PipelineError::Format(SaveError::Integrity("memory-lane/capture-span")))?;
-    let envelope = ConsequenceEnvelope::capture(
-        consequence,
-        vec![ClassifiedSpan::new(span, DurabilityClass::DurableEligible)],
-        SignalLane::Captured,
-        CounterValues::default(),
-        SourceBaseline {
-            counters: CounterValues::default(),
-            award: AwardCheckpoint {
-                durable: Coverage::new(),
-                provisional: Coverage::new(),
+        let span = OccurrenceSpan::new(0, count)
+            .map_err(|_| PipelineError::Format(SaveError::Integrity("memory-lane/capture-span")))?;
+        let envelope = ConsequenceEnvelope::capture(
+            consequence,
+            vec![ClassifiedSpan::new(span, DurabilityClass::DurableEligible)],
+            SignalLane::Captured,
+            CounterValues::default(),
+            SourceBaseline {
+                counters: CounterValues::default(),
+                award: AwardCheckpoint {
+                    durable: Coverage::new(),
+                    provisional: Coverage::new(),
+                },
             },
-        },
-        position,
-    )
-    .map_err(PipelineError::Format)?;
+            position,
+        )
+        .map_err(PipelineError::Format)?;
 
-    pipeline.stage(envelope)?;
+        pipeline.stage(envelope)?;
 
-    // THE PLAN BLOB (the journal transaction's plan, opaque to the
-    // pipeline): the witness id and the claimed-record count, both
-    // little-endian — the lane's decodable recovery material.
-    let mut plan_bytes = Vec::with_capacity(12);
-    plan_bytes.extend_from_slice(&witness.to_le_bytes());
-    plan_bytes.extend_from_slice(&count.to_le_bytes());
-
-    // THE T1 CAPTURE — the fsynced journal transaction over the
-    // staged envelope (the durable boundary; the CaptureReceipt is
-    // post-fsync by contract). WITHOUT THIS the key is InMemory and
-    // mark_applied rightly refuses (AppliedBeforeJournal —
-    // durable-before-live).
-    pipeline.capture(
-        position,
-        DurabilityClass::DurableEligible,
-        Vec::new(),
-        vec![FrontierEntry {
-            region: region as u32,
+        // THE PLAN BLOB v2 (the journal transaction's plan, opaque to
+        // the pipeline): the episode's identity and membership — the
+        // ordered claimed records' CANONICAL BYTES (the key, the tick,
+        // the delta — the material a fresh session decodes), plus the
+        // witness's classification-sync section (the durable decisions
+        // as of this episode).
+        let records: Vec<MemoryRecord> = {
+            let lane = &spine.world().lane;
+            keys.iter()
+                .map(|key| {
+                    *lane
+                        .ledger()
+                        .record(key)
+                        .expect("a pending key's record is in the ledger")
+                })
+                .collect()
+        };
+        let classifications = spine.world().lane.witness_classifications(witness);
+        let plan = MemoryPlan {
+            witness,
             episode,
-        }],
-        plan_bytes,
-    )?;
+            records,
+            classifications,
+        }
+        .encode()
+        .map_err(PipelineError::Format)?;
 
-    pipeline.mark_applied(&[consequence])?;
+        // THE T1 CAPTURE — the fsynced journal transaction over the
+        // staged envelope (the durable boundary; the CaptureReceipt is
+        // post-fsync by contract). WITHOUT THIS the key is InMemory and
+        // mark_applied rightly refuses (AppliedBeforeJournal —
+        // durable-before-live).
+        pipeline.capture(
+            position,
+            DurabilityClass::DurableEligible,
+            Vec::new(),
+            vec![FrontierEntry {
+                region: region as u32,
+                episode,
+            }],
+            plan,
+        )?;
 
-    // The claim is established at the episode's capture — before the
-    // submission branch (the confirm loop below reads this set).
-    for key in &keys {
-        book.claimed.insert(*key);
+        pipeline.mark_applied(&[consequence])?;
+
+        // The claim is established at the episode's capture — before the
+        // submission branch (the confirm loop below reads this set).
+        for key in &keys {
+            book.claimed.insert(*key);
+        }
     }
 
+    // ---- THE FLUSH HALF (the finding 1 corrective): submit drives the
+    // canonical commit over the whole actionable set even when THIS
+    // call staged nothing — the last unacknowledged capture's own
+    // retry, with zero new events. A transient commit failure
+    // propagates (the claims and the journal transaction stand;
+    // nothing is rolled back); the next submit call — this session's
+    // or a recovered one's — re-derives the actionable set from the
+    // journal and finishes it.
     if submit && let CommitOutcome::Confirmed(_) = pipeline.commit_canonical()? {
         // The canonical confirmation covers EVERY actionable journaled
         // key — this episode's AND every previously dropped-ack
@@ -700,8 +892,125 @@ pub fn commit_witness_captures<M: CanonicalMedium>(
     // NothingPending / Unknown / StaleParent (or the dropped-ack
     // fault's withheld submit): the pipeline's own outcome
     // discipline — the keys stay claimed and pending-live; the
-    // caller re-commits (the honest retry).
+    // caller re-commits (the honest retry — now self-sufficient:
+    // zero new events suffice).
     Ok(keys)
+}
+
+/// The recovered lane and commit book (a fresh session's state,
+/// rebuilt from the journal and the canonical chain alone).
+pub struct RecoveredMemoryLane {
+    pub lane: MemoryLane,
+    pub book: MemoryCommitBook,
+}
+
+/// THE COLD-REOPEN RECOVERY (the Era-2 audit's finding 2 corrective):
+/// rebuild a FRESH lane and commit book from (a) the T1 journal's
+/// committed transactions — each plan v2's ordered records and
+/// classification sync — and (b) the canonical chain's confirmed
+/// identities (the pipeline's own session-open walk). Every witness
+/// starts DORMANT (the session-reopen shape: the materialization is
+/// the [`MemoryLane::activate`] rebuild, never a silent partial live
+/// view). TERMINATES AT THE JOURNALED, APPLIED AND CONFIRMED
+/// BOUNDARIES: an unjournaled capture is honestly absent (the
+/// pipeline's InMemory discipline), a journaled-but-unconfirmed
+/// episode recovers PENDING (its keys claimed, re-submittable by
+/// [`commit_witness_captures`]'s flush half), a chain-confirmed
+/// episode recovers CONFIRMED. Every cross-check fails closed — a
+/// plan that disagrees with its transaction's consequence identity,
+/// frontier or membership is corruption, never a guess.
+pub fn recover_memory_lane<M: CanonicalMedium>(
+    pipeline: &CommitPipeline<M>,
+) -> Result<RecoveredMemoryLane, PipelineError> {
+    let integrity = |gate: &'static str| PipelineError::Format(SaveError::Integrity(gate));
+    let mut lane = MemoryLane::new();
+    let mut book = MemoryCommitBook::default();
+
+    for transaction in pipeline.journal().transactions() {
+        // The plan is this bridge's own material; a foreign or v1
+        // blob is refused at the domain gate (the journal belongs to
+        // the memory-lane campaign — fail closed, never skipped).
+        let plan = MemoryPlan::decode(&transaction.plan).map_err(PipelineError::Format)?;
+
+        // THE IDENTITY CROSS-CHECK: the plan's (witness, episode)
+        // must equal the transaction's own consequence identity —
+        // the envelope's ConsequenceId and the frontier's (region,
+        // episode). Membership: the envelope's occurrence span
+        // covers exactly the plan's record count.
+        let Some(envelope) = transaction.envelopes.first() else {
+            return Err(integrity("memory-lane/plan-empty-transaction"));
+        };
+        let Some(frontier) = transaction.frontier.first() else {
+            return Err(integrity("memory-lane/plan-missing-frontier"));
+        };
+        if frontier.episode != plan.episode
+            || frontier.region as usize >= MEMORY_REGIONS
+            || envelope.id != ConsequenceId::new(frontier.region, plan.episode, plan.witness)
+        {
+            return Err(integrity("memory-lane/plan-identity-mismatch"));
+        }
+        let span_count = envelope
+            .sub_spans
+            .first()
+            .map(|classified| classified.span.hi - classified.span.lo)
+            .unwrap_or(0);
+        if span_count != plan.records.len() as u64 {
+            return Err(integrity("memory-lane/plan-membership-mismatch"));
+        }
+
+        // The journaled boundary: every record recovers into the
+        // ledger (dormant — counted, never materialized). A key
+        // claimed by two episodes is a conflicting reuse the pipeline
+        // itself refuses; a duplicate plan record is corruption.
+        for record in &plan.records {
+            if record.key.witness != plan.witness {
+                return Err(integrity("memory-lane/plan-record-witness-mismatch"));
+            }
+            match lane.capture_dormant(*record) {
+                Ok(CaptureOutcome::Captured) => {}
+                Ok(_) => return Err(integrity("memory-lane/plan-duplicate-record")),
+                Err(_) => return Err(integrity("memory-lane/plan-record-refused")),
+            }
+            book.claimed.insert(record.key);
+        }
+
+        // The applicable classification history: the sync section's
+        // decisions re-record durably (a decision re-carried by a
+        // later episode is the AlreadyClassified no-op — first
+        // decision wins, exactly the live discipline).
+        for (key, accepted) in &plan.classifications {
+            if key.witness != plan.witness {
+                return Err(integrity(
+                    "memory-lane/plan-classification-witness-mismatch",
+                ));
+            }
+            match lane.classify(key, *accepted) {
+                ClassifyOutcome::Classified | ClassifyOutcome::AlreadyClassified => {}
+                ClassifyOutcome::Unknown => {
+                    return Err(integrity("memory-lane/plan-unknown-classification"));
+                }
+            }
+        }
+
+        // The confirmed boundary: the canonical chain's own view (the
+        // fresh pipeline's session-open walk) decides the phase.
+        if pipeline.is_confirmed(envelope.id) {
+            for record in &plan.records {
+                match lane.confirm(&record.key) {
+                    ConfirmOutcome::Confirmed | ConfirmOutcome::AlreadyConfirmed => {}
+                    ConfirmOutcome::Unknown => {
+                        return Err(integrity("memory-lane/plan-confirm-unknown"));
+                    }
+                }
+            }
+        }
+
+        // The next episode number: one past the highest journaled
+        // episode (the frontier's monotonic contract).
+        book.episodes = book.episodes.max(plan.episode.saturating_add(1));
+    }
+
+    Ok(RecoveredMemoryLane { lane, book })
 }
 
 #[cfg(test)]
