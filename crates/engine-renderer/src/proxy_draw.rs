@@ -490,23 +490,108 @@ impl ProxyResources {
         }
     }
 
-    /// Records the proxy draws for one populated frame, PER KIND in
-    /// the FIXED order (npc, vehicle, rain — rain LAST): the npc
-    /// kind binds the SKINNED pipeline (this render pass's variant —
-    /// main or HDR) with the skinned set and its two dynamic offsets
-    /// (the corner FrameParams slot offset and the pose slot
-    /// offset); the vehicle kind binds the PLAIN proxy pipeline with
-    /// the corner material set and the single FrameParams offset —
-    /// today's path, byte-identical; the rain kind binds the RAIN
+    /// Records the OPAQUE proxy kinds for one populated frame —
+    /// npc then vehicle, in the FIXED kind order (the repack's byte
+    /// order and the indirect block's command order both pin it).
+    /// THE FINDING-14 DRAW-ORDER SPLIT: the translucent rain kind
+    /// is recorded separately ([`Self::draw_rain_kind`]) so the
+    /// scene recorder can slot the wet-ground receiver BETWEEN the
+    /// opaque kinds and the depth-tested translucent rain — the
+    /// reflection blends over the opaque ground, the rain over the
+    /// reflection (the ordered blend), never the reflection over
+    /// the rain. The draw modes and per-kind submission logic are
+    /// [`Self::draw_kinds`]'s own, unchanged; the two split entry
+    /// points together record exactly what the former combined
+    /// `draw` recorded (same commands, same order per kind, same
+    /// counts — only the rain kind's position relative to the
+    /// ground receiver changes).
+    ///
+    /// # Safety
+    /// [`Self::draw_kinds`]'s contract (this is its `[Npc, Vehicle]`
+    /// slice).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn draw_opaque_kinds(
+        &self,
+        ctx: &VulkanContext,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+        upload: &ProxyFrameUpload<'_>,
+        pipelines: &ProxyPipelines,
+        skinned: &SkinnedSetBind,
+        vehicle: &PlainSetBind,
+        rain: &PlainSetBind,
+    ) -> u32 {
+        // SAFETY: this entry point is draw_kinds' [Npc, Vehicle]
+        // slice under this function's own documented contract.
+        unsafe {
+            self.draw_kinds(
+                ctx,
+                cmd,
+                slot,
+                upload,
+                pipelines,
+                skinned,
+                vehicle,
+                rain,
+                &[ProxyKind::Npc, ProxyKind::Vehicle],
+            )
+        }
+    }
+
+    /// Records the TRANSLUCENT rain kind for one populated frame
+    /// (the finding-14 split's second half — see
+    /// [`Self::draw_opaque_kinds`]). The rain kind binds the RAIN
     /// pipeline (this pass's unlit blended particle variant) with
-    /// the rain material's corner set and the same single FrameParams
+    /// the rain material's corner set and the single FrameParams
     /// offset (the [`PlainSetBind`] shape, shared with the vehicle
-    /// kind). Each kind then binds its mesh at binding 0 and its
-    /// instance range at binding 1, and submits per the upload's
-    /// mode: one direct `vkCmdDraw` per kind, one draw per instance
-    /// in the reference mode, or — 6-E2 — one `vkCmdDrawIndirect`
-    /// per kind reading this slot's command block. Returns the
-    /// recorded draw-call count.
+    /// kind), then submits per the upload's mode exactly like the
+    /// opaque kinds.
+    ///
+    /// # Safety
+    /// [`Self::draw_kinds`]'s contract (this is its `[Rain]`
+    /// slice).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn draw_rain_kind(
+        &self,
+        ctx: &VulkanContext,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+        upload: &ProxyFrameUpload<'_>,
+        pipelines: &ProxyPipelines,
+        skinned: &SkinnedSetBind,
+        vehicle: &PlainSetBind,
+        rain: &PlainSetBind,
+    ) -> u32 {
+        // SAFETY: this entry point is draw_kinds' [Rain] slice
+        // under this function's own documented contract.
+        unsafe {
+            self.draw_kinds(
+                ctx,
+                cmd,
+                slot,
+                upload,
+                pipelines,
+                skinned,
+                vehicle,
+                rain,
+                &[ProxyKind::Rain],
+            )
+        }
+    }
+
+    /// The per-kind recording core both split entry points share:
+    /// each kind binds its pipeline and set (the npc kind's SKINNED
+    /// pipeline with the skinned set and its two dynamic offsets —
+    /// the corner FrameParams slot offset and the pose slot offset;
+    /// the vehicle kind's PLAIN proxy pipeline with the corner
+    /// material set and the single FrameParams offset; the rain
+    /// kind's RAIN pipeline with the rain material's corner set and
+    /// the same single FrameParams offset), then its mesh at
+    /// binding 0 and its instance range at binding 1, and submits
+    /// per the upload's mode: one direct `vkCmdDraw` per kind, one
+    /// draw per instance in the reference mode, or — 6-E2 — one
+    /// `vkCmdDrawIndirect` per kind reading this slot's command
+    /// block. Returns the recorded draw-call count.
     ///
     /// # Safety
     /// `cmd` must be recording inside a render pass compatible with
@@ -522,7 +607,7 @@ impl ProxyResources {
     /// pose bytes, and, in the indirect mode, its command block (the
     /// frame flow writes all after the slot's fence wait).
     #[allow(clippy::too_many_arguments)]
-    pub(super) unsafe fn draw(
+    unsafe fn draw_kinds(
         &self,
         ctx: &VulkanContext,
         cmd: vk::CommandBuffer,
@@ -532,13 +617,15 @@ impl ProxyResources {
         skinned: &SkinnedSetBind,
         vehicle: &PlainSetBind,
         rain: &PlainSetBind,
+        kinds: &[ProxyKind],
     ) -> u32 {
         let slot_start = self.slot_bytes * slot as u64;
         let mut calls = 0;
-        // The fixed kind order: npc, vehicle, rain — the rain kind
-        // appends AFTER vehicle, never between (the repack's byte
-        // order and the indirect block's command order both pin it).
-        for kind in [ProxyKind::Npc, ProxyKind::Vehicle, ProxyKind::Rain] {
+        // The fixed kind order within the requested slice (npc,
+        // vehicle, rain — the rain kind appends AFTER vehicle, never
+        // between; the repack's byte order and the indirect block's
+        // command order both pin it).
+        for &kind in kinds {
             let (vbo, vertex_count, count, kind_index) = match kind {
                 ProxyKind::Npc => (self.npc_vbo, self.npc_vertices, upload.npc_count, 0),
                 ProxyKind::Vehicle => (

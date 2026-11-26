@@ -25,10 +25,14 @@
 //! ```
 //!
 //! THE BILLBOARD ARBITER: the ink gate is the physical proof of
-//! the turn derivation (`corner_weather::yaw_to_turn`'s t = −yaw —
-//! the streak's mesh-authored +Z normal facing the camera). A
-//! wrong turn turns the streaks edge-on and the ink collapses —
-//! the gate fails by construction.
+//! the turn derivation (`corner_weather::yaw_to_turn`'s t = +yaw —
+//! the finding-13 corrective; the pre-corrective packer's −yaw is
+//! edge-on at diagonal headings, cos 2θ = 0 at 45°). A wrong turn
+//! turns the streaks edge-on and the ink collapses — the gate
+//! fails by construction. The CPU known answers live beside the
+//! packer (corner_weather's
+//! `billboard_faces_the_camera_at_diagonal_headings`); the
+//! diagonal capture below is the GPU half of that proof.
 
 mod common;
 
@@ -180,9 +184,18 @@ fn rain_ink_count_gate() {
         "rain ink count: {differing} differing bytes of {}",
         rainless_frame.bytes.len()
     );
-    // MEASURED on this pod's lavapipe: 492 differing bytes (the
-    // warm field's near-camera streaks, ~164 pixels at 3 bytes per
-    // pixel). The floor holds a wide margin under the measurement.
+    // MEASURED on this pod's lavapipe: the pre-corrective tree
+    // measured 492 differing bytes (the warm field's near-camera
+    // streaks, ~164 pixels at 3 bytes per pixel); the tree under
+    // review measured 288 (the audit's pinned log, run 45721467971
+    // — recorded here per the audit's own instruction to keep the
+    // 492 comment's history and track the current baseline
+    // separately). THE FINDING-12 POLICY CHANGE moves the actual
+    // again — PROVISIONAL: re-measure on lavapipe in CI and pin
+    // the new baseline here (the corrected policy's steady state
+    // holds ~624 streaks vs the old ~552, all of them now falling
+    // the full column to the street, so the count should RISE from
+    // 288). The floor keeps the wide margin either way.
     const INK_FLOOR: usize = 200;
     assert!(
         differing >= INK_FLOOR,
@@ -256,8 +269,14 @@ fn rain_ink_broadside_at_presentation_extent() {
     let raining = raining_capture(&mut renderer, &matrix, yaw, light, 60);
 
     // The pixel metric: 4-byte pixels, a pixel counts once when any
-    // of its bytes moved. MEASURED on this pod's lavapipe (pinned in
-    // the asserts below from the run's own print).
+    // of its bytes moved. The "sky region" is the fixed UPPER-THIRD
+    // SCREEN RECTANGLE — a screen-region proxy for "analytically
+    // visible sky at this camera", not the analytic sky itself
+    // (deriving the true horizon would duplicate the projection
+    // chain the gate exists to check); at this camera the horizon
+    // sits ~40% from the top, so the upper third is entirely sky.
+    // MEASURED on this pod's lavapipe (pinned in the asserts below
+    // from the run's own print).
     assert_eq!(dry.bytes.len(), raining.bytes.len());
     let (width, height) = (SIZE.0 as usize, SIZE.1 as usize);
     let mut ink = 0usize;
@@ -272,7 +291,8 @@ fn rain_ink_broadside_at_presentation_extent() {
         }
     }
     println!(
-        "rain broadside ink: {ink} pixels of {} changed ({sky_ink} in the sky region)",
+        "rain broadside ink: {ink} pixels of {} changed ({sky_ink} in the upper-third \
+         screen region)",
         width * height
     );
     // MEASURED on this pod's lavapipe, this tree, this campaign -
@@ -286,8 +306,14 @@ fn rain_ink_broadside_at_presentation_extent() {
     // physically-correct model); the steady-state coverage at this
     // vantage is now 473 pixels total, 282 in the sky region (the
     // 60% sky majority holds - rain still falls in front of the
-    // background). The floors sit ~70% under the measurement while
-    // staying ~2x above the edge-on collapse (~164 pixels - the
+    // background). THE FINDING-12 POLICY CHANGE (the rain now falls
+    // to the street-level world receiver; the band is the
+    // compatible 4 m over the 8 m observed column; the steady state
+    // holds ~624 streaks crossing the FULL view column) moves BOTH
+    // actuals - PROVISIONAL: re-measure on lavapipe in CI and pin
+    // the new baseline here (the count should RISE from 473). The
+    // floors keep their margins: they sit under the old actual
+    // while staying above the edge-on collapse (~164 pixels - the
     // mining source's 8-frame fresh-capture gate).
     assert!(
         ink > 330,
@@ -295,10 +321,24 @@ fn rain_ink_broadside_at_presentation_extent() {
          (measured 473 at the steady state after the volume-refresh corrective; \
          the edge-on collapse measures ~164)"
     );
+    // THE MAJORITY PREDICATE (the audit's finding 13 fold-in): the
+    // claimed invariant is that a MAJORITY of the ink lives in the
+    // upper-third region — rain falls in front of the sky-backed
+    // background. The old check required only `sky_ink > 190`
+    // without the majority (1,000 changed pixels with 191 in the
+    // upper third would pass — the audit's own counterexample);
+    // both the floor AND the majority now hold.
     assert!(
         sky_ink > 190,
-        "the sky region carries {sky_ink} of the ink (measured 282 - rain falls \
-         in front of the background)"
+        "the upper-third screen region carries {sky_ink} of the ink (measured 282 - rain \
+         falls in front of the background)"
+    );
+    assert!(
+        sky_ink * 2 > ink,
+        "the upper-third screen region carries a MAJORITY of the rain ink: {sky_ink} of \
+         {ink} (the depth-interaction's visible half - a depth-write regression that \
+         punches streak holes, or a billboard regression that turns them edge-on, \
+         collapses this long before the total)"
     );
 }
 
@@ -472,6 +512,15 @@ fn ripple_reflection_gate() {
     // kills most of the perturbation fails them) while holding
     // wide margin under the full-strength actual (the ink-count
     // gate's 492-vs-200 discipline).
+    // THE FINDING-12 POLICY CHANGE and THE FINDING-14 DRAW-ORDER
+    // CORRECTIVE both move this gate's actuals (the rain now falls
+    // to the street-level receiver and composes OVER the
+    // reflection; the campaign's live ring stream changed with the
+    // decimation) — the diff still isolates the ripple perturbation
+    // (the rain instances are identical across both arms), but the
+    // measured baseline is PROVISIONAL: re-measure on lavapipe in
+    // CI and pin the new actuals here (the floors are expected to
+    // hold; the perturbation mechanism is unchanged).
     const RIPPLE_BYTE_FLOOR: usize = 100_000;
     const RIPPLE_PIXEL_FLOOR: usize = 39_000;
     assert!(
@@ -686,6 +735,213 @@ fn rain_n_vs_1_draw_mode_equivalence() {
         per_instance.bytes, instanced.bytes,
         "the PerInstance and Instanced rain captures are byte-identical"
     );
+}
+
+/// THE DIAGONAL SINGLE-DROP CAPTURE (finding 13's deciding GPU
+/// half — the CPU half lives beside the packer as
+/// `billboard_faces_the_camera_at_diagonal_headings`): ONE streak
+/// at a DIAGONAL camera heading (yaw = π/4 — the heading where the
+/// pre-corrective −yaw turn is EXACTLY edge-on, its normal's dot
+/// with the intended facing cos 2θ = 0), captured against the
+/// rainless baseline and checked against the CPU-projected
+/// footprint of the turned quad. The pre-corrective packer
+/// collapses the streak to a sub-pixel sliver at this heading (the
+/// projected broadside width × |cos 2θ| ≈ 0); the corrected t =
+/// +yaw holds it broadside. The witness scale (6) spans ~10 px of
+/// width at 8 m, so the edge-on collapse cannot hide inside
+/// rounding.
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe)"]
+fn rain_diagonal_single_drop_footprint() {
+    let _guard = sdl_lock();
+    let (_app, mut renderer) = app_and_renderer("rain diagonal single drop footprint");
+
+    // The diagonal camera: the gate eye, yaw exactly π/4 (looking
+    // northwest over the intersection), pitch level — the heading
+    // where the two turn signs differ the most in the frame.
+    let yaw = std::f32::consts::FRAC_PI_4;
+    let view = engine_slice::math::camera_view(GATE_EYE, yaw, 0.0, 0.0);
+    let proj = engine_slice::math::perspective(65_f32.to_radians(), 16.0 / 9.0, 0.1, 150.0);
+    let matrix = engine_slice::math::mul(&proj, &view);
+    let light = day_preset();
+
+    // The single drop: 8 m along the camera's forward, 1.5 m above
+    // the eye line, turned to face the camera through the MODULE's
+    // own derivation (the same yaw_to_turn the layer's pack uses).
+    let forward = engine_slice::math::camera_forward(yaw, 0.0, 0.0);
+    let pos = [
+        GATE_EYE[0] + forward[0] * 8.0,
+        GATE_EYE[1] + 1.5,
+        GATE_EYE[2] + forward[2] * 8.0,
+    ];
+    let instance = ProxyInstance {
+        transform: InstanceTransform {
+            pos,
+            turn: yaw_to_turn(yaw),
+            scale: 6.0,
+        },
+        tint: [0.7, 0.8, 0.9],
+        alpha: RAIN_ALPHA,
+        pose_index: 0,
+    };
+    let population = ProxyPopulation {
+        npc: &[],
+        npc_poses: &[],
+        npc_material: 1,
+        vehicle: &[],
+        vehicle_material: 2,
+        rain: std::slice::from_ref(&instance),
+        rain_material: RAIN_MATERIAL,
+    };
+
+    // The CPU-projected footprint: the streak mesh's four corner
+    // positions (populated_meshes::rain_streak_mesh emits BL, BR,
+    // TR, TL), transformed by `instance_columns` (the same packed
+    // matrix the shader consumes), projected through the same
+    // view_proj with the w-divide and the shader boundary's Y flip
+    // (authored NDC +y is screen-up; pixel row 0 is the top).
+    let mesh = engine_renderer::populated_meshes::rain_streak_mesh();
+    let columns = engine_renderer::proxy_instances::instance_columns(&instance.transform);
+    let project = |corner: [f32; 3]| -> (f32, f32) {
+        let world = [
+            columns[0][0] * corner[0]
+                + columns[1][0] * corner[1]
+                + columns[2][0] * corner[2]
+                + columns[3][0],
+            columns[0][1] * corner[0]
+                + columns[1][1] * corner[1]
+                + columns[2][1] * corner[2]
+                + columns[3][1],
+            columns[0][2] * corner[0]
+                + columns[1][2] * corner[1]
+                + columns[2][2] * corner[2]
+                + columns[3][2],
+        ];
+        let clip = [
+            matrix[0][0] * world[0]
+                + matrix[1][0] * world[1]
+                + matrix[2][0] * world[2]
+                + matrix[3][0],
+            matrix[0][1] * world[0]
+                + matrix[1][1] * world[1]
+                + matrix[2][1] * world[2]
+                + matrix[3][1],
+            matrix[0][2] * world[0]
+                + matrix[1][2] * world[1]
+                + matrix[2][2] * world[2]
+                + matrix[3][2],
+            matrix[0][3] * world[0]
+                + matrix[1][3] * world[1]
+                + matrix[2][3] * world[2]
+                + matrix[3][3],
+        ];
+        let ndc_x = clip[0] / clip[3];
+        let ndc_y = clip[1] / clip[3];
+        (
+            (ndc_x + 1.0) / 2.0 * SIZE.0 as f32,
+            (1.0 - ndc_y) / 2.0 * SIZE.1 as f32,
+        )
+    };
+    let corners: Vec<[f32; 3]> = mesh[..4].iter().map(|v| v.pos).collect();
+    let screen_corners: Vec<(f32, f32)> = corners.iter().map(|c| project(*c)).collect();
+    let xs: Vec<f32> = screen_corners.iter().map(|c| c.0).collect();
+    let ys: Vec<f32> = screen_corners.iter().map(|c| c.1).collect();
+    let box_min_x = xs.iter().cloned().fold(f32::INFINITY, f32::min).floor() as i64 - 1;
+    let box_max_x = xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max).ceil() as i64 + 1;
+    let box_min_y = ys.iter().cloned().fold(f32::INFINITY, f32::min).floor() as i64 - 1;
+    let box_max_y = ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max).ceil() as i64 + 1;
+    let box_width = box_max_x - box_min_x + 1;
+    println!(
+        "diagonal single-drop projected footprint: x [{box_min_x}, {box_max_x}], y \
+         [{box_min_y}, {box_max_y}] ({box_width} px wide)"
+    );
+    // The witness must be ON-SCREEN (the projection is the gate's
+    // own arithmetic — a drop projected off-frame means the pose
+    // constants drifted, not a renderer defect).
+    assert!(
+        box_min_x >= 0 && box_max_x < SIZE.0 as i64 && box_min_y >= 0 && box_max_y < SIZE.1 as i64,
+        "the projected footprint stays on screen"
+    );
+    // The broadside expectation: the quad's authored width (0.012 m
+    // half-extent, scale 6) projects to ~10 px at 8 m — the
+    // edge-on collapse would project under 1 px.
+    assert!(
+        box_width >= 6,
+        "the CPU-projected broadside width is ~10 px (got {box_width}) — the witness \
+         scale/distance drifted"
+    );
+
+    // The captures: the rainless baseline, then the single drop.
+    renderer.set_proxy_draw_mode(ProxyDrawMode::Instanced);
+    renderer.request_frame_capture().unwrap();
+    let baseline_pop = rainless();
+    assert!(
+        renderer
+            .render_corner_populated(&matrix, GATE_EYE, light, &baseline_pop, SIZE)
+            .unwrap()
+            .presented
+    );
+    let baseline = renderer.take_frame_capture().unwrap().unwrap();
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner_populated(&matrix, GATE_EYE, light, &population, SIZE)
+            .unwrap()
+            .presented
+    );
+    let dropping = renderer.take_frame_capture().unwrap().unwrap();
+
+    // The ink: every differing pixel must lie INSIDE the inflated
+    // projected footprint (the streak draws exactly where the
+    // turned quad projects), and the ink's x-extent must span at
+    // least half the projected width — the broadside proof (the
+    // pre-corrective edge-on turn collapses the x-extent to ~1 px).
+    assert_eq!(baseline.bytes.len(), dropping.bytes.len());
+    let width = SIZE.0 as usize;
+    let mut ink = 0usize;
+    let mut ink_min_x = i64::MAX;
+    let mut ink_max_x = i64::MIN;
+    for (index, (a, b)) in baseline
+        .bytes
+        .chunks(4)
+        .zip(dropping.bytes.chunks(4))
+        .enumerate()
+    {
+        if a != b {
+            ink += 1;
+            let x = (index % width) as i64;
+            let y = (index / width) as i64;
+            assert!(
+                x >= box_min_x && x <= box_max_x && y >= box_min_y && y <= box_max_y,
+                "a differing pixel ({x}, {y}) lies OUTSIDE the projected footprint \
+                 [{box_min_x}..={box_max_x}] x [{box_min_y}..={box_max_y}] — the streak \
+                 is not drawing where the turned quad projects"
+            );
+            ink_min_x = ink_min_x.min(x);
+            ink_max_x = ink_max_x.max(x);
+        }
+    }
+    println!("diagonal single-drop ink: {ink} differing pixels");
+    assert!(
+        ink >= 3,
+        "the single diagonal streak is visible ({ink} differing pixels) — the edge-on \
+         turn would collapse it to ~0"
+    );
+    let ink_width = ink_max_x - ink_min_x + 1;
+    assert!(
+        ink_width * 2 >= box_width,
+        "the ink's x-extent ({ink_width} px) spans at least half the projected broadside \
+         width ({box_width} px) — a diagonal edge-on turn collapses it to ~1 px (the \
+         finding-13 defect)"
+    );
+
+    let stats = renderer.stats();
+    assert_eq!(
+        stats.validation_errors, 0,
+        "no validation errors: {:?}",
+        stats.recent_validation
+    );
+    assert_eq!(stats.validation_warnings, 0, "no validation warnings");
 }
 
 /// THE COMPOSITION SMOKE: the mission's full composition — the

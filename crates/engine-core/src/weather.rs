@@ -168,6 +168,18 @@ pub struct RainPolicy {
     /// terminal-velocity derivation; paired with gravity so the
     /// fixed point is fall_speed).
     pub drag_factor: f32,
+    /// The WORLD RECEIVER PLANE's height — street level, where rain
+    /// dies and contacts are observed (the kill plane). A WORLD
+    /// constant authored once with the scene, deliberately NOT
+    /// derived from the observed volume: the observed box's floor
+    /// rides the camera, so deriving the kill plane from it made
+    /// rain "land" at the initial eye height while the drawn ground
+    /// sits at the world's street level (the audit's finding 12 —
+    /// a death spawned a ring on the drawn ground even though the
+    /// drop crossed a plane 1.7 m above it). Climbing the camera
+    /// never moves this plane; only the overhead spawn band follows
+    /// the eye.
+    pub receiver_y: f32,
 }
 
 /// Derive the rain emitter configuration for a weather state over
@@ -182,9 +194,13 @@ pub struct RainPolicy {
 /// the observed volume and falls through it); the rate scales the
 /// policy's full rate by the rain intensity; the base velocity is
 /// the fall speed on -Y with the policy's jitters; the lifetime,
-/// gravity, and drag pass through; the kill plane is the observed
-/// volume's floor; and the seed passes through unchanged (the
-/// caller's per-emitter stream identity).
+/// gravity, and drag pass through; the kill plane is the policy's
+/// WORLD RECEIVER PLANE (`receiver_y` — street level, a world
+/// constant that never rides the observed volume's camera-following
+/// floor; finding 12's three-volume separation: the OBSERVED box
+/// and the overhead BAND follow the eye, the RECEIVER is the
+/// world's); and the seed passes through unchanged (the caller's
+/// per-emitter stream identity).
 pub fn rain_emitter_config(
     weather: Weather,
     policy: &RainPolicy,
@@ -213,7 +229,7 @@ pub fn rain_emitter_config(
         lifetime: policy.lifetime,
         gravity: policy.gravity,
         drag_factor: policy.drag_factor,
-        kill_y: Some(observed.min[1]),
+        kill_y: Some(policy.receiver_y),
         seed,
     })
 }
@@ -232,7 +248,10 @@ mod tests {
         }
     }
 
-    /// The test rain policy (the campaign's rain-like numbers).
+    /// The test rain policy (the campaign's rain-like numbers). The
+    /// receiver plane sits at street level (y = 0 — the corner
+    /// scene's ground, the world constant the kill plane derives
+    /// from).
     fn rain_policy() -> RainPolicy {
         RainPolicy {
             full_rate: 480.0,
@@ -243,6 +262,7 @@ mod tests {
             lifetime: [0.9, 1.4],
             gravity: 9.81,
             drag_factor: 0.982,
+            receiver_y: 0.0,
         }
     }
 
@@ -286,7 +306,8 @@ mod tests {
     /// observed volume (floor riding the observed ceiling, ceiling
     /// extended by band_height), the intensity-scaled rate
     /// (480 x 0.5 = 240 — exact in f32), the policy's velocities
-    /// and jitters, and the kill plane at the observed floor.
+    /// and jitters, and the kill plane at the policy's WORLD
+    /// RECEIVER (never the observed floor).
     #[test]
     fn rain_derivation_fields_are_exact() {
         let config = rain_emitter_config(
@@ -312,10 +333,73 @@ mod tests {
         assert_eq!(config.lifetime, [0.9, 1.4]);
         assert_eq!(config.gravity, 9.81);
         assert_eq!(config.drag_factor, 0.982);
-        assert_eq!(config.kill_y, Some(0.0), "rain dies at the observed floor");
+        assert_eq!(
+            config.kill_y,
+            Some(0.0),
+            "rain dies at the policy's WORLD receiver plane (street level)"
+        );
         assert_eq!(
             config.seed, 0xC0FFEE,
             "the caller's stream identity passes through"
+        );
+    }
+
+    /// THE THREE-VOLUME SEPARATION (the audit's finding 12, the
+    /// engine-core half): the kill plane is the policy's WORLD
+    /// RECEIVER — a constant — never the observed volume's
+    /// camera-following floor. An observed box whose floor rides an
+    /// eye ABOVE the street (the demo starts rain at y = 1.7)
+    /// still derives the street-level kill plane, and a HIGHER eye
+    /// (the climbing camera) moves only the overhead band, never
+    /// the receiver.
+    #[test]
+    fn kill_plane_is_the_world_receiver_never_the_observed_floor() {
+        // The demo's starting eye: the observed floor at 1.7 — the
+        // pre-corrective derivation would have "landed" rain here,
+        // 1.7 m above the drawn ground.
+        let eye_level = SpawnVolume {
+            min: [-24.0, 1.7, -8.0],
+            max: [16.0, 9.7, 32.0],
+        };
+        let config = rain_emitter_config(Weather::rain(1.0), &rain_policy(), &eye_level, 1)
+            .expect("full rain derives");
+        assert_eq!(
+            config.kill_y,
+            Some(0.0),
+            "the receiver stays at street level (the observed floor 1.7 never lands rain)"
+        );
+        assert_eq!(
+            config.volume.min[1], 9.7,
+            "the band floor rides the observed ceiling (the band follows the eye)"
+        );
+        assert_eq!(config.volume.max[1], 21.7, "the band extends band_height");
+        // The climbing camera: a HIGHER observed box moves the band
+        // and leaves the receiver exactly where it was.
+        let climbing = SpawnVolume {
+            min: [-24.0, 30.0, -8.0],
+            max: [16.0, 38.0, 32.0],
+        };
+        let climbed = rain_emitter_config(Weather::rain(1.0), &rain_policy(), &climbing, 1)
+            .expect("full rain derives");
+        assert_eq!(
+            climbed.kill_y,
+            Some(0.0),
+            "climbing never moves the world's receiver plane"
+        );
+        assert_eq!(
+            climbed.volume.min[1], 38.0,
+            "the band floor rides the climbed observed ceiling"
+        );
+        // A different authored receiver passes through verbatim
+        // (the plane is policy data, the scene's own constant).
+        let mut rooftop = rain_policy();
+        rooftop.receiver_y = 12.0;
+        let config = rain_emitter_config(Weather::rain(1.0), &rooftop, &eye_level, 1)
+            .expect("full rain derives");
+        assert_eq!(
+            config.kill_y,
+            Some(12.0),
+            "an authored receiver above the street passes through"
         );
     }
 

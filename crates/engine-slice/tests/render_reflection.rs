@@ -34,15 +34,18 @@ use engine_renderer::lit_scene::{
     lit_surface_color, materials,
 };
 use engine_renderer::planar::{mirrored_eye, reflection_blend};
+use engine_renderer::populated_meshes::rain_streak_mesh;
 use engine_renderer::proc_texture::{TEXTURE_SIZE, procedural_texture};
+use engine_renderer::proxy_instances::{InstanceTransform, ProxyInstance, instance_columns};
 use engine_renderer::shadows::ShadowBias;
 use engine_renderer::sky::atmosphere_at;
 use engine_renderer::{
-    DemoScenePreference, DepthFormatPreference, RenderConfig, Renderer, SkyFrame,
+    DemoScenePreference, DepthFormatPreference, ProxyPopulation, RenderConfig, Renderer, SkyFrame,
     ValidationPreference,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 use engine_slice::corner_demo::view_projection;
+use engine_slice::corner_weather::{RAIN_ALPHA, RAIN_MATERIAL, yaw_to_turn};
 use engine_slice::math::{camera_forward, camera_right};
 
 /// The bias under test (the demo's own policy — one source for both).
@@ -2345,4 +2348,510 @@ fn shadowed_wet_ground_reads_the_current_camera() {
         "shadowed+wet camera gate: both slots' ground re-draws read the CURRENT camera — \
          {grand_max_error}/255 max against the measured oracle, the HDR variant blended"
     );
+}
+
+/// THE ORDERED BLEND: THE WET RECEIVER COMPOSES UNDER TRANSLUCENT
+/// RAIN (the audit's finding 14 deciding gate — the draw-order
+/// corrective's acceptance). The scene pass now draws the opaque
+/// geometry, then the wet-ground receiver re-draw, then the
+/// depth-tested translucent rain: the reflection blends over the
+/// opaque ground and the rain over the reflection. The
+/// pre-corrective order drew the rain BEFORE the receiver — the
+/// EQUAL-depth ground re-draw blended the reflection OVER the
+/// already-blended rain, erasing a foreground streak at high
+/// reflectivity.
+///
+/// THE WITNESS (one known-alpha bright streak over a high-contrast
+/// reflective ground patch, and another behind solid geometry):
+/// a single hand-authored streak — the module's own billboard turn,
+/// the shipped RAIN_ALPHA coverage, a mid-bright tint capped BELOW
+/// the reflective patch's wet value (so the CORRECT order must DIM
+/// the bright reflection while the DEFECT order brightens over it —
+/// the sign flip is the discriminator, no texel oracle needed) —
+/// placed in the air over a MEASURED high-contrast reflective
+/// ground pixel, plus a second streak placed BEHIND a building mass
+/// (the depth test must kill it byte-exactly). Captures: the dry
+/// ground D, the wet ground W, the streak over dry R_DRY (its
+/// presence/alpha witness), the streak over wet R (the ordered
+/// blend), and the post-enabled pair (the HDR scene pass's own
+/// ordered blend, through the ACES tonemap a differential).
+///
+/// PROVISIONAL THRESHOLDS: this pod has no software ICD — the
+/// selection floors (the wet patch's brightness, the streak's
+/// presence) are derived from the blend algebra's worst cases (the
+/// doc comments at each assert) and must be re-measured on CI's
+/// lavapipe; the gate prints its measurements for that re-pin.
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
+fn wet_ground_receiver_blends_under_translucent_rain() {
+    let _guard = sdl_lock();
+    let mut app = ShellApp::new(ShellConfig {
+        title: "wet receiver under rain".into(),
+        width: 512,
+        height: 512,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    })
+    .unwrap();
+    let mut renderer = Renderer::new(
+        app.window(),
+        RenderConfig {
+            demo_scene: DemoScenePreference::Corner,
+            validation: ValidationPreference::On,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let size = app.window().size_in_pixels();
+    assert_eq!(size, (512, 512));
+    assert!(renderer.stats().validation_active);
+    let _ = app.frame();
+
+    // The grazing gate's own pose (street level, looking down-and-
+    // west — the reflected rays climb the southwest mass's east
+    // face): a low eye over far ground, the high-reflectivity band.
+    let eye = [12.0, 2.0, -12.0];
+    let aim = [2.0, 0.0, -12.0];
+    let matrix = view_projection(
+        RouteWaypoint {
+            position: eye,
+            look_at: aim,
+        },
+        1.0,
+    );
+    let (forward, right, up) = basis(eye, aim);
+    let light = day_preset();
+    let empty = rainless_population();
+
+    // One render + capture at the current sticky wet state.
+    let capture = |renderer: &mut Renderer,
+                   population: &ProxyPopulation<'_>|
+     -> engine_renderer::CapturedFrame {
+        renderer.request_frame_capture().unwrap();
+        assert!(
+            renderer
+                .render_corner_populated(&matrix, eye, light, population, size)
+                .unwrap()
+                .presented
+        );
+        renderer.take_frame_capture().unwrap().unwrap()
+    };
+
+    // D and W: the dry ground and the wet ground (no rain).
+    renderer.set_wet(false);
+    let dry = capture(&mut renderer, &empty);
+    renderer.set_wet(true);
+    let wet = capture(&mut renderer, &empty);
+
+    // The placement pixel P0: the most CONTRASTIVE reflective ground
+    // pixel in the lower frame (W - D maximal, W bright) whose CPU
+    // Schlick factor sits inside the discriminating band (b >= 0.25
+    // so the defect's re-brightening is materially visible; b <=
+    // 0.85 so it cannot hide in rounding) — MEASURED from the two
+    // captures, with the CPU oracle only narrowing the band.
+    let (width, height) = (size.0 as usize, size.1 as usize);
+    let mut best = None;
+    for y in ((height * 45 / 100)..height).step_by(2) {
+        for x in (0..width).step_by(2) {
+            let ray = pixel_ray(forward, right, up, x as u32, y as u32, size);
+            if ray[1] >= -1e-4 {
+                continue; // not a ground pixel
+            }
+            let t_ground = -eye[1] / ray[1];
+            let hit = [
+                eye[0] + ray[0] * t_ground,
+                GROUND_Y,
+                eye[2] + ray[2] * t_ground,
+            ];
+            let view = [eye[0] - hit[0], eye[1] - hit[1], eye[2] - hit[2]];
+            let view_length = (view[0] * view[0] + view[1] * view[1] + view[2] * view[2]).sqrt();
+            let n_dot_v = (view[1] / view_length).clamp(0.0, 1.0);
+            let b = reflection_blend(n_dot_v);
+            if !(0.25..=0.85).contains(&b) {
+                continue;
+            }
+            let w_pixel = wet.pixel_rgba(x as u32, y as u32);
+            let d_pixel = dry.pixel_rgba(x as u32, y as u32);
+            let (channel, contrast) = (0..3)
+                .map(|c| (c, w_pixel[c] as i32 - d_pixel[c] as i32))
+                .max_by_key(|&(_, diff)| diff)
+                .unwrap();
+            let wet_value = w_pixel[channel] as i32;
+            if contrast >= 50
+                && wet_value >= WET_PATCH_FLOOR
+                && best.is_none_or(|(_, _, best_contrast, _)| contrast > best_contrast)
+            {
+                best = Some((x as u32, y as u32, contrast, channel));
+            }
+        }
+    }
+    let Some((p0_x, p0_y, p0_contrast, _)) = best else {
+        panic!(
+            "PROVISIONAL gate: no high-contrast reflective ground pixel qualified in the \
+             lower frame (re-measure on lavapipe and re-pin the W-contrast/wet-value \
+             floors from this run's captures)"
+        );
+    };
+    println!(
+        "placement pixel ({p0_x}, {p0_y}): W-D contrast {p0_contrast}/255 — the \
+         high-contrast reflective patch"
+    );
+
+    // The streak: hung in the air on P0's view ray at 62% of the
+    // ground distance (in front of the ground — LESS depth, the
+    // depth test passes), the module's own billboard turn for this
+    // pose's yaw, a witness scale that spans several pixels, and a
+    // MID-BRIGHT tint capped below the patch's wet value (the tint
+    // ceiling 0.57 x the texture's <= 1.0 rgb keeps the streak's
+    // source color under the W floor — the correct order must DIM
+    // the bright reflection; the defect order, which re-blends the
+    // reflection over the streak, must BRIGHTEN past it).
+    let ray = pixel_ray(forward, right, up, p0_x, p0_y, size);
+    let t_ground = -eye[1] / ray[1];
+    let streak_pos = [
+        eye[0] + ray[0] * t_ground * 0.62,
+        eye[1] + ray[1] * t_ground * 0.62,
+        eye[2] + ray[2] * t_ground * 0.62,
+    ];
+    let offset = std::array::from_fn(|i| aim[i] - eye[i]);
+    let (yaw, _pitch) = engine_slice::corner_demo::waypoint_orientation(offset);
+    let streak = ProxyInstance {
+        transform: InstanceTransform {
+            pos: streak_pos,
+            turn: yaw_to_turn(yaw),
+            scale: 6.0,
+        },
+        tint: [0.50, 0.53, 0.57],
+        alpha: RAIN_ALPHA,
+        pose_index: 0,
+    };
+    let streak_population = ProxyPopulation {
+        npc: &[],
+        npc_poses: &[],
+        npc_material: 1,
+        vehicle: &[],
+        vehicle_material: 2,
+        rain: std::slice::from_ref(&streak),
+        rain_material: RAIN_MATERIAL,
+    };
+
+    // R_DRY (the streak's presence witness over the dry ground)
+    // and R (the ordered blend over the wet ground).
+    renderer.set_wet(false);
+    let streak_dry = capture(&mut renderer, &streak_population);
+    renderer.set_wet(true);
+    let streak_wet = capture(&mut renderer, &streak_population);
+
+    // The streak's CPU-projected footprint (the weather gate's own
+    // projector: the mesh corners through the packed instance
+    // matrix and the view-projection, w-divided, the shader
+    // boundary's Y flip included).
+    let footprint = streak_footprint(&streak, &matrix, size);
+
+    // The witness pixel: the footprint pixel where the streak is
+    // PRESENT over the dry ground (its texture alpha is real) and
+    // the wet patch is bright — selected by MEASUREMENT, so no
+    // texel oracle is needed.
+    let mut witness = None;
+    for y in footprint.min_y..=footprint.max_y {
+        for x in footprint.min_x..=footprint.max_x {
+            let w_pixel = wet.pixel_rgba(x, y);
+            let d_pixel = dry.pixel_rgba(x, y);
+            let s_pixel = streak_dry.pixel_rgba(x, y);
+            let (channel, presence) = (0..3)
+                .map(|c| (c, s_pixel[c] as i32 - d_pixel[c] as i32))
+                .max_by_key(|&(_, diff)| diff)
+                .unwrap();
+            let wet_value = w_pixel[channel] as i32;
+            let contrast = w_pixel[channel] as i32 - d_pixel[channel] as i32;
+            if presence >= STREAK_PRESENCE_FLOOR
+                && wet_value >= WET_PATCH_FLOOR
+                && contrast >= 50
+                && witness.is_none_or(|(_, _, best_presence, _)| presence > best_presence)
+            {
+                witness = Some((x, y, presence, channel));
+            }
+        }
+    }
+    let Some((w_x, w_y, presence, w_channel)) = witness else {
+        panic!(
+            "PROVISIONAL gate: no footprint pixel showed the streak present over a \
+             bright wet patch (re-measure on lavapipe and re-pin the presence floor \
+             from this run's prints: footprint x [{}, {}] y [{}, {}])",
+            footprint.min_x, footprint.max_x, footprint.min_y, footprint.max_y
+        );
+    };
+    let w_wet = wet.pixel_rgba(w_x, w_y)[w_channel] as i32;
+    let w_dry = dry.pixel_rgba(w_x, w_y)[w_channel] as i32;
+    let w_streak_wet = streak_wet.pixel_rgba(w_x, w_y)[w_channel] as i32;
+    let w_streak_dry = streak_dry.pixel_rgba(w_x, w_y)[w_channel] as i32;
+    println!(
+        "witness ({w_x}, {w_y}) channel {w_channel}: dry {w_dry}, wet {w_wet}, \
+         streak-dry {w_streak_dry} (presence {presence}), streak-wet {w_streak_wet}"
+    );
+
+    // THE ORDERED BLEND (postless): the streak composes UNDER the
+    // wet reflection — the witness channel must DIM below the
+    // no-rain wet value. The tint ceiling (<= 0.57) keeps the
+    // streak's source color under the W floor, so the correct order
+    // dims by (W - S) x alpha >= 2 (the presence floor 15 with the
+    // source-color spread bounds the worst case); the DEFECT order
+    // re-blends the reflection over the streak and brightens by
+    // presence x (1 - b) >= 15 x 0.15 >= 2 — the sign flip.
+    assert!(
+        w_wet - w_streak_wet >= 2,
+        "the ordered blend: the streak DIMS the bright wet patch ({w_wet} -> \
+         {w_streak_wet}) — the defect order re-blends the reflection over it and \
+         brightens (the sign flip is the discriminator)"
+    );
+    // The streak is genuinely bright over the dark ground (the
+    // audit's known-alpha bright streak, present on the dry patch).
+    assert!(
+        w_streak_dry - w_dry >= 2,
+        "the streak is present over the dry ground ({w_dry} -> {w_streak_dry})"
+    );
+    // The ordered blend's attenuation bound: the dimming cannot
+    // exceed the streak's known alpha applied to the wet value (the
+    // source color is non-negative): W - R <= alpha x W + rounding.
+    assert!(
+        (w_wet - w_streak_wet) as f32 <= RAIN_ALPHA * w_wet as f32 + 3.0,
+        "the dimming ({}) stays inside the known-alpha attenuation bound",
+        w_wet - w_streak_wet
+    );
+    // The streak is present over the WET ground across the
+    // footprint (at least two pixels moved by >= 2 — the ordered
+    // blend keeps the streak visible over the reflection).
+    let mut moved = 0usize;
+    for y in footprint.min_y..=footprint.max_y {
+        for x in footprint.min_x..=footprint.max_x {
+            let w_pixel = wet.pixel_rgba(x, y);
+            let r_pixel = streak_wet.pixel_rgba(x, y);
+            if (0..3).any(|c| (w_pixel[c] as i32 - r_pixel[c] as i32).abs() >= 2) {
+                moved += 1;
+            }
+        }
+    }
+    println!("streak-over-wet footprint pixels moved: {moved}");
+    assert!(
+        moved >= 2,
+        "the streak stays visible over the wet ground ({moved} footprint pixels moved)"
+    );
+
+    // THE BEHIND-GEOMETRY WITNESS: a second streak placed BEYOND a
+    // building mass on a view ray that hits one — the depth test
+    // must kill every fragment (byte-identical to the no-rain wet
+    // capture over its whole footprint).
+    let mut occluded = None;
+    for y in ((height * 20 / 100)..(height * 70 / 100)).step_by(2) {
+        for x in (0..width).step_by(2) {
+            let ray = pixel_ray(forward, right, up, x as u32, y as u32, size);
+            if let Some(hit) = raycast_boxes(eye, ray) {
+                let distance = ((hit.pos[0] - eye[0]).powi(2)
+                    + (hit.pos[1] - eye[1]).powi(2)
+                    + (hit.pos[2] - eye[2]).powi(2))
+                .sqrt();
+                occluded = Some((x as u32, y as u32, distance));
+                break;
+            }
+        }
+        if occluded.is_some() {
+            break;
+        }
+    }
+    let Some((o_x, o_y, wall_distance)) = occluded else {
+        panic!("PROVISIONAL gate: no building-covered pixel found mid-frame");
+    };
+    let ray = pixel_ray(forward, right, up, o_x, o_y, size);
+    let behind_streak = ProxyInstance {
+        transform: InstanceTransform {
+            pos: [
+                eye[0] + ray[0] * (wall_distance + 4.0),
+                eye[1] + ray[1] * (wall_distance + 4.0),
+                eye[2] + ray[2] * (wall_distance + 4.0),
+            ],
+            turn: yaw_to_turn(yaw),
+            scale: 6.0,
+        },
+        tint: [0.50, 0.53, 0.57],
+        alpha: RAIN_ALPHA,
+        pose_index: 0,
+    };
+    let behind_population = ProxyPopulation {
+        npc: &[],
+        npc_poses: &[],
+        npc_material: 1,
+        vehicle: &[],
+        vehicle_material: 2,
+        rain: std::slice::from_ref(&behind_streak),
+        rain_material: RAIN_MATERIAL,
+    };
+    let behind_footprint = streak_footprint(&behind_streak, &matrix, size);
+    let behind_wet = capture(&mut renderer, &behind_population);
+    for y in behind_footprint.min_y..=behind_footprint.max_y {
+        for x in behind_footprint.min_x..=behind_footprint.max_x {
+            assert_eq!(
+                wet.pixel_rgba(x, y),
+                behind_wet.pixel_rgba(x, y),
+                "the behind-geometry streak is depth-killed at ({x}, {y}) — byte-identical \
+                 to the no-rain wet capture"
+            );
+        }
+    }
+
+    // THE POST-ENABLED VARIANT (the HDR scene pass's own ordered
+    // blend, a differential through the ACES tonemap): the streak
+    // must still move the witness pixel wet-vs-rain (the defect
+    // erasure would leave the HDR pair identical at high
+    // reflectivity).
+    renderer.set_post(true);
+    let wet_post = capture(&mut renderer, &empty);
+    let streak_post = capture(&mut renderer, &streak_population);
+    let post_delta = (wet_post.pixel_rgba(w_x, w_y)[w_channel] as i32
+        - streak_post.pixel_rgba(w_x, w_y)[w_channel] as i32)
+        .abs();
+    println!("post-enabled witness delta: {post_delta}");
+    assert!(
+        post_delta >= 2,
+        "the ordered blend survives the HDR scene pass and the tonemap ({post_delta})"
+    );
+
+    let stats = renderer.stats();
+    assert_eq!(
+        stats.validation_errors, 0,
+        "no validation errors: {:?}",
+        stats.recent_validation
+    );
+    assert_eq!(stats.validation_warnings, 0, "no validation warnings");
+    println!(
+        "wet receiver under rain: the ordered blend held postless and post — the \
+         streak dims the bright patch, the behind-geometry streak is depth-killed"
+    );
+}
+
+/// The rainless empty population (the ordering gate's baseline).
+fn rainless_population() -> ProxyPopulation<'static> {
+    ProxyPopulation {
+        npc: &[],
+        npc_poses: &[],
+        npc_material: 1,
+        vehicle: &[],
+        vehicle_material: 2,
+        rain: &[],
+        rain_material: RAIN_MATERIAL,
+    }
+}
+
+/// The wet patch's brightness floor (PROVISIONAL — derived from the
+/// discriminator's worst case: the streak tint's 0.57 ceiling keeps
+/// its source color under this value, so the correct order dims and
+/// the defect brightens; re-measure on CI's lavapipe).
+const WET_PATCH_FLOOR: i32 = 165;
+
+/// The streak's presence floor over the dry ground (PROVISIONAL —
+/// the presence bounds the defect's re-brightening at
+/// presence x (1 - b) >= 15 x 0.15 >= 2 beyond rounding).
+const STREAK_PRESENCE_FLOOR: i32 = 15;
+
+/// One streak's CPU-projected screen footprint: the rain-streak
+/// mesh's four corner positions transformed by the packed instance
+/// matrix, projected through the view-projection, w-divided, with
+/// the shader boundary's Y flip (authored NDC +y is screen-up;
+/// pixel row 0 is the top) — the bounding box inflated by one
+/// pixel (the rasterizer's coverage edge).
+struct StreakFootprint {
+    min_x: u32,
+    max_x: u32,
+    min_y: u32,
+    max_y: u32,
+}
+
+fn streak_footprint(
+    instance: &ProxyInstance,
+    matrix: &[[f32; 4]; 4],
+    size: (u32, u32),
+) -> StreakFootprint {
+    let mesh = rain_streak_mesh();
+    let columns = instance_columns(&instance.transform);
+    let project = |corner: [f32; 3]| -> (f32, f32) {
+        let world = [
+            columns[0][0] * corner[0]
+                + columns[1][0] * corner[1]
+                + columns[2][0] * corner[2]
+                + columns[3][0],
+            columns[0][1] * corner[0]
+                + columns[1][1] * corner[1]
+                + columns[2][1] * corner[2]
+                + columns[3][1],
+            columns[0][2] * corner[0]
+                + columns[1][2] * corner[1]
+                + columns[2][2] * corner[2]
+                + columns[3][2],
+        ];
+        let clip = [
+            matrix[0][0] * world[0]
+                + matrix[1][0] * world[1]
+                + matrix[2][0] * world[2]
+                + matrix[3][0],
+            matrix[0][1] * world[0]
+                + matrix[1][1] * world[1]
+                + matrix[2][1] * world[2]
+                + matrix[3][1],
+            matrix[0][2] * world[0]
+                + matrix[1][2] * world[1]
+                + matrix[2][2] * world[2]
+                + matrix[3][2],
+            matrix[0][3] * world[0]
+                + matrix[1][3] * world[1]
+                + matrix[2][3] * world[2]
+                + matrix[3][3],
+        ];
+        let ndc_x = clip[0] / clip[3];
+        let ndc_y = clip[1] / clip[3];
+        (
+            (ndc_x + 1.0) / 2.0 * size.0 as f32,
+            (1.0 - ndc_y) / 2.0 * size.1 as f32,
+        )
+    };
+    let corners: Vec<[f32; 3]> = mesh[..4].iter().map(|v| v.pos).collect();
+    let screen: Vec<(f32, f32)> = corners.iter().map(|c| project(*c)).collect();
+    let min_x = screen
+        .iter()
+        .map(|c| c.0)
+        .fold(f32::INFINITY, f32::min)
+        .floor() as i64
+        - 1;
+    let max_x = screen
+        .iter()
+        .map(|c| c.0)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil() as i64
+        + 1;
+    let min_y = screen
+        .iter()
+        .map(|c| c.1)
+        .fold(f32::INFINITY, f32::min)
+        .floor() as i64
+        - 1;
+    let max_y = screen
+        .iter()
+        .map(|c| c.1)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil() as i64
+        + 1;
+    assert!(
+        min_x >= 0
+            && max_x < size.0 as i64
+            && min_y >= 0
+            && max_y < size.1 as i64
+            && min_x <= max_x
+            && min_y <= max_y,
+        "the streak's projected footprint stays on screen: x [{min_x}, {max_x}], \
+         y [{min_y}, {max_y}] of {size:?}"
+    );
+    StreakFootprint {
+        min_x: min_x as u32,
+        max_x: max_x as u32,
+        min_y: min_y as u32,
+        max_y: max_y as u32,
+    }
 }
