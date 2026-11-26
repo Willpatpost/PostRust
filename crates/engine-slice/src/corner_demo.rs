@@ -157,7 +157,13 @@ impl LocomotionCrowd {
         let (_, vehicles) = crate::corner_population::corner_population();
 
         // Build the behavior world with the 64/near32 reservation.
-        let world = crate::corner_behavior::CornerCrowdWorld::new(states.clone(), present.clone());
+        // THE ROLLING STREAM MODE (the audit's finding 5 correction):
+        // the demo owns this world for the whole session, so the
+        // behavior stream is folded into the rolling digest and
+        // counters — no per-entry retention, no reservation to
+        // outgrow (the exit summary carries the digest).
+        let world =
+            crate::corner_behavior::CornerCrowdWorld::new_rolling(states.clone(), present.clone());
         let mut spine = engine_core::spine::Spine::with_reservation(world, 64, 32);
 
         // Arm EVERY schedule entry at its own first occurrence.
@@ -952,8 +958,17 @@ pub fn run(
     {
         let world = spine.world();
         println!(
-            "behavior spine composed: {} wake executions, {} arrivals over the route (exit)",
-            world.wake_executions, world.arrivals
+            "behavior spine composed: {} wake executions, {} arrivals over the route (exit); \
+             behavior stream: {} entries folded to digest {} (rolling — the running demo \
+             retains no per-entry history, the bounded record finding 5 asked for); \
+             crossing-guard settles {}, phase clamps {} (zero on the authored table — \
+             nonzero is an authoring defect)",
+            world.wake_executions,
+            world.arrivals,
+            world.stream_entries,
+            world.stream_digest,
+            world.guard_settles,
+            world.phase_clamps
         );
     }
     // Rain layer exit summary (if enabled).

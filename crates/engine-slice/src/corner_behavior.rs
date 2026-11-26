@@ -204,12 +204,73 @@ fn seam_retarget(
 
 // ------------------------------------------------------- the spine world
 
+/// The behavior-stream recording mode (the audit's finding 5
+/// correction). `Full` retains every entry in `stream` — the
+/// fixtures that pin the complete stream byte-for-byte and hash it
+/// with `execution_digest`. `Rolling` retains NOTHING per entry: the
+/// rolling FNV-1a digest and the counters carry the record, so a
+/// session that outlives any reservation (the running demo) grows
+/// nothing — the old wake log pushed one entry per wake into a
+/// 256-reserved Vec forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamMode {
+    /// Retain every entry (the fixture mode: the complete stream is
+    /// the pinned record).
+    Full,
+    /// Retain nothing; fold each entry into the rolling digest (the
+    /// running demo's bounded record).
+    Rolling,
+}
+
+/// Folds ONE stream entry into a running FNV-1a hash — EXACTLY
+/// `execution_digest`'s per-entry byte sequence (tick u64 LE, npc
+/// u32 LE, rule u32 LE, kind tag byte, the kind's params as LE u32s
+/// in decision_digest's order), starting from the FNV offset basis.
+/// Folding every executed entry in order makes the rolling digest
+/// EQUAL `execution_digest` over the equivalent retained stream at
+/// every prefix — the fixture campaign below pins that equality, so
+/// the two encodings cannot drift apart.
+fn fold_stream_entry(mut hash: u64, entry: &StreamEntry) -> u64 {
+    let mut fold = |bytes: &[u8]| {
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    fold(&entry.tick.as_u64().to_le_bytes());
+    fold(&entry.npc.to_le_bytes());
+    fold(&entry.activity.rule.to_le_bytes());
+    let tag = match entry.activity.kind {
+        ActivityKind::Idle => 0,
+        ActivityKind::MoveTo { .. } => 1,
+        ActivityKind::Fulfill { .. } => 2,
+        ActivityKind::React { .. } => 3,
+    };
+    fold(&[tag]);
+    match entry.activity.kind {
+        ActivityKind::Idle => {}
+        ActivityKind::MoveTo { route, waypoint } => {
+            fold(&route.to_le_bytes());
+            fold(&waypoint.to_le_bytes());
+        }
+        ActivityKind::Fulfill { commitment } => {
+            fold(&commitment.to_le_bytes());
+        }
+        ActivityKind::React { class, subject } => {
+            fold(&class.to_le_bytes());
+            fold(&subject.0.to_le_bytes());
+        }
+    }
+    hash
+}
+
 /// The composed crowd's spine world: the 24 schedules/routines/rngs
 /// (one per NPC), the locomotion states and present mask from part
-/// 4's constructor, and the behavior stream (PRE-ALLOCATED — the
-/// composed per-tick path allocates nothing; the capacity bound is
-/// derived below). `execute` IS the policy seam: a wake event
-/// evaluates (schedule authority) and retargets the walker.
+/// 4's constructor, and the behavior stream (PRE-ALLOCATED in the
+/// Full fixture mode — the composed per-tick path allocates nothing;
+/// in the Rolling demo mode nothing is retained at all). `execute`
+/// IS the policy seam: a wake event evaluates (schedule authority)
+/// and retargets the walker.
 pub struct CornerCrowdWorld {
     /// The 24 schedules (one per NPC).
     pub schedules: Vec<NpcSchedule>,
@@ -223,8 +284,17 @@ pub struct CornerCrowdWorld {
     pub rules: Vec<Rule>,
     /// Need decay rates.
     pub rates: [f32; MAX_NEEDS],
-    /// The behavior stream (capacity bound documented in the module).
+    /// The behavior stream (Full mode only; the capacity bound is
+    /// documented in the constructors).
     pub stream: Vec<StreamEntry>,
+    /// The stream recording mode (finding 5's correction).
+    pub stream_mode: StreamMode,
+    /// The rolling stream digest: FNV-1a folded per executed entry
+    /// (both modes — the fixture cross-check pins it against
+    /// `execution_digest` over the retained stream).
+    pub stream_digest: u64,
+    /// The number of entries folded into `stream_digest`.
+    pub stream_entries: u64,
     /// Per-NPC locomotion states from part 4.
     pub states: Vec<NpcLocomotion>,
     /// Per-NPC present mask.
@@ -240,16 +310,37 @@ pub struct CornerCrowdWorld {
     pub arrivals: u64,
     /// Stepped counter (from batch summary).
     pub stepped: u64,
+    /// Crossing-guard settlements (from batch summary; the authored
+    /// table's ordinary trajectories never fire it — nonzero is an
+    /// authoring defect, counted fail-visibly).
+    pub guard_settles: u64,
+    /// Stride-phase clamps (from batch summary; same discipline as
+    /// `guard_settles`).
+    pub phase_clamps: u64,
 }
 
 impl CornerCrowdWorld {
-    /// The composed crowd constructor.
-    ///
-    /// The stream Vec's capacity is 256 (663 ticks × the cadence
+    /// The composed crowd constructor, FIXTURE mode: the stream
+    /// retains every entry (capacity 256 — 663 ticks × the cadence
     /// arithmetic give ≈ 70 entries total — waiter 2-3 fires each,
     /// crossers ~11 each, strollers ~5-6 each ≈ 24 + 22 + 76 ≈ 122;
-    /// 256 carries 2× headroom; the allocation gate MEASURES it).
+    /// 256 carries 2× headroom; the fixtures that run past it pay
+    /// the Vec growth, which is the fixture's business — never the
+    /// demo's per-frame path).
     pub fn new(states: Vec<NpcLocomotion>, present: Vec<bool>) -> Self {
+        Self::build(states, present, StreamMode::Full)
+    }
+
+    /// The running-demo constructor (finding 5's correction): the
+    /// same schedules, routines, rngs, states, and routes, with the
+    /// behavior stream in the Rolling mode — no per-entry retention,
+    /// no reservation. A session that outgrows any reservation grows
+    /// nothing; the rolling digest and the counters carry the record.
+    pub fn new_rolling(states: Vec<NpcLocomotion>, present: Vec<bool>) -> Self {
+        Self::build(states, present, StreamMode::Rolling)
+    }
+
+    fn build(states: Vec<NpcLocomotion>, present: Vec<bool>, mode: StreamMode) -> CornerCrowdWorld {
         let schedules = corner_schedules();
         let routines = vec![
             engine_core::npc_behavior::NpcRoutine {
@@ -273,7 +364,11 @@ impl CornerCrowdWorld {
             applies_below: 0.0,
         }];
         let rates = [0.001; MAX_NEEDS];
-        let stream = Vec::with_capacity(256);
+        let stream = if mode == StreamMode::Full {
+            Vec::with_capacity(256)
+        } else {
+            Vec::new()
+        };
         let routes = corner_routes();
         CornerCrowdWorld {
             schedules,
@@ -283,6 +378,9 @@ impl CornerCrowdWorld {
             rules,
             rates,
             stream,
+            stream_mode: mode,
+            stream_digest: 0xcbf2_9ce4_8422_2325,
+            stream_entries: 0,
             states,
             present,
             routes,
@@ -290,6 +388,8 @@ impl CornerCrowdWorld {
             retarget_refusals: 0,
             arrivals: 0,
             stepped: 0,
+            guard_settles: 0,
+            phase_clamps: 0,
         }
     }
 
@@ -302,7 +402,10 @@ impl CornerCrowdWorld {
     /// - the mirror is field writes only
     /// - `corner_instances_into` reuses its output buffer
     /// - `evaluate_population_poses_locomotion` reuses its output buffer
-    /// - The stream capacity is construction-time (256)
+    /// - The stream record is construction-time only: the Full
+    ///   fixture mode's 256-entry reservation, or the Rolling demo
+    ///   mode's nothing-at-all (finding 5's correction — the wake
+    ///   log can no longer grow past any boundary)
     pub fn composed_tick(&mut self, dt: f32) -> engine_core::npc_locomotion::BatchSummary {
         // The batch step (the demo's dt = 1/60 — the same deterministic
         // clock as part 4).
@@ -317,6 +420,11 @@ impl CornerCrowdWorld {
         );
         self.stepped += u64::from(summary.stepped);
         self.arrivals += u64::from(summary.arrivals);
+        // The pathological-tick counters, fail-visible (both stay
+        // zero on the authored table — nonzero is an authoring
+        // defect the demo's exit summary reports).
+        self.guard_settles += u64::from(summary.guard_settles);
+        self.phase_clamps += u64::from(summary.phase_clamps);
 
         // THE ARRIVAL MIRROR (idempotent at stands): any present WALKER
         // (npc 8-23 — the waiters are world-placed policy whose
@@ -380,11 +488,22 @@ impl World for CornerCrowdWorld {
         self.routines[npc_idx] = outcome.routine_after;
         self.rngs[npc_idx] = rng;
         self.last_decay_tick[npc_idx] = ctx.executed_tick();
-        self.stream.push(StreamEntry {
+        // THE STREAM RECORD (finding 5's correction): every mode
+        // folds the entry into the rolling digest (the fixture
+        // cross-check pins the fold against `execution_digest` over
+        // the retained stream); only the Full fixture mode retains
+        // the entry itself — the Rolling demo mode keeps nothing per
+        // entry, so the log cannot grow past any reservation.
+        let entry = StreamEntry {
             tick: ctx.executed_tick(),
             npc,
             activity: outcome.activity,
-        });
+        };
+        self.stream_digest = fold_stream_entry(self.stream_digest, &entry);
+        self.stream_entries += 1;
+        if self.stream_mode == StreamMode::Full {
+            self.stream.push(entry);
+        }
         self.wake_executions += 1;
 
         // THE SEAM (the authored table above): the commitment's kind
@@ -475,10 +594,14 @@ mod tests {
     struct CampaignSnapshot {
         states: Vec<NpcLocomotion>,
         stream: Vec<StreamEntry>,
+        stream_digest: u64,
+        stream_entries: u64,
         routines: Vec<engine_core::npc_behavior::NpcRoutine>,
         wake_executions: u64,
         retarget_refusals: u64,
         arrivals: u64,
+        guard_settles: u64,
+        phase_clamps: u64,
         fingerprint: u64,
     }
 
@@ -486,7 +609,21 @@ mod tests {
     /// construction; returns the terminal readout (frame `ticks`).
     fn run_campaign(ticks: u64) -> CampaignSnapshot {
         let (_, states, present) = corner_population_locomotion();
-        let world = CornerCrowdWorld::new(states, present);
+        run_world_campaign(CornerCrowdWorld::new(states, present), ticks)
+    }
+
+    /// The same campaign in the ROLLING stream mode (the demo's
+    /// construction since finding 5's correction) — identical
+    /// schedules, wakes, and states; the behavior stream is folded,
+    /// not retained.
+    fn run_campaign_rolling(ticks: u64) -> CampaignSnapshot {
+        let (_, states, present) = corner_population_locomotion();
+        run_world_campaign(CornerCrowdWorld::new_rolling(states, present), ticks)
+    }
+
+    /// The shared driver: arm every entry, run `ticks` composed
+    /// ticks, read the world out through the spine.
+    fn run_world_campaign(world: CornerCrowdWorld, ticks: u64) -> CampaignSnapshot {
         let mut spine = Spine::with_reservation(world, 64, 32);
         arm_all_entries(&mut spine);
         for _ in 0..ticks {
@@ -499,10 +636,14 @@ mod tests {
         CampaignSnapshot {
             states: world.states.clone(),
             stream: world.stream.clone(),
+            stream_digest: world.stream_digest,
+            stream_entries: world.stream_entries,
             routines: world.routines.clone(),
             wake_executions: world.wake_executions,
             retarget_refusals: world.retarget_refusals,
             arrivals: world.arrivals,
+            guard_settles: world.guard_settles,
+            phase_clamps: world.phase_clamps,
             fingerprint: fp.finish(),
         }
     }
@@ -633,6 +774,15 @@ mod tests {
             a.fingerprint, b.fingerprint,
             "the world fingerprint is byte-identical"
         );
+        // THE ROLLING-FOLD CROSS-CHECK (finding 5's correction): the
+        // digest the demo mode carries equals execution_digest over
+        // the retained stream — the two encodings cannot drift.
+        assert_eq!(
+            a.stream_digest,
+            execution_digest(&a.stream),
+            "the rolling fold equals execution_digest over the retained stream"
+        );
+        assert_eq!(a.stream_entries, a.stream.len() as u64);
 
         // THE COUNTER PINS (the derivation above; the arrivals measured).
         assert_eq!(
@@ -713,6 +863,82 @@ mod tests {
     const PIN_EXEC_33: u64 = 14_695_981_039_346_656_037;
     const PIN_EXEC_300: u64 = 17_642_371_054_831_568_059;
     const PIN_EXEC_662: u64 = 2_580_761_500_374_851_303;
+
+    /// THE ROLLING STREAM CAMPAIGN (the audit's finding 5 deciding
+    /// test, the determinism half; the allocation half lives in the
+    /// lavapipe composed-gate tests, `render_instanced.rs`): the
+    /// running demo's bounded record — no per-entry retention, the
+    /// rolling digest and counters only — equals the fixture mode's
+    /// complete-stream execution digest, byte-identical across
+    /// double construction, driven PAST the old wake log's 256-entry
+    /// reservation and its 512 growth boundary with real wakes.
+    ///
+    /// THE WAKE-COUNT DERIVATION at 4200 ticks (hand-computed like
+    /// the 663-tick table above, then MEASURED — the placeholder-pin
+    /// discipline): waiters 92 (start 120+40i, every 360: waiters
+    /// 0-3 fire 12× — waiter 3's 12th is due exactly at 4200 and
+    /// executes — waiters 4-7 fire 11×); crossers 20 (each of the
+    /// two crossers' two entries fires 5×); strollers 477 (entry 0
+    /// at 60+17k+240m: k=0-3 fire 18×, k=4-13 fire 17× = 242; entry
+    /// 1 at 180+17k+240m: k=0-10 fire 17×, k=11-13 fire 16× = 235)
+    /// — total 589, comfortably past the old 512 boundary.
+    #[test]
+    fn rolling_campaign_digest_equals_full_stream_past_boundaries() {
+        let full = run_campaign(4200);
+        let rolling = run_campaign_rolling(4200);
+        let rolling_b = run_campaign_rolling(4200);
+
+        // Past BOTH old boundaries with real wakes (the measured
+        // count; the derivation above).
+        assert_eq!(
+            full.wake_executions, 589,
+            "the 4200-tick cadence arithmetic"
+        );
+        assert!(
+            full.wake_executions > 512,
+            "past the old 256-entry reservation AND its 512 growth point"
+        );
+
+        // THE ROLLING RECORD EQUALS THE COMPLETE STREAM: the fold is
+        // execution_digest, entry for entry.
+        assert_eq!(
+            rolling.stream_digest, full.stream_digest,
+            "the rolling digest equals the full mode's"
+        );
+        assert_eq!(
+            rolling.stream_digest,
+            execution_digest(&full.stream),
+            "the rolling digest equals execution_digest over the retained stream"
+        );
+        assert_eq!(rolling.stream_entries, full.stream.len() as u64);
+        assert_eq!(rolling.wake_executions, full.wake_executions);
+
+        // The bounded record: nothing retained, byte-identical
+        // across double construction, the trajectories themselves
+        // mode-independent.
+        assert!(
+            rolling.stream.is_empty(),
+            "the rolling mode retains no per-entry history"
+        );
+        assert_eq!(
+            rolling.stream_digest, rolling_b.stream_digest,
+            "the rolling record is byte-identical across construction"
+        );
+        assert_eq!(rolling.fingerprint, rolling_b.fingerprint);
+        assert_eq!(rolling.states, rolling_b.states);
+        assert_eq!(
+            rolling.states, full.states,
+            "the trajectories are mode-independent"
+        );
+
+        // The authored table never fires the pathological guards
+        // (finding 4's counters stay zero on ordinary trajectories).
+        assert_eq!(rolling.guard_settles, 0, "no crossing-guard settlement");
+        assert_eq!(rolling.phase_clamps, 0, "no stride-phase clamp");
+        assert_eq!(full.guard_settles, 0);
+        assert_eq!(full.phase_clamps, 0);
+        assert_eq!(rolling.retarget_refusals, 0, "the seam never refuses");
+    }
 
     /// THE SEAM RETARGET KNOWN ANSWERS (the REAL seam — the same
     /// function `execute` drives, never a test copy).
