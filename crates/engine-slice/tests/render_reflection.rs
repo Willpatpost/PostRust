@@ -2695,6 +2695,19 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
     let mut occluded = None;
     for y in ((height * 20 / 100)..(height * 70 / 100)).step_by(2) {
         for x in (0..width).step_by(2) {
+            // The interior guard (the round-7 corrective): the
+            // search takes the FIRST box-hitting ray scanning
+            // left-to-right - on a camera aimed at a low-left
+            // measured placement patch (Ubuntu's) the first hit
+            // sits at the screen edge and the behind-wall streak's
+            // projection falls off-screen (round 6 measured
+            // footprint x [-3, 6] of 512; Windows's brighter
+            // placement aimed the camera elsewhere and passed).
+            // The occlusion witness needs an INTERIOR hit so the
+            // depth-killed footprint is fully comparable.
+            if x < width / 8 || x >= width * 7 / 8 {
+                continue;
+            }
             let ray = pixel_ray(forward, right, up, x as u32, y as u32, size);
             if let Some(hit) = raycast_boxes(eye, ray) {
                 let distance = ((hit.pos[0] - eye[0]).powi(2)
