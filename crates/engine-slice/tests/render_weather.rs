@@ -57,9 +57,19 @@ const BIAS: engine_renderer::shadows::ShadowBias = engine_renderer::shadows::Sha
 
 fn sdl_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap()
+    // Poison-tolerant (the round-7 corrective): a gate's assertion
+    // panic must not cascade into every other gate's PoisonError —
+    // each gate reports ITS OWN verdict (the round-6 run lost the
+    // term-separation gate's Ubuntu debut to exactly this cascade).
+    // The mutex serializes SDL process-global setup; an assertion
+    // failure while holding it never corrupts that state (the
+    // poisoned case is precisely "another gate panicked while
+    // measuring"), so the guard is recovered and the next gate runs
+    // on the same disciplined setup.
+    match LOCK.get_or_init(|| std::sync::Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 fn app_and_renderer(title: &str) -> (ShellApp, Renderer) {
@@ -614,14 +624,24 @@ fn gate_basis() -> ([f32; 3], [f32; 3], [f32; 3]) {
 /// The CPU ray for one raster pixel (the receiver-blend gate's own
 /// helper — the 65° gate frustum, the pixel-center convention, the
 /// shader boundary's Y flip: pixel row 0 is the top, authored NDC
-/// +y is screen-up).
+/// +y is screen-up). THE ASPECT FACTOR (the round-8 corrective):
+/// the gate matrix is perspective(fov_y, 16/9) with focal/aspect on
+/// the x lane, so NDC x maps to view-space x through
+/// tan_half·ASPECT — the ray's horizontal term carries the aspect
+/// (the pre-corrective form used tan_half alone, compressing every
+/// inverse-projected ground point 1.778× toward the screen-center
+/// column: authored rings landed at the wrong world centers, and
+/// the GPU's true band ink appeared at modeled "hole" positions —
+/// the forward projection (project_ground) was always correct; only
+/// the inverse was broken).
 fn gate_pixel_ray(forward: [f32; 3], right: [f32; 3], up: [f32; 3], x: u32, y: u32) -> [f32; 3] {
     let nx = (x as f32 + 0.5) * 2.0 / SIZE.0 as f32 - 1.0;
     let ny = (y as f32 + 0.5) * 2.0 / SIZE.1 as f32 - 1.0;
     let math_y = -ny;
     let tan_half = (65_f32.to_radians() / 2.0).tan();
+    let aspect = SIZE.0 as f32 / SIZE.1 as f32;
     let ray = std::array::from_fn(|axis| {
-        forward[axis] + nx * tan_half * right[axis] + math_y * tan_half * up[axis]
+        forward[axis] + nx * tan_half * aspect * right[axis] + math_y * tan_half * up[axis]
     });
     let length = (ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]).sqrt();
     ray.map(|component| component / length)
@@ -886,31 +906,54 @@ fn ripple_signed_movement_gate() {
     // The baseline (the empty field — the identity no-op).
     let baseline = ripple_mode_capture(&mut renderer, &matrix, light, None, RippleDebugMode::Off);
 
-    // THE MEASURED ASYMMETRIC MIRROR FEATURE: the strongest vertical
-    // transition in the reflected content over the open road cross
-    // (the interior columns — the direct-view building walls live in
-    // the flanks; the scan band sits below the horizon where the
-    // reflection draws), restricted to pixels whose CPU Schlick
-    // factor is inside the reflective band (b >= 0.15: the sweep's
-    // magnitude is b x the content transition — a matte patch
-    // cannot show it) and whose ground point is on the open cross
-    // (|x| < 5: the building masses start 6 m off-axis). The
-    // near-miss tracker carries the best raw contrast for the
-    // PROVISIONAL re-pin.
+    // THE DRY CAPTURE (the round-7 corrective — the receiver-blend
+    // gate's own qualification discipline): the round-6 Ubuntu run
+    // measured 0/0/0 at every probe because the max-DISPLAYED-
+    // contrast search selected the road's own paint/texture edges
+    // (the crosswalk band projects into the scan band) — and the UV
+    // displacement never moves those: the sweep displaces ONLY the
+    // reflection sample, so the edge must be selected by the
+    // reflection CONTENT's own transition. The composite is
+    // displayed = content·b + dry·(1-b) (ground_reflect.wgsl: the
+    // reflection blended over the destination — the already-rendered
+    // lit ground the dry frame shows), so the sweep's expected
+    // magnitude at a full crossing is, per channel,
+    //     s = |Δwet − (1-b)·Δdry|
+    // (b·Δcontent recovered without division: a ground-term edge has
+    // Δwet = (1-b)·Δdry exactly and s = 0; a content edge over flat
+    // ground has s = b·Δcontent — the measured sweep itself). Walls
+    // never reach the sweep: opaque geometry above the plane is
+    // byte-identical wet and dry (the receiver redraw is depth-EQUAL
+    // on the ground only), so the receiver-response floor excludes
+    // it before the content math runs.
+    renderer.set_wet(false);
+    let dry = ripple_mode_capture(&mut renderer, &matrix, light, None, RippleDebugMode::Off);
+    renderer.set_wet(true);
+
+    // THE MEASURED ASYMMETRIC MIRROR FEATURE: the strongest
+    // reflection-CONTENT transition (the sweep magnitude s above)
+    // over the open road cross (the interior columns; the scan band
+    // sits below the horizon where the reflection draws), on pixels
+    // that respond to set_wet (live receiver) and whose CPU Schlick
+    // factor is inside the reflective band. The near-miss tracker
+    // carries the best sweep magnitude for the PROVISIONAL re-pin.
     let mut best: Option<(u32, u32, i32, usize, [f32; 3])> = None;
     let mut near_miss: Option<(u32, u32, i32)> = None;
+    // The best edge that qualified on sweep magnitude but sat too
+    // deep for the newborn push (the oracle-push selection's own
+    // diagnostic — the panic names it when nothing clears both).
+    let mut push_limited: Option<(u32, u32, f32)> = None;
     for y in ((height * 45 / 100)..(height * 92 / 100)).step_by(2) {
         for x in (width / 4..width * 3 / 4).step_by(2) {
             let (x, y) = (x as u32, y as u32);
-            let (a0, a1) = (baseline.pixel_rgba(x, y), baseline.pixel_rgba(x + 1, y));
-            let (channel, contrast) = (0..3)
-                .map(|c| (c, (a1[c] as i32 - a0[c] as i32).abs()))
-                .max_by_key(|&(_, diff)| diff)
-                .unwrap();
-            if near_miss.is_none_or(|(_, _, nm)| contrast > nm) {
-                near_miss = Some((x, y, contrast));
-            }
-            if contrast < 6 {
+            let (w0, w1) = (baseline.pixel_rgba(x, y), baseline.pixel_rgba(x + 1, y));
+            let (d0, d1) = (dry.pixel_rgba(x, y), dry.pixel_rgba(x + 1, y));
+            // THE RECEIVER RESPONSE (the wall exclusion): both edge
+            // pixels must respond to set_wet — opaque geometry above
+            // the plane renders byte-identical wet and dry.
+            let responds =
+                |w: [u8; 4], d: [u8; 4]| (0..3).any(|c| (w[c] as i32 - d[c] as i32).abs() >= 2);
+            if !responds(w0, d0) || !responds(w1, d1) {
                 continue;
             }
             let Some(ground) = pixel_ground(forward, right, up, x, y) else {
@@ -930,23 +973,86 @@ fn ripple_signed_movement_gate() {
             if !(0.15..=0.9).contains(&b) {
                 continue;
             }
-            if best.is_none_or(|(_, _, bc, _, _)| contrast > bc) {
-                best = Some((x, y, contrast, channel, ground));
+            // THE SWEEP MAGNITUDE: the content transition in the
+            // channel that carries it — signed, because the sign IS
+            // the direction discriminator the sweep asserts use.
+            let (channel, signed_s) = (0..3)
+                .map(|c| {
+                    let dwet = w1[c] as i32 - w0[c] as i32;
+                    let ddry = d1[c] as i32 - d0[c] as i32;
+                    (c, dwet - ((1.0 - b) * ddry as f32) as i32)
+                })
+                .max_by_key(|&(_, s)| s.abs())
+                .unwrap();
+            if near_miss.is_none_or(|(_, _, ns)| signed_s.abs() > ns) {
+                near_miss = Some((x, y, signed_s.abs()));
+            }
+            const SWEEP_EDGE_FLOOR: i32 = 8;
+            if signed_s.abs() < SWEEP_EDGE_FLOOR {
+                continue;
+            }
+            if best.is_none_or(|(_, _, bs, _, _)| signed_s.abs() > bs) {
+                // THE ORACLE-PUSH GATE (the round-8 selection
+                // corrective): the newborn push shrinks with depth
+                // (the round-7 Windows actual measured 2.43 px at a
+                // content edge 20 m from the camera — under the
+                // 2.5 px the sweep asserts need), so the selection
+                // requires the CANDIDATE'S OWN oracle-projected
+                // probe push to clear the floor now: an edge that
+                // cannot be swept measurably is recorded as
+                // push-limited, never selected. The evaluation runs
+                // only for candidates that beat the current best,
+                // so the scan stays cheap.
+                let rows = oracle_rows(&[RippleRing {
+                    center: [ground[0], ground[2]],
+                    age: 0.005,
+                    amplitude: 1.0,
+                }]);
+                let probe = pixel_ground(forward, right, up, x.saturating_sub(1), y)
+                    .expect("the probe row is below the horizon");
+                let (world, _) = ripple_perturbation(&rows, [probe[0], probe[2]]);
+                let uv = projected_uv_offset(&matrix, probe, world);
+                let push_px = uv[0] * SIZE.0 as f32;
+                if push_px < 2.5 {
+                    if push_limited.is_none_or(|(_, _, p)| push_px > p) {
+                        push_limited = Some((x, y, push_px));
+                    }
+                    continue;
+                }
+                best = Some((x, y, signed_s, channel, ground));
             }
         }
     }
-    let Some((x_t, y_r, contrast, channel, center)) = best else {
-        let (nm_x, nm_y, nm_contrast) =
-            near_miss.expect("the lower frame has vertical transitions");
+    let Some((x_t, y_r, c, channel, center)) = best else {
+        if let Some((nm_x, nm_y, nm_s)) = near_miss {
+            panic!(
+                "PROVISIONAL gate: no reflection-content edge qualified for the sweep probe \
+                 (floor: sweep magnitude 8/255 at a full crossing). The best near-miss: \
+                 ({nm_x}, {nm_y}) sweep magnitude {nm_s} — re-pin the scan band or the sweep \
+                 floor from THIS platform's actuals"
+            );
+        }
+        let (pl_x, pl_y, pl_push) =
+            push_limited.expect("the lower frame has live receiver pixels with content edges");
         panic!(
-            "PROVISIONAL gate: no reflective-cross vertical edge qualified for the sweep \
-             probe. The best near-miss: ({nm_x}, {nm_y}) contrast {nm_contrast}/255 (floor \
-             6) — re-pin the scan band or the contrast floor from THIS platform's actuals"
-        );
+            "PROVISIONAL gate: every reflection-content edge sits too deep for the \
+             newborn push (the best push-limited: ({pl_x}, {pl_y}) projected probe push \
+             {pl_push} px < 2.5) — re-pin the scan band toward the camera or the push \
+             floor from THIS platform's actuals"
+        )
     };
+    // The sign reference for the sweep asserts is the CONTENT-side
+    // contrast (b·Δcontent — the quantity that actually moves), not
+    // the displayed composite: a ground-term transition can cancel
+    // the content edge in the displayed frame while the sweep still
+    // crosses it.
     println!(
-        "sweep probe edge: transition at x {x_t}->{x_t}+1, row {y_r}, channel {channel}, \
-         contrast {contrast}/255, ground center {center:?}"
+        "sweep probe edge: reflection-content transition at x {x_t}->{x_t}+1, row {y_r}, \
+         channel {channel}, sweep magnitude {}/255 (displayed contrast {}), ground center \
+         {center:?}",
+        c.abs(),
+        baseline.pixel_rgba(x_t + 1, y_r)[channel] as i32
+            - baseline.pixel_rgba(x_t, y_r)[channel] as i32
     );
 
     // THE NEWBORN RING at the measured center (age 0.005 s — radius
@@ -1019,21 +1125,55 @@ fn ripple_signed_movement_gate() {
          actual"
     );
 
-    // THE MEASURED SWEEP: the signed transition contrast c (the
-    // right plateau minus the left, the probe's channel) and the
-    // displacement-only deltas at the probes. displayed(P) = ground
-    // x (1-b) + b x content(P + off): the (1-b) ground part cancels
+    // THE MEASURED SWEEP: the displacement-only deltas at the probes
+    // (the content-side contrast c is the sweep magnitude selected
+    // above — the quantity that actually moves). displayed(P) =
+    // dry·(1-b) + b·content(P + off): the (1-b) ground part cancels
     // in the delta, so a full crossing measures ~c itself.
-    let c = baseline.pixel_rgba(x_t + 1, y_r)[channel] as i32
-        - baseline.pixel_rgba(x_t, y_r)[channel] as i32;
     let delta = |frame: &engine_renderer::CapturedFrame, px: u32| -> i32 {
         frame.pixel_rgba(px, y_r)[channel] as i32 - baseline.pixel_rgba(px, y_r)[channel] as i32
     };
     let d_left = delta(&displacement, x_t.saturating_sub(1));
     let d_right = delta(&displacement, x_t + 2);
     let d_far = delta(&displacement, x_t.saturating_sub(10));
+    // THE YOUNG FIELD'S OWN INK CENSUS (the failure message must
+    // carry the whole field's measured displacement, not just three
+    // probe values): differing pixels, displayed-rgb movement, and
+    // the best moved pixel's position — a field that moves nothing
+    // anywhere is a dead upload (the probes then cannot be the
+    // story), a field that moves pixels elsewhere but not at the
+    // probes is a probe-position story.
+    let mut census_diff = 0usize;
+    let mut census_rgb = 0usize;
+    let mut census_best: Option<(u32, u32, i32)> = None;
+    for cy in 0..height {
+        for cx in 0..width {
+            let (a, b) = (
+                baseline.pixel_rgba(cx as u32, cy as u32),
+                displacement.pixel_rgba(cx as u32, cy as u32),
+            );
+            let rgb_delta = (0..3)
+                .map(|c| (a[c] as i32 - b[c] as i32).abs())
+                .max()
+                .unwrap();
+            if a != b {
+                census_diff += 1;
+            }
+            if rgb_delta >= 1 {
+                census_rgb += 1;
+            }
+            if census_best.is_none_or(|(_, _, bd)| rgb_delta > bd) {
+                census_best = Some((cx as u32, cy as u32, rgb_delta));
+            }
+        }
+    }
     println!(
-        "measured sweep (channel {channel}, transition contrast {c}): left {d_left}, \
+        "young field ink census: {census_diff} differing pixels, {census_rgb} rgb-moved, \
+         best moved {:?}",
+        census_best
+    );
+    println!(
+        "measured sweep (channel {channel}, sweep magnitude {c}): left {d_left}, \
          right {d_right}, plateau control {d_far}"
     );
     // OPPOSITE SIGNS on opposite sides of the ring center, each
@@ -1043,15 +1183,15 @@ fn ripple_signed_movement_gate() {
     // nothing, and fails these floors).
     assert!(
         d_left.abs() >= (c.abs() / 2).max(2),
-        "the left probe sweeps across the edge: |{d_left}| >= {} (the transition contrast \
+        "the left probe sweeps across the edge: |{d_left}| >= {} (the sweep magnitude \
          {c} halved for the filter's slack) — an inverted or dead UV term sweeps away \
          and crosses nothing",
         (c.abs() / 2).max(2)
     );
     assert!(
         d_right.abs() >= (c.abs() / 2).max(2),
-        "the right probe sweeps across the edge: |{d_right}| >= {} (the transition \
-         contrast {c} halved for the filter's slack)",
+        "the right probe sweeps across the edge: |{d_right}| >= {} (the sweep \
+         magnitude {c} halved for the filter's slack)",
         (c.abs() / 2).max(2)
     );
     assert!(
