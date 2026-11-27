@@ -130,11 +130,13 @@ pub(crate) struct PostFrameInputs<'a> {
     pub proxy_sets: Option<[vk::DescriptorSet; 3]>,
     pub shadowed: Option<&'a ShadowFrameParams>,
     pub sky: Option<&'a SkyFrameParams>,
-    /// The Era-1 wet reflection's ground re-draw lands inside THIS
-    /// pass (the HDR one) after the mesh draws — the frame flow's
-    /// mirrored-scene pass and barrier already preceded the scene
-    /// pass; the belt check keeps a dry frame off it.
-    pub wet: bool,
+    /// The wet reflection's ground re-draw placement (the frame
+    /// plan's derived field, S3 — previously this carried only the
+    /// wet bit and the record re-derived `Hdr` from it): the re-draw
+    /// lands inside THIS pass (the HDR one) after the mesh draws —
+    /// the frame flow's mirrored-scene pass and barrier already
+    /// preceded the scene pass; `None` keeps a dry frame off it.
+    pub ground: super::scene_record::GroundRedrawPass,
 }
 
 /// The extent-bound half of the post state: the per-slot HDR and
@@ -1363,12 +1365,10 @@ impl PostResources {
             // opaque kinds and the translucent rain kind — the
             // ordered blend (the recorder's own comments document
             // the defect this corrects; the main pass passes its
-            // own Main variant).
-            let ground = if inputs.wet {
-                scene_record::GroundRedrawPass::Hdr
-            } else {
-                scene_record::GroundRedrawPass::None
-            };
+            // own Main variant). The placement arrives as the frame
+            // plan's derived field (S3) — the HDR variant for a wet
+            // post frame, `None` on the dry one.
+            let ground = inputs.ground;
             match scene_record::record_corner_scene(
                 ctx,
                 pipes,

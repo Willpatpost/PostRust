@@ -109,6 +109,8 @@ use crate::config::DepthFormatPreference;
 pub(crate) mod corner;
 #[path = "descriptors.rs"]
 pub mod descriptors;
+#[path = "frame_plan.rs"]
+pub(crate) mod frame_plan;
 #[path = "frame_prepare.rs"]
 pub(crate) mod frame_prepare;
 #[path = "post_draw.rs"]
@@ -136,6 +138,7 @@ use crate::config::{
 use crate::overlay::OverlayVertex;
 use crate::scene::SceneVertex;
 use descriptors::DescriptorFoundation;
+use frame_plan::FramePlan;
 use frame_prepare::{FramePreparationResult, prepare_after_recreation, prepare_frame};
 #[allow(unused_imports)]
 use scene_record::record_corner_scene;
@@ -2323,25 +2326,33 @@ impl PipelineState {
     /// variant — review finding 6: the replacement replicates only
     /// proxy/indirect/shadow/post, never sky, reflection, or the HDR
     /// variants).
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// THE S3 CONSUMER (P4 D2 §4.2): the uses this dispatcher derives
+    /// arrive as the frame's EXPLICIT declaration — the
+    /// [`FramePlan`] built once per frame at the top of
+    /// `render_frame` — instead of being re-derived from the
+    /// positional `Option` parameters at each of the THREE call
+    /// sites (`prepare_frame`'s pre-recreation ensure, the
+    /// `Recreated` arm's re-run, and `prepare_after_recreation`). The
+    /// boolean ladder below is unchanged condition-for-condition
+    /// (each `uses` bit IS the former `Option` check — the
+    /// equivalence is pinned by `frame_plan`'s unit test); only the
+    /// derivation moved. The layered family-growth conditions
+    /// (`shadowed && proxy`, `post && proxy`, …) are now written
+    /// once against the plan's bits.
     fn ensure_frame_targets_and_resources(
         &mut self,
         ctx: &mut VulkanContext,
         swapchain: &SwapchainState,
         slot: usize,
-        proxy: Option<&proxy_draw::ProxyFrameUpload<'_>>,
-        shadowed: Option<&shadow_draw::ShadowFrameParams>,
-        sky: Option<&sky_draw::SkyFrameParams>,
-        post: bool,
-        wet: Option<&reflection_draw::WetCamera>,
-        region_vertices: &[SceneVertex],
-        foreground_vertices: &[SceneVertex],
+        plan: &FramePlan,
     ) -> Result<(), RendererError> {
+        let uses = &plan.uses;
         // Lazy region-scene buffer (Stage 4 final-verification finding):
         // allocated on first use only, outside command recording — the
         // default renderer path (no dynamic region geometry) pays no
         // allocation, mapping, or memory cost.
-        if !region_vertices.is_empty() || !foreground_vertices.is_empty() {
+        if uses.region_layers {
             self.ensure_region_capacity(ctx)?;
         }
 
@@ -2354,7 +2365,7 @@ impl PipelineState {
         // created at the first INDIRECT-mode populated frame only, so
         // the direct instanced path's allocation pins (the 6-E gates)
         // pay nothing for the mechanism they never touch.
-        if proxy.is_some() && ctx.corner.is_some() {
+        if uses.populated && ctx.corner.is_some() {
             self.ensure_proxy_resources(ctx)?;
             // The Era-2 companion: the npc kind ALWAYS skins (the
             // pose storage + the skinned pipeline exist from the
@@ -2363,7 +2374,7 @@ impl PipelineState {
             // waits for a populated POST frame (the family-growth
             // block below).
             self.ensure_skinned_resources(ctx)?;
-            if proxy.is_some_and(|upload| matches!(upload.mode, crate::ProxyDrawMode::Indirect))
+            if uses.indirect
                 && let Some(proxy_state) = self.proxy.as_mut()
             {
                 proxy_state.ensure_indirect(ctx)?;
@@ -2375,7 +2386,7 @@ impl PipelineState {
         // unshadowed corner path pays nothing. Structural invariant: a
         // shadowed frame implies corner resources (the safe layer's
         // scene-preference gate), which the ensure itself re-checks.
-        if shadowed.is_some() {
+        if uses.shadow_depth {
             self.ensure_shadow_resources(ctx)?;
         }
         // The shadowed-populated proxy state: one level deeper than the
@@ -2383,7 +2394,7 @@ impl PipelineState {
         // flow's ensure discipline guarantees shadows AND skinned exist
         // before the shadowed populated path is reached (shadows and
         // skinned are ensured above, so this is safe).
-        if shadowed.is_some() && proxy.is_some() && self.skinned.is_some() {
+        if uses.shadow_depth && uses.populated && self.skinned.is_some() {
             self.ensure_shadowed_proxy_resources(ctx)?;
         }
 
@@ -2391,7 +2402,7 @@ impl PipelineState {
         // first sky frame only, outside command recording — the skyless
         // path pays nothing, and a pipeline replacement re-ensures an
         // identical set at the next sky frame (the 6-F finding-A shape).
-        if sky.is_some() {
+        if uses.sky {
             self.ensure_sky_resources(ctx)?;
         }
 
@@ -2403,9 +2414,9 @@ impl PipelineState {
         // frame flow ensures their states (shadows, then sky, then
         // post — so the layouts exist by the time the variant
         // pipelines bind them).
-        if post {
+        if uses.post {
             self.ensure_post_resources(ctx, swapchain.format, swapchain.depth_format)?;
-            if shadowed.is_some()
+            if uses.shadow_depth
                 && let (Some(post_state), Some(shadow_state)) = (&mut self.post, &self.shadows)
             {
                 let layout = shadow_state.shadowed(slot).1;
@@ -2417,7 +2428,7 @@ impl PipelineState {
             // the same family-growth shape as the shadowed HDR
             // variant above; the skinned state itself was ensured
             // with the populated frame above).
-            if proxy.is_some()
+            if uses.populated
                 && let (Some(post_state), Some(skinned_state)) = (&mut self.post, &mut self.skinned)
             {
                 let retained = ctx.skinned_retained.as_ref().expect(
@@ -2438,7 +2449,7 @@ impl PipelineState {
             // pass exactly like the skinned HDR variant (the
             // finding-A discipline: the replacement replicates the
             // base states, the variants re-ensure lazily).
-            if proxy.is_some()
+            if uses.populated
                 && let Some(post_state) = &mut self.post
             {
                 let proxy_layout = self.proxy_layout;
@@ -2454,8 +2465,8 @@ impl PipelineState {
             // the new pass exactly like the skinned HDR variant (the finding-A
             // discipline: the replacement replicates the base states, the
             // variants re-ensure lazily).
-            if proxy.is_some()
-                && shadowed.is_some()
+            if uses.populated
+                && uses.shadow_depth
                 && let (Some(post_state), Some(shadowed_proxy_state)) =
                     (&mut self.post, &mut self.shadowed_proxy)
             {
@@ -2465,7 +2476,7 @@ impl PipelineState {
                 );
                 shadowed_proxy_state.ensure_hdr(ctx, retained, post_state.hdr_render_pass())?;
             }
-            if sky.is_some()
+            if uses.sky
                 && let (Some(post_state), Some(sky_state)) = (&mut self.post, &self.sky)
             {
                 let layout = sky_state.set_and_layout().1;
@@ -2478,7 +2489,7 @@ impl PipelineState {
         // pass rides its HDR render pass object) — ensured ABOVE the
         // post chain's own ensure so the pass exists; the chain itself
         // stays optional.
-        if wet.is_some() {
+        if uses.wet {
             self.ensure_post_resources(ctx, swapchain.format, swapchain.depth_format)?;
             self.ensure_reflection_resources(ctx)?;
         }
@@ -4074,6 +4085,29 @@ pub(crate) fn render_frame(
     // Frame preparation: swapchain checks, lazy state, and target creation
     // before acquire (finding 20, Phase A; findings 3-8).
     let foreground_vertices = foreground.map_or(&[][..], |layer| layer.vertices);
+    // THE FRAME PLAN (P4 D2 §4.2, stage S3): the explicit pass-uses
+    // declaration, derived ONCE here from the input set — the same
+    // flat facts every route hands the frame flow. The THREE
+    // preparation sites below (the pre-recreation ensure, the
+    // Recreated arm's re-run, and the out-of-date path's
+    // re-preparation) and the record cascade's pass-variant decisions
+    // (the post/main branch, the wet ground's placement, the overlay
+    // upload gate) consume it instead of re-deriving the uses from
+    // the positional Options — the preparation triplication the
+    // design's §1.4 finding named. The equivalence to the implicit
+    // derivation this flow previously performed at each site is
+    // pinned by `frame_plan`'s unit test (the S1/S2 pattern).
+    let plan = FramePlan::derive(
+        region_vertices,
+        foreground_vertices,
+        hud,
+        debug_overlay,
+        proxy,
+        shadowed,
+        sky,
+        post,
+        wet,
+    );
     match prepare_frame(
         ctx,
         swapchain,
@@ -4083,13 +4117,7 @@ pub(crate) fn render_frame(
         present_preference,
         replace_pipelines,
         demo_scene,
-        proxy,
-        shadowed,
-        sky,
-        post,
-        wet,
-        region_vertices,
-        foreground_vertices,
+        &plan,
         frames.capture.pending,
     )? {
         FramePreparationResult::Deferred => {
@@ -4108,13 +4136,7 @@ pub(crate) fn render_frame(
                 present_preference,
                 replace_pipelines,
                 demo_scene,
-                proxy,
-                shadowed,
-                sky,
-                post,
-                wet,
-                region_vertices,
-                foreground_vertices,
+                &plan,
                 frames.capture.pending,
             )? {
                 FramePreparationResult::Deferred => {
@@ -4185,13 +4207,7 @@ pub(crate) fn render_frame(
             present_preference,
             replace_pipelines,
             demo_scene,
-            proxy,
-            shadowed,
-            sky,
-            post,
-            wet,
-            region_vertices,
-            foreground_vertices,
+            &plan,
             frames.capture.pending,
         )? {
             FramePreparationResult::Deferred => {
@@ -4317,7 +4333,10 @@ pub(crate) fn render_frame(
     }
     let overlay = &frames.overlay_slots[slot];
     outcome.overlay.capacity = overlay.capacity;
-    if !hud.is_empty() || !debug_overlay.is_empty() {
+    // The overlay upload's gate is the plan's overlay bit (the
+    // frame's explicit declaration — the same emptiness check the
+    // plan derived once at the top).
+    if plan.uses.overlay {
         (outcome.overlay, _) = unsafe {
             upload_layers(
                 overlay.mapped,
@@ -4484,8 +4503,12 @@ pub(crate) fn render_frame(
         // sequence and its synchronization). A postless frame takes
         // the main pass below, byte-identical to the pre-package
         // renderer (the post state may exist — the belt check
-        // keeps a postless frame off the chain regardless).
-        if let (Some(post_state), true) = (&pipes.post, post) {
+        // keeps a postless frame off the chain regardless). The
+        // branch is the plan's post bit — the scene-pass variant
+        // declaration (S3).
+        if plan.uses.post
+            && let Some(post_state) = &pipes.post
+        {
             let inputs = post_draw::PostFrameInputs {
                 slot,
                 image_index,
@@ -4496,7 +4519,10 @@ pub(crate) fn render_frame(
                 proxy_sets,
                 shadowed,
                 sky,
-                wet: wet.is_some(),
+                // The wet receiver's placement, derived once in the
+                // plan (the HDR variant here — the post chain's scene
+                // pass is the one a wet post frame records through).
+                ground: plan.ground,
             };
             // SAFETY: the command buffer is recording past the
             // shadow depth pass; this slot's fence wait passed (the
@@ -4546,12 +4572,11 @@ pub(crate) fn render_frame(
             // opaque kinds and the translucent rain kind — the
             // ordered blend (the reflection over the opaque ground,
             // the rain over the reflection). The recorder's own
-            // comments document the defect this corrects.
-            let ground = if wet.is_some() {
-                scene_record::GroundRedrawPass::Main
-            } else {
-                scene_record::GroundRedrawPass::None
-            };
+            // comments document the defect this corrects. The
+            // placement is the plan's ground field — derived once
+            // (the Main variant on a wet postless frame; the HDR
+            // variant routes through the post chain's own recorder).
+            let ground = plan.ground;
             match scene_record::record_corner_scene(
                 ctx,
                 pipes,
@@ -4642,11 +4667,13 @@ pub(crate) fn render_frame(
                     // now, finding 14; this else-branch keeps the
                     // pre-corrective position, after the draws,
                     // byte-identical for the static-scene frames).
-                    // SAFETY: the command buffer is inside the main
-                    // render pass, past the scene draws; this slot's
-                    // corner FrameParams region holds the true camera
-                    // (the frame flow's write).
-                    if wet.is_some()
+                    // The gate is the plan's wet bit (the frame's
+                    // explicit declaration). SAFETY: the command
+                    // buffer is inside the main render pass, past
+                    // the scene draws; this slot's corner
+                    // FrameParams region holds the true camera (the
+                    // frame flow's write).
+                    if plan.uses.wet
                         && let (Some(reflection_state), Some(corner)) =
                             (&pipes.reflection, &ctx.corner)
                     {
