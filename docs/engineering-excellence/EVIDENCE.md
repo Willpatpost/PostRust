@@ -52,13 +52,14 @@ sources (`.wgsl`/`.glsl`).
 core → {persist? no} (actual dependency edges to be mapped by P0 auditors:
 slice depends on all; renderer/shell/persist on core per manifests).
 
-## E-3 Model fleet (verified callable, 2026-11-26)
+## E-3 Model fleet (2026-11-26; labels corrected 2026-11-27 per the audit's IA-14)
 
-`tools.opencode.models` (odu provider): glm-5.3-w4a8, qwen3-coder-next,
-gpt-oss-120b, MiMo-V2.6-Pro-RL, qwen36-35b, qwen38-27b, qwen3-8-flash-next,
-gpt-oss-20b, gemma-4-31b, gemma-4-12b, gemma-4-e4b, diffusiongemma-26b —
-all active chat models. (Non-chat: embedding/ASR/TTS/audio per charter §3,
-not used for source judgment.)
+`tools.opencode.models` (odu provider) LISTED the twelve directive-named chat
+models (a catalog discovery — individual callability is evidenced only by the
+lanes that subsequently ran on each model, not by the listing itself):
+glm-5.3-w4a8, qwen3-coder-next, gpt-oss-120b, MiMo-V2.6-Pro-RL, qwen36-35b,
+qwen38-27b, qwen3-8-flash-next, gpt-oss-20b, gemma-4-31b, gemma-4-12b,
+gemma-4-e4b, diffusiongemma-26b.
 
 ## E-4 Seed-finding verification (2026-11-26, baseline tree, `git grep` exit 0)
 
@@ -82,10 +83,19 @@ still counted (correct for census), brace-in-string edge cases unhandled
 | engine-shell | ~1,854 | ~705 | ~498 |
 | engine-slice | ~43,976 | ~6,397 | ~56,475 |
 
-**Workspace production ≈ 128k lines; test material ≈ 155k+ lines** (inline
-+ tests/ dirs) — a test-heavy codebase by design; per-file prod counts feed
-A01 (split by change reason) and B15 (footprint claims must cite these, not
-whole-file sizes).
+**Workspace production ≈ 128k lines; test material ≈ 134,949 lines by the
+table's own mixed conventions** (inline + tests/ dirs) — a test-heavy codebase
+by design; per-file prod counts feed A01 (split by change reason) and B15
+(footprint claims must cite these, not whole-file sizes).
+
+**IA-13 CORRECTION (2026-11-27, per the independent audit):** this census has
+known defects — it omits `crates/engine-core/tests/` entirely (11 tracked
+files, 4,471 nonempty lines), the shader glob (15 WGSL) misses the four
+compiled GLSL inputs (`.vert`/`.frag`, enumerated by build.rs), and the
+earlier "155k+" total overstated the table's own mixed-convention sum
+(134,949; adding the omitted core tests alone yields 139,420). A regeneration
+from the tag with ONE line-count convention is queued (P6); until then the
+per-crate PRODUCTION figures remain the useful column.
 
 ## E-6 First integration-batch gate run (2026-11-26, Windows rig, tree `3439633`)
 
@@ -106,17 +116,22 @@ Linux values are the platform-uniform inference (+1), to be confirmed by the
 candidate's own CI run per the repo's established practice. No test weakened;
 the count moved because a corrective ADDED a test.
 
-## E-7 A24 rig verification (2026-11-26, Windows rig, RTX 5070 Ti, tree `1884582`)
+## E-7 A24 rig verification (2026-11-26, Windows rig, RTX 5070 Ti, tree `1884582`; labels corrected 2026-11-27 per the audit's IA-14)
 
 `cargo test -p engine-slice --test render_weather -- --ignored --nocapture
 --test-threads=1` (real GPU, real windows, validation on, no offscreen driver —
-the rig discipline): **11 passed / 0 failed, exit 0, 7.29 s**. Pinned values
-reproduce digit-for-digit: rain ink 17041 differing bytes; broadside ink
-3482 px / 2162 upper-third; allocation constancy 12 distinct captures with
-the AllocationStats tuple (19/4/1589248/3/7/2); ripple sweep 22/255 at the
+the rig discipline): **11 passed / 0 failed, exit 0, 7.29 s**. The gates'
+MEASURED observations (the ink counts and term-separation counts as printed);
+their ASSERTIONS are acceptance floors (e.g. ink ≥ 200, term separation ≥ its
+floor) — the floors are the pinned contract, the printed values the measured
+evidence; within-build double-run equality is what the byte-equality gates
+prove (no cross-build comparison is claimed by this run). Measured values
+from the log: rain ink 17041 differing bytes; broadside ink 3482 px / 2162
+upper-third; allocation constancy 12 distinct captures with the
+AllocationStats tuple (19/4/1589248/3/7/2); ripple sweep 22/255 at the
 recorded ground center; term separation 96548/67535/7625 blend-only and
-27149/27149/2538 displacement-only; double-run byte-equality, N-vs-1, and
-composition smokes ok. Log: `Temp\opencode\ee\artifacts\gates-a24-render-weather-rig.log`.
+27149/27149/2538 displacement-only; the composition smokes ok. Log:
+`Temp\opencode\ee\artifacts\gates-a24-render-weather-rig.log`.
 This is the A24 equivalence-bar proof: the scripted route's weather campaign
 reproduces exactly on the real GPU through the explicit-dt plumbing.
 
@@ -134,7 +149,17 @@ These are the "before" numbers the P2/P3/P5 packages are judged against.
 - compaction (150-tick history): 1.16 ms; compacted snapshot 124,968 B vs full 220,438 B (retain 100)
 - **PP-B3 retention section PANICS on Windows** — see NEW-SLICE-06 (the tier-gated reclamation-begin legitimately refuses on `ProcessCrashOnly` Windows; the harness unwraps it where local.rs's own tests cfg-gate). PP-B3 baselines remain pod-only.
 
-**Entity-scale (600 ticks × {1k,5k,20k} × {full,mixed,event-driven}, all DOUBLE-RUN IDENTICAL):**
+**Entity-scale (600 ticks × {1k,5k,20k} × {full,mixed,event-driven}, all DOUBLE-RUN IDENTICAL) —**
+**IA-12 CORRECTION (2026-11-27, per the independent audit): the 5k and 20k
+rows are WITHDRAWN as evidence of continuously-active workloads at those
+scales — the harness's `routine_payload_parts` codec rejects identities ≥
+`NPC_COUNT` (1000), so only the first 1,000 identities run recurring chains
+(the same read-through defect CURRENT-STATUS documented historically; the
+archived logs confirm 1,000 pending at all three scales). The measurements
+stand under their ACTUAL workload description: 1,000 recurring chains amid
+{5k, 20k} initial dispatches and full-population fingerprinting. A
+scale-capable versioned benchmark is queued (the sustained-load harness
+already uses its own codec and retains its evidentiary basis):**
 - 1k: full median 0.019/p99 0.034 · mixed 0.010/0.017 · event-driven 0.002/0.005 ms/tick
 - 5k: full 0.019/0.049 · mixed 0.011/0.031 · event-driven 0.002/0.011
 - 20k: full 0.019/0.065 · mixed 0.011/0.061 · event-driven 0.002/0.048

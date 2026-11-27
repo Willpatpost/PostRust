@@ -635,7 +635,11 @@ jobs:
           # code and green on the single protocol rerun — a
           # one-time parallel-test race in the fresh-bootstrap
           # check, occurrence and diff-relevance analysis
-          # recorded; Linux the platform-uniform inference, to
+          # recorded — IA-08 CORRECTION 2026-11-27: the
+          # race is a HYPOTHESIS, not a verified cause;
+          # the raw logs establish only the bootstrap
+          # refusal and the successful rerun; Linux the
+          # platform-uniform inference, to
           # be confirmed by the candidate's run).
           # ENGINEERING EXCELLENCE P3-L2 (2026-11-26, the
           # refactor/engineering-excellence branch): the reclaim
@@ -686,7 +690,11 @@ jobs:
           # refactor/engineering-excellence branch): the spine
           # bulk-partition adds 3 platform-uniform engine-core
           # lib tests (the layout-independence pin, the
-          # partition equivalence, the allocation shape):
+          # partition equivalence, and the empty and
+          # single-entry lane shapes — IA-08 correction
+          # 2026-11-27: the third test exercises lane
+          # shapes, not allocations; the allocation
+          # observations were separate):
           # 1431 + 3 = 1434 Linux / 1380 + 3 = 1383 Windows
           # (Windows main MEASURED locally on the integrated
           # tree with this step's own awk — 1383/2/33, exit 0,

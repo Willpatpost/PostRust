@@ -1,13 +1,25 @@
 # engine-renderer + shaders audit (P0, read-only)
 
-> **Provenance note (orchestrator, 2026-11-26):** the renderer auditor
-> delivered its full report through its completion message but never wrote
-> the report FILE (a bookkeeping failure caught by the P4 design agent —
-> FINDINGS/AGENTS referenced a phantom). This file re-materializes the
-> report verbatim from that message so the audit evidence is durable
-> in-repo; the orchestrator's reconciliation of it (2 claims refuted, 1
-> miscount, 6 duplicates folded) lives in FINDINGS.md's seed rows and the
-> calibration record, committed at `fdab946`.
+> **Provenance note (orchestrator, 2026-11-26; CORRECTED 2026-11-27 per the
+> independent audit's IA-10):** the renderer auditor delivered its full report
+> through its completion message (message `msg_21aa7c0d50013GZKML1sTRr51r`,
+> part 1; UTF-8 text SHA-256
+> `c60c6ded395176efda961aae12f79550bb677b9fe9ad2c16c0e3604347e61e3b`) but
+> never wrote the report file. This file is an ANNOTATED RECONSTRUCTION, not
+> a verbatim recovery: the original's false framing passages (its claim to
+> have created the file; its closing "19 seed verdicts" summary — the table
+> carries 15) were omitted, and later-fix annotations were added inside the
+> table. Two further corrections from the audit: the original's seed verdict
+> describing `nalgebra` and `validation`/`replace-pipelines` features
+> describes a manifest that does not match crates/engine-renderer/Cargo.toml
+> and is SUPERSEDED (the manifest lists ash/bytemuck/font8x8/naga/sdl3 and
+> defines no such feature pair — the dependency-tightness conclusion itself
+> stands on the actual manifest); and the orchestrator's reconciliation
+> committed at `fdab946` enumerated "six folds" where the IDs number five
+> (01, 03, 08, 09, 10 — two refutations and three retained findings out of
+> ten NEW-REND items). The orchestrator's reconciliation of this audit (2
+> claims refuted, 1 miscount, the folds) lives in FINDINGS.md's seed rows and
+> the calibration record.
 
 - **Auditor:** gpt-oss-120b
 - **Date:** 2026-11-26
