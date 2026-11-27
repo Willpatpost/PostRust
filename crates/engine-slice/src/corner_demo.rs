@@ -405,6 +405,43 @@ impl LocomotionCrowd {
     }
 }
 
+/// The weather's PRE-SUBMISSION tick consumption (finding 18's
+/// ordering discipline — the presented frame shows one completed
+/// rain tick): the rain layer advances `ticks` times with the
+/// frame's camera and cycle tint. R04's consumption law, weather
+/// half — extracted from `run_free_look` so the discipline is
+/// unit-testable against the real crowd + rain machinery (the inline
+/// test drives it through the deferred frame's shape).
+fn consume_weather_ticks(
+    crowd: &mut LocomotionCrowd,
+    camera_position: [f32; 3],
+    camera_yaw: f32,
+    rain_t: f32,
+    ticks: u32,
+) {
+    for _ in 0..ticks {
+        crowd.update_rain(camera_position, camera_yaw, rain_t, DEMO_CLOCK_DT_F32);
+    }
+}
+
+/// The crowd's POST-ATTEMPT tick consumption (R04's corrective): the
+/// SAME share the weather consumed above the submission
+/// ([`CoherentTickShares::crowd`]), stepped after the render attempt
+/// on EITHER outcome — presented or deferred — so presentation
+/// failure never desyncs the crowd from the weather clock. The
+/// pre-fix loop stepped the crowd only after a successful
+/// presentation: a deferred frame (the drawable temporarily
+/// unavailable, mid-transition) burned the ticks the accumulator had
+/// already consumed — the rain and the day/night cycle advanced on
+/// them, the crowd never stepped them, and the two clocks desynced
+/// permanently (the R04 gap). Extracted so the discipline is
+/// unit-testable.
+fn consume_crowd_ticks(crowd: &mut LocomotionCrowd, ticks: u32) {
+    for _ in 0..ticks {
+        crowd.step(DEMO_CLOCK_DT_F32);
+    }
+}
+
 /// Two seconds per segment at the reference 60 Hz. Uncapped runs present
 /// the identical sequence. Shared waypoints appear once, including both ends.
 pub fn route_poses() -> impl ExactSizeIterator<Item = RouteWaypoint> {
@@ -1239,8 +1276,13 @@ fn run_free_look(
         // ONE accumulator feed per frame: the world (crowd, rain,
         // day/night) advances in coherent 1/60 ticks off the SAME
         // accumulated wall time, with bounded catch-up (the cap) and
-        // visible drop accounting beyond it.
-        let ticks = sim_accumulator.advance(split.sim_advance);
+        // visible drop accounting beyond it. R04's COHERENT SHARES:
+        // the crowd and the weather consume the SAME extracted ticks
+        // on every frame that attempts presentation — the weather
+        // pre-submission (finding 18's order), the crowd after the
+        // attempt, presented or deferred alike (see
+        // `CoherentTickShares` and the deferred branch below).
+        let shares = sim_accumulator.advance_coherent(split.sim_advance);
         // Era 1 package 4: the free-look clock drives the cycle from
         // the CUMULATIVE tick count (the session's total advanced
         // ticks × the fixed dt — a monotone cycle position, never a
@@ -1263,14 +1305,11 @@ fn run_free_look(
         // THE RAIN UPDATE PRECEDES THE SUBMISSION (the audit's
         // finding 18 corrective — rain and rings present from ONE
         // completed tick): per-tick with the camera's CURRENT yaw and
-        // the cycle's current tint, the same `ticks` the crowd steps
-        // on below (one clock, all three subsystems).
+        // the cycle's current tint, the same `shares.weather` ticks
+        // the crowd steps on below (one clock, all three subsystems).
         if let Some(crowd) = crowd.as_mut() {
             let rain_t = cycle_t.unwrap_or(if night { 1.0 } else { 0.0 });
-            // Advance rain once per tick.
-            for _ in 0..ticks {
-                crowd.update_rain(camera.position, camera.yaw, rain_t, DEMO_CLOCK_DT_F32);
-            }
+            consume_weather_ticks(crowd, camera.position, camera.yaw, rain_t, shares.weather);
         }
         let vertical = i8::from(app.is_held(Keycode::R)) - i8::from(app.is_held(Keycode::F));
         let sprint = app.is_held(Keycode::LShift);
@@ -1338,6 +1377,22 @@ fn run_free_look(
         if frame.deferred {
             // The drawable is temporarily unavailable (mid-transition):
             // poll quietly, present nothing, retry — no recreation storm.
+            // R04's coherence: this frame's ticks are NOT lost for the
+            // crowd. The weather consumed `shares.weather` above the
+            // submission (finding 18's order, pinned by the
+            // render_weather gates), so the crowd consumes the SAME
+            // `shares.crowd` here, before the retry — the pre-fix loop
+            // `continue`d past the crowd's step and permanently
+            // dropped the ticks the accumulator had already consumed
+            // (the crowd fell behind the rain and the day/night cycle:
+            // the R04 gap). The audible projection below stays
+            // presentation-side: a deferred frame observes nothing, and
+            // the walkers' committed phases carry to the next presented
+            // frame's observation — the same multi-step-then-observe
+            // shape the minimized-accrue catch-up already uses.
+            if let Some(crowd) = crowd.as_mut() {
+                consume_crowd_ticks(crowd, shares.crowd);
+            }
             std::thread::sleep(Duration::from_millis(50));
             continue;
         }
@@ -1347,27 +1402,28 @@ fn run_free_look(
         if crowd.is_some() && frame.geometry.proxy_draw_calls == 0 {
             return Err("free-look populated session drew no proxy calls".into());
         }
-        // The crowd's tick (render-then-step — the SAME `ticks` the
-        // rain and the cycle advanced on above: one accumulator, one
-        // clock; a deferred frame presents nothing and the crowd
-        // skips its ticks — presentation-only divergence in a mode
-        // that claims nothing, documented rather than silently
-        // dropped). The rain layer's own tick moved ABOVE the
-        // submission (finding 18); only the locomotion batch steps
-        // here.
+        // The crowd's tick (render-then-step — the SAME `shares.crowd`
+        // ticks the rain and the cycle advanced on above: one
+        // accumulator, one clock, one consumption plan; the deferred
+        // branch above stepped the identical count, so a deferred
+        // presentation never desyncs the crowd from the weather —
+        // R04's corrective, closing the loop's old documented
+        // divergence). Only the locomotion batch steps here; the
+        // rain layer's own tick moved ABOVE the submission
+        // (finding 18).
         if let Some(crowd) = crowd.as_mut() {
-            // Step the crowd for each accumulated tick.
-            for _ in 0..ticks {
-                crowd.step(DEMO_CLOCK_DT_F32);
-            }
+            consume_crowd_ticks(crowd, shares.crowd);
         }
         // Era 2 package B part 3 — THE AUDIBLE CROWD (after the
         // composed tick, presentation-side): the walking NPCs'
         // footsteps through the trigger projection into the SDL3
         // device layer, and the listener from the camera's own pose.
-        // Skipped identically to the tick above (a frame that steps
-        // nothing accumulates nothing — feet only move on presented
-        // frames).
+        // Presentation-side by contract (the audio map's constraint
+        // 1.1): presented frames only — a deferred frame's crowd
+        // ticks (the R04 branch above) are observed at the NEXT
+        // presented frame's projection, the committed phases carrying
+        // across (the same multi-step-then-observe shape the
+        // minimized-accrue catch-up uses).
         if let (Some(audio), Some(crowd)) = (audio_device.as_mut(), crowd.as_ref()) {
             let crowd: &LocomotionCrowd = crowd;
             observations.clear();
@@ -1522,6 +1578,95 @@ mod tests {
             camera.view_projection(16. / 9.),
             view_projection(pose, 16. / 9.)
         );
+    }
+
+    /// R04's end-to-end half: the REAL crowd + rain machinery driven
+    /// through the free-look loop's own consumption path
+    /// (`advance_coherent` + `consume_weather_ticks` +
+    /// `consume_crowd_ticks`) across the finding's frame shape —
+    /// presented, DEFERRED, presented. A genuine deferred submission
+    /// needs a drawable mid-transition (a renderer/window condition
+    /// the headless harness cannot construct), so the frame OUTCOME
+    /// is the modeled part; the extraction and both consumption sites
+    /// are the loop's own code. The coherent discipline leaves the
+    /// crowd on the 3-tick reference (locomotion states, packed
+    /// instances, and pose blocks tick-for-tick identical to a
+    /// reference crowd stepped 3 times), while the rain lands on the
+    /// same digest in every arm — the rain was never
+    /// presentation-gated; that asymmetry WAS the finding. The
+    /// PRE-FIX discipline (the crowd skipping the deferred frame's
+    /// ticks) lands the crowd on the 2-tick reference: asserted
+    /// DIFFERENT from the coherent outcome — the discriminating
+    /// proof that this test sees the gap it exists to close.
+    #[test]
+    fn deferred_frame_consumption_keeps_the_real_crowd_and_rain_in_lockstep() {
+        let dt = crate::corner_timing::demo_clock_dt();
+        // The free-look start: the route's entry waypoint — the same
+        // eye the rain layer's warm start used (`with_rain`'s own
+        // construction), the same orientation conversion the first
+        // presented frame's matrix evaluates.
+        let waypoint = camera_route()[0];
+        let offset = std::array::from_fn(|i| waypoint.look_at[i] - waypoint.position[i]);
+        let (yaw, _) = waypoint_orientation(offset);
+        // The loop's frame sequence: presented, DEFERRED (presents
+        // nothing, retries), presented — three extracted frames, the
+        // middle one presenting nothing.
+        let run = |coherent: bool| -> LocomotionCrowd {
+            let mut crowd = LocomotionCrowd::with_rain(None);
+            let mut accumulator = FixedTimestepAccumulator::new();
+            for deferred in [false, true, false] {
+                let shares = accumulator.advance_coherent(dt);
+                // The weather consumes pre-submission (finding 18) on
+                // EVERY arm — the loop's own helper (the rain was
+                // never presentation-gated; that was the asymmetry).
+                consume_weather_ticks(&mut crowd, waypoint.position, yaw, 0.0, shares.weather);
+                // [The submission would be here; `deferred` is its
+                // outcome.] The crowd consumes post-attempt — the
+                // loop's own helper — presented or deferred alike
+                // (R04); the pre-fix discipline skips the deferred
+                // frame's step.
+                if coherent || !deferred {
+                    consume_crowd_ticks(&mut crowd, shares.crowd);
+                }
+            }
+            crowd
+        };
+        let coherent = run(true);
+        let pre_fix = run(false);
+        // The straight references: fresh crowds driven whole ticks
+        // (weather + crowd together, the scripted route's own shape).
+        let reference = |ticks: u32| -> LocomotionCrowd {
+            let mut crowd = LocomotionCrowd::with_rain(None);
+            for _ in 0..ticks {
+                consume_weather_ticks(&mut crowd, waypoint.position, yaw, 0.0, 1);
+                consume_crowd_ticks(&mut crowd, 1);
+            }
+            crowd
+        };
+        let three = reference(3);
+        let two = reference(2);
+        // THE LOCKSTEP: the coherent run's crowd is EXACTLY the
+        // 3-tick reference — the deferred frame's tick was consumed,
+        // not dropped (states, instances, poses: the full packed
+        // surface the renderer would show).
+        assert_eq!(coherent.states(), three.states());
+        assert_eq!(coherent.instances, three.instances);
+        assert_eq!(coherent.poses, three.poses);
+        // THE GAP, demonstrated: the pre-fix run's crowd is EXACTLY
+        // the 2-tick reference (the deferred frame's tick dropped),
+        // and therefore different from the coherent outcome.
+        assert_eq!(pre_fix.states(), two.states());
+        assert_ne!(pre_fix.states(), coherent.states());
+        // THE ASYMMETRY the finding named: the rain consumed the SAME
+        // ticks in every arm — same emitter digest, same ripple
+        // digest, in the coherent run, the pre-fix run, AND the
+        // 3-tick reference. Under the pre-fix discipline the weather
+        // stood at 3 ticks while the crowd stood at 2; the coherent
+        // shares close exactly that gap.
+        assert_eq!(coherent.rain_fold_state(), three.rain_fold_state());
+        assert_eq!(coherent.ripple_fold_state(), three.ripple_fold_state());
+        assert_eq!(pre_fix.rain_fold_state(), coherent.rain_fold_state());
+        assert_eq!(pre_fix.ripple_fold_state(), coherent.ripple_fold_state());
     }
 
     /// The world-AABB clamp: an inside point is returned UNCHANGED
