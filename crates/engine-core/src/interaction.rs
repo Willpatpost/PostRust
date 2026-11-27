@@ -110,9 +110,17 @@ pub fn select_target(
         let distance = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
         if distance == 0.0 {
             // The eye is inside the target's extent: dead-ahead by
-            // definition.
+            // definition (surface 0.0 — the same surface a distant
+            // target with radius ≥ distance clamps to, so the
+            // documented lowest-id tie governs here exactly as the
+            // normal branch's equality does; the pre-fix form used
+            // strict less, silently preferring iteration order over
+            // the contract the module header promises).
             let candidate = (target.id, 0.0f32);
-            if best.is_none_or(|(_, best_d)| candidate.1 < best_d) {
+            let better = best.is_none_or(|(best_id, best_d)| {
+                candidate.1 < best_d || (candidate.1 == best_d && target.id < best_id)
+            });
+            if better {
                 best = Some(candidate);
             }
             continue;
@@ -168,7 +176,6 @@ mod tests {
         };
         let targets = [target(1, [0.0, 1.0, -2.0]), target(2, [0.0, 1.0, -4.0])];
         assert_eq!(select_target(&targets, eye, forward, &query), Some(1));
-
         // A large extent discounts the surface distance: the "far"
         // target with a 3 m radius is nearer by surface.
         let targets = [
@@ -383,6 +390,58 @@ mod tests {
             select_target(&[infinite_far, negative, valid], eye, forward, &query),
             Some(1),
             "invalid targets do not displace the valid candidate"
+        );
+    }
+
+    /// P2-L1 (the B06 conformance fix): two EYE-INSIDE targets tie at
+    /// surface 0.0 — the documented lowest-id tie governs, never
+    /// iteration order (the pre-fix zero-distance branch used strict
+    /// less, silently preferring whichever came first).
+    #[test]
+    fn zero_distance_ties_break_by_lowest_id() {
+        let (eye, forward) = eye_forward();
+        let query = InteractionQuery {
+            range: 5.0,
+            ..InteractionQuery::default()
+        };
+        // The higher id FIRST: the pre-fix form returned it (first
+        // encountered at equal distance); the contract returns 3.
+        let targets = [target(7, eye), target(3, eye)];
+        assert_eq!(
+            select_target(&targets, eye, forward, &query),
+            Some(3),
+            "the eye-inside tie breaks by the lowest id, never iteration order"
+        );
+        // Both orders agree (order-independence is the point).
+        let reversed = [target(3, eye), target(7, eye)];
+        assert_eq!(select_target(&reversed, eye, forward, &query), Some(3));
+    }
+
+    /// P2-L1: an eye-inside target (surface 0.0) and a distant target
+    /// whose radius clamps its surface to 0.0 tie — the lowest id
+    /// wins in EITHER encounter order (the mixed-shape contract the
+    /// normal branch's equality already half-carried).
+    #[test]
+    fn zero_distance_ties_with_clamped_surface_by_lowest_id() {
+        let (eye, forward) = eye_forward();
+        let query = InteractionQuery {
+            range: 10.0,
+            ..InteractionQuery::default()
+        };
+        let inside_high = target(9, eye);
+        let clamped_low = InteractionTarget {
+            id: 4,
+            position: [0.0, 1.0, -5.0],
+            radius: 6.0,
+        };
+        assert_eq!(
+            select_target(&[inside_high, clamped_low], eye, forward, &query),
+            Some(4)
+        );
+        assert_eq!(
+            select_target(&[clamped_low, inside_high], eye, forward, &query),
+            Some(4),
+            "the tie is order-independent"
         );
     }
 }
