@@ -1134,11 +1134,15 @@ impl InstanceExtensionPlan {
         // and a real-GPU loader that lacks the headless extension
         // is unchanged.
         // The correct extension for macOS is VK_EXT_metal_surface.
-        // VK_KHR_metal_surface does not exist; VK_MVK_macos_surface is deprecated
-        // and superseded by VK_EXT_metal_surface (2020-07-31).
-        // VK_KHR_display_surface does not exist; the display enumeration extension
-        // is VK_KHR_display but it doesn't provide a surface creation function.
-        // All remaining entries are ratified extensions from the Khronos registry.
+        // VK_KHR_metal_surface does not exist (removed by the P1-B09 fix).
+        // VK_MVK_macos_surface is deprecated and superseded by
+        // VK_EXT_metal_surface (2020-07-31), but it IS a real extension
+        // name legacy MoltenVK loaders advertise — it stays in the list so
+        // a legacy windowed macOS list is still classified as having a
+        // platform surface and never receives the headless fallback.
+        // VK_KHR_display_surface does not exist; display WSI is
+        // VK_KHR_display (which provides vkCreateDisplayPlaneSurfaceKHR),
+        // a different name no SDL list carries, so no entry is needed here.
         const PLATFORM_SURFACE_EXTENSIONS: &[&str] = &[
             "VK_KHR_win32_surface",
             "VK_KHR_xlib_surface",
@@ -1147,6 +1151,7 @@ impl InstanceExtensionPlan {
             "VK_KHR_android_surface",
             "VK_EXT_metal_surface",
             "VK_EXT_headless_surface",
+            "VK_MVK_macos_surface",
             "VK_GGP_stream_descriptor_surface",
             "VK_NN_vi_surface",
             "VK_FUCHSIA_imagepipe_surface",

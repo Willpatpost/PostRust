@@ -12,9 +12,9 @@ main checkout `C:\Users\Willp\Code\GitHub\PostRust` on
 | auditor-persist | read-only audit, engine-persist / gpt-oss-120b | 5b93167 | read-only, no branch | P0 | COMPLETED — `audits/persist.md`; verdicts reconciled in FINDINGS.md (A13 label corrected) |
 | auditor-renderer | read-only audit, engine-renderer+shaders / gpt-oss-120b | 5b93167 | read-only, no branch | P0 | COMPLETED — `audits/renderer.md`; 2 claims refuted + 1 miscount on orchestrator verification (see FINDINGS.md calibration record) |
 | auditor-shell | read-only audit, engine-shell / qwen38-27b | 5b93167 | read-only, no branch | P0 | RUNNING |
-| auditor-slice | read-only audit, engine-slice / qwen36-35b | 5b93167 | read-only, no branch | P0 | RUNNING |
-| lane-a16 | implementation, ordered confirm / qwen3-coder-next | 00a637c | `Temp\opencode\ee\a16`, `ee/p1-a16-ordered-confirm` | P1-A16 | RUNNING |
+| auditor-slice | read-only audit, engine-slice / qwen36-35b | 5b93167 | read-only, no branch | P0 | COMPLETED — `audits/slice.md`; B04 quote fabricated + consequences overstated, reconciled by orchestrator read (see FINDINGS.md) |
+| lane-a16 | implementation, ordered confirm / qwen3-coder-next | 00a637c | lane commit `118e193` → integrated `f9901f3` | P1-A16 | FIXED-AWAITING-REVIEW — integrated; full workspace gates at batch close |
 | lane-a17 | implementation, rest-transform caching / qwen3-coder-next | 00a637c | `Temp\opencode\ee\a17`, `ee/p1-a17-rest-caching` | P1-A17 | RUNNING |
-| lane-b09 | implementation, metal-surface literal / qwen3-coder-next | 00a637c | `Temp\opencode\ee\b09`, `ee/p1-b09-metal-surface` | P1-B09 | RUNNING |
+| lane-b09 | implementation, metal-surface literal / qwen3-coder-next | 00a637c | lane commit `2ddef05` → integrated `9dce061` + orchestrator corrective | P1-B09 | FIXED-AWAITING-REVIEW — integrated with the MVK restoration corrective; full workspace gates at batch close |
 
 Retired/completed agents stay listed with their final status and evidence link.

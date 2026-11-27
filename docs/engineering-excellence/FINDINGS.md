@@ -30,7 +30,7 @@ corrected).
 | A11 | REND | CONFIRMED | — | MAX_INSTANCES=4096 = MAX_POSE_BLOCKS; region capacity per FRAMES_IN_FLIGHT (scene.rs:319) |
 | A12 | REND | CONFIRMED | — | 1:1 shadowed/skinned shader variant pairs + per-variant descriptor layouts (audits/renderer.md duplication matrix) |
 | A13 | PERSIST | CONFIRMED | — | **auditor labeled "Refuted" but its own evidence confirms the mixing** (validate_observed local.rs:714, validate local.rs:1656 interleaved with append/commit in the same modules; no dedicated pure-validation layer) — label corrected by orchestrator |
-| A16 | PERSIST | CONFIRMED | ee/p1-a16-ordered-confirm | verified `pipeline.rs:1394`; lane IN-PROGRESS |
+| A16 | PERSIST | FIXED-AWAITING-REVIEW | integrated `f9901f3` | lane `118e193` reviewed: ordered merge verified sound (decode enforces ascending-unique at pipeline.rs:208-212; error semantics traced identical in all divergence cases); gates green, zero test changes → no pin movement; awaits batch gate run |
 | A17 | REND/SLICE | CONFIRMED | ee/p1-a17-rest-caching | verified `animation.rs:420` (+ usages shadow_draw.rs:928, reflection_draw.rs:1402), `corner_routes.rs:617`; lane IN-PROGRESS |
 | A18 | REND | CONFIRMED | — | repack_populations proxy_instances.rs:699-706 + repack_poses animation.rs:729 per frame; folds NEW-REND-08 (static-population caching = P5 dirty-generation question) |
 | A19 | REND | CONFIRMED | — | ground_reflect.wgsl:144-166 per-fragment loop over all rings; folds NEW-REND-09 |
@@ -51,7 +51,7 @@ corrected).
 | B06 | CORE | UNTRIAGED | — | pending auditor-core |
 | B07 | CORE | UNTRIAGED | — | pending auditor-core |
 | B08 | SHELL | UNTRIAGED | — | pending auditor-shell |
-| B09 | REND | CONFIRMED | ee/p1-b09-metal-surface | verified `vulkan.rs:1142`; lane IN-PROGRESS; auditor cross-checked the REST of PLATFORM_SURFACE_EXTENSIONS clean |
+| B09 | REND | FIXED-AWAITING-REVIEW | integrated `9dce061` + corrective | lane `2ddef05` reviewed: metal literal fixed + never-existed display_surface removed + one focused test; **orchestrator corrective restored `VK_MVK_macos_surface`** (deprecated but REAL — legacy MoltenVK loaders advertise it; its removal re-opened the exact misclassification class the fix closes); lane citation inaccuracy recorded (VK_KHR_display does provide vkCreateDisplayPlaneSurfaceKHR); +1 test → pin correction at batch gate close; awaits batch gate run |
 | B12 | CORE | UNTRIAGED | — | pending auditor-core |
 | B14 | REND | CONFIRMED | — | full-size RGBA16F reflection targets per slot + HDR/bloom targets; P5 measurement package |
 | B15 | WORKSPACE | PARTIAL (rend half) | — | renderer dep closure tight (ash/bytemuck/nalgebra + engine-core); full workspace measurement pending P0/P6 |
