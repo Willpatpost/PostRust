@@ -2,6 +2,7 @@
 //! — or, with `--free-look` (Era 1), the interactive eyeball camera:
 //! presentation only, never a measured claim.
 use crate::corner_population::Block;
+use crate::corner_timing::{DEMO_CLOCK_DT_F32, FixedTimestepAccumulator};
 use crate::frame_timing::FrameTiming;
 use crate::math::{Mat4, camera_forward, camera_right, camera_view, mul, percentile, perspective};
 use crate::render_demo::free_flight_look_delta;
@@ -152,6 +153,12 @@ struct LocomotionCrowd {
     /// When rain is enabled, the rain layer that owns the emitter
     /// and builds instances per frame.
     rain: Option<crate::corner_weather::RainLayer>,
+    /// Fixed-timestep accumulator for the crowd's simulation steps.
+    /// Accumulates presented-frame sim time and drives the world at
+    /// exactly 1/60 per tick, with bounded catch-up and visible drop
+    /// accounting beyond the cap.
+    #[allow(dead_code)]
+    step_accumulator: FixedTimestepAccumulator,
 }
 
 impl LocomotionCrowd {
@@ -187,6 +194,7 @@ impl LocomotionCrowd {
             vehicles,
             spine: None,
             rain: None,
+            step_accumulator: FixedTimestepAccumulator::new(),
         }
     }
 
@@ -259,6 +267,7 @@ impl LocomotionCrowd {
             vehicles,
             spine: Some(spine),
             rain: None,
+            step_accumulator: FixedTimestepAccumulator::new(),
         }
     }
 
@@ -279,18 +288,20 @@ impl LocomotionCrowd {
                     decimation,
                     ..crate::corner_weather::RIPPLE_POLICY
                 },
+                crate::corner_timing::demo_clock_dt().as_secs_f32(),
             ),
         });
         crowd
     }
 
-    /// The plain step: batch, instances, poses.
-    fn step_plain(&mut self) {
+    /// The plain step: batch, instances, poses. Advances the crowd
+    /// by the given dt (from the fixed-timestep accumulator).
+    fn step_plain(&mut self, dt: f32) {
         engine_core::npc_locomotion::advance_batch(
             &self.routes,
             &mut self.states,
             &self.present,
-            1.0 / 60.0,
+            dt,
             None,
             0.3,
             1.75,
@@ -301,11 +312,12 @@ impl LocomotionCrowd {
 
     /// The composed step: spine.run_tick() then composed_tick() then
     /// instances/poses re-packs (borrow states from the world).
-    fn step_composed(&mut self) {
+    /// Advances the world by the given dt (from the fixed-timestep
+    /// accumulator).
+    fn step_composed(&mut self, dt: f32) {
         let spine = self.spine.as_mut().expect("behavior spine exists");
         spine.run_tick();
         let world = spine.world_mut();
-        let dt = 1.0 / 60.0;
         world.composed_tick(dt);
         // Borrow states from the world and re-pack instances/poses.
         crate::corner_routes::corner_instances_into(
@@ -317,11 +329,13 @@ impl LocomotionCrowd {
     }
 
     /// One step: plain or composed depending on behavior flag.
-    fn step(&mut self) {
+    /// Uses the fixed-timestep accumulator to determine how many
+    /// ticks to advance based on accumulated wall time.
+    fn step(&mut self, dt: f32) {
         if self.spine.is_some() {
-            self.step_composed();
+            self.step_composed(dt);
         } else {
-            self.step_plain();
+            self.step_plain(dt);
         }
     }
 
@@ -349,9 +363,10 @@ impl LocomotionCrowd {
     /// Updates the rain layer for one frame, building instances and
     /// ticking the emitter. `camera_position` and `camera_yaw` are
     /// from the current frame's view. `day_night` is the cycle position.
-    fn update_rain(&mut self, camera_position: [f32; 3], camera_yaw: f32, day_night: f32) {
+    /// `dt` is the fixed-timestep delta (typically DEMO_CLOCK_DT = 1/60).
+    fn update_rain(&mut self, camera_position: [f32; 3], camera_yaw: f32, day_night: f32, dt: f32) {
         if let Some(rain) = &mut self.rain {
-            let _report = rain.update_and_build(camera_position, camera_yaw, day_night);
+            let _report = rain.update_and_build(camera_position, camera_yaw, day_night, dt);
         }
     }
 
@@ -722,6 +737,7 @@ pub fn run(
                             decimation,
                             ..crate::corner_weather::RIPPLE_POLICY
                         },
+                        crate::corner_timing::demo_clock_dt().as_secs_f32(),
                     ),
                 });
                 crowd
@@ -876,6 +892,10 @@ pub fn run(
     let mut light = if night { night_preset() } else { day_preset() };
     let bias = demo_bias();
     let pace = (fps > 0).then(|| Duration::from_secs_f64(1. / f64::from(fps)));
+    // FrameTiming for the scripted route: tracks real wall time between
+    // presented frames. The accumulator in LocomotionCrowd uses this
+    // sim_advance to drive fixed-timestep stepping at 1/60 per tick.
+    let mut timing = FrameTiming::new();
     // Era 1 package 4: the day/night cycle's banner (the wiring
     // below advances the atmosphere — the light AND the sky layer,
     // which the cycle implies — with each loop's own demo clock).
@@ -912,12 +932,19 @@ pub fn run(
     let mut intervals = Distribution::new(count);
     let mut gpu = Distribution::new(count);
     let mut previous = Instant::now();
+
     for i in 0..measured.end + lag {
-        let start = Instant::now();
+        let frame_start = Instant::now();
         let input = app.frame();
         if input.quit_requested || input.minimized || app.window().size_in_pixels() != size {
             return Err("route interrupted by close, minimize or resize".into());
         }
+        // Frame-boundary timing: the accumulator gets the full sim
+        // advance (no cap - the brief's "simulation time is never
+        // silently discarded" policy) which drives the crowd's
+        // fixed-timestep stepping. The camera uses FrameTiming's
+        // 100 ms cap to prevent teleportation on post-stall frames.
+        let _split = timing.begin_frame(frame_start, !input.minimized);
         if measured.contains(&i) {
             pose = poses.next().unwrap();
         }
@@ -960,7 +987,7 @@ pub fn run(
             let rain_t = day_night
                 .map(|period| engine_renderer::sky::cycle_position(i as f32 / 60.0, period))
                 .unwrap_or(if night { 1.0 } else { 0.0 });
-            crowd.update_rain(pose.position, yaw, rain_t);
+            crowd.update_rain(pose.position, yaw, rain_t, DEMO_CLOCK_DT_F32);
         }
         // The rain-ripple field (Era-2 package C recursive item 1):
         // packed into the renderer's sticky wet state BEFORE the
@@ -1014,18 +1041,19 @@ pub fn run(
             return Err("populated route drew no proxy calls".into());
         }
         // THE CROWD'S TICK (render-then-step): the submission above
-        // presented frame i; one deterministic 1/60 batch step now
-        // advances the crowd for frame i+1 — the instances and pose
-        // blocks re-evaluated into their retained buffers (zero
-        // allocation; the presentation-only crowd never enters the
-        // spine, a fingerprint, or a measured claim). The rain
+        // presented frame i; advance the crowd based on accumulated
+        // wall time at exactly 1/60 per tick, with bounded catch-up
+        // and visible drop accounting beyond the cap. The rain
         // layer's own tick moved ABOVE the submission (finding 18);
         // only the locomotion batch steps here.
         if let Some(crowd) = crowd.as_mut() {
-            crowd.step();
+            // Step the crowd once per presented frame at the reference
+            // 60 Hz cadence. The crowd.step() contract is render-then-step:
+            // the k-th presented frame shows the crowd after k ticks.
+            crowd.step(DEMO_CLOCK_DT_F32);
         }
         if measured.contains(&i) {
-            cpu.record((end - start).as_secs_f64() * 1000.);
+            cpu.record((end - frame_start).as_secs_f64() * 1000.);
             intervals.record((end - previous).as_secs_f64() * 1000.);
         }
         // Query results belong to the previous submission in this slot.
@@ -1037,7 +1065,7 @@ pub fn run(
         }
         previous = end;
         if let Some(period) = pace {
-            pace_until(start + period);
+            pace_until(frame_start + period);
         }
     }
     if renderer.stats().gpu_timestamps_supported && gpu.exact_ms.len() != count {
@@ -1189,6 +1217,7 @@ fn run_free_look(
     let mut triggers: Vec<SoundTrigger> = Vec::new();
     let mut camera = FreeLookCamera::at_waypoint(camera_route()[0]);
     let mut timing = FrameTiming::new();
+    let mut sim_accumulator = FixedTimestepAccumulator::new();
     let mut presented: u64 = 0;
     // The standing warmed-allocations gate: snapshot after the
     // route's own warmup count, assert at exit when no swapchain
@@ -1204,29 +1233,46 @@ fn run_free_look(
         }
         // Frame-boundary timing: the camera step uses the capped
         // frame delta (FrameTiming's 100 ms cap — a post-stall frame
-        // never teleports the view) and takes NO step on minimized
-        // frames (no presentation, no movement — the render-demo
-        // discipline).
+        // never teleports the view). The accumulator collects sim
+        // time and drives the crowd/rain/day/night clocks per tick
+        // at exactly 1/60 per tick.
         let split = timing.begin_frame(frame_start, !snapshot.minimized);
+        if snapshot.minimized {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        // The accumulator drives the crowd, rain, and day/night
+        // clocks per tick at exactly 1/60 per tick, with bounded
+        // catch-up and visible drop accounting. All three clocks
+        // advance together for coherence.
+        let ticks = sim_accumulator.advance(split.sim_advance);
         // Era 1 package 4: the free-look clock drives the cycle (the
-        // wall elapsed time FrameTiming accumulates — presentation
-        // policy only; the interactive session makes no measured
-        // claim).
+        // accumulator-based tick count advances the atmosphere — the
+        // light AND the sky layer). The cycle uses the tick-based
+        // time (DEMO_CLOCK_DT_F32 per tick) for determinism.
         if let Some(period) = day_night {
-            let atmosphere =
-                engine_renderer::sky::atmosphere_at(engine_renderer::sky::cycle_position(
-                    timing.total_sim_advanced().as_secs_f32(),
-                    period,
-                ));
+            let atmosphere = engine_renderer::sky::atmosphere_at(
+                engine_renderer::sky::cycle_position(ticks as f32 * DEMO_CLOCK_DT_F32, period),
+            );
             light = atmosphere.light;
             renderer.set_sky(Some(engine_renderer::SkyFrame {
                 palette: atmosphere.sky,
                 disc_dir: atmosphere.disc_dir,
             }));
         }
-        if snapshot.minimized {
-            std::thread::sleep(Duration::from_millis(50));
-            continue;
+        // Update rain per tick to stay coherent with crowd and
+        // day/night. The rain layer's step accepts dt as f32, so we
+        // use the bit-identical DEMO_CLOCK_DT_F32 constant.
+        if let Some(crowd) = crowd.as_mut() {
+            let rain_t = day_night
+                .map(|period| {
+                    engine_renderer::sky::cycle_position(ticks as f32 * DEMO_CLOCK_DT_F32, period)
+                })
+                .unwrap_or(if night { 1.0 } else { 0.0 });
+            // Advance rain once per tick.
+            for _ in 0..ticks {
+                crowd.update_rain(camera.position, camera.yaw, rain_t, DEMO_CLOCK_DT_F32);
+            }
         }
         let vertical = i8::from(app.is_held(Keycode::R)) - i8::from(app.is_held(Keycode::F));
         let sprint = app.is_held(Keycode::LShift);
@@ -1278,17 +1324,7 @@ fn run_free_look(
         // default was always day, painting day-tinted streaks over
         // a static-night scene; the scripted route already
         // distinguished night in the same situation).
-        if let Some(crowd) = crowd.as_mut() {
-            let rain_t = day_night
-                .map(|period| {
-                    engine_renderer::sky::cycle_position(
-                        timing.total_sim_advanced().as_secs_f32(),
-                        period,
-                    )
-                })
-                .unwrap_or(if night { 1.0 } else { 0.0 });
-            crowd.update_rain(camera.position, camera.yaw, rain_t);
-        }
+
         // The rain-ripple field (Era-2 package C recursive item 1),
         // from the JUST-COMPLETED tick above — the frame renders
         // the ripple field and the rain instances of the SAME tick.
@@ -1341,13 +1377,25 @@ fn run_free_look(
         if crowd.is_some() && frame.geometry.proxy_draw_calls == 0 {
             return Err("free-look populated session drew no proxy calls".into());
         }
-        // The crowd's tick (render-then-step — one deterministic 1/60
-        // batch step per PRESENTED frame; a minimized or deferred frame
-        // presents nothing and steps nothing). The rain layer's own
-        // tick moved ABOVE the submission (finding 18); only the
-        // locomotion batch steps here.
-        if let Some(crowd) = crowd.as_mut() {
-            crowd.step();
+        // The crowd's tick (render-then-step — advance based on
+        // accumulated wall time at exactly 1/60 per tick, with
+        // bounded catch-up and visible drop accounting beyond the
+        // cap; a minimized or deferred frame presents nothing and
+        // steps nothing). The rain layer's own tick moved ABOVE the
+        // submission (finding 18); only the locomotion batch steps
+        // here.
+        if !snapshot.minimized && frame.presented {
+            // Only advance on presented frames (minimized frames
+            // advance the accumulator but don't step the world).
+            let ticks = sim_accumulator.advance(split.sim_advance);
+            if ticks > 0
+                && let Some(crowd) = crowd.as_mut()
+            {
+                // Step the crowd for each accumulated tick.
+                for _ in 0..ticks {
+                    crowd.step(DEMO_CLOCK_DT_F32);
+                }
+            }
         }
         // Era 2 package B part 3 — THE AUDIBLE CROWD (after the
         // composed tick, presentation-side): the walking NPCs'

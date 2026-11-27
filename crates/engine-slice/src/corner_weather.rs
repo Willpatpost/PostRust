@@ -26,7 +26,7 @@
 //! `--populated`. The demo's policy constants are documented
 //! below. The census lines in the exit summary surface the
 //! per-campaign totals (the rain's and the ripple's).
-
+use crate::corner_timing::demo_clock_dt;
 use engine_core::particle::{Emitter, SpawnVolume};
 use engine_core::weather::{RainPolicy, Weather};
 use engine_renderer::proxy_instances::{InstanceTransform, ProxyInstance};
@@ -212,7 +212,11 @@ impl RainLayer {
     /// dt=1/60 against the route's first camera position). The first
     /// presented frame is already wet.
     pub fn new(camera_position: [f32; 3]) -> Self {
-        Self::with_ripple_policy(camera_position, RIPPLE_POLICY)
+        Self::with_ripple_policy(
+            camera_position,
+            RIPPLE_POLICY,
+            demo_clock_dt().as_secs_f32(),
+        )
     }
 
     /// The A/B-diagnostic constructor (the ripple-visibility
@@ -223,6 +227,7 @@ impl RainLayer {
     pub fn with_ripple_policy(
         camera_position: [f32; 3],
         policy: engine_core::ripple::RipplePolicy,
+        dt: f32,
     ) -> Self {
         // The initial volume: the frustum AABB intersected with the
         // scene AABB. The camera is at `camera_position`, looking at
@@ -264,7 +269,7 @@ impl RainLayer {
         let mut warm_kill_deaths: u64 = 0;
         for _ in 0..132 {
             let report = emitter
-                .tick_observing_kill_deaths(1.0 / 60.0, |position| {
+                .tick_observing_kill_deaths(dt, |position| {
                     warm_kill_deaths += 1;
                     // The typed spawn refusal, counted at the site
                     // (never swallowed — unreachable at this policy's
@@ -279,7 +284,7 @@ impl RainLayer {
             record_census(&mut spawned, &mut died, &mut refused, &report);
             previous_active = u64::from(report.active);
             ripples
-                .tick(1.0 / 60.0)
+                .tick(dt)
                 .expect("the warm-start dt is finite and nonnegative");
         }
 
@@ -317,13 +322,15 @@ impl RainLayer {
     /// the overhead band — never the world receiver plane);
     /// `camera_yaw` is the listener's yaw (for the billboard turn,
     /// computed once per build); `day_night` is the cycle position
-    /// for the tint derivation. Returns the tick report for census
+    /// for the tint derivation. `dt` is the fixed-timestep delta
+    /// (typically 1/60). Returns the tick report for census
     /// accumulation.
     pub fn update_and_build(
         &mut self,
         camera_position: [f32; 3],
         camera_yaw: f32,
         day_night: f32,
+        dt: f32,
     ) -> engine_core::particle::TickReport {
         // 1. Volume refresh, LIKE-FOR-LIKE (the corrective): the
         //    emitter's config volume is the BAND rain_emitter_config
@@ -381,7 +388,7 @@ impl RainLayer {
         let mut ripple_refused_this_tick: u32 = 0;
         let report = self
             .emitter
-            .tick_observing_kill_deaths(1.0 / 60.0, |position| {
+            .tick_observing_kill_deaths(dt, |position| {
                 self.kill_deaths += 1;
                 if let Some(overflow) = self.ripples.observe_death(position) {
                     ripple_refused_this_tick += overflow.dropped;
@@ -390,7 +397,7 @@ impl RainLayer {
             .expect("the demo's dt is finite and nonnegative");
         let ripple_report = self
             .ripples
-            .tick(1.0 / 60.0)
+            .tick(dt)
             .expect("the demo's dt is finite and nonnegative");
         assert_eq!(
             ripple_report.refused, ripple_refused_this_tick,
@@ -601,6 +608,7 @@ fn atmosphere_ambient(day_night: f32) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::corner_timing::demo_clock_dt;
     use engine_renderer::proxy_instances::instance_columns;
 
     /// The campaign's fixed first eye (the route's entry waypoint —
@@ -700,7 +708,7 @@ mod tests {
         let mut layer = RainLayer::new(FIRST_EYE);
         let mut hasher = engine_core::fingerprint::Fingerprinter::new();
         for tick in 1..=600u32 {
-            layer.update_and_build(FIRST_EYE, 0.0, 0.0);
+            layer.update_and_build(FIRST_EYE, 0.0, 0.0, demo_clock_dt().as_secs_f32());
             if tick % 60 == 0 {
                 layer.ripple_field().fold_state(&mut hasher);
             }
@@ -771,7 +779,7 @@ mod tests {
         let mut layer = RainLayer::new(FIRST_EYE);
         let kill_deaths_at_window_start = layer.kill_deaths();
         for _ in 0..600 {
-            layer.update_and_build(FIRST_EYE, 0.0, 0.0);
+            layer.update_and_build(FIRST_EYE, 0.0, 0.0, demo_clock_dt().as_secs_f32());
         }
         let contacts = layer.kill_deaths() - kill_deaths_at_window_start;
         let seconds = 600.0 / 60.0;
@@ -817,7 +825,7 @@ mod tests {
         //     contacts land, and the receiver stays at street level.
         let mut layer = RainLayer::new(FIRST_EYE);
         for _ in 0..120 {
-            layer.update_and_build(FIRST_EYE, 0.0, 0.0);
+            layer.update_and_build(FIRST_EYE, 0.0, 0.0, demo_clock_dt().as_secs_f32());
             assert_eq!(
                 layer.receiver_plane(),
                 engine_renderer::lit_scene::GROUND_Y,
@@ -840,7 +848,7 @@ mod tests {
                 FIRST_EYE[1],
                 FIRST_EYE[2] - step as f32 * 0.5,
             ];
-            layer.update_and_build(eye, 0.0, 0.0);
+            layer.update_and_build(eye, 0.0, 0.0, demo_clock_dt().as_secs_f32());
             assert_eq!(
                 layer.receiver_plane(),
                 engine_renderer::lit_scene::GROUND_Y,
@@ -870,7 +878,7 @@ mod tests {
         let mut rings_high_window = 0u64;
         for step in 0..400u32 {
             let eye = [0.0, 1.7 + step as f32 * (30.0 - 1.7) / 400.0, 0.0];
-            climbing.update_and_build(eye, 0.0, 0.0);
+            climbing.update_and_build(eye, 0.0, 0.0, demo_clock_dt().as_secs_f32());
             assert_eq!(
                 climbing.receiver_plane(),
                 engine_renderer::lit_scene::GROUND_Y,
@@ -925,7 +933,7 @@ mod tests {
         // The drain: the street cohort lands within its remaining
         // fall (<= 1.55 s = 93 ticks).
         for _ in 0..150 {
-            layer.update_and_build(high_eye, 0.0, 0.0);
+            layer.update_and_build(high_eye, 0.0, 0.0, demo_clock_dt().as_secs_f32());
         }
         let kill_deaths_after_drain = layer.kill_deaths();
         let rings_after_drain = layer.ripple_spawned;
@@ -935,7 +943,7 @@ mod tests {
         );
         // The steady high regime: 300 ticks, zero contacts.
         for _ in 0..300 {
-            layer.update_and_build(high_eye, 0.0, 0.0);
+            layer.update_and_build(high_eye, 0.0, 0.0, demo_clock_dt().as_secs_f32());
         }
         assert_eq!(
             layer.kill_deaths(),
@@ -970,7 +978,7 @@ mod tests {
     fn ripple_census_conservation() {
         let mut layer = RainLayer::new(FIRST_EYE);
         for tick in 1..=600u32 {
-            layer.update_and_build(FIRST_EYE, 0.0, 0.0);
+            layer.update_and_build(FIRST_EYE, 0.0, 0.0, demo_clock_dt().as_secs_f32());
             if tick % 60 == 0 {
                 let attempts = layer.ripple_spawned + layer.ripple_refused;
                 let outcomes = layer.ripple_expired
@@ -1016,7 +1024,7 @@ mod tests {
         let run = || {
             let mut layer = RainLayer::new(FIRST_EYE);
             for _ in 0..600 {
-                layer.update_and_build(FIRST_EYE, 0.0, 0.0);
+                layer.update_and_build(FIRST_EYE, 0.0, 0.0, demo_clock_dt().as_secs_f32());
             }
             layer.fold_state()
         };
@@ -1048,7 +1056,7 @@ mod tests {
     fn census_conservation() {
         let mut layer = RainLayer::new(FIRST_EYE);
         for _ in 0..600 {
-            layer.update_and_build(FIRST_EYE, 0.0, 0.0);
+            layer.update_and_build(FIRST_EYE, 0.0, 0.0, demo_clock_dt().as_secs_f32());
         }
         assert_eq!(
             layer.spawned,
@@ -1167,7 +1175,7 @@ mod tests {
     fn packed_instances_carry_the_completed_tick() {
         let mut layer = RainLayer::new(FIRST_EYE);
         for tick in 1..=120u32 {
-            let report = layer.update_and_build(FIRST_EYE, 0.0, 0.0);
+            let report = layer.update_and_build(FIRST_EYE, 0.0, 0.0, demo_clock_dt().as_secs_f32());
             assert_eq!(
                 layer.instances.len(),
                 report.active as usize,
@@ -1185,13 +1193,13 @@ mod tests {
         let mut layer = RainLayer::new(FIRST_EYE);
         let old_yaw = 0.0f32;
         let new_yaw = 0.83f32; // an off-cardinal heading, ~47.6 degrees
-        layer.update_and_build(FIRST_EYE, old_yaw, 0.0);
+        layer.update_and_build(FIRST_EYE, old_yaw, 0.0, demo_clock_dt().as_secs_f32());
         let old_turn = yaw_to_turn(old_yaw);
         assert!(
             layer.instances.iter().all(|i| i.transform.turn == old_turn),
             "the first pack carries the first yaw"
         );
-        layer.update_and_build(FIRST_EYE, new_yaw, 0.0);
+        layer.update_and_build(FIRST_EYE, new_yaw, 0.0, demo_clock_dt().as_secs_f32());
         let new_turn = yaw_to_turn(new_yaw);
         assert_ne!(old_turn, new_turn, "the witness yaws differ");
         assert!(
@@ -1214,7 +1222,7 @@ mod tests {
             "the night and day ambients differ (the witness)"
         );
         let mut layer = RainLayer::new(FIRST_EYE);
-        layer.update_and_build(FIRST_EYE, 0.0, 1.0);
+        layer.update_and_build(FIRST_EYE, 0.0, 1.0, demo_clock_dt().as_secs_f32());
         assert!(
             !layer.instances.is_empty(),
             "the warm-started layer packs streaks on the first update"
@@ -1225,7 +1233,7 @@ mod tests {
              day default)"
         );
         // The day control: the same call at t=0 packs the day tint.
-        layer.update_and_build(FIRST_EYE, 0.0, 0.0);
+        layer.update_and_build(FIRST_EYE, 0.0, 0.0, demo_clock_dt().as_secs_f32());
         assert!(
             layer.instances.iter().all(|i| i.tint == day),
             "the day control packs the day ambient"
@@ -1246,7 +1254,7 @@ mod tests {
         let rings_before = layer.ripple_spawned;
         let mut ring_tick = None;
         for tick in 1..=600u32 {
-            let report = layer.update_and_build(FIRST_EYE, 0.0, 0.0);
+            let report = layer.update_and_build(FIRST_EYE, 0.0, 0.0, demo_clock_dt().as_secs_f32());
             if layer.ripple_spawned > rings_before && ring_tick.is_none() {
                 ring_tick = Some(tick);
                 assert_eq!(
