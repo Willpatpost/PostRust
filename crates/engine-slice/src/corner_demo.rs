@@ -892,10 +892,6 @@ pub fn run(
     let mut light = if night { night_preset() } else { day_preset() };
     let bias = demo_bias();
     let pace = (fps > 0).then(|| Duration::from_secs_f64(1. / f64::from(fps)));
-    // FrameTiming for the scripted route: tracks real wall time between
-    // presented frames. The accumulator in LocomotionCrowd uses this
-    // sim_advance to drive fixed-timestep stepping at 1/60 per tick.
-    let mut timing = FrameTiming::new();
     // Era 1 package 4: the day/night cycle's banner (the wiring
     // below advances the atmosphere — the light AND the sky layer,
     // which the cycle implies — with each loop's own demo clock).
@@ -939,12 +935,6 @@ pub fn run(
         if input.quit_requested || input.minimized || app.window().size_in_pixels() != size {
             return Err("route interrupted by close, minimize or resize".into());
         }
-        // Frame-boundary timing: the accumulator gets the full sim
-        // advance (no cap - the brief's "simulation time is never
-        // silently discarded" policy) which drives the crowd's
-        // fixed-timestep stepping. The camera uses FrameTiming's
-        // 100 ms cap to prevent teleportation on post-stall frames.
-        let _split = timing.begin_frame(frame_start, !input.minimized);
         if measured.contains(&i) {
             pose = poses.next().unwrap();
         }
@@ -1238,37 +1228,45 @@ fn run_free_look(
         // at exactly 1/60 per tick.
         let split = timing.begin_frame(frame_start, !snapshot.minimized);
         if snapshot.minimized {
+            // The campaign clock never silently pauses (the
+            // no-silent-discard rule): minimized time ACCRUES in the
+            // accumulator — the world catches up, bounded by the cap,
+            // on the next presented frame.
+            sim_accumulator.accrue(split.sim_advance);
             std::thread::sleep(Duration::from_millis(50));
             continue;
         }
-        // The accumulator drives the crowd, rain, and day/night
-        // clocks per tick at exactly 1/60 per tick, with bounded
-        // catch-up and visible drop accounting. All three clocks
-        // advance together for coherence.
+        // ONE accumulator feed per frame: the world (crowd, rain,
+        // day/night) advances in coherent 1/60 ticks off the SAME
+        // accumulated wall time, with bounded catch-up (the cap) and
+        // visible drop accounting beyond it.
         let ticks = sim_accumulator.advance(split.sim_advance);
-        // Era 1 package 4: the free-look clock drives the cycle (the
-        // accumulator-based tick count advances the atmosphere — the
-        // light AND the sky layer). The cycle uses the tick-based
-        // time (DEMO_CLOCK_DT_F32 per tick) for determinism.
-        if let Some(period) = day_night {
-            let atmosphere = engine_renderer::sky::atmosphere_at(
-                engine_renderer::sky::cycle_position(ticks as f32 * DEMO_CLOCK_DT_F32, period),
-            );
+        // Era 1 package 4: the free-look clock drives the cycle from
+        // the CUMULATIVE tick count (the session's total advanced
+        // ticks × the fixed dt — a monotone cycle position, never a
+        // per-frame reset). The cycle advances the atmosphere — the
+        // light AND the sky layer.
+        let cycle_t = day_night.map(|period| {
+            engine_renderer::sky::cycle_position(
+                sim_accumulator.ticks_advanced() as f32 * DEMO_CLOCK_DT_F32,
+                period,
+            )
+        });
+        if let Some(t) = cycle_t {
+            let atmosphere = engine_renderer::sky::atmosphere_at(t);
             light = atmosphere.light;
             renderer.set_sky(Some(engine_renderer::SkyFrame {
                 palette: atmosphere.sky,
                 disc_dir: atmosphere.disc_dir,
             }));
         }
-        // Update rain per tick to stay coherent with crowd and
-        // day/night. The rain layer's step accepts dt as f32, so we
-        // use the bit-identical DEMO_CLOCK_DT_F32 constant.
+        // THE RAIN UPDATE PRECEDES THE SUBMISSION (the audit's
+        // finding 18 corrective — rain and rings present from ONE
+        // completed tick): per-tick with the camera's CURRENT yaw and
+        // the cycle's current tint, the same `ticks` the crowd steps
+        // on below (one clock, all three subsystems).
         if let Some(crowd) = crowd.as_mut() {
-            let rain_t = day_night
-                .map(|period| {
-                    engine_renderer::sky::cycle_position(ticks as f32 * DEMO_CLOCK_DT_F32, period)
-                })
-                .unwrap_or(if night { 1.0 } else { 0.0 });
+            let rain_t = cycle_t.unwrap_or(if night { 1.0 } else { 0.0 });
             // Advance rain once per tick.
             for _ in 0..ticks {
                 crowd.update_rain(camera.position, camera.yaw, rain_t, DEMO_CLOCK_DT_F32);
@@ -1298,42 +1296,14 @@ fn run_free_look(
         } else {
             size.0 as f32 / size.1 as f32
         };
-        // THE RAIN UPDATE PRECEDES THE SUBMISSION (the audit's
-        // finding 18 corrective — free-look rain and rings present
-        // from ONE completed tick, with THIS frame's camera): the
-        // layer advances its emitter and ripple field one tick,
-        // then packs the post-tick instances with the camera's
-        // CURRENT yaw and the ACTIVE atmosphere. The pre-corrective
-        // order rendered the retained instances first and updated
-        // after — the next frame's ring state ran one simulation
-        // step ahead of the rendered drop snapshot, and the
-        // billboards carried the preceding camera yaw (a witness
-        // could see the old falling drop beside its newly emitted
-        // ring). The crowd's own tick stays render-then-step below;
-        // a DEFERRED frame (the drawable-transition continue below)
-        // advances the rain without presenting it — presentation-
-        // only state in a mode that claims nothing, documented
-        // here rather than silently dropped.
-        // For free-look, the camera yaw is from the FreeLookCamera
-        // (the live interactive camera drives the billboard basis
-        // and the listener — presentation only, never a
-        // fingerprint); the tint rides the cycle's current position
-        // when active (the same t the atmosphere above consumed),
-        // else the STATIC PRESET — night when the session started
-        // --night (the audit's finding 18 palette half: the old
-        // default was always day, painting day-tinted streaks over
-        // a static-night scene; the scripted route already
-        // distinguished night in the same situation).
-
-        // The rain-ripple field (Era-2 package C recursive item 1),
-        // from the JUST-COMPLETED tick above — the frame renders
-        // the ripple field and the rain instances of the SAME tick.
-        // free-look does not carry the `wet` flag — the renderer's
-        // own sticky setting IS the state (set at startup from the
-        // flag; reading it back is exact). The sticky setter is the
-        // presentation bridge: the field state itself is
-        // deterministic sim state (the campaign digest pins it) —
-        // the setter only copies it into the frame's uniform.
+        // The rain update ran ABOVE (per-tick, before the submission)
+        // — the frame renders the ripple field and the rain instances
+        // of the SAME tick. free-look does not carry the `wet` flag —
+        // the renderer's own sticky setting IS the state (set at
+        // startup from the flag; reading it back is exact). The
+        // sticky setter is the presentation bridge: the field state
+        // itself is deterministic sim state (the campaign digest pins
+        // it) — the setter only copies it into the frame's uniform.
         if renderer.wet() {
             renderer.set_ripple_field(
                 crowd
@@ -1377,24 +1347,18 @@ fn run_free_look(
         if crowd.is_some() && frame.geometry.proxy_draw_calls == 0 {
             return Err("free-look populated session drew no proxy calls".into());
         }
-        // The crowd's tick (render-then-step — advance based on
-        // accumulated wall time at exactly 1/60 per tick, with
-        // bounded catch-up and visible drop accounting beyond the
-        // cap; a minimized or deferred frame presents nothing and
-        // steps nothing). The rain layer's own tick moved ABOVE the
+        // The crowd's tick (render-then-step — the SAME `ticks` the
+        // rain and the cycle advanced on above: one accumulator, one
+        // clock; a deferred frame presents nothing and the crowd
+        // skips its ticks — presentation-only divergence in a mode
+        // that claims nothing, documented rather than silently
+        // dropped). The rain layer's own tick moved ABOVE the
         // submission (finding 18); only the locomotion batch steps
         // here.
-        if !snapshot.minimized && frame.presented {
-            // Only advance on presented frames (minimized frames
-            // advance the accumulator but don't step the world).
-            let ticks = sim_accumulator.advance(split.sim_advance);
-            if ticks > 0
-                && let Some(crowd) = crowd.as_mut()
-            {
-                // Step the crowd for each accumulated tick.
-                for _ in 0..ticks {
-                    crowd.step(DEMO_CLOCK_DT_F32);
-                }
+        if let Some(crowd) = crowd.as_mut() {
+            // Step the crowd for each accumulated tick.
+            for _ in 0..ticks {
+                crowd.step(DEMO_CLOCK_DT_F32);
             }
         }
         // Era 2 package B part 3 — THE AUDIBLE CROWD (after the

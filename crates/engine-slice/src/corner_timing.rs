@@ -135,6 +135,14 @@ impl FixedTimestepAccumulator {
         ticks
     }
 
+    /// Accrues time WITHOUT extracting ticks: minimized-window frames
+    /// collect their interval here (the campaign clock never silently
+    /// pauses) and the world catches up — bounded by the cap — on the
+    /// next presented frame's `advance`.
+    pub fn accrue(&mut self, sim_advance: Duration) {
+        self.accumulator += sim_advance;
+    }
+
     /// Returns the current accumulator value (for diagnostics).
     pub fn accumulator(&self) -> Duration {
         self.accumulator
@@ -304,5 +312,38 @@ mod tests {
             assert_eq!(acc.dropped_time(), Duration::ZERO);
         }
         assert_eq!(acc.ticks_advanced(), 100);
+    }
+
+    /// The dt forms are BIT-IDENTICAL (the orchestrator's empirical
+    /// check, pinned): the Duration path (nanosecond-quantized
+    /// 1/60 s → f32) and the direct f32 division must produce the
+    /// same float — every downstream deterministic value depends on
+    /// it. If this assertion ever fires, a Duration representation
+    /// change has shifted the tick delta by an ulp.
+    #[test]
+    fn dt_forms_are_bit_identical() {
+        assert_eq!(
+            demo_clock_dt().as_secs_f32().to_bits(),
+            DEMO_CLOCK_DT_F32.to_bits()
+        );
+        assert_eq!((1.0f64 / DEMO_CLOCK_HZ) as f32, DEMO_CLOCK_DT_F32);
+    }
+
+    #[test]
+    fn accrue_collects_without_stepping() {
+        // Minimized frames accrue; the catch-up fires on the next
+        // presented frame, bounded by the cap.
+        let mut acc = FixedTimestepAccumulator::new();
+        let dt = Duration::from_secs_f64(1.0 / 60.0);
+        acc.accrue(dt * 3);
+        assert_eq!(acc.ticks_advanced(), 0, "accrue steps nothing");
+        assert_eq!(
+            acc.advance(dt * 3),
+            5,
+            "the 6 accumulated ticks catch up to the cap"
+        );
+        assert_eq!(acc.dropped_frames(), 1);
+        assert_eq!(acc.dropped_time(), dt);
+        assert_eq!(acc.ticks_advanced(), 5);
     }
 }
