@@ -2309,6 +2309,16 @@ impl T1Journal {
         &self.state.committed
     }
 
+    /// One committed transaction's source position, by identity —
+    /// the committed-index lookup (O(log n), where the alternative is
+    /// a linear scan of every committed transaction per queried id).
+    /// `None` for an identity outside the committed set — the same
+    /// absence a linear search of [`Self::transactions`] produces.
+    pub fn transaction_position(&self, id: TransactionId) -> Option<SourcePosition> {
+        let index = *self.state.committed_index.get(&id)?;
+        Some(self.state.committed[index].position)
+    }
+
     /// The validated cancellation records, in sequence order.
     pub fn cancellations(&self) -> &[RecordedCancellation] {
         &self.state.cancellations

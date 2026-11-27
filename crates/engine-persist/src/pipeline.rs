@@ -944,13 +944,13 @@ impl CommitAuthority {
     ) -> BTreeMap<TransactionId, u64> {
         let mut ticks: BTreeMap<TransactionId, u64> = BTreeMap::new();
         for (_, transaction, _) in keys.values() {
-            if let Some(committed) = self
-                .journal
-                .transactions()
-                .iter()
-                .find(|committed| committed.id == *transaction)
-            {
-                ticks.insert(*transaction, committed.position.tick);
+            // (P3-L3) The committed-index lookup replaces the per-key
+            // linear scan over every committed transaction
+            // (O(keys × transactions) → O(keys · log transactions));
+            // an identity outside the committed set still freezes
+            // nothing — the same absence the linear find produced.
+            if let Some(position) = self.journal.transaction_position(*transaction) {
+                ticks.insert(*transaction, position.tick);
             }
         }
         ticks
@@ -1094,7 +1094,7 @@ impl<M: CanonicalMedium> CommitVerifier<M> {
         let candidate = attempt.record.id();
         match self.medium.reconcile_unknown(&candidate)? {
             Reconciliation::Installed { .. } => {
-                let CommitOutcome::Confirmed(receipt) = self.confirm(attempt)? else {
+                let CommitOutcome::Confirmed(receipt) = self.confirm(&attempt)? else {
                     unreachable!("confirm returns Confirmed or errors");
                 };
                 self.pending = None;
@@ -1203,30 +1203,46 @@ impl<M: CanonicalMedium> CommitVerifier<M> {
     /// handles the stale-rebase once. The idempotency key is the
     /// batch's content hash — the rebase preserves per-key
     /// identities, and the medium's chain-wide key uniqueness makes a
-    /// double-install unrepresentable.
+    /// double-install unrepresentable. (P3-L3) `keys` MOVES into the
+    /// retained attempt — the single key-set copy on this path — and
+    /// the stale-parent re-derivation reads it back from the pending
+    /// slot, exactly as `retry` does.
     fn submit_keys(
         &mut self,
         keys: BTreeMap<ConsequenceId, AttemptedKey>,
         parent: Hash,
         ticks: &BTreeMap<TransactionId, u64>,
     ) -> Result<CommitOutcome, PipelineError> {
-        let (attempt, outcome) = self.append_for(keys.clone(), parent, ticks)?;
+        let (revision, outcome) = self.append_for(keys, parent, ticks)?;
         match outcome {
             AppendOutcome::Accepted { id, tier: _ } => {
-                if id != attempt.record.id() {
+                if id != revision {
                     return Err(PipelineError::ConfirmationInvalid {
                         detail: "accepted-revision-identity-mismatch",
                     });
                 }
-                self.confirm_retained(attempt)
+                self.confirm_retained()
             }
             AppendOutcome::RejectedStaleParent { observed } => {
                 // Revalidate: the observed chain was validated by the
                 // medium before the rejection; the suffix walk
                 // determines the now-confirmed keys.
                 self.walk_chain()?;
-                let attempted: Vec<ConsequenceId> = keys.keys().copied().collect();
-                let remaining = remaining_keys(keys, self)?;
+                // (P3-L3) The re-derivation reads the RETAINED
+                // candidate — `retry`'s demonstrated shape: a clone of
+                // the slot's key set feeds the fallible re-derivation,
+                // so the original candidate stays in the slot through
+                // every pre-rebase step (the second append_for
+                // replaces it only on its own
+                // write-at-uncertainty-or-acceptance).
+                let retained = self
+                    .pending
+                    .as_ref()
+                    .expect("append_for retains the candidate it just built")
+                    .keys
+                    .clone();
+                let attempted: Vec<ConsequenceId> = retained.keys().copied().collect();
+                let remaining = remaining_keys(retained, self)?;
                 if remaining.is_empty() {
                     // Every attempted key is now chain-confirmed (another
                     // writer's batch) — confirmed without our revision. The
@@ -1243,62 +1259,70 @@ impl<M: CanonicalMedium> CommitVerifier<M> {
                 let observed_parent = observed
                     .or(self.verified_head)
                     .ok_or(PipelineError::UnfoundedMedium)?;
-                let (attempt, outcome) = self.append_for(remaining, observed_parent, ticks)?;
+                let (revision, outcome) = self.append_for(remaining, observed_parent, ticks)?;
                 match outcome {
                     AppendOutcome::Accepted { id, tier: _ } => {
-                        if id != attempt.record.id() {
+                        if id != revision {
                             return Err(PipelineError::ConfirmationInvalid {
                                 detail: "accepted-revision-identity-mismatch",
                             });
                         }
-                        self.confirm_retained(attempt)
+                        self.confirm_retained()
                     }
                     // The rebase was rejected again — append_for already
                     // retains the last built attempt for retry_pending.
                     AppendOutcome::RejectedStaleParent { observed } => {
                         Ok(CommitOutcome::StaleParent { observed })
                     }
-                    AppendOutcome::Unknown { reason } => Ok(CommitOutcome::Unknown {
-                        revision: attempt.record.id(),
-                        reason,
-                    }),
+                    AppendOutcome::Unknown { reason } => {
+                        Ok(CommitOutcome::Unknown { revision, reason })
+                    }
                 }
             }
-            AppendOutcome::Unknown { reason } => Ok(CommitOutcome::Unknown {
-                revision: attempt.record.id(),
-                reason,
-            }),
+            AppendOutcome::Unknown { reason } => Ok(CommitOutcome::Unknown { revision, reason }),
         }
     }
 
     /// The confirmation procedure's exception-safe entry (PP-B4
-    /// checkpoint 2): `confirm` runs on the retained clone — the
-    /// pending slot already holds the candidate (append_for's
-    /// write-at-uncertainty-or-acceptance) and is cleared ONLY on
-    /// verified confirmation. A worker-transport failure during the
-    /// readback returns `CommitOutcome::Unknown` with
-    /// `WorkerReplyLost` — the append was accepted (its disposition
-    /// stands) while the verification could not complete: never a
-    /// definite failure, never a false confirmation. Any other
-    /// readback error propagates with the candidate retained for
-    /// reconciliation.
-    fn confirm_retained(
-        &mut self,
-        attempt: PendingAttempt,
-    ) -> Result<CommitOutcome, PipelineError> {
+    /// checkpoint 2): `confirm` runs on the slot's SINGLE retained
+    /// copy — taken out for the verification and restored on every
+    /// failure arm, so the pending slot keeps the candidate until
+    /// verified confirmation (append_for's
+    /// write-at-uncertainty-or-acceptance wrote it; the success path
+    /// below is the one place the slot clears). A worker-transport
+    /// failure during the readback returns `CommitOutcome::Unknown`
+    /// with `WorkerReplyLost` — the append was accepted (its
+    /// disposition stands) while the verification could not complete:
+    /// never a definite failure, never a false confirmation. Any
+    /// other readback error propagates with the candidate restored to
+    /// the slot for reconciliation. (The verification window holds
+    /// the taken copy; every error exit below restores it, and the
+    /// only panic site inside `confirm` is the merge loop's
+    /// provably-unreachable exhaustion guard — equal key counts on
+    /// both sides of a sorted merge.)
+    fn confirm_retained(&mut self) -> Result<CommitOutcome, PipelineError> {
+        let attempt = self
+            .pending
+            .take()
+            .expect("append_for retains the candidate before the confirmation");
         let revision = attempt.record.id();
-        match self.confirm(attempt) {
+        match self.confirm(&attempt) {
             Ok(outcome) => {
-                self.pending = None;
+                // Verified confirmation: the single copy is consumed
+                // — the slot stays cleared.
                 Ok(outcome)
             }
             Err(PipelineError::Medium(MediumError::WorkerUnavailable { .. })) => {
+                self.pending = Some(attempt);
                 Ok(CommitOutcome::Unknown {
                     revision,
                     reason: UnknownReason::WorkerReplyLost,
                 })
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                self.pending = Some(attempt);
+                Err(error)
+            }
         }
     }
 
@@ -1306,7 +1330,10 @@ impl<M: CanonicalMedium> CommitVerifier<M> {
     /// `keys` on `parent`, and appends. The tick derives
     /// deterministically from the batched transactions' journaled
     /// positions (retry stability — carried frozen in the request and
-    /// the retained attempt).
+    /// the retained attempt). (P3-L3) `keys` moves into the attempt —
+    /// the single key-set copy — and the attempt MOVES into the
+    /// pending slot (no clone anywhere on this path); the caller
+    /// receives only the revision identity and the append outcome.
     ///
     /// THE CANDIDATE-STATE RULE (PP-B4 checkpoint 2, the preflight's
     /// four-state lifecycle): a DEFINITE pre-commit failure (the
@@ -1324,7 +1351,7 @@ impl<M: CanonicalMedium> CommitVerifier<M> {
         keys: BTreeMap<ConsequenceId, AttemptedKey>,
         parent: Hash,
         ticks: &BTreeMap<TransactionId, u64>,
-    ) -> Result<(PendingAttempt, AppendOutcome), PipelineError> {
+    ) -> Result<(Hash, AppendOutcome), PipelineError> {
         let mut entries: Vec<BatchEntry> = Vec::with_capacity(keys.len());
         let mut tick: u64 = 0;
         for (id, (coverage, transaction, effect)) in &keys {
@@ -1361,17 +1388,21 @@ impl<M: CanonicalMedium> CommitVerifier<M> {
         let outcome =
             self.medium
                 .append(&record, std::slice::from_ref(&batch_object), Some(parent))?;
-        let attempt = PendingAttempt {
+        let revision = record.id();
+        // Write-at-uncertainty-or-acceptance (P3-L3's single
+        // retention copy): the attempt — keys moved in, ticks frozen —
+        // MOVES into the pending slot, the one copy the confirmation
+        // borrows; only its revision identity returns to the caller.
+        // The retained candidate precedes every further fallible step
+        // (the readback included); cleared only by verified
+        // confirmation.
+        self.pending = Some(PendingAttempt {
             record,
             batch_hash,
             keys,
             ticks: ticks.clone(),
-        };
-        // Write-at-uncertainty-or-acceptance: the retained candidate
-        // precedes every further fallible step (the readback included);
-        // cleared only by verified confirmation.
-        self.pending = Some(attempt.clone());
-        Ok((attempt, outcome))
+        });
+        Ok((revision, outcome))
     }
 
     /// The confirmation procedure: the verified read-back walk (a
@@ -1379,8 +1410,12 @@ impl<M: CanonicalMedium> CommitVerifier<M> {
     /// its content identity, and the **individual validation** of
     /// every attempted key — present, with exactly the attempted
     /// coverage and producing transaction, placed by the walk at the
-    /// confirming revision, with no unattempted keys.
-    fn confirm(&mut self, attempt: PendingAttempt) -> Result<CommitOutcome, PipelineError> {
+    /// confirming revision, with no unattempted keys. (P3-L3) The
+    /// procedure runs on a BORROW: the commit path lends the pending
+    /// slot's single retained copy (via [`Self::confirm_retained`],
+    /// which restores it on every failure); `reconcile` lends its
+    /// retention clone.
+    fn confirm(&mut self, attempt: &PendingAttempt) -> Result<CommitOutcome, PipelineError> {
         self.walk_chain()?;
         let bytes = self.medium.read_object(&attempt.batch_hash)?;
         let batch = ConsequenceBatch::decode(&bytes).map_err(PipelineError::Format)?;
@@ -2195,7 +2230,7 @@ mod tests {
             ticks: BTreeMap::new(),
         };
         assert!(matches!(
-            pipeline.verifier.confirm(attempt),
+            pipeline.verifier.confirm(&attempt),
             Err(PipelineError::ConfirmationInvalid {
                 detail: "payload-mismatch-in-confirmed-batch"
             })
@@ -2226,7 +2261,7 @@ mod tests {
             ticks: BTreeMap::new(),
         };
         assert!(matches!(
-            pipeline.verifier.confirm(attempt),
+            pipeline.verifier.confirm(&attempt),
             Err(PipelineError::ConfirmationInvalid {
                 detail: "batch-key-set-mismatch"
             })
@@ -2316,6 +2351,167 @@ mod tests {
         };
         assert_eq!(
             recovered.status(ConsequenceId::new(1, 1, 1)).unwrap().phase,
+            KeyPhase::InConfirmedChain
+        );
+        let mut check = LocalFileMedium::open(dir.store()).unwrap();
+        assert_eq!(check.validate().unwrap().records, 2, "one revision only");
+    }
+
+    /// (P3-L3) The readback-losing medium (the pending-retention test
+    /// seam): after the first ACCEPTED append, the NEXT `read_object`
+    /// fails ONCE with the worker-death class — the reply the
+    /// transport loses after append admission, surfacing exactly
+    /// inside the confirmation procedure's readback walk.
+    /// Classification stays provider-side (delegated, never routed
+    /// through the failing read) so the failure lands on the batch
+    /// readback the confirmation performs.
+    struct ReadbackLosingMedium<M: CanonicalMedium> {
+        inner: M,
+        lose_next_readback: bool,
+    }
+
+    impl<M: CanonicalMedium> ReadbackLosingMedium<M> {
+        fn over(inner: M) -> Self {
+            ReadbackLosingMedium {
+                inner,
+                lose_next_readback: false,
+            }
+        }
+    }
+
+    impl<M: CanonicalMedium> CanonicalMedium for ReadbackLosingMedium<M> {
+        fn head(&mut self) -> Result<Option<Hash>, MediumError> {
+            self.inner.head()
+        }
+        fn append_admitted(
+            &mut self,
+            admitted: crate::medium::AdmittedAppend,
+            expected_parent: Option<Hash>,
+        ) -> Result<AppendOutcome, MediumError> {
+            let outcome = self.inner.append_admitted(admitted, expected_parent)?;
+            if matches!(outcome, AppendOutcome::Accepted { .. }) {
+                self.lose_next_readback = true;
+            }
+            Ok(outcome)
+        }
+        fn read_record(&mut self, id: &Hash) -> Result<RevisionRecord, MediumError> {
+            self.inner.read_record(id)
+        }
+        fn read_object(&mut self, hash: &Hash) -> Result<Vec<u8>, MediumError> {
+            if self.lose_next_readback {
+                self.lose_next_readback = false;
+                return Err(MediumError::WorkerUnavailable {
+                    detail: "readback lost after append admission".to_owned(),
+                });
+            }
+            self.inner.read_object(hash)
+        }
+        fn classify_object(&mut self, hash: &Hash) -> Result<ObjectClass, MediumError> {
+            self.inner.classify_object(hash)
+        }
+        fn validate(&mut self) -> Result<crate::medium::ChainSummary, MediumError> {
+            self.inner.validate()
+        }
+        fn reconcile_unknown(&mut self, candidate: &Hash) -> Result<Reconciliation, MediumError> {
+            self.inner.reconcile_unknown(candidate)
+        }
+        fn durability_tier(&self) -> SyncTier {
+            self.inner.durability_tier()
+        }
+        fn reclaim(
+            &mut self,
+            directive: &crate::reclaim::ReclaimDirective,
+        ) -> Result<crate::reclaim::ReclaimOutcome, MediumError> {
+            self.inner.reclaim(directive)
+        }
+        fn reclaim_pending(
+            &mut self,
+            directive: &crate::reclaim::ReclaimDirective,
+        ) -> Result<bool, MediumError> {
+            self.inner.reclaim_pending(directive)
+        }
+        fn begin_reclamation(
+            &mut self,
+            audit: &Hash,
+            mk: &Hash,
+            tick: u64,
+        ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+            self.inner.begin_reclamation(audit, mk, tick)
+        }
+        fn verify_begin_authority(
+            &mut self,
+            audit: &Hash,
+            mk: &Hash,
+        ) -> Result<crate::reclaim::BeginAuthority, MediumError> {
+            self.inner.verify_begin_authority(audit, mk)
+        }
+        fn begin_reclamation_v2(
+            &mut self,
+            mk: &Hash,
+            tick: u64,
+        ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+            self.inner.begin_reclamation_v2(mk, tick)
+        }
+        fn verify_begin_authority_v2(
+            &mut self,
+            mk: &Hash,
+        ) -> Result<crate::reclaim::BeginAuthority, MediumError> {
+            self.inner.verify_begin_authority_v2(mk)
+        }
+        fn observe_range_terminal_under_coordination(
+            &mut self,
+            expected: &crate::range_completion::RangeCompletionContext,
+            limits: &crate::range_installation::RangeInstallationLimits,
+        ) -> Result<crate::range_installation::CoordinatedObservation, MediumError> {
+            self.inner
+                .observe_range_terminal_under_coordination(expected, limits)
+        }
+    }
+
+    /// (P3-L3) The single retained copy survives a failed readback:
+    /// the confirmation takes the candidate OUT of the pending slot
+    /// for the verification and restores it on every failure — a
+    /// worker-death readback after an ACCEPTED append still maps to
+    /// `Unknown{WorkerReplyLost}` with the attempt retained (never a
+    /// discarded unresolved obligation), the slot still refuses a new
+    /// submission, and the retry confirms the installed attempt
+    /// through the recovered readback.
+    #[test]
+    fn readback_failure_retains_the_single_pending_copy() {
+        let dir = TestDir::new("readback-retention");
+        ensure_founded(&dir);
+        let journal = T1Journal::open(dir.path().join("journal.t1")).unwrap();
+        let medium = ReadbackLosingMedium::over(LocalFileMedium::open(dir.store()).unwrap());
+        let mut pipeline = CommitPipeline::open(medium, journal).unwrap();
+        capture_index_on(&mut pipeline, 1);
+        // The append is ACCEPTED; the confirmation's readback loses
+        // the reply — the exact window the retained copy exists for.
+        let revision = match pipeline.commit_canonical().unwrap() {
+            CommitOutcome::Unknown {
+                revision,
+                reason: UnknownReason::WorkerReplyLost,
+            } => revision,
+            other => panic!("expected the worker-reply-lost Unknown, observed {other:?}"),
+        };
+        // The failed verification RESTORED the single retained copy —
+        // the unresolved obligation is still observable and still
+        // refuses a new submission.
+        assert_eq!(pipeline.verifier.pending_revision(), Some(revision));
+        assert!(matches!(
+            pipeline.commit_canonical(),
+            Err(PipelineError::AttemptUnresolved { revision: pending }) if pending == revision
+        ));
+        // The append WAS installed: the retry's walk confirms it
+        // through the recovered readback, and the slot clears only on
+        // that verified confirmation.
+        let CommitOutcome::Confirmed(receipt) = pipeline.retry_pending().unwrap() else {
+            panic!("expected the retry to confirm the installed attempt");
+        };
+        assert_eq!(receipt.keys, vec![ConsequenceId::new(1, 1, 1)]);
+        assert_eq!(pipeline.verifier.pending_revision(), None);
+        assert!(pipeline.is_confirmed(ConsequenceId::new(1, 1, 1)));
+        assert_eq!(
+            pipeline.status(ConsequenceId::new(1, 1, 1)).unwrap().phase,
             KeyPhase::InConfirmedChain
         );
         let mut check = LocalFileMedium::open(dir.store()).unwrap();
@@ -3672,7 +3868,7 @@ mod tests {
         // half — no Confirmed receipt, no promotion on the authority
         // side.
         assert!(matches!(
-            pipeline.verifier.confirm(attempt),
+            pipeline.verifier.confirm(&attempt),
             Err(PipelineError::ConfirmationInvalid {
                 detail: "payload-mismatch-in-confirmed-batch"
             })
