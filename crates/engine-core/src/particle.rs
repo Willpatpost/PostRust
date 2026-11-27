@@ -142,7 +142,7 @@ pub struct EmitterConfig {
 /// The per-tick report (the caller MUST observe — the overflow half
 /// especially; ignoring the return is the swallowed-refusal
 /// failure).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TickReport {
     /// Particles ADMITTED this tick (incremented only when a spawn
     /// unit found pool room — the admission count, never the
@@ -154,12 +154,19 @@ pub struct TickReport {
     pub active: u32,
     /// Particles that DIED this tick (kill-plane and lifetime
     /// deaths together) — the emitter's OWN observation, exposed for
-    /// the census check (finding 16's correction: deaths are no
-    /// longer re-derived downstream by subtracting refusals from
-    /// admissions). The identity:
+    /// the layer's census conservation and the census check (finding
+    /// 16's correction: deaths are no longer re-derived downstream
+    /// by subtracting refusals from admissions). The identity:
     /// `active_before + spawned == deaths + active` (an admitted
     /// particle is live or dead by the tick's end).
     pub deaths: u32,
+    /// Spawn-accumulator time DISCARDED at the cap this tick (the
+    /// above-cap excess of `dt·rate`, zero when the accumulator
+    /// stayed under the cap) — B05's observability corrective: the
+    /// clamp is a real discard of spawn opportunity and is reported,
+    /// never silent. May be infinite when `dt·rate` itself overflowed
+    /// (the cap's purpose); the drain stays structurally bounded.
+    pub cap_discard: f32,
 }
 
 /// One emitter: its configuration, spawn stream, and bounded pool.
@@ -290,7 +297,32 @@ impl EmitterConfig {
                 return Err("particle/kinematic-extent-non-finite");
             }
         }
-        if !(self.gravity * life * life).is_finite() {
+        // THE COMBINED Y EXCURSION (B05's corrective): gravity acts on
+        // Y, and the worst-case Y path is position + velocity·life +
+        // g·life² AS A SUM — every term nonnegative (speed, endpoint
+        // magnitudes, and gravity ≥ 0 are all gated above), so the
+        // sum is finite iff the combination is. The pre-fix shape
+        // checked g·life² SEPARATELY from the per-axis excursion:
+        // each part finite at ~1e38 passed while the combination
+        // overflowed (the same admission, both halves green, an
+        // infinite post-integration position downstream).
+        let y_speed = self.base_velocity[1].abs() + self.velocity_jitter[1].abs();
+        let y_excursion = y_speed * life
+            + self.volume.max[1].abs()
+            + self.volume.min[1].abs()
+            + self.gravity * life * life;
+        if !y_excursion.is_finite() {
+            return Err("particle/kinematic-extent-non-finite");
+        }
+        // THE VELOCITY GATE (B05's beyond-charter discovery): gravity
+        // accumulates VELOCITY at g·life — not g·life², which is its
+        // displacement. For life < 1 the velocity sum can overflow
+        // while every extent gate above is green (v₀ 2e38, g 3e38,
+        // life 0.5: extents 1e38 and 7.5e37, velocity 3.5e38 — over
+        // f32::MAX). The worst-case |v_y| at end of life must be
+        // finite AS A SUM with the initial speed.
+        let y_velocity = y_speed + self.gravity * life;
+        if !y_velocity.is_finite() {
             return Err("particle/kinematic-extent-non-finite");
         }
         Ok(())
@@ -433,7 +465,15 @@ impl Emitter {
         let mut dropped: u32 = 0;
         let active_before = self.active;
         self.spawn_accumulator += dt * self.config.rate;
+        // THE CAP DISCARD (B05's observability corrective): the clamp
+        // is a real discard of spawn opportunity — reported in the
+        // tick report, never silent. `dt·rate` may itself overflow to
+        // inf (the cap exists for exactly that); the discard amount
+        // is then inf, and the drain below stays structurally
+        // bounded by the cap.
+        let mut cap_discard = 0.0f32;
         if self.spawn_accumulator > SPAWN_ACCUMULATOR_CAP {
+            cap_discard = self.spawn_accumulator - SPAWN_ACCUMULATOR_CAP;
             self.spawn_accumulator = SPAWN_ACCUMULATOR_CAP;
         }
         while self.spawn_accumulator >= 1.0 {
@@ -487,7 +527,11 @@ impl Emitter {
             }
         }
         self.active = write;
-        self.overflow_total += dropped;
+        // B05: the lifetime overflow counter SATURATES (u32 addition
+        // would wrap at 2³²·dropped-per-tick — an observability lie
+        // in exactly the runaway regime the counter exists to
+        // report).
+        self.overflow_total = self.overflow_total.saturating_add(dropped);
         // THE DEATH OBSERVATION (finding 16's correction): deaths are
         // counted HERE — the pre-integration pool (after this tick's
         // spawns landed, since spawn precedes integration) minus the
@@ -500,6 +544,7 @@ impl Emitter {
             overflow: (dropped > 0).then_some(SpawnOverflow { dropped }),
             active: self.active as u32,
             deaths,
+            cap_discard,
         })
     }
 
@@ -595,10 +640,30 @@ fn kill_plane_impact(pre: [f32; 3], post: [f32; 3], kill_y: Option<f32>) -> [f32
             } else {
                 1.0
             };
+            // B05's TOTALITY GUARD: a dt larger than any admission
+            // bound can integrate to a nonfinite post position (the
+            // dt domain is deliberately open — refusing dt > lifetime
+            // would outlaw valid short-spark policies), and the
+            // interpolated XZ then poisons the OBSERVED impact with
+            // NaN. The observation is total instead: a nonfinite
+            // interpolated axis falls back to that axis's PRE value
+            // (a real, finite position inside the step). The state
+            // path is untouched — the death test and compaction read
+            // the post-integration position exactly as before.
+            let impact_x = pre[0] + (post[0] - pre[0]) * alpha;
+            let impact_z = pre[2] + (post[2] - pre[2]) * alpha;
             [
-                pre[0] + (post[0] - pre[0]) * alpha,
+                if impact_x.is_finite() {
+                    impact_x
+                } else {
+                    pre[0]
+                },
                 k,
-                pre[2] + (post[2] - pre[2]) * alpha,
+                if impact_z.is_finite() {
+                    impact_z
+                } else {
+                    pre[2]
+                },
             ]
         }
         // No kill plane (unreachable from the kill-death branch) or
@@ -2036,7 +2101,92 @@ mod tests {
         assert!(
             churn_refused > 0,
             "the churning campaign's fill ramp refused above the pool ({churn_refused} \
-             total) — the mixed shape, counted never silent"
+             total) - the mixed shape, counted never silent"
+        );
+    }
+
+    /// B05: the COMBINED Y excursion is bounded AS A SUM — the old
+    /// shape checked g·life² separately from the per-axis excursion,
+    /// so velocity −3e38 with gravity 3e38 over lifetime 1 passed
+    /// every gate (each part finite) while the combined path
+    /// overflows. The corrected admission refuses it (the design's
+    /// combined-Y witness; both halves finite, the sum 6e38).
+    #[test]
+    fn combined_y_extent_refuses_parts_finite() {
+        let config = EmitterConfig {
+            volume: SpawnVolume {
+                min: [0.0; 3],
+                max: [0.0; 3],
+            },
+            rate: 1.0,
+            base_velocity: [0.0, -3.0e38, 0.0],
+            velocity_jitter: [0.0; 3],
+            lifetime: [1.0, 1.0],
+            gravity: 3.0e38,
+            drag_factor: 1.0,
+            kill_y: None,
+            seed: 0xB05,
+        };
+        assert_eq!(
+            config.validate(),
+            Err("particle/kinematic-extent-non-finite"),
+            "the combined Y sum (velocity·life + endpoints + g·life² = 6e38) overflows"
+        );
+    }
+
+    /// B05's beyond-charter discovery: gravity accumulates VELOCITY at
+    /// g·life (not g·life²). For life < 1 the velocity sum overflows
+    /// while every extent gate is green — v₀ 2e38, g 3e38, life 0.5:
+    /// extents 1e38 and 7.5e37, worst-case |v_y| 3.5e38 > f32::MAX.
+    /// (The design's own "g 6e38" witness is not a valid f32; this
+    /// is the corrected witness recorded in the program register.)
+    #[test]
+    fn velocity_gate_refuses_life_under_one() {
+        let config = EmitterConfig {
+            volume: SpawnVolume {
+                min: [0.0; 3],
+                max: [0.0; 3],
+            },
+            rate: 1.0,
+            base_velocity: [0.0, 2.0e38, 0.0],
+            velocity_jitter: [0.0; 3],
+            lifetime: [0.5, 0.5],
+            gravity: 3.0e38,
+            drag_factor: 1.0,
+            kill_y: None,
+            seed: 0xB05,
+        };
+        assert_eq!(
+            config.validate(),
+            Err("particle/kinematic-extent-non-finite"),
+            "the velocity sum (2e38 + 3e38·0.5 = 3.5e38) overflows while the extents stay finite"
+        );
+    }
+
+    /// B05: the kill-plane impact observation is TOTAL — a nonfinite
+    /// interpolated axis falls back to that axis's PRE value (a real,
+    /// finite position inside the step), never a NaN reaching the
+    /// ripple derivation.
+    #[test]
+    fn kill_plane_impact_is_total_on_nonfinite_post() {
+        let pre = [1.0f32, 5.0, 2.0];
+        let post = [f32::NAN, -1.0, f32::NAN];
+        assert_eq!(
+            kill_plane_impact(pre, post, Some(0.0)),
+            [1.0, 0.0, 2.0],
+            "nonfinite interpolated XZ falls back to the pre values; y is the plane"
+        );
+        // The finite case is unchanged (the known-answer shape).
+        let finite_post = [1.5f32, -0.2, 2.5];
+        let alpha = 5.0f32 / 5.2f32;
+        assert_eq!(
+            kill_plane_impact(pre, finite_post, Some(0.0)),
+            [
+                1.0f32 + (1.5f32 - 1.0f32) * alpha,
+                0.0,
+                2.0f32 + (2.5f32 - 2.0f32) * alpha
+            ],
+            "the finite straddling case interpolates exactly as before"
         );
     }
 }
