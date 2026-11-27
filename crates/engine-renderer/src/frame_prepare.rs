@@ -20,13 +20,22 @@
 //! those arms — the public poll-and-retry contract
 //! (`FrameResult::deferred`, `FrameResult::recreated`) must survive any
 //! future reshaping of this seam.
+//!
+//! **Stage S3 (P4 D2 §4.2/§4.4):** the per-frame pass uses arrive as
+//! the frame's EXPLICIT declaration — the [`FramePlan`] derived once
+//! at the top of `render_frame` — instead of the positional
+//! `Option`/slice parameters each preparation path re-threaded. The
+//! lazy-ensure dispatcher and the extent-target ensures below read
+//! the plan's bits; the ONE derivation lives in `frame_plan`, and
+//! this module's two entry points are two of its three consumers
+//! (the third is `prepare_frame`'s own `Recreated`-arm re-entry).
+//! The request-side `capture_pending` bit stays a LIVE read passed
+//! per call — `frames.capture.pending` is prepare-mutable (a refused
+//! capture ensure clears it mid-frame), so freezing it in the plan
+//! would change the refused-capture-then-recreate path's behavior.
 
 use crate::config::DemoScenePreference;
-use crate::scene::SceneVertex;
-use crate::vulkan::proxy_draw;
-use crate::vulkan::reflection_draw::WetCamera;
-use crate::vulkan::shadow_draw::ShadowFrameParams;
-use crate::vulkan::sky_draw::SkyFrameParams;
+use crate::vulkan::frame_plan::FramePlan;
 
 /// Result of the preparation phase, indicating what action the frame
 /// coordinator should take next.
@@ -85,13 +94,7 @@ pub(crate) fn prepare_frame(
     present_preference: crate::config::PresentModePreference,
     replace_pipelines: bool,
     demo_scene: DemoScenePreference,
-    proxy: Option<&proxy_draw::ProxyFrameUpload<'_>>,
-    shadowed: Option<&ShadowFrameParams>,
-    sky: Option<&SkyFrameParams>,
-    post: bool,
-    wet: Option<&WetCamera>,
-    region_vertices: &[SceneVertex],
-    foreground_vertices: &[SceneVertex],
+    plan: &FramePlan,
     capture_pending: bool,
 ) -> Result<FramePreparationResult, crate::vulkan::RendererError> {
     let slot = frames.frame_slot;
@@ -133,19 +136,10 @@ pub(crate) fn prepare_frame(
     // decision — the pre-acquire preparation discipline (finding 3's
     // stranded-frame corrective, and finding 6's replacement-variant
     // completeness). Each ensure_* is idempotent (an existence check),
-    // so calling it twice (before and after recreation) is safe.
-    pipes.ensure_frame_targets_and_resources(
-        ctx,
-        swapchain,
-        slot,
-        proxy,
-        shadowed,
-        sky,
-        post,
-        wet,
-        region_vertices,
-        foreground_vertices,
-    )?;
+    // so calling it twice (before and after recreation) is safe. The
+    // uses arrive as the frame's plan (S3: the ONE derivation, this
+    // and the two re-run sites below its three consumers).
+    pipes.ensure_frame_targets_and_resources(ctx, swapchain, slot, plan)?;
 
     // A previous present reported suboptimal — recreate before drawing
     // (verification requirement: suboptimal must eventually trigger
@@ -164,18 +158,9 @@ pub(crate) fn prepare_frame(
         // The generation that draws carries every active variant —
         // calling the helper here ensures sky, reflection, and HDR
         // variant pipelines exist on the new generation (finding 6).
-        pipes.ensure_frame_targets_and_resources(
-            ctx,
-            swapchain,
-            slot,
-            proxy,
-            shadowed,
-            sky,
-            post,
-            wet,
-            region_vertices,
-            foreground_vertices,
-        )?;
+        // The plan is the SAME declaration re-consumed (S3: one
+        // derivation, this is the second consumer).
+        pipes.ensure_frame_targets_and_resources(ctx, swapchain, slot, plan)?;
         return Ok(FramePreparationResult::Recreated);
     }
 
@@ -208,28 +193,11 @@ pub(crate) fn prepare_frame(
     // proof in post_draw's module header. The swapchain generation
     // replaces the view handle for cache invalidation (corrective
     // finding 7): Vulkan permits handle reuse, so a numerical view
-    // handle could recur after destruction.
-    if post && let Some(post_state) = &mut pipes.post {
-        post_state.ensure_targets(
-            ctx,
-            swapchain.extent,
-            &swapchain.views,
-            swapchain.generation,
-        )?;
-    }
-    if wet.is_some()
-        && let (Some(post_state), Some(reflection_state), Some(corner)) =
-            (&pipes.post, &mut pipes.reflection, ctx.corner.as_ref())
-    {
-        reflection_state.ensure_targets(
-            ctx,
-            swapchain.extent,
-            corner,
-            post_state.hdr_render_pass(),
-            swapchain.generation,
-            swapchain.depth_format,
-        )?;
-    }
+    // handle could recur after destruction. S3: the duplicated
+    // post/wet target pair this path and the out-of-date path each
+    // carried is ONE helper now (`ensure_extent_targets`), driven by
+    // the plan's bits.
+    ensure_extent_targets(ctx, pipes, swapchain, plan)?;
 
     Ok(FramePreparationResult::Proceeded)
 }
@@ -260,13 +228,7 @@ pub(crate) fn prepare_after_recreation(
     present_preference: crate::config::PresentModePreference,
     replace_pipelines: bool,
     demo_scene: DemoScenePreference,
-    proxy: Option<&proxy_draw::ProxyFrameUpload<'_>>,
-    shadowed: Option<&ShadowFrameParams>,
-    sky: Option<&SkyFrameParams>,
-    post: bool,
-    wet: Option<&WetCamera>,
-    region_vertices: &[SceneVertex],
-    foreground_vertices: &[SceneVertex],
+    plan: &FramePlan,
     capture_pending: bool,
 ) -> Result<FramePreparationResult, crate::vulkan::RendererError> {
     // The out-of-date inline recreation ALSO probes first (the
@@ -310,20 +272,10 @@ pub(crate) fn prepare_after_recreation(
     // generation (finding 6: the replacement replicates only
     // proxy/indirect/shadow/post; without this call the first
     // frame after THIS recreation silently skips sky and wet
-    // passes).
+    // passes). The plan is the SAME declaration re-consumed (S3:
+    // one derivation, this is the third consumer).
     let slot = frames.frame_slot;
-    pipes.ensure_frame_targets_and_resources(
-        ctx,
-        swapchain,
-        slot,
-        proxy,
-        shadowed,
-        sky,
-        post,
-        wet,
-        region_vertices,
-        foreground_vertices,
-    )?;
+    pipes.ensure_frame_targets_and_resources(ctx, swapchain, slot, plan)?;
 
     // The targets were ensured pre-acquire against the OLD
     // generation — repeat preparation against the replacement
@@ -331,8 +283,52 @@ pub(crate) fn prepare_after_recreation(
     // stranded-frame corrective; the same frame-sync discipline,
     // still before any acquire of the new chain). The swapchain
     // generation replaces the view handle for cache invalidation
-    // (corrective finding 7).
-    if post && let Some(post_state) = &mut pipes.post {
+    // (corrective finding 7). S3: the duplicated post/wet target
+    // pair this path and prepare_frame each carried is ONE helper
+    // now (`ensure_extent_targets`), driven by the plan's bits.
+    ensure_extent_targets(ctx, pipes, swapchain, plan)?;
+    // The capture ensure is repeated here too (the same frame-sync
+    // discipline: a failure here cannot strand a frame). NOTE the
+    // position: THIS path ensures the capture destination AFTER the
+    // extent targets where `prepare_frame` ensures it BEFORE them —
+    // the order is observable through the refusal state when a
+    // later fatal ensure fails (a refused capture records
+    // `last_refusal` and clears `pending`; an extent-target failure
+    // errors the frame), so each path keeps its own documented
+    // order rather than sharing one folded sequence.
+    if capture_pending && let Err(error) = frames.capture.ensure(ctx, swapchain) {
+        frames.capture.pending = false;
+        frames.capture.last_refusal = Some(error);
+    }
+
+    Ok(FramePreparationResult::Proceeded)
+}
+
+/// The extent-bound target ensures the frame's post and wet passes
+/// need — ONE implementation for both preparation paths (P4 D2
+/// §4.4, stage S3): the post chain's HDR/bloom/framebuffer bundle
+/// and the wet reflection's offscreen mirrored-scene target, both
+/// rebuilt only when the swapchain's extent or view generation
+/// changed (which only a recreation — already device-idle — can
+/// cause; the rebuild-safety proofs live in the owning modules'
+/// headers). Before S3 this pair existed twice, verbatim, in
+/// `prepare_frame` and `prepare_after_recreation`.
+///
+/// The CAPTURE destination ensure deliberately stays OUT (each path
+/// calls it at its own position — `prepare_frame` before this pair,
+/// `prepare_after_recreation` after it; the order difference is
+/// observable through the capture refusal state when a later fatal
+/// ensure fails, so folding it in would change one path's
+/// behavior).
+fn ensure_extent_targets(
+    ctx: &mut crate::vulkan::VulkanContext,
+    pipes: &mut crate::vulkan::PipelineState,
+    swapchain: &crate::vulkan::SwapchainState,
+    plan: &FramePlan,
+) -> Result<(), crate::vulkan::RendererError> {
+    if plan.uses.post
+        && let Some(post_state) = &mut pipes.post
+    {
         post_state.ensure_targets(
             ctx,
             swapchain.extent,
@@ -340,7 +336,7 @@ pub(crate) fn prepare_after_recreation(
             swapchain.generation,
         )?;
     }
-    if wet.is_some()
+    if plan.uses.wet
         && let (Some(post_state), Some(reflection_state), Some(corner)) =
             (&pipes.post, &mut pipes.reflection, ctx.corner.as_ref())
     {
@@ -353,12 +349,5 @@ pub(crate) fn prepare_after_recreation(
             swapchain.depth_format,
         )?;
     }
-    // The capture ensure is repeated here too (the same frame-sync
-    // discipline: a failure here cannot strand a frame).
-    if capture_pending && let Err(error) = frames.capture.ensure(ctx, swapchain) {
-        frames.capture.pending = false;
-        frames.capture.last_refusal = Some(error);
-    }
-
-    Ok(FramePreparationResult::Proceeded)
+    Ok(())
 }

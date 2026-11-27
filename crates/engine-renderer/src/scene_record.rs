@@ -10,6 +10,18 @@
 //! identified as a maintenance hazard. Findings 3, 5, and 6 are concrete
 //! consequences of this split responsibility — this correction unifies the
 //! recorder while leaving the preparation and post-processing phases intact.
+//!
+//! **Stage S3 (P4 D2 §4.3 — B14's named half):** the two lighting
+//! arms' repeated variant pass ordering is consolidated SEMANTICALLY
+//! without erasing the specialized GPU pipelines: the wet receiver
+//! re-draw (`record_wet_receiver`) and the ordered per-kind proxy
+//! sequence (`record_proxy_sequence`) are written ONCE, while each
+//! arm keeps its own bind construction — the genuine variation
+//! ([`LitBind`]: which descriptor family and dynamic stride each
+//! kind's set comes from, the corner's plain 112-byte FrameParams
+//! block vs the shadow uniform's extended 192-byte one). The
+//! per-variant pipelines, sets, and strides are untouched; only the
+//! sequencing they were duplicated around is shared.
 
 use crate::vulkan::corner;
 use crate::vulkan::shadow_draw;
@@ -27,7 +39,7 @@ use ash::vk;
 /// foreground streak. The pass variant selects the ground pipeline
 /// matching the recording render pass (the main pass's or the HDR
 /// scene pass's own object); `None` is the dry frame (no redraw).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GroundRedrawPass {
     /// The dry frame — no ground re-draw.
     None,
@@ -119,6 +131,150 @@ pub(crate) struct SceneTargetPipelines {
     /// The shadowed-populated vehicle kind pipeline (the main pass's
     /// plain shadowed pipeline). HDR passes the ensured variant.
     pub shadowed_proxy_vehicle: Option<vk::Pipeline>,
+}
+
+/// The per-kind proxy bind family for one lighting variant (P4 D2
+/// §4.3, stage S3 — B14's named half): the three per-kind binds the
+/// shared proxy sequence ([`record_proxy_sequence`]) consumes. The
+/// ordinary and shadowed arms each construct one — the construction
+/// is the arms' ONLY genuine divergence (which descriptor family and
+/// dynamic stride each kind's set comes from: the skinned state's
+/// per-material sets at the CORNER uniform's plain 112-byte
+/// FrameParams stride, vs the shadowed-populated state's sets at the
+/// SHADOW uniform's extended 192-byte stride) — while the ordered
+/// draw sequence is written ONCE. The specialized GPU pipelines are
+/// untouched (the charter's "without erasing specialized GPU
+/// pipelines"): each variant still binds its own compiled objects
+/// and per-material sets — the discriminant is the type-level proof
+/// that two bind families exist, exactly the variation the
+/// consolidation must preserve.
+#[derive(Clone, Copy)]
+pub(crate) enum LitBind {
+    /// The ordinary arm's family: the skinned state's retained
+    /// per-material sets and the corner sets, all offset at the
+    /// corner uniform's plain stride.
+    Ordinary {
+        skinned: crate::vulkan::proxy_draw::SkinnedSetBind,
+        vehicle: crate::vulkan::proxy_draw::PlainSetBind,
+        rain: crate::vulkan::proxy_draw::PlainSetBind,
+    },
+    /// The shadowed arm's family: the shadowed-populated state's own
+    /// sets at the shadow uniform's extended stride (the npc kind's
+    /// `skinned_shadowed_bind`, the vehicle kind's
+    /// `plain_shadowed_bind` — never the unshadowed sets: their
+    /// binding 2 points at the corner's plain block, which the
+    /// 192-byte shadowed shader would read past).
+    Shadowed {
+        skinned: crate::vulkan::proxy_draw::SkinnedSetBind,
+        vehicle: crate::vulkan::proxy_draw::PlainSetBind,
+        rain: crate::vulkan::proxy_draw::PlainSetBind,
+    },
+}
+
+/// Records the wet-ground receiver re-draw — finding 14's
+/// ordered-blend slot, ONE implementation for every recording arm
+/// (P4 D2 §4.3, stage S3; before it the shadowed and ordinary arms
+/// each carried a textually identical `record_ground` closure, and
+/// the proxy-less paths called their own copy). The reflection
+/// blends over the opaque ground and the rain blends over the
+/// reflection — never the reflection over the rain (the
+/// pre-corrective order drew the rain first and the ground re-draw
+/// (EQUAL depth) after, blending the reflection OVER the
+/// already-blended rain — at high reflectivity it erased a
+/// foreground streak). A no-op on the dry frame
+/// (`GroundRedrawPass::None`) and on a frame whose reflection state
+/// or scene attachment is absent (the belt-check shape both arms'
+/// closures held, preserved verbatim).
+///
+/// # Safety
+///
+/// - `cmd` must be recording inside the scene pass (the main or HDR
+///   one), past the opaque draws this placement follows
+/// - this slot's corner FrameParams region holds this frame's true
+///   camera (the frame flow's write)
+/// - the reflection barrier preceded the scene pass (the frame
+///   flow's recording order)
+unsafe fn record_wet_receiver(
+    ctx: &crate::vulkan::VulkanContext,
+    pipes: &crate::vulkan::PipelineState,
+    cmd: vk::CommandBuffer,
+    slot: usize,
+    ground: GroundRedrawPass,
+) {
+    if ground.wet()
+        && let (Some(reflection_state), Some(corner)) = (&pipes.reflection, &ctx.corner)
+    {
+        // SAFETY: this function's documented contract — the same
+        // argument the two arms' identical closures carried.
+        unsafe {
+            reflection_state.record_ground_redraw(
+                ctx,
+                corner,
+                cmd,
+                slot,
+                ground.in_hdr(),
+                corner.receiver_range(),
+            );
+        }
+    }
+}
+
+/// Records the shared per-kind proxy sequence — finding 14's
+/// ordered blend written ONCE for both lighting variants (P4 D2
+/// §4.3, stage S3): the OPAQUE kinds (npc, vehicle), the wet
+/// receiver BETWEEN them and the translucent rain kind, then the
+/// rain kind. The per-kind pipelines and binds arrive fully
+/// constructed ([`ProxyPipelines`] + [`LitBind`]) — the arms'
+/// genuine variation — so nothing here knows the lighting variant;
+/// the calls are the same ones both arms recorded before the
+/// consolidation, in the same order with the same arguments.
+///
+/// # Safety
+///
+/// - `cmd` must be recording inside the scene pass, past the mesh
+///   draw (the arms' own contracts)
+/// - the per-kind pipelines are compatible with the render pass
+///   being recorded (each arm selected this pass's variants)
+/// - the sets are material-validated (the frame flow's validation,
+///   before any synchronization state was touched)
+/// - this slot's instance AND pose regions hold this frame's bytes
+///   (written after the fence wait, above)
+#[allow(clippy::too_many_arguments)]
+unsafe fn record_proxy_sequence(
+    ctx: &crate::vulkan::VulkanContext,
+    pipes: &crate::vulkan::PipelineState,
+    cmd: vk::CommandBuffer,
+    slot: usize,
+    upload: &crate::vulkan::proxy_draw::ProxyFrameUpload<'_>,
+    proxy_state: &crate::vulkan::proxy_draw::ProxyResources,
+    pipelines: &crate::vulkan::proxy_draw::ProxyPipelines,
+    bind: LitBind,
+    ground: GroundRedrawPass,
+) -> u32 {
+    let (skinned, vehicle, rain) = match bind {
+        LitBind::Ordinary {
+            skinned,
+            vehicle,
+            rain,
+        }
+        | LitBind::Shadowed {
+            skinned,
+            vehicle,
+            rain,
+        } => (skinned, vehicle, rain),
+    };
+    // SAFETY: this function's documented contract (the arms' own
+    // arguments, unchanged).
+    let opaque_calls = unsafe {
+        proxy_state.draw_opaque_kinds(ctx, cmd, slot, upload, pipelines, &skinned, &vehicle, &rain)
+    };
+    // THE WET RECEIVER, between the opaque kinds and the translucent
+    // rain kind (finding 14's ordered blend).
+    unsafe { record_wet_receiver(ctx, pipes, cmd, slot, ground) };
+    let rain_calls = unsafe {
+        proxy_state.draw_rain_kind(ctx, cmd, slot, upload, pipelines, &skinned, &vehicle, &rain)
+    };
+    opaque_calls + rain_calls
 }
 
 /// Records the unified corner scene sequence: sky (if present), corner
@@ -261,28 +417,10 @@ pub(crate) unsafe fn record_corner_scene(
         // ordered blend), never the reflection over the rain. The
         // pre-corrective order drew the ground re-draw after the
         // rain: at high reflectivity the EQUAL-depth blend erased a
-        // foreground streak. A no-op on the dry frame.
-        let record_ground = |ctx: &crate::vulkan::VulkanContext, cmd: vk::CommandBuffer| {
-            if ground.wet()
-                && let (Some(reflection_state), Some(corner)) = (&pipes.reflection, &ctx.corner)
-            {
-                // SAFETY: the command buffer records inside this
-                // arm's render pass, past the mesh draw; this slot's
-                // corner FrameParams region holds this frame's true
-                // camera (the frame flow's write); the reflection
-                // barrier preceded the scene pass.
-                unsafe {
-                    reflection_state.record_ground_redraw(
-                        ctx,
-                        corner,
-                        cmd,
-                        slot,
-                        ground.in_hdr(),
-                        corner.receiver_range(),
-                    );
-                }
-            }
-        };
+        // foreground streak. A no-op on the dry frame. S3: the
+        // re-draw itself is `record_wet_receiver` — ONE
+        // implementation this arm and the ordinary arm share (their
+        // two closures were textually identical).
         // The shadowed arm draws proxies when the HDR variants are ensured
         // (the frame flow's family-growth block). The belt-check guards the
         // lazy first-frame window and pipeline-replacement frames (the same
@@ -290,7 +428,10 @@ pub(crate) unsafe fn record_corner_scene(
         if targets.shadowed_proxy_skinned.is_none() || targets.shadowed_proxy_vehicle.is_none() {
             // The proxy draws are skipped, so the receiver lands right
             // after the mesh — the last opaque draw this arm made.
-            record_ground(ctx, cmd);
+            // SAFETY: `record_wet_receiver`'s contract — inside this
+            // arm's render pass, past the mesh draw, this slot's
+            // corner region holding this frame's camera.
+            unsafe { record_wet_receiver(ctx, pipes, cmd, slot, ground) };
             return Some(0);
         }
         let shadowed_proxy = pipes.shadowed_proxy.as_ref().expect(
@@ -306,16 +447,17 @@ pub(crate) unsafe fn record_corner_scene(
              missing proxy state unreachable",
         );
         let calls = if let Some(upload) = proxy {
-            // The per-kind proxy draws through the SHADOWED family's
-            // own pipelines and sets — the npc kind's skinned-shadowed
-            // set (binding 2 = the shadow state's EXTENDED FrameParams
-            // at the shadow uniform's stride, binding 4 = this slot's
-            // map view, binding 5 = the pose slot) and the vehicle
-            // kind's plain-shadowed set. NEVER the unshadowed sets:
-            // their binding 2 points at the corner's 112-byte PLAIN
-            // block, which the 192-byte shadowed shader would read
-            // past (the first wiring draft made exactly that mistake
-            // — the discarded-bind bug this repair exists to fix).
+            // The per-kind bind construction — THE SHADOWED FAMILY
+            // (the arm's only genuine variation, P4 D2 §4.3): the
+            // npc kind's skinned-shadowed set (binding 2 = the
+            // shadow state's EXTENDED FrameParams at the shadow
+            // uniform's stride, binding 4 = this slot's map view,
+            // binding 5 = the pose slot) and the vehicle kind's
+            // plain-shadowed set. NEVER the unshadowed sets: their
+            // binding 2 points at the corner's 112-byte PLAIN block,
+            // which the 192-byte shadowed shader would read past
+            // (the first wiring draft made exactly that mistake —
+            // the discarded-bind bug this repair exists to fix).
             let (skinned_layout, skinned_set, [skinned_frame, skinned_pose]) = shadowed_proxy
                 .skinned_shadowed_bind(
                     upload.npc_material,
@@ -382,6 +524,10 @@ pub(crate) unsafe fn record_corner_scene(
                 npc: targets.shadowed_proxy_skinned.unwrap(),
                 rain: rain_pipeline,
             };
+            // The shared ordered sequence (S3): the opaque kinds, the
+            // wet receiver between them and the rain kind, the rain
+            // kind — the same calls this arm recorded inline before
+            // the consolidation.
             // SAFETY: the per-kind pipelines are bound with their own
             // layouts inside their render pass (the draw does the
             // binding); the sets are the shadowed-populated state's
@@ -391,34 +537,29 @@ pub(crate) unsafe fn record_corner_scene(
             // shadowed family); this slot's instance AND pose
             // regions hold this frame's bytes (written above, after
             // the fence wait).
-            let opaque_calls = proxy_state.draw_opaque_kinds(
-                ctx,
-                cmd,
-                slot,
-                upload,
-                &pipelines,
-                &skinned_bind,
-                &vehicle_bind,
-                &rain_bind,
-            );
-            // THE WET RECEIVER, between the opaque kinds and the
-            // translucent rain kind (finding 14's ordered blend).
-            record_ground(ctx, cmd);
-            let rain_calls = proxy_state.draw_rain_kind(
-                ctx,
-                cmd,
-                slot,
-                upload,
-                &pipelines,
-                &skinned_bind,
-                &vehicle_bind,
-                &rain_bind,
-            );
-            opaque_calls + rain_calls
+            unsafe {
+                record_proxy_sequence(
+                    ctx,
+                    pipes,
+                    cmd,
+                    slot,
+                    upload,
+                    proxy_state,
+                    &pipelines,
+                    LitBind::Shadowed {
+                        skinned: skinned_bind,
+                        vehicle: vehicle_bind,
+                        rain: rain_bind,
+                    },
+                    ground,
+                )
+            }
         } else {
             // No proxy draws: the receiver lands right after the
             // mesh — the last opaque draw this arm made.
-            record_ground(ctx, cmd);
+            // SAFETY: `record_wet_receiver`'s contract (inside this
+            // arm's render pass, past the mesh draw).
+            unsafe { record_wet_receiver(ctx, pipes, cmd, slot, ground) };
             0
         };
         return Some(calls);
@@ -442,29 +583,10 @@ pub(crate) unsafe fn record_corner_scene(
         );
 
         // THE WET RECEIVER PLACEMENT (finding 14 — the shadowed arm's
-        // own comment documents the ordered blend; this is the
-        // ordinary arm's copy of it). A no-op on the dry frame.
-        let record_ground = |ctx: &crate::vulkan::VulkanContext, cmd: vk::CommandBuffer| {
-            if ground.wet()
-                && let (Some(reflection_state), Some(corner)) = (&pipes.reflection, &ctx.corner)
-            {
-                // SAFETY: the command buffer records inside this
-                // arm's render pass, past the mesh draw; this slot's
-                // corner FrameParams region holds this frame's true
-                // camera (the write above); the reflection barrier
-                // preceded the scene pass.
-                unsafe {
-                    reflection_state.record_ground_redraw(
-                        ctx,
-                        corner,
-                        cmd,
-                        slot,
-                        ground.in_hdr(),
-                        corner.receiver_range(),
-                    );
-                }
-            }
-        };
+        // own comment documents the ordered blend; the re-draw itself
+        // is the SHARED `record_wet_receiver`, S3: this arm's closure
+        // was the shadowed arm's textual twin). A no-op on the dry
+        // frame.
 
         // 4. proxy draw — the main pass's and HDR's `if let (Some(proxy_state), Some(upload), Some(sets))`
         //    arm. The proxy draws after the static corner mesh (the depth-ordering
@@ -539,36 +661,32 @@ pub(crate) unsafe fn record_corner_scene(
                 npc: skinned_pipeline,
                 rain: rain_pipeline,
             };
+            // The shared ordered sequence (S3): the opaque kinds, the
+            // wet receiver between them and the rain kind, the rain
+            // kind — the same calls this arm recorded inline before
+            // the consolidation.
             // SAFETY: the per-kind pipelines are bound with their own
             // layouts inside their render pass (the draw does the
             // binding); `sets` were validated before recording; this
             // slot's instance AND pose regions hold this frame's
             // bytes (written above, after the fence wait).
-            let opaque_calls = proxy_state.draw_opaque_kinds(
-                ctx,
-                cmd,
-                slot,
-                upload,
-                &pipelines,
-                &skinned_bind,
-                &vehicle_bind,
-                &rain_bind,
-            );
-            // THE WET RECEIVER, between the opaque kinds and the
-            // translucent rain kind (finding 14's ordered blend —
-            // the shadowed arm's comment documents the defect).
-            record_ground(ctx, cmd);
-            let rain_calls = proxy_state.draw_rain_kind(
-                ctx,
-                cmd,
-                slot,
-                upload,
-                &pipelines,
-                &skinned_bind,
-                &vehicle_bind,
-                &rain_bind,
-            );
-            let recorded = opaque_calls + rain_calls;
+            let recorded = unsafe {
+                record_proxy_sequence(
+                    ctx,
+                    pipes,
+                    cmd,
+                    slot,
+                    upload,
+                    proxy_state,
+                    &pipelines,
+                    LitBind::Ordinary {
+                        skinned: skinned_bind,
+                        vehicle: vehicle_bind,
+                        rain: rain_bind,
+                    },
+                    ground,
+                )
+            };
             // The recorded count and the pure submission model must
             // agree (the unit test pins the model; this co-pins the
             // loop against it in debug builds).
@@ -585,7 +703,9 @@ pub(crate) unsafe fn record_corner_scene(
         } else {
             // No proxy draws: the receiver lands right after the
             // mesh — the last opaque draw this arm made.
-            record_ground(ctx, cmd);
+            // SAFETY: `record_wet_receiver`'s contract (inside this
+            // arm's render pass, past the mesh draw).
+            unsafe { record_wet_receiver(ctx, pipes, cmd, slot, ground) };
         }
         return Some(calls);
     }
