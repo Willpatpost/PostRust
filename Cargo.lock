@@ -182,6 +182,7 @@ dependencies = [
  "engine-core",
  "font8x8",
  "naga",
+ "once_cell",
  "sdl3",
  "sdl3-sys",
 ]

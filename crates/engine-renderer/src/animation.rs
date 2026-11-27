@@ -58,9 +58,15 @@
 //! will compute the same position as the unskinned path.
 
 use crate::proxy_instances::sin_cos_turn;
+use once_cell::sync::OnceCell;
 
 /// The number of joints in the v2 humanoid skeleton.
 pub const HUMANOID_JOINTS: usize = 11;
+
+/// The cached rest pose block - computed once at first call and reused.
+/// The rest pose is a pure function of the immutable skeleton, so we cache it
+/// once to avoid recomputing for every stationary NPC on every frame.
+static REST_POSE_BLOCK_CACHE: OnceCell<[[[f32; 4]; 4]; HUMANOID_JOINTS]> = OnceCell::new();
 
 /// The pose stride: 11 column-major mat4s of f32, 64 bytes each = 704 bytes.
 pub const POSE_STRIDE: usize = HUMANOID_JOINTS * 64;
@@ -666,14 +672,17 @@ pub fn repack_poses(
 
 /// Returns the rest pose block: the skin matrices at the all-zero pose.
 /// These are BIT-EXACT identity matrices (the rest-identity proof).
+/// Uses a cached value computed once at first call.
 pub fn rest_pose_block() -> [[[f32; 4]; 4]; HUMANOID_JOINTS] {
-    let skeleton = humanoid_skeleton();
-    let rest_pose = [JointPose {
-        delta_pos: [0.0; 3],
-        delta_turns: [0; 3],
-    }; HUMANOID_JOINTS];
-    let joint_worlds = compose_joint_matrices(&skeleton, &rest_pose);
-    skin_matrices(&joint_worlds, &skeleton)
+    *REST_POSE_BLOCK_CACHE.get_or_init(|| {
+        let skeleton = humanoid_skeleton();
+        let rest_pose = [JointPose {
+            delta_pos: [0.0; 3],
+            delta_turns: [0; 3],
+        }; HUMANOID_JOINTS];
+        let joint_worlds = compose_joint_matrices(&skeleton, &rest_pose);
+        skin_matrices(&joint_worlds, &skeleton)
+    })
 }
 
 /// Samples a pose from a clip at time t (modulo duration).
