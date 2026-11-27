@@ -49,9 +49,14 @@ use ash::vk;
 use super::proxy_draw;
 use super::skinned_draw;
 
-/// The corner material table's length (the shadowed sets' fixed
-/// count: one set per material × frame slot).
-const MATERIAL_COUNT: usize = 3;
+/// The pass families' material-count shape — the attach-time
+/// contract's own constant (P4 S2: the lit/shadowed/skinned/
+/// reflection descriptor sets are compiled for the corner-era
+/// table; `SceneDescription::validate` refuses any other count at
+/// attach, so this belt check compares the attached table against
+/// the same single source). The shadowed sets' fixed count: one
+/// set per material × frame slot.
+const MATERIAL_COUNT: usize = crate::scene_description::PASS_FAMILY_MATERIAL_COUNT;
 
 /// The shadow map's depth format: D32_SFLOAT — one f32 per texel,
 /// exactly what the known-answer readback and `textureLoad`'s
@@ -187,10 +192,14 @@ impl ShadowResources {
         corner: &CornerResources,
     ) -> Result<(), RendererError> {
         let slots = FRAMES_IN_FLIGHT as usize;
-        let material_count = crate::lit_scene::materials().len();
+        // The attached scene's material table (P4 S2: the S1-era read
+        // of `lit_scene::materials()` — the description's own values,
+        // pinned equal to the reference table by the shim-equality
+        // gate while both exist).
+        let material_count = corner.materials().len();
         if material_count != MATERIAL_COUNT {
             return Err(RendererError::Vulkan(format!(
-                "the corner material table changed ({material_count} entries, \
+                "the scene material table changed ({material_count} entries, \
                  the shadowed sets are built for {MATERIAL_COUNT})"
             )));
         }
@@ -333,8 +342,8 @@ impl ShadowResources {
         let light_offset = (size_of::<ShadowFrameParams>() as u64).next_multiple_of(align) as u32;
         let frame_stride = ((light_offset as u64) + 64).next_multiple_of(align) as u32;
         let tail_stride = (size_of::<[f32; 4]>() as u64).max(align);
-        let total = u64::from(frame_stride) * slots as u64
-            + tail_stride * crate::lit_scene::materials().len() as u64;
+        let total =
+            u64::from(frame_stride) * slots as u64 + tail_stride * corner.materials().len() as u64;
         let (frame_buffer, frame_memory, frame_mapped) =
             create_mapped_buffer(ctx, vk::BufferUsageFlags::UNIFORM_BUFFER, total)?;
         self.frame_buffer = frame_buffer;
@@ -342,12 +351,13 @@ impl ShadowResources {
         self.frame_mapped = frame_mapped;
         self.frame_stride = frame_stride;
         self.light_offset = light_offset;
-        // The immutable material tail, written once (the corner's
-        // own values, from the same engine table).
+        // The immutable material tail, written once (the attached
+        // scene's own values — the description's table, the same
+        // values the corner's own uniform tail carries).
         // SAFETY: disjoint aligned tail in coherent memory, written
         // once before any submission.
         unsafe {
-            for (index, mat) in crate::lit_scene::materials().iter().enumerate() {
+            for (index, mat) in corner.materials().iter().enumerate() {
                 let offset =
                     (slots as u64 * frame_stride as u64 + index as u64 * tail_stride) as usize;
                 let params = [
@@ -736,8 +746,13 @@ impl ShadowResources {
         retained: Option<&skinned_draw::SkinnedRetained>,
         upload: Option<&proxy_draw::ProxyFrameUpload<'_>>,
     ) {
+        // The whole attached mesh, one draw: the ranges are
+        // contiguous and cover the buffer (the attach validation's
+        // contract), so the LAST range's end is the vertex count —
+        // the former `draws[2].end` for the three-range corner
+        // table, now stated over any validated table.
         let (vertices, draws) = corner.mesh();
-        let total = draws[2].end;
+        let total = draws.last().map_or(0, |range| range.end);
         let clear = [vk::ClearValue {
             depth_stencil: vk::ClearDepthStencilValue {
                 depth: 1.0,

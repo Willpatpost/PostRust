@@ -35,6 +35,14 @@
 //! two renderer-level policies the adapter still reads — the proxy
 //! submission mode and the TEST-ONLY ripple debug lane — ride
 //! [`SubmissionPolicy`] until their own migration steps.
+//!
+//! **Stage S2 extension:** the population validation's
+//! material-table bound moved behind the attach-time scene handle —
+//! [`adapt_frame`] now takes the ATTACHED table's length (the
+//! S1-era read of `lit_scene::materials().len()`; the corner's
+//! value is pinned to the reference table by the
+//! `corner_content` shim-equality gate) instead of reading a
+//! renderer-internal constant.
 
 use engine_core::ripple::RippleField;
 
@@ -113,9 +121,11 @@ pub struct SceneFrame<'a> {
     /// passes).
     pub light: LightParams,
     /// The shadow pass: the compare-time bias plus the scene bounds
-    /// the cascade is computed over (the corner route's value —
-    /// `shadows::scene_bounds(lit_scene::intersection_boxes())` —
-    /// until S2's scene handle authors it).
+    /// the cascade is computed over — AUTHORED content, supplied
+    /// with the attached scene's description (the corner route's
+    /// value — `shadows::scene_bounds(lit_scene::intersection_boxes())`
+    /// — since S2 lives in the description the `Corner` preference
+    /// attaches; a `submit_frame` caller authors their own).
     pub shadows: Option<ShadowFrame>,
     /// The proxy population (the existing typed struct, verbatim:
     /// npc/vehicle/rain kinds, the npc pose blocks, per-kind material
@@ -241,14 +251,21 @@ pub(crate) struct FrameInputs<'x> {
 /// entry constructs inline.
 ///
 /// Validation order — the populated entries' own sequence, preserved
-/// exactly: material indices vs the corner table, then the instance
-/// repack, then the pose-index-vs-blocks check, then the pose repack.
-/// Every refusal is a typed error that leaves both repack buffers
-/// and all frame state untouched (an atomic repack, never a partial
-/// buffer).
+/// exactly: material indices vs the ATTACHED scene's table (the
+/// S2 parameter — the corner routes' former
+/// `lit_scene::materials().len()` read, now the handle's count),
+/// then the instance repack, then the pose-index-vs-blocks check,
+/// then the pose repack. Every refusal is a typed error that leaves
+/// both repack buffers and all frame state untouched (an atomic
+/// repack, never a partial buffer).
+///
+/// `material_table` is the attached scene's material count — the
+/// population validation's bound. `0` on the layers-only shape
+/// (unread there: no population path runs without a scene half).
 pub(crate) fn adapt_frame<'a, 'x>(
     policy: SubmissionPolicy,
     submission: &'x FrameSubmission<'a>,
+    material_table: u32,
     debug_overlay: &'x [OverlayVertex],
     instance_bytes: &'x mut Vec<u8>,
     pose_bytes: &'x mut Vec<u8>,
@@ -282,13 +299,12 @@ pub(crate) fn adapt_frame<'a, 'x>(
     // like the unpopulated entries.
     let proxy = match &scene.population {
         Some(population) => {
-            let material_table = crate::lit_scene::materials().len() as u32;
             if population.npc_material >= material_table
                 || population.vehicle_material >= material_table
                 || population.rain_material >= material_table
             {
                 return Err(RendererError::Vulkan(format!(
-                    "proxy material index outside the corner material table \
+                    "proxy material index outside the scene material table \
                      ({} materials, npc {}, vehicle {}, rain {})",
                     material_table,
                     population.npc_material,
@@ -474,9 +490,14 @@ mod tests {
         };
         let mut instance_bytes = Vec::new();
         let mut pose_bytes = Vec::new();
+        // The attached table's length (S2): the corner routes' own
+        // bound — `lit_scene::materials().len()` (renderer.rs's
+        // former inline read), pinned to the shim's table by the
+        // corner_content equality gate.
         let inputs = adapt_frame(
             policy,
             &submission,
+            3,
             &[],
             &mut instance_bytes,
             &mut pose_bytes,
@@ -539,6 +560,7 @@ mod tests {
         let inputs = adapt_frame(
             policy,
             &submission,
+            3,
             &[],
             &mut instance_bytes,
             &mut pose_bytes,
@@ -576,6 +598,102 @@ mod tests {
             inputs, expected,
             "the sticky-on corner frame's full parameter set"
         );
+    }
+
+    /// THE S2 EQUIVALENCE EXTENSION (device-free, the type-level
+    /// bar): the population material validation reads the ATTACHED
+    /// scene's table length — the parameter the renderer fills from
+    /// the [`crate::SceneHandle`] — not a renderer-internal
+    /// constant. The corner's attached value (3, the shim's table,
+    /// pinned to `lit_scene::materials()` by the corner_content
+    /// gate) refuses index 3 with EXACTLY the populated entries'
+    /// own refusal text (modulo the S2 wording — "scene" for
+    /// "corner", matched in the entries themselves); a LARGER
+    /// attached table accepts the same index — the boundary is the
+    /// attachment's, proving the validation follows the handle.
+    #[test]
+    fn population_material_validation_reads_the_attached_table() {
+        let matrix = [
+            [0.9, 0.0, 0.0, 0.0],
+            [0.0, 0.9, 0.0, 0.0],
+            [0.0, 0.0, 0.9, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let light = crate::lit_scene::day_preset();
+        let policy = SubmissionPolicy {
+            proxy_draw_mode: ProxyDrawMode::default(),
+            ripple_debug: RippleDebugMode::default(),
+        };
+        // An empty-kind population carrying material index 3: no
+        // repack work, no pose blocks — the validation is the only
+        // code that runs (the index is checked regardless of kind
+        // population, exactly like the entries').
+        let population = crate::renderer::ProxyPopulation {
+            npc: &[],
+            npc_poses: &[],
+            npc_material: 3,
+            vehicle: &[],
+            vehicle_material: 0,
+            rain: &[],
+            rain_material: 0,
+        };
+        let submission = FrameSubmission {
+            camera: FrameCamera {
+                view_proj: matrix,
+                eye: [4.0, 1.7, 12.0],
+            },
+            output: OutputTarget {
+                window_size: (1280, 720),
+            },
+            layers: DynamicLayers::default(),
+            scene: Some(SceneFrame {
+                light,
+                shadows: None,
+                population: Some(population),
+                sky: None,
+                post: false,
+                wet: None,
+            }),
+        };
+        // Against the corner's attached table (3 materials): the
+        // typed refusal, the entries' own text.
+        let mut instance_bytes = Vec::new();
+        let mut pose_bytes = Vec::new();
+        let error = adapt_frame(
+            policy,
+            &submission,
+            3,
+            &[],
+            &mut instance_bytes,
+            &mut pose_bytes,
+        )
+        .expect_err("index 3 must refuse against the corner table");
+        let RendererError::Vulkan(text) = &error else {
+            panic!("the refusal is a Vulkan error: {error:?}");
+        };
+        assert_eq!(
+            text,
+            "proxy material index outside the scene material table \
+             (3 materials, npc 3, vehicle 0, rain 0)",
+            "the entries' own refusal text (the S2 wording)"
+        );
+        // Against a FOUR-material attached table: the same
+        // submission validates — the empty kinds repack to nothing
+        // and the upload carries the (now in-table) indices.
+        let mut instance_bytes = Vec::new();
+        let mut pose_bytes = Vec::new();
+        let inputs = adapt_frame(
+            policy,
+            &submission,
+            4,
+            &[],
+            &mut instance_bytes,
+            &mut pose_bytes,
+        )
+        .expect("index 3 is inside a four-material table");
+        let proxy = inputs.proxy.expect("the population maps to an upload");
+        assert_eq!(proxy.npc_material, 3, "the in-table index rides through");
+        assert_eq!(proxy.npc_count, 0, "the empty kinds repack to nothing");
     }
 
     /// The ripple fixture (renderer.rs's own test policy, verbatim):

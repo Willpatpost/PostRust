@@ -783,18 +783,41 @@ impl VulkanContext {
             context.destroy();
             return Err(e);
         }
-        if config.demo_scene == DemoScenePreference::Corner {
-            match corner::CornerResources::new(&context) {
-                Ok(resources) => {
-                    context.corner = Some(resources);
-                }
-                Err(e) => {
-                    context.destroy();
-                    return Err(e);
-                }
-            }
-        }
+        // The corner content NO LONGER uploads here (P4 S2): the
+        // `Corner` preference's construction-time upload moved to the
+        // attach API (`Renderer::new`'s preference adapter attaches the
+        // migration shim's description through
+        // `VulkanContext::attach_scene_resources` — the same ladder
+        // position, the same allocation order, now behind the
+        // `SceneDescription` handle every future consumer uses).
         Ok((context, validation_active, sync_validation))
+    }
+
+    /// Attaches the scene's device-lifetime resources (P4 S2 — the
+    /// design's §3.2 attach step): builds the corner resource set
+    /// from a VALIDATED description (the caller validates whole,
+    /// device-free, first — a refusal builds nothing). ONE scene
+    /// per context: the device-lifetime pass families (the
+    /// retained skinned state, the shadow/reflection per-material
+    /// sets) bind these buffers, so a second attachment would
+    /// orphan them — refused here, and a fresh renderer is the
+    /// supported path for different content. A failed build
+    /// changes nothing (the builder's partial-failure discipline
+    /// releases its own partials; `corner` stays `None`).
+    pub(crate) fn attach_scene_resources(
+        &mut self,
+        description: &crate::scene_description::SceneDescription,
+    ) -> Result<(), RendererError> {
+        if self.corner.is_some() {
+            return Err(RendererError::Vulkan(
+                "a scene is already attached (one scene per renderer — \
+                 construct a fresh renderer to attach different content)"
+                    .into(),
+            ));
+        }
+        let resources = corner::CornerResources::new(self, description)?;
+        self.corner = Some(resources);
+        Ok(())
     }
 
     fn init_atlas(&mut self, atlas: &crate::glyph_atlas::GlyphAtlas) -> Result<(), RendererError> {
@@ -1017,7 +1040,7 @@ impl VulkanContext {
             return Ok(());
         }
         let corner = self.corner.as_ref().ok_or_else(|| {
-            RendererError::Vulkan("skinned proxy requires the Corner scene preference".into())
+            RendererError::Vulkan("skinned proxy requires an attached scene".into())
         })?;
         let retained = skinned_draw::SkinnedRetained::new(self, corner)?;
         self.skinned_retained = Some(retained);
@@ -2162,9 +2185,10 @@ impl PipelineState {
         if self.shadows.is_some() {
             return Ok(());
         }
-        let corner = ctx.corner.as_ref().ok_or_else(|| {
-            RendererError::Vulkan("shadows require the Corner scene preference".into())
-        })?;
+        let corner = ctx
+            .corner
+            .as_ref()
+            .ok_or_else(|| RendererError::Vulkan("shadows require an attached scene".into()))?;
         self.shadows = Some(shadow_draw::ShadowResources::new(
             ctx,
             self.render_pass,
@@ -2188,7 +2212,7 @@ impl PipelineState {
             return Ok(());
         }
         let corner = ctx.corner.as_ref().ok_or_else(|| {
-            RendererError::Vulkan("shadowed proxy requires the Corner scene preference".into())
+            RendererError::Vulkan("shadowed proxy requires an attached scene".into())
         })?;
         let shadows = self.shadows.as_ref().ok_or_else(|| {
             RendererError::Vulkan(
@@ -2247,7 +2271,7 @@ impl PipelineState {
         }
         if ctx.corner.is_none() {
             return Err(RendererError::Vulkan(
-                "the post chain requires the Corner scene preference".into(),
+                "the post chain requires an attached scene".into(),
             ));
         }
         self.post = Some(post_draw::PostResources::new(
@@ -2274,7 +2298,7 @@ impl PipelineState {
             return Ok(());
         }
         let corner = ctx.corner.as_ref().ok_or_else(|| {
-            RendererError::Vulkan("the wet reflection requires the Corner scene preference".into())
+            RendererError::Vulkan("the wet reflection requires an attached scene".into())
         })?;
         let post = self.post.as_ref().ok_or_else(|| {
             RendererError::Vulkan(
@@ -4028,7 +4052,7 @@ pub(crate) fn render_frame(
                 || (upload.rain_count > 0 && rain_set.is_none())
             {
                 return Err(RendererError::Vulkan(format!(
-                    "proxy material index outside the corner material table \
+                    "proxy material index outside the scene material table \
                      (npc {}, vehicle {}, rain {})",
                     upload.npc_material, upload.vehicle_material, upload.rain_material
                 )));
@@ -4039,10 +4063,11 @@ pub(crate) fn render_frame(
                 rain_set.unwrap_or(vk::DescriptorSet::null()),
             ])
         }
-        // A proxy upload without corner resources is structurally
-        // unreachable (the safe layer requires the Corner scene
-        // preference, whose renderer construction built them) —
-        // treated as the unpopulated frame rather than an error.
+        // A proxy upload without scene resources is structurally
+        // unreachable (the safe layer requires an attached scene —
+        // the Corner preference auto-attaches at construction, and
+        // attach_scene is the public path) — treated as the
+        // unpopulated frame rather than an error.
         (None, Some(_)) | (None, None) | (Some(_), None) => None,
     };
 

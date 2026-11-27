@@ -88,9 +88,13 @@ use ash::vk;
 /// possible pose index (MAX_POSE_BLOCKS), one region per frame slot.
 const SLOT_STRIDE: u64 = MAX_POSE_BLOCKS as u64 * POSE_STRIDE as u64;
 
-/// The corner material table's length (the skinned sets' fixed
-/// count — one set per material, `corner.rs`'s own three).
-const MATERIAL_COUNT: usize = 3;
+/// The pass families' material-count shape — the attach-time
+/// contract's own constant (P4 S2: the lit/shadowed/skinned/
+/// reflection descriptor sets are compiled for the corner-era
+/// table; `SceneDescription::validate` refuses any other count at
+/// attach, so the set sizing below always matches the attached
+/// table). One set per material here.
+const MATERIAL_COUNT: usize = crate::scene_description::PASS_FAMILY_MATERIAL_COUNT;
 
 /// The proxy vertex form a pipeline reads. The two kinds' mesh
 /// bindings differ: the npc kind's 64-byte

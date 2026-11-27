@@ -1,13 +1,20 @@
-//! Device-lifetime corner resources. Mesh, material blocks and descriptors
-//! survive pipeline replacement. Only the fenced frame slot is writable.
+//! Device-lifetime scene resources (P4 S2: generalized from the
+//! corner constants to the ATTACHED
+//! [`SceneDescription`](crate::scene_description::SceneDescription)
+//! — the design's "the existing CornerResources machinery
+//! generalized"). Mesh, material blocks and descriptors survive
+//! pipeline replacement; only the fenced frame slot is writable.
+//! The name keeps its history (the corner was the first — and so
+//! far only — attached scene); the CONTENT is caller data now.
+use super::descriptors::create_sets_sized;
 use super::{
     RendererError, SamplerPool, Texture, VulkanContext, create_device_local_buffer_with_data,
-    create_mapped_buffer, descriptors::create_sets,
+    create_mapped_buffer,
 };
 use crate::config::FRAMES_IN_FLIGHT;
-use crate::lit_mesh::corner_mesh;
-use crate::lit_scene::{LightParams, materials};
-use crate::proc_texture::{TEXTURE_SIZE, procedural_texture};
+use crate::lit_scene::{LightParams, Material};
+use crate::proc_texture::TEXTURE_SIZE;
+use crate::scene_description::{GroundRoles, SceneDescription};
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use std::ops::Range;
@@ -46,8 +53,12 @@ impl FrameParams {
 pub(super) struct CornerResources {
     pub layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
-    sets: [vk::DescriptorSet; 3],
-    textures: [Texture; 3],
+    /// One descriptor set per attached material (the description's
+    /// table length — validated at attach; the pass families'
+    /// compile-time shape pins it at three today).
+    sets: Vec<vk::DescriptorSet>,
+    /// The attached albedo set's uploads, in texture-index order.
+    textures: Vec<Texture>,
     sampler: SamplerPool,
     uniforms: vk::Buffer,
     uniform_memory: vk::DeviceMemory,
@@ -55,37 +66,61 @@ pub(super) struct CornerResources {
     stride: u32,
     vertices: vk::Buffer,
     vertex_memory: vk::DeviceMemory,
-    draws: [Range<u32>; 3],
+    /// The attached mesh's per-material draw ranges (one per
+    /// material, contiguous, covering the buffer — the attach
+    /// validation's contract).
+    draws: Vec<Range<u32>>,
+    /// The attached material table (kept for the downstream
+    /// pass-family builders — the shadow/reflection material tails
+    /// and the albedo-index mapping — and the table-length checks
+    /// that used to read `lit_scene::materials()` directly).
+    materials: Vec<Material>,
+    /// The attached wet ground roles (the receiver and reflected
+    /// ranges the recorder and reflection state consume — the
+    /// values `receiver_range()`/`reflected_ranges()` used to
+    /// derive from the draw table).
+    ground: GroundRoles,
 }
 
 impl CornerResources {
-    pub fn new(ctx: &VulkanContext) -> Result<Self, RendererError> {
+    /// Builds the scene resources from a VALIDATED description
+    /// (the caller — the context's attach step — validates whole
+    /// first; a refusal here never happens for a validated
+    /// description, and a construction failure releases exactly
+    /// what exists). Partial-failure safe, as ever.
+    pub fn new(ctx: &VulkanContext, description: &SceneDescription) -> Result<Self, RendererError> {
         let mut state = Self::default();
-        if let Err(e) = state.build(ctx) {
+        if let Err(e) = state.build(ctx, description) {
             state.destroy(ctx);
             return Err(e);
         }
         Ok(state)
     }
 
-    fn build(&mut self, ctx: &VulkanContext) -> Result<(), RendererError> {
-        let (vertices, draws) = corner_mesh();
-        self.draws = draws;
+    fn build(
+        &mut self,
+        ctx: &VulkanContext,
+        description: &SceneDescription,
+    ) -> Result<(), RendererError> {
+        let materials = &description.materials;
+        self.materials = materials.clone();
+        self.draws = description.mesh.draws.clone();
+        self.ground = description.ground.clone();
         (self.vertices, self.vertex_memory) = create_device_local_buffer_with_data(
             ctx,
             vk::BufferUsageFlags::VERTEX_BUFFER,
-            bytemuck::cast_slice(&vertices),
+            bytemuck::cast_slice(&description.mesh.vertices),
         )?;
-        for (i, texture) in self.textures.iter_mut().enumerate() {
-            *texture = Texture::upload(
+        for bytes in &description.textures.textures {
+            self.textures.push(Texture::upload(
                 ctx,
                 vk::Format::R8G8B8A8_UNORM,
                 vk::Extent2D {
                     width: TEXTURE_SIZE,
                     height: TEXTURE_SIZE,
                 },
-                &procedural_texture(i as u32),
-            )?;
+                bytes,
+            )?);
         }
         self.sampler = SamplerPool::with_address_mode(ctx, vk::SamplerAddressMode::REPEAT)?;
 
@@ -99,7 +134,6 @@ impl CornerResources {
             .next_multiple_of(limits.min_uniform_buffer_offset_alignment.max(1));
         self.stride = u32::try_from(stride)
             .map_err(|_| RendererError::Vulkan("dynamic UBO offset exceeds u32".into()))?;
-        let materials = materials();
         (self.uniforms, self.uniform_memory, self.mapped) = create_mapped_buffer(
             ctx,
             vk::BufferUsageFlags::UNIFORM_BUFFER,
@@ -127,7 +161,10 @@ impl CornerResources {
             ty,
             descriptor_count: count,
         });
-        (self.pool, self.layout, self.sets) = create_sets(ctx, &bindings, &sizes, count)?;
+        let (pool, layout, sets) = create_sets_sized(ctx, &bindings, &sizes, count)?;
+        self.pool = pool;
+        self.layout = layout;
+        self.sets = sets;
         for (i, mat) in materials.iter().enumerate() {
             let offset = (u64::from(FRAMES_IN_FLIGHT) + i as u64) * stride;
             let [r, g, b] = mat.specular;
@@ -185,6 +222,14 @@ impl CornerResources {
         self.sets.get(material as usize).copied()
     }
 
+    /// The attached material table (the downstream pass-family
+    /// builders' source — the shadow/reflection material tails and
+    /// the table-length checks that read `lit_scene::materials()`
+    /// before S2).
+    pub(crate) fn materials(&self) -> &[Material] {
+        &self.materials
+    }
+
     /// Called inside the lit render pass only after this slot's fence
     /// wait (the caller writes the slot's FrameParams first — the
     /// 6-F split, so the shadowed path can write the EXTENDED block
@@ -199,11 +244,12 @@ impl CornerResources {
         ctx: &VulkanContext,
         cmd: vk::CommandBuffer,
         layout: vk::PipelineLayout,
-        sets: &[vk::DescriptorSet; 3],
+        sets: &[vk::DescriptorSet],
         frame_offset: u32,
     ) {
-        // SAFETY: the bound vertex buffer is the corner mesh's own;
-        // all draws refer to complete triangle ranges in it. The
+        // SAFETY: the bound vertex buffer is the attached mesh's own;
+        // all draws refer to complete triangle ranges in it (the
+        // attach validation's contiguity/coverage contract). The
         // sets' frame regions were written after the slot's fence
         // wait (the caller's write, the coherent-buffer discipline).
         unsafe {
@@ -224,14 +270,14 @@ impl CornerResources {
         }
     }
 
-    /// The corner's own per-material descriptor sets (the unshadowed
+    /// The scene's own per-material descriptor sets (the unshadowed
     /// path's `draw` binding).
-    pub(crate) fn sets(&self) -> &[vk::DescriptorSet; 3] {
+    pub(crate) fn sets(&self) -> &[vk::DescriptorSet] {
         &self.sets
     }
 
     /// The skinned proxy path's descriptor companions (the Era-2
-    /// sibling sets bind the corner's OWN uniform/texture/sampler
+    /// sibling sets bind the scene's OWN uniform/texture/sampler
     /// resources — the accessors skinned_draw's set writes need).
     /// The uniform buffer handle (FrameParams regions + the material
     /// tail).
@@ -243,17 +289,20 @@ impl CornerResources {
         std::mem::size_of::<FrameParams>() as u64
     }
     /// Material `i`'s immutable tail offset in the uniform buffer
-    /// (binding 3's static offset — the same arithmetic the corner's
+    /// (binding 3's static offset — the same arithmetic the scene's
     /// own set writes use).
     pub(crate) fn material_offset(&self, material: usize) -> u64 {
         (u64::from(FRAMES_IN_FLIGHT) + material as u64) * u64::from(self.stride)
     }
-    /// Material `i`'s albedo texture view.
+    /// Material `i`'s albedo texture view (mapped through the
+    /// attached table — the material's OWN texture index, which the
+    /// corner authoring happens to make equal to the material
+    /// index).
     pub(crate) fn texture_view(&self, material: usize) -> vk::ImageView {
-        self.textures[material].view
+        self.textures[self.materials[material].texture as usize].view
     }
     /// The nearest-addressing sampler (binding 0's immutable
-    /// sampler — the corner sets' own choice).
+    /// sampler — the scene sets' own choice).
     pub(crate) fn nearest_sampler(&self) -> vk::Sampler {
         self.sampler.nearest()
     }
@@ -282,49 +331,32 @@ impl CornerResources {
         }
     }
 
-    /// The corner's own FrameParams uniform buffer (the Era-1 wet
+    /// The scene's own FrameParams uniform buffer (the Era-1 wet
     /// reflection's ground re-draw binds THE TRUE camera's regions
-    /// — the same buffer the corner mesh draws read — at its own
+    /// — the same buffer the scene mesh draws read — at its own
     /// binding 3).
     pub(crate) fn frame_buffer(&self) -> vk::Buffer {
         self.uniforms
     }
 
-    /// The corner mesh's vertex buffer and its material-grouped draw
-    /// ranges (the shadow state's depth-only pass draws the whole
-    /// mesh through them).
-    pub(crate) fn mesh(&self) -> (vk::Buffer, [Range<u32>; 3]) {
-        (
-            self.vertices,
-            [
-                Range {
-                    start: self.draws[0].start,
-                    end: self.draws[0].end,
-                },
-                Range {
-                    start: self.draws[1].start,
-                    end: self.draws[1].end,
-                },
-                Range {
-                    start: self.draws[2].start,
-                    end: self.draws[2].end,
-                },
-            ],
-        )
+    /// The attached mesh's vertex buffer and its material-grouped
+    /// draw ranges (the shadow state's depth-only pass draws the
+    /// whole mesh through them).
+    pub(crate) fn mesh(&self) -> (vk::Buffer, &[Range<u32>]) {
+        (self.vertices, &self.draws)
     }
 
     /// The ground quad's draw range — the planar mirror's RECEIVER:
-    /// the quad the wet re-draw re-rasterizes (EQUAL depth) with the
-    /// mirrored scene sampled at the same screen position. This is
-    /// the authored corner scene's OWN planar intent, stated where
-    /// the scene is authored (finding 20, phase C: the recorder
-    /// assumed range zero was the reflector; now the corner caller
-    /// supplies the range and the recorder is a primitive over it).
+    /// the range the wet re-draw re-rasterizes (EQUAL depth) with
+    /// the mirrored scene sampled at the same screen position. The
+    /// ATTACHED scene's own planar intent, stated where the content
+    /// is authored (finding 20, phase C: the recorder assumed range
+    /// zero was the reflector; the caller supplies the range and
+    /// the recorder is a primitive over it — since S2 the range
+    /// lives in the description's [`GroundRoles`], not the draw
+    /// table's implicit slot zero).
     pub(crate) fn receiver_range(&self) -> Range<u32> {
-        Range {
-            start: self.draws[0].start,
-            end: self.draws[0].end,
-        }
+        self.ground.receiver.clone()
     }
 
     /// The reflected building masses' draw ranges, in MATERIAL
@@ -333,33 +365,29 @@ impl CornerResources {
     /// material·slots + slot — so the order is the contract between
     /// this accessor and the reflection state's own set layout).
     /// The masses the planar mirror reflects toward the receiver —
-    /// the authored corner scene's planar intent, stated where the
-    /// scene is authored (finding 20, phase C: the recorder assumed
-    /// materials 1.. were the reflected buildings and skipped the
-    /// ground; now the corner caller supplies the ranges and the
-    /// recorder iterates exactly what it is given).
+    /// the ATTACHED scene's planar intent (finding 20, phase C;
+    /// since S2 the ranges live in the description's
+    /// [`GroundRoles`]).
     pub(crate) fn reflected_ranges(&self) -> [Range<u32>; 2] {
-        [
-            Range {
-                start: self.draws[1].start,
-                end: self.draws[1].end,
-            },
-            Range {
-                start: self.draws[2].start,
-                end: self.draws[2].end,
-            },
-        ]
+        self.ground.reflected.clone()
+    }
+
+    /// The wet ground's mirror-plane height (the receiver's world
+    /// plane — the reflection camera's mirrored math reflects
+    /// across it; the corner authoring's ground plate at y = 0).
+    pub(crate) fn ground_plane_y(&self) -> f32 {
+        self.ground.receiver_plane_y
     }
 
     /// The albedo texture view for a material index (the shadowed
-    /// sets bind the same textures the corner's own sets do).
+    /// sets bind the same textures the scene's own sets do — mapped
+    /// through the attached table).
     pub(crate) fn albedo_view(&self, material: u32) -> Option<vk::ImageView> {
-        let table = materials();
-        let mat = table.get(material as usize)?;
+        let mat = self.materials.get(material as usize)?;
         Some(self.textures[mat.texture as usize].view)
     }
 
-    /// The corner's REPEAT-addressed sampler (the shadowed sets'
+    /// The scene's REPEAT-addressed sampler (the shadowed sets'
     /// immutable sampler — identical sampling to the unshadowed path).
     pub(crate) fn repeat_sampler(&self) -> vk::Sampler {
         self.sampler.nearest()
@@ -367,7 +395,7 @@ impl CornerResources {
 
     pub fn destroy(mut self, ctx: &VulkanContext) {
         // SAFETY: init failure or idle device with referencing pipelines gone.
-        // Pool owns all three sets. Null handles denote partial construction.
+        // Pool owns all the sets. Null handles denote partial construction.
         unsafe {
             ctx.device.destroy_descriptor_pool(self.pool, None);
             ctx.device.destroy_descriptor_set_layout(self.layout, None);
