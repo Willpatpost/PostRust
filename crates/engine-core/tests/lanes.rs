@@ -297,7 +297,20 @@ fn legacy_single_lane_is_deterministic_in_the_stage0_domain() {
 
 #[test]
 fn shared_prerequisites_release_fanout_once_in_order() {
-    let mut spine = Spine::with_reservation(CountingWorld::new(), 127, 63);
+    // B01's housekeeping bound (the P2-L3 corrective, 2026-11-27): the
+    // original fixture observed the whole 2048-herd parked after two
+    // ticks at budget 127 — a 16:1 housekeeping-to-budget ratio the
+    // bound now rate-limits by design, so the all-parked-at-once
+    // state is unreachable at that budget. The fixture's intent is
+    // the DEDUP (the duplicated `first` dependency registering once)
+    // and the canonical-order release — the budget was the harness
+    // choice, not the assertion. The budget rises to 2100/2050 so
+    // the herd parks within one tick's allowance, preserving the
+    // original observation shape; the bounded-storm semantics at
+    // the old budget are pinned separately in spine.rs
+    // (release_storm_releases_atomically_then_defers and the
+    // parking storm fixtures).
+    let mut spine = Spine::with_reservation(CountingWorld::new(), 2100, 2050);
     let first = spine.schedule(at(Field::Far, 2, 0)).unwrap();
     let last = spine.schedule(at(Field::Far, 4, 1)).unwrap();
     for payload in 2..2050 {
@@ -305,22 +318,7 @@ fn shared_prerequisites_release_fanout_once_in_order() {
             .schedule(at(Field::Near, 1, payload).with_dependencies(vec![first, last, first]))
             .unwrap();
     }
-    // B01's housekeeping bound (the P2-L3 corrective, 2026-11-27): this
-    // fixture parks 2048 due-blocked events against a 127-event budget —
-    // a 16:1 housekeeping-to-budget ratio, adversarial by the design's
-    // own definition and exactly the storm shape the bound exists to
-    // rate-limit. The pre-B01 battery observed the whole herd parked
-    // after two ticks (the unbounded rate); the bound now parks
-    // ~190/tick (the 127 + 63 allowances across the phases), so the
-    // full park completes over ~11 ticks. The observation window
-    // widens from 2 to 30 ticks — the fixture's intent (every event
-    // parked exactly once, release fired once with the duplicate dep
-    // deduped, canonical order to completion, the mid-storm
-    // suspend/resume surviving) is unchanged and now ALSO covers the
-    // bounded cadence. The inline replica in spine.rs
-    // (release_storm_releases_atomically_then_defers) pins the atomic
-    // single-release semantics at the herd's exact shape.
-    spine.run_ticks(30);
+    spine.run_ticks(2);
     assert_eq!(spine.blocked_count(), 2048);
     assert_eq!(spine.world().executed, [0]);
     assert_eq!(spine.suspend_matching(|v| v.payload == 27), 1);
