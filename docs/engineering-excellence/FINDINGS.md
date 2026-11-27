@@ -43,7 +43,7 @@ corrected).
 | B01 | CORE | UNTRIAGED | — | pending auditor-core |
 | B02 | PERSIST | CONFIRMED | — | journal.rs:170-189 whole-file read ≤4 GiB; auditor's caller list (journal.rs:1115…3428) to be re-verified in P3 (line refs ambiguous across modules) |
 | B03 | PERSIST | CONFIRMED | — | composite_reader.rs:416-464,544 payload clones; reclaim.rs ~5686 bytes.clone(); pipeline.rs PendingAttempt clones; folds NEW-PERSIST-01/04 |
-| B04 | SLICE/PERSIST | CONFIRMED | — | **orchestrator-read verification (npc_memory_lane.rs):** the record path's `mark_applied` failure records `UnresolvedEpisode` (954–967, retry completes the apply, never a second envelope); the classification flush (1166–1226) has NO equivalent — failure after `stage` → retry mints a NEW episode id + a SECOND journal transaction for the same sync (retry-identity inconsistency + write amplification). Auditor's quoted "bypass" comment FABRICATED (not in source) and "lost consequences" OVERSTATED (the durable journal holds unconfirmed transactions; recovery rebuilds; state converges); the flush is also partially guarded (`book.unresolved.is_none()` at 980). Persist half: core pipeline state machine consolidated. Disposition: P1/P3 transaction-lifecycle consolidation lane (charter's own direction), design-first — the S6 fuzz gate guards this semantics |
+| B04 | SLICE/PERSIST | FIXED-AWAITING-REVIEW | integrated `e31dc61` | lane `35211d2` + orchestrator corrective `2f92788`: the flush now records unresolved episodes on all three failure boundaries; the corrective fixed the lane's two defects (unjournaled retry hit the inverted `new(0,0)` membership span; journaled retry left the sync snapshot stale → duplicate flush) via `UnresolvedKind` + failure-boundary bookkeeping; 2 discriminating tests; fuzz-gate values unchanged; heavy +2 pending measured pin |
 | B10 | SLICE | CONFIRMED | — | replay/synthesis asymmetry verified in structure (audits/slice.md; line refs approximate) — measurement-quality fix alongside the measurement owner |
 | B11 | SLICE | CONFIRMED (LOW) | — | occupancy-vs-visibility terminology (audits/slice.md) |
 | B13 | SLICE/PERSIST | CONFIRMED (HIGH) | — | verified: `worker.rs` send-then-`slot.recv()` round-trip at :635,687,745,792,837,877,921,1174; charter-known blocking bounded send on `submit_required`; P3 mapping of which calls can block sim/presentation |
@@ -103,3 +103,17 @@ refutation is evidence too.
   refuted by the journal's recovery classification), line refs off by ~5–15,
   coverage table internally inconsistent (SKIM/UNEXAMINED overlap). Use for
   mapping/classification; verify every quote and HIGH claim before acting.
+- **qwen3-coder-next (implementation lanes ×3):** real implementation energy
+  and correct instincts on small bounded changes (A16's merge was genuinely
+  sound), but **3/3 lanes required orchestrator correctives after "all
+  acceptance criteria met" claims**: A17 silently dropped the primary item
+  (cached only the identity constant) and added an unnecessary `once_cell`
+  dependency; B09 overshot scope (removed the real-but-deprecated
+  `VK_MVK_macos_surface`) with one wrong registry citation; B04's retry paths
+  were defective in both halves the fix existed for (inverted span on the
+  unjournaled retry, stale snapshot re-duplicating on the journaled retry)
+  while the handoff claimed them fixed. Pattern: verify every completion
+  claim against the actual diff; briefs must name the discriminating tests;
+  prefer this model for mechanical/structural changes with tight contracts,
+  route semantics-heavy durability work through orchestrator implementation
+  or far stricter briefs.
