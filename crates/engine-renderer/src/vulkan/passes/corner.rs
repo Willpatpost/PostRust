@@ -9,7 +9,7 @@
 use super::descriptors::create_sets_sized;
 use super::{
     RendererError, SamplerPool, Texture, VulkanContext, create_device_local_buffer_with_data,
-    create_mapped_buffer,
+    create_mapped_buffer, shader_layout_pins,
 };
 use crate::config::FRAMES_IN_FLIGHT;
 use crate::lit_scene::{LightParams, Material};
@@ -17,6 +17,7 @@ use crate::proc_texture::TEXTURE_SIZE;
 use crate::scene_description::{GroundRoles, SceneDescription};
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
+use std::mem::offset_of;
 use std::ops::Range;
 
 /// WGSL FrameParams: mat4 followed by three 16-byte lanes. Their spare W
@@ -30,7 +31,30 @@ pub(crate) struct FrameParams {
     ambient: [f32; 4],
 }
 
-const _: () = assert!(size_of::<FrameParams>() == 112);
+// The P4 S5 layout pins (design §6.4): this Rust mirror is checked
+// against the WGSL-derived layout constants the build emits from the
+// COMPOSED shader sources (see `vulkan::shader_layout_pins`) — a
+// drift on either side fails the build. The hand-written 112-byte
+// size pin this replaces dated from Cycle 6-B; the values are the
+// same, now single-sourced from the shader side.
+const _: () = assert!(size_of::<FrameParams>() == shader_layout_pins::FRAME_PARAMS_SIZE);
+const _: () = assert!(
+    offset_of!(FrameParams, view_proj) == shader_layout_pins::FRAME_PARAMS_VIEW_PROJ_OFFSET
+);
+const _: () = assert!(
+    offset_of!(FrameParams, light_dir) == shader_layout_pins::FRAME_PARAMS_LIGHT_DIR_OFFSET
+);
+const _: () = assert!(
+    offset_of!(FrameParams, light_color) == shader_layout_pins::FRAME_PARAMS_LIGHT_COLOR_OFFSET
+);
+const _: () =
+    assert!(offset_of!(FrameParams, ambient) == shader_layout_pins::FRAME_PARAMS_AMBIENT_OFFSET);
+// The material tail this module writes is the WGSL MaterialParams
+// block's host form (specular rgb + shininess packed as [f32; 4],
+// written at the tail start — the block's only member must sit at
+// offset 0 for the write to land on it).
+const _: () = assert!(size_of::<[f32; 4]>() == shader_layout_pins::MATERIAL_PARAMS_SIZE);
+const _: () = assert!(shader_layout_pins::MATERIAL_PARAMS_SPECULAR_OFFSET == 0);
 
 impl FrameParams {
     pub(super) fn clear_color(&self) -> [f32; 4] {

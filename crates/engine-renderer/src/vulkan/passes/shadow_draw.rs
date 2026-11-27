@@ -40,10 +40,12 @@
 //! `shadow_ray_hit`.
 
 use super::corner::CornerResources;
+use super::shader_layout_pins;
 use super::{RendererError, VulkanContext, create_mapped_buffer, descriptors::create_sets};
 use crate::config::{FRAMES_IN_FLIGHT, TargetFaultSite, TargetFaultStage};
 use crate::shadows::SHADOW_MAP_EXTENT;
 use ash::vk;
+use std::mem::offset_of;
 
 // Sibling modules (same `vulkan` parent)
 use super::proxy_draw;
@@ -82,7 +84,45 @@ pub(crate) struct ShadowFrameParams {
     pub shadow_control: [f32; 4],
 }
 
-const _: () = assert!(size_of::<ShadowFrameParams>() == 192);
+// The P4 S5 layout pins (design §6.4): this Rust mirror is checked
+// against the WGSL-derived layout constants the build emits from the
+// COMPOSED shadowed variants (see `vulkan::shader_layout_pins`) — a
+// drift on either side fails the build. The base members assert
+// against the PLAIN block's pins because the shadowed block's base
+// is build-checked to pin-identically to it (the unshadowed shader
+// reads the same 112-byte prefix — the prefix invariant). The
+// hand-written 192-byte size pin this replaces dated from 6-F; the
+// values are the same, now single-sourced from the shader side.
+const _: () =
+    assert!(size_of::<ShadowFrameParams>() == shader_layout_pins::SHADOW_FRAME_PARAMS_SIZE);
+const _: () = assert!(
+    offset_of!(ShadowFrameParams, view_proj) == shader_layout_pins::FRAME_PARAMS_VIEW_PROJ_OFFSET
+);
+const _: () = assert!(
+    offset_of!(ShadowFrameParams, light_dir) == shader_layout_pins::FRAME_PARAMS_LIGHT_DIR_OFFSET
+);
+const _: () = assert!(
+    offset_of!(ShadowFrameParams, light_color)
+        == shader_layout_pins::FRAME_PARAMS_LIGHT_COLOR_OFFSET
+);
+const _: () = assert!(
+    offset_of!(ShadowFrameParams, ambient) == shader_layout_pins::FRAME_PARAMS_AMBIENT_OFFSET
+);
+const _: () = assert!(
+    offset_of!(ShadowFrameParams, light_view_proj)
+        == shader_layout_pins::SHADOW_FRAME_PARAMS_LIGHT_VIEW_PROJ_OFFSET
+);
+const _: () = assert!(
+    offset_of!(ShadowFrameParams, shadow_control)
+        == shader_layout_pins::SHADOW_FRAME_PARAMS_SHADOW_CONTROL_OFFSET
+);
+// The depth-only pass's LightMatrix host form: the light matrix this
+// module re-writes at `light_offset` for the depth set's binding 0 —
+// pinned to the WGSL LightMatrix block the depth variants declare
+// (the block's only member must sit at offset 0 for the matrix write
+// to land on it).
+const _: () = assert!(size_of::<[[f32; 4]; 4]>() == shader_layout_pins::LIGHT_MATRIX_SIZE);
+const _: () = assert!(shader_layout_pins::LIGHT_MATRIX_LIGHT_VIEW_PROJ_OFFSET == 0);
 
 /// The extended FrameParams block's byte size (the shadowed proxy
 /// sets' binding-2 range — pub for the sibling state's set writes).

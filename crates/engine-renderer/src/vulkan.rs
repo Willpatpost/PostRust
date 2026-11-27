@@ -136,6 +136,21 @@ pub(crate) mod sky_draw;
 #[path = "textures.rs"]
 pub mod textures;
 
+/// The P4 S5 shader/host layout pins (design §6.4): the WGSL-side
+/// uniform-struct layouts the build script resolves from the COMPOSED
+/// variant sources (member offsets from the parsed IR — the same
+/// values the SPIR-V writer emits — sizes through naga's WGSL
+/// memory-layout table), cross-checked for agreement across every
+/// variant consumer before emission. The host mirrors
+/// ([`corner::FrameParams`], [`shadow_draw::ShadowFrameParams`], the
+/// material tail's `[f32; 4]`, the depth pass's light-matrix write)
+/// assert against these constants: a layout drift between the Rust
+/// packing and the WGSL consumption fails the BUILD, on whichever
+/// side moved. Generated file — never edited by hand.
+pub(crate) mod shader_layout_pins {
+    include!(concat!(env!("OUT_DIR"), "/layout_pins.rs"));
+}
+
 // The pre-split surface of this module, re-exported so no sibling
 // (renderer.rs, submission.rs, scene_description.rs, lib.rs) and no
 // child (the pass families, frame_prepare, frame_plan, scene_record)
@@ -719,5 +734,155 @@ mod position_invariance {
             "sky.spv carries no @invariant — a match here means the matcher fires \
              on structure that is not the decoration"
         );
+    }
+}
+
+#[cfg(test)]
+mod shader_composition {
+    //! The P4 S5 composition guard (design §6.3 + §8-S5's removal
+    //! condition, made executable): the variant shells under
+    //! `shaders/variants/` compose from the shared fragments under
+    //! `shaders/core/` at `// @core:<name>` anchor lines; the build
+    //! script performs the splice and fails on a missing core. These
+    //! tests pin the SOURCE TREE's shape so a regression — a pasted-
+    //! back equation, an orphaned fragment, a restored monolith —
+    //! fails `cargo test`, not just review.
+
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn shaders_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shaders")
+    }
+
+    /// (file name, text) for every `.wgsl` under `shaders/<sub>`.
+    fn wgsl_sources(sub: &str) -> Vec<(String, String)> {
+        let dir = shaders_dir().join(sub);
+        let mut out = Vec::new();
+        for entry in
+            fs::read_dir(&dir).unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
+        {
+            let path = entry
+                .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
+                .path();
+            if path.extension().is_some_and(|ext| ext == "wgsl") {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                let text = fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+                out.push((name, text));
+            }
+        }
+        out
+    }
+
+    /// A marker hits `text` only on a NON-COMMENT line: the shells'
+    /// headers document the equations (the pre-S5 documentation
+    /// sketches), and those comment lines are not live equation text.
+    fn carries_marker(text: &str, marker: &str) -> bool {
+        text.lines().any(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("//") && trimmed.contains(marker)
+        })
+    }
+
+    /// The composition's integrity: every anchor resolves to an
+    /// existing core, and every core is spliced by at least one shell
+    /// (no orphaned fragments).
+    #[test]
+    fn every_anchor_resolves_and_every_core_is_used() {
+        let mut referenced: Vec<String> = Vec::new();
+        for (shell, text) in wgsl_sources("variants") {
+            for line in text.lines() {
+                let Some(core) = line.trim().strip_prefix("// @core:") else {
+                    continue;
+                };
+                let core = core.trim();
+                let path = shaders_dir().join("core").join(format!("{core}.wgsl"));
+                assert!(
+                    path.is_file(),
+                    "{shell}: anchor @core:{core} does not resolve — every anchor must name a \
+                     shaders/core/{core}.wgsl"
+                );
+                referenced.push(core.to_owned());
+            }
+        }
+        assert!(
+            !referenced.is_empty(),
+            "no anchors found — the variants tree lost its composition"
+        );
+        for (core, _) in wgsl_sources("core") {
+            let stem = core.trim_end_matches(".wgsl");
+            assert!(
+                referenced.iter().any(|name| name == stem),
+                "core {core} is orphaned — no variant shell splices it (delete it or wire it)"
+            );
+        }
+    }
+
+    /// The S5 removal condition: the shared lighting/shadow/skinning/
+    /// layout semantics live ONCE, in `shaders/core/` — no shell
+    /// re-declares them, and each still exists somewhere (only the
+    /// duplication is gone, never the semantic).
+    #[test]
+    fn variant_shells_carry_no_duplicated_equation_text() {
+        const MARKERS: &[&str] = &[
+            "fn shadow_factor",
+            "fn tap_offset",
+            "fn square_pow",
+            "fn trailing_zeros",
+            "let base = u32(i_pose.x) * 11u;",
+            "let m0 = poses[base + joints.x];",
+            "var shadow_map: texture_depth_2d;",
+            "var<storage, read> poses: array<mat4x4<f32>>;",
+            "struct FrameParams {",
+            "struct MaterialParams {",
+            "struct LightMatrix {",
+            "let m = mat4x4<f32>(i_col0, i_col1, i_col2, i_col3);",
+            "let squarings = trailing_zeros(u32(material.specular.a));",
+            "let spec = square_pow(n_dot_h, squarings);",
+            "shadow = shadow_factor(world_pos, n);",
+            "let lit = albedo *",
+        ];
+        let shells = wgsl_sources("variants");
+        let cores = wgsl_sources("core");
+        for marker in MARKERS {
+            for (shell, text) in &shells {
+                assert!(
+                    !carries_marker(text, marker),
+                    "{shell} re-declares `{marker}` — the shared semantics must be composed \
+                     from shaders/core, never duplicated in a shell"
+                );
+            }
+            assert!(
+                cores.iter().any(|(_, text)| carries_marker(text, marker)),
+                "no core carries `{marker}` — the semantic went missing, not just its \
+                 duplication"
+            );
+        }
+    }
+
+    /// The no-dual-source rule (design §8-S5): the nine pre-S5
+    /// monolithic variant sources stay deleted — the composed shells
+    /// are the only source of truth for the variant set.
+    #[test]
+    fn the_legacy_monolithic_variant_sources_are_gone() {
+        const LEGACY: &[&str] = &[
+            "lit_scene.wgsl",
+            "lit_scene_shadowed.wgsl",
+            "instanced_proxy.wgsl",
+            "instanced_proxy_shadowed.wgsl",
+            "instanced_proxy_skinned.wgsl",
+            "instanced_proxy_skinned_shadowed.wgsl",
+            "shadow_depth.wgsl",
+            "shadow_depth_instanced.wgsl",
+            "shadow_depth_skinned.wgsl",
+        ];
+        for name in LEGACY {
+            assert!(
+                !shaders_dir().join(name).exists(),
+                "{name} exists at the shaders root — the monolithic source must stay deleted \
+                 (no dual source; the composed variant owns the name now)"
+            );
+        }
     }
 }
