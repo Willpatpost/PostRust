@@ -317,7 +317,29 @@ fn compare_map(
 /// semantic divergence (a wrong matrix or box moves texels by
 /// 1e-2-scale, not 1e-7). A future exceed is an INVESTIGATION again:
 /// re-measure, document, correct — never a silent widening.
-const POPULATED_MAP_TOLERANCE: f32 = 3.0e-7;
+///
+/// THE CROSS-PLATFORM CORRECTION (RIG-PENDING-02, the owner's
+/// explicit decision 2026-11-27, option 1 of the recorded three):
+/// the gate's FIRST real-GPU execution (the RTX 5070 Ti, driver
+/// 617.42) measured the same census with per-class maxima clear
+/// 0.00e0 / ground 1.31e-6 / building 4.26e-6 / npc 1.97e-6 /
+/// vehicle 3.16e-6 — every mismatch 1–2 ulps at the compared
+/// magnitudes (the recorded sample: gpu 0.863685 vs cpu 0.863687),
+/// the census SHAPE identical to lavapipe's (npc/vehicle an order
+/// under building), 487,690 of 1,035,970 compared texels at the
+/// epsilon tail. The real GPU's rasterizer rounds depth ~14×
+/// further from the CPU raycaster than the software rasterizer
+/// does — hardware precision divergence, not a geometry defect
+/// (macroscopic deltas and the sibling batteries failing would be
+/// that signature; the four same-path batteries were green). The
+/// owner's chosen disposition: ONE tolerance sized for both
+/// platforms — 1e-5, still ~2,000× tighter than any real geometry
+/// error (a wrong triangle lands at 1e-1-scale deltas, never the
+/// sixth decimal) and ~2.3× above the rig's measured tail. The
+/// lavapipe evidence and this rig measurement are both on record;
+/// a future exceed is an INVESTIGATION — re-measure, document,
+/// correct — never a silent widening.
+const POPULATED_MAP_TOLERANCE: f32 = 1.0e-5;
 
 /// One class's comparison census (the investigation's evidence: the
 /// compared and mismatched counts and the max error, per class).
