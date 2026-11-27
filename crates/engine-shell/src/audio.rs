@@ -1227,6 +1227,12 @@ impl AudioDevice {
     /// and attenuated against the listener it was published with —
     /// the camera/pose layer's data, gains derived AT the callback,
     /// never in the trigger core). Bounded and fail-visible —
+    /// THE PRODUCER STALL BOUND (NEW-SHELL-6): the audio thread's
+    /// drain holds this lock only for the bounded ring copy (the
+    /// A25 corrective — the voice-start work runs unheld after
+    /// it), so this blocking acquisition waits at most one
+    /// bounded copy of ≤ `TRIGGER_QUEUE_CAPACITY` `Copy` slots
+    /// (microseconds), never a voice-start batch.
     /// refusals land in [`AudioStats::triggers_dropped`].
     pub fn submit_triggers(&mut self, triggers: &[SoundTrigger], listener: Listener) {
         self.shared.submit(triggers, listener);
