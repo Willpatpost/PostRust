@@ -42,7 +42,7 @@ corrected).
 | A25 | SHELL | FIXED-AWAITING-REVIEW | integrated `7c30aee` | **auditor PASS verdict REFUTED by direct read** (start_voice ran inside the lock at audio.rs:912 — the auditor's "releases before heavy work" was backwards); orchestrator-implemented fix `fa13e26`: copy-out under try-lock → guard dropped → voice-start unheld; pairing preserved; shell battery green, zero test changes |
 | B01 | CORE | CONFIRMED | — | spine.rs:1767-1786 drain_due counts executions only (blocked moves don't count); charter's structural-gap framing stands (audits/core.md) |
 | B02 | PERSIST | IN-PROGRESS | L1 integrated `19fe59d` | the bounded header-prefix read LANDED (the three header-only callers no longer read whole journals; the frontier-from-memory half reverted to L4/L5 after the rotation-invariant review); remaining: recovery single-decode (L4), the streaming framed reader (L5) |
-| B03 | PERSIST | IN-PROGRESS | L2 integrated `c084230` | reclaim dedupe LANDED (the duplicate read eliminated, borrowed domain peek, o(1) membership — with the orchestrator corrective for the inverted closure-dedupe condition and the teeth-proven discriminating test); remaining: the composite Arc backing (L8, the dark-module authorization question) + the pipeline one-retained-copy restructure (L3) |
+| B03 | PERSIST | IN-PROGRESS (reclaim + pipeline halves landed) | L2 `c084230`, L3 `8636d89` | reclaim dedupe LANDED (with the inversion corrective + teeth-proven test); pipeline copies LANDED (glm-5.3 `54cc9e9`: the commit path 3 key-set copies → 1 — keys move into append_for with the clone paid only on the rare rebase path, the attempt moves into the pending slot, confirm_retained's take/restore with byte-identical failure semantics, transaction_ticks O(keys·log) via the committed index); remaining: the composite Arc backing (L8, the dark-module authorization question) |
 | B04 | SLICE/PERSIST | VERIFIED-CLOSED (slice) / NO-CHANGE (persist) | integrated `e31dc61`; P3 design | slice half fixed+gated as recorded below; persist half: the P3 design re-read the pending-retention/retry/reconcile state machine and found it SOUND (no-change with evidence — the S6 fuzz gate + pp_b4_pending are the standing pins) |
 | B10 | SLICE | CONFIRMED | — | replay/synthesis asymmetry verified in structure (audits/slice.md; line refs approximate) — measurement-quality fix alongside the measurement owner |
 | B11 | SLICE | CONFIRMED (LOW) | — | occupancy-vs-visibility terminology (audits/slice.md) |
@@ -222,6 +222,18 @@ refutation is evidence too.
   glm-5.3 by default** (cost noted by the owner, justified by quality);
   implementation lanes remain case-by-case under the verify-everything
   discipline; independent review stays cross-family per the charter.
+- **glm-5.3-w4a8 (implementation lanes, design-as-spec pattern):** after the
+  B07/B05 design trial, the P4-S1 and P3-L3 implementation lanes are **2/2
+  clean** — no orchestrator correctives needed: additive-only constraints
+  honored to the letter (verified at the diff level), baselines self-measured
+  BEFORE editing, TRUE counts reported, honest semantic deltas documented
+  unprompted (S1's route-semantics choices; L3's take/restore panic window
+  with its reachability analysis), and the design-named cross-crate gates
+  run voluntarily. **The pattern that works: the design document IS the
+  spec + glm-5.3 + the additive/constraint framing + D-EE-09 branch
+  discipline.** Contrast qwen3-coder-next's 4/5 corrective rate on
+  brief-only work. Implementation lanes route to glm-5.3 by default now,
+  matching the design-work default.
 - **qwen38-27b (shell — CORRECTED 2026-11-26):** delivered one of the two
   best audits of the five (line-by-line coverage, byte-level A23
   measurements, claims verified against the vendored SDL 3.4.18 source,
