@@ -111,11 +111,27 @@
 //! Linux carries the full fsync contract, Windows the process-crash
 //! tier — never presented as power-loss durability (the SQLite
 //! fallback decision remains the lead's).
+//!
+//! **The streaming scan (B02's bounded working set):** every scan
+//! path — open, bound open, bound creation admission, `scan_file`,
+//! `scan_bound_file`, and the ambiguous-write reread — reads the
+//! file through the framed streaming reader: the fixed header probe
+//! first (a bounded prefix), then one length-framed record at a
+//! time, each record's bytes landing in a reused buffer bounded by
+//! the largest record the documented field maxima can compose. A
+//! scan's working set is the decoded state plus ONE frame — never
+//! the file (the 4 GiB ceiling stays a fail-closed cap, never a
+//! working-set budget). The whole-file classification walk this
+//! replaced remains in-tree, compile-time isolated to tests, as the
+//! differential oracle's reference: the streaming reader's outputs
+//! — states and error surfaces alike — are pinned byte-identical to
+//! it over an adversarial corpus
+//! (`journal_streaming_differential`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use engine_core::{Decoder, Encoder, SaveError};
@@ -147,9 +163,60 @@ pub const MAX_JOURNAL_FRONTIER: u64 = 1 << 16;
 pub const MAX_JOURNAL_ENVELOPE_BYTES: u64 = 1 << 20;
 pub const MAX_JOURNAL_PLAN_BYTES: u64 = 1 << 20;
 pub const MAX_JOURNAL_DETAIL_BYTES: u64 = 1 << 16;
-/// Documented maximum for the journal file itself (the scan reads it
-/// once per open/recovery — bounded, never in a hot path; growth
-/// beyond this fails closed rather than allocating unbounded).
+/// (B02, lane P3-L5) The largest record the writer can ever produce
+/// — the documented per-field maxima summed over the largest frame
+/// shape (the commit record). Strict decode consumes a frame
+/// EXACTLY, one bounded field at a time, so a frame declaring more
+/// than this can never decode: the streaming reader treats such a
+/// declaration as the undecodable frame it is and skips its bytes
+/// WITHOUT buffering them — the identical `Undecodable` walk-past
+/// the whole-file reader's failed decode produced, without the
+/// frame ever landing in memory. This is the streaming reader's
+/// per-frame working-set bound (a derived consequence of the wire
+/// maxima above, not a new format rule: no encoder or decoder
+/// enforces it as a limit).
+const MAX_JOURNAL_RECORD_BYTES: u64 = (8 + JOURNAL_RECORD_DOMAIN.len() as u64) // the domain tag
+    + 1 // schema
+    + 1 // kind
+    + (8 + Hash::WIDTH) // the prev-hash field
+    + (8 + Hash::WIDTH) // the commit's transaction id
+    + 8 // sequence
+    + 8 // record_count
+    + (8 + Hash::WIDTH) // the capture-set digest
+    + (8 + MAX_JOURNAL_IDENTITIES * 16) // identities
+    + (1 + 8 + Hash::WIDTH + 8) // position (the Some(head) maximum)
+    + 1 // the classification discriminant
+    + (8 + MAX_JOURNAL_DEPENDENCIES * (8 + Hash::WIDTH)) // dependencies
+    + (8 + MAX_JOURNAL_FRONTIER * 12) // frontier entries
+    + (8 + MAX_JOURNAL_PLAN_BYTES); // plan
+/// (B02, lane P3-L5) The streaming header probe's length for the
+/// legacy header: the larger of the fixed header itself and the
+/// largest domain tag the wire decoder accepts (plus its length
+/// prefix). The whole-file reader handed `read_header` the ENTIRE
+/// file; the decoder's domain read can fail with a
+/// remaining-dependent error (a corrupted domain-length field
+/// claiming more bytes than the slice holds), so a shorter probe
+/// would turn some of the whole-file reader's `Domain`/`Utf8`
+/// refusals into `Limit` refusals with different detail strings. At
+/// this probe length the domain read's own `MAX_TAG_LEN` bound is
+/// the binding limit whenever the file outgrows the probe (and a
+/// file shorter than the probe yields its full content — the L1
+/// `read_prefix` contract), so every `read_header` outcome, error
+/// detail included, is byte-identical to the whole-file reader's.
+/// The probe over-reads the fixed header; the walk rewinds to the
+/// header's end.
+const LEGACY_HEADER_PROBE_LEN: usize = 8 + engine_core::wire::MAX_TAG_LEN as usize;
+// The probe must dominate the fixed header's own length (it does
+// with every realistic domain; a compile-time refusal if that ever
+// changes — the probe would need to grow with the header).
+const _: () = assert!(LEGACY_HEADER_PROBE_LEN > 8 + JOURNAL_DOMAIN.len());
+/// Documented maximum for the journal file itself — the fail-closed
+/// ceiling every scan enforces (the open-time length check plus the
+/// streaming reader's read budget; growth beyond it refuses typed
+/// rather than allocating or scanning unbounded). Since the P3-L5
+/// streaming reader landed, no scan path holds the file: this is a
+/// ceiling, never a working-set budget (the per-frame bound is
+/// [`MAX_JOURNAL_RECORD_BYTES`]).
 pub const MAX_JOURNAL_FILE_BYTES: u64 = 1 << 32;
 
 fn check_journal_length(length: u64) -> Result<u64, JournalError> {
@@ -181,9 +248,13 @@ pub fn read_prefix(path: &Path, len: usize) -> Result<Vec<u8>, JournalError> {
     Ok(bytes)
 }
 
-/// Reads journal bytes for scanning, hashing, or checking the bound header.
-/// The same open handle supplies the metadata and the read. The reader also
-/// enforces the ceiling if a writer grows the file during an unlocked scan.
+/// Reads the WHOLE journal file into one exact-reserved `Vec` — the
+/// bounded read for callers that legitimately need every byte (the
+/// backup manifest's journal hash) and the differential oracle's
+/// reference scans. The scan paths do NOT use this (P3-L5): they
+/// stream through the framed reader with a per-frame buffer. The
+/// reader also enforces the ceiling if a writer grows the file
+/// during an unlocked read.
 pub fn read_journal_bytes(path: &Path) -> Result<Vec<u8>, JournalError> {
     let read_error = |e| io_err("read journal", path, e);
     let mut file = File::open(path).map_err(read_error)?;
@@ -1109,6 +1180,262 @@ pub fn read_bound_header(
     })
 }
 
+// ----------------- the streaming framed reader (B02, lane P3-L5)
+//
+// The frame format is streaming-shaped by construction: every frame
+// is `[u64 little-endian length][record bytes]` — the length
+// PREFIXES its record — and the record chain hashes run forward from
+// the header's anchor, so one sequential pass with a per-frame
+// buffer reproduces the whole-file walk's every decision. This
+// block is the bounded-buffer replacement for the whole-file
+// `read_journal_bytes` in every scan path; the whole-file walk it
+// replaced survives below, test-gated, as the differential oracle.
+
+/// The 8-byte frame length prefix's read outcome.
+enum LengthPrefix {
+    /// The scan ended cleanly: the file or the read budget is
+    /// exactly exhausted (the whole-file loop's `offset ==
+    /// bytes.len()`).
+    End,
+    /// A partial prefix — the classical torn tail (the whole-file
+    /// walk's `remaining < 8` arm, take-cap truncation included).
+    Torn,
+    /// The complete prefix and the payload length it declares.
+    Full(u64),
+}
+
+/// One frame's read outcome.
+enum FrameOutcome {
+    /// The complete frame; its record bytes are in the reused
+    /// per-frame buffer.
+    Buffered,
+    /// The complete frame, consumed WITHOUT buffering: its declared
+    /// size exceeds [`MAX_JOURNAL_RECORD_BYTES`], so no strict decode
+    /// could ever accept it — the identical `Undecodable` walk-past
+    /// the whole-file reader's failed decode produced, without the
+    /// bytes ever landing in memory.
+    Skipped,
+    /// The declared payload exceeds the scan budget or the bytes the
+    /// file actually holds — the whole-file `frame_end`'s `None`.
+    Torn,
+}
+
+/// (B02, P3-L5) THE STREAMING FRAMED READER — the bounded-buffer
+/// journal read. One open read handle (the single-writer lock lives
+/// on the sidecar, so the data file's bytes are never range-locked
+/// and every scan reads through its own handle); the walk cursor
+/// counts consumed bytes, budgeted against the 4 GiB ceiling exactly
+/// as the whole-file reader's `take` cap was; the end-of-walk length
+/// observation is the whole-file reader's `bytes.len()` (with the
+/// grew-past-the-ceiling probe). The working set is ONE frame's
+/// bytes plus the I/O buffer — never the file.
+///
+/// **The equivalence contract (the differential oracle's
+/// subject):** on identical bytes, every classification decision,
+/// every `JournalState`/`JournalScan` field, and every
+/// `JournalError` surface is byte-identical to the whole-file
+/// reader's, pinned by the differential corpus. The one deliberate
+/// divergence lives inside the untimestampable concurrent-growth
+/// race PAST the ceiling: the whole-file reader probed before
+/// classifying anything, the streaming reader classifies as it
+/// reads, so a file that both exceeds the cap AND carries
+/// committed-history damage can surface a different fail-closed
+/// error depending on which reader ran — both refuse, neither
+/// truncates, and no static fixture (the oracle's domain) can
+/// distinguish them. A mid-read I/O failure likewise surfaces where
+/// the walk meets it rather than before the first frame; on every
+/// readable file the two are indistinguishable.
+struct FrameReader {
+    reader: BufReader<File>,
+    path: PathBuf,
+    /// The walk cursor — bytes consumed so far (the whole-file
+    /// walk's `offset`). Never exceeds [`MAX_JOURNAL_FILE_BYTES`].
+    consumed: u64,
+    /// (test instrumentation) the largest frame this reader ever
+    /// buffered — the working-set bound's observable (the
+    /// differential corpus asserts it stays under
+    /// [`MAX_JOURNAL_RECORD_BYTES`] even over giant-declared frames).
+    #[cfg(test)]
+    peak_frame_bytes: u64,
+}
+
+impl FrameReader {
+    /// Opens the data file and enforces the file-length ceiling on
+    /// the observed length, exactly where the whole-file read
+    /// enforced it. The whole-file reader's exact-reserve step has
+    /// no streaming counterpart (there is no file-sized allocation
+    /// to reserve); its failure mapping is preserved per frame
+    /// ([`Self::read_frame`]'s bounded reserve).
+    fn open(path: &Path) -> Result<Self, JournalError> {
+        let read_error = |e| io_err("read journal", path, e);
+        let file = File::open(path).map_err(read_error)?;
+        check_journal_length(file.metadata().map_err(read_error)?.len())?;
+        Ok(FrameReader {
+            reader: BufReader::new(file),
+            path: path.to_path_buf(),
+            consumed: 0,
+            #[cfg(test)]
+            peak_frame_bytes: 0,
+        })
+    }
+
+    /// The whole-file reader's read-error surface (`read journal`
+    /// at this path) — byte-identical, so the differential oracle's
+    /// error comparisons see the same strings.
+    fn read_error(&self, source: io::Error) -> JournalError {
+        io_err("read journal", &self.path, source)
+    }
+
+    /// The walk cursor (bytes consumed so far).
+    fn consumed(&self) -> u64 {
+        self.consumed
+    }
+
+    /// Reads at most `len` bytes — the header probe: a file shorter
+    /// than the probe yields its FULL content (the L1
+    /// [`read_prefix`] contract — exactly the bytes the whole-file
+    /// reader would have handed the header parser).
+    fn read_probe(&mut self, len: usize) -> Result<Vec<u8>, JournalError> {
+        let mut bytes = Vec::with_capacity(len);
+        let mut chunk = [0u8; 8192];
+        while bytes.len() < len {
+            let want = (len - bytes.len()).min(chunk.len());
+            let read = self
+                .reader
+                .read(&mut chunk[..want])
+                .map_err(|e| self.read_error(e))?;
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            self.consumed += read as u64;
+        }
+        Ok(bytes)
+    }
+
+    /// Repositions the walk cursor: the legacy header probe may
+    /// over-read the fixed header (the probe is sized for error
+    /// identity, not for the header alone), so the walk rewinds to
+    /// the header's end before the first frame.
+    fn seek_to(&mut self, offset: u64) -> Result<(), JournalError> {
+        self.reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| self.read_error(e))?;
+        self.consumed = offset;
+        Ok(())
+    }
+
+    /// Reads the next frame's 8-byte length prefix (budgeted: a
+    /// prefix the remaining scan budget cannot hold whole is the
+    /// torn tail the whole-file `take` truncation produced).
+    fn read_length_prefix(&mut self) -> Result<LengthPrefix, JournalError> {
+        let mut prefix = [0u8; 8];
+        let budget = MAX_JOURNAL_FILE_BYTES - self.consumed;
+        let want = usize::try_from(budget.min(8)).expect("at most 8");
+        let mut read = 0;
+        while read < want {
+            let n = self
+                .reader
+                .read(&mut prefix[read..want])
+                .map_err(|e| self.read_error(e))?;
+            if n == 0 {
+                break;
+            }
+            read += n;
+            self.consumed += n as u64;
+        }
+        if read == 0 {
+            Ok(LengthPrefix::End)
+        } else if read < 8 {
+            Ok(LengthPrefix::Torn)
+        } else {
+            Ok(LengthPrefix::Full(u64::from_le_bytes(prefix)))
+        }
+    }
+
+    /// Reads one frame's declared payload into the reused `buf` —
+    /// or past it, unbuffered, when the declaration exceeds
+    /// [`MAX_JOURNAL_RECORD_BYTES`] (no strict decode could accept
+    /// such a frame; the classification is the whole-file reader's
+    /// decode failure, and the bytes never land in memory).
+    fn read_frame(
+        &mut self,
+        declared: u64,
+        buf: &mut Vec<u8>,
+    ) -> Result<FrameOutcome, JournalError> {
+        let budget = MAX_JOURNAL_FILE_BYTES - self.consumed;
+        if declared > budget {
+            // The frame declares past the scan's ceiling — the torn
+            // tail the whole-file `take` cap produced.
+            return Ok(FrameOutcome::Torn);
+        }
+        if declared > MAX_JOURNAL_RECORD_BYTES {
+            let mut remaining = declared;
+            while remaining > 0 {
+                let take = {
+                    // The path-only error mapping keeps this borrow
+                    // disjoint from the buffer's lifetime (fill_buf's
+                    // slice borrows the reader through the arm).
+                    let chunk = self
+                        .reader
+                        .fill_buf()
+                        .map_err(|e| io_err("read journal", &self.path, e))?;
+                    if chunk.is_empty() {
+                        return Ok(FrameOutcome::Torn);
+                    }
+                    chunk
+                        .len()
+                        .min(usize::try_from(remaining).unwrap_or(usize::MAX))
+                };
+                self.reader.consume(take);
+                self.consumed += take as u64;
+                remaining -= take as u64;
+            }
+            return Ok(FrameOutcome::Skipped);
+        }
+        let len = usize::try_from(declared).expect("≤ MAX_JOURNAL_RECORD_BYTES");
+        buf.clear();
+        buf.try_reserve(len)
+            .map_err(|_| self.read_error(io::Error::from(io::ErrorKind::OutOfMemory)))?;
+        buf.resize(len, 0);
+        let mut filled = 0;
+        while filled < len {
+            let n = self
+                .reader
+                .read(&mut buf[filled..])
+                .map_err(|e| self.read_error(e))?;
+            if n == 0 {
+                return Ok(FrameOutcome::Torn);
+            }
+            filled += n;
+            self.consumed += n as u64;
+        }
+        #[cfg(test)]
+        self.record_peak(len as u64);
+        Ok(FrameOutcome::Buffered)
+    }
+
+    #[cfg(test)]
+    fn record_peak(&mut self, len: u64) {
+        self.peak_frame_bytes = self.peak_frame_bytes.max(len);
+    }
+
+    /// The whole-file reader's `bytes.len()`: the file's actual
+    /// length, observed once at the end of the walk. A length beyond
+    /// the ceiling is the grew-past-the-cap probe — the whole-file
+    /// reader's post-read check, the same fail-closed refusal.
+    fn file_length(&mut self) -> Result<u64, JournalError> {
+        let actual = self
+            .reader
+            .seek(SeekFrom::End(0))
+            .map_err(|e| self.read_error(e))?;
+        if actual > MAX_JOURNAL_FILE_BYTES {
+            check_journal_length(MAX_JOURNAL_FILE_BYTES + 1)?;
+        }
+        Ok(actual.min(MAX_JOURNAL_FILE_BYTES))
+    }
+}
+
 /// (V2-W F4) The bound-journal scan: the identity-verifying
 /// read-only classification. An ABSENT file is a typed missing-
 /// evidence refusal — never the empty-journal fallback (once the
@@ -1123,7 +1450,56 @@ pub fn read_bound_header(
 /// creation resolution remains the exclusive province of the
 /// PRE-BINDING creation path (`T1Journal::open_bound_creating`'s
 /// initialization of a journal whose binding was never published).
+/// (P3-L5) The scan STREAMS: the bound header probe (a bounded
+/// prefix — the header parser is pure byte comparison, so the probe
+/// is exactly the header's length), then the framed walk with a
+/// per-frame buffer; the whole-file body this replaced is preserved
+/// verbatim below as the differential oracle.
 pub fn scan_bound_file(
+    path: impl AsRef<Path>,
+    founding: &crate::hash::Hash,
+    root_id: &crate::hash::Hash,
+) -> Result<JournalScan, JournalError> {
+    let path = path.as_ref();
+    let mut reader = FrameReader::open(path)?;
+    let header = bound_header_bytes(founding, root_id);
+    match read_bound_header(&reader.read_probe(header.len())?, founding, root_id)? {
+        BoundHeaderState::Fresh => Err(JournalError::Io {
+            op: "read bound journal",
+            path: path.display().to_string(),
+            source: io::Error::from(io::ErrorKind::NotFound),
+        }),
+        BoundHeaderState::TornCreation { byte_len } => Err(JournalError::CorruptHeader {
+            detail: format!(
+                "torn bound header — damaged evidence, never an inert scan \
+                 (prefix of {byte_len} bytes)"
+            ),
+        }),
+        BoundHeaderState::Matching { header_hash } => {
+            let state = classify_streaming(
+                JournalState::empty_bound(header_hash, header.len() as u64),
+                &mut reader,
+                header_hash,
+            )?;
+            Ok(JournalScan {
+                committed: state.committed,
+                cancellations: state.cancellations,
+                tail: state.observed_tail,
+            })
+        }
+    }
+}
+
+/// (P3-L5) THE DIFFERENTIAL ORACLE'S WHOLE-FILE REFERENCE — the
+/// exact pre-streaming `scan_bound_file` body (the whole-file read,
+/// the whole-file `classify_bound`), compile-time isolated to tests.
+/// The differential corpus (`journal_streaming_differential`)
+/// asserts this function's output byte-identical to the production
+/// streaming path's on identical fixtures — states and error
+/// surfaces. Retained for exactly as long as the oracle is; never a
+/// production path.
+#[cfg(test)]
+fn scan_bound_file_whole_file(
     path: impl AsRef<Path>,
     founding: &crate::hash::Hash,
     root_id: &crate::hash::Hash,
@@ -1220,15 +1596,22 @@ struct Damage {
     kind: TailKind,
 }
 
-/// The classification walk — the documented rules of the module
-/// docs, applied in one sequential pass.
+/// (P3-L5) The whole-file classification walk — the differential
+/// oracle's reference (compile-time isolated to tests; the
+/// production walk is [`classify_streaming`]). The documented rules
+/// of the module docs, applied in one sequential pass over the
+/// whole file's bytes.
+#[cfg(test)]
 fn classify(bytes: &[u8], header_hash: Hash) -> Result<JournalState, JournalError> {
     let state = JournalState::empty(header_hash);
     classify_from(state, bytes, header_hash, header_bytes().len())
 }
 
-/// (V2-W F4) The bound-journal classification walk — the identical
-/// documented rules over the bound header's anchor and length.
+/// (P3-L5) The whole-file bound-journal classification walk — the
+/// differential oracle's reference (test-gated; the production walk
+/// is [`classify_streaming`]). The identical documented rules over
+/// the bound header's anchor and length.
+#[cfg(test)]
 fn classify_bound(
     bytes: &[u8],
     header_hash: Hash,
@@ -1238,6 +1621,11 @@ fn classify_bound(
     classify_from(state, bytes, header_hash, header_len)
 }
 
+/// (P3-L5) The whole-file strict bound state — the differential
+/// oracle's reference for the bound open and the ambiguous-write
+/// reread (test-gated; the production path is
+/// [`strict_bound_state_streaming`]).
+#[cfg(test)]
 fn strict_bound_state(
     bytes: &[u8],
     founding: &Hash,
@@ -1258,14 +1646,22 @@ fn strict_bound_state(
     }
 }
 
+/// (P3-L5) The whole-file walk's frame-boundary arithmetic — the
+/// oracle's companion (test-gated; the streaming reader expresses
+/// the same boundary as "declared length vs. the bytes actually
+/// available until EOF, budgeted by the ceiling").
+#[cfg(test)]
 fn frame_end(payload_start: usize, declared: u64, file_len: usize) -> Option<u64> {
     let end = (payload_start as u64).checked_add(declared)?;
     (end <= file_len as u64).then_some(end)
 }
 
-/// The shared sequential walk (both header shapes): the state's
-/// append_offset carries the header length; the chain anchors at the
-/// header's hash.
+/// (P3-L5) The whole-file shared sequential walk — the differential
+/// oracle's core (compile-time isolated to tests; the production
+/// walk is [`classify_streaming`], decision for decision). The
+/// state's append_offset carries the header length; the chain
+/// anchors at the header's hash.
+#[cfg(test)]
 fn classify_from(
     mut state: JournalState,
     bytes: &[u8],
@@ -1527,6 +1923,387 @@ fn classify_from(
     Ok(state)
 }
 
+/// (P3-L5) THE STREAMING CLASSIFICATION WALK — the whole-file
+/// [`classify_from`] walk's documented rules over the streaming
+/// reader, decision for decision: the same damage-first-wins rule,
+/// the same chain re-anchoring at validating commits, the same
+/// fail-closed corruption rules with the same `at` offsets (each
+/// frame's start) and the same trailing classification over the
+/// file's actual length. The state's `append_offset` carries the
+/// header length and the reader's cursor sits there (the header
+/// probe consumed exactly that much, or was rewound to it); the
+/// chain anchors at the header's hash; the per-frame buffer is
+/// reused across frames and bounded by
+/// [`MAX_JOURNAL_RECORD_BYTES`] — the whole file never lands in
+/// memory.
+fn classify_streaming(
+    mut state: JournalState,
+    reader: &mut FrameReader,
+    header_hash: Hash,
+) -> Result<JournalState, JournalError> {
+    let mut expected_prev = header_hash;
+    let mut chain_ok = true;
+    let mut damage: Option<Damage> = None;
+    // The pending (uncommitted) capture group.
+    let mut pending: Vec<ConsequenceEnvelope> = Vec::new();
+    let mut pending_ids: Vec<ConsequenceId> = Vec::new();
+    let mut pending_digest = Sha256::new();
+    let mut last_valid_end = reader.consumed();
+    // The reused per-frame buffer: one frame's bytes at most.
+    let mut record_buf: Vec<u8> = Vec::new();
+
+    loop {
+        let frame_start = reader.consumed();
+        let declared = match reader.read_length_prefix()? {
+            LengthPrefix::End => break,
+            LengthPrefix::Torn => {
+                // A partial length prefix — the classical torn tail.
+                damage = Some(Damage {
+                    offset: frame_start,
+                    kind: TailKind::TornFrame,
+                });
+                break;
+            }
+            LengthPrefix::Full(len) => len,
+        };
+        if declared == 0 {
+            // A zero-length frame is the documented zero-fill
+            // artifact (or garbage): damage, walked past.
+            if damage.is_none() {
+                damage = Some(Damage {
+                    offset: frame_start,
+                    kind: TailKind::Undecodable,
+                });
+            }
+            chain_ok = false;
+            continue;
+        }
+        let record_bytes: &[u8] = match reader.read_frame(declared, &mut record_buf)? {
+            FrameOutcome::Torn => {
+                // The frame claims more bytes than the budget or the
+                // file holds — torn.
+                damage = Some(Damage {
+                    offset: frame_start,
+                    kind: TailKind::TornFrame,
+                });
+                break;
+            }
+            FrameOutcome::Skipped => {
+                // A declaration no bounded-field decode could accept:
+                // the whole-file reader's undecodable walk-past,
+                // without the bytes.
+                if damage.is_none() {
+                    damage = Some(Damage {
+                        offset: frame_start,
+                        kind: TailKind::Undecodable,
+                    });
+                }
+                chain_ok = false;
+                continue;
+            }
+            FrameOutcome::Buffered => record_buf.as_slice(),
+        };
+        let (prev, record) = match decode_record(record_bytes) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                if damage.is_none() {
+                    damage = Some(Damage {
+                        offset: frame_start,
+                        kind: TailKind::Undecodable,
+                    });
+                }
+                chain_ok = false;
+                continue;
+            }
+        };
+        if chain_ok && prev != expected_prev {
+            if damage.is_none() {
+                damage = Some(Damage {
+                    offset: frame_start,
+                    kind: TailKind::ChainDamage,
+                });
+            }
+            chain_ok = false;
+            continue;
+        }
+        let record_hash = hash_object(record_bytes);
+        match record {
+            JournalRecord::Capture { envelope_bytes } => {
+                match ConsequenceEnvelope::decode(&envelope_bytes) {
+                    Ok(envelope) => {
+                        state.inert_ids.insert(envelope.id);
+                        pending_ids.push(envelope.id);
+                        pending.push(envelope);
+                        pending_digest.update(record_bytes);
+                    }
+                    Err(_) => {
+                        // The frame decodes as a record but the
+                        // envelope inside is damaged.
+                        if damage.is_none() {
+                            damage = Some(Damage {
+                                offset: frame_start,
+                                kind: TailKind::Undecodable,
+                            });
+                        }
+                        chain_ok = false;
+                    }
+                }
+            }
+            JournalRecord::Commit {
+                id,
+                sequence,
+                record_count,
+                digest,
+                identities,
+                position,
+                classification,
+                dependencies,
+                frontier,
+                plan,
+            } => {
+                // A decodable commit record whose semantic checks
+                // fail is post-write corruption of committed history
+                // (the single-writer, no-append-past-tail discipline
+                // makes a mismatch unreachable at write time): fail
+                // closed, evidence preserved.
+                let fail_closed = |rule: &'static str| {
+                    Err(JournalError::CorruptCommitted {
+                        at: frame_start,
+                        rule,
+                    })
+                };
+                if sequence != state.next_sequence {
+                    return fail_closed(if sequence < state.next_sequence {
+                        "sequence-regression"
+                    } else {
+                        "sequence-gap"
+                    });
+                }
+                if record_count != pending.len() as u64 {
+                    return fail_closed("count-mismatch");
+                }
+                if digest.as_bytes()[..] != pending_digest.finalize_reset()[..] {
+                    return fail_closed("digest-mismatch");
+                }
+                if identities != pending_ids {
+                    return fail_closed("identity-set-mismatch");
+                }
+                let derived = derive_transaction_id(&identities, classification, &plan);
+                if id != derived {
+                    return fail_closed("identity-derivation");
+                }
+                if state.committed_index.contains_key(&id) {
+                    return fail_closed("duplicate-transaction-id");
+                }
+                if let Some(site) = damage {
+                    // A fully validating commit after earlier damage:
+                    // the writer wrote this commit over a clean file,
+                    // so the damage modified committed history.
+                    return Err(JournalError::CorruptCommitted {
+                        at: site.offset,
+                        rule: "damage-within-committed-history",
+                    });
+                }
+                let frame_end = reader.consumed();
+                state.committed_index.insert(id, state.committed.len());
+                state.committed.push(CommittedTransaction {
+                    id,
+                    sequence,
+                    record_count,
+                    digest,
+                    envelopes: std::mem::take(&mut pending),
+                    position,
+                    classification,
+                    dependencies,
+                    frontier,
+                    plan,
+                });
+                pending_ids.clear();
+                state.next_sequence += 1;
+                last_valid_end = frame_end;
+                state.append_offset = frame_end;
+                // A validated commit proves its own bytes; the chain
+                // re-anchors here — and the append chain anchors at
+                // the last durable record (an unresolved tail's
+                // captures are truncated before any append).
+                chain_ok = true;
+                expected_prev = record_hash;
+                state.chain_prev = record_hash;
+                continue;
+            }
+            JournalRecord::Cancellation {
+                target,
+                sequence,
+                reason,
+                detail,
+            } => {
+                let fail_closed = |rule: &'static str| {
+                    Err(JournalError::CorruptCommitted {
+                        at: frame_start,
+                        rule,
+                    })
+                };
+                if sequence != state.next_sequence {
+                    return fail_closed(if sequence < state.next_sequence {
+                        "sequence-regression"
+                    } else {
+                        "sequence-gap"
+                    });
+                }
+                if !state.committed_index.contains_key(&target) {
+                    return fail_closed("cancel-unknown-target");
+                }
+                if state.canceled_ids.contains(&target) {
+                    return fail_closed("cancel-duplicate-target");
+                }
+                if let Some(site) = damage {
+                    return Err(JournalError::CorruptCommitted {
+                        at: site.offset,
+                        rule: "damage-within-committed-history",
+                    });
+                }
+                state.canceled_ids.insert(target);
+                state.cancellations.push(RecordedCancellation {
+                    sequence,
+                    target,
+                    reason,
+                    detail,
+                });
+                state.next_sequence += 1;
+                let frame_end = reader.consumed();
+                last_valid_end = frame_end;
+                state.append_offset = frame_end;
+                chain_ok = true;
+                expected_prev = record_hash;
+                state.chain_prev = record_hash;
+                continue;
+            }
+        }
+        expected_prev = record_hash;
+    }
+
+    // The trailing classification: damage or pending captures beyond
+    // the last valid record are the inert tail (never actionable,
+    // never acknowledged). Committed history ended at
+    // `last_valid_end`; the file's actual length — observed once at
+    // the walk's end, ceiling-probed — is the whole-file reader's
+    // `bytes.len()` (the saturating subtraction only guards the
+    // uncontracted shrink-during-scan race; on every quiescent file
+    // the actual length covers every walk position).
+    let file_len = reader.file_length()?;
+    if let Some(site) = damage {
+        state.observed_tail = TailState::Inert {
+            byte_len: file_len.saturating_sub(last_valid_end),
+            kind: site.kind,
+        };
+    } else if !pending.is_empty() {
+        state.observed_tail = TailState::Inert {
+            byte_len: file_len.saturating_sub(last_valid_end),
+            kind: TailKind::MissingCommit,
+        };
+    } else {
+        state.observed_tail = TailState::Clean;
+    }
+    state.tail_resolved = state.append_offset == file_len;
+    // Identities that landed in committed transactions are not
+    // `Readable`-tail state.
+    for transaction in &state.committed {
+        for identity in transaction.envelopes.iter().map(|e| e.id) {
+            state.inert_ids.remove(&identity);
+        }
+    }
+    Ok(state)
+}
+
+/// (P3-L5) The legacy header's streaming classification: the rewind
+/// over the header probe's over-read (see
+/// [`LEGACY_HEADER_PROBE_LEN`]), then the walk. The whole-file
+/// [`classify`] remains in-tree, test-gated, as this path's
+/// differential oracle.
+fn classify_legacy_streaming(
+    reader: &mut FrameReader,
+    header_hash: Hash,
+) -> Result<JournalState, JournalError> {
+    reader.seek_to(header_bytes().len() as u64)?;
+    classify_streaming(JournalState::empty(header_hash), reader, header_hash)
+}
+
+/// (P3-L5) The strict bound classification's streaming form — the
+/// whole-file [`strict_bound_state`]'s decisions and refusal
+/// strings: the bound header probe at exactly the header's length
+/// (the bound header parser is pure byte comparison — no decoder,
+/// no over-read), then the walk. The whole-file function remains
+/// in-tree, test-gated, as this path's differential oracle.
+fn strict_bound_state_streaming(
+    reader: &mut FrameReader,
+    founding: &Hash,
+    root_id: &Hash,
+) -> Result<JournalState, JournalError> {
+    let header = bound_header_bytes(founding, root_id);
+    match read_bound_header(&reader.read_probe(header.len())?, founding, root_id)? {
+        BoundHeaderState::Matching { header_hash } => classify_streaming(
+            JournalState::empty_bound(header_hash, header.len() as u64),
+            reader,
+            header_hash,
+        ),
+        BoundHeaderState::Fresh => Err(JournalError::CorruptHeader {
+            detail: "the bound journal is empty — no complete header".into(),
+        }),
+        BoundHeaderState::TornCreation { byte_len } => Err(JournalError::CorruptHeader {
+            detail: format!("torn bound header — damaged evidence (prefix of {byte_len} bytes)"),
+        }),
+    }
+}
+
+/// (P3-L5) THE DIFFERENTIAL ORACLE'S WHOLE-FILE REFERENCE for the
+/// legacy `T1Journal::scan_file` — the exact pre-streaming body
+/// (the whole-file read, the whole-file `classify`), compile-time
+/// isolated to tests. The differential corpus
+/// (`journal_streaming_differential`) asserts this function's
+/// output byte-identical to the production streaming path's on
+/// identical fixtures — states and error surfaces. (The production
+/// `scan_file` lives inside the `T1Journal` impl; its reference
+/// sits here with the other classification helpers.) Retained for
+/// exactly as long as the oracle is; never a production path.
+#[cfg(test)]
+fn scan_file_whole_file(path: impl AsRef<Path>) -> Result<JournalScan, JournalError> {
+    let path = path.as_ref();
+    let bytes = match read_journal_bytes(path) {
+        Ok(bytes) => bytes,
+        Err(JournalError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            return Ok(JournalScan {
+                committed: Vec::new(),
+                cancellations: Vec::new(),
+                tail: TailState::Clean,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    match read_header(&bytes)? {
+        HeaderState::Fresh => Ok(JournalScan {
+            committed: Vec::new(),
+            cancellations: Vec::new(),
+            tail: TailState::Clean,
+        }),
+        HeaderState::TornCreation { byte_len } => Ok(JournalScan {
+            committed: Vec::new(),
+            cancellations: Vec::new(),
+            tail: TailState::Inert {
+                byte_len,
+                kind: TailKind::TornCreation,
+            },
+        }),
+        HeaderState::Valid { header_hash } => {
+            let state = classify(&bytes, header_hash)?;
+            Ok(JournalScan {
+                committed: state.committed,
+                cancellations: state.cancellations,
+                tail: state.observed_tail,
+            })
+        }
+    }
+}
+
 /// The stable-identity derivation (shared by the writer and the
 /// scan's validation — the carried id must equal it).
 fn derive_transaction_id(
@@ -1629,7 +2406,7 @@ impl T1Journal {
         // lacks; every write seeks to the end first (the journal is
         // append-only by design under the single-writer lock).
         let lock = open_lock_file(&path)?;
-        let bytes = read_journal_bytes(&path)?;
+        let mut reader = FrameReader::open(&path)?;
         let mut journal = T1Journal {
             path: path.clone(),
             file,
@@ -1644,7 +2421,7 @@ impl T1Journal {
             next_sync_handle: None,
             platform_tier: platform_tier(),
         };
-        match read_header(&bytes)? {
+        match read_header(&reader.read_probe(LEGACY_HEADER_PROBE_LEN)?)? {
             HeaderState::Fresh | HeaderState::TornCreation { .. } => {
                 // (Re-)initialize: the header is one write + one fsync,
                 // so a crash can only have left a prefix — nothing
@@ -1664,7 +2441,7 @@ impl T1Journal {
                 journal.state = JournalState::empty(hash_object(&header));
             }
             HeaderState::Valid { header_hash } => {
-                journal.state = classify(&bytes, header_hash)?;
+                journal.state = classify_legacy_streaming(&mut reader, header_hash)?;
                 journal.resolve_tail()?;
             }
         }
@@ -1727,7 +2504,7 @@ impl T1Journal {
                 detail: "the bound journal is absent — an ordinary open never creates it".into(),
             })?;
         let lock = open_lock_file(&path)?;
-        let bytes = read_journal_bytes(&path)?;
+        let mut reader = FrameReader::open(&path)?;
         let mut journal = T1Journal {
             path: path.clone(),
             file,
@@ -1742,7 +2519,7 @@ impl T1Journal {
             next_sync_handle: None,
             platform_tier: platform_tier(),
         };
-        journal.state = strict_bound_state(&bytes, founding, root_id)?;
+        journal.state = strict_bound_state_streaming(&mut reader, founding, root_id)?;
         journal.resolve_tail()?;
         Ok(journal)
     }
@@ -1906,7 +2683,7 @@ impl T1Journal {
         created_here: bool,
     ) -> Result<Self, JournalError> {
         let lock = open_lock_file(path)?;
-        let bytes = read_journal_bytes(path)?;
+        let mut reader = FrameReader::open(path)?;
         let mut journal = T1Journal {
             path: path.to_path_buf(),
             file,
@@ -1922,7 +2699,7 @@ impl T1Journal {
             platform_tier: platform_tier(),
         };
         let header = bound_header_bytes(founding, root_id);
-        match read_bound_header(&bytes, founding, root_id)? {
+        match read_bound_header(&reader.read_probe(header.len())?, founding, root_id)? {
             BoundHeaderState::Fresh => {
                 if !created_here {
                     // (Option B) An EXISTING zero-byte file is
@@ -1977,7 +2754,11 @@ impl T1Journal {
                 // with the bytes preserved (never silently adopted
                 // as a fresh campaign's authoritative root, never
                 // truncated).
-                let state = classify_bound(&bytes, header_hash, header.len())?;
+                let state = classify_streaming(
+                    JournalState::empty_bound(header_hash, header.len() as u64),
+                    &mut reader,
+                    header_hash,
+                )?;
                 if !state.committed.is_empty()
                     || !state.cancellations.is_empty()
                     || state.observed_tail != TailState::Clean
@@ -2002,10 +2783,15 @@ impl T1Journal {
     /// writer, because the writer's exclusive lock lives on the
     /// sidecar file — the data file's bytes are never range-locked).
     /// An absent file is an empty journal: nothing pending.
+    /// (P3-L5) The scan STREAMS: the header probe (a bounded
+    /// prefix), then the framed walk with a per-frame buffer — the
+    /// file never lands in memory. The whole-file body this
+    /// replaced is preserved verbatim (test-gated) as
+    /// `scan_file_whole_file`, the differential oracle's reference.
     pub fn scan_file(path: impl AsRef<Path>) -> Result<JournalScan, JournalError> {
         let path = path.as_ref();
-        let bytes = match read_journal_bytes(path) {
-            Ok(bytes) => bytes,
+        let mut reader = match FrameReader::open(path) {
+            Ok(reader) => reader,
             Err(JournalError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
                 return Ok(JournalScan {
                     committed: Vec::new(),
@@ -2015,7 +2801,7 @@ impl T1Journal {
             }
             Err(error) => return Err(error),
         };
-        match read_header(&bytes)? {
+        match read_header(&reader.read_probe(LEGACY_HEADER_PROBE_LEN)?)? {
             HeaderState::Fresh => Ok(JournalScan {
                 committed: Vec::new(),
                 cancellations: Vec::new(),
@@ -2030,7 +2816,7 @@ impl T1Journal {
                 },
             }),
             HeaderState::Valid { header_hash } => {
-                let state = classify(&bytes, header_hash)?;
+                let state = classify_legacy_streaming(&mut reader, header_hash)?;
                 Ok(JournalScan {
                     committed: state.committed,
                     cancellations: state.cancellations,
@@ -2432,11 +3218,19 @@ impl T1Journal {
     }
 
     fn refresh_from_disk(&mut self) -> Result<(), JournalError> {
-        let bytes = read_journal_bytes(&self.path)?;
+        // (P3-L5) The reread STREAMS (the header probe plus the
+        // framed walk — the file never lands in memory); the
+        // classification and every refusal surface are the
+        // whole-file shape's, pinned by the differential oracle.
+        let mut reader = FrameReader::open(&self.path)?;
         let state = match self.binding {
-            Some((founding, root_id)) => strict_bound_state(&bytes, &founding, &root_id)?,
-            None => match read_header(&bytes)? {
-                HeaderState::Valid { header_hash } => classify(&bytes, header_hash)?,
+            Some((founding, root_id)) => {
+                strict_bound_state_streaming(&mut reader, &founding, &root_id)?
+            }
+            None => match read_header(&reader.read_probe(LEGACY_HEADER_PROBE_LEN)?)? {
+                HeaderState::Valid { header_hash } => {
+                    classify_legacy_streaming(&mut reader, header_hash)?
+                }
                 _ => {
                     return Err(JournalError::CorruptHeader {
                         detail: "an open journal lost its complete header".into(),
@@ -3803,3 +4597,14 @@ mod tests {
         assert_eq!(scan.committed[0].receipt(), receipt);
     }
 }
+
+/// (P3-L5, B02) THE STREAMING READER'S DIFFERENTIAL ORACLE — the
+/// lane's mandatory test shape, in its own file: the corpus
+/// generator and the equivalence assertions proving the production
+/// streaming scan/open/refresh paths byte-identical to the
+/// whole-file reader (preserved in-tree, test-gated, as the
+/// reference). See the module's own documentation for the corpus
+/// discipline and the in-module placement rationale.
+#[cfg(test)]
+#[path = "journal_streaming_differential.rs"]
+mod journal_streaming_differential;
