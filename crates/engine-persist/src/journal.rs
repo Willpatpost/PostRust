@@ -164,6 +164,23 @@ fn check_journal_length(length: u64) -> Result<u64, JournalError> {
     Ok(length)
 }
 
+/// Reads a bounded prefix of the journal file (for header-only uses):
+/// at most `len` bytes — a file shorter than the requested prefix
+/// yields its FULL content (exactly what a whole-file read would have
+/// given the header parser, so legacy and torn shapes keep their
+/// existing semantics; the bound only saves the read when the file is
+/// larger). Enforces the 4 GiB file ceiling.
+pub fn read_prefix(path: &Path, len: usize) -> Result<Vec<u8>, JournalError> {
+    let read_error = |e| io_err("read journal prefix", path, e);
+    let file = File::open(path).map_err(read_error)?;
+    let _ = check_journal_length(file.metadata().map_err(read_error)?.len())?;
+    let mut bytes = Vec::with_capacity(len);
+    file.take(len as u64)
+        .read_to_end(&mut bytes)
+        .map_err(read_error)?;
+    Ok(bytes)
+}
+
 /// Reads journal bytes for scanning, hashing, or checking the bound header.
 /// The same open handle supplies the metadata and the read. The reader also
 /// enforces the ceiling if a writer grows the file during an unlocked scan.

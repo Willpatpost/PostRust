@@ -2445,11 +2445,11 @@ pub fn publish_journal_root_binding(
             });
         }
         let bootstrap_journal = std::path::Path::new(location);
-        let bootstrap_bytes =
-            crate::journal::read_journal_bytes(bootstrap_journal).map_err(|_error| {
-                MediumError::Chain {
-                    rule: "journal-root/bootstrap-evidence-missing",
-                }
+        // Read only the bound header prefix; the full journal is not needed.
+        let bound_header_len = crate::journal::bound_header_bytes(founding, root_id).len();
+        let bootstrap_bytes = crate::journal::read_prefix(bootstrap_journal, bound_header_len)
+            .map_err(|_error| MediumError::Chain {
+                rule: "journal-root/bootstrap-evidence-missing",
             })?;
         match crate::journal::read_bound_header(&bootstrap_bytes, founding, root_id) {
             Ok(crate::journal::BoundHeaderState::Matching { .. }) => {}
@@ -2620,12 +2620,14 @@ pub fn collect_bound_reclaimable_journal_files(
     let names = crate::rotation::read_journal_generations(journal_root)
         .map_err(|_error| refused("journal-root/journal-evidence"))?;
     let mut stale = Vec::new();
+    let bound_header_len = crate::journal::bound_header_bytes(founding, root_id).len();
     for name in names {
         if active_name.as_deref() == Some(name.as_str()) {
             continue;
         }
         let path = journal_root.with_file_name(&name);
-        let bytes = crate::journal::read_journal_bytes(&path)
+        // Read only the bound header prefix; the full journal is not needed.
+        let bytes = crate::journal::read_prefix(&path, bound_header_len)
             .map_err(|_error| refused("journal-root/generation-missing"))?;
         match crate::journal::read_bound_header(&bytes, founding, root_id) {
             Ok(crate::journal::BoundHeaderState::Matching { .. }) => {}
