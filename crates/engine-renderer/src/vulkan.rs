@@ -1133,16 +1133,20 @@ impl InstanceExtensionPlan {
         // backend extension; a windowed SDL list is never touched,
         // and a real-GPU loader that lacks the headless extension
         // is unchanged.
+        // The correct extension for macOS is VK_EXT_metal_surface.
+        // VK_KHR_metal_surface does not exist; VK_MVK_macos_surface is deprecated
+        // and superseded by VK_EXT_metal_surface (2020-07-31).
+        // VK_KHR_display_surface does not exist; the display enumeration extension
+        // is VK_KHR_display but it doesn't provide a surface creation function.
+        // All remaining entries are ratified extensions from the Khronos registry.
         const PLATFORM_SURFACE_EXTENSIONS: &[&str] = &[
             "VK_KHR_win32_surface",
             "VK_KHR_xlib_surface",
             "VK_KHR_xcb_surface",
             "VK_KHR_wayland_surface",
             "VK_KHR_android_surface",
-            "VK_KHR_metal_surface",
-            "VK_KHR_display_surface",
+            "VK_EXT_metal_surface",
             "VK_EXT_headless_surface",
-            "VK_MVK_macos_surface",
             "VK_GGP_stream_descriptor_surface",
             "VK_NN_vi_surface",
             "VK_FUCHSIA_imagepipe_surface",
@@ -5675,6 +5679,34 @@ mod policy_tests {
             ])
         );
         assert_eq!(without.create_flags(), with.create_flags());
+    }
+
+    #[test]
+    fn macos_windowed_sdl_list_with_metal_surface_does_not_get_headless_fallback() {
+        // P1-B09 corrective test: a macOS windowed SDL list advertising
+        // VK_EXT_metal_surface must NOT get VK_EXT_headless_surface added,
+        // even if the loader offers it. The metal surface extension is a
+        // platform surface, so has_platform_surface is true and the
+        // headless fallback is blocked. This test specifically validates
+        // the fix for the wrong "VK_KHR_metal_surface" literal that was
+        // misclassifying macOS windowed lists as headless candidates.
+        let plan = InstanceExtensionPlan::select(
+            &strings(&["VK_KHR_surface", "VK_EXT_metal_surface"]),
+            &strings(&["VK_KHR_surface", "VK_EXT_headless_surface"]),
+            false,
+        );
+        // The SDL list is untouched: metal surface is recognized, so no
+        // headless fallback is added.
+        assert_eq!(
+            plan.extensions(),
+            strings(&["VK_KHR_surface", "VK_EXT_metal_surface"])
+        );
+        // Verify the loader offer did not trigger the fallback.
+        assert!(
+            !plan
+                .extensions()
+                .contains(&"VK_EXT_headless_surface".to_string())
+        );
     }
 
     #[test]
