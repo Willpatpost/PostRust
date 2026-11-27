@@ -118,7 +118,7 @@ pub use lod::{LodConfig, LodConfigError, LodController, LodLevel, PresenceSample
 pub use npc_world_save::{NPC_WORLD_SAVE_DOMAIN, NpcSaveWorld, NpcWorldSection};
 pub use spine::{
     CompactionError, ExecCtx, HistoryKind, LaneReport, LaneTotals, ObligationLocation,
-    ObligationView, ScheduleError, Spine, Stats, SuspensionStats, World,
+    ObligationView, ReconstructionError, ScheduleError, Spine, Stats, SuspensionStats, World,
 };
 pub use weapons::{
     Arsenal, FireContext, FireOutcome, FireRefusal, FiringPattern, MAX_SPREAD_RAYS, Shot,

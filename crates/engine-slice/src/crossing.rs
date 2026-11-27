@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use engine_core::wire::{MAX_COLLECTION_COUNT, MAX_TAG_LEN};
 use engine_core::{
     CompactionError, Decoder, Diagnostics, Encoder, Event, EventClass, EventId, Field, HistoryKind,
-    Level, LodLevel, ObligationView, SaveError, Schedule, Spine, Tick,
+    Level, LodLevel, ObligationView, ReconstructionError, SaveError, Schedule, Spine, Tick,
 };
 
 use engine_persist::{
@@ -3937,9 +3937,25 @@ fn install_recovered_deactivation(
         }
     }
     // INSTALL — the id-exact held reconstruction (the stale chains
-    // replaced by the plan's), then the same state writes.
+    // replaced by the plan's), then the same state writes. The typed
+    // form (IA-06): an inconsistent plan — a replacement identity
+    // colliding with a survivor or a duplicate within the plan —
+    // refuses the transition fail-closed with the plan's own evidence,
+    // never the loud surface.
     let class = EventClass::new(region as u16);
-    spine.reconstruct_held(|view| view.class == class, plan_events(plan));
+    spine
+        .try_reconstruct_held(|view| view.class == class, plan_events(plan))
+        .map_err(|error| TransitionError::InstallIncompatible {
+            region,
+            detail: match error {
+                ReconstructionError::DuplicateReplacement { .. } => {
+                    "reconstruction-plan-duplicate-identity"
+                }
+                ReconstructionError::SurvivingIdentity { .. } => {
+                    "reconstruction-plan-surviving-identity"
+                }
+            },
+        })?;
     director.install_captures(region, plan.episode, &plan.captures);
     spine.world_mut().set_region_lod(region, LodLevel::Dormant);
     spine.world_mut().discard_region_routine(region);
