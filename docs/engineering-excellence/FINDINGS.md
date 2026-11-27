@@ -37,9 +37,9 @@ corrected).
 | A20 | REND | CONFIRMED | — | per-static-upload staging alloc/copy/submit/fence (vulkan.rs:3035-3199, textures.rs:61-202); folds NEW-REND-03 (no staging pool — same finding, more detail) |
 | A21 | CORE | UNTRIAGED | — | pending auditor-core |
 | A22 | CORE/PERSIST | CONFIRMED (persist half) | — | confirmed_history grows unbounded, local.rs:3015-3028, no pruning; CORE half pending |
-| A23 | REND/SHELL | CONFIRMED (rend half) | — | pose storage dynamic-offset per slot (skinned_draw.rs:949-950, POSE_STRIDE=704); SHELL half pending auditor-shell |
+| A23 | REND/SHELL | CONFIRMED (rend half) / N/A (shell half) | — | pose storage dynamic-offset per slot (skinned_draw.rs:949-950, POSE_STRIDE=704); the charter's shell clause (voice arrays) is NOT-APPLICABLE as written per auditor + orchestrator read — the voice pool is bounded-by-design with prebuilt PCM (a preserved strength); NEW-SHELL-05 notes the constructor-call-site documentation |
 | A24 | SLICE | VERIFIED-CLOSED | integrated `1884582` | **rig-verified 2026-11-26:** all 11 `render_weather` Vulkan gates green on the RTX 5070 Ti (exit 0, 7.29 s) with the pinned values reproducing digit-for-digit (ink 17041, broadside 3482/2162, the allocation tuple, sweep 22/255, the term-separation counts) — the scripted route's census equivalence proven on the real GPU; heavy 664/46/64 measured (pin corrected); scripted route frame-indexed by design, free-look on one coherent accumulator (crowd+rain+day/night, monotone cycle, minimized accrual, dt bit-identity pinned `0x3c888889`); two defective lane rounds caught at review, final surgery by orchestrator |
-| A25 | SHELL | UNTRIAGED | — | pending auditor-shell |
+| A25 | SHELL | FIXED-AWAITING-REVIEW | integrated `7c30aee` | **auditor PASS verdict REFUTED by direct read** (start_voice ran inside the lock at audio.rs:912 — the auditor's "releases before heavy work" was backwards); orchestrator-implemented fix `fa13e26`: copy-out under try-lock → guard dropped → voice-start unheld; pairing preserved; shell battery green, zero test changes |
 | B01 | CORE | UNTRIAGED | — | pending auditor-core |
 | B02 | PERSIST | CONFIRMED | — | journal.rs:170-189 whole-file read ≤4 GiB; auditor's caller list (journal.rs:1115…3428) to be re-verified in P3 (line refs ambiguous across modules) |
 | B03 | PERSIST | CONFIRMED | — | composite_reader.rs:416-464,544 payload clones; reclaim.rs ~5686 bytes.clone(); pipeline.rs PendingAttempt clones; folds NEW-PERSIST-01/04 |
@@ -50,7 +50,7 @@ corrected).
 | B05 | CORE | UNTRIAGED | — | pending auditor-core |
 | B06 | CORE | UNTRIAGED | — | pending auditor-core |
 | B07 | CORE | UNTRIAGED | — | pending auditor-core |
-| B08 | SHELL | UNTRIAGED | — | pending auditor-shell |
+| B08 | SHELL | CONFIRMED (deferred to measurement) | — | **auditor PASS verdict REFUTED by direct read** (mem::take at input.rs:199-203 moves the buffers out, leaving capacity-0 accumulators that reallocate on the next input-bearing frame — "reused via take" was backwards); disposition: the churn is human-scale at current workloads (edges are rare, idle frames allocate nothing) — the caller-owned-snapshot API change needs an input-event allocation census to justify; queued for the P0 measurement matrix |
 | B09 | REND | FIXED-AWAITING-REVIEW | integrated `9dce061` + corrective | lane `2ddef05` reviewed: metal literal fixed + never-existed display_surface removed + one focused test; **orchestrator corrective restored `VK_MVK_macos_surface`** (deprecated but REAL — legacy MoltenVK loaders advertise it; its removal re-opened the exact misclassification class the fix closes); lane citation inaccuracy recorded (VK_KHR_display does provide vkCreateDisplayPlaneSurfaceKHR); +1 test → pin correction at batch gate close; awaits batch gate run |
 | B12 | CORE | UNTRIAGED | — | pending auditor-core |
 | B14 | REND | CONFIRMED | — | full-size RGBA16F reflection targets per slot + HDR/bloom targets; P5 measurement package |
@@ -86,6 +86,11 @@ refutation is evidence too.
 | NEW-SLICE-03 | SLICE | HYPOTHESIS (LOW) | — | evidence-collector loss semantics correct-by-design but undocumented; P6 doc note |
 | NEW-SLICE-04 | SLICE | HYPOTHESIS (LOW) | — | per-demo collision-world builders duplicate the pattern (acceptable demo isolation per auditor); P4/P6 shared-utility decision |
 | NEW-SLICE-05 | SLICE | CONFIRMED (LOW) | — | main.rs monolithic CLI dispatch cascade; P6 split candidate (cli.rs) |
+| NEW-SHELL-01 | SHELL | HYPOTHESIS (LOW) | — | SDL3 hint-name documentation note (platform.rs:45); P6 |
+| NEW-SHELL-02 | SHELL | NOT-APPLICABLE | — | REFUTED: let-chains on the pinned 1.99.1 toolchain (rust-toolchain.toml) — no minimum-version concern exists |
+| NEW-SHELL-03 | SHELL | HYPOTHESIS (MED) | — | loop pacing drift accumulation when consistently lagging (app.rs:266-270) — verify the actual pace_until/reset semantics before acting; may interact with the A24 accumulator discipline |
+| NEW-SHELL-04 | SHELL | HYPOTHESIS (LOW) | — | /proc VmRSS parse robustness (app.rs:292-303); P6 defensive note |
+| NEW-SHELL-05 | SHELL | HYPOTHESIS (LOW) | — | MixerCore construction-site documentation (audio.rs:830-838); P6 note |
 
 ## Auditor calibration record (charter §3)
 
@@ -128,3 +133,12 @@ refutation is evidence too.
   semantics work is no longer delegated to implementation lanes — the
   orchestrator implements or the lane produces a design document first for
   orchestrator approval before any code.**
+- **qwen38-27b (shell, self-mislabeled gpt-oss-120b in its own report):** the
+  weakest audit of the five — BOTH seed verdicts wrong with backwards
+  reasoning (A25 "releases the lock before heavy work" — the lock was held
+  through start_voice; B08 "vectors are reused via take" — take gives the
+  buffer away, the opposite), one non-finding (let-chains vs a pinned
+  toolchain), and a provenance error (wrong auditor identity in the report
+  header). Both seeds were re-verified and reconciled by direct orchestrator
+  read; the new LOW/MED items registered as hypotheses pending verification.
+  Do not assign this model seed-verification work without full re-verification.
