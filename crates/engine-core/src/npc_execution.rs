@@ -40,7 +40,7 @@ use crate::npc_behavior::{
     Activity, ActivityKind, MAX_NEEDS, NpcId, NpcRng, NpcRoutine, Rule, WorldView, decay_needs,
     select_activity, validate_rule_table,
 };
-use crate::npc_perception::{NpcRecord, PerceptionTrace, perceive, perception_budget};
+use crate::npc_perception::{CensusIndex, NpcRecord, PerceptionTrace, perceive, perception_budget};
 use crate::npc_schedule::NpcSchedule;
 
 /// The NPC-AI event family: the commitment wake (a calendar
@@ -332,6 +332,51 @@ fn tier_level(level: LodLevel) -> u8 {
     }
 }
 
+/// The INDEXED sibling of [`enumerate_witnesses`] (P2 L6 — the
+/// composition seam's D-family census index entry): the identical
+/// witness census — every population record within `radius` of
+/// `center`, as POPULATION INDICES in fixed population order,
+/// EXCLUDING zero-budget tiers (Dormant) — answered through a
+/// built [`CensusIndex`] instead of the linear walk. Bit-identical
+/// to [`enumerate_witnesses`] on the same (center, radius,
+/// population, tiers): the index's yields are the linear walk's own
+/// yields (see `npc_perception`'s module docs for the superset
+/// argument), so this composition's tier filter — the SAME filter,
+/// over the SAME ordered indices, `perception_budget` never
+/// re-derived — produces the identical `out` by construction.
+///
+/// The composition calls
+/// `CensusIndexScratch::build`/`build_if_advisable` once per tick
+/// (or per population-change batch — the cadence the composition
+/// owns, per the P2 design §2.2.2) and passes the handle to every
+/// census that batch; `out` is the same caller-owned scratch
+/// (cleared first, the F-02 discipline). The population inside the
+/// handle is the slice the caller built it from, enforced by the
+/// borrow — never a mismatched slice.
+pub fn enumerate_witnesses_indexed(
+    center: [f32; 2],
+    radius: f32,
+    index: &mut CensusIndex<'_, '_>,
+    tiers: &[LodLevel],
+    out: &mut Vec<u32>,
+) {
+    out.clear();
+    for idx in index.perceive(center, radius) {
+        // The landed budget table is the authority: a tier whose
+        // budget is zero perceives nothing (Dormant today; if the
+        // table ever changes, the census follows it — the exclusion
+        // is never re-derived here). Identical to the linear
+        // composition's filter, by construction.
+        let Some(tier) = tiers.get(idx) else {
+            continue;
+        };
+        if perception_budget(tier_level(*tier)) == 0 {
+            continue;
+        }
+        out.push(idx as u32);
+    }
+}
+
 /// Appends `trace` to an NPC's bounded memory with oldest-first
 /// eviction at the tier's perception budget (§5.2's retention
 /// machinery: bounded depth, oldest-first expiry; the depth IS the
@@ -460,7 +505,7 @@ mod tests {
     use super::*;
     use crate::event::Field;
     use crate::npc_behavior::{NpcId, NpcRng};
-    use crate::npc_perception::PerceptionTrace;
+    use crate::npc_perception::{CensusIndexScratch, PerceptionTrace};
     use crate::npc_schedule::{ActivityDescriptor, Cadence, Commitment, Target};
 
     /// A one-entry schedule targeting NPC 0, recurring every 10 from
@@ -1206,6 +1251,15 @@ mod tests {
         wake_log: Vec<(u32, u32, Tick, Tick)>,
         /// The reused census scratch (zero allocation on the event path).
         scratch: Vec<u32>,
+        /// The P2-L6 census-index scratch (the per-batch counting
+        /// sort's reusable buffers — see `use_indexed_census`).
+        census_scratch: CensusIndexScratch,
+        /// The census path selector (P2 L6's battery control):
+        /// false = the exact linear census (every pinned test's
+        /// path); true = the indexed census through
+        /// `enumerate_witnesses_indexed`. Both paths must produce
+        /// byte-identical streams — the L6 equivalence proof.
+        use_indexed_census: bool,
         wake_executions: u64,
         witness_executions: u64,
         census_witnesses: u64,
@@ -1302,9 +1356,36 @@ mod tests {
                     tiers,
                     npcs,
                     scratch,
+                    census_scratch,
+                    use_indexed_census,
                     ..
                 } = self;
-                enumerate_witnesses(authored.center, authored.radius, population, tiers, scratch);
+                // The P2-L6 census path: the indexed census through
+                // a per-significant-event build (this world's
+                // population is static, so per-event and per-tick
+                // cadences coincide; a position-mutating composition
+                // rebuilds per tick or per batch — the design's
+                // cadence rule). The build's `None` (below the
+                // forced gate's poison rule) falls back to the
+                // exact linear census, so the stream never depends
+                // on the index being available.
+                if *use_indexed_census && let Some(mut index) = census_scratch.build(population) {
+                    enumerate_witnesses_indexed(
+                        authored.center,
+                        authored.radius,
+                        &mut index,
+                        tiers,
+                        scratch,
+                    );
+                } else {
+                    enumerate_witnesses(
+                        authored.center,
+                        authored.radius,
+                        population,
+                        tiers,
+                        scratch,
+                    );
+                }
                 self.census_witnesses += scratch.len() as u64;
                 for &witness_idx in scratch.iter() {
                     let idx = witness_idx as usize;
@@ -1661,6 +1742,8 @@ mod tests {
             stream: Vec::new(),
             wake_log: Vec::new(),
             scratch: Vec::new(),
+            census_scratch: CensusIndexScratch::new(),
+            use_indexed_census: false,
             wake_executions: 0,
             witness_executions: 0,
             census_witnesses: 0,
@@ -1831,6 +1914,8 @@ mod tests {
             stream: Vec::new(),
             wake_log: Vec::new(),
             scratch,
+            census_scratch: CensusIndexScratch::new(),
+            use_indexed_census: false,
             wake_executions: 0,
             witness_executions: 0,
             census_witnesses: 0,
@@ -1996,6 +2081,8 @@ mod tests {
             stream: Vec::new(),
             wake_log: Vec::new(),
             scratch: Vec::new(),
+            census_scratch: CensusIndexScratch::new(),
+            use_indexed_census: false,
             wake_executions: 0,
             witness_executions: 0,
             census_witnesses: 0,
@@ -2130,5 +2217,238 @@ mod tests {
             .iter()
             .any(|t| t.tick == Tick(50) && t.class == 6);
         assert!(npc3_has_trace, "NPC 3 has tick-50 trace");
+    }
+
+    // -----------------------------------------------------------------
+    // P2 L6 — the census-index battery at the composition seam (the
+    // design's L6 acceptance row: the indexed census through
+    // enumerate_witnesses's own tier composition, bit-compared
+    // against the linear walk; and the full campaign through BOTH
+    // census paths — the pinned execution-stream digest holds for
+    // the indexed path too).
+    // -----------------------------------------------------------------
+
+    /// The seam battery's fixture population: a jittered lattice
+    /// (deterministic xorshift64*, the L5/L6 battery discipline)
+    /// plus hand-authored exact 3-4-5 records for the on-radius
+    /// class — the exact center and the two exact distance-5
+    /// records (the inclusive boundary). The NaN-position class
+    /// lives in the poisoned arm below (a non-finite position
+    /// refuses the whole batch's build — the fail-closed rule).
+    fn census_fixture_population(seed: u64, count: usize) -> Vec<NpcRecord> {
+        let mut state = seed | 1;
+        let mut next = move || {
+            let mut x = state;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            state = x;
+            (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 33) as u32
+        };
+        let mut population = Vec::with_capacity(count + 3);
+        // The lattice body.
+        let cols = ((count as f64).sqrt().ceil() as usize).max(1);
+        for index in 0..count {
+            let mut jitter =
+                |lo: f32, hi: f32| lo + (hi - lo) * ((next() >> 8) as f32 / 16_777_216.0);
+            population.push(NpcRecord {
+                id: index as u32,
+                pos: [
+                    (index % cols) as f32 * 4.0 + jitter(-1.5, 1.5),
+                    (index / cols) as f32 * 4.0 + jitter(-1.5, 1.5),
+                ],
+            });
+        }
+        // The known-answer tail (indices count..count+3): the exact
+        // center and the two exact distance-5 records.
+        population.push(NpcRecord {
+            id: count as u32,
+            pos: [0.0, 0.0],
+        });
+        population.push(NpcRecord {
+            id: count as u32 + 1,
+            pos: [3.0, 4.0],
+        });
+        population.push(NpcRecord {
+            id: count as u32 + 2,
+            pos: [5.0, 0.0],
+        });
+        population
+    }
+
+    /// Test 15 (L6): the indexed census through the SEAM —
+    /// `enumerate_witnesses_indexed` vs `enumerate_witnesses` on the
+    /// identical (center, radius, population, tiers), populations
+    /// below and above the gate, tier patterns including Dormant
+    /// records INSIDE the radius and a short `tiers` slice (the
+    /// missing-entry fail-closed class), and every query class from
+    /// the perception battery. The outputs must be equal as whole
+    /// vectors — contents AND order.
+    #[test]
+    fn enumerate_witnesses_indexed_matches_linear_at_the_seam() {
+        let mut scratch = CensusIndexScratch::new();
+        for count in [20usize, 125, 600, 2048] {
+            let population = census_fixture_population(0x5EED_0000 + count as u64, count);
+            let label = format!("{count}");
+            // The tier patterns: all Full; every 3rd Dormant (inside
+            // the radius class — the lattice body is inside a big
+            // enough radius); every 7th EventDriven.
+            let all_full = vec![LodLevel::Full; population.len()];
+            let mut every_third = vec![LodLevel::Full; population.len()];
+            for (index, tier) in every_third.iter_mut().enumerate() {
+                *tier = if index % 3 == 1 {
+                    LodLevel::Dormant
+                } else if index % 7 == 2 {
+                    LodLevel::EventDriven
+                } else {
+                    LodLevel::Full
+                };
+            }
+            // The short-slice class: a `tiers` shorter than the
+            // population (the missing entries fail closed — not
+            // enumerated, never an over-perception).
+            let short = &all_full[..population.len() / 2];
+
+            for tiers in [&all_full, &every_third, short] {
+                let mut index_handle = scratch.build(&population).expect("grid-usable");
+                for (center, radius) in [
+                    ([0.0, 0.0], 5.0),      // the 3-4-5 boundary pair, inclusive
+                    ([0.0, 0.0], 4.9),      // just inside (boundary excluded)
+                    ([0.0, 0.0], 5.1),      // just outside (boundary included)
+                    ([0.0, 0.0], 0.0),      // the exact center only
+                    ([0.0, 0.0], 1e6),      // the waste-guard regime (internal fallback)
+                    ([0.0, 0.0], f32::NAN), // fail-closed radius
+                    ([0.0, 0.0], -1.0),     // fail-closed radius
+                    ([0.0, 0.0], 1e30),     // square-overflow radius
+                    ([f32::NAN, 0.0], 5.0), // NaN center (internal fallback)
+                    ([4.0, 4.0], 2.0),      // a street query
+                    ([8.0, 0.0], 3.0),      // a mid-lattice query
+                ] {
+                    let mut linear = Vec::new();
+                    enumerate_witnesses(center, radius, &population, tiers, &mut linear);
+                    let mut indexed = Vec::new();
+                    enumerate_witnesses_indexed(
+                        center,
+                        radius,
+                        &mut index_handle,
+                        tiers,
+                        &mut indexed,
+                    );
+                    assert_eq!(
+                        indexed, linear,
+                        "seam {label} at {center:?} r{radius}: identical census"
+                    );
+                }
+            }
+        }
+
+        // THE POISONED-BATCH ARM (the fail-closed rule at the seam):
+        // a NaN position refuses the whole batch's build, and the
+        // composition's handler shape (the BehaviorWorld census
+        // arm's own if-let-else) falls back to the exact linear
+        // census — which answers identically to the pre-poison
+        // population, because the poisoned record was imperceivable
+        // anyway (NaN compares false; lattice record 3 sits beyond
+        // the radius). Behavior never depends on the index being
+        // available.
+        let mut poisoned = census_fixture_population(0xDEAD_0000, 125);
+        let clean = poisoned.clone();
+        let poison_tiers = vec![LodLevel::Full; poisoned.len()];
+        poisoned[3].pos = [f32::NAN, 0.0];
+        assert!(
+            scratch.build(&poisoned).is_none(),
+            "a NaN position poisons the batch build (fail-closed)"
+        );
+        // The handler's else-arm (the refused build): the exact
+        // linear census.
+        let mut from_fallback = Vec::new();
+        enumerate_witnesses(
+            [0.0, 0.0],
+            5.0,
+            &poisoned,
+            &poison_tiers,
+            &mut from_fallback,
+        );
+        let mut clean_yields = Vec::new();
+        enumerate_witnesses([0.0, 0.0], 5.0, &clean, &poison_tiers, &mut clean_yields);
+        assert_eq!(
+            from_fallback, clean_yields,
+            "the poison changes nothing observable (the record was imperceivable anyway)"
+        );
+    }
+
+    /// Test 16 (L6): the FULL campaign through the indexed census —
+    /// the same fixed campaign, the same 200 ticks, with the world's
+    /// census path switched to `enumerate_witnesses_indexed` (the
+    /// per-significant-event force-build; this world's population is
+    /// static, so per-event and per-tick cadences coincide). The
+    /// execution-stream digest must equal the PINNED linear-path
+    /// value itself (the census feeds the witness follow-ups, the
+    /// memory traces, and the counters — an indexed/linear
+    /// divergence anywhere moves it), the world fingerprint must be
+    /// byte-identical across the two paths, and every census counter
+    /// must agree. This is the L6 acceptance row's "pins that must
+    /// hold" — the execution stream digest, unchanged, through the
+    /// new path.
+    #[test]
+    fn indexed_census_campaign_matches_the_pinned_stream_digest() {
+        // The linear arm (the pinned tests' own path).
+        let mut linear = build_campaign();
+        arm_campaign(&mut linear);
+        linear.run_ticks(200);
+
+        // The indexed arm: the same campaign, census path switched.
+        let mut indexed = build_campaign();
+        indexed.world_mut().use_indexed_census = true;
+        arm_campaign(&mut indexed);
+        indexed.run_ticks(200);
+
+        // THE PIN (seeded_campaign_stream_digest_pin's own value,
+        // the L6 requirement: the digest holds through the indexed
+        // census too — unchanged, never re-pinned).
+        const PINNED_STREAM_DIGEST: u64 = 10778018066104731562;
+        assert_eq!(
+            execution_digest(&indexed.world().stream),
+            PINNED_STREAM_DIGEST,
+            "the indexed census reproduces the pinned stream digest"
+        );
+
+        // Cross-path identity: stream, fingerprint, and the census
+        // counters — byte-identical.
+        let linear_world = linear.world();
+        let indexed_world = indexed.world();
+        assert_eq!(
+            execution_digest(&linear_world.stream),
+            execution_digest(&indexed_world.stream),
+            "the two census paths produce identical streams"
+        );
+        let mut linear_fp = Fingerprinter::new();
+        linear_world.fingerprint(&mut linear_fp);
+        let mut indexed_fp = Fingerprinter::new();
+        indexed_world.fingerprint(&mut indexed_fp);
+        assert_eq!(
+            linear_fp.finish(),
+            indexed_fp.finish(),
+            "the two census paths produce identical world fingerprints"
+        );
+        assert_eq!(
+            linear_world.census_witnesses, indexed_world.census_witnesses,
+            "the census witness counts agree"
+        );
+        assert_eq!(
+            linear_world.witness_executions, indexed_world.witness_executions,
+            "the witness executions agree"
+        );
+        assert_eq!(
+            linear_world.wake_executions, indexed_world.wake_executions,
+            "the wake executions agree"
+        );
+        // The census actually ran through the index (a vacuous pass
+        // is the failure this gate exists to catch): the campaign's
+        // two significant events executed with the indexed path on.
+        assert!(
+            indexed_world.census_witnesses == 5,
+            "the campaign's 3 + 2 witnesses censused through the index"
+        );
     }
 }
