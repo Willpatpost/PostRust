@@ -34,6 +34,35 @@
 //! rebuild in BOTH phases, pending and confirmed alike — the C1 discipline.
 //! Confirmation is asynchronous and never blocks anything.
 //!
+//! # THE WITNESS→KEYS INDEX (A09 — the witness-oriented access shape)
+//! `MemoryKey` orders EVENT-FIRST — (event, witness, kind) — so the
+//! pending/confirmed `BTreeMap`s iterate in EVENT order and ONE
+//! witness's records are scattered across the whole key space, never
+//! a contiguous range: no range query can serve a witness's history.
+//! The ledger therefore keeps a DERIVED witness→keys index
+//! (`MemoryLedger::witness_index`, maintained at the single key-set
+//! mutation site — capture), and every witness-oriented read
+//! (`witness_records`, `pending_keys`, `witness_counts`, the
+//! `activate` rebuild, and `witness_classifications` through the
+//! lane's own analogous derived index) is a per-witness key-set walk
+//! in the CANONICAL order fused with the two-phase precedence at
+//! read time — byte-identical to the old scan+sort forms (the
+//! equivalence battery pins it across fixture shapes, the recovery
+//! shape included) at O(log L + the witness's OWN records), flat in
+//! the foreign history the old forms scanned per call. The indexes
+//! are DERIVED in the spine's class sense: wire-invisible (never
+//! serialized — the durable form is the journal's records and
+//! decisions, and a recovered lane REPLAYS through the public
+//! capture/classify/confirm APIs, maintaining them at the same
+//! insertion sites; no digest reads them), PHASE-BLIND (`confirm`
+//! moves a record between phases without changing the key set, so it
+//! never touches them), and pure functions of the canonical maps
+//! (the rebuild-equals-maintained invariant is pinned by test). What
+//! stays linear ON PURPOSE (§5.3's documented boundary):
+//! `candidate_records` — the shared reputation fold is lane-scope,
+//! needs ALL candidates regardless of witness, and is rare; a
+//! kind-index is the future shape only if ever measured.
+//!
 //! # THE POLICY BOUNDARY
 //! Which event classes produce which record kinds, the radii, and the
 //! classification decisions are game policy authored above. The engine
@@ -610,6 +639,47 @@ impl Default for WitnessMemory {
 pub struct MemoryLedger {
     pending: BTreeMap<MemoryKey, MemoryRecord>,
     confirmed: BTreeMap<MemoryKey, MemoryRecord>,
+    /// THE DERIVED WITNESS→KEYS INDEX (A09, design §5.2): `witness →
+    /// the set of keys it owns across BOTH phases`. THE STRUCTURAL
+    /// FACT that forces a derived index (and forbids the tempting
+    /// range query): `MemoryKey` orders EVENT-FIRST — (event,
+    /// witness, kind) — so the canonical maps iterate in EVENT order
+    /// and one witness's records are SCATTERED; `witness_records`'s
+    /// pre-index form full-scanned both maps, filtered, and sorted —
+    /// O(ledger) + O(result · log result) per call, paid per witness
+    /// activation, per journal flush claim, per conservation check.
+    ///
+    /// MAINTENANCE (the ONE key-set mutation site): [`Self::capture`]
+    /// inserts, exactly on `Captured`. `confirm` moves a record
+    /// BETWEEN phases without changing the key set — the index is
+    /// PHASE-BLIND (a load-bearing simplification: the phase merge
+    /// happens at read time through the same
+    /// pending-then-confirmed precedence [`Self::record`] exposes).
+    /// No removal site exists (the ledger never drops a record;
+    /// durable-history retention is the journal machinery's lane).
+    ///
+    /// DETERMINISM: a `BTreeSet<MemoryKey>` iterates in canonical
+    /// MemoryKey order — for a FIXED witness that is (event, kind),
+    /// exactly the order the pre-index sort produced — so every
+    /// query the index serves is byte-identical to the scan form
+    /// (pinned by the equivalence battery). The outer map is
+    /// keyed-lookup only in production code (never iterated), so it
+    /// cannot introduce an order.
+    ///
+    /// WIRE-INVISIBILITY (the spine's derived-class precedent —
+    /// `held_index`, `remaining_deps`): the ledger is never
+    /// serialized; the durable form is the journal's plan records,
+    /// and a recovered lane is REPLAYED through the public capture/
+    /// confirm APIs, which maintain the index at the same insertion
+    /// site (the recovery-replay test pins the reconstructed index
+    /// equal to the incrementally maintained one). Neither
+    /// `MemoryLedger::digest` nor any lane digest reads it, and its
+    /// value is a pure function of the canonical maps (the
+    /// rebuild-equals-maintained invariant, pinned by test). Memory
+    /// cost: one `BTreeSet` entry per captured key (~13 bytes + tree
+    /// overhead) — the price of O(log + own) witness access; the
+    /// canonical maps stay the single authority.
+    witness_index: BTreeMap<u32, BTreeSet<MemoryKey>>,
 }
 
 impl MemoryLedger {
@@ -619,6 +689,7 @@ impl MemoryLedger {
         MemoryLedger {
             pending: BTreeMap::new(),
             confirmed: BTreeMap::new(),
+            witness_index: BTreeMap::new(),
         }
     }
 }
@@ -644,11 +715,26 @@ impl MemoryLedger {
         if self.pending.contains_key(&key) {
             return Ok(CaptureOutcome::AlreadyPending);
         }
+        // THE DERIVED WITNESS→KEYS INDEX's one maintenance site: a
+        // fresh key enters both phase-agnostic homes together (the
+        // duplicate guards above keep a re-delivery from ever
+        // reaching this line, so the index and the maps cannot
+        // diverge). One O(log) set insert per captured record — the
+        // whole steady-state cost of every witness-oriented read
+        // becoming O(log + own).
+        self.witness_index
+            .entry(key.witness)
+            .or_default()
+            .insert(key);
         self.pending.insert(key, record);
         Ok(CaptureOutcome::Captured)
     }
 
-    /// Confirm a pending record: moves it to confirmed.
+    /// Confirm a pending record: moves it to confirmed. THE DERIVED
+    /// WITNESS→KEYS INDEX IS PHASE-BLIND: the key set is unchanged by
+    /// the move, so this path never touches it (the phase merge
+    /// happens at read time, through the two-phase precedence
+    /// [`Self::record`] exposes).
     pub fn confirm(&mut self, key: &MemoryKey) -> ConfirmOutcome {
         if self.confirmed.contains_key(key) {
             return ConfirmOutcome::AlreadyConfirmed;
@@ -671,44 +757,69 @@ impl MemoryLedger {
     /// a phase-partitioned concatenation (the rebuild folds these in
     /// order, and the episodic retention keeps the LAST records
     /// applied: only the event order makes "last" mean "newest").
+    ///
+    /// THE INDEXED PHASE MERGE (A09): the derived witness→keys
+    /// index's per-witness key set already iterates in canonical
+    /// `MemoryKey` order — (event, kind) for a fixed witness, exactly
+    /// the order the pre-index scan+sort produced — and each key
+    /// resolves through the same two-phase precedence
+    /// [`Self::record`] exposes (pending first, then confirmed).
+    /// Cost O(log L + the witness's OWN records) with zero sorting —
+    /// FLAT in the foreign history the scan form walked whole, per
+    /// call. Output: the identical `Vec<&MemoryRecord>` in the
+    /// identical order (the equivalence battery pins the
+    /// byte-identity across fixture shapes, the recovery replay
+    /// included).
     #[must_use]
     pub fn witness_records(&self, witness: u32) -> Vec<&MemoryRecord> {
-        let mut merged: Vec<(MemoryKey, &MemoryRecord)> = self
-            .pending
-            .iter()
-            .chain(self.confirmed.iter())
-            .filter(|(k, _)| k.witness == witness)
-            .map(|(k, r)| (*k, r))
-            .collect();
-        merged.sort_unstable_by_key(|(k, _)| *k);
-        merged.into_iter().map(|(_, r)| r).collect()
+        let Some(keys) = self.witness_index.get(&witness) else {
+            return Vec::new();
+        };
+        keys.iter()
+            .map(|key| {
+                self.record(key)
+                    .expect("the derived index's key is captured in exactly one phase")
+            })
+            .collect()
     }
 
     /// The witness's pending (captured, unconfirmed) keys in canonical
     /// order — the pipeline ride's episode material (which keys a
-    /// commit claims).
+    /// commit claims). Served by the same index walk: canonical key
+    /// order with the pending-phase filter — O(log L + the witness's
+    /// OWN records), never the pre-index form's full scan and re-sort
+    /// through [`Self::witness_records`].
     #[must_use]
     pub fn pending_keys(&self, witness: u32) -> Vec<MemoryKey> {
-        self.witness_records(witness)
-            .iter()
-            .filter(|r| self.pending.contains_key(&r.key))
-            .map(|r| r.key)
+        let Some(keys) = self.witness_index.get(&witness) else {
+            return Vec::new();
+        };
+        keys.iter()
+            .filter(|key| self.pending.contains_key(*key))
+            .copied()
             .collect()
     }
 
-    /// Get (pending count, confirmed count) for a witness.
+    /// Get (pending count, confirmed count) for a witness — the same
+    /// index walk, counting each owned key's phase membership
+    /// independently per map (a key lives in exactly one; the pair of
+    /// independent counts keeps the answer honest per phase): O(log L
+    /// + the witness's OWN records), never two full-ledger scans.
     #[must_use]
     pub fn witness_counts(&self, witness: u32) -> (usize, usize) {
-        let pending = self
-            .pending
-            .values()
-            .filter(|r| r.key.witness == witness)
-            .count();
-        let confirmed = self
-            .confirmed
-            .values()
-            .filter(|r| r.key.witness == witness)
-            .count();
+        let Some(keys) = self.witness_index.get(&witness) else {
+            return (0, 0);
+        };
+        let mut pending = 0usize;
+        let mut confirmed = 0usize;
+        for key in keys {
+            if self.pending.contains_key(key) {
+                pending += 1;
+            }
+            if self.confirmed.contains_key(key) {
+                confirmed += 1;
+            }
+        }
         (pending, confirmed)
     }
 
@@ -767,6 +878,31 @@ impl MemoryLedger {
 pub struct MemoryLane {
     ledger: MemoryLedger,
     classifications: BTreeMap<MemoryKey, bool>,
+    /// THE DERIVED CLASSIFICATION WITNESS INDEX (A09 §5.2's
+    /// "+ classifications if measured" clause — measured IN, this
+    /// lane): `witness → the set of decided keys`. The same
+    /// structural fact as the ledger's — `classifications` is keyed
+    /// by the event-first `MemoryKey`, so one witness's decisions
+    /// scatter and `witness_classifications`' pre-index form
+    /// full-scanned the map — and the same consumers pay it: the
+    /// journal bridge reads the witness's sync PER COMMIT CALL
+    /// (commit staging, the classification flush, the recovery
+    /// comparison), so the scan is linear in the GLOBAL decision
+    /// history per witness per commit. The scaling gate measures the
+    /// scan growing linearly while the indexed walk stays flat in
+    /// the witness's own decisions; the cost is one O(log) set
+    /// insert at the single insertion site (the demo's 24-witness
+    /// population sits far below any conceivable crossover — the
+    /// index is the design's unconditional shape, not a gated one).
+    ///
+    /// MAINTENANCE: [`Self::classify`]'s durable insert — the ONE
+    /// mutation site (decisions are terminal and exactly-once; no
+    /// removal site exists). WIRE-INVISIBLE like the ledger's index:
+    /// the durable form is the journal plan's sync section, a
+    /// recovered lane replays through `classify` (reconstructing it
+    /// at the same site), and no digest reads it. The per-key
+    /// `classification` lookup was already O(log) and is untouched.
+    classification_index: BTreeMap<u32, BTreeSet<MemoryKey>>,
     live: BTreeMap<u32, WitnessMemory>,
     /// The ACTIVE witness set: a first-sight capture inserts (the
     /// implicit activation), [`Self::activate`] inserts; membership is
@@ -866,6 +1002,16 @@ impl MemoryLane {
     /// classified candidate never regresses to Pending). FAILS CLOSED:
     /// an apply overflow propagates (never swallowed). The witness
     /// leaves the dormant set.
+    ///
+    /// THE INDEXED ACTIVATION (A09): the fold is served by the
+    /// derived witness→keys index — O(log L + the witness's OWN
+    /// records) — so a regional activation batch (the composition
+    /// looping a region's witnesses through this function) never pays
+    /// O(global history) per witness. No batch engine API is needed:
+    /// the per-witness O(log) index lookup is noise at any
+    /// composition's witness count (the scaling gate measures
+    /// `activate` flat in ledger size), and the per-witness fold work
+    /// is irreducible (each record must apply).
     pub fn activate(
         &mut self,
         witness: u32,
@@ -907,12 +1053,27 @@ impl MemoryLane {
     /// One witness's durable classification decisions in canonical key
     /// order — the journal's classification-sync section (the
     /// applicable classification history carried with each episode).
+    /// Served by the derived classification index: the per-witness
+    /// key set iterates in canonical `MemoryKey` order — the same
+    /// order the decisions map's own iteration restricted to the
+    /// witness produces — each key resolved through the decisions
+    /// map. Cost O(log C + the witness's OWN decisions), flat in the
+    /// global decision history the pre-index form scanned per call.
     #[must_use]
     pub fn witness_classifications(&self, witness: u32) -> Vec<(MemoryKey, bool)> {
-        self.classifications
-            .iter()
-            .filter(|(key, _)| key.witness == witness)
-            .map(|(key, &decision)| (*key, decision))
+        let Some(keys) = self.classification_index.get(&witness) else {
+            return Vec::new();
+        };
+        keys.iter()
+            .map(|key| {
+                (
+                    *key,
+                    self.classifications
+                        .get(key)
+                        .copied()
+                        .expect("the derived classification index's key is decided"),
+                )
+            })
             .collect()
     }
 
@@ -966,6 +1127,14 @@ impl MemoryLane {
         }
 
         self.classifications.insert(*key, accept);
+        // THE DERIVED CLASSIFICATION INDEX's one maintenance site,
+        // beside the durable insert it mirrors (the guards above keep
+        // a re-decision from ever reaching this line — first decision
+        // wins, so the index and the map cannot diverge).
+        self.classification_index
+            .entry(key.witness)
+            .or_default()
+            .insert(*key);
         if let Some(witness_mem) = self.live.get_mut(&key.witness) {
             // The live candidate exists (the ledger gate above plus the
             // materialization discipline: every captured record of an
@@ -2487,5 +2656,583 @@ mod tests {
         let live = lane.live(witness).unwrap();
         assert_eq!(live.episodic().len(), 1);
         assert_eq!(live.relationships().get(&1), Some(&5));
+    }
+
+    // ------------------------------------------------------------------
+    // A09 (P2 L4) — THE DERIVED WITNESS→KEYS INDEX: the equivalence
+    // battery (every witness-oriented query byte-identical to the
+    // scan-based form across fixture shapes), the derived invariant
+    // (the index equals the from-maps rebuild — the incrementally
+    // maintained and the recovery-replayed forms alike), the
+    // wire-invisibility proof (the live and recovery-shaped builds
+    // of the same canonical state produce identical digests and
+    // identical indexes), and the scaling evidence (the query cost
+    // vs ledger size — flat in the witness's own history against the
+    // linear scan).
+    // ------------------------------------------------------------------
+
+    /// The seeded SplitMix64 (the s6 fuzz gate's generator form):
+    /// fixture violations reproduce deterministically from the seed.
+    struct FixtureRng(u64);
+
+    impl FixtureRng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// One fixture record: all three kinds constructible for any
+    /// (event, witness), small deterministic field values derived
+    /// from the event id (the episodic observer is the witness — the
+    /// validation gate).
+    fn fixture_record(event: u64, witness: u32, kind: MemoryKind) -> MemoryRecord {
+        let delta = match kind {
+            MemoryKind::Episodic => make_episodic(
+                witness,
+                (event % 97) as u32,
+                Tick(event),
+                (event % 31) as u32,
+            ),
+            MemoryKind::Relationship => {
+                make_relationship(witness, (event % 13) as u32, (event % 11) as i32 - 5)
+            }
+            MemoryKind::ReputationCandidate => make_candidate(
+                witness,
+                (event % 7) as u32,
+                (event % 5) as u32,
+                (event % 17) as i32 - 8,
+            ),
+        };
+        make_record(event, witness, kind, delta, Tick(event))
+    }
+
+    /// THE SCAN ORACLES — deliberately separate code (the S6/C4
+    /// oracle precedent): the PRE-INDEX bodies, verbatim, reading the
+    /// canonical maps directly. The equivalence battery compares
+    /// every indexed result against these, byte for byte and in
+    /// order.
+    fn scan_witness_records(ledger: &MemoryLedger, witness: u32) -> Vec<(MemoryKey, Vec<u8>)> {
+        let mut merged: Vec<(MemoryKey, &MemoryRecord)> = ledger
+            .pending
+            .iter()
+            .chain(ledger.confirmed.iter())
+            .filter(|(k, _)| k.witness == witness)
+            .map(|(k, r)| (*k, r))
+            .collect();
+        merged.sort_unstable_by_key(|(k, _)| *k);
+        merged
+            .into_iter()
+            .map(|(k, r)| (k, r.canonical_bytes()))
+            .collect()
+    }
+
+    fn scan_pending_keys(ledger: &MemoryLedger, witness: u32) -> Vec<MemoryKey> {
+        scan_witness_records(ledger, witness)
+            .iter()
+            .filter(|(k, _)| ledger.pending.contains_key(k))
+            .map(|(k, _)| *k)
+            .collect()
+    }
+
+    fn scan_witness_counts(ledger: &MemoryLedger, witness: u32) -> (usize, usize) {
+        let pending = ledger
+            .pending
+            .values()
+            .filter(|r| r.key.witness == witness)
+            .count();
+        let confirmed = ledger
+            .confirmed
+            .values()
+            .filter(|r| r.key.witness == witness)
+            .count();
+        (pending, confirmed)
+    }
+
+    fn scan_witness_classifications(lane: &MemoryLane, witness: u32) -> Vec<(MemoryKey, bool)> {
+        lane.classifications
+            .iter()
+            .filter(|(key, _)| key.witness == witness)
+            .map(|(key, &decision)| (*key, decision))
+            .collect()
+    }
+
+    /// The indexed form flattened to the oracle's comparable shape.
+    fn indexed_witness_records(ledger: &MemoryLedger, witness: u32) -> Vec<(MemoryKey, Vec<u8>)> {
+        ledger
+            .witness_records(witness)
+            .into_iter()
+            .map(|record| (record.key, record.canonical_bytes()))
+            .collect()
+    }
+
+    /// The from-maps rebuild of the ledger's derived index — the
+    /// derived-class invariant's oracle (a lane restored from its
+    /// canonical state reconstructs exactly this).
+    fn rebuilt_witness_index(ledger: &MemoryLedger) -> BTreeMap<u32, BTreeSet<MemoryKey>> {
+        let mut rebuilt: BTreeMap<u32, BTreeSet<MemoryKey>> = BTreeMap::new();
+        for key in ledger.pending.keys().chain(ledger.confirmed.keys()) {
+            rebuilt.entry(key.witness).or_default().insert(*key);
+        }
+        rebuilt
+    }
+
+    /// The from-maps rebuild of the lane's derived classification
+    /// index.
+    fn rebuilt_classification_index(lane: &MemoryLane) -> BTreeMap<u32, BTreeSet<MemoryKey>> {
+        let mut rebuilt: BTreeMap<u32, BTreeSet<MemoryKey>> = BTreeMap::new();
+        for key in lane.classifications.keys() {
+            rebuilt.entry(key.witness).or_default().insert(*key);
+        }
+        rebuilt
+    }
+
+    /// One fixture shape's full comparison: every witness-oriented
+    /// query byte-identical to its scan oracle for every PRESENT
+    /// witness plus two absent ones, and both derived indexes equal
+    /// their from-maps rebuilds (the incrementally maintained form
+    /// and the recovery-replayed form both pass here — the invariant
+    /// is the same).
+    fn assert_indexed_equivalence(lane: &MemoryLane, witnesses: &[u32], where_: &str) {
+        for witness in witnesses.iter().chain([u32::MAX, 7_777_777].iter()) {
+            assert_eq!(
+                indexed_witness_records(&lane.ledger, *witness),
+                scan_witness_records(&lane.ledger, *witness),
+                "witness_records({witness}) is byte-identical to the scan form at {where_}"
+            );
+            assert_eq!(
+                lane.ledger.pending_keys(*witness),
+                scan_pending_keys(&lane.ledger, *witness),
+                "pending_keys({witness}) is identical to the scan form at {where_}"
+            );
+            assert_eq!(
+                lane.ledger.witness_counts(*witness),
+                scan_witness_counts(&lane.ledger, *witness),
+                "witness_counts({witness}) is identical to the scan form at {where_}"
+            );
+            assert_eq!(
+                lane.witness_classifications(*witness),
+                scan_witness_classifications(lane, *witness),
+                "witness_classifications({witness}) is identical to the scan form at {where_}"
+            );
+        }
+        assert_eq!(
+            rebuilt_witness_index(&lane.ledger),
+            lane.ledger.witness_index,
+            "the maintained witness index equals the from-maps rebuild at {where_}"
+        );
+        assert_eq!(
+            rebuilt_classification_index(lane),
+            lane.classification_index,
+            "the maintained classification index equals the from-maps rebuild at {where_}"
+        );
+    }
+
+    /// Build one fixture lane (seeded, fully deterministic): `events`
+    /// events over `witnesses` witnesses — each event addressed to
+    /// ONE witness (event % witnesses: consecutive events to
+    /// consecutive witnesses, CROSS-WITNESS INTERLEAVING, the
+    /// event-first key order's scatter made maximal), all three kinds
+    /// captured per (event, witness) in the encounter composition's
+    /// fixed order. `confirm_pct`/`classify_pct`/`duplicate_pct` of
+    /// the respective populations fire — MID-STREAM (after half the
+    /// captures: confirmed records interleave with later pending
+    /// ones across the whole event space) and post-stream.
+    /// `dormant` selects the RECOVERY SHAPE: every capture and
+    /// duplicate through [`MemoryLane::capture_dormant`], the
+    /// decisions and confirms applied while dormant — the exact API
+    /// sequence a journal replay drives, with no live
+    /// materialization. The RNG stream is identical in both shapes
+    /// (the capture API switch draws nothing), so the two builds
+    /// reach the SAME canonical state.
+    fn fixture_lane(
+        events: u64,
+        witnesses: u32,
+        confirm_pct: u64,
+        classify_pct: u64,
+        duplicate_pct: u64,
+        seed: u64,
+        dormant: bool,
+    ) -> MemoryLane {
+        let mut lane = MemoryLane::new();
+        let mut rng = FixtureRng(seed);
+        let mut captured: Vec<MemoryRecord> = Vec::new();
+        let mut candidates: Vec<MemoryKey> = Vec::new();
+
+        let capture = |lane: &mut MemoryLane, record: MemoryRecord| {
+            if dormant {
+                lane.capture_dormant(record)
+                    .expect("the fixture record validates");
+            } else {
+                lane.capture_and_apply(record, 8)
+                    .expect("the fixture record validates");
+            }
+        };
+
+        let half = (events / 2).max(1);
+        for event in 0..events {
+            let witness = (event % u64::from(witnesses)) as u32;
+            for kind in [
+                MemoryKind::Episodic,
+                MemoryKind::Relationship,
+                MemoryKind::ReputationCandidate,
+            ] {
+                let record = fixture_record(event, witness, kind);
+                capture(&mut lane, record);
+                if kind == MemoryKind::ReputationCandidate {
+                    candidates.push(record.key);
+                }
+                captured.push(record);
+            }
+            // MID-STREAM phase mix: confirms and classifications among
+            // the first half's records — the phase interleave the
+            // canonical-order contract exists for.
+            if event + 1 == half {
+                for record in &captured {
+                    if rng.below(100) < confirm_pct {
+                        lane.confirm(&record.key);
+                    }
+                }
+                for key in &candidates {
+                    if rng.below(100) < classify_pct {
+                        lane.classify(key, rng.below(2) == 0);
+                    }
+                }
+            }
+        }
+
+        // POST-STREAM: the rest of the confirms and classifications
+        // over the whole history, then the duplicate re-deliveries
+        // (the exactly-once no-ops — the index must not grow).
+        for record in &captured {
+            if rng.below(100) < confirm_pct {
+                lane.confirm(&record.key);
+            }
+        }
+        for key in &candidates {
+            if rng.below(100) < classify_pct {
+                lane.classify(key, rng.below(2) == 0);
+            }
+        }
+        for record in &captured {
+            if rng.below(100) < duplicate_pct {
+                capture(&mut lane, *record);
+            }
+        }
+
+        // The live shape's dormancy round trip for the boundary
+        // witnesses (the rebuild through the indexed path), balanced —
+        // everyone ends active.
+        if !dormant {
+            for witness in [0u32, witnesses - 1] {
+                lane.deactivate(witness);
+                lane.activate(witness, 8)
+                    .expect("the fixture's authored deltas cannot overflow");
+            }
+        }
+        lane
+    }
+
+    /// THE EQUIVALENCE BATTERY (the lane's first mandatory test):
+    /// every `witness_records`/`witness_counts`/`witness_classifications`
+    /// (and `pending_keys`) result byte-identical to the scan-based
+    /// form across fixture shapes — multiple witnesses,
+    /// cross-witness interleaving (the event-first key order's
+    /// scatter), pending/confirmed mixes with mid-stream and
+    /// post-stream confirms, classification mixes, duplicate
+    /// deliveries, the dormancy round trip, the recovery-shaped
+    /// build, and the empty lane — with the derived-index invariant
+    /// (maintained == from-maps rebuild) checked at every shape.
+    #[test]
+    fn witness_indexed_queries_are_byte_identical_to_the_scan_forms() {
+        // The empty lane: every query empty, both indexes empty.
+        let empty = MemoryLane::new();
+        assert_indexed_equivalence(&empty, &[], "the empty lane");
+
+        // (events, witnesses, confirm%, classify%, duplicate%)
+        let shapes: [(u64, u32, u64, u64, u64); 5] = [
+            (60, 7, 50, 50, 20),  // the balanced mix
+            (60, 1, 0, 0, 0),     // single witness, all pending
+            (90, 7, 90, 30, 10),  // phase-heavy (most confirmed)
+            (30, 24, 30, 80, 40), // the demo's witness count, classify-heavy
+            (75, 5, 40, 60, 35),  // duplicate-heavy
+        ];
+        for (shape_index, &(events, witnesses, confirm_pct, classify_pct, duplicate_pct)) in
+            shapes.iter().enumerate()
+        {
+            let witness_ids: Vec<u32> = (0..witnesses).collect();
+            for seed in [0xA09_5EED_0001_u64, 0xA09_5EED_0002] {
+                let live = fixture_lane(
+                    events,
+                    witnesses,
+                    confirm_pct,
+                    classify_pct,
+                    duplicate_pct,
+                    seed,
+                    false,
+                );
+                assert_indexed_equivalence(
+                    &live,
+                    &witness_ids,
+                    &format!("the live shape {shape_index} (seed {seed:#x})"),
+                );
+
+                let recovery = fixture_lane(
+                    events,
+                    witnesses,
+                    confirm_pct,
+                    classify_pct,
+                    duplicate_pct,
+                    seed,
+                    true,
+                );
+                assert_indexed_equivalence(
+                    &recovery,
+                    &witness_ids,
+                    &format!("the recovery shape {shape_index} (seed {seed:#x})"),
+                );
+            }
+        }
+    }
+
+    /// THE WIRE-INVISIBILITY PROOF (the lane's third mandatory test):
+    /// the same canonical end-state, reached through the LIVE path
+    /// (capture_and_apply with live classification and a dormancy
+    /// round trip) and through the RECOVERY-SHAPED path
+    /// (capture_dormant, dormant classification, late confirms, and
+    /// the activate rebuild — the exact API sequence a journal
+    /// replay drives), produces the IDENTICAL compatibility digest,
+    /// the IDENTICAL diagnostic digest, and the IDENTICAL derived
+    /// indexes: the index never reaches the wire (no digest reads
+    /// it; the durable form is the journal's records and decisions)
+    /// and the restore-path replay reconstructs it exactly — the
+    /// incrementally maintained and the reconstructed forms are the
+    /// same map (the spine's derived-class discipline). The real
+    /// journal round-trip is the engine-slice cold-reopen gate's own
+    /// pin; this is the engine-core boundary's half.
+    #[test]
+    fn the_recovery_replay_rebuilds_the_identical_index_and_digests() {
+        let (events, witnesses) = (66u64, 6u32);
+        let live = fixture_lane(events, witnesses, 45, 55, 25, 0xC0FF_EE03, false);
+        let mut recovery = fixture_lane(events, witnesses, 45, 55, 25, 0xC0FF_EE03, true);
+
+        // The session-reopen materialization: activate every witness
+        // the replay gave records (zero-record witnesses were never
+        // active in the live lane either — first sight is the
+        // implicit activation).
+        for witness in 0..witnesses {
+            if live.ledger.witness_index.contains_key(&witness) {
+                recovery
+                    .activate(witness, 8)
+                    .expect("the replay's records rebuild");
+            }
+        }
+
+        assert_eq!(
+            recovery.digest(),
+            live.digest(),
+            "the compatibility digest is identical across the construction paths"
+        );
+        assert_eq!(
+            recovery.diagnostic_digest(),
+            live.diagnostic_digest(),
+            "the diagnostic digest (active/dormant/produced included) is identical across the \
+             construction paths"
+        );
+        assert_eq!(
+            recovery.ledger.witness_index, live.ledger.witness_index,
+            "the reconstructed witness index equals the incrementally maintained one"
+        );
+        assert_eq!(
+            recovery.classification_index, live.classification_index,
+            "the reconstructed classification index equals the incrementally maintained one"
+        );
+        // And the per-witness reads agree across the paths.
+        for witness in 0..witnesses {
+            assert_eq!(
+                indexed_witness_records(&recovery.ledger, witness),
+                indexed_witness_records(&live.ledger, witness),
+                "witness {witness}'s records agree across the construction paths"
+            );
+            assert_eq!(
+                recovery.witness_classifications(witness),
+                live.witness_classifications(witness),
+                "witness {witness}'s classifications agree across the construction paths"
+            );
+        }
+    }
+
+    /// The scaling fixture: `total` records with witness 0 owning
+    /// exactly `own` of them, SCATTERED across the event space (every
+    /// total/own-th event — the event-first scatter, never a
+    /// contiguous range), the filler spread over witnesses
+    /// 1..witnesses as candidates; witness 0's own candidates all
+    /// classified and every 10th filler candidate classified, so the
+    /// ledger, the classifications map, and both derived indexes all
+    /// grow with `total` while witness 0's OWN history stays fixed.
+    /// The capture path is the recovery shape (`capture_dormant` —
+    /// nothing materializes live), leaving `activate` measurable.
+    fn scaling_lane(total: usize, witnesses: u32, own: usize) -> MemoryLane {
+        let mut lane = MemoryLane::new();
+        let step = (total / own).max(1);
+        let mut own_taken = 0usize;
+        let mut to_classify: Vec<MemoryKey> = Vec::new();
+        for event in 0..total as u64 {
+            let is_own = own_taken < own && (event as usize).is_multiple_of(step);
+            let (witness, kind) = if is_own {
+                own_taken += 1;
+                (
+                    0u32,
+                    match own_taken % 3 {
+                        0 => MemoryKind::Episodic,
+                        1 => MemoryKind::Relationship,
+                        _ => MemoryKind::ReputationCandidate,
+                    },
+                )
+            } else {
+                (
+                    1 + (event % u64::from(witnesses - 1)) as u32,
+                    MemoryKind::ReputationCandidate,
+                )
+            };
+            let record = fixture_record(event, witness, kind);
+            lane.capture_dormant(record)
+                .expect("the fixture record validates");
+            if kind == MemoryKind::ReputationCandidate && (witness == 0 || event % 10 == 0) {
+                to_classify.push(record.key);
+            }
+        }
+        for key in to_classify {
+            assert_eq!(
+                lane.classify(&key, true),
+                ClassifyOutcome::Classified,
+                "each fixture candidate classifies exactly once"
+            );
+        }
+        lane
+    }
+
+    /// Median-of-`reps` nanoseconds for `f` (the robust statistic
+    /// under the parallel test battery's noise).
+    fn median_ns<F: FnMut()>(reps: usize, mut f: F) -> u64 {
+        let mut samples = Vec::with_capacity(reps);
+        for _ in 0..reps {
+            let started = std::time::Instant::now();
+            f();
+            samples.push(started.elapsed().as_nanos() as u64);
+        }
+        samples.sort_unstable();
+        samples[reps / 2]
+    }
+
+    /// THE SCALING EVIDENCE (the lane's second mandatory test, the
+    /// design §9.9 matrix's engine-core half): the indexed queries
+    /// are FLAT in the ledger's size at a fixed witness history
+    /// (witness 0 owns exactly 40 records and ~13 decisions at every
+    /// size) while the scan forms grow LINEARLY — measured at ledger
+    /// sizes {1k, 10k, 100k} × witness counts {24, 1000}
+    /// (pod-observational numbers in the unoptimized test profile;
+    /// the assertions are the robust invariants only: the scan's
+    /// linear growth across the 100× size range, the indexed walk's
+    /// flat-to-logarithmic growth, and the indexed advantage at the
+    /// largest size. The release-mode rig curve remains §9.9's own
+    /// measurement, as with every lane).
+    #[test]
+    fn witness_query_cost_is_flat_in_ledger_size() {
+        let sizes = [1_000usize, 10_000, 100_000];
+        for witnesses in [24u32, 1000] {
+            let mut scan = [0u64; 3];
+            let mut indexed = [0u64; 3];
+            let mut cls_scan = [0u64; 3];
+            let mut cls_indexed = [0u64; 3];
+            let mut activate = [0u64; 3];
+            for (i, &total) in sizes.iter().enumerate() {
+                let mut lane = scaling_lane(total, witnesses, 40);
+                scan[i] = median_ns(15, || {
+                    let _ = scan_witness_records(&lane.ledger, 0);
+                });
+                indexed[i] = median_ns(100, || {
+                    let _ = indexed_witness_records(&lane.ledger, 0);
+                });
+                cls_scan[i] = median_ns(15, || {
+                    let _ = scan_witness_classifications(&lane, 0);
+                });
+                cls_indexed[i] = median_ns(100, || {
+                    let _ = lane.witness_classifications(0);
+                });
+                activate[i] = median_ns(20, || {
+                    lane.activate(0, 8)
+                        .expect("the fixture's deltas cannot overflow");
+                });
+                println!(
+                    "a09 scaling (witnesses {witnesses:4}, ledger {total:6} records, witness 0 \
+                     owns 40): witness_records scan {scan:9} ns vs indexed {indexed:8} ns; \
+                     witness_classifications scan {cls_scan:8} ns vs indexed {cls_indexed:7} \
+                     ns; activate {activate:8} ns (pod-observational, test profile)",
+                    scan = scan[i],
+                    indexed = indexed[i],
+                    cls_scan = cls_scan[i],
+                    cls_indexed = cls_indexed[i],
+                    activate = activate[i],
+                );
+            }
+
+            // The scan grows linearly with the ledger (the 100× size
+            // range must show at least 20× — expected ~100×).
+            assert!(
+                scan[2] >= 20 * scan[0].max(1),
+                "witnesses {witnesses}: witness_records' scan grows linearly (measured {} → {} \
+                 ns across 1k → 100k records)",
+                scan[0],
+                scan[2]
+            );
+            assert!(
+                cls_scan[2] >= 20 * cls_scan[0].max(1),
+                "witnesses {witnesses}: witness_classifications' scan grows linearly (measured \
+                 {} → {} ns)",
+                cls_scan[0],
+                cls_scan[2]
+            );
+            // The indexed walks are flat-to-logarithmic (the walk
+            // depth grows with log L; a 100× ledger must stay within
+            // 3× + the constant headroom).
+            assert!(
+                indexed[2] <= 3 * indexed[0] + 20_000,
+                "witnesses {witnesses}: witness_records' indexed walk is flat in ledger size \
+                 (measured {} → {} ns)",
+                indexed[0],
+                indexed[2]
+            );
+            assert!(
+                cls_indexed[2] <= 3 * cls_indexed[0] + 20_000,
+                "witnesses {witnesses}: witness_classifications' indexed walk is flat \
+                 (measured {} → {} ns)",
+                cls_indexed[0],
+                cls_indexed[2]
+            );
+            // The indexed activation rebuild is flat likewise.
+            assert!(
+                activate[2] <= 3 * activate[0] + 50_000,
+                "witnesses {witnesses}: activate is flat in ledger size (measured {} → {} ns)",
+                activate[0],
+                activate[2]
+            );
+            // The indexed advantage at the largest size (expected
+            // one-to-two orders of magnitude; 5× is the robust floor).
+            assert!(
+                5 * indexed[2] <= scan[2],
+                "witnesses {witnesses}: the indexed walk wins at scale ({} vs {} ns at 100k \
+                 records)",
+                indexed[2],
+                scan[2]
+            );
+        }
     }
 }
