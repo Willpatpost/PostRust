@@ -32,7 +32,7 @@ use ash::vk;
 /// SkyParams block, byte-identical (mat4 + four vec4s; the alpha
 /// lanes carry nothing and are written 0).
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct SkyFrameParams {
     /// The inverse of the corner frame's view-projection (the ray
     /// reconstruction's source; CPU-computed via `sky::mat4_inverse`).

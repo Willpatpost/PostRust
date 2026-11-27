@@ -101,7 +101,7 @@ pub(crate) enum ProxyKind {
 /// repacked instance bytes, the repacked POSE bytes (the npc kind's
 /// skin-matrix blocks in pose-index order), the per-kind counts,
 /// materials, and submission mode.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ProxyFrameUpload<'a> {
     /// The repacked instance bytes (npc population first, vehicle
     /// after, rain LAST — [`crate::proxy_instances::repack_populations`]'s

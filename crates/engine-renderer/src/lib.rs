@@ -60,6 +60,7 @@ pub mod shadows;
 pub mod sky;
 
 mod renderer;
+mod submission;
 mod vulkan;
 
 pub use animation::{
@@ -76,5 +77,9 @@ pub use renderer::{
     AllocationStats, FrameResult, GeometryStats, ProxyDrawMode, ProxyPopulation,
     RIPPLE_ROUGHEN_GAIN, RIPPLE_UV_GAIN, RenderStats, Renderer, RippleDebugMode, SceneLayer,
     ShadowMapReadback, SkyFrame,
+};
+pub use submission::{
+    DynamicLayers, FrameCamera, FrameSubmission, OutputTarget, SceneBounds, SceneFrame,
+    ShadowFrame, WetFrame,
 };
 pub use vulkan::{CaptureFormat, CapturedFrame, RendererError};

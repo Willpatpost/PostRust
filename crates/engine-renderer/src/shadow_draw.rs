@@ -65,7 +65,7 @@ const SHADOW_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 /// matrix repeats at the region's aligned tail for the depth pass's
 /// own set — see `light_offset`).
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct ShadowFrameParams {
     pub view_proj: [[f32; 4]; 4],
     pub light_dir: [f32; 4],

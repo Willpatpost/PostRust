@@ -129,6 +129,7 @@ impl RippleUniformData {
 /// packed uniform the ground re-draw reads (the per-frame camera
 /// description's own lane — `render_frame`'s flat parameter list
 /// never changes).
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct WetCamera {
     pub view_proj: [[f32; 4]; 4],
     pub eye: [f32; 3],

@@ -11,6 +11,7 @@ use sdl3::video::Window as SdlWindow;
 use crate::config::{RenderConfig, TargetFaultSite, TargetFaultStage, present_mode_str};
 use crate::overlay::{AtlasText, OverlayVertex};
 use crate::scene::SceneVertex;
+use crate::submission::{FrameSubmission, SubmissionPolicy, adapt_frame};
 use crate::vulkan::{
     self, CapturedFrame, FrameState, PipelineState, RendererError, SwapchainState, VulkanContext,
     drain_validation_messages, environment_pending, pick_depth_format, pick_surface_format,
@@ -32,7 +33,7 @@ pub struct ShadowMapReadback {
 
 /// A batch of triangles with its own transform into clip space. A
 /// foreground batch typically supplies camera-local vertices and a projection.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SceneLayer<'a> {
     pub vertices: &'a [SceneVertex],
     pub view_proj: &'a [[f32; 4]; 4],
@@ -993,6 +994,100 @@ impl Renderer {
         Ok(self.finish_frame(outcome))
     }
 
+    /// Renders one frame from a typed, scene-independent submission
+    /// (the P4 D1 contract's entry point, stage S1's additive
+    /// landing). The submission is validated WHOLE before any frame
+    /// state is touched — a refusal renders nothing and leaves every
+    /// sticky setting and capture request intact — then mapped onto
+    /// the frame flow's inputs through [`crate::submission`]'s
+    /// adapter, which produces the same parameter set the
+    /// per-feature entry points construct inline (that equivalence is
+    /// pinned at the type level by the submission module's unit
+    /// test).
+    ///
+    /// `scene: None` is the [`Self::render_layers`] shape (dynamic
+    /// layers only); `scene: Some(_)` is the corner family's — the
+    /// light, the optional shadows/population, and the per-frame
+    /// sky/post/wet state the sticky setters fed (S3 migrates the
+    /// stickies into per-frame fields; S6 removes the old routes).
+    /// The debug overlay builds exactly like `render_layers`'s path
+    /// (the F-05 retained rebuild) whenever `layers.debug_text` is
+    /// set. The proxy submission mode and the TEST-ONLY ripple debug
+    /// lane stay renderer-level settings, read per frame.
+    pub fn submit_frame(
+        &mut self,
+        submission: FrameSubmission<'_>,
+    ) -> Result<FrameResult, RendererError> {
+        // Scene/preference coherence (the render_corner gate's
+        // generalization): a SceneFrame requires the Corner
+        // preference — S2 replaces this with the attach-time scene
+        // check.
+        if submission.scene.is_some()
+            && self.config.demo_scene != crate::DemoScenePreference::Corner
+        {
+            return Err(RendererError::Vulkan(
+                "submit_frame with a scene requires the Corner scene preference".into(),
+            ));
+        }
+        // The F-05 overlay-vertex rebuild (render_layers' own
+        // discipline, verbatim): the glyph vertices are built into
+        // the retained buffer — the capacity from the first frames is
+        // reused every frame (no per-frame allocation or growth; the
+        // vertex content is identical); no debug text clears it.
+        if self.overlay_enabled {
+            if let Some(text) = submission.layers.debug_text {
+                self.atlas_text.build_overlay_vertices_into(
+                    &mut self.overlay_vertices,
+                    text,
+                    submission.output.window_size,
+                    self.overlay_color,
+                );
+            } else {
+                self.overlay_vertices.clear();
+            }
+        } else {
+            self.overlay_vertices.clear();
+        }
+        // Validate + repack + build the input set (the adapter —
+        // device-free, whole-submission validation before the frame
+        // flow).
+        let policy = SubmissionPolicy {
+            proxy_draw_mode: self.proxy_draw_mode,
+            ripple_debug: self.ripple_debug,
+        };
+        let inputs = adapt_frame(
+            policy,
+            &submission,
+            &self.overlay_vertices,
+            &mut self.instance_bytes,
+            &mut self.pose_bytes,
+        )?;
+        // The frame flow — the identical parameter set the existing
+        // entries hand vulkan::render_frame.
+        let outcome = vulkan::render_frame(
+            &mut self.ctx,
+            &mut self.swapchain,
+            &mut self.pipes,
+            &mut self.frames,
+            inputs.window_size,
+            self.config.present_mode,
+            self.config.replace_pipelines,
+            self.config.demo_scene,
+            &inputs.view_proj,
+            inputs.region_vertices,
+            inputs.foreground,
+            inputs.hud,
+            inputs.debug_overlay,
+            inputs.corner_params.as_ref(),
+            inputs.proxy.as_ref(),
+            inputs.shadowed.as_ref(),
+            inputs.sky.as_ref(),
+            inputs.post,
+            inputs.wet.as_ref(),
+        )?;
+        Ok(self.finish_frame(outcome))
+    }
+
     /// Sets the proxy submission mode (the equivalence gate's axis —
     /// see [`ProxyDrawMode`]; the default is the production
     /// `Instanced` mode).
@@ -1350,7 +1445,7 @@ impl Drop for Renderer {
 /// shader's identity no-op, the rainless wet path's byte-identity;
 /// the debug lane reads 0 there too, but the count gate makes the
 /// question moot).
-fn pack_ripple_field(
+pub(crate) fn pack_ripple_field(
     field: Option<&engine_core::ripple::RippleField>,
     debug: RippleDebugMode,
 ) -> vulkan::reflection_draw::RippleUniformData {

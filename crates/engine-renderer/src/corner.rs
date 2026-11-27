@@ -15,7 +15,7 @@ use std::ops::Range;
 /// WGSL FrameParams: mat4 followed by three 16-byte lanes. Their spare W
 /// components carry eye.xyz without changing the scaffold ABI.
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, PartialEq, Debug, Pod, Zeroable)]
 pub(crate) struct FrameParams {
     view_proj: [[f32; 4]; 4],
     light_dir: [f32; 4],
