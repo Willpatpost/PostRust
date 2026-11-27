@@ -208,6 +208,33 @@ pub enum CompactionError {
     RetainExceedsLedger { ledger_len: u64, retain: u64 },
 }
 
+/// Typed refusals of the held-reconstruction replacement set
+/// ([`Spine::try_reconstruct_held`]; the direct
+/// [`Spine::reconstruct_held`] surfaces the same conflicts loudly).
+/// The reconstruction is a REPLACEMENT — the matching chains are
+/// removed, the given events installed as held under their own
+/// identities — so a refusal is always about the replacement set's
+/// identities, and it is always fail-closed and PRE-MUTATION: the
+/// spine is left exactly as the call found it (independent audit
+/// IA-06 at `be910bf`: the pre-fix insertion half installed a
+/// conflicting identity without checking the surviving structures,
+/// and the save then failed restore with
+/// `Duplicate { section: "spine-save/identities", seq: 0 }`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconstructionError {
+    /// The replacement set repeats an identity: the second install
+    /// would silently overwrite the first in the held map (keyed by
+    /// seq) — a partial install the conservation accounting cannot
+    /// represent, since the scheduled statistic counts both inserts.
+    DuplicateReplacement { id: EventId },
+    /// The identity still belongs to a SURVIVING obligation — one the
+    /// removal predicate did not match, in either lane, the blocked
+    /// set, or the held set. Installing it would give one identity
+    /// two simultaneous obligations; the save's identity-uniqueness
+    /// gate would refuse the resulting spine at restore.
+    SurvivingIdentity { id: EventId },
+}
+
 /// Spine counters. All fields are logical state and fingerprinted.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
@@ -1014,28 +1041,149 @@ impl<W: World> Spine<W> {
     /// the deactivation captured them). The scheduled statistic
     /// adjusts by the replacement delta so the conservation identity
     /// holds. Returns the inserted count.
+    ///
+    /// The replacement set is VALIDATED before any mutation (IA-06,
+    /// the audit's disposition option (a) — validate rather than
+    /// restrict the API to a pre-validated plan, so the recovery
+    /// callers keep this shape): every replacement identity must be
+    /// unique within the set and free of every SURVIVING obligation
+    /// (one the predicate did not match). A conflicting set is a
+    /// documented contract violation surfaced LOUDLY here — the
+    /// `ledger()`/`try_ledger_full` discipline — because proceeding
+    /// would give one identity two simultaneous obligations and
+    /// manufacture a save the restore gates must refuse as
+    /// `Duplicate`; the typed refusal lives on
+    /// [`Self::try_reconstruct_held`] for callers that compose the
+    /// conflict into their own fail-closed reporting.
     pub fn reconstruct_held(
+        &mut self,
+        matches: impl FnMut(&ObligationView) -> bool,
+        events: Vec<Event>,
+    ) -> u32 {
+        self.try_reconstruct_held(matches, events).expect(
+            "reconstruct_held requires a replacement set whose identities are unique among \
+             themselves and free of every surviving obligation — a conflicting set would give \
+             one identity two simultaneous obligations and manufacture a save the restore \
+             gates refuse as Duplicate; use try_reconstruct_held for the typed refusal \
+             (ReconstructionError); an inconsistent reconstruction input is a documented \
+             contract violation surfaced loudly, never a silent duplicate install",
+        )
+    }
+
+    /// The typed-refusal form of [`Self::reconstruct_held`]: identical
+    /// replacement semantics, with an inconsistent replacement set
+    /// returned as [`ReconstructionError`] instead of surfaced loudly
+    /// — fail-closed and PRE-MUTATION, so a refusal leaves the spine
+    /// observationally exact (the lanes re-heap from the decision
+    /// snapshot's own multiset; `unfinished`, `blocked`, `held`, and
+    /// every statistic are untouched) and the spine still saves and
+    /// restores cleanly. This is the load-path form the audit's IA-06
+    /// witness exercises: the pre-fix insertion half installed a
+    /// replacement carrying a SURVIVING identity without checking the
+    /// surviving structures, and the save then failed restore with
+    /// `Duplicate { section: "spine-save/identities", seq: 0 }`.
+    ///
+    /// Replacement identities MAY reuse identities the removal just
+    /// freed (the crossing's recovery re-installs the journaled
+    /// chains under their own ids), and may carry formerly completed
+    /// or freshly journaled identities — the documented recovery
+    /// semantics; the gate is exactly the uniqueness the save's
+    /// identity checks enforce, so an accepted reconstruction can
+    /// never manufacture a spine the restore gates must refuse. The
+    /// removal predicate observes candidates in the same order the
+    /// unvalidated form always visited: each lane ascending
+    /// `(due, seq)`, then the blocked and held sets in ascending-seq
+    /// order.
+    pub fn try_reconstruct_held(
         &mut self,
         mut matches: impl FnMut(&ObligationView) -> bool,
         events: Vec<Event>,
-    ) -> u32 {
-        let mut removed = 0u64;
-        removed += u64::from(Self::drop_from_queue(
-            &mut self.near_queue,
-            &mut self.unfinished,
-            &mut matches,
-        ));
-        removed += u64::from(Self::drop_from_queue(
-            &mut self.far_queue,
-            &mut self.unfinished,
-            &mut matches,
-        ));
+    ) -> Result<u32, ReconstructionError> {
+        // The decision snapshot — ONE predicate pass, in the exact
+        // order the unvalidated form visited (each lane ascending
+        // (due, seq) — a min-heap over unique keys pops canonically —
+        // then the blocked and held maps in ascending-seq order), with
+        // every structure intact: the lanes are drained into the
+        // snapshot, `unfinished` keeps every identity, and a refusal
+        // below re-heaps the lanes from the same multiset (heap
+        // layout is rebuild-dependent and invisible — the restore
+        // path's own argument).
+        let (near_retained, near_dropped) =
+            Self::partition_queue(&mut self.near_queue, &mut matches);
+        let (far_retained, far_dropped) = Self::partition_queue(&mut self.far_queue, &mut matches);
         let blocked_drop: Vec<u64> = self
             .blocked
             .values()
             .filter(|event| matches(&event_view(event, ObligationLocation::Blocked)))
             .map(|event| event.id.seq)
             .collect();
+        let held_drop: Vec<u64> = self
+            .held
+            .values()
+            .filter(|pending| matches(&pending.view(ObligationLocation::Held)))
+            .map(|pending| pending.seq)
+            .collect();
+
+        // The pre-mutation replacement validation (IA-06): the
+        // survivors are exactly the non-matching halves — the
+        // obligations still holding their identities after the
+        // removal — so the replacement set must be unique within
+        // itself and disjoint from them.
+        let blocked_drop_set: BTreeSet<u64> = blocked_drop.iter().copied().collect();
+        let held_drop_set: BTreeSet<u64> = held_drop.iter().copied().collect();
+        let mut surviving: BTreeSet<u64> = BTreeSet::new();
+        surviving.extend(
+            near_retained
+                .iter()
+                .chain(far_retained.iter())
+                .map(|Reverse(pending)| pending.seq),
+        );
+        surviving.extend(
+            self.blocked
+                .keys()
+                .copied()
+                .filter(|seq| !blocked_drop_set.contains(seq)),
+        );
+        surviving.extend(
+            self.held
+                .keys()
+                .copied()
+                .filter(|seq| !held_drop_set.contains(seq)),
+        );
+        let mut replacement_ids: BTreeSet<u64> = BTreeSet::new();
+        let refusal = events.iter().find_map(|event| {
+            if surviving.contains(&event.id.seq) {
+                Some(ReconstructionError::SurvivingIdentity { id: event.id })
+            } else if !replacement_ids.insert(event.id.seq) {
+                Some(ReconstructionError::DuplicateReplacement { id: event.id })
+            } else {
+                None
+            }
+        });
+        if let Some(error) = refusal {
+            // Fail-closed, pre-mutation: restore both lanes from the
+            // snapshot's multiset — every canonical observable (save
+            // bytes, fingerprints, counts) is unchanged.
+            Self::restore_queue(&mut self.near_queue, near_retained, near_dropped);
+            Self::restore_queue(&mut self.far_queue, far_retained, far_dropped);
+            return Err(error);
+        }
+
+        // The removal half — applied only after the validation
+        // passed, in the order the unvalidated form applied it (the
+        // lanes' unfinished removals first, so the blocked cleanup's
+        // executed-membership answers are identical).
+        let mut removed = 0u64;
+        for Reverse(pending) in near_dropped {
+            self.unfinished.remove(&pending.seq);
+            removed += 1;
+        }
+        for Reverse(pending) in far_dropped {
+            self.unfinished.remove(&pending.seq);
+            removed += 1;
+        }
+        self.near_queue = BinaryHeap::from(near_retained);
+        self.far_queue = BinaryHeap::from(far_retained);
         for seq in blocked_drop {
             if let Some(event) = self.blocked.remove(&seq) {
                 // The suspend path's discipline: leave the
@@ -1054,12 +1202,6 @@ impl<W: World> Spine<W> {
                 removed += 1;
             }
         }
-        let held_drop: Vec<u64> = self
-            .held
-            .values()
-            .filter(|pending| matches(&pending.view(ObligationLocation::Held)))
-            .map(|pending| pending.seq)
-            .collect();
         for seq in held_drop {
             if let Some(pending) = self.held.remove(&seq) {
                 self.held_index.remove(&(pending.due, pending.seq));
@@ -1092,34 +1234,52 @@ impl<W: World> Spine<W> {
             .saturating_sub(removed)
             .checked_add(u64::from(inserted))
             .expect("the scheduled count is bounded");
-        inserted
+        Ok(inserted)
     }
 
-    /// Drops matching entries from one lane (the reconstruction's
-    /// removal half — the same rebuild-invisibility argument as the
-    /// suspension drain: observable order derives from the canonical
-    /// `(due, seq)` keys). A dropped obligation leaves the unfinished
-    /// index — it is neither queued nor held anymore, and the
-    /// reconstruction's replacement insertions re-enter it.
-    fn drop_from_queue(
+    /// Partitions one lane into the reconstruction's decision
+    /// snapshot (the validation's read-only source — the pre-mutation
+    /// form of the old drop-from-queue drain): `into_vec` consumes
+    /// the heap's buffer, the sort exits it into canonical
+    /// `(due, seq)` order — the order the old pop drain visited (a
+    /// min-heap over unique keys pops ascending; the IA-02
+    /// canonical-visitation discipline) — and `extract_if` is the
+    /// retain-style compaction yielding the matching half by value.
+    /// Returns `(retained, dropped)`; NO other structure is touched
+    /// (`unfinished` keeps every identity), so the caller applies
+    /// the snapshot only after the replacement-set validation passes
+    /// and re-heaps both halves on refusal.
+    fn partition_queue(
         queue: &mut BinaryHeap<Reverse<Pending>>,
-        unfinished: &mut BTreeSet<u64>,
         matches: &mut impl FnMut(&ObligationView) -> bool,
-    ) -> u32 {
-        let mut dropped = 0u32;
-        let mut retained: Vec<Reverse<Pending>> = Vec::with_capacity(queue.len());
-        while let Some(Reverse(pending)) = queue.pop() {
-            if matches(&pending.view(ObligationLocation::Queued)) {
-                unfinished.remove(&pending.seq);
-                dropped += 1;
-            } else {
-                retained.push(Reverse(pending));
-            }
-        }
-        for item in retained {
-            queue.push(item);
-        }
-        dropped
+    ) -> (Vec<Reverse<Pending>>, Vec<Reverse<Pending>>) {
+        let mut items = std::mem::take(queue).into_vec();
+        // Canonical visitation for the public predicate (IA-02 — the
+        // suspend_from_queue argument): the buffer enters heap order;
+        // the predicate must exit it into `(due, seq)` order before
+        // any call.
+        items.sort_unstable_by_key(|Reverse(pending)| (pending.due, pending.seq));
+        let dropped: Vec<Reverse<Pending>> = items
+            .extract_if(.., |Reverse(pending)| {
+                matches(&pending.view(ObligationLocation::Queued))
+            })
+            .collect();
+        (items, dropped)
+    }
+
+    /// Re-heaps one lane from the snapshot's halves — the refusal
+    /// path's exact restore: the multiset (retained + dropped) is the
+    /// lane the snapshot drained, so every canonical observable is
+    /// unchanged (heap buffer layout is rebuild-dependent and
+    /// invisible — the restore path's own argument; save bytes and
+    /// the fingerprints all sort canonically).
+    fn restore_queue(
+        queue: &mut BinaryHeap<Reverse<Pending>>,
+        mut retained: Vec<Reverse<Pending>>,
+        dropped: Vec<Reverse<Pending>>,
+    ) {
+        retained.extend(dropped);
+        *queue = BinaryHeap::from(retained);
     }
 
     /// Returns matching held obligations to pending state with their
@@ -3422,6 +3582,190 @@ mod tests {
             live.save_bytes(),
             restored.save_bytes(),
             "identical selections leave the two spines byte-identical"
+        );
+    }
+
+    // ----------------------------------- IA-06 replacement-validation tests
+
+    /// IA-06's mandatory witness, the audit's probe verbatim: schedule
+    /// seq 0, attempt the held reconstruction with a replacement event
+    /// carrying the SAME seq under a predicate that matches nothing
+    /// (so the queued seq-0 obligation SURVIVES the removal), and
+    /// assert the TYPED refusal — never the duplicate insert. The
+    /// pre-fix form reported one insertion and the save then failed
+    /// restore with `Duplicate { section: "spine-save/identities",
+    /// seq: 0 }` (reproduced red-on-old before this fix landed); the
+    /// refusal is pre-mutation, so the spine is exactly the spine
+    /// that scheduled seq 0 and the save restores cleanly.
+    #[test]
+    fn reconstruct_held_refuses_a_surviving_identity_before_mutation() {
+        let mut spine = Spine::new(SaveableNoopWorld, 100);
+        spine
+            .schedule(spec(0, Field::Near, 5, 50))
+            .expect("schedule");
+        let bytes_before = spine.save_bytes();
+        let replacement = Event {
+            id: EventId { seq: 0 },
+            class: EventClass::new(0),
+            schedule: Schedule::AtLogicalTime { due: Tick(9) },
+            payload: 900,
+            field: Field::Near,
+            depends_on: Vec::new(),
+        };
+        assert_eq!(
+            spine.try_reconstruct_held(|_| false, vec![replacement]),
+            Err(ReconstructionError::SurvivingIdentity {
+                id: EventId { seq: 0 }
+            }),
+            "the identity still belongs to the surviving queued obligation"
+        );
+        // Never the duplicate insert: the refusal left the spine
+        // observationally exact — the obligation still queued (not
+        // held), the accounting untouched, the save bytes identical.
+        assert_eq!(spine.near_pending_count(), 1);
+        assert_eq!(spine.held_count(), 0);
+        assert_eq!(spine.stats().scheduled, 1);
+        assert_eq!(spine.stats().executed, 0);
+        assert_eq!(
+            spine.save_bytes(),
+            bytes_before,
+            "the refusal is observationally a no-op"
+        );
+        // The save restores cleanly — the pre-fix form's save failed
+        // with Duplicate { section: "spine-save/identities", seq: 0 }.
+        let bytes = spine.save_bytes();
+        let restored: Spine<SaveableNoopWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("clean restore");
+        assert_eq!(restored.save_bytes(), bytes);
+    }
+
+    /// The validation's other half — replacement identities against
+    /// ONE ANOTHER: the pre-fix insertion loop keyed the held map by
+    /// seq, so a repeated identity silently OVERWROTE its earlier
+    /// install while the scheduled statistic counted both — a
+    /// partial install the conservation identity cannot represent.
+    /// The typed refusal fires before any mutation.
+    #[test]
+    fn reconstruct_held_refuses_a_repeated_replacement_identity() {
+        let mut spine = Spine::new(SaveableNoopWorld, 100);
+        spine
+            .schedule(spec(0, Field::Near, 5, 50))
+            .expect("schedule");
+        let bytes_before = spine.save_bytes();
+        let replacement = |seq: u64| Event {
+            id: EventId { seq },
+            class: EventClass::new(3),
+            schedule: Schedule::AtLogicalTime { due: Tick(9) },
+            payload: 900,
+            field: Field::Near,
+            depends_on: Vec::new(),
+        };
+        assert_eq!(
+            spine.try_reconstruct_held(|_| false, vec![replacement(9001), replacement(9001)]),
+            Err(ReconstructionError::DuplicateReplacement {
+                id: EventId { seq: 9001 }
+            }),
+            "the replacement set repeats an identity"
+        );
+        assert_eq!(spine.held_count(), 0, "never a partial install");
+        assert_eq!(
+            spine.near_pending_count(),
+            1,
+            "the queued obligation is untouched"
+        );
+        assert_eq!(spine.stats().scheduled, 1);
+        assert_eq!(
+            spine.save_bytes(),
+            bytes_before,
+            "the refusal is observationally a no-op"
+        );
+        let bytes = spine.save_bytes();
+        let restored: Spine<SaveableNoopWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("clean restore");
+        assert_eq!(restored.save_bytes(), bytes);
+    }
+
+    /// The direct form surfaces the conflict loudly — the
+    /// `ledger()`/`try_ledger_full` discipline: an inconsistent
+    /// replacement set is a documented contract violation, never a
+    /// silent duplicate install. (IA-06's fixture: seq 0 scheduled,
+    /// a replacement carrying the same seq, predicate matching
+    /// nothing.)
+    #[test]
+    #[should_panic(expected = "reconstruct_held requires a replacement set whose identities")]
+    fn reconstruct_held_surfaces_a_conflicting_replacement_loudly() {
+        let mut spine = Spine::new(SaveableNoopWorld, 100);
+        spine
+            .schedule(spec(0, Field::Near, 5, 50))
+            .expect("schedule");
+        let replacement = Event {
+            id: EventId { seq: 0 },
+            class: EventClass::new(0),
+            schedule: Schedule::AtLogicalTime { due: Tick(9) },
+            payload: 900,
+            field: Field::Near,
+            depends_on: Vec::new(),
+        };
+        spine.reconstruct_held(|_| false, vec![replacement]);
+    }
+
+    /// The legitimate replacement the crossing's recovery performs
+    /// (B4's id-exact install): the matching chains removed, the
+    /// plan's obligation installed as held under the JUST-FREED
+    /// identity — the validation must not refuse this, and the
+    /// resulting spine must save and restore cleanly (the
+    /// conservation identity holds with the delta:
+    /// scheduled 2 - 1 + 1 == next_seq, executed unchanged).
+    #[test]
+    fn a_validated_replacement_installs_and_saves_cleanly() {
+        let mut spine = Spine::new(SaveableNoopWorld, 100);
+        spine
+            .schedule(spec(0, Field::Near, 5, 500))
+            .expect("schedule"); // seq 0, class 0 — replaced
+        spine
+            .schedule(spec(1, Field::Far, 6, 501))
+            .expect("schedule"); // seq 1, class 1 — survives
+        let replacement = Event {
+            id: EventId { seq: 0 }, // the identity the removal frees
+            class: EventClass::new(0),
+            schedule: Schedule::AtLogicalTime { due: Tick(9) },
+            payload: 900,
+            field: Field::Near,
+            depends_on: Vec::new(),
+        };
+        assert_eq!(
+            spine
+                .try_reconstruct_held(|view| view.class == EventClass::new(0), vec![replacement])
+                .expect("the legitimate replacement installs"),
+            1
+        );
+        assert_eq!(spine.held_count(), 1);
+        assert_eq!(
+            spine.far_pending_count(),
+            1,
+            "the class-1 obligation survives the replacement"
+        );
+        assert_eq!(
+            spine
+                .held_view()
+                .iter()
+                .map(|view| view.id.seq)
+                .collect::<Vec<_>>(),
+            vec![0],
+            "the replacement is held under its own identity"
+        );
+        let bytes = spine.save_bytes();
+        let mut restored: Spine<SaveableNoopWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off))
+                .expect("the replaced spine saves and restores cleanly");
+        assert_eq!(restored.save_bytes(), bytes);
+        // The reconstructed obligation resumes under its identity and
+        // executes.
+        assert_eq!(restored.resume_matching(|_| true), 1);
+        restored.run_to_completion(60);
+        assert!(
+            restored.ledger().iter().any(|record| record.id.seq == 0),
+            "the reconstructed obligation executes under its own identity"
         );
     }
 }
