@@ -1,9 +1,13 @@
 # Evidence Manifest
 
 Every entry: what, exact command(s), exit status, tree SHA, artifact path.
-Raw large outputs live outside the source tree at
-`C:\Users\Willp\AppData\Local\Temp\opencode\ee\artifacts\` (scratch, pre-approved);
-summaries and hashes are committed here so important results survive loss.
+Raw large outputs lived outside the source tree at
+`C:\Users\Willp\AppData\Local\Temp\opencode\ee\artifacts\` — **cleaned
+2026-11-27 per the owner's house-cleaning directive** (with the three
+worktrees and 14.4 GiB of build targets); the summarized results, every
+command, and every exit status are committed here and in the commit
+messages, which stand as the durable record. A re-verification re-runs the
+commands below; the raw logs were scratch by design.
 
 ## Environment (measured 2026-11-26, session start)
 
