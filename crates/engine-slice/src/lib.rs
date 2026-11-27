@@ -33,6 +33,7 @@ pub mod region;
 pub mod region_render;
 pub mod render_benchmark;
 pub mod render_demo;
+pub mod ripple_visibility;
 pub mod save_demo;
 pub mod session;
 pub mod session_chunks;

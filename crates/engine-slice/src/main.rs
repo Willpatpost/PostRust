@@ -119,6 +119,7 @@ Benchmarks
   --benchmark-render | --benchmark-encounter | --benchmark-persistence
   --benchmark-instrumentation | --benchmark-entity-scale | --benchmark-sustained-load
   --benchmark-locomotion | --benchmark-behavior
+| --benchmark-ripple-visibility
   --benchmark-perf-sweep <cell> | --sustained-load-full-matrix
   --sustained-load-capacity-envelope
 
@@ -219,6 +220,16 @@ fn main() {
         // (E-09), skip-cost curves (E-08), and memory-per-NPC by tier
         // (pod results, observational; never CI thresholds).
         engine_slice::behavior_measurement::run_behavior_measurements();
+        return;
+    }
+
+    if std::env::args().any(|arg| arg == "--benchmark-ripple-visibility") {
+        // The sign-off review's pre-puddle diagnostic: the matched
+        // density A/B (the shipped 320:1 admission vs 160:1 vs 80:1,
+        // the same camera/seed/warm start) — the opportunity census
+        // that decides between a policy re-pin and the authored
+        // puddle package (pod-observational; never a CI threshold).
+        engine_slice::ripple_visibility::run_ripple_visibility_diagnostic();
         return;
     }
 

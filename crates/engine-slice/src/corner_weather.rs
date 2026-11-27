@@ -212,6 +212,18 @@ impl RainLayer {
     /// dt=1/60 against the route's first camera position). The first
     /// presented frame is already wet.
     pub fn new(camera_position: [f32; 3]) -> Self {
+        Self::with_ripple_policy(camera_position, RIPPLE_POLICY)
+    }
+
+    /// The A/B-diagnostic constructor (the ripple-visibility
+    /// harness): the SAME layer construction with ONE policy knob
+    /// varied (the decimation — the admission rate), everything
+    /// else identical (the seed, the volume, the warm start, the
+    /// composition order).
+    pub fn with_ripple_policy(
+        camera_position: [f32; 3],
+        policy: engine_core::ripple::RipplePolicy,
+    ) -> Self {
         // The initial volume: the frustum AABB intersected with the
         // scene AABB. The camera is at `camera_position`, looking at
         // the corner scene's center. The frustum half-extent in X/Z
@@ -228,8 +240,8 @@ impl RainLayer {
                 .expect("the rain config validates");
 
         let mut emitter = Emitter::new(config).expect("the emitter config is valid");
-        let mut ripples = engine_core::ripple::RippleField::new(RIPPLE_POLICY)
-            .expect("the ripple policy validates");
+        let mut ripples =
+            engine_core::ripple::RippleField::new(policy).expect("the ripple policy validates");
 
         // Warm start: 132 ticks at dt = 1/60 — the first presented
         // frame is already wet. THE WARM CENSUS IS COUNTED (the

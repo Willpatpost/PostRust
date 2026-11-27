@@ -181,6 +181,11 @@ struct BehaviorScaleWorld {
     rates: [f32; MAX_NEEDS],
     stream: Vec<StreamEntry>,
     wake_executions: u64,
+    /// Per-NPC wake executions (the sign-off review's finding 28
+    /// corrective: the total-count conservation alone cannot catch a
+    /// redistribution — the right number of events on the wrong NPCs;
+    /// the drain's per-NPC census closes that escape).
+    per_npc_wakes: Vec<u64>,
 }
 
 impl BehaviorScaleWorld {
@@ -213,6 +218,7 @@ impl BehaviorScaleWorld {
             rates,
             stream,
             wake_executions: 0,
+            per_npc_wakes: vec![0; n],
         }
     }
 }
@@ -255,6 +261,7 @@ impl World for BehaviorScaleWorld {
             activity: outcome.activity,
         });
         self.wake_executions += 1;
+        self.per_npc_wakes[npc_idx] += 1;
         if let Some(next) = outcome.next_wake {
             let payload = wake_payload(npc, commitment).expect("the authored index round-trips");
             ctx.schedule_at(next, BENCH_WAKE_CLASS, payload, Vec::new());
@@ -821,6 +828,20 @@ fn run_activation_crossover() {
             );
         }
         let outcome = world_outcome(spine.world(), spine.pending_count() as u64);
+        // THE PER-NPC DRAIN CENSUS (the sign-off review's finding 28
+        // corrective): the total-count conservation cannot catch a
+        // redistribution — the right number of events on the wrong
+        // NPCs. Every NPC executed EXACTLY its authored share (2
+        // entries × k occurrences each — the duplicate-drain form of
+        // the queued-multiset check).
+        for (npc_idx, &wakes) in spine.world().per_npc_wakes.iter().enumerate() {
+            assert_eq!(
+                wakes,
+                2 * k,
+                "k {k}: NPC {npc_idx} executed exactly its 2 x k authored occurrences — \
+                 no redistribution escapes the census"
+            );
+        }
         (elapsed.as_nanos(), outcome)
     }
 
@@ -891,6 +912,16 @@ fn run_activation_crossover() {
                     activity_digest.write_u32(subject.0);
                 }
             }
+            // NOTE (the sign-off review's finding 28 corrective,
+            // labeled): these digests are the PREDICTED per-NPC
+            // routine lanes — the loop's evaluations, computed here
+            // and reported beside the costs, but NEVER INSTALLED
+            // into the armed world (which starts Idle; the synthesis
+            // policy is the approximation the paired comparison
+            // reports, never an equivalence claim). The digest
+            // writes happen inside the loop window so the loop's
+            // cost includes its own bookkeeping; the ARM and the
+            // world's spine construction sit outside it.
             let next0 = schedule.entries[0].next_occurrence(Tick(k * 600 + 1));
             let next1 = schedule.entries[1].next_occurrence(Tick(k * 600 + 1));
             assert_eq!(
@@ -1075,7 +1106,10 @@ fn run_activation_crossover() {
         println!(
             "  outcome divergence beside the costs: executions {} vs {}, needs digest \
              {} vs {}, activity digest {} vs {} — synthesis is the cheaper approximate \
-             reconstruction (one evaluation per NPC), accepted deliberately",
+             reconstruction (one evaluation per NPC), accepted deliberately. THE \
+             SYNTHESIS DIGESTS ARE PREDICTIONS (the loop's evaluated routine lanes — \
+             computed and reported, never installed into the armed world, which starts \
+             Idle; the finding 28 labeling)",
             replay_outcome.wake_executions,
             synth_outcome.wake_executions,
             replay_outcome.needs_digest,
@@ -1093,7 +1127,11 @@ fn run_activation_crossover() {
                 2 * k
             );
         }
-        println!("  determinism: re-arm dues + needs digest DOUBLE-RUN IDENTICAL (asserted)");
+        println!(
+            "  determinism: re-arm dues + needs digest DOUBLE-RUN IDENTICAL (asserted); \
+             the per-NPC drain census asserted (every NPC executed exactly 2 x k — no \
+             redistribution escapes the total-count conservation)"
+        );
         println!();
     }
     match crossover_k {
