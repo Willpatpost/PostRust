@@ -746,7 +746,13 @@ fn a_rejected_journal_append_retries_the_same_episode() {
         .expect("the rejected append records the unresolved episode");
     assert_eq!(unresolved.episode, 0, "the first episode identity");
     assert_eq!(unresolved.keys.len(), 3, "the staged membership");
-    assert!(!unresolved.journaled, "nothing is durable for it");
+    assert!(
+        matches!(
+            unresolved.phase,
+            engine_slice::npc_memory_lane::RetryPhase::Unjournaled
+        ),
+        "nothing is durable for it"
+    );
     assert!(book.claimed.is_empty(), "no key is claimed");
     assert_eq!(
         book.episodes, 1,
@@ -1090,7 +1096,7 @@ fn a_journaled_classification_flush_completes_without_a_duplicate() {
         episode,
         consequence,
         keys: Vec::new(),
-        journaled: true,
+        phase: engine_slice::npc_memory_lane::RetryPhase::Journaled,
     });
 
     // THE COMPLETION: the next submit finishes the apply only — no new
@@ -1171,7 +1177,7 @@ fn an_unjournaled_classification_flush_retries_the_same_identity() {
         episode,
         consequence,
         keys: Vec::new(),
-        journaled: false,
+        phase: engine_slice::npc_memory_lane::RetryPhase::Unjournaled,
     });
 
     // THE RETRY: the completion re-stages the SAME identity (the
@@ -1198,6 +1204,392 @@ fn an_unjournaled_classification_flush_retries_the_same_identity() {
     drop(pipeline);
     let reopened = fresh_pipeline(&dir);
     let recovered = recover_memory_lane(&reopened).unwrap();
+    let mut fresh_spine = make_spine();
+    let _recovered_book = install_recovered_lane(&mut fresh_spine, recovered);
+    assert_eq!(
+        fresh_spine.world().lane.reputation_score().unwrap(),
+        -3,
+        "the late classification survives the reopen"
+    );
+    drop(reopened);
+}
+
+/// IA-01 (the independent audit's BLOCKER, B04 reopened): a
+/// classification flush whose journal write IS durable but whose
+/// verification cannot reread the path — the journal's `AfterSync`
+/// seam with the file moved aside while its write handle stays open
+/// (the sync succeeds on the open handle; the reconciliation's reread
+/// of the PATH fails) — separates a successful durable write from a
+/// transient verification failure. The defective bridge escaped with
+/// the episode staged and no unresolved record: the next submit saw
+/// the same dirty classification, reserved a fresh episode, and
+/// captured BOTH envelopes under the new plan — the cold reopen then
+/// refused the journal at `plan-identity-mismatch`. The audit's fault
+/// sequence verbatim: the faulted submit errors; the SAME-HANDLE
+/// submit after the path is restored reconciles the EXACT previous
+/// attempt (never a fresh identity); the COLD REOPEN SUCCEEDS and
+/// recovers the classification.
+#[test]
+fn an_indeterminate_journal_write_reconciles_the_exact_attempt() {
+    let dir = TestDir::new("ia01-indeterminate-write");
+    let mut spine = make_spine();
+    let mut pipeline = fresh_pipeline(&dir);
+    let mut book = MemoryCommitBook::default();
+
+    // The late-classification fixture (the B04 shape): the record
+    // episode confirmed, the candidate classified AFTER it — a live
+    // sync the journal does not hold yet.
+    schedule_encounter(&mut spine, 1, EncounterKind::Altercation, 0, 0, Tick(5)).unwrap();
+    spine.run_ticks(5);
+    commit_witness_captures(&mut spine, &mut pipeline, &mut book, 0, true).unwrap();
+    assert_eq!(spine.world().lane.witness_conservation(0), (3, 0, 3));
+    let candidate_key = MemoryKey {
+        event: 1,
+        witness: 0,
+        kind: MemoryKind::ReputationCandidate,
+    };
+    assert_eq!(
+        spine.world_mut().lane.classify(&candidate_key, true),
+        engine_core::npc_memory::ClassifyOutcome::Classified,
+        "the live decision applies"
+    );
+    drop(pipeline);
+
+    // THE FAULTED FLUSH: the journal opened with its AfterSync /
+    // InjectError seam, then the path moved aside while the write
+    // handle stays open. The capture's frames and commit record are
+    // written and fsynced (the transaction IS durable); the injected
+    // post-sync error forces the ambiguous-commit reconciliation,
+    // which cannot reread the path — the honest indeterminate error.
+    let journal = engine_persist::journal::T1Journal::open_with(
+        dir.journal(),
+        Some(engine_persist::journal::JournalFaultControl::new().arm(
+            engine_persist::journal::JournalFaultPoint::AfterSync,
+            FaultAction::InjectError,
+        )),
+    )
+    .unwrap();
+    let mut faulted =
+        CommitPipeline::open(LocalFileMedium::open(dir.store()).unwrap(), journal).unwrap();
+    let aside = dir.journal().with_extension("t1.aside");
+    fs::rename(dir.journal(), &aside).expect("the journal path moves aside");
+    let result = commit_witness_captures(&mut spine, &mut faulted, &mut book, 0, true);
+    assert!(
+        result.is_err(),
+        "the reread failure propagates (an honest error): {result:?}"
+    );
+    // THE RETAINED ATTEMPT: the book holds the episode — the identity
+    // and shape the retry must RECONCILE (the defective bridge
+    // recorded nothing here, and the next submit double-captured).
+    let unresolved = book
+        .unresolved
+        .as_ref()
+        .expect("the indeterminate write retains the episode");
+    assert_eq!(
+        unresolved.episode, 1,
+        "the classification-sync episode identity"
+    );
+    assert!(
+        unresolved.keys.is_empty(),
+        "the flush shape's empty membership"
+    );
+
+    // THE SAME-HANDLE RETRY after the path is restored: the completion
+    // reconciles the EXACT previous attempt — the journal's idempotent
+    // duplicate recognition returns the durable transaction's receipt
+    // (no second frame, no fresh plan, no second envelope). The
+    // defective bridge staged a SECOND envelope here, captured both
+    // under plan 2, and then failed `ConflictingReuse` at the canonical
+    // commit.
+    fs::rename(&aside, dir.journal()).expect("the journal path is restored");
+    let result = commit_witness_captures(&mut spine, &mut faulted, &mut book, 0, true);
+    assert!(
+        result.is_ok(),
+        "the retry reconciles the exact attempt (never a fresh identity): {result:?}"
+    );
+    assert!(
+        result.unwrap().is_empty(),
+        "no new records — the completion only"
+    );
+    assert!(book.unresolved.is_none(), "the completion cleared it");
+    // The audit's enumeration, on the fixed shape: exactly the record
+    // episode and the ONE classification-sync episode — never a third
+    // transaction carrying both envelopes (the audit observed plan 2
+    // with envelopes [1, 2] here).
+    let transactions = faulted.journal().transactions();
+    assert_eq!(transactions.len(), 2, "exactly two journal transactions");
+    assert_eq!(
+        transactions[0].frontier.first().unwrap().episode,
+        0,
+        "the record episode"
+    );
+    assert_eq!(transactions[0].envelopes.len(), 1);
+    assert_eq!(
+        transactions[1].frontier.first().unwrap().episode,
+        1,
+        "the classification-sync episode under its OWN identity"
+    );
+    assert_eq!(
+        transactions[1].envelopes.len(),
+        1,
+        "ONE envelope — never the leftover double-capture"
+    );
+    let mut confirmed = faulted.confirmed_keys();
+    confirmed.sort_unstable();
+    assert_eq!(
+        confirmed,
+        vec![ConsequenceId::new(0, 0, 0), ConsequenceId::new(0, 1, 0)],
+        "TWO durable consequences — one per episode, none per retry"
+    );
+    drop(faulted);
+
+    // THE COLD REOPEN (the audit's terminal step): the journal is
+    // internally consistent — the recovery SUCCEEDS (the defective
+    // bridge's journal failed `plan-identity-mismatch` exactly here)
+    // and the late classification is recovered with the episode
+    // counter intact.
+    let reopened = fresh_pipeline(&dir);
+    let recovered = recover_memory_lane(&reopened).unwrap();
+    assert_eq!(
+        recovered.book.episodes, 2,
+        "the recovered book's episode counter"
+    );
+    let mut fresh_spine = make_spine();
+    let _recovered_book = install_recovered_lane(&mut fresh_spine, recovered);
+    assert_eq!(
+        fresh_spine.world().lane.reputation_score().unwrap(),
+        -3,
+        "the late classification survives the reopen"
+    );
+    assert_eq!(
+        fresh_spine.world().lane.witness_conservation(0),
+        (3, 0, 3),
+        "the recovered witness is materialized with its confirmed records"
+    );
+    assert_lane_conservation(&fresh_spine, "the IA-01 campaign");
+    drop(reopened);
+}
+
+/// IA-05 (the independent audit's major, B04's commit-confirmation
+/// half reopened): a canonical submission whose medium write is
+/// durable but unacknowledged — the medium's `AfterRootDirSync` seam
+/// (the revision IS installed, the rename happened; the reply is
+/// lost) — leaves the verifier's pending candidate retained. The
+/// defective bridge handled only `Confirmed`: every later submit on
+/// the SAME pipeline refused `AttemptUnresolved` forever, the only
+/// escape being dropping the pipeline. The flush half now drives the
+/// existing reconcile/retry machinery on the live handle — the same
+/// pipeline completes its own uncertain canonical commit.
+#[test]
+fn a_live_handle_completes_its_uncertain_canonical_commit() {
+    let dir = TestDir::new("ia05-live-handle");
+    let mut spine = make_spine();
+    let mut pipeline = fresh_pipeline(&dir);
+    let mut book = MemoryCommitBook::default();
+
+    // The late-classification fixture (the audit's IA-05 shape): the
+    // record episode confirmed, the candidate classified after it.
+    schedule_encounter(&mut spine, 1, EncounterKind::Altercation, 0, 0, Tick(5)).unwrap();
+    spine.run_ticks(5);
+    commit_witness_captures(&mut spine, &mut pipeline, &mut book, 0, true).unwrap();
+    assert_eq!(spine.world().lane.witness_conservation(0), (3, 0, 3));
+    let candidate_key = MemoryKey {
+        event: 1,
+        witness: 0,
+        kind: MemoryKind::ReputationCandidate,
+    };
+    assert_eq!(
+        spine.world_mut().lane.classify(&candidate_key, true),
+        engine_core::npc_memory::ClassifyOutcome::Classified,
+        "the live decision applies"
+    );
+    let id0 = ConsequenceId::new(0, 0, 0);
+    drop(pipeline);
+
+    // THE UNCERTAIN CANONICAL COMMIT: the medium's AfterRootDirSync
+    // seam with the journal UNFAULTED — the classification-sync
+    // episode journals and applies cleanly; the canonical submission's
+    // revision is installed but the acknowledgment is lost. The first
+    // submit returns the ordinary empty success (the honest ambiguous
+    // outcome — the audit observed exactly this), with the episode
+    // not yet canonically confirmed.
+    let mut faulted = CommitPipeline::open(
+        LocalFileMedium::open_with(
+            dir.store(),
+            Some(FaultControl::new().arm(FaultPoint::AfterRootDirSync, FaultAction::InjectError)),
+        )
+        .unwrap(),
+        T1Journal::open(dir.journal()).unwrap(),
+    )
+    .unwrap();
+    let keys = commit_witness_captures(&mut spine, &mut faulted, &mut book, 0, true).unwrap();
+    assert!(keys.is_empty(), "no new records — the flush only");
+    let id1 = ConsequenceId::new(0, 1, 0);
+    assert!(
+        !faulted.is_confirmed(id1),
+        "the uncertain submission is not yet confirmed"
+    );
+    assert_eq!(
+        faulted.journal().transactions().len(),
+        2,
+        "the flush's journal transaction is durable"
+    );
+
+    // THE LIVE-HANDLE COMPLETION: the next submit on the SAME pipeline
+    // (the fault still armed) — the defective bridge returned
+    // `AttemptUnresolved` here, on this submit and every later one.
+    // The flush half drives the retained pending attempt: the
+    // reconcile re-reads and verifies the installed revision and
+    // confirms it — no fresh submission needed, no pipeline reopen.
+    let result = commit_witness_captures(&mut spine, &mut faulted, &mut book, 0, true);
+    assert!(
+        result.is_ok(),
+        "the SAME pipeline finishes its own uncertain commit (IA-05): {result:?}"
+    );
+    assert!(result.unwrap().is_empty(), "still zero new events");
+    assert!(
+        faulted.is_confirmed(id1),
+        "the live handle's reconcile confirmed the uncertain submission"
+    );
+    let mut confirmed = faulted.confirmed_keys();
+    confirmed.sort_unstable();
+    assert_eq!(
+        confirmed,
+        vec![id0, id1],
+        "both episodes confirmed through the live handle"
+    );
+
+    // THE THIRD SUBMIT: no refusal loop — the ordinary nothing-pending
+    // shape (the defective bridge errored `AttemptUnresolved` forever).
+    let keys = commit_witness_captures(&mut spine, &mut faulted, &mut book, 0, true).unwrap();
+    assert!(keys.is_empty(), "the settled pipeline is an ordinary no-op");
+    assert_eq!(
+        spine.world().lane.witness_conservation(0),
+        (3, 0, 3),
+        "the lane's records stayed confirmed throughout"
+    );
+
+    // THE COLD REOPEN: the recovered state is consistent (the
+    // classification survived; the confirmed boundary holds).
+    drop(faulted);
+    let reopened = fresh_pipeline(&dir);
+    let recovered = recover_memory_lane(&reopened).unwrap();
+    assert_eq!(recovered.book.episodes, 2, "the recovered episode counter");
+    let mut fresh_spine = make_spine();
+    let _recovered_book = install_recovered_lane(&mut fresh_spine, recovered);
+    assert_eq!(
+        fresh_spine.world().lane.reputation_score().unwrap(),
+        -3,
+        "the late classification survives the reopen"
+    );
+    assert_eq!(
+        fresh_spine.world().lane.witness_conservation(0),
+        (3, 0, 3),
+        "the recovered witness is materialized with its confirmed records"
+    );
+    drop(reopened);
+}
+
+/// IA-01's fresh-session half: the indeterminate write's retained
+/// attempt must complete on a REOPENED pipeline too. A fresh
+/// pipeline's open seeds the envelope identity from the journal's
+/// durable state — a blind re-stage of the retained envelope would
+/// refuse `ConflictingReuse` there (the identity is tracked as
+/// journaled, which is not a verdict about the attempt). The
+/// completion therefore consults the journal's committed set FIRST
+/// and finds the EXACT attempt (the byte-identical envelope and
+/// plan), completing the bookkeeping and the apply without staging
+/// anything.
+#[test]
+fn an_indeterminate_write_completes_on_a_fresh_pipeline() {
+    let dir = TestDir::new("ia01-fresh-pipeline");
+    let mut spine = make_spine();
+    let mut pipeline = fresh_pipeline(&dir);
+    let mut book = MemoryCommitBook::default();
+
+    // The late-classification fixture, then the faulted flush with the
+    // journal path moved aside (the IA-01 sequence's first half: the
+    // transaction IS durable, the verification could not reread).
+    schedule_encounter(&mut spine, 1, EncounterKind::Altercation, 0, 0, Tick(5)).unwrap();
+    spine.run_ticks(5);
+    commit_witness_captures(&mut spine, &mut pipeline, &mut book, 0, true).unwrap();
+    assert_eq!(spine.world().lane.witness_conservation(0), (3, 0, 3));
+    let candidate_key = MemoryKey {
+        event: 1,
+        witness: 0,
+        kind: MemoryKind::ReputationCandidate,
+    };
+    assert_eq!(
+        spine.world_mut().lane.classify(&candidate_key, true),
+        engine_core::npc_memory::ClassifyOutcome::Classified,
+        "the live decision applies"
+    );
+    drop(pipeline);
+
+    let journal = engine_persist::journal::T1Journal::open_with(
+        dir.journal(),
+        Some(engine_persist::journal::JournalFaultControl::new().arm(
+            engine_persist::journal::JournalFaultPoint::AfterSync,
+            FaultAction::InjectError,
+        )),
+    )
+    .unwrap();
+    let mut faulted =
+        CommitPipeline::open(LocalFileMedium::open(dir.store()).unwrap(), journal).unwrap();
+    let aside = dir.journal().with_extension("t1.aside");
+    fs::rename(dir.journal(), &aside).expect("the journal path moves aside");
+    let result = commit_witness_captures(&mut spine, &mut faulted, &mut book, 0, true);
+    assert!(result.is_err(), "the reread failure propagates: {result:?}");
+    assert!(
+        book.unresolved.is_some(),
+        "the indeterminate write retains the episode"
+    );
+
+    // THE FRESH PIPELINE: the path restored, the FAULTED handle
+    // dropped, a clean pipeline reopened over the same store and
+    // journal — its open read the durable transaction (the identity
+    // is now tracked as journaled by the fresh authority).
+    fs::rename(&aside, dir.journal()).expect("the journal path is restored");
+    drop(faulted);
+    let mut reopened = fresh_pipeline(&dir);
+    assert_eq!(
+        reopened.journal().transactions().len(),
+        2,
+        "the fresh journal read the durable flush transaction"
+    );
+
+    // THE COMPLETION: the journal's committed set is consulted FIRST —
+    // the exact attempt is found (no staging, no ConflictingReuse, no
+    // second envelope), the bookkeeping and the apply complete, and
+    // the flush half confirms the episode canonically.
+    let result = commit_witness_captures(&mut spine, &mut reopened, &mut book, 0, true);
+    assert!(
+        result.is_ok(),
+        "the fresh pipeline completes the retained attempt: {result:?}"
+    );
+    assert!(
+        result.unwrap().is_empty(),
+        "no new records — the completion only"
+    );
+    assert!(book.unresolved.is_none(), "the completion cleared it");
+    assert_eq!(
+        reopened.journal().transactions().len(),
+        2,
+        "still exactly two journal transactions — the completion staged nothing"
+    );
+    let mut confirmed = reopened.confirmed_keys();
+    confirmed.sort_unstable();
+    assert_eq!(
+        confirmed,
+        vec![ConsequenceId::new(0, 0, 0), ConsequenceId::new(0, 1, 0)],
+        "both episodes confirmed through the fresh handle"
+    );
+
+    // THE COLD REOPEN: consistent, the classification recovered.
+    drop(reopened);
+    let reopened = fresh_pipeline(&dir);
+    let recovered = recover_memory_lane(&reopened).unwrap();
+    assert_eq!(recovered.book.episodes, 2, "the recovered episode counter");
     let mut fresh_spine = make_spine();
     let _recovered_book = install_recovered_lane(&mut fresh_spine, recovered);
     assert_eq!(
@@ -1299,7 +1691,7 @@ fn a_journaled_unresolved_episode_completes_with_the_apply_only() {
         episode,
         consequence,
         keys: keys.clone(),
-        journaled: true,
+        phase: engine_slice::npc_memory_lane::RetryPhase::Journaled,
     });
 
     // THE COMPLETION: the next call finishes the apply only — no new
