@@ -1390,12 +1390,31 @@ impl<M: CanonicalMedium> CommitVerifier<M> {
             });
         }
         let revision = attempt.record.id();
+        // Both attempt.keys (BTreeMap) and batch.entries (Vec) are sorted
+        // by ConsequenceId. Use a single ordered merge/zip for O(N) matching
+        // instead of O(N²) per-key linear search. This preserves the exact
+        // per-key check order: key-missing → payload-mismatch →
+        // key-not-chain-included → key-confirmed-by-different-revision.
+        let mut batch_iter = batch.entries.iter().peekable();
         for (id, (coverage, transaction, effect)) in &attempt.keys {
-            let Some(entry) = batch.entries.iter().find(|entry| entry.id == *id) else {
+            // Check if there are any batch entries with smaller ids (unattempted keys)
+            if let Some(entry) = batch_iter.peek()
+                && entry.id < *id
+            {
+                // Batch entry has smaller id - this is an unattempted key
                 return Err(PipelineError::ConfirmationInvalid {
                     detail: "key-missing-from-confirmed-batch",
                 });
-            };
+            }
+            // Now batch_iter.peek() is either None or has entry.id >= id
+            let entry = batch_iter.next().expect("batch entries exhausted early");
+            if entry.id != *id {
+                // We skipped an entry or hit a larger one - key is missing
+                return Err(PipelineError::ConfirmationInvalid {
+                    detail: "key-missing-from-confirmed-batch",
+                });
+            }
+            // ids match - perform validation checks in exact order
             if entry.coverage != *coverage
                 || entry.transaction != *transaction
                 || entry.effect != *effect
