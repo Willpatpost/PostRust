@@ -1505,8 +1505,18 @@ fn depth_fallbacks_and_the_post_lifecycle() {
         );
 
         // Resize (a forced recreation), render, capture — the SAME
-        // oracle recomputed at the new extent.
+        // oracle recomputed at the new extent. The resize reaches the
+        // ACTUAL drawable (render_encounter's own set_size + sync
+        // shape): the extent tuple passed below is a REQUEST, and on
+        // a fixed-extent surface (Win32: currentExtent pins the
+        // client size) the renderer correctly clamps to the
+        // drawable's old extent while this gate's oracle is computed
+        // at the new one — the rig's RIG-PENDING-01 defect (audit
+        // IA-09: requested/window/captured were 264/256/256).
         let resized = (size.0 + 8, size.1 + 8);
+        let mut window = app.window().clone();
+        window.set_size(resized.0, resized.1).unwrap();
+        window.sync();
         renderer.request_frame_capture().unwrap();
         assert!(
             renderer
@@ -1515,6 +1525,17 @@ fn depth_fallbacks_and_the_post_lifecycle() {
                 .presented
         );
         let resized_capture = renderer.take_frame_capture().unwrap().unwrap();
+        // Fail-visible extent: the capture must actually BE the
+        // requested extent before its pixels are compared against the
+        // oracle computed at that extent — a future request/drawable
+        // divergence fails HERE, loudly, instead of silently measuring
+        // two different images against each other.
+        assert_eq!(
+            (resized_capture.width, resized_capture.height),
+            resized,
+            "the resize reached the drawable — the capture extent must equal the request \
+             before the {resized:?} oracle is compared"
+        );
         let hdr_resized = (0..resized.1)
             .flat_map(|y| (0..resized.0).map(move |x| (x, y)))
             .map(|(x, y)| {
