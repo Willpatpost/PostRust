@@ -106,6 +106,20 @@ Linux values are the platform-uniform inference (+1), to be confirmed by the
 candidate's own CI run per the repo's established practice. No test weakened;
 the count moved because a corrective ADDED a test.
 
+## E-7 A24 rig verification (2026-11-26, Windows rig, RTX 5070 Ti, tree `1884582`)
+
+`cargo test -p engine-slice --test render_weather -- --ignored --nocapture
+--test-threads=1` (real GPU, real windows, validation on, no offscreen driver —
+the rig discipline): **11 passed / 0 failed, exit 0, 7.29 s**. Pinned values
+reproduce digit-for-digit: rain ink 17041 differing bytes; broadside ink
+3482 px / 2162 upper-third; allocation constancy 12 distinct captures with
+the AllocationStats tuple (19/4/1589248/3/7/2); ripple sweep 22/255 at the
+recorded ground center; term separation 96548/67535/7625 blend-only and
+27149/27149/2538 displacement-only; double-run byte-equality, N-vs-1, and
+composition smokes ok. Log: `Temp\opencode\ee\artifacts\gates-a24-render-weather-rig.log`.
+This is the A24 equivalence-bar proof: the scripted route's weather campaign
+reproduces exactly on the real GPU through the explicit-dt plumbing.
+
 ## Measurement baselines
 
 (To be established in P0: first full build of the integration tree, then the
