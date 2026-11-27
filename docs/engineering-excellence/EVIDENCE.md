@@ -66,6 +66,27 @@ not used for source judgment.)
 - B09: `crates/engine-renderer/src/vulkan.rs:1142` — `"VK_KHR_metal_surface"` in `PLATFORM_SURFACE_EXTENSIONS`; correct `VK_EXT_metal_surface` used at :5407,:5424,:5531,:5568,:5630,:5640. CONFIRMED.
 - A17: `crates/engine-renderer/src/animation.rs:420` `skin_matrices` recomputes `rest_pose`/`rest_worlds` per call (rest worlds at :429); `crates/engine-slice/src/corner_routes.rs:617` `evaluate_population_poses_locomotion`. CONFIRMED.
 
+## E-5 Production vs test line split (heuristic, 2026-11-26, baseline tree)
+
+PowerShell brace-depth heuristic: lines inside `#[cfg(test)]` blocks in
+`src/` files counted as inline-test; `tests|benches|examples/` directories
+excluded (counted in E-2). Heuristic limitations: `#[cfg(test)]` on bare fns
+still counted (correct for census), brace-in-string edge cases unhandled
+(negligible here). Whole-file totals reconcile with E-2.
+
+| Crate | src prod lines | src inline-test lines | tests/ dir lines (E-2) |
+|---|---:|---:|---:|
+| engine-core | ~14,144 | ~15,932 | ~0 |
+| engine-persist | ~46,379 | ~39,946 | ~8,684 |
+| engine-renderer | ~21,384 | ~6,312 | ~0 |
+| engine-shell | ~1,854 | ~705 | ~498 |
+| engine-slice | ~43,976 | ~6,397 | ~56,475 |
+
+**Workspace production ≈ 128k lines; test material ≈ 155k+ lines** (inline
++ tests/ dirs) — a test-heavy codebase by design; per-file prod counts feed
+A01 (split by change reason) and B15 (footprint claims must cite these, not
+whole-file sizes).
+
 ## Measurement baselines
 
 (To be established in P0: first full build of the integration tree, then the
