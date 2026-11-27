@@ -38,14 +38,22 @@ P0 baseline/census/measurement ──┬──> P1 direct improvements ──┐
 
 | Package | Scope (charter IDs) | Status |
 |---|---|---|
-| P0 | tag/branch done; census, coverage ledger, baseline measurements, architecture map | IN-PROGRESS (auditors dispatched, first lanes started) |
-| P1 | A16 A17 A21 A25 B05 B07 B08 B09 B04(partial) B03(obvious) | IN-PROGRESS (A16/A17/B09 lanes dispatched) |
-| P2 | A05 A07–A10 A22 A24 B01 B06 B12 | NOT STARTED (waits on P0 audit) |
-| P3 | A13 A22 B02 B03 B04 B12 B13 | NOT STARTED (waits on P0 audit) |
-| P4 | A01 A03–A06 A11 A12 A14 A15 B14 B15 | NOT STARTED (waits on P0 audit) |
+| P0 | tag/branch done; census, coverage ledger, baseline measurements, architecture map | IN-PROGRESS — 4/5 area audits landed+verified (renderer, persist, slice, shell pending… core pending); census E-2/E-5 done; first gate baseline E-6 done; measurement matrix NOT STARTED |
+| P1 | A16 A17 A21 A25 B05 B07 B08 B09 B04(partial) B03(obvious) | 4 DONE integrated+gated (A16 `f9901f3`, A17 `3439633`, B09 `9dce061`+corrective, B04 `e31dc61`+corrective); A21/A25/B07/B08/B05 awaiting the core/shell audit reads |
+| P2 | A05 A07–A10 A22 A24 B01 B06 B12 | A24 lane RUNNING (`ee/p2-a24-fixed-timestep`); rest awaiting P0 audit + design |
+| P3 | A13 A22 B02 B03 B04 B12 B13 | NOT STARTED (persist audit in; design package after all audits) |
+| P4 | A01 A03–A06 A11 A12 A14 A15 B14 B15 | NOT STARTED (slice module-classification map in hand) |
 | P5 | A11 A17–A20 A23 B14 | NOT STARTED (waits on P4 interfaces) |
-| P6 | A01–A06 A12–A15 B15 B16 | INCREMENTAL (runs alongside) |
+| P6 | A01–A06 A12–A15 B15 B16 | INCREMENTAL (LOW doc notes registered: NEW-REND-04/05/06, NEW-SLICE-02/03/05) |
 | P7 | full re-audit, rubric scoring, final report + PR | NOT STARTED |
+
+## Next actions
+
+1. auditor-core + auditor-shell results → verify, reconcile register, unblock the A21/A25/B07/B08/B05 wave.
+2. lane-a24 (fixed timestep) → review diff (the 60fps equivalence bar + determinism boundary), integrate, gate.
+3. P0 measurement matrix (charter §8.2) on the integrated tree — SERIAL, no concurrent lanes building.
+4. P3 persistence design package (B02 streaming reads, B03 copy amplification, B13 worker map) from the persist audit + module map.
+5. Linux count confirmations ride the first PR's CI run (platform-uniform inferences recorded per pin commit).
 
 ## File map
 
@@ -76,11 +84,4 @@ P0 baseline/census/measurement ──┬──> P1 direct improvements ──┐
 6. Commit messages: long, lowercase, evidence-carrying (house style — read
    `git log` before writing).
 
-## Next actions
-
-1. Five read-only area auditors (core / persist / renderer+shaders / shell /
-   slice) → `audits/*.md`, seed FINDINGS.md states from measured current source.
-2. Three P1 implementation lanes (A16, A17, B09) in disjoint worktrees.
-3. Baseline measurement battery (P0) on the integration tree after the first
-   full build (target dir is fresh — first build ~10–20 min).
-4. Integration + full local gate run when lanes land; FINDINGS/AGENTS updated.
+## File map
