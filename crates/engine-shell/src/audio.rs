@@ -898,17 +898,37 @@ impl MixerCore {
     /// batched frames spatializes each against the listener that
     /// frame was published with, never a single latest one.
     fn drain_commands(&mut self) {
-        // The Arc clone releases the self borrow so `start_voice`
-        // can take `&mut self` while the guard lives (a refcount
-        // bump — no allocation).
+        // A25 (the engineering-excellence corrective): the queued
+        // commands are copied out under the try-lock (a bounded copy
+        // of Copy slots — microseconds), the guard is RELEASED, and
+        // only then does the voice-start work run (the class→source
+        // table, the listener-relative pan/attenuation gains, and the
+        // pool's free-slot-or-steal search) — unheld. The pre-fix
+        // shape called start_voice INSIDE the lock: a producer
+        // publishing triggers on the sim/presentation thread could
+        // contend the whole voice-start batch. Each drained command
+        // still carries its OWN listener snapshot (the finding-9
+        // atomic publication): a drain that empties two batched
+        // frames spatializes each against the listener that frame
+        // was published with, never a single latest one — the copy
+        // preserves the pairing exactly (queue order, per-slot
+        // listener).
         let shared = Arc::clone(&self.shared);
-        let Ok(mut commands) = shared.commands.try_lock() else {
-            return;
-        };
-        while commands.count > 0 {
-            let command = commands.ring[commands.head];
-            commands.head = (commands.head + 1) % TRIGGER_QUEUE_CAPACITY;
-            commands.count -= 1;
+        let mut drained = [None; TRIGGER_QUEUE_CAPACITY];
+        let mut drained_count = 0usize;
+        {
+            let Ok(mut commands) = shared.commands.try_lock() else {
+                return;
+            };
+            while commands.count > 0 {
+                drained[drained_count] = Some(commands.ring[commands.head]);
+                commands.head = (commands.head + 1) % TRIGGER_QUEUE_CAPACITY;
+                commands.count -= 1;
+                drained_count += 1;
+            }
+        }
+        for slot in &drained[..drained_count] {
+            let command = slot.expect("set by the drain loop above");
             self.start_voice(command.trigger, command.listener);
         }
     }
