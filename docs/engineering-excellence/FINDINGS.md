@@ -24,7 +24,7 @@ corrected).
 | A15 | SLICE | CONFIRMED (LOW, severity reduced) | — | wire discipline is correct (subsystems import only public APIs); the issue is the monolithic `corner_demo` dispatch + `main.rs` CLI cascade — P4/P6 extraction per the module classification map (audits/slice.md §2) |
 | A06 | REND/SLICE | CONFIRMED | — | animation core is pure but lives INSIDE the renderer crate — placement is the P4 question (auditor read the purity as fine; the crate-coupling issue stands); slice half verified: `corner_routes.rs` imports `engine_renderer::animation` directly (audits/slice.md) |
 | A07 | CORE | CONFIRMED | — | npc_perception.rs:83-94 linear population walk; npc_execution.rs:283-306 enumerate_witnesses rides it (audits/core.md) |
-| A08 | CORE | CONFIRMED | — | spine.rs:1128-1146 suspend_from_queue heap pop + temp Vec + full predicate scan (audits/core.md) |
+| A08 | CORE | FIXED-AWAITING-REVIEW | integrated `e1031e5` | glm-5.3 `b051e3b`: the bulk-partition operations landed (extract_if + heapify, in-place BTreeMap passes, zero scratch on the drain path) with the rigorous invariant argument (pop order = the multiset sort, layout-independent) and save/restore byte-compatibility CROSS-VERIFIED against the old tree; measured ~4×/12×/34×; all digest pins green; the design's step-2 derived index (L2b) remains gated on the §9.8 matrix at 100k obligations |
 | A09 | CORE | CONFIRMED | — | npc_memory.rs:669-684 witness_records merges pending+confirmed, whole-ledger scan + sort (audits/core.md) |
 | A10 | CORE | UNTRIAGED | — | pending auditor-core |
 | A11 | REND | CONFIRMED | — | MAX_INSTANCES=4096 = MAX_POSE_BLOCKS; region capacity per FRAMES_IN_FLIGHT (scene.rs:319) |
@@ -224,17 +224,18 @@ refutation is evidence too.
   implementation lanes remain case-by-case under the verify-everything
   discipline; independent review stays cross-family per the charter.
 - **glm-5.3-w4a8 (implementation lanes, design-as-spec pattern):** after the
-  B07/B05 design trial, the P4-S1 and P3-L3 implementation lanes are **2/2
-  clean** — no orchestrator correctives needed: additive-only constraints
+  B07/B05 design trial, the implementation lanes are **4/4 clean** (P4-S1
+  additive-only, P3-L3 pipeline copies, P4-S1g the GPU gate, P2-L2 the spine
+  bulk-partition — the deepest delegation into the determinism-critical core,
+  delivered with a rigorous invariant argument and a cross-tree
+  byte-compatibility proof) — no orchestrator correctives needed: constraints
   honored to the letter (verified at the diff level), baselines self-measured
   BEFORE editing, TRUE counts reported, honest semantic deltas documented
-  unprompted (S1's route-semantics choices; L3's take/restore panic window
-  with its reachability analysis), and the design-named cross-crate gates
-  run voluntarily. **The pattern that works: the design document IS the
-  spec + glm-5.3 + the additive/constraint framing + D-EE-09 branch
-  discipline.** Contrast qwen3-coder-next's 4/5 corrective rate on
-  brief-only work. Implementation lanes route to glm-5.3 by default now,
-  matching the design-work default.
+  unprompted, and design-named cross-crate gates run voluntarily. **The
+  pattern that works: the design document IS the spec + glm-5.3 + the
+  additive/constraint framing + D-EE-09 branch discipline.** Contrast
+  qwen3-coder-next's 4/5 corrective rate on brief-only work. Implementation
+  lanes route to glm-5.3 by default now, matching the design-work default.
 - **qwen38-27b (shell — CORRECTED 2026-11-26):** delivered one of the two
   best audits of the five (line-by-line coverage, byte-level A23
   measurements, claims verified against the vendored SDL 3.4.18 source,
