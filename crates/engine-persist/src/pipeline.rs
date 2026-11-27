@@ -63,8 +63,80 @@
 //! O(new revisions) per commit (the session-open walk is O(chain),
 //! documented honestly — never per tick); staging performs no I/O;
 //! the pipeline never decides gameplay policy.
+//!
+//! **The settled-transaction watermark and coverage shedding
+//! (P3-L6, A22-persist):** the per-commit actionable scan is
+//! proportional to the UNSETTLED window, never the total history.
+//! The authority tracks per-transaction settledness — a journal
+//! transaction is *settled* when it is durably canceled (never
+//! actionable again — cancellations are append-only) or when EVERY
+//! envelope it captured is chain-confirmed under exact provenance
+//! (the same producing transaction, coverage, and effect commitment
+//! the scan itself verifies). Settlements are recorded as a monotone
+//! prefix mark (the watermark — every transaction below it is
+//! settled, never revisited) plus a settled-bitmap for out-of-order
+//! settlements above the mark. The ordering proof: the journal is
+//! append-only within a generation and a transaction's envelope set
+//! is fixed at capture ([`CommitAuthority::stage`] refuses tracked
+//! identities), the confirmed map is insert-only (a conflicting
+//! claim fails the walk closed), and confirmation is monotone — so
+//! the exact-provenance check that established a settlement would
+//! succeed identically on every later scan; skipping it is
+//! decision-equivalent, and a settled transaction's keys can never
+//! become actionable again. **Fail-closed:** the watermark can never
+//! advance past an unconfirmed transaction — the mark holds at the
+//! earliest unsettled transaction, its keys are re-collected on
+//! every commit (never silently dropped), and the held state is
+//! reported in [`CommitPipeline::retention_stats`], never silently
+//! accepted. A fresh open re-derives the watermark lazily at the
+//! first actionable scan (O(journal) once per session — the same
+//! honest-cost tradition as the session-open chain walk).
+//!
+//! **The coverage shed:** the per-key coverage detail
+//! (`ConfirmedEntry.coverage`) of a chain-confirmed identity is dead
+//! weight once its producing journal transaction is settled — the
+//! actionable scan skips settled transactions, and the retained
+//! pending attempts only ever carry keys whose producers are
+//! UNSETTLED (an attempt is collected from an unsettled transaction,
+//! and no further collection runs while the attempt is unresolved),
+//! so the exact-provenance comparisons that consult coverage never
+//! reach a settled producer's entry; a foreign or duplicate claim on
+//! a settled identity fails on the producing-transaction arm before
+//! coverage is compared. The shed therefore drops the coverage Vec
+//! of settled producers' entries — keeping the identity, the
+//! producing transaction, the effect commitment, the confirming
+//! revision, and the epoch: **the dedup membership is NEVER dropped**
+//! (`is_confirmed`, `confirmed_keys`, the conflicting-reuse refusal,
+//! the receipts, and the promotions all survive unchanged). The shed
+//! is eligibility-gated (only settled producers — anything unproven
+//! is retained, fail-closed) and bounded to
+//! [`SETTLED_COVERAGE_RETAINED`] retained entries (the documented
+//! grace window for post-confirmation provenance queries). A shed
+//! identity's coverage **re-derives from the chain**: a freshly
+//! opened pipeline's session walk re-collects every batch entry with
+//! full coverage — the recovery composition runs over exactly that
+//! fresh open (the crossing's recovery driver opens the pipeline
+//! before consuming `confirmed_evidence`), so recovery never depends
+//! on shed detail; in-session, [`CommitVerifier::confirmed_coverage`]
+//! and [`CommitVerifier::confirmed_evidence`] honestly refuse the
+//! shed detail (reported in the retention stats, never silent).
+//!
+//! **The compaction cadence:** rotation+reclamation is ALREADY the
+//! compaction point for the journal-side retention — the rotation's
+//! authenticated classification (rotation.rs) retires canceled and
+//! confirmed-and-subsumed transactions, re-anchoring only the
+//! unsettled survivors into a fresh generation, and the reopened
+//! pipeline reseeds its dedup keys and watermark from the smaller
+//! journal. The engine's contribution to the cadence is the
+//! documented threshold ([`ROTATION_CADENCE_TRANSACTIONS`]) and the
+//! [`CommitPipeline::retention_stats`] surface that reports a
+//! generation exceeding it: the growth is REPORTED (the application
+//! layer's maintenance reads the stats and invokes the rotation),
+//! never silently accepted, and never auto-triggered (the rotation
+//! stays the explicit maintenance action under the single-writer
+//! discipline).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use engine_core::{Decoder, Encoder, SaveError};
@@ -107,6 +179,40 @@ pub const CONSEQUENCE_BATCH_SCHEMA: u8 = 2;
 pub const MAX_BATCH_ENTRIES: u64 = 1 << 16;
 /// Documented maximum for one entry's coverage spans.
 pub const MAX_BATCH_SPANS: u64 = 1 << 16;
+
+/// (P3-L6, A22-persist) The documented settled-coverage retention
+/// bound: the number of shed-ELIGIBLE confirmed entries (settled
+/// producers' identities) whose coverage detail is retained past
+/// eligibility — the grace window for in-session post-confirmation
+/// provenance queries. Entries beyond the bound shed their coverage
+/// Vec (the identity, producing transaction, effect commitment,
+/// revision, and epoch are ALWAYS kept — the dedup membership is
+/// never dropped); the shed detail re-derives from the chain at the
+/// next session open (the walk's full batch collection). The bound
+/// exists so the shed only ever trades detail that has actually
+/// accumulated: two orders above the largest observed single-commit
+/// key set at the current scale (the E-8 memory-lane flushes are
+/// tens of keys against `MAX_BATCH_ENTRIES`'s 65,536 ceiling).
+/// **[ASSUMPTION]** pending the owner-rig retention data point at
+/// the intended first-game scale (the design supplies the mechanism,
+/// not the number — the P3 §6 unresolved-questions discipline).
+pub const SETTLED_COVERAGE_RETAINED: usize = 1 << 10;
+
+/// (P3-L6, A22-persist) The documented rotation-cadence threshold:
+/// the committed-transaction count at which a journal generation is
+/// REPORTED as exceeding the cadence
+/// ([`CommitPipeline::retention_stats`]'s
+/// `exceeds_rotation_cadence`). The rotation itself is never
+/// auto-triggered — it stays the explicit maintenance action under
+/// the single-writer discipline (rotation.rs), and this constant is
+/// the documented default the application layer's maintenance reads:
+/// without maintenance available, the growth is reported in the
+/// stats, never silently accepted. The order matches the long-journal
+/// fixture scale the P3 design names (~5,000 settled transactions).
+/// **[ASSUMPTION]** pending the owner-rig data point at the intended
+/// first-game scale (the design supplies the mechanism, not the
+/// threshold).
+pub const ROTATION_CADENCE_TRANSACTIONS: u64 = 1 << 12;
 
 /// One consequence's entry in the canonical batch — the complete
 /// per-consequence evidence: the identity, the producing transaction,
@@ -662,6 +768,34 @@ pub struct CommitAuthority {
     /// crash loses it honestly (P0-5).
     staged: Vec<ConsequenceEnvelope>,
     keys: BTreeMap<ConsequenceId, KeyStatus>,
+    /// (P3-L6) THE SETTLED-TRANSACTION WATERMARK — the monotone prefix
+    /// mark: every `journal.transactions()[..watermark]` is settled
+    /// (durably canceled, or every envelope chain-confirmed under the
+    /// exact provenance a scan verified) and is never revisited by
+    /// the actionable scan. The mark only ever advances through a
+    /// settled transaction — an unconfirmed transaction HOLDS it
+    /// (fail-closed: the unsettled window keeps paying for it, and
+    /// its keys keep being collected, never silently dropped).
+    settled_watermark: usize,
+    /// (P3-L6) The settled-bitmap: transactions settled OUT of order
+    /// (at or above the mark — e.g. a canceled transaction behind an
+    /// unconfirmed hole). The mark absorbs an entry (removing it)
+    /// exactly when it advances past it.
+    settled_above: HashSet<TransactionId>,
+    /// (P3-L6) The envelope identities of the transactions the
+    /// actionable scans settled since the last drain — the coverage
+    /// shed's eligibility input, consumed by the facade's
+    /// post-commit composition. A direct half-composition that never
+    /// drains forfeits the shed for those settlements (coverage stays
+    /// retained — never a correctness effect).
+    newly_settled_keys: Vec<ConsequenceId>,
+    /// (P3-L6) Cumulative transaction visits by the actionable scans
+    /// (the observational scaling surface — see
+    /// [`CommitPipeline::retention_stats`]).
+    scan_transactions: u64,
+    /// (P3-L6) Cumulative envelope examinations by the actionable
+    /// scans — the provenance-check work the watermark bounds.
+    scan_envelopes: u64,
 }
 
 /// The medium-owned half of the commit pipeline: the canonical
@@ -675,6 +809,21 @@ pub struct CommitVerifier<M: CanonicalMedium> {
     /// The chain-derived confirmed key set (the session's verified
     /// view — rebuilt at open, extended by the walks).
     confirmed: BTreeMap<ConsequenceId, ConfirmedEntry>,
+    /// (P3-L6) The shed-eligible queue: confirmed identities whose
+    /// producing journal transactions settled (the actionable scan's
+    /// settlement proof), in settlement order, bounded to
+    /// [`SETTLED_COVERAGE_RETAINED`] retained entries — beyond the
+    /// bound the oldest entry's coverage detail sheds.
+    shed_eligible: VecDeque<ConsequenceId>,
+    /// (P3-L6) The shed discriminator: identities whose coverage
+    /// detail was shed. An EMPTY `ConfirmedEntry.coverage` is
+    /// legitimate for span-less movements — this set (never the Vec's
+    /// emptiness alone) is what distinguishes a shed span-bearing
+    /// entry, so the movement arm can never be confused with the shed
+    /// state.
+    shed_coverage: HashSet<ConsequenceId>,
+    /// (P3-L6) Cumulative shed count (the observability surface).
+    shed_coverage_total: u64,
     /// The last revision the walk processed (the append basis — the
     /// trusted-cursor model; `None` on an unfounded medium).
     verified_head: Option<Hash>,
@@ -706,6 +855,68 @@ pub struct CommitPipeline<M: CanonicalMedium> {
     verifier: CommitVerifier<M>,
 }
 
+/// (P3-L6, A22-persist) The retention/compaction observability
+/// surface — the settled-transaction watermark's position, the
+/// unsettled population the per-commit actionable scan pays for, the
+/// coverage-shed state, and the rotation-cadence reading. Read-only
+/// derived state (never serialized, never a fingerprint input); the
+/// application layer's maintenance reads it to decide the rotation
+/// cadence — a generation exceeding the documented threshold is
+/// REPORTED here, never silently accepted, and the rotation itself
+/// stays the explicit maintenance action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionStats {
+    /// The generation's committed transactions (the journal total).
+    pub journal_transactions: u64,
+    /// The settled-transaction watermark: every transaction below the
+    /// mark is settled (canceled, or every envelope chain-confirmed
+    /// under exact provenance) — the prefix the actionable scan never
+    /// revisits.
+    pub settled_watermark: u64,
+    /// Settled transactions at or above the mark (out-of-order
+    /// settlements the mark has not yet absorbed).
+    pub settled_above_watermark: u64,
+    /// The unsettled population the per-commit scan examines envelopes
+    /// for (journal total − settled) — the window the watermark bounds
+    /// the per-commit cost to.
+    pub unsettled_transactions: u64,
+    /// The dedup-membership size (`keys`) — the identity authority,
+    /// NEVER dropped; bounded generationally by the rotation's
+    /// retirement (the reopened pipeline reseeds from the smaller
+    /// journal).
+    pub tracked_keys: u64,
+    /// The chain-confirmed membership size (`confirmed`).
+    pub confirmed_keys: u64,
+    /// Confirmed entries whose coverage detail was shed past the
+    /// documented bound (cumulative since open).
+    pub shed_coverage_entries: u64,
+    /// Shed-eligible entries whose coverage is retained within the
+    /// documented bound (the grace window).
+    pub retained_settled_coverage: u64,
+    /// Cumulative transaction visits by the actionable scans — with a
+    /// watermark HELD by an unconfirmed transaction this grows with
+    /// the window above the mark (the bitmap-skips are cheap but not
+    /// free); the honest cost the hold reports.
+    pub actionable_scan_transactions: u64,
+    /// Cumulative envelope examinations by the actionable scans — the
+    /// provenance-check work: flat iff the per-commit cost is
+    /// proportional to the unsettled window (the observational
+    /// scaling the watermark exists for).
+    pub actionable_scan_envelopes: u64,
+    /// Whether the generation exceeds the documented rotation-cadence
+    /// threshold ([`ROTATION_CADENCE_TRANSACTIONS`]) — the reported
+    /// growth the maintenance layer acts on.
+    pub exceeds_rotation_cadence: bool,
+}
+
+impl RetentionStats {
+    /// The settled population — the watermark plus the out-of-order
+    /// bitmap.
+    pub fn settled_transactions(&self) -> u64 {
+        self.settled_watermark + self.settled_above_watermark
+    }
+}
+
 impl CommitAuthority {
     /// Opens the authority half: the journal's committed transactions
     /// seed the per-key tracking (the T1 state is durable across
@@ -715,6 +926,16 @@ impl CommitAuthority {
             journal,
             staged: Vec::new(),
             keys: BTreeMap::new(),
+            // (P3-L6) The watermark starts at zero: settlement is
+            // derived state, re-proven by the first actionable scan
+            // of the session (O(journal) once — the same
+            // honest-cost tradition as the verifier's session-open
+            // chain walk; sessions that never commit never pay it).
+            settled_watermark: 0,
+            settled_above: HashSet::new(),
+            newly_settled_keys: Vec::new(),
+            scan_transactions: 0,
+            scan_envelopes: 0,
         };
         for transaction in authority.journal.transactions() {
             for envelope in &transaction.envelopes {
@@ -892,16 +1113,50 @@ impl CommitAuthority {
     /// filter corrects any over-inclusion, never trusting the view).
     /// A key claimed by two journal transactions is a conflicting
     /// reuse and fails closed.
+    ///
+    /// (P3-L6) THE SETTLED-TRANSACTION WATERMARK: the scan starts at
+    /// the watermark (every transaction below the mark is settled and
+    /// never revisited) and skips the settled-bitmap's out-of-order
+    /// entries — the per-commit cost is proportional to the UNSETTLED
+    /// window, not the total history. A transaction settles during
+    /// the scan when it is durably canceled or when EVERY envelope is
+    /// confirmed under exact provenance (the check this very scan
+    /// performs — the settlement proof is per-transaction and
+    /// independent, so settlements recorded before a later
+    /// transaction's failure stand). Settlements accumulate into the
+    /// shed-eligibility drain the facade's post-commit composition
+    /// consumes; canceled settlements mark the watermark but feed no
+    /// shed eligibility (a canceled transaction's keys are never
+    /// confirmed — the batch excludes them). The mark advances only
+    /// through settled transactions — an unconfirmed transaction
+    /// HOLDS it, fail-closed.
     pub fn collect_actionable(
-        &self,
+        &mut self,
         confirmed: &dyn ConfirmedView,
     ) -> Result<BTreeMap<ConsequenceId, AttemptedKey>, PipelineError> {
         let mut keys: BTreeMap<ConsequenceId, AttemptedKey> = BTreeMap::new();
-        for transaction in self.journal.transactions() {
-            if !self.journal.is_actionable(transaction.id) {
+        // The journal borrow is field-disjoint from every watermark
+        // mutation below (NLL tracks the paths; no whole-self method
+        // call happens while the slice is live).
+        let transactions = self.journal.transactions();
+        for transaction in transactions.iter().skip(self.settled_watermark) {
+            self.scan_transactions += 1;
+            // The settled-bitmap skip (out-of-order settlements the
+            // mark has not absorbed).
+            if self.settled_above.contains(&transaction.id) {
                 continue;
             }
+            if !self.journal.is_actionable(transaction.id) {
+                // Durably canceled — permanently un-actionable
+                // (cancellations are append-only): settle it for the
+                // scan, no shed eligibility (its keys are never
+                // confirmed).
+                self.settled_above.insert(transaction.id);
+                continue;
+            }
+            let mut settled = true;
             for envelope in &transaction.envelopes {
+                self.scan_envelopes += 1;
                 let effect = envelope
                     .effect_commitment()
                     .map_err(PipelineError::Format)?;
@@ -912,7 +1167,13 @@ impl CommitAuthority {
                     // (identity-level equality is content-blind; the
                     // effect commitment binds the actual authoritative
                     // effects); a mismatch is a conflicting claim,
-                    // never silently skipped.
+                    // never silently skipped. A matching entry is one
+                    // envelope's settlement proof — the coverage is
+                    // guaranteed present here: a shed entry's producer
+                    // is settled (this transaction would have been
+                    // skipped), and a foreign entry naming a DIFFERENT
+                    // producing transaction fails on the transaction
+                    // arm before coverage is compared.
                     if entry.transaction == transaction.id
                         && entry.coverage == envelope.sub_spans
                         && entry.effect == effect
@@ -921,6 +1182,7 @@ impl CommitAuthority {
                     }
                     return Err(PipelineError::ConfirmedProvenanceMismatch { id: envelope.id });
                 }
+                settled = false;
                 if keys.contains_key(&envelope.id) {
                     return Err(PipelineError::ConflictingReuse { id: envelope.id });
                 }
@@ -929,8 +1191,41 @@ impl CommitAuthority {
                     (envelope.sub_spans.clone(), transaction.id, effect),
                 );
             }
+            if settled {
+                // THE SETTLEMENT: every envelope chain-confirmed under
+                // exact provenance — the transaction's keys can never
+                // become actionable again (confirmation is monotone
+                // and the journal is append-only), so the scan will
+                // never need to re-verify them. The identities feed
+                // the shed-eligibility drain.
+                self.settled_above.insert(transaction.id);
+                self.newly_settled_keys
+                    .extend(transaction.envelopes.iter().map(|envelope| envelope.id));
+            }
+        }
+        // The mark advances through the settled prefix only — an
+        // unconfirmed transaction holds it (fail-closed), and the
+        // bitmap keeps the out-of-order settlements above it.
+        while self.settled_watermark < transactions.len()
+            && self
+                .settled_above
+                .contains(&transactions[self.settled_watermark].id)
+        {
+            self.settled_above
+                .remove(&transactions[self.settled_watermark].id);
+            self.settled_watermark += 1;
         }
         Ok(keys)
+    }
+
+    /// (P3-L6) Drains the envelope identities of the transactions the
+    /// actionable scans settled since the last drain — the coverage
+    /// shed's eligibility input. The facade's post-commit composition
+    /// drains per commit; a direct half-composition that never drains
+    /// forfeits the shed for those settlements (the coverage stays
+    /// retained — never a correctness effect).
+    fn take_newly_settled_keys(&mut self) -> Vec<ConsequenceId> {
+        std::mem::take(&mut self.newly_settled_keys)
     }
 
     /// The producing transactions' journal position ticks for one
@@ -1022,6 +1317,9 @@ impl<M: CanonicalMedium> CommitVerifier<M> {
         let mut verifier = CommitVerifier {
             medium,
             confirmed: BTreeMap::new(),
+            shed_eligible: VecDeque::new(),
+            shed_coverage: HashSet::new(),
+            shed_coverage_total: 0,
             verified_head: None,
             verified_epoch: 0,
             founding: None,
@@ -1151,7 +1449,18 @@ impl<M: CanonicalMedium> CommitVerifier<M> {
 
     /// One confirmed key's exact occurrence coverage (the suppression
     /// authority's span-exact form).
+    ///
+    /// (P3-L6) THE SHED CONTRACT: a settled producer's identity whose
+    /// coverage detail was shed past the documented bound REFUSES
+    /// (`None`) in-session — the membership ([`Self::is_confirmed`])
+    /// survives, and the detail RE-DERIVES from the chain at the next
+    /// session open (the walk's full batch collection — the recovery
+    /// composition's fresh-open path); identities within the retained
+    /// bound always answer with the full coverage.
     pub fn confirmed_coverage(&self, id: ConsequenceId) -> Option<&[ClassifiedSpan]> {
+        if self.shed_coverage.contains(&id) {
+            return None;
+        }
         self.confirmed
             .get(&id)
             .map(|entry| entry.coverage.as_slice())
@@ -1164,9 +1473,22 @@ impl<M: CanonicalMedium> CommitVerifier<M> {
 
     /// The confirmed evidence export (the recovery composition's
     /// chain-side input).
+    ///
+    /// (P3-L6) THE SHED CONTRACT: identities whose coverage detail was
+    /// shed past the documented bound are OMITTED — an export entry
+    /// must carry the complete provenance or none (an empty-coverage
+    /// export would misreport a span-bearing entry as a movement).
+    /// The recovery composition runs over a FRESHLY OPENED pipeline
+    /// by construction (the crossing's recovery driver opens the
+    /// pipeline before consuming this export; its session walk
+    /// re-derives every entry with full coverage), so the recovery's
+    /// accountability never depends on shed detail; the shed
+    /// population is reported in [`CommitPipeline::retention_stats`],
+    /// never silent.
     pub fn confirmed_evidence(&self) -> BTreeMap<ConsequenceId, ConfirmedEvidence> {
         self.confirmed
             .iter()
+            .filter(|(id, _)| !self.shed_coverage.contains(id))
             .map(|(id, entry)| {
                 (
                     *id,
@@ -1699,6 +2021,43 @@ impl<M: CanonicalMedium> CommitVerifier<M> {
     fn read_verified(&mut self, hash: &Hash) -> Result<Vec<u8>, PipelineError> {
         Ok(self.medium.read_object(hash)?)
     }
+
+    /// (P3-L6) THE SETTLED-COVERAGE SHED: records the drained
+    /// settlement identities as shed-ELIGIBLE (their producing
+    /// journal transactions settled — the actionable scan's
+    /// per-transaction proof), then enforces the documented retention
+    /// bound: beyond [`SETTLED_COVERAGE_RETAINED`] retained entries,
+    /// the oldest eligible entry's coverage Vec is dropped (the
+    /// identity, producing transaction, effect commitment, revision,
+    /// and epoch are ALWAYS kept — the dedup membership is never
+    /// dropped). Fail-closed by construction: ONLY settled producers'
+    /// identities ever enter the queue (an entry whose producer is
+    /// unproven — an unsettled or partially-confirmed transaction —
+    /// is never eligible and keeps its full coverage for the
+    /// exact-provenance comparisons that consult it). The shed entry
+    /// is marked in the discriminator set so a legitimately
+    /// empty-coverage movement can never be confused with it. The
+    /// detail re-derives from the chain at the next session open.
+    fn shed_settled_coverage(&mut self, eligible: Vec<ConsequenceId>) {
+        for id in eligible {
+            self.shed_eligible.push_back(id);
+        }
+        while self.shed_eligible.len() > SETTLED_COVERAGE_RETAINED {
+            let id = self
+                .shed_eligible
+                .pop_front()
+                .expect("the bound check preceded the pop");
+            // A settled transaction's every envelope was confirmed
+            // under exact provenance (the settlement proof), and the
+            // confirmed map is insert-only — the entry exists; the
+            // guard is defensive shape, never a reachable skip.
+            if let Some(entry) = self.confirmed.get_mut(&id) {
+                entry.coverage = Vec::new();
+                self.shed_coverage.insert(id);
+                self.shed_coverage_total += 1;
+            }
+        }
+    }
 }
 
 impl<M: CanonicalMedium> CommitPipeline<M> {
@@ -1805,6 +2164,17 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
         if self.verifier.completed_walks() != before {
             self.authority.promote_from(&self.verifier);
         }
+        // (P3-L6) THE SETTLED-COVERAGE SHED composition: the
+        // actionable scan's settlements (recorded even when the
+        // operation later failed — each settlement proof is
+        // per-transaction and independent) drain into the verifier's
+        // eligibility queue, which enforces the documented retention
+        // bound. The shed never touches the dedup membership; a
+        // failed operation with no settlements drains nothing.
+        let settled_keys = self.authority.take_newly_settled_keys();
+        if !settled_keys.is_empty() {
+            self.verifier.shed_settled_coverage(settled_keys);
+        }
         result
     }
 
@@ -1903,6 +2273,33 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
     /// The confirmed key set (the pipeline's session view).
     pub fn confirmed_keys(&self) -> Vec<ConsequenceId> {
         self.verifier.confirmed_keys()
+    }
+
+    /// (P3-L6) The retention/compaction observability surface — the
+    /// settled-transaction watermark, the unsettled window the
+    /// per-commit actionable scan pays for, the coverage-shed state,
+    /// and the rotation-cadence reading (see [`RetentionStats`]).
+    /// Read-only derived state: the growth a generation past the
+    /// documented cadence threshold is REPORTED here for the
+    /// maintenance layer's rotation decision, never silently
+    /// accepted, never auto-triggered.
+    pub fn retention_stats(&self) -> RetentionStats {
+        let journal_transactions = self.authority.journal.transactions().len() as u64;
+        let settled_above_watermark = self.authority.settled_above.len() as u64;
+        let settled = self.authority.settled_watermark as u64 + settled_above_watermark;
+        RetentionStats {
+            journal_transactions,
+            settled_watermark: self.authority.settled_watermark as u64,
+            settled_above_watermark,
+            unsettled_transactions: journal_transactions.saturating_sub(settled),
+            tracked_keys: self.authority.keys.len() as u64,
+            confirmed_keys: self.verifier.confirmed.len() as u64,
+            shed_coverage_entries: self.verifier.shed_coverage_total,
+            retained_settled_coverage: self.verifier.shed_eligible.len() as u64,
+            actionable_scan_transactions: self.authority.scan_transactions,
+            actionable_scan_envelopes: self.authority.scan_envelopes,
+            exceeds_rotation_cadence: journal_transactions >= ROTATION_CADENCE_TRANSACTIONS,
+        }
     }
 
     /// The actual durability tier of the underlying medium (the
@@ -3990,5 +4387,495 @@ mod tests {
         // still holds only the founding.
         let mut check = LocalFileMedium::open(dir.store()).unwrap();
         assert_eq!(check.validate().unwrap().records, 1, "the founding only");
+    }
+
+    // ------------------------------------------ P3-L6: the retention lane
+
+    /// (P3-L6) The multi-envelope capture fixture: one staged
+    /// transaction carrying `count` envelopes — distinct identities
+    /// (the npc field varies), per-identity occurrence coverage, all
+    /// under the one capture boundary. The shed fixture's settlement
+    /// granularity: one transaction's confirmation settles `count`
+    /// identities at once (a transaction may carry up to
+    /// `MAX_JOURNAL_ENVELOPES` envelopes).
+    fn staged_envelopes(index: u64, count: u64) -> Vec<ConsequenceEnvelope> {
+        (1..=count)
+            .map(|npc| {
+                ConsequenceEnvelope::capture(
+                    ConsequenceId::new(1, index, npc as u32),
+                    vec![ClassifiedSpan {
+                        span: OccurrenceSpan::new(2 * (npc - 1), 2 * npc).unwrap(),
+                        class: DurabilityClass::DurableEligible,
+                    }],
+                    SignalLane::Captured,
+                    CounterValues::default(),
+                    SourceBaseline {
+                        counters: CounterValues::default(),
+                        award: AwardCheckpoint {
+                            durable: Coverage::new(),
+                            provisional: Coverage::new(),
+                        },
+                    },
+                    SourcePosition {
+                        head: None,
+                        tick: 100 + index,
+                    },
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// The staged fixture's expected per-identity coverage (the
+    /// span-exact form the re-derivation must reproduce).
+    fn expected_span(npc: u64) -> Vec<ClassifiedSpan> {
+        vec![ClassifiedSpan {
+            span: OccurrenceSpan::new(2 * (npc - 1), 2 * npc).unwrap(),
+            class: DurabilityClass::DurableEligible,
+        }]
+    }
+
+    /// The multi-envelope capture: stages `count` envelopes under one
+    /// boundary and journals them as one transaction.
+    fn capture_many(
+        pipeline: &mut CommitPipeline<LocalFileMedium>,
+        index: u64,
+        count: u64,
+    ) -> TransactionId {
+        for envelope in staged_envelopes(index, count) {
+            pipeline.stage(envelope).unwrap();
+        }
+        let boundary = boundary(index);
+        let receipt = pipeline
+            .capture(
+                boundary.position,
+                boundary.classification,
+                boundary.dependencies,
+                boundary.frontier,
+                boundary.plan,
+            )
+            .unwrap();
+        receipt.journal.id
+    }
+
+    /// (P3-L6, test 1) THE WATERMARK'S OBSERVATIONAL SCALING: as the
+    /// settled history grows, the per-commit actionable-scan cost
+    /// stays FLAT — proportional to the unsettled window (the new
+    /// transaction's own envelope plus the one settlement proof for
+    /// the transaction the previous commit confirmed), never the
+    /// total history behind the mark. The pre-watermark scan examined
+    /// EVERY journal envelope on EVERY commit (iteration i paid i —
+    /// the quadratic total the watermark removes). The foreign
+    /// settlement is asserted at the same scale: another writer's
+    /// byte-identical capture confirms this pipeline's next
+    /// transaction, and the scan after it settles the LOCAL
+    /// transaction from the foreign evidence — the existing
+    /// foreign-receipt semantics, now also the watermark's advance.
+    #[test]
+    fn settled_watermark_keeps_the_per_commit_scan_flat_as_history_grows() {
+        let dir = TestDir::new("l6-watermark-flat");
+        let mut pipeline = fresh_pipeline(&dir);
+        const HISTORY: u64 = 120;
+        let mut max_scan_delta = 0u64;
+        for index in 1..=HISTORY {
+            capture_index(&mut pipeline, index);
+            let before = pipeline.retention_stats().actionable_scan_envelopes;
+            let CommitOutcome::Confirmed(receipt) = pipeline.commit_canonical().unwrap() else {
+                panic!("iteration {index} must confirm");
+            };
+            assert_eq!(receipt.keys, vec![ConsequenceId::new(1, index, 1)]);
+            let delta = pipeline.retention_stats().actionable_scan_envelopes - before;
+            max_scan_delta = max_scan_delta.max(delta);
+        }
+        assert!(
+            max_scan_delta <= 2,
+            "the per-commit scan cost must stay flat against the settled \
+             history's growth: {max_scan_delta}"
+        );
+        // The trailing confirmation settles at the next scan (the
+        // settlement proof runs in the collect that FOLLOWS the
+        // confirming commit): one more commit — nothing pending —
+        // advances the mark over the full history.
+        assert_eq!(
+            pipeline.commit_canonical().unwrap(),
+            CommitOutcome::NothingPending
+        );
+        let stats = pipeline.retention_stats();
+        // LINEAR cumulative work, not quadratic: the whole history's
+        // scan work is a small multiple of the transaction count
+        // (the pre-watermark total was HISTORY*(HISTORY+1)/2 = 7,260).
+        assert!(
+            stats.actionable_scan_envelopes <= 4 * HISTORY,
+            "the cumulative scan work must be linear in the history: {}",
+            stats.actionable_scan_envelopes
+        );
+        assert_eq!(stats.journal_transactions, HISTORY);
+        assert_eq!(stats.settled_watermark, HISTORY);
+        assert_eq!(stats.settled_transactions(), HISTORY);
+        assert_eq!(stats.unsettled_transactions, 0);
+        assert_eq!(stats.tracked_keys, HISTORY, "the dedup membership");
+        assert!(!stats.exceeds_rotation_cadence);
+
+        // THE FOREIGN SETTLEMENT: writer B (its own journal over the
+        // same store) captures the SAME deterministic identity
+        // byte-identically (the same content-derived TransactionId)
+        // and confirms it; this pipeline's commit then confirms
+        // through the foreign receipt — no new revision of its own —
+        // and the scan after it settles the local transaction.
+        capture_index(&mut pipeline, HISTORY + 1);
+        let journal_b = T1Journal::open(dir.path().join("journal-b.t1")).unwrap();
+        let mut writer_b = CommitPipeline::open(clean_medium(&dir), journal_b).unwrap();
+        pipeline_stage_b(&mut writer_b, HISTORY + 1);
+        let CommitOutcome::Confirmed(foreign) = writer_b.commit_canonical().unwrap() else {
+            panic!("writer B must confirm");
+        };
+        assert_eq!(foreign.keys, vec![ConsequenceId::new(1, HISTORY + 1, 1)]);
+        drop(writer_b);
+        let before_records = {
+            let mut check = LocalFileMedium::open(dir.store()).unwrap();
+            check.validate().unwrap().records
+        };
+        let CommitOutcome::Confirmed(receipt) = pipeline.commit_canonical().unwrap() else {
+            panic!("the foreign confirmation must satisfy the local attempt");
+        };
+        assert_eq!(receipt.revision, foreign.revision);
+        assert_eq!(receipt.keys, vec![ConsequenceId::new(1, HISTORY + 1, 1)]);
+        let mut check = LocalFileMedium::open(dir.store()).unwrap();
+        assert_eq!(
+            check.validate().unwrap().records,
+            before_records,
+            "the foreign confirmation installs no new revision"
+        );
+        assert_eq!(
+            pipeline.commit_canonical().unwrap(),
+            CommitOutcome::NothingPending
+        );
+        let stats = pipeline.retention_stats();
+        assert_eq!(
+            stats.settled_watermark,
+            HISTORY + 1,
+            "the foreign confirmation settles the local transaction"
+        );
+        assert_eq!(stats.unsettled_transactions, 0);
+    }
+
+    /// (P3-L6, test 2) THE FAIL-CLOSED HOLD: an unconfirmed
+    /// transaction holds the watermark — the mark cannot advance past
+    /// it, its key is re-collected on EVERY commit attempt (never
+    /// silently dropped), and the per-commit scan pays only the
+    /// unsettled window (the settled history behind the mark is never
+    /// revisited — the pre-watermark scan re-examined all 41
+    /// envelopes on every attempt). The hold is never a deadlock:
+    /// through a clean medium the held transaction confirms and the
+    /// mark advances.
+    #[test]
+    fn unconfirmed_transaction_holds_the_watermark_fail_closed() {
+        let dir = TestDir::new("l6-watermark-held");
+        // The settled history on a clean medium first; the fault is
+        // armed on the held pipeline's own instance (the
+        // medium-failure pattern: the fault hits the append, never
+        // the journal-side collect).
+        let mut pipeline = fresh_pipeline(&dir);
+        const HISTORY: u64 = 40;
+        for index in 1..=HISTORY {
+            capture_index(&mut pipeline, index);
+            let CommitOutcome::Confirmed(_) = pipeline.commit_canonical().unwrap() else {
+                panic!("iteration {index} must confirm");
+            };
+        }
+        drop(pipeline);
+        let journal = T1Journal::open(dir.path().join("journal.t1")).unwrap();
+        let medium = LocalFileMedium::open_with(
+            dir.store(),
+            Some(FaultControl::new().arm(FaultPoint::BeforeLock, FaultAction::InjectError)),
+        )
+        .unwrap();
+        let mut held = CommitPipeline::open(medium, journal).unwrap();
+        // The unconfirmed hole: captured after the settled history,
+        // never confirmed (every canonical append faults — a
+        // definite pre-commit failure that retains no pending
+        // attempt, so every attempt re-collects).
+        capture_index(&mut held, HISTORY + 1);
+        let mut max_delta = 0u64;
+        for attempt in 1..=8u64 {
+            let before = held.retention_stats().actionable_scan_envelopes;
+            assert!(
+                matches!(held.commit_canonical(), Err(PipelineError::Medium(_))),
+                "attempt {attempt} must fail on the faulted medium"
+            );
+            let delta = held.retention_stats().actionable_scan_envelopes - before;
+            if attempt == 1 {
+                // The session's first scan re-derives the watermark
+                // (O(journal) once — the honest open tradition): the
+                // 40 settlement proofs plus the held transaction's
+                // envelope.
+                assert_eq!(delta, HISTORY + 1);
+            } else {
+                max_delta = max_delta.max(delta);
+            }
+        }
+        assert_eq!(
+            max_delta, 1,
+            "the held window's per-commit cost is the unconfirmed \
+             transaction's envelope alone — never the settled history"
+        );
+        let stats = held.retention_stats();
+        assert_eq!(stats.journal_transactions, HISTORY + 1);
+        assert_eq!(
+            stats.settled_watermark, HISTORY,
+            "the mark is HELD at the unconfirmed transaction"
+        );
+        assert_eq!(stats.settled_transactions(), HISTORY);
+        assert_eq!(stats.unsettled_transactions, 1);
+        assert_eq!(
+            stats.actionable_scan_transactions,
+            HISTORY + 1 + 7,
+            "the first scan's 41 transaction visits plus one per held attempt"
+        );
+        // The held key keeps being collected — never silently
+        // dropped, never promoted.
+        assert_eq!(
+            held.status(ConsequenceId::new(1, HISTORY + 1, 1))
+                .unwrap()
+                .phase,
+            KeyPhase::JournaledT1
+        );
+        // The hold is not a deadlock: through a clean medium the held
+        // transaction confirms and the mark advances past it.
+        drop(held);
+        let mut recovered = fresh_pipeline(&dir);
+        let CommitOutcome::Confirmed(receipt) = recovered.commit_canonical().unwrap() else {
+            panic!("the held transaction confirms through the clean medium");
+        };
+        assert_eq!(receipt.keys, vec![ConsequenceId::new(1, HISTORY + 1, 1)]);
+        assert_eq!(
+            recovered.commit_canonical().unwrap(),
+            CommitOutcome::NothingPending
+        );
+        let stats = recovered.retention_stats();
+        assert_eq!(stats.settled_watermark, HISTORY + 1);
+        assert_eq!(stats.unsettled_transactions, 0);
+    }
+
+    /// (P3-L6, test 3) THE COVERAGE SHED: past the documented
+    /// retention bound, settled producers' entries shed their
+    /// coverage detail — the dedup membership NEVER drops
+    /// (`is_confirmed`, the producing transaction, the
+    /// conflicting-reuse refusal all survive), in-session provenance
+    /// queries REFUSE the shed detail, and a fresh open RE-DERIVES
+    /// every entry's byte-exact coverage from the chain (the recovery
+    /// composition's path). 1,400 settled identities against the
+    /// 1,024 bound: 376 shed, the grace window retains the rest.
+    #[test]
+    fn settled_coverage_sheds_past_the_documented_bound_keeping_membership() {
+        let dir = TestDir::new("l6-coverage-shed");
+        let mut pipeline = fresh_pipeline(&dir);
+        const PER_TRANSACTION: u64 = 140;
+        const TRANSACTIONS: u64 = 10;
+        const TOTAL: u64 = PER_TRANSACTION * TRANSACTIONS;
+        for index in 1..=TRANSACTIONS {
+            capture_many(&mut pipeline, index, PER_TRANSACTION);
+            let CommitOutcome::Confirmed(receipt) = pipeline.commit_canonical().unwrap() else {
+                panic!("transaction {index} must confirm");
+            };
+            assert_eq!(receipt.keys.len() as u64, PER_TRANSACTION);
+        }
+        // The last transaction settles at the next scan.
+        assert_eq!(
+            pipeline.commit_canonical().unwrap(),
+            CommitOutcome::NothingPending
+        );
+        let stats = pipeline.retention_stats();
+        assert_eq!(stats.confirmed_keys, TOTAL);
+        assert_eq!(stats.settled_transactions(), TRANSACTIONS);
+        assert_eq!(stats.settled_watermark, TRANSACTIONS);
+        // THE BOUND: 1,400 eligible − 1,024 retained = 376 shed (the
+        // oldest settlements first — the FIFO's front).
+        assert_eq!(
+            stats.shed_coverage_entries,
+            TOTAL - SETTLED_COVERAGE_RETAINED as u64
+        );
+        assert_eq!(
+            stats.retained_settled_coverage,
+            SETTLED_COVERAGE_RETAINED as u64
+        );
+        // The shed identities: transaction 1's settlement batch (the
+        // FIFO's front) — membership retained, detail refused.
+        let shed_id = ConsequenceId::new(1, 1, 1);
+        assert!(pipeline.is_confirmed(shed_id), "the membership never drops");
+        assert_eq!(
+            pipeline.confirmed_transaction(shed_id),
+            pipeline
+                .journal()
+                .transactions()
+                .first()
+                .map(|transaction| transaction.id),
+            "the producing transaction is kept"
+        );
+        assert_eq!(
+            pipeline.confirmed_coverage(shed_id),
+            None,
+            "the shed detail refuses in-session (it re-derives at open)"
+        );
+        // A conflicting re-stage of a shed identity still fails
+        // closed — the identity authority (keys) is never dropped.
+        let mut conflicting = staged_envelopes(99, 1).pop().unwrap();
+        conflicting.id = shed_id;
+        assert!(matches!(
+            pipeline.stage(conflicting),
+            Err(PipelineError::ConflictingReuse { .. })
+        ));
+        // A retained identity (the newest settlement) answers with
+        // the full coverage — the grace window.
+        let retained_id = ConsequenceId::new(1, TRANSACTIONS, 1);
+        assert!(pipeline.is_confirmed(retained_id));
+        assert_eq!(
+            pipeline.confirmed_coverage(retained_id).unwrap(),
+            expected_span(1).as_slice()
+        );
+        // The export omits the shed detail, keeps the retained —
+        // reported in the stats, never silent.
+        let evidence = pipeline.confirmed_evidence();
+        assert_eq!(evidence.len(), SETTLED_COVERAGE_RETAINED);
+        assert!(!evidence.contains_key(&shed_id));
+        assert!(evidence.contains_key(&retained_id));
+        // THE RE-DERIVATION: a fresh open re-collects every batch
+        // entry with full coverage — byte-exact against the staged
+        // fixture, for shed and retained identities alike (the
+        // recovery composition's exact path).
+        drop(pipeline);
+        let fresh = fresh_pipeline(&dir);
+        for (index, npc) in [
+            (1u64, 1u64),
+            (1, PER_TRANSACTION),
+            (5, 64),
+            (TRANSACTIONS, 1),
+        ] {
+            let id = ConsequenceId::new(1, index, npc as u32);
+            assert!(fresh.is_confirmed(id));
+            assert_eq!(
+                fresh.confirmed_coverage(id).unwrap(),
+                expected_span(npc).as_slice(),
+                "the open walk re-derives the coverage exactly as before"
+            );
+        }
+        assert_eq!(fresh.confirmed_evidence().len() as u64, TOTAL);
+        assert_eq!(fresh.retention_stats().shed_coverage_entries, 0);
+    }
+
+    /// (P3-L6, test 4) THE SHED REFUSAL (fail-closed): an identity
+    /// whose producing transaction is only PARTIALLY confirmed — one
+    /// envelope chain-confirmed by a foreign batch carrying the exact
+    /// provenance, the other still unconfirmed — is NEVER
+    /// shed-eligible: the entry keeps its full coverage, and the
+    /// exact-provenance comparisons that consult it (the stale-rebase
+    /// remaining-keys filter) keep succeeding. A shed keyed on
+    /// confirmation alone would empty the coverage and turn this
+    /// commit into a false ConfirmedProvenanceMismatch.
+    #[test]
+    fn partially_settled_producer_retains_coverage_for_exact_provenance() {
+        let dir = TestDir::new("l6-shed-refusal");
+        ensure_founded(&dir);
+        let id_a = ConsequenceId::new(1, 1, 1);
+        let id_b = ConsequenceId::new(1, 1, 2);
+        // Writer A captures ONE transaction carrying both envelopes —
+        // the partially-settlable producer.
+        let journal_a = T1Journal::open(dir.path().join("journal-a.t1")).unwrap();
+        let mut writer_a =
+            CommitPipeline::open(LocalFileMedium::open(dir.store()).unwrap(), journal_a).unwrap();
+        let transaction = capture_many(&mut writer_a, 1, 2);
+        // THE PARTIAL FOREIGN BATCH: a valid canonical revision on
+        // the founding carrying ONLY id_a, under the journal
+        // envelope's exact provenance (the same producing
+        // transaction, coverage, and effect commitment) — a foreign
+        // writer's legitimate partial confirmation (a batch need not
+        // carry every key of a transaction; the medium does not know
+        // journals — the hand-crafted-valid-revision pattern the
+        // canonical-conflict battery uses).
+        let envelope_a = &staged_envelopes(1, 2)[0];
+        let batch = ConsequenceBatch {
+            entries: vec![BatchEntry {
+                id: id_a,
+                transaction,
+                coverage: envelope_a.sub_spans.clone(),
+                effect: envelope_a.effect_commitment().unwrap(),
+            }],
+        };
+        let batch_object = StoredObject::new(batch.canonical_bytes().unwrap()).unwrap();
+        let batch_hash = batch_object.hash();
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let founding_head = medium.head().unwrap().expect("founded");
+        let record = RevisionRecord::regular(founding_head, 0, 100)
+            .with_idempotency_key(batch_hash.as_bytes().to_vec())
+            .with_content_refs(vec![batch_hash]);
+        match medium
+            .append(
+                &record,
+                std::slice::from_ref(&batch_object),
+                Some(founding_head),
+            )
+            .unwrap()
+        {
+            AppendOutcome::Accepted { .. } => {}
+            other => panic!("the partial foreign revision must append: {other:?}"),
+        }
+        drop(medium);
+        // A's commit: the actionable scan sees both keys unconfirmed
+        // (A's verified head predates the foreign revision); the
+        // append meets the advanced head — the stale re-walk learns
+        // the partial foreign confirmation — and the rebase's
+        // remaining-keys filter checks id_a's entry against the
+        // local attempt's EXACT provenance, coverage included: the
+        // comparison the shed must have refused to empty (id_a's
+        // producer is unsettled — id_b is still unconfirmed).
+        let CommitOutcome::Confirmed(receipt) = writer_a.commit_canonical().unwrap() else {
+            panic!("the partial foreign confirmation must satisfy id_a exactly");
+        };
+        assert_eq!(
+            receipt.keys,
+            vec![id_b],
+            "only the unconfirmed key is submitted"
+        );
+        // The refusal's evidence: BOTH entries carry their full
+        // coverage — nothing was eligible (the producer T1 is
+        // unsettled at the settlement check).
+        assert!(writer_a.is_confirmed(id_a));
+        assert!(writer_a.is_confirmed(id_b));
+        assert_eq!(
+            writer_a.confirmed_coverage(id_a).unwrap(),
+            expected_span(1).as_slice(),
+            "the partially-settled producer's entry retains its coverage"
+        );
+        assert_eq!(
+            writer_a.confirmed_coverage(id_b).unwrap(),
+            expected_span(2).as_slice()
+        );
+        let stats = writer_a.retention_stats();
+        assert_eq!(stats.shed_coverage_entries, 0);
+        assert_eq!(stats.retained_settled_coverage, 0);
+        assert_eq!(stats.unsettled_transactions, 1);
+        // The settlement completes at the next scan (both envelopes
+        // now confirmed under exact provenance) — the identities
+        // become eligible and are RETAINED within the documented
+        // bound: the coverage still answers in-session.
+        assert_eq!(
+            writer_a.commit_canonical().unwrap(),
+            CommitOutcome::NothingPending
+        );
+        let stats = writer_a.retention_stats();
+        assert_eq!(stats.settled_watermark, 1);
+        assert_eq!(stats.settled_transactions(), 1);
+        assert_eq!(stats.retained_settled_coverage, 2);
+        assert_eq!(stats.shed_coverage_entries, 0);
+        assert_eq!(
+            writer_a.confirmed_coverage(id_a).unwrap(),
+            expected_span(1).as_slice(),
+            "within the bound the settled detail is retained"
+        );
+        // The store: founding + the partial foreign revision + A's
+        // id_b revision — the foreign partial confirmation installed
+        // exactly once, A's rebase exactly once.
+        let mut check = LocalFileMedium::open(dir.store()).unwrap();
+        assert_eq!(check.validate().unwrap().records, 3);
     }
 }
