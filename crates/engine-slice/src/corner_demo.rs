@@ -264,10 +264,23 @@ impl LocomotionCrowd {
 
     /// Constructs the crowd with the rain layer warm-started (the
     /// first route waypoint's eye — the first presented frame is
-    /// already wet).
-    fn with_rain() -> Self {
+    /// already wet). `ripple_decimation` is the walk-time density
+    /// knob (the ripple-visibility diagnostic's own ladder: None =
+    /// the shipped 320:1 policy and its exact pins; a value swaps
+    /// ONLY the admission rate — the owner's future-walk decision
+    /// tool, never a silent production change).
+    fn with_rain(ripple_decimation: Option<u32>) -> Self {
         let mut crowd = Self::new();
-        crowd.rain = Some(crate::corner_weather::RainLayer::new([-5.0, 1.7, 13.0]));
+        crowd.rain = Some(match ripple_decimation {
+            None => crate::corner_weather::RainLayer::new([-5.0, 1.7, 13.0]),
+            Some(decimation) => crate::corner_weather::RainLayer::with_ripple_policy(
+                [-5.0, 1.7, 13.0],
+                engine_core::ripple::RipplePolicy {
+                    decimation,
+                    ..crate::corner_weather::RIPPLE_POLICY
+                },
+            ),
+        });
         crowd
     }
 
@@ -647,6 +660,7 @@ pub fn run(
     wet: bool,
     behavior: bool,
     weather: Option<String>,
+    ripple_decimation: Option<u32>,
     audio: bool,
 ) -> Result<(), String> {
     let mut app = ShellApp::new(ShellConfig {
@@ -685,17 +699,34 @@ pub fn run(
     // When weather is "rain", the crowd includes the warm-started rain layer.
     let mut crowd = populated.then(|| {
         if weather.as_ref().is_some_and(|w| w == "rain") {
+            if let Some(decimation) = ripple_decimation {
+                println!(
+                    "rain layer: enabled (the emitter seed 0xDEADBEEF, policy rate=480/s) \
+                     — WALK-TIME DENSITY: ripple decimation {decimation}:1 (the shipped \
+                     policy is 320:1; this route's campaign and pins are the DIAGNOSTIC \
+                     arm, not the shipped configuration)"
+                );
+            } else {
+                println!("rain layer: enabled (the emitter seed 0xDEADBEEF, policy rate=480/s)");
+            }
             if behavior {
                 println!(
                     "behavior spine composed: 24 schedules, the commitment wakes drive the crowd"
                 );
-                println!("rain layer: enabled (the emitter seed 0xDEADBEEF, policy rate=480/s)");
                 let mut crowd = LocomotionCrowd::with_behavior();
-                crowd.rain = Some(crate::corner_weather::RainLayer::new([-5.0, 1.7, 13.0]));
+                crowd.rain = Some(match ripple_decimation {
+                    None => crate::corner_weather::RainLayer::new([-5.0, 1.7, 13.0]),
+                    Some(decimation) => crate::corner_weather::RainLayer::with_ripple_policy(
+                        [-5.0, 1.7, 13.0],
+                        engine_core::ripple::RipplePolicy {
+                            decimation,
+                            ..crate::corner_weather::RIPPLE_POLICY
+                        },
+                    ),
+                });
                 crowd
             } else {
-                println!("rain layer: enabled (the emitter seed 0xDEADBEEF, policy rate=480/s)");
-                LocomotionCrowd::with_rain()
+                LocomotionCrowd::with_rain(ripple_decimation)
             }
         } else if behavior {
             println!("behavior spine composed: 24 schedules, the commitment wakes drive the crowd");

@@ -29,6 +29,31 @@ work from THIS file alone.
   still-water composition, ring confinement, and its acceptance
   table) is the path to readable impacts; the sign-off walk's
   negative result is the package's motivating evidence.
+- **Era 2 CLOSED here (the owner's completion directive, 2026-11-27):**
+  the owner reviewed the density question, walked the composition
+  again ("I have just now seen ripples for the very first time" —
+  the flat-daylight variant), and directed completion: every
+  finding of both independent audits (the Era-2 audit's 1–19 and
+  the sign-off review's 20–28) is remediated on `main`, every
+  corrective green on all five CI jobs, and the one open
+  presentation question — the ripple density — is resolved as a
+  WALK-TIME TOOL, not a unilateral policy change:
+  `--corner --weather rain --ripple-decimation <n>` swaps ONLY the
+  admission rate (the shipped 320:1 policy and its exact pins stay
+  the default — MEASURED on the rig: the default route's census
+  spawned=17, the 80:1 arm spawned=71 with 15 active at exit, the
+  typed refusals loud). The owner's future walk decides the re-pin
+  (40/80/160) vs the puddle package; the density A/B
+  (`--benchmark-ripple-visibility`) and the knob are the decision
+  instruments. **Era 2 is code-complete, owner-walked, and
+  remediation-verified — the sign-off review's own closure
+  criteria met (all three blocker packages landed: findings 20–21
+  via PR #68, finding 22 via #69, findings 23–26 via #70, the
+  reporting items 27–28 and the diagnostic in the same); the
+  puddle prototype, the warmed combined-view allocation scope,
+  and the owner decision lists (NPC-AI §9, T-06 physics, the
+  audio ambitions) are ERA 3 PLANNING INPUTS, not Era 2 work.**
+  The next era begins with the owner's plans.
 - **Reconciled for the sign-off review remediation's completion on
   2026-11-27:** the independent sign-off review at `ec4eb3c`
   (`docs/ERA2-REMEDIATION-SIGNOFF-ec4eb3c.md`) held Era-2 sign-off
