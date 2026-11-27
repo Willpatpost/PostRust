@@ -28,13 +28,45 @@
 //!    velocity[1] * dt; position[2] += velocity[2] * dt`.
 //! 4. `life -= dt`.
 //! 5. Death test: dead iff `life <= 0.0` OR (`kill_y` is `Some` and
-//!    `position[1] <= kill_y`). A kill-plane death is observed at
-//!    the IMPACT CROSSING — the linear interpolation between the
-//!    pre-step and post-step positions where the step straddles the
-//!    plane (see [`kill_plane_impact`]) — never at the
-//!    post-integration position below the plane (finding 12's
+//!    `position[1] <= kill_y`) OR the integrated state left the
+//!    finite domain (IA-03's checked update — the
+//!    finite-survivor guarantee below). A kill-plane death is
+//!    observed at the IMPACT CROSSING — the linear interpolation
+//!    between the pre-step and post-step positions where the step
+//!    straddles the plane (see [`kill_plane_impact`]) — never at
+//!    the post-integration position below the plane (finding 12's
 //!    impact-XZ correction: the ring lands where the drop crossed
 //!    the world's receiver, not up to one full step past it).
+//!
+//! # THE FINITE-SURVIVOR GUARANTEE (IA-03's checked update)
+//! The independent audit's five-tick witness (velocity f32::MAX on
+//! a zero point volume, life [1, 1], drag 1: four 0.03 ticks then
+//! one 0x3f6147af tick) left a LIVE particle at X = +∞ with life
+//! 5.96e-8 — position addition and life subtraction round
+//! separately, so the exact-arithmetic inference "a survivor's
+//! elapsed time ≤ its drawn lifetime" (B05's admission proof
+//! shape) does not hold in f32, and NO admission margin can
+//! restore it: (a) a dt below half an ulp of the remaining life
+//! decrements nothing (the life clock stalls while position keeps
+//! gaining `v·dt`), so a survivor's exact elapsed time is unbounded
+//! over an unbounded tick sequence — even a 1 m/s particle reaches
+//! infinity after ~3.4e48 stalled ticks; (b) each position
+//! addition rounds, and the accumulated drift over unbounded
+//! ticks is likewise unbounded. The guarantee is therefore
+//! enforced ON THE ACTUAL INTEGRATED STATE: after the pinned
+//! order's steps 1–4, any nonfinite position or velocity
+//! component transitions the particle to dead that tick —
+//! compacted away stably, counted in [`TickReport::deaths`],
+//! never observed as a kill death (not a landing) — so the active
+//! prefix holds only all-finite state at every tick boundary.
+//! Life needs no check: a live particle enters the tick with
+//! positive finite life against the gated finite-nonnegative dt,
+//! and `|life − dt| ≤ max(|life|, |dt|) ≤ f32::MAX` — the
+//! subtraction cannot leave the finite domain. The check is
+//! branch-not-taken for every ordinary configuration (the
+//! admission gates hold ordinary excursions ~36 orders of
+//! magnitude below the f32 ceiling), so the pinned trajectory
+//! arithmetic is byte-identical — the campaign digest pin holds.
 //!
 //! No transcendental function appears anywhere on a byte path —
 //! gravity and drag are fixed constants (the libm-free law).
@@ -152,11 +184,12 @@ pub struct TickReport {
     pub overflow: Option<SpawnOverflow>,
     /// Active particles after the tick.
     pub active: u32,
-    /// Particles that DIED this tick (kill-plane and lifetime
-    /// deaths together) — the emitter's OWN observation, exposed for
-    /// the layer's census conservation and the census check (finding
-    /// 16's correction: deaths are no longer re-derived downstream
-    /// by subtracting refusals from admissions). The identity:
+    /// Particles that DIED this tick (kill-plane, lifetime, and
+    /// IA-03's nonfinite-state checked-update deaths together) —
+    /// the emitter's OWN observation, exposed for the layer's
+    /// census conservation and the census check (finding 16's
+    /// correction: deaths are no longer re-derived downstream by
+    /// subtracting refusals from admissions). The identity:
     /// `active_before + spawned == deaths + active` (an admitted
     /// particle is live or dead by the tick's end).
     pub deaths: u32,
@@ -443,9 +476,12 @@ impl Emitter {
     /// drop when it does not (never a silent drop; the drain is
     /// structurally bounded by the cap). Phase 2, integrate: every
     /// active particle steps through THE PINNED INTEGRATION ORDER,
-    /// the death test runs, every kill-plane death is observed
-    /// BEFORE the compaction write decision, and survivors compact
-    /// stably into the prefix. The report must be observed.
+    /// the death test runs (lifetime expiry, the kill plane, or
+    /// IA-03's nonfinite-state checked update — a nonfinite
+    /// integrated position or velocity component is a death, never
+    /// a live particle at infinity), every kill-plane death is
+    /// observed BEFORE the compaction write decision, and survivors
+    /// compact stably into the prefix. The report must be observed.
     ///
     /// THE TYPED DT REFUSAL (finding 17's correction, identical to
     /// [`Emitter::tick`]'s): a non-finite or negative `dt` is
@@ -520,7 +556,19 @@ impl Emitter {
                 let impact = kill_plane_impact(pre_position, p.position, kill_y);
                 on_kill_death(impact);
             }
-            let dead = p.life <= 0.0 || kill_death;
+            // IA-03's CHECKED UPDATE (the finite-survivor guarantee,
+            // module doc): the integrated state is checked AS
+            // INTEGRATED — a nonfinite position or velocity
+            // component transitions the particle to dead this tick
+            // (compacted away stably, counted in `deaths`, never
+            // observed as a kill death — not a landing). The kill
+            // observation above is UNCHANGED and fires first: a
+            // death is a kill death iff the kill condition holds,
+            // and IA-04's totality guard keeps its impact finite.
+            // Branch-not-taken for every ordinary configuration —
+            // the pinned trajectory arithmetic is byte-identical.
+            let nonfinite_death = !integrated_state_is_finite(&p);
+            let dead = p.life <= 0.0 || kill_death || nonfinite_death;
             if !dead {
                 self.particles[write] = p;
                 write += 1;
@@ -606,6 +654,23 @@ fn gt_total(a: f32, b: f32) -> bool {
     matches!(a.partial_cmp(&b), Some(Ordering::Greater))
 }
 
+/// Whether one particle's INTEGRATED state is finite on every axis
+/// — IA-03's checked-update predicate (the finite-survivor
+/// guarantee, module doc), evaluated after the pinned order's steps
+/// 1–4 in the fixed axis order. Life needs no check: a live
+/// particle enters the tick with positive finite life against the
+/// gated finite-nonnegative dt, and `|life − dt| ≤ max(|life|,
+/// |dt|) ≤ f32::MAX` — the subtraction cannot leave the finite
+/// domain (and cannot produce NaN from finite operands).
+fn integrated_state_is_finite(p: &Particle) -> bool {
+    p.position[0].is_finite()
+        && p.position[1].is_finite()
+        && p.position[2].is_finite()
+        && p.velocity[0].is_finite()
+        && p.velocity[1].is_finite()
+        && p.velocity[2].is_finite()
+}
+
 /// The IMPACT position where one integration step crossed the kill
 /// plane (finding 12's impact-XZ correction). The step's endpoints
 /// are `pre` (the position before the step) and `post` (the
@@ -621,6 +686,23 @@ fn gt_total(a: f32, b: f32) -> bool {
 /// (a spawn below the receiver — degenerate authored data), the
 /// crossing happened at or before the step and the honest in-step
 /// estimate is the post-step position.
+///
+/// TOTALITY (B05's guard, extended by IA-04 to BOTH arms): the
+/// returned impact is finite on every axis for every kill death
+/// the caller can invoke this on. The dt domain is deliberately
+/// open (refusing dt > lifetime would outlaw valid short-spark
+/// policies), so an oversized-but-legal step can integrate the
+/// post position off the finite domain — the audit's already-below
+/// witness sent `[inf, 0, 0]` to the observer through this arm.
+/// Both arms therefore fall back PER AXIS to the PRE value when
+/// the post-derived axis is nonfinite (the straddling arm guards
+/// the interpolated XZ; the already-below arm guards the verbatim
+/// post). The PRE position is finite by construction: a live
+/// particle's state is all-finite at every tick boundary (IA-03's
+/// checked update), and a spawn's position lands inside
+/// `[volume.min, volume.max]` — both endpoints finite by admission,
+/// and rounding cannot leave an interval whose endpoints are
+/// representable.
 ///
 /// Pure fixed-order IEEE f32 — no transcendental, byte-identical on
 /// every platform; the particle-state path is UNTOUCHED (the death
@@ -667,8 +749,19 @@ fn kill_plane_impact(pre: [f32; 3], post: [f32; 3], kill_y: Option<f32>) -> [f32
             ]
         }
         // No kill plane (unreachable from the kill-death branch) or
-        // the degenerate already-below case: the post position.
-        _ => post,
+        // the degenerate already-below case: the post position —
+        // TOTAL per axis (IA-04's extension of the straddling
+        // branch's guard): a nonfinite post axis (an oversized but
+        // legal step integrating off the finite domain — the
+        // audit's witness: post `[inf, 0, 0]`) falls back to that
+        // axis's PRE value, finite by the doc law above, so the
+        // already-below observer never receives infinity. The
+        // finite case is byte-identical to the pre-fix arm.
+        _ => [
+            if post[0].is_finite() { post[0] } else { pre[0] },
+            if post[1].is_finite() { post[1] } else { pre[1] },
+            if post[2].is_finite() { post[2] } else { pre[2] },
+        ],
     }
 }
 
@@ -2188,5 +2281,157 @@ mod tests {
             ],
             "the finite straddling case interpolates exactly as before"
         );
+    }
+
+    /// IA-03's five-tick infinite-survivor witness (the independent
+    /// audit's fixture, verbatim): a zero point volume, rate 34,
+    /// velocity [f32::MAX, 0, 0], zero jitter and gravity, lifetime
+    /// [1, 1], drag 1, no kill plane, seed 1 — admitted by every
+    /// gate (the worst-case X excursion is exactly f32::MAX,
+    /// finite). Four tick(0.03) steps, then
+    /// tick(f32::from_bits(0x3f6147af)) — the final dt sits ONE ULP
+    /// below the stored remaining life, and the position addition
+    /// `X += f32::MAX·dt` rounds to +inf while the life subtraction
+    /// leaves 5.96e-8 (= 2⁻²⁴): position addition and life
+    /// subtraction round separately, so the exact-arithmetic
+    /// survivor argument ("a survivor's elapsed time ≤ its drawn
+    /// lifetime") fails in f32. The pre-fix emitter kept the first
+    /// particle LIVE in the public slice at X = +∞ with life
+    /// 5.96e-8. The checked update (the finite-survivor guarantee,
+    /// module doc) kills it: the fifth tick counts it in `deaths`,
+    /// and no live particle holds a nonfinite component.
+    #[test]
+    fn five_tick_infinite_survivor_witness_leaves_no_live_particle_at_infinity() {
+        let config = EmitterConfig {
+            volume: SpawnVolume {
+                min: [0.0; 3],
+                max: [0.0; 3],
+            },
+            rate: 34.0,
+            base_velocity: [f32::MAX, 0.0, 0.0],
+            velocity_jitter: [0.0; 3],
+            lifetime: [1.0, 1.0],
+            gravity: 0.0,
+            drag_factor: 1.0,
+            kill_y: None,
+            seed: 1,
+        };
+        let mut emitter = Emitter::new(config).expect("the audit's witness is admitted");
+        // Four 0.03 ticks: one spawn per tick (34·0.03 ≈ 1.02 units
+        // with the carry), nobody dies, every live state finite —
+        // the first particle accumulates X ≈ 4.1e37 with ≈ 0.88
+        // life stored.
+        for t in 1..=4u32 {
+            let report = emitter
+                .tick(0.03)
+                .expect("the fixture dt is finite and nonnegative");
+            assert_eq!(report.deaths, 0, "tick {t}: the cohort is alive");
+            assert_eq!(report.spawned, 1, "tick {t}: the 1.02-unit gain spawns one");
+            for p in emitter.particles() {
+                assert!(
+                    p.position[0].is_finite()
+                        && p.position[1].is_finite()
+                        && p.position[2].is_finite()
+                        && p.velocity[0].is_finite()
+                        && p.velocity[1].is_finite()
+                        && p.velocity[2].is_finite(),
+                    "tick {t}: no live particle holds a nonfinite component (found {p:?})"
+                );
+            }
+        }
+        assert_eq!(emitter.active_count(), 4, "four spawns, zero deaths");
+        // THE WITNESS'S FINAL TICK: 0x3f6147af — one ulp below the
+        // stored remaining life (the audit's exact bit pattern).
+        let fifth = emitter
+            .tick(f32::from_bits(0x3f6147af))
+            .expect("the fixture dt is finite and nonnegative");
+        // Pre-fix: deaths 0, the first particle LIVE at X = +inf
+        // with life 5.96e-8. Post-fix: the checked update killed it.
+        assert_eq!(
+            fifth.deaths, 1,
+            "the nonfinite survivor died — never a live particle at infinity"
+        );
+        // The census identity with the nonfinite death counted:
+        // active_before (4) + spawned == deaths (1) + active.
+        assert_eq!(4 + fifth.spawned, fifth.deaths + fifth.active);
+        for p in emitter.particles() {
+            assert!(
+                p.position[0].is_finite()
+                    && p.position[1].is_finite()
+                    && p.position[2].is_finite()
+                    && p.velocity[0].is_finite()
+                    && p.velocity[1].is_finite()
+                    && p.velocity[2].is_finite(),
+                "no live particle holds a nonfinite component (found {p:?})"
+            );
+            assert!(p.life > 0.0, "the survivors are live");
+        }
+    }
+
+    /// IA-04's already-below witness (the independent audit's
+    /// fixture, verbatim): the same zero point volume, unit life and
+    /// f32::MAX X velocity, rate 1, kill_y = Some(1.0), dt = 2.0 —
+    /// an oversized but LEGAL step. Two particles spawn at Y = 0
+    /// (below the plane), integrate X to +inf, and the kill
+    /// condition holds (0 <= 1.0), so both are kill deaths observed
+    /// through the PUBLIC observer. The pre-fix already-below arm
+    /// (`_ => post`) returned the unguarded post position and the
+    /// observer received [inf, 0.0, 0.0] twice. The fix extends the
+    /// straddling branch's totality to the fallback: a nonfinite
+    /// post axis falls back to that axis's PRE value (the spawn
+    /// position — finite), so the impact is [0, 0, 0].
+    #[test]
+    fn already_below_spawn_impact_is_finite_on_oversized_step() {
+        // The helper-level known answer: the already-below pair with
+        // a nonfinite post — per axis, post when finite, else pre.
+        assert_eq!(
+            kill_plane_impact([0.0, 0.0, 0.0], [f32::INFINITY, 0.0, 0.0], Some(1.0)),
+            [0.0, 0.0, 0.0],
+            "the already-below arm is total: a nonfinite post axis falls back to pre"
+        );
+        // The public observer, driven with the audit's exact fixture.
+        let config = EmitterConfig {
+            volume: SpawnVolume {
+                min: [0.0; 3],
+                max: [0.0; 3],
+            },
+            rate: 1.0,
+            base_velocity: [f32::MAX, 0.0, 0.0],
+            velocity_jitter: [0.0; 3],
+            lifetime: [1.0, 1.0],
+            gravity: 0.0,
+            drag_factor: 1.0,
+            kill_y: Some(1.0),
+            seed: 1,
+        };
+        let mut emitter = Emitter::new(config).expect("the audit's witness is admitted");
+        let mut observed: Vec<[f32; 3]> = Vec::new();
+        let report = emitter
+            .tick_observing_kill_deaths(2.0, |impact| observed.push(impact))
+            .expect("dt 2.0 is finite and nonnegative (oversized but legal)");
+        assert_eq!(
+            report.spawned, 2,
+            "dt 2.0 × rate 1.0: two units, two spawns"
+        );
+        assert_eq!(
+            observed.len(),
+            2,
+            "both spawns die at the plane they started below"
+        );
+        for (i, impact) in observed.iter().enumerate() {
+            assert!(
+                impact[0].is_finite() && impact[1].is_finite() && impact[2].is_finite(),
+                "impact {i} is finite on every axis — pre-fix the observer received \
+                 [inf, 0.0, 0.0] (found {impact:?})"
+            );
+            assert_eq!(
+                *impact,
+                [0.0, 0.0, 0.0],
+                "impact {i}: the already-below fallback — the nonfinite post X falls \
+                 back to the pre (spawn) X, the finite post axes stay"
+            );
+        }
+        assert_eq!(report.active, 0, "both particles died this tick");
+        assert_eq!(report.deaths, 2, "the census counts both deaths");
     }
 }
