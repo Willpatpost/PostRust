@@ -58,7 +58,7 @@
 //! will compute the same position as the unskinned path.
 
 use crate::proxy_instances::sin_cos_turn;
-use once_cell::sync::OnceCell;
+use std::sync::OnceLock;
 
 /// The number of joints in the v2 humanoid skeleton.
 pub const HUMANOID_JOINTS: usize = 11;
@@ -66,7 +66,8 @@ pub const HUMANOID_JOINTS: usize = 11;
 /// The cached rest pose block - computed once at first call and reused.
 /// The rest pose is a pure function of the immutable skeleton, so we cache it
 /// once to avoid recomputing for every stationary NPC on every frame.
-static REST_POSE_BLOCK_CACHE: OnceCell<[[[f32; 4]; 4]; HUMANOID_JOINTS]> = OnceCell::new();
+/// (`std::sync::OnceLock` — no external dependency for this.)
+static REST_POSE_BLOCK_CACHE: OnceLock<[[[f32; 4]; 4]; HUMANOID_JOINTS]> = OnceLock::new();
 
 /// The pose stride: 11 column-major mat4s of f32, 64 bytes each = 704 bytes.
 pub const POSE_STRIDE: usize = HUMANOID_JOINTS * 64;
@@ -418,47 +419,80 @@ fn matrix_multiply_4x4(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     out
 }
 
+/// The precomputed skin bind data for one skeleton: the per-joint
+/// inverse-bind matrices `translate(-bind_world_j)` derived from the
+/// chain-composed REST pose (the all-zero `JointPose`). A pure function
+/// of the immutable skeleton — construct once per evaluation batch (or
+/// once per process for a fixed skeleton) and share across every
+/// [`skin_matrices_bound`] call, instead of recomposing the rest chain
+/// per skinned NPC per frame.
+pub struct SkinBind {
+    inv_bind: [[[f32; 4]; 4]; HUMANOID_JOINTS],
+}
+
+impl SkinBind {
+    /// Computes the bind exactly as [`skin_matrices`] does internally —
+    /// the same fixed operation order, so the rest-identity bit-exactness
+    /// contract carries over unchanged.
+    pub fn from_skeleton(skeleton: &[Joint; HUMANOID_JOINTS]) -> Self {
+        let rest_pose = [JointPose {
+            delta_pos: [0.0; 3],
+            delta_turns: [0; 3],
+        }; HUMANOID_JOINTS];
+        let rest_worlds = compose_joint_matrices(skeleton, &rest_pose);
+        let mut inv_bind = [[[0.0; 4]; 4]; HUMANOID_JOINTS];
+        for idx in 0..HUMANOID_JOINTS {
+            // Extract the bind world translation from the rest world matrix.
+            let bind_world_translation = [
+                rest_worlds[idx][3][0],
+                rest_worlds[idx][3][1],
+                rest_worlds[idx][3][2],
+            ];
+            // Build the translation matrix for -bind_world.
+            inv_bind[idx] = compose_transform_matrix(
+                [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], // identity rotation
+                [
+                    -bind_world_translation[0],
+                    -bind_world_translation[1],
+                    -bind_world_translation[2],
+                ],
+            );
+        }
+        SkinBind { inv_bind }
+    }
+}
+
+/// Computes the skin matrices from precomputed bind data: `M_j = J_j ·
+/// inv_bind_j` per joint — the final multiply of [`skin_matrices`], the
+/// rest-chain cost already paid once at [`SkinBind::from_skeleton`].
+pub fn skin_matrices_bound(
+    joint_worlds: &[[[f32; 4]; 4]; HUMANOID_JOINTS],
+    bind: &SkinBind,
+) -> [[[f32; 4]; 4]; HUMANOID_JOINTS] {
+    let mut result = [[[0.0; 4]; 4]; HUMANOID_JOINTS];
+    for idx in 0..HUMANOID_JOINTS {
+        // M_j = J_j · inv_bind
+        result[idx] = matrix_multiply_4x4(joint_worlds[idx], bind.inv_bind[idx]);
+    }
+    result
+}
+
 /// Computes the skin matrices from the joint world matrices and the skeleton.
 /// M_j = J_j · translate(-bind_world_j) where bind_world_j is the chain-composed
 /// REST translation of joint j (compose the rest locals — all-zero JointPose —
 /// and take the translation column).
 /// This makes the rest pose produce BIT-EXACT identity skin matrices.
+///
+/// Delegates to [`SkinBind::from_skeleton`] + [`skin_matrices_bound`] with the
+/// identical fixed operation order, so every digest pin carries over. Hot
+/// paths (per-NPC-per-frame pose evaluation) should construct the bind once
+/// per batch and call [`skin_matrices_bound`]; this from-skeleton form stays
+/// for oracles, one-shot use, and any future non-humanoid skeleton.
 pub fn skin_matrices(
     joint_worlds: &[[[f32; 4]; 4]; HUMANOID_JOINTS],
     skeleton: &[Joint; HUMANOID_JOINTS],
 ) -> [[[f32; 4]; 4]; HUMANOID_JOINTS] {
-    // Compute the rest pose world transforms to get the bind poses.
-    let rest_pose = [JointPose {
-        delta_pos: [0.0; 3],
-        delta_turns: [0; 3],
-    }; HUMANOID_JOINTS];
-    let rest_worlds = compose_joint_matrices(skeleton, &rest_pose);
-
-    let mut result = [[[0.0; 4]; 4]; HUMANOID_JOINTS];
-
-    for idx in 0..HUMANOID_JOINTS {
-        // Extract the bind world translation from the rest world matrix.
-        let bind_world_translation = [
-            rest_worlds[idx][3][0],
-            rest_worlds[idx][3][1],
-            rest_worlds[idx][3][2],
-        ];
-
-        // Build the translation matrix for -bind_world.
-        let inv_bind = compose_transform_matrix(
-            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], // identity rotation
-            [
-                -bind_world_translation[0],
-                -bind_world_translation[1],
-                -bind_world_translation[2],
-            ],
-        );
-
-        // M_j = J_j · inv_bind
-        result[idx] = matrix_multiply_4x4(joint_worlds[idx], inv_bind);
-    }
-
-    result
+    skin_matrices_bound(joint_worlds, &SkinBind::from_skeleton(skeleton))
 }
 
 /// A skinned vertex: the same structure as ProxyVertex plus skinning info.

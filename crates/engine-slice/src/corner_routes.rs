@@ -616,12 +616,15 @@ pub fn corner_instances(states: &[NpcLocomotion], table_tints: &[[f32; 3]]) -> V
 /// after the first frame.
 pub fn evaluate_population_poses_locomotion(states: &[NpcLocomotion], out: &mut Vec<Block>) {
     use engine_renderer::animation::{
-        compose_joint_matrices, humanoid_skeleton, rest_pose_block, sample_pose, skin_matrices,
-        walk_clip,
+        SkinBind, compose_joint_matrices, humanoid_skeleton, rest_pose_block, sample_pose,
+        skin_matrices_bound, walk_clip,
     };
 
     let clip = walk_clip();
     let skeleton = humanoid_skeleton();
+    // The bind is a pure function of the immutable skeleton: pay the
+    // rest-chain composition ONCE per batch, not per walking NPC.
+    let bind = SkinBind::from_skeleton(&skeleton);
 
     out.clear();
     out.reserve(states.len());
@@ -635,7 +638,7 @@ pub fn evaluate_population_poses_locomotion(states: &[NpcLocomotion], out: &mut 
             let t = state.stride_phase * WALK_STRIDE_SECONDS;
             let pose = sample_pose(&clip, t);
             let joint_worlds = compose_joint_matrices(&skeleton, &pose);
-            skin_matrices(&joint_worlds, &skeleton)
+            skin_matrices_bound(&joint_worlds, &bind)
         };
         out.push(block);
     }

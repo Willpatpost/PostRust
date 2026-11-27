@@ -240,11 +240,14 @@ pub const DEMO_CLOCK_HZ: f32 = 60.0;
 /// below).
 pub fn evaluate_population_poses(k: u64, phases: &[Phase], out: &mut Vec<Block>) {
     use engine_renderer::animation::{
-        compose_joint_matrices, humanoid_skeleton, rest_pose_block, sample_pose, skin_matrices,
-        walk_clip,
+        SkinBind, compose_joint_matrices, humanoid_skeleton, rest_pose_block, sample_pose,
+        skin_matrices_bound, walk_clip,
     };
     let clip = walk_clip();
     let skeleton = humanoid_skeleton();
+    // The bind is a pure function of the immutable skeleton: pay the
+    // rest-chain composition ONCE per batch, not per walking NPC.
+    let bind = SkinBind::from_skeleton(&skeleton);
     // THE INTEGER STRIDE REDUCTION: one stride is exactly 66 frames
     // (1.1 s × 60 Hz), and the frame counter reduces modulo it IN
     // INTEGERS before any float is formed — `66.0/60.0 + p` does NOT
@@ -268,7 +271,7 @@ pub fn evaluate_population_poses(k: u64, phases: &[Phase], out: &mut Vec<Block>)
                 let t = within_stride + offset as f32 / 65536.0 * WALK_STRIDE_SECONDS;
                 let pose = sample_pose(&clip, t);
                 let joint_worlds = compose_joint_matrices(&skeleton, &pose);
-                skin_matrices(&joint_worlds, &skeleton)
+                skin_matrices_bound(&joint_worlds, &bind)
             }
         };
         out.push(block);
