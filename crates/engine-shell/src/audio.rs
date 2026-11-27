@@ -298,6 +298,16 @@ impl Audio {
     /// it; no allocation, no synthesis, no polling). A no-op in the
     /// silent state; a mid-run playback failure degrades to the
     /// observable silent state and releases the audio resources.
+    ///
+    /// Push-rate contract: the underlying `SDL_PutAudioStreamData`
+    /// buffers unconditionally (verified in the vendored SDL 3.4.18),
+    /// so in-flight PCM is held by SDL and this path carries NO
+    /// in-flight-sample bound — the deliberate asymmetry with the
+    /// device layer's bounded refusal discipline ([`AudioDevice`],
+    /// below). The caller must not push faster than the device
+    /// drains: cue pushes ride discrete gameplay events, which is the
+    /// intended rate limit, and a sustained over-rate would grow
+    /// SDL's buffered PCM without bound.
     pub fn play(&mut self, cue: Cue) {
         let Some(streams) = self.streams.as_mut() else {
             return;

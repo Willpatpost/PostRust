@@ -46,6 +46,16 @@ use crate::player_controls::PlayerControls;
 
 /// Demo movement tick rate (a demo policy value, not an engine-wide
 /// rate — the same reviewer clarification `sim.rs` records).
+///
+/// Relationship to [`crate::sim::DEFAULT_TICK_RATE_HZ`]: the two are
+/// deliberately independent constants that never feed one
+/// accumulator. `DEFAULT_TICK_RATE_HZ` (10 Hz) is the NPC-scheduling
+/// `SimDriver`'s demo default (the `--sim` / `--render --regions` /
+/// `--demo-persist` lineage, configurable through `SimConfig`); this
+/// 60 Hz is the player-movement fixed step — the `PlayerDriver`
+/// lineage (player, combat, encounter, playable) steps movement on
+/// it and never reads the sim default. Changing either value leaves
+/// the other's cadence untouched.
 pub const DEMO_TICK_HZ: u32 = 60;
 
 /// Mouse-look sensitivity (radians per pixel) — the free-flight

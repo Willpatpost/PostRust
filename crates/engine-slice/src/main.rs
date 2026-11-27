@@ -21,6 +21,15 @@
 //! pending-vs-confirmed persistence overlay, and the graceful durable
 //! close on exit; `--headless --ticks <n> [--action-at <tick>]` runs
 //! the same lifecycle deterministically without a GPU).
+//!
+//! Dispatch shape (a registered split candidate): `main` is ONE
+//! monolithic CLI cascade — sequential whole-argv mode checks
+//! spanning ~1,200 lines. The engineering-excellence register
+//! (NEW-SLICE-05, folding A15's slice classification) tracks
+//! extracting a `cli.rs` mode table as the P6 candidate; until that
+//! split, new modes extend the cascade in place, and guard clauses
+//! that must precede mode dispatch (like the integrated-soak flag
+//! check at the top of `main`) stay ahead of it.
 
 use std::io::{self, Write};
 use std::path::PathBuf;

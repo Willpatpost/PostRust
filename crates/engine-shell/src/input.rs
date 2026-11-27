@@ -16,6 +16,12 @@
 //! cleared and unconsumed mouse deltas are discarded, so stuck keys and
 //! stale look deltas cannot survive a focus change; fresh input is
 //! required after focus is regained.
+//!
+//! Key-identity contract: the intent surface is keyed by `Keycode` —
+//! SDL's layout-mapped virtual key. Key events carrying only a
+//! scancode (`keycode: None`, a key with no layout mapping) have no
+//! intent identity and are silently dropped; scancode-level
+//! (physical-key, layout-independent) input is out of scope.
 
 use std::collections::HashSet;
 

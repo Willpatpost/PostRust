@@ -316,6 +316,18 @@ pub fn push_box(
 /// plus margin. The disjoint per-slot pattern divides this total by
 /// `FRAMES_IN_FLIGHT`, so the total carries that factor; one frame's
 /// output must fit one slot.
+///
+/// The `+ 512` margin's source: it is a HAND allowance, not an
+/// enumerated geometry contribution. The closed-form ceiling is
+/// exact — the region-scene builder pushes only area plates and NPC
+/// proxy boxes, so (8 + 1000) × 36 = 36,288 vertices per frame at
+/// `NPC_COUNT` = 1000 — and the 512 (~1.4% headroom) exists so a
+/// small future addition to the derived region scene does not
+/// immediately overflow the slot. It is NOT budget for structural
+/// growth: new pushed geometry must re-derive the closed-form sum.
+/// Either way, overflow fails visibly — the layered upload truncates
+/// against the slot capacity with the frame outcome's counters,
+/// never an out-of-bounds write.
 pub fn region_scene_capacity_vertices() -> u32 {
     ((8 + 1000) * 36 + 512) * FRAMES_IN_FLIGHT
 }

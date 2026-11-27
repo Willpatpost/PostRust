@@ -312,7 +312,7 @@ ARM64) with a five-job CI:
   non-finite coordinate can never authorize a witness, the gate that
   caught a real overflow bug during its own gating; the four-tier
   perception budget table; the durable trace record's canonical
-  little-endian encoding, its digest pinned at 1076637108585072602).
+  little-endian encoding, its digest pinned at 10766371085850726021).
   The engine/policy boundary held throughout: the selector MACHINERY,
   the calendar queries, and the census mechanism are engine; the rule
   tables, schedule content, and perception classes are policy authored
