@@ -968,15 +968,18 @@ pub fn commit_witness_captures<M: CanonicalMedium>(
     }
 
     // ---- THE CLASSIFICATION FLUSH (the sign-off review's finding 21
-    // corrective): a classification decision taken AFTER the
-    // witness's final record episode is durable only in the live
-    // lane — a cold reopen rebuilds from the last journaled plan and
-    // the decision vanishes (the reported score and the decision
-    // itself). Submit now observes the mismatch between the lane's
-    // current classification sync and the book's last-journaled
-    // snapshot, and flushes the decisions through their OWN journal
-    // transaction — a classification-sync episode (an empty record
-    // set, the unit-marker span, the current sync as the plan).
+    // corrective, extended to the retry discipline): a classification
+    // decision taken AFTER the witness's final record episode is
+    // durable only in the live lane — a cold reopen rebuilds from the
+    // last journaled plan and the decision vanishes (the reported
+    // score and the decision itself). Submit now observes the mismatch
+    // between the lane's current classification sync and the book's
+    // last-journaled snapshot, and flushes the decisions through their
+    // OWN journal transaction — a classification-sync episode (an
+    // empty record set, the unit-marker span, the current sync as the
+    // plan). This follows the same retry discipline as the record
+    // path: failure after stage records an unresolved episode so the
+    // retry completes the same identity, never a second envelope.
     if submit && keys.is_empty() && book.unresolved.is_none() {
         let current = spine.world().lane.witness_classifications(witness);
         if !current.is_empty() && book.journaled_classifications.get(&witness) != Some(&current) {
@@ -1157,12 +1160,15 @@ fn complete_unresolved_episode<M: CanonicalMedium>(
 }
 
 /// Flush dirty classification decisions through their OWN journal
-/// transaction (finding 21's corrective): a classification-sync
-/// episode — an empty record set with the unit-marker span (the
-/// envelope's occurrence space is non-empty by contract; the marker
-/// is the recovery's classification-sync shape), the current sync
-/// as the plan. The recovery applies the decisions and terminates
-/// at the same journaled/applied/confirmed boundaries.
+/// transaction (finding 21's corrective, extended to the retry
+/// discipline): a classification-sync episode — an empty record set
+/// with the unit-marker span (the envelope's occurrence space is
+/// non-empty by contract; the marker is the recovery's classification-
+/// sync shape), the current sync as the plan. The recovery applies
+/// the decisions and terminates at the same journaled/applied/
+/// confirmed boundaries. The retry discipline mirrors the record
+/// path: failure after stage records an unresolved episode so the
+/// retry completes the same identity, never a second envelope.
 fn flush_witness_classifications<M: CanonicalMedium>(
     spine: &mut Spine<MemoryLaneWorld>,
     pipeline: &mut CommitPipeline<M>,
@@ -1199,7 +1205,18 @@ fn flush_witness_classifications<M: CanonicalMedium>(
         position,
     )
     .map_err(PipelineError::Format)?;
-    pipeline.stage(envelope)?;
+    if let Err(error) = pipeline.stage(envelope) {
+        // A stage failure is like CaptureAborted for records: nothing
+        // is durable, so journaled=false and the retry re-stages.
+        book.unresolved = Some(UnresolvedEpisode {
+            witness,
+            episode,
+            consequence,
+            keys: Vec::new(),
+            journaled: false,
+        });
+        return Err(error);
+    }
 
     let plan = MemoryPlan {
         witness,
@@ -1209,7 +1226,7 @@ fn flush_witness_classifications<M: CanonicalMedium>(
     }
     .encode()
     .map_err(PipelineError::Format)?;
-    pipeline.capture(
+    if let Err(error) = pipeline.capture(
         position,
         DurabilityClass::DurableEligible,
         Vec::new(),
@@ -1218,8 +1235,32 @@ fn flush_witness_classifications<M: CanonicalMedium>(
             episode,
         }],
         plan,
-    )?;
-    pipeline.mark_applied(&[consequence])?;
+    ) {
+        if matches!(error, PipelineError::CaptureAborted) {
+            pipeline.discard_staged(&[consequence]);
+            book.unresolved = Some(UnresolvedEpisode {
+                witness,
+                episode,
+                consequence,
+                keys: Vec::new(),
+                journaled: false,
+            });
+        }
+        return Err(error);
+    }
+
+    if let Err(error) = pipeline.mark_applied(&[consequence]) {
+        // The transaction is journaled at this point, so journaled=true
+        // and the retry completes the apply only.
+        book.unresolved = Some(UnresolvedEpisode {
+            witness,
+            episode,
+            consequence,
+            keys: Vec::new(),
+            journaled: true,
+        });
+        return Err(error);
+    }
     book.episode_keys.insert(episode, (consequence, Vec::new()));
     book.journaled_classifications.insert(witness, current);
     Ok(())
