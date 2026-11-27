@@ -19,6 +19,7 @@
 //! for acceptance. This distinguishes insufficient opportunity from
 //! weak per-ring movement."
 
+use crate::corner_timing::demo_clock_dt;
 use crate::corner_weather::{RAIN_SEED, RIPPLE_POLICY, RainLayer};
 use engine_core::ripple::RIPPLE_POOL_BOUND;
 
@@ -55,11 +56,11 @@ fn run_arm(tag: &'static str, decimation: u32, frames: u64) -> ArmCensus {
         decimation,
         ..RIPPLE_POLICY
     };
-    let mut layer = RainLayer::with_ripple_policy(EYE, policy);
+    let mut layer = RainLayer::with_ripple_policy(EYE, policy, demo_clock_dt().as_secs_f32());
     // The warm start (the demo's own 132 ticks — the first measured
     // frame is already wet).
     for _ in 0..132 {
-        layer.update_and_build(EYE, 0.0, 0.0);
+        layer.update_and_build(EYE, 0.0, 0.0, demo_clock_dt().as_secs_f32());
     }
     // The cumulative counters' baselines (the window's admissions
     // and refusals are the DELTAS — the counters are lifetime-
@@ -70,7 +71,7 @@ fn run_arm(tag: &'static str, decimation: u32, frames: u64) -> ArmCensus {
     let mut frames_with_live_rings = 0u64;
     let mut max_live_rings = 0usize;
     for _ in 0..frames {
-        let report = layer.update_and_build(EYE, 0.0, 0.0);
+        let report = layer.update_and_build(EYE, 0.0, 0.0, demo_clock_dt().as_secs_f32());
         contacts += u64::from(report.deaths);
         let live = layer.ripple_field().active_count();
         max_live_rings = max_live_rings.max(live);

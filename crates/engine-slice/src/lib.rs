@@ -11,6 +11,7 @@ pub mod corner_behavior;
 pub mod corner_demo;
 pub mod corner_population;
 pub mod corner_routes;
+pub mod corner_timing;
 pub mod corner_weather;
 pub mod crossing;
 pub mod encounter_benchmark;

@@ -23,6 +23,7 @@
 //! SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_weather -- \
 //!     --ignored --nocapture
 //! ```
+//! [`demo_clock_dt`]: crate::corner_timing::demo_clock_dt
 //!
 //! THE BILLBOARD ARBITER: the ink gate is the physical proof of
 //! the turn derivation (`corner_weather::yaw_to_turn`'s t = +yaw —
@@ -33,6 +34,8 @@
 //! packer (corner_weather's
 //! `billboard_faces_the_camera_at_diagonal_headings`); the
 //! diagonal capture below is the GPU half of that proof.
+
+use engine_slice::corner_timing::demo_clock_dt;
 
 mod common;
 
@@ -135,7 +138,7 @@ fn raining_capture(
     let mut layer = RainLayer::new(GATE_EYE);
     renderer.set_proxy_draw_mode(ProxyDrawMode::Instanced);
     for _ in 0..frames {
-        layer.update_and_build(GATE_EYE, yaw, 0.0);
+        layer.update_and_build(GATE_EYE, yaw, 0.0, demo_clock_dt().as_secs_f32());
         let population = layer.population();
         renderer
             .render_corner_populated(matrix, GATE_EYE, light, &population, SIZE)
@@ -369,7 +372,7 @@ fn ripple_campaign(
 ) -> engine_renderer::CapturedFrame {
     let mut layer = RainLayer::new(GATE_EYE);
     for _ in 0..frames {
-        layer.update_and_build(GATE_EYE, yaw, 0.0);
+        layer.update_and_build(GATE_EYE, yaw, 0.0, demo_clock_dt().as_secs_f32());
         let population = layer.population();
         renderer.set_ripple_field(ripple);
         renderer
@@ -1426,7 +1429,7 @@ fn ripple_natural_sequence_gate() {
         // field is fed ONLY by observe_death, so an increase IS a
         // natural kill-plane death landing).
         let before_spawned = layer.ripple_field().spawned();
-        layer.update_and_build(GATE_EYE, yaw, 0.0);
+        layer.update_and_build(GATE_EYE, yaw, 0.0, demo_clock_dt().as_secs_f32());
         // THE LIVE FIELD FORWARDED (the finding-15d corrective: the
         // campaign's own field, packed every frame exactly as the
         // demo's bridge does).
@@ -1826,7 +1829,7 @@ fn rain_warmed_allocation_constancy() {
     let mut warm: Option<engine_renderer::AllocationStats> = None;
     let mut distinct: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     for frame in 0..12 {
-        layer.update_and_build(GATE_EYE, yaw, 0.0);
+        layer.update_and_build(GATE_EYE, yaw, 0.0, demo_clock_dt().as_secs_f32());
         let population = layer.population();
         renderer.request_frame_capture().unwrap();
         assert!(
@@ -1846,7 +1849,7 @@ fn rain_warmed_allocation_constancy() {
             // capture machinery's own vec! is presentation-side,
             // the render_instanced precedent's exact discipline).
             let scope = common::HostAllocScope::new();
-            layer.update_and_build(GATE_EYE, yaw, 0.0);
+            layer.update_and_build(GATE_EYE, yaw, 0.0, demo_clock_dt().as_secs_f32());
             let population = layer.population();
             let outcome = renderer
                 .render_corner_populated(&matrix, GATE_EYE, light, &population, SIZE)
@@ -1896,7 +1899,7 @@ fn rain_double_run_byte_equality() {
         renderer.set_proxy_draw_mode(ProxyDrawMode::Instanced);
         let mut frames = Vec::new();
         for _ in 0..6 {
-            layer.update_and_build(GATE_EYE, yaw, 0.0);
+            layer.update_and_build(GATE_EYE, yaw, 0.0, demo_clock_dt().as_secs_f32());
             let population = layer.population();
             renderer.request_frame_capture().unwrap();
             assert!(
@@ -2216,7 +2219,7 @@ fn rain_composition_smoke() {
     let mut layer = RainLayer::new(GATE_EYE);
     renderer.set_proxy_draw_mode(ProxyDrawMode::Instanced);
     for _ in 0..4 {
-        layer.update_and_build(GATE_EYE, yaw, 0.35);
+        layer.update_and_build(GATE_EYE, yaw, 0.35, demo_clock_dt().as_secs_f32());
         let population = layer.population();
         renderer
             .render_corner_populated_shadowed(&matrix, GATE_EYE, light, BIAS, &population, SIZE)
