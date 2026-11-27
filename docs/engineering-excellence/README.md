@@ -6,16 +6,23 @@ linked files. One status page, no monolithic log.
 
 - **Baseline:** `main` @ `5b9316742b2f9fe4d0fca2a9743275f91a2ff6aa` = tag
   `pre-excellence-5b93167` (tag object `4ca7846f6a5453da0afe2e82d204246cbf6a7180`,
-  verified on origin by `git ls-remote` — see EVIDENCE.md E-1).
+  verified on origin).
 - **Integration branch:** `refactor/engineering-excellence` (from the tagged
   commit, pushed). Lane branches `ee/<package>` merge into it under the
-  orchestrator's review; **main is never touched, no merges into main until the
-  owner's explicit final GO**.
+  orchestrator's review; **main is never touched, no merges into main until
+  the owner's explicit final GO**.
 - **Program law:** the repo's standing discipline governs where the charter is
-  silent — `docs/AUTONOMOUS-CYCLE-PROTOCOL.md` (never merge, never weaken a
-  pin, run local gates before push, one package per branch, no unsafe without
-  proof, determinism guarded) plus `docs/CURRENT-STATUS.md`'s update rule.
+  silent — `docs/AUTONOMOUS-CYCLE-PROTOCOL.md` plus `docs/CURRENT-STATUS.md`'s
+  update rule (which carries a branch notice pointing readers here).
   Charter §1 grants exactly one exception: the baseline preservation tag.
+- **THE SOL RE-AUDIT (2026-11-27, `600bff2`'s FINDINGS section) is the
+  governing continuation mandate:** the program is NOT complete (scores
+  6.0–8.3 against the 9/10 bar); the verified improvements are retained as
+  intermediate progress; the outstanding work is P2 spatial, P3 remaining,
+  P4 migration S4–S6, P5 GPU/resource scalability, P6 alongside; the
+  largest objective is workload-proportional engine work and resident
+  memory. No merge until the full directive + independent lead + owner
+  accept.
 
 ## The eight rubrics (each ≥ 9/10, independently reviewed — charter §9)
 
@@ -47,14 +54,24 @@ P0 baseline/census/measurement ──┬──> P1 direct improvements ──┐
 | P6 | A01–A06 A12–A15 B15 B16 | INCREMENTAL (LOW doc notes registered: NEW-REND-04/05/06, NEW-SLICE-02/03/05) |
 | P7 | full re-audit, rubric scoring, final report + PR | NOT STARTED |
 
-## Next actions
+## Next actions (the continuation mandate)
 
-1. P3-L3 + P4-S1 lanes (glm-5.3, RUNNING) → verify diffs against the designs, integrate, gate.
-2. P4's DeviceLost typed arm (orchestrator — error-semantics class, deferred from S1).
-3. P2-L2/L3 spine lanes (orchestrator — the A08a bulk-partition and B01 accounting).
-4. P3-L4/L5 (recovery single-decode, streaming reader — orchestrator).
-5. The P6 doc pass (the stale lib.rs scope docs, the CURRENT-STATUS perception-digest typo, the NEW-REND/NEW-SHELL LOW notes).
-6. Linux count confirmations ride the first PR's CI run (platform-uniform inferences recorded per pin commit).
+1. RUNNING: the R-scenes (R01+R02 admission invariants), R-timing (R03+R04
+   accumulator arithmetic + presentation coherence), and P2-L5 (the static
+   broad phase — the re-audit's highest priority) lanes.
+2. P2 remaining: L6 (the census grid — A07's composition-layer index), L3
+   (B01's housekeeping accounting), L7 (A22-core ledger policy), L8 (A05/B12
+   the world-configuration boundary with the old-save story).
+3. P4 migration: S4 (the vulkan.rs split), S5 (shader composition), S6 (the
+   adapter/shim deletion + the second scene — closing R06's transitional
+   constraints).
+4. P5: the resource-residency/dirty-range/batched-upload work on P4's
+   interfaces (A11/A18/A19/A20/A23/B14).
+5. P3 remaining: L6–L9 (A22 watermark, B13 instrumentation, the Arc backing,
+   the A13 module split — R07's consolidation investigation feeds L9).
+6. The measurement-methodology items (B10/B11/B12) and R05's bounded
+   interval retention.
+7. P7 only after every category independently reaches the bar.
 
 ## File map
 
