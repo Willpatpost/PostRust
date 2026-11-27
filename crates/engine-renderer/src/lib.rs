@@ -59,7 +59,9 @@ pub mod shadow_filter;
 pub mod shadows;
 pub mod sky;
 
+mod corner_content;
 mod renderer;
+mod scene_description;
 mod submission;
 mod vulkan;
 
@@ -78,6 +80,7 @@ pub use renderer::{
     RIPPLE_ROUGHEN_GAIN, RIPPLE_UV_GAIN, RenderStats, Renderer, RippleDebugMode, SceneLayer,
     ShadowMapReadback, SkyFrame,
 };
+pub use scene_description::{GroundRoles, LitVertex, SceneDescription, SceneHandle, SceneMesh};
 pub use submission::{
     DynamicLayers, FrameCamera, FrameSubmission, OutputTarget, SceneBounds, SceneFrame,
     ShadowFrame, WetFrame,

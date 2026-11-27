@@ -82,7 +82,7 @@
 use super::corner::{CornerResources, FrameParams};
 use super::{RendererError, VulkanContext, create_mapped_buffer, find_memory_type};
 use crate::config::{FRAMES_IN_FLIGHT, TargetFaultSite, TargetFaultStage};
-use crate::lit_scene::{GROUND_Y, LightParams};
+use crate::lit_scene::LightParams;
 use crate::planar::{mirrored_eye, mirrored_view_projection};
 use ash::vk;
 
@@ -201,6 +201,11 @@ pub(crate) struct ReflectionResources {
     /// immutable material tail (binding 4's descriptor write points
     /// here; the per-frame dynamic offset adds slot × stride).
     ripple_base: u32,
+    /// The attached scene's mirror-plane height (P4 S2: the wet
+    /// ground role's `receiver_plane_y` — the S1-era read of
+    /// `lit_scene::GROUND_Y`, now the description's own authored
+    /// plane, carried here at the state's construction).
+    ground_plane_y: f32,
     targets: Option<ReflectionTargets>,
 }
 
@@ -236,6 +241,7 @@ impl ReflectionResources {
             tail_stride: 0,
             ripple_stride: 0,
             ripple_base: 0,
+            ground_plane_y: 0.0,
             targets: None,
         };
         if let Err(error) = partial.build(ctx, corner, hdr_pass, main_render_pass) {
@@ -253,7 +259,11 @@ impl ReflectionResources {
         main_render_pass: vk::RenderPass,
     ) -> Result<(), RendererError> {
         let slots = FRAMES_IN_FLIGHT as usize;
-        let material_count = crate::lit_scene::materials().len();
+        // The attached scene's material table (P4 S2: the S1-era read
+        // of `lit_scene::materials()` — the description's own values,
+        // pinned equal to the reference table by the shim-equality
+        // gate while both exist).
+        let material_count = corner.materials().len();
 
         // --- the mirrored FrameParams uniform (per-slot regions +
         // the material tail — the shadow state's buffer shape).
@@ -293,12 +303,17 @@ impl ReflectionResources {
         self.tail_stride = tail_stride;
         self.ripple_stride = ripple_stride;
         self.ripple_base = ripple_base as u32;
-        // The immutable material tail, written once (the corner's
-        // own values, from the same engine table).
+        // The wet ground's mirror plane (the attached description's
+        // receiver plane — the value the camera math below reflects
+        // across; the corner's is the ground at y = 0).
+        self.ground_plane_y = corner.ground_plane_y();
+        // The immutable material tail, written once (the attached
+        // scene's own values — the description's table, the same
+        // values the corner's own uniform tail carries).
         // SAFETY: disjoint aligned tail in coherent memory, written
         // once before any submission.
         unsafe {
-            for (index, mat) in crate::lit_scene::materials().iter().enumerate() {
+            for (index, mat) in corner.materials().iter().enumerate() {
                 let offset = (slots as u64 * u64::from(params_stride)
                     + index as u64 * u64::from(tail_stride)) as usize;
                 let params = [
@@ -773,8 +788,8 @@ impl ReflectionResources {
     /// `slot` must be owned (its fence wait passed).
     pub(super) unsafe fn write_frame(&self, slot: usize, camera: &WetCamera) {
         let mirrored = FrameParams::new(
-            mirrored_view_projection(&camera.view_proj, GROUND_Y),
-            mirrored_eye(camera.eye, GROUND_Y),
+            mirrored_view_projection(&camera.view_proj, self.ground_plane_y),
+            mirrored_eye(camera.eye, self.ground_plane_y),
             camera.light,
         );
         let base = slot as u32 * self.params_stride;
@@ -1281,7 +1296,7 @@ impl ReflectionTargets {
         let (reflected_pool, reflected_sets) =
             alloc_sets::<6>(ctx, reflected_layout, &reflected_sizes, 6)?;
         self.reflected_pool = reflected_pool;
-        let material_count = crate::lit_scene::materials().len();
+        let material_count = corner.materials().len();
         for material in 0..material_count {
             let view = corner
                 .albedo_view(material as u32)

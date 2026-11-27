@@ -111,3 +111,67 @@ pub(super) fn create_sets<const N: usize>(
         }
     }
 }
+
+/// The runtime-count sibling of [`create_sets`] (P4 S2): the same
+/// layout + pool + one-shot allocation discipline, for callers
+/// whose set count is the ATTACHED scene's material count rather
+/// than a compile-time family shape (the corner resources' own
+/// per-material sets). Identical counters and failure discipline
+/// — for the same capacity the allocation behavior is
+/// byte-identical to the const form.
+pub(super) fn create_sets_sized(
+    ctx: &VulkanContext,
+    bindings: &[vk::DescriptorSetLayoutBinding<'_>],
+    sizes: &[vk::DescriptorPoolSize],
+    capacity: u32,
+) -> Result<
+    (
+        vk::DescriptorPool,
+        vk::DescriptorSetLayout,
+        Vec<vk::DescriptorSet>,
+    ),
+    RendererError,
+> {
+    // SAFETY: as create_sets (the const form's own contract): all
+    // create-info slices live through their calls; on failure release
+    // the partial pool/layout; on success the caller owns both.
+    unsafe {
+        let layout = ctx
+            .device
+            .create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(bindings),
+                None,
+            )
+            .map_err(|e| RendererError::vk(e, "create descriptor set layout"))?;
+        let pool = match ctx.device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .max_sets(capacity)
+                .pool_sizes(sizes),
+            None,
+        ) {
+            Ok(pool) => pool,
+            Err(e) => {
+                ctx.device.destroy_descriptor_set_layout(layout, None);
+                return Err(RendererError::vk(e, "create descriptor pool"));
+            }
+        };
+        ctx.descriptor_pools.set(ctx.descriptor_pools.get() + 1);
+        let layouts = vec![layout; capacity as usize];
+        match ctx.device.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(&layouts),
+        ) {
+            Ok(sets) => {
+                ctx.descriptor_sets
+                    .set(ctx.descriptor_sets.get() + sets.len() as u64);
+                Ok((pool, layout, sets))
+            }
+            Err(e) => {
+                ctx.device.destroy_descriptor_pool(pool, None);
+                ctx.device.destroy_descriptor_set_layout(layout, None);
+                Err(RendererError::vk(e, "allocate descriptor sets"))
+            }
+        }
+    }
+}

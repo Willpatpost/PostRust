@@ -101,6 +101,28 @@ pub fn procedural_texture(index: u32) -> Vec<u8> {
     data
 }
 
+/// A scene's albedo set (P4 S2 — the attach-time description's
+/// texture half): the RGBA8 images a
+/// [`crate::scene_description::SceneDescription`] attaches, in
+/// TEXTURE-INDEX order (a [`crate::lit_scene::Material`]'s
+/// `texture` field selects from this list). Each image is
+/// row-major [`TEXTURE_SIZE`]² pixels — the generator's own byte
+/// contract, enforced at attach
+/// ([`SceneDescription::validate`](crate::scene_description::SceneDescription::validate)):
+/// a malformed length is a typed refusal, never a runtime shape
+/// guess at upload.
+///
+/// Built by ANY consumer from [`procedural_texture`] (the corner's
+/// set is indices `0..[`TEXTURE_COUNT`]` — see the migration shim,
+/// `corner_content.rs`); a future scene may attach any subset or
+/// reorder, as long as every material's index selects a supplied
+/// texture.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ProcTextureSet {
+    /// One RGBA8 image per texture, in texture-index order.
+    pub textures: Vec<Vec<u8>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

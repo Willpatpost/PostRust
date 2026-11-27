@@ -11,7 +11,8 @@ use sdl3::video::Window as SdlWindow;
 use crate::config::{RenderConfig, TargetFaultSite, TargetFaultStage, present_mode_str};
 use crate::overlay::{AtlasText, OverlayVertex};
 use crate::scene::SceneVertex;
-use crate::submission::{FrameSubmission, SubmissionPolicy, adapt_frame};
+use crate::scene_description::{SceneDescription, SceneHandle};
+use crate::submission::{FrameSubmission, SceneBounds, SubmissionPolicy, adapt_frame};
 use crate::vulkan::{
     self, CapturedFrame, FrameState, PipelineState, RendererError, SwapchainState, VulkanContext,
     drain_validation_messages, environment_pending, pick_depth_format, pick_surface_format,
@@ -275,6 +276,17 @@ pub struct Renderer {
     frames: FrameState,
     config: RenderConfig,
     stats: RenderStats,
+    /// The attached scene's CPU-side facts (P4 S2): the handle (the
+    /// material-count bound the population validation reads) and
+    /// the shadow cascade's world bounds (the shadowed routes'
+    /// input). `None` until [`Self::attach_scene`]; the `Corner`
+    /// construction preference auto-attaches the migration shim's
+    /// content (see `corner_content`) at construction — the S6 step
+    /// deletes that adapter and the shim. The description itself is
+    /// consumed at attach (the GPU half lives in the context's
+    /// scene resources; these are the facts the per-frame paths
+    /// read).
+    scene: Option<AttachedScene>,
     overlay_enabled: bool,
     overlay_color: [f32; 4],
     /// The F-05 retained overlay-vertex buffer: rebuilt in place every
@@ -416,11 +428,69 @@ impl RippleDebugMode {
     }
 }
 
+/// The attached scene's retained facts (the renderer's `scene`
+/// field's payload — see its doc): plain `Copy` data distilled
+/// from the consumed [`SceneDescription`] at attach. The bounds
+/// are the shadowed routes' cascade input (the S1-era
+/// `shadows::scene_bounds(lit_scene::intersection_boxes())`
+/// inline computation, now the description's authored value); the
+/// handle's material count is the population validation bound
+/// (the S1-era `lit_scene::materials().len()` read).
+#[derive(Debug, Clone, Copy)]
+struct AttachedScene {
+    handle: SceneHandle,
+    bounds: SceneBounds,
+}
+
+/// The attach step shared by the public API
+/// ([`Renderer::attach_scene`]) and the construction adapter (the
+/// `Corner` preference in [`Renderer::new`]): validate the
+/// description WHOLE, device-free (a refusal builds nothing and
+/// leaves the context untouched), then upload through the
+/// context's scene-resource machinery (partial-failure-safe — on
+/// error the context is unchanged), then distill the retained
+/// facts. ONE scene per renderer lifetime (the context's attach
+/// refuses a second; the device-lifetime pass families bind the
+/// attached buffers).
+fn attach_description(
+    ctx: &mut VulkanContext,
+    description: SceneDescription,
+) -> Result<AttachedScene, RendererError> {
+    description.validate()?;
+    let material_count = description.materials.len() as u32;
+    let bounds = description.bounds;
+    ctx.attach_scene_resources(&description)?;
+    Ok(AttachedScene {
+        handle: SceneHandle { material_count },
+        bounds,
+    })
+}
+
 impl Renderer {
     pub fn new(window: &SdlWindow, config: RenderConfig) -> Result<Renderer, RendererError> {
         let atlas_text = AtlasText::default();
         let (mut ctx, validation_active, sync_validation) =
             VulkanContext::new(window, atlas_text.atlas(), &config)?;
+        // The Corner preference's construction adapter (P4 S2): the
+        // preference keeps uploading the corner content at
+        // construction — now through the SAME attach path every
+        // consumer uses (the migration shim's description; the
+        // upload this preference used to trigger inside
+        // `VulkanContext::new` moved behind the `SceneDescription`
+        // handle). Same ladder position (the context's own stages,
+        // then the scene upload — the allocation order the
+        // batteries pin), same cross-stage teardown on failure.
+        let scene = if config.demo_scene == crate::DemoScenePreference::Corner {
+            match attach_description(&mut ctx, crate::corner_content::corner_scene_description()) {
+                Ok(attached) => Some(attached),
+                Err(error) => {
+                    ctx.destroy();
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         // Cross-stage cleanup (corrective finding G): each constructor
         // cleans up its own partials; this ladder releases completed
         // stages when a later stage fails.
@@ -510,6 +580,7 @@ impl Renderer {
             frames,
             config,
             stats,
+            scene,
             overlay_enabled: true,
             overlay_color: [0.72, 1.0, 0.78, 0.85],
             overlay_vertices: Vec::new(),
@@ -626,9 +697,16 @@ impl Renderer {
         light: crate::lit_scene::LightParams,
         size: (u32, u32),
     ) -> Result<FrameResult, RendererError> {
-        if self.config.demo_scene != crate::DemoScenePreference::Corner {
+        // The scene gate (P4 S2: the preference gate's
+        // generalization — the routes require the ATTACHED scene;
+        // the Corner preference auto-attaches at construction, so
+        // every existing construction behaves exactly as before,
+        // and an explicit `attach_scene` is the new public way in).
+        if self.scene.is_none() {
             return Err(RendererError::Vulkan(
-                "render_corner requires the Corner scene preference".into(),
+                "render_corner requires an attached scene (attach_scene, or construct \
+                 with the Corner preference)"
+                    .into(),
             ));
         }
         let params = vulkan::corner::FrameParams::new(*view_proj, eye, light);
@@ -678,18 +756,24 @@ impl Renderer {
         population: &ProxyPopulation<'_>,
         size: (u32, u32),
     ) -> Result<FrameResult, RendererError> {
-        if self.config.demo_scene != crate::DemoScenePreference::Corner {
+        if self.scene.is_none() {
             return Err(RendererError::Vulkan(
-                "render_corner_populated requires the Corner scene preference".into(),
+                "render_corner_populated requires an attached scene (attach_scene, or \
+                 construct with the Corner preference)"
+                    .into(),
             ));
         }
-        let material_table = crate::lit_scene::materials().len() as u32;
+        // The material-table bound (P4 S2: the S1-era read of
+        // `lit_scene::materials().len()` — now the attached scene's
+        // own table length through the handle; the shim-equality
+        // gate pins the corner's to the reference table's three).
+        let material_table = self.scene.map_or(0, |scene| scene.handle.material_count);
         if population.npc_material >= material_table
             || population.vehicle_material >= material_table
             || population.rain_material >= material_table
         {
             return Err(RendererError::Vulkan(format!(
-                "proxy material index outside the corner material table \
+                "proxy material index outside the scene material table \
                  ({} materials, npc {}, vehicle {}, rain {})",
                 material_table,
                 population.npc_material,
@@ -786,13 +870,21 @@ impl Renderer {
         bias: crate::shadows::ShadowBias,
         size: (u32, u32),
     ) -> Result<FrameResult, RendererError> {
-        if self.config.demo_scene != crate::DemoScenePreference::Corner {
+        if self.scene.is_none() {
             return Err(RendererError::Vulkan(
-                "render_corner_shadowed requires the Corner scene preference".into(),
+                "render_corner_shadowed requires an attached scene (attach_scene, or \
+                 construct with the Corner preference)"
+                    .into(),
             ));
         }
-        let boxes = crate::lit_scene::intersection_boxes();
-        let (min, max) = crate::shadows::scene_bounds(boxes);
+        // The cascade's world bounds (P4 S2: the S1-era inline
+        // `shadows::scene_bounds(lit_scene::intersection_boxes())`
+        // — now the attached scene's authored bounds through the
+        // handle; the shim-equality gate pins the corner's to the
+        // reference computation's value).
+        let (min, max) = self.scene.map_or(([0.0; 3], [0.0; 3]), |scene| {
+            (scene.bounds.min, scene.bounds.max)
+        });
         let cascade = crate::shadows::cascade_for(light.dir_toward_light, min, max);
         let [r, g, b] = light.ambient;
         let params = vulkan::shadow_draw::ShadowFrameParams {
@@ -875,18 +967,22 @@ impl Renderer {
         population: &ProxyPopulation<'_>,
         size: (u32, u32),
     ) -> Result<FrameResult, RendererError> {
-        if self.config.demo_scene != crate::DemoScenePreference::Corner {
+        if self.scene.is_none() {
             return Err(RendererError::Vulkan(
-                "render_corner_populated_shadowed requires the Corner scene preference".into(),
+                "render_corner_populated_shadowed requires an attached scene \
+                 (attach_scene, or construct with the Corner preference)"
+                    .into(),
             ));
         }
-        let material_table = crate::lit_scene::materials().len() as u32;
+        // The material-table bound (P4 S2: as render_corner_populated's
+        // — the attached scene's own table length through the handle).
+        let material_table = self.scene.map_or(0, |scene| scene.handle.material_count);
         if population.npc_material >= material_table
             || population.vehicle_material >= material_table
             || population.rain_material >= material_table
         {
             return Err(RendererError::Vulkan(format!(
-                "proxy material index outside the corner material table \
+                "proxy material index outside the scene material table \
                  ({} materials, npc {}, vehicle {}, rain {})",
                 material_table,
                 population.npc_material,
@@ -926,8 +1022,12 @@ impl Renderer {
         }
         crate::animation::repack_poses(&mut self.pose_bytes, population.npc_poses)
             .map_err(RendererError::PosePack)?;
-        let boxes = crate::lit_scene::intersection_boxes();
-        let (min, max) = crate::shadows::scene_bounds(boxes);
+        // The cascade's world bounds (P4 S2: as
+        // render_corner_shadowed's — the attached scene's authored
+        // bounds through the handle).
+        let (min, max) = self.scene.map_or(([0.0; 3], [0.0; 3]), |scene| {
+            (scene.bounds.min, scene.bounds.max)
+        });
         let cascade = crate::shadows::cascade_for(light.dir_toward_light, min, max);
         let [r, g, b] = light.ambient;
         let params = vulkan::shadow_draw::ShadowFrameParams {
@@ -994,6 +1094,42 @@ impl Renderer {
         Ok(self.finish_frame(outcome))
     }
 
+    /// Attaches one scene's authored content (P4 S2 — the design's
+    /// §3.2 attach-time surface): the mesh, the material table,
+    /// the albedo set, the shadow bounds, and the wet ground's
+    /// roles, all as caller data. The description is validated
+    /// WHOLE before anything is built (a refusal — an incoherent
+    /// mesh/table/roles shape, or a material count outside the
+    /// pass families' compiled shape — builds nothing and leaves
+    /// the renderer exactly as it was), then uploaded once through
+    /// the scene-resource machinery, and the returned
+    /// [`SceneHandle`] is the proof the content is live: every
+    /// scene-backed frame (the `render_corner*` routes and
+    /// [`Self::submit_frame`]'s `scene` half) draws it.
+    ///
+    /// ONE scene per renderer lifetime: the device-lifetime pass
+    /// families (the retained skinned state, the shadow/reflection
+    /// per-material sets) bind the attached mesh/material buffers,
+    /// so a second attachment is a typed refusal — construct a
+    /// fresh renderer for different content. The `Corner`
+    /// construction preference auto-attaches the migration shim's
+    /// corner description (see `corner_content`) — the demo's
+    /// existing routes keep working unchanged; S6 deletes the shim
+    /// and the preference arm.
+    pub fn attach_scene(&mut self, scene: SceneDescription) -> Result<SceneHandle, RendererError> {
+        let attached = attach_description(&mut self.ctx, scene)?;
+        let handle = attached.handle;
+        self.scene = Some(attached);
+        Ok(handle)
+    }
+
+    /// The currently attached scene's handle, if any (the
+    /// material-count bound and the attach proof — see
+    /// [`SceneHandle`]).
+    pub fn scene(&self) -> Option<SceneHandle> {
+        self.scene.map(|scene| scene.handle)
+    }
+
     /// Renders one frame from a typed, scene-independent submission
     /// (the P4 D1 contract's entry point, stage S1's additive
     /// landing). The submission is validated WHOLE before any frame
@@ -1018,17 +1154,26 @@ impl Renderer {
         &mut self,
         submission: FrameSubmission<'_>,
     ) -> Result<FrameResult, RendererError> {
-        // Scene/preference coherence (the render_corner gate's
-        // generalization): a SceneFrame requires the Corner
-        // preference — S2 replaces this with the attach-time scene
-        // check.
-        if submission.scene.is_some()
-            && self.config.demo_scene != crate::DemoScenePreference::Corner
-        {
-            return Err(RendererError::Vulkan(
-                "submit_frame with a scene requires the Corner scene preference".into(),
-            ));
-        }
+        // Scene/attach coherence (the render_corner gate's S2
+        // generalization, the design's §3.3 order step 1): a
+        // SceneFrame requires an ATTACHED scene — the Corner
+        // preference auto-attaches at construction (the migration
+        // shim), and attach_scene is the public way to bring your
+        // own. The layers-only shape (`scene: None`) needs none.
+        // The attached table's length rides down to the adapter for
+        // the population validation (0 on the layers-only shape —
+        // unread there).
+        let material_table = match (&submission.scene, self.scene) {
+            (None, _) => 0,
+            (Some(_), Some(scene)) => scene.handle.material_count,
+            (Some(_), None) => {
+                return Err(RendererError::Vulkan(
+                    "submit_frame with a scene requires an attached scene \
+                     (attach_scene, or construct with the Corner preference)"
+                        .into(),
+                ));
+            }
+        };
         // The F-05 overlay-vertex rebuild (render_layers' own
         // discipline, verbatim): the glyph vertices are built into
         // the retained buffer — the capacity from the first frames is
@@ -1058,6 +1203,7 @@ impl Renderer {
         let inputs = adapt_frame(
             policy,
             &submission,
+            material_table,
             &self.overlay_vertices,
             &mut self.instance_bytes,
             &mut self.pose_bytes,
@@ -1226,9 +1372,11 @@ impl Renderer {
     /// frame runs the depth pass.
     pub fn request_shadow_map_capture(&mut self) -> Result<(), RendererError> {
         if self.pipes.shadows.is_none() {
-            if self.config.demo_scene != crate::DemoScenePreference::Corner {
+            if self.scene.is_none() {
                 return Err(RendererError::Vulkan(
-                    "shadow capture requires the Corner scene preference".into(),
+                    "shadow capture requires an attached scene (attach_scene, or \
+                     construct with the Corner preference)"
+                        .into(),
                 ));
             }
             self.pipes.ensure_shadow_resources(&self.ctx)?;
