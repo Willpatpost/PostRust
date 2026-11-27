@@ -87,6 +87,25 @@ still counted (correct for census), brace-in-string edge cases unhandled
 A01 (split by change reason) and B15 (footprint claims must cite these, not
 whole-file sizes).
 
+## E-6 First integration-batch gate run (2026-11-26, Windows rig, tree `3439633`)
+
+Full serial batch on the integrated tree (A16+A17+B09+correctives), log at
+`Temp\opencode\ee\artifacts\gates-batch1.log` (exact commands + exit codes):
+
+| Gate | Result | Note |
+|---|---|---|
+| `cargo fmt --all -- --check` | exit 0 | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 | clean |
+| main shard (`--workspace --exclude engine-slice --features engine-persist/composite-test-fixture`) | **1369/2/33, exit 0** | = pin 1368 + 1 (the B09 platform-surface test, platform-uniform pure logic) |
+| renderer release (`-p engine-renderer --release`) | **173 passed / 2 result lines, exit 0** | = pin 172 + 1 (same test; the pin's "/2" is RESULT LINES, not ignored — corrected our own earlier misreading) |
+| heavy shard (`-p engine-slice --features crash-test-seams`) | **650/46/64, exit 0** | unchanged — heavy carries engine-slice only |
+
+Pin corrections from these measured actuals (workflow lines ~599/722/732):
+main 1419→**1420** Linux / 1368→**1369** Windows; renderer release 172→**173**.
+Linux values are the platform-uniform inference (+1), to be confirmed by the
+candidate's own CI run per the repo's established practice. No test weakened;
+the count moved because a corrective ADDED a test.
+
 ## Measurement baselines
 
 (To be established in P0: first full build of the integration tree, then the
