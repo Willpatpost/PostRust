@@ -602,6 +602,24 @@ pub fn schedule_encounter(
     }
 }
 
+/// Which half of the commit bridge left the episode unresolved — the
+/// record-capture path or the classification-sync flush. The completion
+/// re-creates the right envelope shape (a record episode carries its
+/// membership span; a classification-sync episode carries the
+/// UNIT-MARKER span and no records) and only the record kind restores
+/// key claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnresolvedKind {
+    /// The record-capture path: `keys` is the episode's membership.
+    Record,
+    /// The classification-sync flush: `keys` is empty and the retry's
+    /// plan carries the CURRENT classification sync (a fresh plan on
+    /// the same identity — the decisions may legitimately have moved
+    /// since the failed attempt; the journal is the authority either
+    /// way).
+    ClassificationSync,
+}
+
 /// One unresolved episode (the sign-off review's finding 20
 /// corrective): a definite capture failure or a mid-flight apply
 /// failure left an episode incomplete. The book records the
@@ -613,6 +631,9 @@ pub fn schedule_encounter(
 /// it anew under a fresh identity — nothing durable existed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnresolvedEpisode {
+    /// Which bridge half owns the episode (the envelope shape the
+    /// completion must re-create).
+    pub kind: UnresolvedKind,
     pub witness: u32,
     pub episode: u64,
     pub consequence: ConsequenceId,
@@ -927,6 +948,7 @@ pub fn commit_witness_captures<M: CanonicalMedium>(
             if matches!(error, PipelineError::CaptureAborted) {
                 pipeline.discard_staged(&[consequence]);
                 book.unresolved = Some(UnresolvedEpisode {
+                    kind: UnresolvedKind::Record,
                     witness,
                     episode,
                     consequence,
@@ -957,6 +979,7 @@ pub fn commit_witness_captures<M: CanonicalMedium>(
         // retry completes the apply only (never a second envelope).
         if let Err(error) = pipeline.mark_applied(&[consequence]) {
             book.unresolved = Some(UnresolvedEpisode {
+                kind: UnresolvedKind::Record,
                 witness,
                 episode,
                 consequence,
@@ -1050,6 +1073,7 @@ fn complete_unresolved_episode<M: CanonicalMedium>(
     unresolved: UnresolvedEpisode,
 ) -> Result<(), PipelineError> {
     let UnresolvedEpisode {
+        kind,
         witness,
         episode,
         consequence,
@@ -1058,7 +1082,77 @@ fn complete_unresolved_episode<M: CanonicalMedium>(
     } = unresolved;
     let region = (witness as usize) / REGION_NPCS;
 
-    if !journaled {
+    if !journaled && kind == UnresolvedKind::ClassificationSync {
+        // The classification-sync retry (P1-B04's corrective): re-stage
+        // the SAME identity with the UNIT-MARKER span — the recovery's
+        // membership rule pairs marker + empty records as the flush
+        // shape, so the record path's membership span (which would be
+        // EMPTY here and fail closed) must never be built — and a
+        // FRESH plan: the CURRENT classification sync, which may
+        // legitimately have moved since the failed attempt (the
+        // journal is the authority for what lands; the identity is
+        // what must not fork).
+        let span = OccurrenceSpan::new(0, 1)
+            .map_err(|_| PipelineError::Format(SaveError::Integrity("memory-lane/flush-span")))?;
+        let position = SourcePosition {
+            head: None,
+            tick: spine.world().last_tick.as_u64(),
+        };
+        let envelope = ConsequenceEnvelope::capture(
+            consequence,
+            vec![ClassifiedSpan::new(span, DurabilityClass::DurableEligible)],
+            SignalLane::Captured,
+            CounterValues::default(),
+            SourceBaseline {
+                counters: CounterValues::default(),
+                award: AwardCheckpoint {
+                    durable: Coverage::new(),
+                    provisional: Coverage::new(),
+                },
+            },
+            position,
+        )
+        .map_err(PipelineError::Format)?;
+        pipeline.stage(envelope)?;
+        let classifications = spine.world().lane.witness_classifications(witness);
+        let plan = MemoryPlan {
+            witness,
+            episode,
+            records: Vec::new(),
+            classifications: classifications.clone(),
+        }
+        .encode()
+        .map_err(PipelineError::Format)?;
+        // The same definite-rejection boundary as the flush's staging
+        // half: a second rejection re-records the unresolved episode
+        // (the identity stays stable across any number of failures).
+        if let Err(error) = pipeline.capture(
+            position,
+            DurabilityClass::DurableEligible,
+            Vec::new(),
+            vec![FrontierEntry {
+                region: region as u32,
+                episode,
+            }],
+            plan,
+        ) {
+            if matches!(error, PipelineError::CaptureAborted) {
+                pipeline.discard_staged(&[consequence]);
+                book.unresolved = Some(UnresolvedEpisode {
+                    kind: UnresolvedKind::ClassificationSync,
+                    witness,
+                    episode,
+                    consequence,
+                    keys: Vec::new(),
+                    journaled: false,
+                });
+            }
+            return Err(error);
+        }
+        book.episode_keys.insert(episode, (consequence, Vec::new()));
+        book.journaled_classifications
+            .insert(witness, classifications);
+    } else if !journaled {
         // The rejected append: re-stage the identity's envelope and
         // journal it (the plan over the SAME keys — their records are
         // still pending-unclaimed in the ledger — plus the CURRENT
@@ -1124,6 +1218,7 @@ fn complete_unresolved_episode<M: CanonicalMedium>(
             if matches!(error, PipelineError::CaptureAborted) {
                 pipeline.discard_staged(&[consequence]);
                 book.unresolved = Some(UnresolvedEpisode {
+                    kind: UnresolvedKind::Record,
                     witness,
                     episode,
                     consequence,
@@ -1207,8 +1302,10 @@ fn flush_witness_classifications<M: CanonicalMedium>(
     .map_err(PipelineError::Format)?;
     if let Err(error) = pipeline.stage(envelope) {
         // A stage failure is like CaptureAborted for records: nothing
-        // is durable, so journaled=false and the retry re-stages.
+        // is durable, so journaled=false and the retry re-stages the
+        // SAME identity (the classification-sync completion).
         book.unresolved = Some(UnresolvedEpisode {
+            kind: UnresolvedKind::ClassificationSync,
             witness,
             episode,
             consequence,
@@ -1239,6 +1336,7 @@ fn flush_witness_classifications<M: CanonicalMedium>(
         if matches!(error, PipelineError::CaptureAborted) {
             pipeline.discard_staged(&[consequence]);
             book.unresolved = Some(UnresolvedEpisode {
+                kind: UnresolvedKind::ClassificationSync,
                 witness,
                 episode,
                 consequence,
@@ -1250,9 +1348,17 @@ fn flush_witness_classifications<M: CanonicalMedium>(
     }
 
     if let Err(error) = pipeline.mark_applied(&[consequence]) {
-        // The transaction is journaled at this point, so journaled=true
-        // and the retry completes the apply only.
+        // The transaction IS journaled (the capture above succeeded):
+        // the journal holds this sync as fact, so the book's episode
+        // tracking and classification snapshot are established NOW —
+        // the flush condition must not fire a SECOND transaction for
+        // the same sync once the apply completes (the lane's first
+        // form left the snapshot stale here, re-flushing a duplicate).
+        // The unresolved record drives the apply completion only.
+        book.episode_keys.insert(episode, (consequence, Vec::new()));
+        book.journaled_classifications.insert(witness, current);
         book.unresolved = Some(UnresolvedEpisode {
+            kind: UnresolvedKind::ClassificationSync,
             witness,
             episode,
             consequence,
