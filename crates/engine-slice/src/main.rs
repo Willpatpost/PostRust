@@ -90,6 +90,11 @@ Interactive modes
   --corner --weather <rain>        The rain layer (Era 2 package C — particles +
                                      weather; requires --populated; the emitter
                                      seed 0xDEADBEEF, policy rate=480/s)
+  --corner --ripple-decimation <n> The walk-time ripple density knob (requires
+                                     --weather rain): swaps ONLY the admission
+                                     rate — the shipped 320:1 policy and its
+                                     pins stay the default; the exit summary
+                                     prints the diagnostic arm's census
   --corner --free-look               Interactive WASD + mouse camera (Era 1's
                                     eyeball mode — presentation only, the camera
                                     never enters a measured claim; starts on the
@@ -602,6 +607,7 @@ fn main() {
             let mut wet = false;
             let mut behavior = false;
             let mut weather: Option<String> = None;
+            let mut ripple_decimation: Option<u32> = None;
             let mut audio = false;
             let mut fps = 60;
             let mut present = engine_renderer::PresentModePreference::Auto;
@@ -666,6 +672,29 @@ fn main() {
                     "--weather" => {
                         weather = Some(options.next().ok_or("--weather requires a value")?.clone());
                     }
+                    // THE WALK-TIME DENSITY KNOB (the ripple-visibility
+                    // diagnostic's ladder, live on the corner route):
+                    // swaps ONLY the ripple admission rate (the
+                    // decimation) — the shipped 320:1 policy and its
+                    // exact pins stay the default; a value makes this
+                    // route the DIAGNOSTIC arm (the exit summary's
+                    // census shows the difference). The owner's
+                    // future-walk decision tool for the density
+                    // re-pin-vs-puddles question.
+                    "--ripple-decimation" => {
+                        let value = options
+                            .next()
+                            .ok_or("--ripple-decimation requires a value")?;
+                        let decimation: u32 = value
+                            .parse()
+                            .map_err(|_| "--ripple-decimation requires a positive integer")?;
+                        if decimation == 0 {
+                            return Err("--ripple-decimation requires a positive integer (the \
+                                 policy's own zero-decimation refusal)"
+                                .into());
+                        }
+                        ripple_decimation = Some(decimation);
+                    }
                     // The behavior spine (Era 2 package A part 5 — the
                     // composed gates): the commitment wakes drive the
                     // populated crowd. Refuses without --populated.
@@ -728,6 +757,15 @@ fn main() {
             if weather.is_some() && !populated {
                 return Err("--weather rain requires --populated (the rain kind rides the populated routes)".into());
             }
+            // --ripple-decimation rides the rain layer (the loud
+            // typed refusal — never a silently ignored flag).
+            if ripple_decimation.is_some() && weather.as_ref() != Some(&"rain".to_string()) {
+                return Err(
+                    "--ripple-decimation requires --weather rain (the knob varies the \
+                     rain layer's ripple admission)"
+                        .into(),
+                );
+            }
             // --weather only accepts 'rain' (the loud typed refusal).
             if let Some(ref weather_type) = weather
                 && weather_type != "rain"
@@ -767,6 +805,7 @@ fn main() {
                 wet,
                 behavior,
                 weather,
+                ripple_decimation,
                 audio,
             )
         };
