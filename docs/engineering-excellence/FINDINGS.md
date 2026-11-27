@@ -38,7 +38,7 @@ corrected).
 | A21 | CORE | UNTRIAGED | — | pending auditor-core |
 | A22 | CORE/PERSIST | CONFIRMED (persist half) | — | confirmed_history grows unbounded, local.rs:3015-3028, no pruning; CORE half pending |
 | A23 | REND/SHELL | CONFIRMED (rend half) | — | pose storage dynamic-offset per slot (skinned_draw.rs:949-950, POSE_STRIDE=704); SHELL half pending auditor-shell |
-| A24 | SLICE | CONFIRMED (HIGH) | — | verified: `corner_demo.rs:293,308` hardcoded `1.0/60.0`; `corner_weather.rs:267,282,384,393` per-frame hardcoded ticks; free-look loop at render cadence (audits/slice.md; orchestrator grep-verified) |
+| A24 | SLICE | FIXED-AWAITING-REVIEW | integrated `1884582` | lane `b1a052b`+`886361c` after two corrective rounds (wall-clock-driven scripted route → reverted; double-fed accumulator/frozen cycle/lost minimized time → fixed by direct surgery): scripted route stays frame-indexed (deterministic acceptance harness, census pinned), free-look runs ONE accumulator (crowd+rain+day/night coherent, monotone cycle, `accrue` for minimized); dt bit-identity pinned by `dt_forms_are_bit_identical` (0x3c888889); lib 130 (118+12); heavy +12 pending measured pin; rig weather gates pending |
 | A25 | SHELL | UNTRIAGED | — | pending auditor-shell |
 | B01 | CORE | UNTRIAGED | — | pending auditor-core |
 | B02 | PERSIST | CONFIRMED | — | journal.rs:170-189 whole-file read ≤4 GiB; auditor's caller list (journal.rs:1115…3428) to be re-verified in P3 (line refs ambiguous across modules) |
@@ -117,3 +117,14 @@ refutation is evidence too.
   prefer this model for mechanical/structural changes with tight contracts,
   route semantics-heavy durability work through orchestrator implementation
   or far stricter briefs.
+- **qwen3-coder-next (A24, rounds 1+2):** the pattern's worst case — round 1
+  wall-clock-drove the deterministic scripted route (breaking the pinned exit
+  census on any machine ≠ 60fps) with a non-bit-identical dt and incoherent
+  clocks; round 2 claimed the corrective but left the accumulator
+  double-fed (2× world speed), the day/night cycle frozen at a per-frame
+  position, minimized time silently lost, and dead code — while reporting
+  "Risks: None identified." Both caught only by orchestrator diff review
+  against the named equivalence bar. **Standing decision: timing/determinism
+  semantics work is no longer delegated to implementation lanes — the
+  orchestrator implements or the lane produces a design document first for
+  orchestrator approval before any code.**
