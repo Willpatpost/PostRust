@@ -20,12 +20,12 @@ corrected).
 | A02 | CORE/REND | UNTRIAGED | — | pending auditor-core (renderer half: scene_record/frame_prepare per charter) |
 | A03 | REND | CONFIRMED | — | four render_corner* entry points + DemoScenePreference (audits/renderer.md) |
 | A04 | REND | CONFIRMED | — | render_frame 19 params (incl. wet; charter said ~18) — vulkan.rs:3974-3994 |
-| A05 | CORE | UNTRIAGED | — | pending auditor-core |
+| A05 | CORE | CONFIRMED (core half) | — | lib.rs:97-111 constants hard-coded and baked into the save format (npc_world_save fixed-population arrays); P2 configurable-identity package |
 | A15 | SLICE | CONFIRMED (LOW, severity reduced) | — | wire discipline is correct (subsystems import only public APIs); the issue is the monolithic `corner_demo` dispatch + `main.rs` CLI cascade — P4/P6 extraction per the module classification map (audits/slice.md §2) |
 | A06 | REND/SLICE | CONFIRMED | — | animation core is pure but lives INSIDE the renderer crate — placement is the P4 question (auditor read the purity as fine; the crate-coupling issue stands); slice half verified: `corner_routes.rs` imports `engine_renderer::animation` directly (audits/slice.md) |
-| A07 | CORE | UNTRIAGED | — | pending auditor-core |
-| A08 | CORE | UNTRIAGED | — | pending auditor-core |
-| A09 | CORE | UNTRIAGED | — | pending auditor-core |
+| A07 | CORE | CONFIRMED | — | npc_perception.rs:83-94 linear population walk; npc_execution.rs:283-306 enumerate_witnesses rides it (audits/core.md) |
+| A08 | CORE | CONFIRMED | — | spine.rs:1128-1146 suspend_from_queue heap pop + temp Vec + full predicate scan (audits/core.md) |
+| A09 | CORE | CONFIRMED | — | npc_memory.rs:669-684 witness_records merges pending+confirmed, whole-ledger scan + sort (audits/core.md) |
 | A10 | CORE | UNTRIAGED | — | pending auditor-core |
 | A11 | REND | CONFIRMED | — | MAX_INSTANCES=4096 = MAX_POSE_BLOCKS; region capacity per FRAMES_IN_FLIGHT (scene.rs:319) |
 | A12 | REND | CONFIRMED | — | 1:1 shadowed/skinned shader variant pairs + per-variant descriptor layouts (audits/renderer.md duplication matrix) |
@@ -35,24 +35,24 @@ corrected).
 | A18 | REND | CONFIRMED | — | repack_populations proxy_instances.rs:699-706 + repack_poses animation.rs:729 per frame; folds NEW-REND-08 (static-population caching = P5 dirty-generation question) |
 | A19 | REND | CONFIRMED | — | ground_reflect.wgsl:144-166 per-fragment loop over all rings; folds NEW-REND-09 |
 | A20 | REND | CONFIRMED | — | per-static-upload staging alloc/copy/submit/fence (vulkan.rs:3035-3199, textures.rs:61-202); folds NEW-REND-03 (no staging pool — same finding, more detail) |
-| A21 | CORE | UNTRIAGED | — | pending auditor-core |
-| A22 | CORE/PERSIST | CONFIRMED (persist half) | — | confirmed_history grows unbounded, local.rs:3015-3028, no pruning; CORE half pending |
+| A21 | CORE | CONFIRMED | — | diag.rs:61 unbounded `Vec<Record>`, :111-119 synchronous stderr echo + push on the record path (orchestrator grep-verified) |
+| A22 | CORE/PERSIST | CONFIRMED (persist half) | — | confirmed_history grows unbounded, local.rs:3015-3028, no pruning; CORE half: spine.rs:1320-1354 ledger grows until explicit compact (audits/core.md) |
 | A23 | REND/SHELL | CONFIRMED (rend half) / N/A (shell half) | — | pose storage dynamic-offset per slot (skinned_draw.rs:949-950, POSE_STRIDE=704); the charter's shell clause (voice arrays) is NOT-APPLICABLE as written per auditor + orchestrator read — the voice pool is bounded-by-design with prebuilt PCM (a preserved strength); NEW-SHELL-05 notes the constructor-call-site documentation |
 | A24 | SLICE | VERIFIED-CLOSED | integrated `1884582` | **rig-verified 2026-11-26:** all 11 `render_weather` Vulkan gates green on the RTX 5070 Ti (exit 0, 7.29 s) with the pinned values reproducing digit-for-digit (ink 17041, broadside 3482/2162, the allocation tuple, sweep 22/255, the term-separation counts) — the scripted route's census equivalence proven on the real GPU; heavy 664/46/64 measured (pin corrected); scripted route frame-indexed by design, free-look on one coherent accumulator (crowd+rain+day/night, monotone cycle, minimized accrual, dt bit-identity pinned `0x3c888889`); two defective lane rounds caught at review, final surgery by orchestrator |
 | A25 | SHELL | FIXED-AWAITING-REVIEW | integrated `7c30aee` | **auditor PASS verdict REFUTED by direct read** (start_voice ran inside the lock at audio.rs:912 — the auditor's "releases before heavy work" was backwards); orchestrator-implemented fix `fa13e26`: copy-out under try-lock → guard dropped → voice-start unheld; pairing preserved; shell battery green, zero test changes |
-| B01 | CORE | UNTRIAGED | — | pending auditor-core |
+| B01 | CORE | CONFIRMED | — | spine.rs:1767-1786 drain_due counts executions only (blocked moves don't count); charter's structural-gap framing stands (audits/core.md) |
 | B02 | PERSIST | CONFIRMED | — | journal.rs:170-189 whole-file read ≤4 GiB; auditor's caller list (journal.rs:1115…3428) to be re-verified in P3 (line refs ambiguous across modules) |
 | B03 | PERSIST | CONFIRMED | — | composite_reader.rs:416-464,544 payload clones; reclaim.rs ~5686 bytes.clone(); pipeline.rs PendingAttempt clones; folds NEW-PERSIST-01/04 |
 | B04 | SLICE/PERSIST | FIXED-AWAITING-REVIEW | integrated `e31dc61` | lane `35211d2` + orchestrator corrective `2f92788`: the flush now records unresolved episodes on all three failure boundaries; the corrective fixed the lane's two defects (unjournaled retry hit the inverted `new(0,0)` membership span; journaled retry left the sync snapshot stale → duplicate flush) via `UnresolvedKind` + failure-boundary bookkeeping; 2 discriminating tests; fuzz-gate values unchanged; heavy +2 pending measured pin |
 | B10 | SLICE | CONFIRMED | — | replay/synthesis asymmetry verified in structure (audits/slice.md; line refs approximate) — measurement-quality fix alongside the measurement owner |
 | B11 | SLICE | CONFIRMED (LOW) | — | occupancy-vs-visibility terminology (audits/slice.md) |
 | B13 | SLICE/PERSIST | CONFIRMED (HIGH) | — | verified: `worker.rs` send-then-`slot.recv()` round-trip at :635,687,745,792,837,877,921,1174; charter-known blocking bounded send on `submit_required`; P3 mapping of which calls can block sim/presentation |
-| B05 | CORE | UNTRIAGED | — | pending auditor-core |
-| B06 | CORE | UNTRIAGED | — | pending auditor-core |
-| B07 | CORE | UNTRIAGED | — | pending auditor-core |
+| B05 | CORE | CONFIRMED (orchestrator-adjudicated) | — | **auditor label wrong again** (claimed the combined Y-excursion is checked): the direct read shows particle.rs:286-291 bounds position+velocity per axis and :293-294 checks gravity×life² SEPARATELY — the combined sum is never bounded (each part finite ≈1e38 passes, sum overflows); the auditor's other points (any finite nonnegative dt accepted incl. dt > remaining lifetime; dt*rate overflow-then-cap) align with the charter |
+| B06 | CORE | CONFIRMED (auditor-located) | — | interaction.rs select_target sqrt+normalize per target, the exact-zero-distance tie question; combat.rs resolve_attack full hitbox scan — verify the tie contract before the P2 spatial package |
+| B07 | CORE | CONFIRMED | — | npc_execution.rs:164 (evaluate_wake) and :246 (evaluate_witness) call validate_rule_table per invocation (orchestrator grep-verified) |
 | B08 | SHELL | CONFIRMED (deferred to measurement) | — | **auditor PASS verdict REFUTED by direct read** (mem::take at input.rs:199-203 moves the buffers out, leaving capacity-0 accumulators that reallocate on the next input-bearing frame — "reused via take" was backwards); disposition: the churn is human-scale at current workloads (edges are rare, idle frames allocate nothing) — the caller-owned-snapshot API change needs an input-event allocation census to justify; queued for the P0 measurement matrix |
 | B09 | REND | FIXED-AWAITING-REVIEW | integrated `9dce061` + corrective | lane `2ddef05` reviewed: metal literal fixed + never-existed display_surface removed + one focused test; **orchestrator corrective restored `VK_MVK_macos_surface`** (deprecated but REAL — legacy MoltenVK loaders advertise it; its removal re-opened the exact misclassification class the fix closes); lane citation inaccuracy recorded (VK_KHR_display does provide vkCreateDisplayPlaneSurfaceKHR); +1 test → pin correction at batch gate close; awaits batch gate run |
-| B12 | CORE | UNTRIAGED | — | pending auditor-core |
+| B12 | CORE | UNTRIAGED (caller analysis open) | — | the codec exists (npc_behavior.rs); the auditor honestly marked it UNEXAMINED (needs a full call-graph analysis); fold into the P2 world-representation package |
 | B14 | REND | CONFIRMED | — | full-size RGBA16F reflection targets per slot + HDR/bloom targets; P5 measurement package |
 | B15 | WORKSPACE | PARTIAL (rend half) | — | renderer dep closure tight (ash/bytemuck/nalgebra + engine-core); full workspace measurement pending P0/P6 |
 | B16 | ALL | UNTRIAGED | — | pending all auditors |
@@ -133,6 +133,16 @@ refutation is evidence too.
   semantics work is no longer delegated to implementation lanes — the
   orchestrator implements or the lane produces a design document first for
   orchestrator approval before any code.**
+- **gpt-oss-120b (core, retry):** delivered under the anti-wedge rules where
+  MiMo wedged (the incremental-file discipline worked); located facts exact
+  where orchestrator-verified (A21, B07 lines precise), but ONE LABEL ERROR
+  again (B05 "combined Y-excursion now checked" — the direct read shows the
+  parts checked separately at particle.rs:286-294 and the combined sum
+  never bounded; same class as the persist A13 label). Third audit, third
+  label error from this model: located facts reliable, verdict labels always
+  need orchestrator adjudication. No new findings beyond seeds (either the
+  core is genuinely clean beyond the seeds or coverage was seed-focused —
+  7 DEEP / 26 SKIM recorded honestly).
 - **qwen38-27b (shell, self-mislabeled gpt-oss-120b in its own report):** the
   weakest audit of the five — BOTH seed verdicts wrong with backwards
   reasoning (A25 "releases the lock before heavy work" — the lock was held
