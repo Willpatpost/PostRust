@@ -2,7 +2,8 @@
 //! `(due, seq)` queue priority, cross-class causal dependencies, per-tick
 //! budget with the near/far lane policy, the housekeeping allowance that
 //! bounds parked-transition and waiter-release work per drain phase (B01),
-//! the execution ledger, and the safe processed-through watermark.
+//! the execution ledger with its opt-in retention policy (A22-core), and
+//! the safe processed-through watermark.
 //!
 //! Stage 3 (`docs/TECH-ARCHITECTURE.md` §2.4, §6): near and far lanes with
 //! the three-phase budget policy — the near reservation is a **guaranteed
@@ -16,10 +17,19 @@
 //! represents the lane classification and reservation as authoritative
 //! state. Regions, LOD levels, and persistence still attach above this
 //! core in their stages.
+//!
+//! The execution-ledger retention policy (A22-core, P2 design §6.2): the
+//! ledger is diagnostic history — the identity/dedup authority is the
+//! unfinished complement (`seq < next_seq && !unfinished`), never the
+//! ledger — so an opt-in [`RetentionPolicy`] bounds the ledger's resident
+//! size by firing the existing explicit [`Spine::compact`] at the tick
+//! boundary, chunk-bounded per invocation. The default is no policy:
+//! exactly today's behavior, byte for byte.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::hash::{BuildHasher, Hasher};
+use std::num::NonZeroU64;
 
 use crate::clock::Tick;
 use crate::diag::{Diagnostics, Level};
@@ -208,6 +218,131 @@ pub enum CompactionError {
     /// The requested retained window exceeds the ledger length — the
     /// explicit operation takes an exact window, never a clamped one.
     RetainExceedsLedger { ledger_len: u64, retain: u64 },
+}
+
+/// The execution-ledger retention policy (A22-core, P2 design §6.2 —
+/// the L7 lane): the configurable cadence that bounds the ledger's
+/// resident size by firing the EXISTING explicit compaction
+/// ([`Spine::compact`]) — no second compaction mechanism, no second
+/// summary domain. The policy is OPT-IN configuration with no
+/// default: a spine constructed without one never auto-compacts,
+/// keeping today's exact behavior (the no-silent-default rule — the
+/// application opts in explicitly through
+/// [`Spine::set_retention_policy`], and opting in IS the eligibility
+/// decision [`Spine::compact`]'s own doc delegates to the driver:
+/// the engine policy bounds RAM; the driver decides when consequence
+/// lanes tolerate a prefix cut).
+///
+/// **The evidence/history split (the contract this policy polices):**
+/// executed-membership, exactly-once, conservation, and the
+/// watermarks hang off `next_seq`, the `unfinished` complement,
+/// `waiting_on`, and the incrementally maintained
+/// [`Spine::max_executed_due`] index — never off the ledger. The
+/// ledger is diagnostic history: audit trail, the late-accounting
+/// source, and the compaction digest's input. The policy therefore
+/// sheds only history (each discarded record authenticated into the
+/// SHA-256 prefix chain), and the authority is structurally
+/// untouched by every cut.
+///
+/// **The cadence (when it fires):** at the tick boundary — the one
+/// checkpoint site, at the end of [`Spine::run_tick`] after every
+/// drain phase has completed, never mid-drain — when
+/// `ledger_retained().len() > retain + chunk`. The `+ chunk` term is
+/// the hysteresis band: the policy tolerates the ledger floating up
+/// to `retain + chunk` records before firing, so every firing has a
+/// full chunk of work and per-record compaction churn never happens.
+///
+/// **The chunk bound (what one invocation costs):** each firing
+/// summarizes `min(excess, chunk)` records — at the threshold gate
+/// exactly `chunk` — so one invocation's SHA-256 work is bounded by
+/// `chunk` records hashed BY CONSTRUCTION (the design's ≤ 4,096
+/// guidance), and a pre-existing backlog (a restored ledger, a long
+/// quiet period) drains at one chunk per tick: bounded per tick,
+/// observable in [`Spine::retention_stats`], like every other
+/// budget.
+///
+/// **The resident bound (the active-RAM target):** with the
+/// checkpoint running every tick, the retained ledger holds at most
+/// [`Self::resident_bound_records`] records at every tick boundary
+/// PROVIDED `chunk` is at least the sustained per-tick execution
+/// count (the per-tick execution budget bounds that): each tick
+/// adds at most `budget` records and each firing removes a full
+/// chunk. A `chunk` below the sustained rate still bounds every
+/// INVOCATION, but the ledger nets upward — the configuration rule
+/// is part of the contract, and [`Spine::retention_stats`] makes the
+/// misconfiguration observable. Resident bytes ≈ records ×
+/// `size_of::<ExecutionRecord>()` (the ~40 B in-memory stride vs
+/// the 31 B wire record — the design's §9-measurement placeholder).
+///
+/// `retain` is the guaranteed verbatim tail window: choose
+/// `retain ≥ budget` when late-accounting consumers need the
+/// current tick's records verbatim — the current tick's appends
+/// always precede the boundary checkpoint, so a `retain ≥ budget`
+/// window always contains them.
+///
+/// Configuration, never logical state: not fingerprinted, not
+/// serialized — a restored spine resumes with NO policy until the
+/// driver re-configures, while the compaction the policy already
+/// performed persists in the `spine-history/2` save form exactly as
+/// an explicit compaction would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    /// The guaranteed verbatim tail window, in records — the policy
+    /// never compacts below it.
+    retain: NonZeroU64,
+    /// The per-invocation compaction chunk: the maximum records one
+    /// firing summarizes (the SHA-256 work bound) and the hysteresis
+    /// band above `retain` the ledger may float through before a
+    /// firing.
+    chunk: NonZeroU64,
+}
+
+impl RetentionPolicy {
+    /// The policy with the given verbatim tail window and
+    /// per-invocation chunk (both non-zero by type: a zero retain
+    /// window or a zero chunk is not a policy but a degenerate
+    /// compaction loop).
+    pub const fn new(retain: NonZeroU64, chunk: NonZeroU64) -> Self {
+        RetentionPolicy { retain, chunk }
+    }
+
+    /// The guaranteed verbatim tail window, in records.
+    pub const fn retain(&self) -> NonZeroU64 {
+        self.retain
+    }
+
+    /// The per-invocation chunk (records summarized per firing, the
+    /// SHA-256 work bound).
+    pub const fn chunk(&self) -> NonZeroU64 {
+        self.chunk
+    }
+
+    /// The documented resident bound: the most retained records the
+    /// ledger holds at any tick boundary when `chunk` is at least
+    /// the sustained per-tick execution count (see the type doc).
+    pub const fn resident_bound_records(&self) -> u64 {
+        self.retain.get().saturating_add(self.chunk.get())
+    }
+}
+
+/// Observational retention counters (the A22-core observability
+/// class — like [`LaneTotals`] and [`SuspensionStats`]: never
+/// fingerprinted, never serialized, never affecting scheduling; a
+/// restored spine resumes them at defaults). `summarized_total`
+/// counts POLICY summarizations only — a manual [`Spine::compact`]
+/// moves `history_kind()`'s `summarized_records` without touching
+/// these counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionStats {
+    /// Policy-driven compaction invocations (at most one per tick —
+    /// the cadence's firing count).
+    pub compactions: u64,
+    /// Cumulative records summarized by policy invocations.
+    pub summarized_total: u64,
+    /// The most recent invocation's cut (the chunk witness).
+    pub last_chunk: u64,
+    /// The largest cut any single invocation has performed.
+    pub max_chunk: u64,
 }
 
 /// Typed refusals of the held-reconstruction replacement set
@@ -490,6 +625,18 @@ pub struct Spine<W: World> {
     /// constraint). Derived state; the held map is canonical.
     held_index: BTreeSet<(Tick, u64)>,
     suspension: SuspensionStats,
+    /// The configured execution-ledger retention policy (A22-core):
+    /// `None` — the default — never auto-compacts (today's exact
+    /// behavior, byte for byte); `Some` fires the chunked compaction
+    /// at the tick boundary (see [`RetentionPolicy`]). Configuration,
+    /// never logical state: not fingerprinted, not serialized — a
+    /// restored spine resumes with no policy until the driver
+    /// re-configures.
+    retention: Option<RetentionPolicy>,
+    /// Observational retention counters (the [`RetentionStats`] doc
+    /// — the `LaneTotals`/`SuspensionStats` never-fingerprinted,
+    /// never-serialized class).
+    retention_stats: RetentionStats,
     /// Reusable handler follow-up buffer — taken per execution, drained
     /// into `schedule`, and returned with its capacity retained (the
     /// F-02 caller-held-scratch discipline applied to the spine's
@@ -717,6 +864,8 @@ impl<W: World> Spine<W> {
             held: BTreeMap::new(),
             held_index: BTreeSet::new(),
             suspension: SuspensionStats::default(),
+            retention: None,
+            retention_stats: RetentionStats::default(),
             scratch_follow_ups: Vec::new(),
         }
     }
@@ -1759,6 +1908,16 @@ impl<W: World> Spine<W> {
             far_backlogged,
             housekeeping_exhausted,
         };
+        // The A22-core retention checkpoint: the policy's ONE firing
+        // site, at the tick boundary — after every drain phase and the
+        // report assembly, so compaction can never interrupt
+        // execution, parking, or waiter-release work (never mid-drain
+        // by construction; the only other compaction entry point is
+        // the public explicit `compact`, which stays the driver's
+        // between-ticks tool). With no policy configured the
+        // checkpoint is a no-op with zero cost (the allocation-pin
+        // discipline).
+        self.apply_retention_policy();
         self.clock
     }
 
@@ -1852,6 +2011,88 @@ impl<W: World> Spine<W> {
             prefix_summary: chain,
         });
         Ok(self.history_kind())
+    }
+
+    // ---------------------------------------------------- retention policy
+
+    /// Configures the execution-ledger retention policy (A22-core —
+    /// see [`RetentionPolicy`]). Opt-in: the default spine never
+    /// auto-compacts. Setting a policy never changes logical state —
+    /// the fingerprint domains and save bytes are untouched by
+    /// configuration alone; only a FIRING changes the history
+    /// representation, through the same authenticated cut the explicit
+    /// [`Spine::compact`] performs.
+    pub fn set_retention_policy(&mut self, policy: RetentionPolicy) {
+        self.retention = Some(policy);
+    }
+
+    /// Removes the policy — the explicit opt-out. Future ticks never
+    /// auto-compact; an already-compacted history STAYS compacted
+    /// (compaction is not reversible — the discarded records are never
+    /// reconstructible), and the observational counters freeze at
+    /// their last values.
+    pub fn clear_retention_policy(&mut self) {
+        self.retention = None;
+    }
+
+    /// The configured policy, if any. Never serialized: a restored
+    /// spine reports `None` until the driver re-configures.
+    pub fn retention_policy(&self) -> Option<RetentionPolicy> {
+        self.retention
+    }
+
+    /// Observational retention counters (never fingerprinted, never
+    /// serialized; see [`RetentionStats`]).
+    pub fn retention_stats(&self) -> RetentionStats {
+        self.retention_stats
+    }
+
+    /// THE POLICY CHECKPOINT (A22-core): the cadence's one firing
+    /// site, called at the END of [`Self::run_tick`] — every drain
+    /// phase has completed and the lane report is assembled, so
+    /// compaction can never interrupt execution, parking, or waiter
+    /// release. Fires when the retained ledger exceeds
+    /// `retain + chunk` (the hysteresis band), summarizing
+    /// `min(excess, chunk)` records through the existing compaction —
+    /// at the gate exactly one chunk — and records the invocation in
+    /// the observational counters. A no-op with no policy configured.
+    ///
+    /// The cut is a valid compaction window BY CONSTRUCTION: the gate
+    /// guarantees `excess ≥ chunk ≥ 1` and `cut ≥ 1`, so the window
+    /// retains ≥ `retain` ≥ 1 records and summarizes ≥ 1 — neither
+    /// typed refusal of [`Self::compact`] is reachable; the `expect`
+    /// documents the invariant, it never fires.
+    fn apply_retention_policy(&mut self) {
+        let Some(policy) = self.retention else {
+            return;
+        };
+        let ledger_len = self.ledger.len() as u64;
+        let threshold = policy.resident_bound_records();
+        if ledger_len <= threshold {
+            return;
+        }
+        let excess = ledger_len - policy.retain.get();
+        let cut = excess.min(policy.chunk.get());
+        let retained = ledger_len - cut;
+        self.compact(retained).expect(
+            "the retention policy's cut is a valid compaction window by construction: the \
+             threshold gate guarantees excess ≥ chunk ≥ 1 and cut ≥ 1, so the window retains \
+             ≥ retain ≥ 1 records and summarizes ≥ 1 — neither typed refusal is reachable",
+        );
+        self.retention_stats.compactions += 1;
+        self.retention_stats.summarized_total += cut;
+        self.retention_stats.last_chunk = cut;
+        self.retention_stats.max_chunk = self.retention_stats.max_chunk.max(cut);
+        if self.diag.would_log(Level::Info) {
+            self.diag.log(
+                Level::Info,
+                format!(
+                    "retention policy compacted {cut} records at {} (retained {retained}, \
+                     cumulative summarized {})",
+                    self.clock, self.retention_stats.summarized_total
+                ),
+            );
+        }
     }
 
     // ------------------------------------------------------- fingerprints
@@ -2591,10 +2832,14 @@ fn fingerprint_deps(fp: &mut Fingerprinter, event: &Event) {
 // `max_executed_index`, `remaining_deps` (B01's derived
 // remaining-dependency counts) — is rebuilt from those canonical sources
 // through the same code paths the live spine uses. Observational —
-// `LaneReport`, `LaneTotals`, `SuspensionStats`, `Diagnostics` — is not
-// logical state: a restored spine resumes them at defaults, they never
-// affect scheduling, accounting, or fingerprints, and the boundary is
-// documented in the wire spec.
+// `LaneReport`, `LaneTotals`, `SuspensionStats`, `RetentionStats`,
+// `Diagnostics` — is not logical state: a restored spine resumes them at
+// defaults, they never affect scheduling, accounting, or fingerprints,
+// and the boundary is documented in the wire spec. The retention POLICY
+// (A22-core) is driver configuration in the same never-serialized class:
+// a restored spine resumes with no policy until re-configured, while
+// compaction the policy already performed persists in the
+// `spine-history/2` save form exactly as an explicit compaction would.
 
 /// Minimum encoded size of one obligation entry (wire-format spec
 /// §maxima): seq 8 + class 4 + field 1 + schedule kind 1 + due 8 +
@@ -2969,6 +3214,8 @@ impl<W: SaveWorld> Spine<W> {
             held: BTreeMap::new(),
             held_index: BTreeSet::new(),
             suspension: SuspensionStats::default(),
+            retention: None,
+            retention_stats: RetentionStats::default(),
             scratch_follow_ups: Vec::new(),
         };
 
@@ -4689,5 +4936,605 @@ mod tests {
             "restore resumes the observational class at defaults"
         );
         assert_eq!(restored.engine_fingerprint(), storm.engine_fingerprint());
+    }
+
+    // -------------------------------- A22-core retention policy tests (P2 L7)
+
+    /// A retention policy from plain non-zero integers (the fixtures'
+    /// shorthand — production callers construct the `NonZeroU64`s at
+    /// their configuration boundary).
+    fn policy(retain: u64, chunk: u64) -> RetentionPolicy {
+        RetentionPolicy::new(
+            NonZeroU64::new(retain).expect("retain is non-zero"),
+            NonZeroU64::new(chunk).expect("chunk is non-zero"),
+        )
+    }
+
+    /// THE OPT-OUT CONTRACT: no policy — the default — never
+    /// auto-compacts, and the policy's PRESENCE alone (configured but
+    /// never firing) changes no observable: fingerprints and save
+    /// bytes stay byte-identical to a never-configured spine. A
+    /// policy cleared after a firing freezes the cadence (future
+    /// ticks never fire) while the already-cut history stays
+    /// compacted, and a restored spine resumes with no policy and
+    /// default counters — configuration is never wire state.
+    #[test]
+    fn retention_policy_is_opt_in_and_its_presence_changes_nothing() {
+        // The default: real work, never compacted, zero counters.
+        let build = || {
+            let mut spine = Spine::new(SaveableNoopWorld, 50);
+            for t in 1..=6u64 {
+                for i in 0..10u64 {
+                    spine
+                        .schedule(spec(0, Field::Near, t, t * 100 + i))
+                        .expect("schedule");
+                }
+            }
+            spine
+        };
+        let mut plain = build();
+        plain.run_ticks(6);
+        assert_eq!(plain.history_kind(), HistoryKind::Full);
+        assert_eq!(plain.retention_policy(), None);
+        assert_eq!(plain.retention_stats(), RetentionStats::default());
+
+        // The same scenario with a policy whose threshold the ledger
+        // never reaches: identical fingerprints, identical saves —
+        // configuration alone is not logical state.
+        let mut configured = build();
+        let fingerprint_before = configured.engine_fingerprint();
+        configured.set_retention_policy(policy(10_000, 4_096));
+        assert_eq!(
+            configured.engine_fingerprint(),
+            fingerprint_before,
+            "setting a policy touches no fingerprinted state"
+        );
+        configured.run_ticks(6);
+        assert_eq!(configured.history_kind(), HistoryKind::Full);
+        assert_eq!(configured.retention_stats(), RetentionStats::default());
+        assert_eq!(configured.engine_fingerprint(), plain.engine_fingerprint());
+        assert_eq!(configured.save_bytes(), plain.save_bytes());
+
+        // Cleared after firing: the cadence freezes, the cut persists,
+        // and the restored spine — carrying the compacted history —
+        // resumes with no policy and default counters. Six ticks of
+        // 10 executions against retain 10 / chunk 40 (threshold 50)
+        // fire exactly once, at tick 6 (60 > 50, cutting 40).
+        let mut frozen = build();
+        frozen.set_retention_policy(policy(10, 40));
+        frozen.run_ticks(6);
+        let fired = frozen.retention_stats();
+        assert_eq!(fired.compactions, 1);
+        assert_eq!(fired.summarized_total, 40);
+        assert_eq!(fired.last_chunk, 40);
+        assert_eq!(fired.max_chunk, 40);
+        frozen.clear_retention_policy();
+        let bytes = frozen.save_bytes();
+        let mut restored: Spine<SaveableNoopWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+        assert_eq!(restored.retention_policy(), None);
+        assert_eq!(restored.retention_stats(), RetentionStats::default());
+        // More work after the clear and the restore: neither spine
+        // fires again — the restored spine carries no policy, and the
+        // cleared one keeps its word. Both stay compacted (history
+        // already cut); the counters freeze at the firing values.
+        for t in 7..=9u64 {
+            for target in [&mut frozen, &mut restored] {
+                for i in 0..10u64 {
+                    target
+                        .schedule(spec(0, Field::Near, t, t * 100 + i))
+                        .expect("schedule");
+                }
+            }
+        }
+        frozen.run_ticks(3);
+        restored.run_ticks(3);
+        assert_eq!(frozen.retention_stats(), fired);
+        assert_eq!(restored.retention_stats(), RetentionStats::default());
+        assert!(matches!(
+            frozen.history_kind(),
+            HistoryKind::Compacted { .. }
+        ));
+        assert!(matches!(
+            restored.history_kind(),
+            HistoryKind::Compacted { .. }
+        ));
+    }
+
+    /// THE CADENCE, EXACT: 100 executions per tick against
+    /// retain 10 / chunk 300 (threshold 310). The ledger sawtooths
+    /// 100 → 200 → 300, fires at tick 4 (400 > 310, cutting exactly
+    /// one chunk of 300), and repeats — firings at ticks 4, 7, 10 —
+    /// with the retained ledger never above the hysteresis band's
+    /// top, the count identity (`summarized + retained == executed`)
+    /// holding at every boundary, and the no-policy twin — the same
+    /// schedule, the same ticks — indistinguishable in every
+    /// authoritative observable at every tick (the drain semantics
+    /// are policy-invisible: the checkpoint runs at the tick
+    /// boundary, after every drain phase, never mid-tick), while its
+    /// FULL ledger provides the verbatim suffix the retained tail
+    /// must equal.
+    #[test]
+    fn retention_policy_fires_at_the_documented_cadence() {
+        let build = || {
+            let mut spine = Spine::new(SaveableNoopWorld, 100);
+            for t in 1..=10u64 {
+                for i in 0..100u64 {
+                    spine
+                        .schedule(spec(0, Field::Near, t, t * 100 + i))
+                        .expect("schedule");
+                }
+            }
+            spine
+        };
+        let mut spine = build();
+        spine.set_retention_policy(policy(10, 300));
+        let mut twin = build();
+
+        // The exact per-tick shape: (retained length, cumulative
+        // firings). Ticks 1-3 grow inside the band; tick 4 crosses
+        // the threshold and fires; the sawtooth repeats every 3 ticks.
+        let expected: [(u64, u64); 10] = [
+            (100, 0),
+            (200, 0),
+            (300, 0),
+            (100, 1),
+            (200, 1),
+            (300, 1),
+            (100, 2),
+            (200, 2),
+            (300, 2),
+            (100, 3),
+        ];
+        for (index, &(len, firings)) in expected.iter().enumerate() {
+            let tick = index + 1;
+            spine.run_tick();
+            twin.run_tick();
+            assert_eq!(
+                spine.ledger_retained().len() as u64,
+                len,
+                "tick {tick}: the retained length"
+            );
+            let stats = spine.retention_stats();
+            assert_eq!(stats.compactions, firings, "tick {tick}: firing count");
+            if firings > 0 {
+                assert_eq!(stats.last_chunk, 300, "tick {tick}: the cut is one chunk");
+                assert_eq!(stats.max_chunk, 300, "tick {tick}: the largest cut");
+                assert_eq!(stats.summarized_total, firings * 300);
+                // The compacted count identity at every boundary.
+                let HistoryKind::Compacted {
+                    summarized_records,
+                    retained_records,
+                    ..
+                } = spine.history_kind()
+                else {
+                    panic!("tick {tick}: a firing has compacted the spine");
+                };
+                assert_eq!(
+                    summarized_records + retained_records,
+                    spine.stats().executed,
+                    "tick {tick}: count identity"
+                );
+                assert_eq!(retained_records, len);
+                // The retained tail is the twin's verbatim suffix.
+                let twin_ledger = twin.ledger();
+                assert_eq!(
+                    spine.ledger_retained(),
+                    &twin_ledger[twin_ledger.len() - len as usize..],
+                    "tick {tick}: the tail is the control's verbatim suffix"
+                );
+            } else {
+                assert_eq!(spine.history_kind(), HistoryKind::Full);
+                assert_eq!(stats, RetentionStats::default());
+            }
+            // The authority and the drain semantics: identical to the
+            // no-policy twin — stats, queues, watermarks, the report.
+            assert_eq!(spine.stats(), twin.stats(), "tick {tick}: stats");
+            assert_eq!(spine.pending_count(), twin.pending_count());
+            assert_eq!(spine.blocked_count(), twin.blocked_count());
+            assert_eq!(spine.held_count(), twin.held_count());
+            assert_eq!(
+                spine.max_executed_due(),
+                twin.max_executed_due(),
+                "tick {tick}: the watermark's max input"
+            );
+            assert_eq!(
+                spine.processed_through(),
+                twin.processed_through(),
+                "tick {tick}: the safe watermark"
+            );
+            assert_eq!(
+                spine.lane_report(),
+                twin.lane_report(),
+                "tick {tick}: report"
+            );
+            // Conservation on both.
+            for s in [&spine, &twin] {
+                let stats = s.stats();
+                assert_eq!(
+                    stats.scheduled,
+                    stats.executed
+                        + s.pending_count() as u64
+                        + s.blocked_count() as u64
+                        + s.held_count() as u64,
+                    "tick {tick}: conservation"
+                );
+            }
+        }
+        // The final shape: 1000 executed, 900 summarized, 100 retained.
+        assert_eq!(spine.stats().executed, 1000);
+        let HistoryKind::Compacted {
+            summarized_records, ..
+        } = spine.history_kind()
+        else {
+            panic!("the cadence compacted the spine");
+        };
+        assert_eq!(summarized_records, 900);
+        assert_eq!(spine.ledger_retained().len(), 100);
+    }
+
+    /// THE AUTHORITY SURVIVES EVERY CUT: after the cadence has
+    /// summarized 600 of 700 executed records (seven ticks), executed
+    /// membership still answers for SUMMARIZED identities — the
+    /// unfinished complement, never the ledger, is the authority —
+    /// matching the twin's full-ledger ground truth for every
+    /// allocated identity; a follow-up may depend on a summarized
+    /// (already-executed) identity exactly as on the twin; unknown
+    /// identities are still rejected; and identical continuations
+    /// agree on stats, watermark, and the verbatim suffix at the cut.
+    #[test]
+    fn policy_compaction_preserves_the_identity_authority() {
+        let build = || {
+            let mut spine = Spine::new(SaveableNoopWorld, 100);
+            for t in 1..=10u64 {
+                for i in 0..100u64 {
+                    spine
+                        .schedule(spec(0, Field::Near, t, t * 100 + i))
+                        .expect("schedule");
+                }
+            }
+            spine
+        };
+        let mut spine = build();
+        spine.set_retention_policy(policy(10, 300));
+        let mut twin = build();
+        spine.run_ticks(7);
+        twin.run_ticks(7);
+        // 700 executed, 600 summarized (firings at ticks 4 and 7):
+        // the complement answers for all 1000 allocated identities.
+        let twin_executed: BTreeSet<u64> =
+            twin.ledger().iter().map(|record| record.id.seq).collect();
+        assert_eq!(twin_executed.len(), 700);
+        let HistoryKind::Compacted {
+            summarized_records, ..
+        } = spine.history_kind()
+        else {
+            panic!("two firings have compacted the spine");
+        };
+        assert_eq!(summarized_records, 600);
+        for seq in 0..1000u64 {
+            assert_eq!(
+                spine.is_executed(EventId { seq }),
+                twin_executed.contains(&seq),
+                "membership mismatch at #{seq} — summarized identities answer through the complement"
+            );
+        }
+        // A follow-up on a SUMMARIZED identity: accepted on both
+        // spines identically (the dependency gates consult
+        // executed-membership, never the ledger); the unknown
+        // identity is rejected on both.
+        let summarized = EventId { seq: 5 };
+        assert!(spine.is_executed(summarized));
+        assert!(
+            spine
+                .schedule(dep_spec(9, Field::Near, 12, 7, vec![summarized]))
+                .is_ok()
+        );
+        assert!(
+            twin.schedule(dep_spec(9, Field::Near, 12, 7, vec![summarized]))
+                .is_ok()
+        );
+        let unknown = EventId { seq: 5000 };
+        for target in [&mut spine, &mut twin] {
+            let bad = dep_spec(9, Field::Near, 12, 8, vec![unknown]);
+            assert!(matches!(
+                target.schedule(bad),
+                Err(ScheduleError::UnknownDependency(id)) if id == unknown
+            ));
+        }
+        // Identical continuations: the follow-up executes at its due
+        // on both, the stats and watermarks agree, and the compacted
+        // history is the twin's verbatim suffix at the policy's cut
+        // (firings at ticks 4, 7, 10 → 900 summarized, 101 retained).
+        spine.run_ticks(8);
+        twin.run_ticks(8);
+        assert_eq!(spine.stats(), twin.stats());
+        assert_eq!(spine.processed_through(), twin.processed_through());
+        assert_eq!(spine.retention_stats().compactions, 3);
+        let spine_cut = match spine.history_kind() {
+            HistoryKind::Compacted {
+                summarized_records, ..
+            } => summarized_records as usize,
+            HistoryKind::Full => unreachable!("the cadence compacted the spine"),
+        };
+        assert_eq!(spine_cut, 900);
+        assert_eq!(
+            spine.ledger_retained(),
+            &twin.ledger()[spine_cut..],
+            "the compacted history is the twin's verbatim suffix at the cut"
+        );
+    }
+
+    /// THE POLICY CHANGES WHEN COMPACTION HAPPENS, NEVER WHAT: three
+    /// policy firings (3 × 300 records) and one explicit
+    /// [`Spine::compact`] to the same total window produce IDENTICAL
+    /// save bytes — the prefix chain is invocation-boundary-
+    /// independent — and a mid-cadence save→restore with the policy
+    /// re-configured reproduces the uninterrupted cadence byte for
+    /// byte (the wire carries the cut; the configuration rides along
+    /// out of band, and the restored counters count only the new
+    /// session's firings).
+    #[test]
+    fn policy_cadence_equals_the_equivalent_explicit_compaction() {
+        let build = || {
+            let mut spine = Spine::new(SaveableNoopWorld, 100);
+            for t in 1..=10u64 {
+                for i in 0..100u64 {
+                    spine
+                        .schedule(spec(0, Field::Near, t, t * 100 + i))
+                        .expect("schedule");
+                }
+            }
+            spine
+        };
+        // The auto cadence: 10 ticks, firings at 4/7/10 (900
+        // summarized, 100 retained).
+        let mut auto = build();
+        auto.set_retention_policy(policy(10, 300));
+        auto.run_ticks(10);
+        assert_eq!(auto.retention_stats().compactions, 3);
+        // The explicit equivalent: the same ticks, one manual cut to
+        // the same window.
+        let mut manual = build();
+        manual.run_ticks(10);
+        manual.compact(100).expect("the equivalent window compacts");
+        assert_eq!(
+            auto.save_bytes(),
+            manual.save_bytes(),
+            "3 × 300 policy firings and one explicit 900-record cut agree byte for byte"
+        );
+
+        // Mid-cadence save→restore→reconfigure→continue: identical
+        // bytes to the never-interrupted cadence. The save at tick 5
+        // carries one firing (300 summarized, 200 retained); the
+        // restored spine fires at ticks 7 and 10 — the cadence
+        // resumes exactly where the wire left it.
+        let mut interrupted = build();
+        interrupted.set_retention_policy(policy(10, 300));
+        interrupted.run_ticks(5);
+        let bytes = interrupted.save_bytes();
+        let mut restored: Spine<SaveableNoopWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+        assert_eq!(
+            restored.save_bytes(),
+            bytes,
+            "the round trip is byte-identical"
+        );
+        assert_eq!(
+            restored.retention_policy(),
+            None,
+            "configuration never rides the wire"
+        );
+        restored.set_retention_policy(policy(10, 300));
+        restored.run_ticks(5);
+        assert_eq!(restored.retention_stats().compactions, 2);
+        assert_eq!(
+            restored.save_bytes(),
+            auto.save_bytes(),
+            "the interrupted-and-resumed cadence is byte-identical to the uninterrupted one"
+        );
+    }
+
+    /// THE BACKLOG DRAINS CHUNK-BOUNDED: a pre-existing 1000-record
+    /// ledger under a retain-10/chunk-100 policy compacts at most 100
+    /// records per tick — one bounded invocation per boundary, never
+    /// a monolithic cut — converging to the band in 9 ticks and
+    /// stopping (the design's "a 100k-record cut would be ~ms scale —
+    /// chunk caps it" made mechanical).
+    #[test]
+    fn policy_backlog_drains_one_chunk_per_tick() {
+        let mut spine = Spine::new(SaveableNoopWorld, 100);
+        for t in 1..=10u64 {
+            for i in 0..100u64 {
+                spine
+                    .schedule(spec(0, Field::Near, t, t * 100 + i))
+                    .expect("schedule");
+            }
+        }
+        spine.run_ticks(10);
+        assert_eq!(spine.ledger_retained().len(), 1000);
+        spine.set_retention_policy(policy(10, 100));
+        let mut len = 1000u64;
+        for tick in 0..9u64 {
+            spine.run_tick(); // no due work remains: only the checkpoint acts
+            len -= 100;
+            let stats = spine.retention_stats();
+            assert_eq!(stats.compactions, tick + 1, "one invocation per tick");
+            assert_eq!(
+                stats.last_chunk, 100,
+                "each invocation cuts exactly one chunk"
+            );
+            assert_eq!(spine.ledger_retained().len() as u64, len);
+        }
+        // Inside the band (100 ≤ 110): the cadence stops.
+        spine.run_tick();
+        assert_eq!(spine.retention_stats().compactions, 9);
+        assert_eq!(spine.ledger_retained().len(), 100);
+        // The count identity survived the drain.
+        let HistoryKind::Compacted {
+            summarized_records, ..
+        } = spine.history_kind()
+        else {
+            panic!("the backlog drain compacted the spine");
+        };
+        assert_eq!(
+            summarized_records + 100,
+            spine.stats().executed,
+            "900 summarized + 100 retained == 1000 executed"
+        );
+    }
+
+    /// The sustained-load world (the E-8 sustained shape): a stateless
+    /// self-feeding handler — every execution schedules exactly one
+    /// follow-up due the next tick — so a seed batch of `budget` due
+    /// events saturates the execution budget every tick indefinitely.
+    /// Saveable with an empty encoding (the world never contributes
+    /// state differences); the logical witness is the spine's own
+    /// counters.
+    struct SustainedWorld;
+
+    impl World for SustainedWorld {
+        fn execute(&mut self, _event: &Event, ctx: &mut ExecCtx) {
+            ctx.follow_up(1, SUSTAINED_CLASS, 7, Vec::new());
+        }
+        fn fingerprint(&self, fp: &mut Fingerprinter) {
+            fp.write_str("engine-core/spine/a22-sustained/1");
+        }
+    }
+
+    impl SaveWorld for SustainedWorld {
+        const SAVE_DOMAIN: &'static str = "engine-core/spine/a22-sustained-world/1";
+
+        fn save(&self, _enc: &mut Encoder) {}
+
+        fn restore(_dec: &mut Decoder) -> Result<Self, SaveError> {
+            Ok(SustainedWorld)
+        }
+    }
+
+    /// The sustained class — the seeds and the self-spawned follow-ups
+    /// share it (`spec` takes the raw u16).
+    const SUSTAINED_CLASS: EventClass = EventClass::new(5);
+
+    /// BOUNDED ACTIVE RAM UNDER SUSTAINED LOAD (the re-audit's bar —
+    /// engine work and resident memory proportional to the relevant
+    /// workload, not historical state): 500 ticks of budget-saturated
+    /// self-feeding execution — 50,000 executions against a
+    /// retain 128 / chunk 300 policy (bound 428; 128 ≥ budget so the
+    /// current tick's records always stay verbatim) — keep the
+    /// retained ledger at or under the bound at EVERY tick boundary,
+    /// conservation exact at every boundary, the count identity exact
+    /// at every firing, while `stats.executed` grows 100 per tick
+    /// without bound. The end-state save round-trips byte-identically
+    /// in the `spine-history/2` form, the restored spine resumes with
+    /// no policy (configuration never rides the wire), and the whole
+    /// 500-tick sustained run is double-run deterministic: two
+    /// independent runs produce identical save bytes, compacted
+    /// fingerprints, and counters (the E-8 double-run-identical
+    /// discipline).
+    #[test]
+    fn sustained_load_keeps_the_resident_ledger_at_the_bound() {
+        const BUDGET: u64 = 100;
+        const TICKS: u64 = 500;
+        let policy_config = policy(128, 300);
+        let bound = policy_config.resident_bound_records();
+
+        let run = || {
+            let mut spine = Spine::new(SustainedWorld, BUDGET as u32);
+            for i in 0..BUDGET {
+                spine
+                    .schedule(spec(5, Field::Near, 1, i))
+                    .expect("schedule");
+            }
+            spine.set_retention_policy(policy_config);
+            for tick in 1..=TICKS {
+                spine.run_tick();
+                let len = spine.ledger_retained().len() as u64;
+                assert!(
+                    len <= bound,
+                    "tick {tick}: the retained ledger ({len}) is at or under the bound ({bound})"
+                );
+                // Conservation at every boundary: each execution
+                // spawns exactly one successor.
+                let stats = spine.stats();
+                assert_eq!(
+                    stats.scheduled,
+                    stats.executed
+                        + spine.pending_count() as u64
+                        + spine.blocked_count() as u64
+                        + spine.held_count() as u64,
+                    "tick {tick}: conservation"
+                );
+                assert_eq!(stats.executed, tick * BUDGET, "tick {tick}: saturation");
+                // The count identity at every firing.
+                if let HistoryKind::Compacted {
+                    summarized_records,
+                    retained_records,
+                    ..
+                } = spine.history_kind()
+                {
+                    assert_eq!(
+                        summarized_records + retained_records,
+                        stats.executed,
+                        "tick {tick}: count identity"
+                    );
+                }
+                // With retain ≥ budget, the current tick's records are
+                // always verbatim in the tail: the checkpoint runs at
+                // the boundary, AFTER the tick's appends (sampled
+                // every 50 ticks to keep the witness cheap).
+                if tick % 50 == 0 {
+                    let retained = spine.ledger_retained();
+                    let current = &retained[retained.len() - BUDGET as usize..];
+                    assert!(
+                        current
+                            .iter()
+                            .all(|record| record.executed_tick.as_u64() == tick),
+                        "tick {tick}: the tick's own records survive verbatim"
+                    );
+                }
+            }
+            spine
+        };
+        let spine = run();
+        // The exact end shape: firings at ticks 5, 8, …, 500 (every
+        // 3 ticks once the sawtooth settles) — 166 firings.
+        assert_eq!(spine.stats().executed, TICKS * BUDGET);
+        assert_eq!(spine.retention_stats().compactions, 166);
+        assert_eq!(spine.retention_stats().summarized_total, 49_800);
+        assert_eq!(spine.retention_stats().last_chunk, 300);
+        assert_eq!(spine.retention_stats().max_chunk, 300);
+        let HistoryKind::Compacted {
+            summarized_records,
+            retained_records,
+            ..
+        } = spine.history_kind()
+        else {
+            panic!("the sustained load compacted the spine");
+        };
+        assert_eq!(summarized_records, 49_800);
+        assert_eq!(retained_records, 200);
+        assert_eq!(spine.ledger_retained().len(), 200);
+        // The round trip: byte-identical, no policy, the same state.
+        let bytes = spine.save_bytes();
+        let restored: Spine<SustainedWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+        assert_eq!(restored.save_bytes(), bytes);
+        assert_eq!(restored.retention_policy(), None);
+        assert_eq!(restored.retention_stats(), RetentionStats::default());
+        assert_eq!(
+            restored.compacted_fingerprint(),
+            spine.compacted_fingerprint()
+        );
+        // DOUBLE-RUN DETERMINISM: the whole sustained run reproduces
+        // byte for byte (the replay re-validates every per-tick
+        // invariant above on the way).
+        let replay = run();
+        assert_eq!(replay.save_bytes(), bytes);
+        assert_eq!(
+            replay.compacted_fingerprint(),
+            spine.compacted_fingerprint()
+        );
+        assert_eq!(replay.retention_stats(), spine.retention_stats());
     }
 }
