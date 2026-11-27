@@ -83,6 +83,33 @@ refutation is evidence too.
   typo queued for the P6 pass); B06's exact-zero tie divergence confirmed
   with the contract decision below. Lanes L1–L8 (L1–L3 orchestrator — spine/
   semantics; L4–L6 lane-able with tight briefs; L7–L8 policy/config).
+- **P4-renderer-architecture.md** (glm-5.3, 1,026 lines, citations verified
+  at `7961cb2`/`a972f3e`): the submission contract — one public
+  `Renderer::submit_frame(FrameSubmission)` (borrow-only: typed camera,
+  dynamic layer batches, optional `SceneFrame` pass-requirements
+  declaration where each field names a pass and `None` means it doesn't
+  run) with authored scene content behind an attach-time
+  `SceneDescription`/`SceneHandle`; the 19-parameter render_frame
+  collapses to 6 with the four owning states kept separate; sky/post/wet
+  migrate from sticky settings to per-frame fields; adapters keep the
+  demo byte-identical until S6 deletes them. Staged DAG S1–S6 (S1
+  contract+adapters, S2 scene extraction with the shim-equality gate, S3
+  the FramePlan coordinator + prepare triplication fix, S4 the vulkan.rs
+  split as pure moves, S5 shader build-time composition — naga 29.0.4
+  has no WGSL includes so build.rs-level composition with layout pins,
+  S6 adapter removal + the second scene), every stage's gate named (the
+  lavapipe batteries, allocation tuples, the E-7 rig pins).
+  **Decisive finds:** the four entry points duplicate ~90 lines each
+  verbatim; `ensure_frame_targets_and_resources` re-derives the implicit
+  uses-declaration at three sites; **device-lost has ZERO typed handling
+  anywhere** (every vk::Result flattened to Vulkan(String)) — the design
+  adds a typed arm, fail-visible, no auto-recovery; the wet reflection's
+  corner-coupling is via receiver_range()/reflected_ranges() (the
+  generalization: role-tagged mesh ranges). **THE PHANTOM: the design
+  caught that audits/renderer.md was never committed** — re-materialized
+  from the auditor's message with a provenance note. Unresolved: the
+  second scene's CLI placement, DeviceLost payload shape at S1, A06's
+  animation crate extraction deferred with a recorded revisit trigger.
 - **P3-persistence-architecture.md** (glm-5.3, 943 lines, citations verified
   at `bceb3fa`): B02 caller-side wins first (bounded header-prefix reads,
   frontier-from-decoded-state) then recovery single-decode then a streaming
