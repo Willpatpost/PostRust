@@ -25,6 +25,7 @@
 //!     --ignored --nocapture
 //! ```
 
+use engine_core::ripple::{RippleField, RipplePolicy};
 use engine_renderer::RendererError;
 use engine_renderer::post::{
     bloom_at_pixel, bloom_mip_from_hdr, bright_pass, post_pixel, tonemap, tonemap_rgb,
@@ -32,8 +33,9 @@ use engine_renderer::post::{
 use engine_renderer::shadows::ShadowBias;
 use engine_renderer::sky::{atmosphere_at, sky_color};
 use engine_renderer::{
-    DemoScenePreference, DepthFormatPreference, RenderConfig, Renderer, SkyFrame, TargetFaultSite,
-    TargetFaultStage, ValidationPreference,
+    DemoScenePreference, DepthFormatPreference, DynamicLayers, FrameCamera, FrameSubmission,
+    OutputTarget, RenderConfig, Renderer, SceneFrame, SkyFrame, TargetFaultSite, TargetFaultStage,
+    ValidationPreference, WetFrame,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 
@@ -2619,6 +2621,283 @@ fn shadowed_populated_composes_through_the_hdr_chain() {
          {delta:?} then constant, fixture S {checked_s} pixels max {max_s}/255, fixture L \
          {checked_l} pixels max {max_l}/255 — the shadowed HDR variants apply the map's \
          verdict per fragment"
+    );
+}
+
+/// THE P4 S1 FOLLOW-UP GATE — the GPU-level `submit_frame`
+/// equivalence proof. The submission module's unit test pins the
+/// mapping at the TYPE level (a [`FrameSubmission`] shaped like
+/// `render_corner`'s argument list produces, through the adapter,
+/// the identical frame-flow parameter set — for the plain all-off
+/// configuration AND the sticky-on sky+post+wet one); this gate is
+/// the presented-bytes half of the same proof: the SAME renderer,
+/// the SAME fixed camera/scene state, the frame rendered through
+/// the EXISTING route (`render_corner` reading its sticky
+/// sky/post/wet fields) and through the NEW route
+/// (`Renderer::submit_frame` carrying the same state per frame) —
+/// the two captures must be BYTE-IDENTICAL.
+///
+/// THE CAMERA: the weather gates' road-cross vantage (the eye the
+/// ripple reflection gate pins its ink at — 1.7 m at [0, 0, 15]
+/// looking at the intersection), under the corner route's own
+/// square-aspect projection (`aimed`): ground, building masses, and
+/// sky all in view, so the composed variant's three passes all
+/// contribute pixels.
+///
+/// THE TWO PROOFS:
+/// 1. THE PLAIN FRAME — `render_corner` with every sticky at its
+///    construction default (no sky, post off, dry ground) vs the
+///    submission with `scene.sky: None`, `post: false`, `wet: None`
+///    (the type-level proof's Configuration 1): byte-equal captures.
+/// 2. THE COMPOSED FRAME — the stickies ON (`set_sky` + `set_post` +
+///    `set_wet` + `set_ripple_field`, with the submission module
+///    test's own one-live-ring ripple fixture) vs the submission
+///    carrying `scene.sky: Some(_)`, `post: true`,
+///    `wet: Some(WetFrame { ripple: Some(&field) })` (the
+///    type-level proof's Configuration 2 — sky + post + wet, the
+///    sticky-on state it pinned): byte-equal captures. The stickies
+///    stay SET while the submission renders — the strongest form:
+///    the submission's per-frame fields alone must reproduce the
+///    frame the stickies feed `render_corner` (the adapter reads
+///    only the proxy mode and the TEST-ONLY ripple debug lane from
+///    the renderer).
+///
+/// THE DISCIPLINE (the neighboring gates' own): each compared
+/// capture follows a warm frame (the composed state's one-time lazy
+/// targets — post HDR + bloom, sky, wet reflection — build in the
+/// warm frame, never inside a compared capture); the ink floor
+/// proves the composed capture is living composed content, not two
+/// accidentally-identical plain frames; the Vulkan allocation set
+/// is constant across every submission-route frame (the adapter is
+/// stack assembly — the contract's zero-cost statement, witnessed on
+/// the device); validation drains clean.
+///
+/// `#[ignore]`d like the binary's other lavapipe gates: it requires
+/// `SDL_VIDEODRIVER=offscreen` plus a software Vulkan ICD
+/// (lavapipe) and the validation layer. CI's Post-gates Linux step
+/// executes it enforced; the rig form adds `--test-threads=1` (the
+/// E-7 discipline). Run explicitly:
+///
+/// ```sh
+/// SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_post -- \
+///     --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
+fn submit_frame_matches_render_corner_bytes_plain_and_composed() {
+    let _guard = sdl_lock();
+    let mut app = ShellApp::new(ShellConfig {
+        title: "S1 submit-frame equivalence".into(),
+        width: 256,
+        height: 256,
+        target_fps: 60,
+        driver: DriverPreference::Real,
+    })
+    .unwrap();
+    let mut renderer = Renderer::new(
+        app.window(),
+        RenderConfig {
+            demo_scene: DemoScenePreference::Corner,
+            validation: ValidationPreference::On,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let size = app.window().size_in_pixels();
+    assert_eq!(size, (256, 256));
+    assert!(renderer.stats().validation_active);
+    let _ = app.frame();
+
+    /// The submission carrying one corner frame's state — the exact
+    /// mapping the submission module's type-level proof pins: the
+    /// same camera/light/output `render_corner` consumes, empty
+    /// dynamic layers (the entry's own `&[]` arguments), and the
+    /// scene half's per-frame sky/post/wet fields standing in for
+    /// the stickies the entry reads.
+    fn corner_submission<'a>(
+        matrix: [[f32; 4]; 4],
+        eye: [f32; 3],
+        light: LightParams,
+        size: (u32, u32),
+        sky: Option<SkyFrame>,
+        post: bool,
+        wet: Option<WetFrame<'a>>,
+    ) -> FrameSubmission<'a> {
+        FrameSubmission {
+            camera: FrameCamera {
+                view_proj: matrix,
+                eye,
+            },
+            output: OutputTarget { window_size: size },
+            layers: DynamicLayers::default(),
+            scene: Some(SceneFrame {
+                light,
+                shadows: None,
+                population: None,
+                sky,
+                post,
+                wet,
+            }),
+        }
+    }
+
+    /// The ripple fixture (the submission module test's own,
+    /// verbatim): one observed kill death at a known position, one
+    /// tick — one live ring, so the wet packing runs over real data
+    /// (the empty field is the trivial all-zeros case).
+    fn ripple_field() -> RippleField {
+        let policy = RipplePolicy {
+            lifetime: 2.5,
+            speed: 0.8,
+            width: 0.35,
+            amplitude: 1.0,
+            decimation: 1,
+        };
+        let mut field = RippleField::new(policy).expect("the policy validates");
+        assert_eq!(field.observe_death([-3.5, 1.7, 8.25]), None);
+        let report = field
+            .tick(1.0 / 60.0)
+            .expect("the fixture dt is finite and nonnegative");
+        assert_eq!(report.active, 1);
+        field
+    }
+
+    // THE FIXED CAMERA/SCENE STATE: the road-cross vantage above,
+    // the day preset, the day sky.
+    let eye = [0.0, 1.7, 15.0];
+    let matrix = aimed(eye, [0.0, 0.0, 0.0]);
+    let light = day_preset();
+    let day = atmosphere_at(0.0);
+
+    // ---- PROOF 1: the plain all-off corner frame ----
+    // One warm frame first (the compared captures then sit on a
+    // fully-warmed renderer, symmetrically for both routes).
+    assert!(
+        renderer
+            .render_corner(&matrix, eye, light, size)
+            .unwrap()
+            .presented,
+        "the plain warm frame"
+    );
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner(&matrix, eye, light, size)
+            .unwrap()
+            .presented
+    );
+    let plain_route = renderer.take_frame_capture().unwrap().unwrap();
+    let plain_allocations = renderer.allocations();
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .submit_frame(corner_submission(
+                matrix, eye, light, size, None, false, None
+            ))
+            .unwrap()
+            .presented
+    );
+    let plain_submission = renderer.take_frame_capture().unwrap().unwrap();
+    assert_eq!(
+        plain_submission.bytes, plain_route.bytes,
+        "PROOF 1 (the plain corner frame): submit_frame's presented bytes must equal \
+         render_corner's"
+    );
+    assert_eq!(
+        renderer.allocations(),
+        plain_allocations,
+        "the submission route's plain frame allocates nothing (stack assembly over a \
+         warmed renderer)"
+    );
+
+    // ---- PROOF 2: the sticky-on composed frame (sky + post + wet) ----
+    let field = ripple_field();
+    renderer.set_sky(Some(SkyFrame {
+        palette: day.sky,
+        disc_dir: day.disc_dir,
+    }));
+    renderer.set_post(true);
+    renderer.set_wet(true);
+    renderer.set_ripple_field(Some(&field));
+    // One warm composed frame: the one-time post/sky/wet lazy
+    // targets build HERE, never inside a compared capture.
+    assert!(
+        renderer
+            .render_corner(&matrix, eye, light, size)
+            .unwrap()
+            .presented,
+        "the composed warm frame"
+    );
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .render_corner(&matrix, eye, light, size)
+            .unwrap()
+            .presented
+    );
+    let composed_route = renderer.take_frame_capture().unwrap().unwrap();
+    let composed_allocations = renderer.allocations();
+    // The stickies stay SET while the submission renders (see the
+    // doc comment): the per-frame fields alone must reproduce the
+    // frame they feed render_corner.
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .submit_frame(corner_submission(
+                matrix,
+                eye,
+                light,
+                size,
+                Some(SkyFrame {
+                    palette: day.sky,
+                    disc_dir: day.disc_dir,
+                }),
+                true,
+                Some(WetFrame {
+                    ripple: Some(&field),
+                }),
+            ))
+            .unwrap()
+            .presented
+    );
+    let composed_submission = renderer.take_frame_capture().unwrap().unwrap();
+    assert_eq!(
+        composed_submission.bytes, composed_route.bytes,
+        "PROOF 2 (the sky+post+wet corner frame): submit_frame's presented bytes must \
+         equal render_corner's"
+    );
+    assert_eq!(
+        renderer.allocations(),
+        composed_allocations,
+        "the submission route's composed frame allocates nothing (the adapter introduces \
+         no per-frame device allocation)"
+    );
+
+    // THE INK FLOOR (the first gate's own discipline at this
+    // extent): the composed capture visibly differs from the plain
+    // one — the sky fills the background, the post chain tonemaps
+    // the frame, the wet reflection re-draws the ground — so the
+    // byte-equality proofs above compared living composed content.
+    let ink = count_differing_pixels(&plain_route.bytes, &composed_route.bytes, size);
+    assert!(
+        ink > 10_000,
+        "the sky+post+wet frame visibly differs from the plain frame ({ink} differing \
+         bytes) — the byte-equality proofs compared living composed content"
+    );
+
+    assert_eq!(
+        renderer.stats().validation_errors,
+        0,
+        "{:?}",
+        renderer.stats().recent_validation
+    );
+    println!(
+        "S1 submit_frame equivalence: the plain and sky+post+wet corner frames \
+         byte-identical through render_corner and submit_frame ({}- and {}-byte \
+         captures), the composed frame {ink} differing bytes from the plain one, \
+         allocations constant across the submission frames",
+        plain_route.bytes.len(),
+        composed_route.bytes.len()
     );
 }
 
