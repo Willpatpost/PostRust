@@ -36,14 +36,14 @@ corrected).
 | A19 | REND | CONFIRMED | — | ground_reflect.wgsl:144-166 per-fragment loop over all rings; folds NEW-REND-09 |
 | A20 | REND | CONFIRMED | — | per-static-upload staging alloc/copy/submit/fence (vulkan.rs:3035-3199, textures.rs:61-202); folds NEW-REND-03 (no staging pool — same finding, more detail) |
 | A21 | CORE | FIXED-AWAITING-REVIEW | integrated `a213563` | orchestrator-implemented `3084a8a`: bounded retention (default 4096, amortized half-drain, lifetime `dropped_total`, NonZeroUsize capacity, opt-in echo documented); caller inventory showed all production paths run `Level::Off` — latent consumer defect closed, zero current behavior change; `&[Record]` API unchanged, `spine_main_path_allocations_are_pinned` green; +3 tests → main pin pending measured shard |
-| A22 | CORE/PERSIST | CONFIRMED (persist half) | — | confirmed_history grows unbounded, local.rs:3015-3028, no pruning; CORE half: spine.rs:1320-1354 ledger grows until explicit compact (audits/core.md) |
+| A22 | CORE/PERSIST | CONFIRMED (persist half, CORRECTED) | P3 design `designs/P3-persistence-architecture.md` | **register correction (design-verified, orchestrator grep-confirmed): `confirmed_history` does NOT exist at HEAD** (zero grep hits — the persist audit's local.rs:3015-3028 refs were stale); the real surfaces: `CommitAuthority.keys`, `CommitVerifier.confirmed` (never pruned), and the per-commit O(total-history) `collect_actionable` scan (pipeline.rs:895-900); rotation+reclaim is already the compaction point — the design adds settled-transaction watermark + coverage shedding + documented cadence (L6, orchestrator); CORE half: spine.rs:1320-1354 ledger grows until explicit compact |
 | A23 | REND/SHELL | CONFIRMED (rend half) / MEASURED (shell half) | — | pose storage dynamic-offset per slot (skinned_draw.rs:949-950, POSE_STRIDE=704); shell half MEASURED by the thorough audit: device layer ≈434 KiB (voice pool 64×32B, ring 256×72B, scratch 24 KiB, resident PCM 399,360 B) + cue surface ≈326 KiB, all construction-time with residency pinned — no blanket replacement warranted; the open question is the two coexisting surfaces (NEW-SHELL-3, design review) |
 | A24 | SLICE | VERIFIED-CLOSED | integrated `1884582` | **rig-verified 2026-11-26:** all 11 `render_weather` Vulkan gates green on the RTX 5070 Ti (exit 0, 7.29 s) with the pinned values reproducing digit-for-digit (ink 17041, broadside 3482/2162, the allocation tuple, sweep 22/255, the term-separation counts) — the scripted route's census equivalence proven on the real GPU; heavy 664/46/64 measured (pin corrected); scripted route frame-indexed by design, free-look on one coherent accumulator (crowd+rain+day/night, monotone cycle, minimized accrual, dt bit-identity pinned `0x3c888889`); two defective lane rounds caught at review, final surgery by orchestrator |
 | A25 | SHELL | FIXED-AWAITING-REVIEW | integrated `7c30aee` | **auditor PASS verdict REFUTED by direct read** (start_voice ran inside the lock at audio.rs:912 — the auditor's "releases before heavy work" was backwards); orchestrator-implemented fix `fa13e26`: copy-out under try-lock → guard dropped → voice-start unheld; pairing preserved; shell battery green, zero test changes |
 | B01 | CORE | CONFIRMED | — | spine.rs:1767-1786 drain_due counts executions only (blocked moves don't count); charter's structural-gap framing stands (audits/core.md) |
 | B02 | PERSIST | CONFIRMED | — | journal.rs:170-189 whole-file read ≤4 GiB; auditor's caller list (journal.rs:1115…3428) to be re-verified in P3 (line refs ambiguous across modules) |
 | B03 | PERSIST | CONFIRMED | — | composite_reader.rs:416-464,544 payload clones; reclaim.rs ~5686 bytes.clone(); pipeline.rs PendingAttempt clones; folds NEW-PERSIST-01/04 |
-| B04 | SLICE/PERSIST | FIXED-AWAITING-REVIEW | integrated `e31dc61` | lane `35211d2` + orchestrator corrective `2f92788`: the flush now records unresolved episodes on all three failure boundaries; the corrective fixed the lane's two defects (unjournaled retry hit the inverted `new(0,0)` membership span; journaled retry left the sync snapshot stale → duplicate flush) via `UnresolvedKind` + failure-boundary bookkeeping; 2 discriminating tests; fuzz-gate values unchanged; heavy +2 pending measured pin |
+| B04 | SLICE/PERSIST | VERIFIED-CLOSED (slice) / NO-CHANGE (persist) | integrated `e31dc61`; P3 design | slice half fixed+gated as recorded below; persist half: the P3 design re-read the pending-retention/retry/reconcile state machine and found it SOUND (no-change with evidence — the S6 fuzz gate + pp_b4_pending are the standing pins) |
 | B10 | SLICE | CONFIRMED | — | replay/synthesis asymmetry verified in structure (audits/slice.md; line refs approximate) — measurement-quality fix alongside the measurement owner |
 | B11 | SLICE | CONFIRMED (LOW) | — | occupancy-vs-visibility terminology (audits/slice.md) |
 | B13 | SLICE/PERSIST | CONFIRMED (HIGH) | — | verified: `worker.rs` send-then-`slot.recv()` round-trip at :635,687,745,792,837,877,921,1174; charter-known blocking bounded send on `submit_required`; P3 mapping of which calls can block sim/presentation |
@@ -63,6 +63,25 @@ Entries below are deduplicated: auditor items that restate a charter seed
 finding fold into that seed's row above (noted there). Items refuted on
 orchestrator verification are kept with their NOT-APPLICABLE proof — the
 refutation is evidence too.
+
+### Package designs (the architecture decision records)
+
+- **P3-persistence-architecture.md** (glm-5.3, 943 lines, citations verified
+  at `bceb3fa`): B02 caller-side wins first (bounded header-prefix reads,
+  frontier-from-decoded-state) then recovery single-decode then a streaming
+  framed reader — **on-disk index REJECTED** (duplicates rotation's job,
+  adds a trust surface); B03 reclaim dedupe + Arc backing + one retained
+  pending copy (the 3× payload and 3 key-set copies traced to exact lines);
+  B13 queue-wait/service instrumentation + measurement-gated deferred
+  confirmation (render-thread blocking PROVEN: persist_demo commits on the
+  render thread, E-8 confirmation 5.97 ms / publication p99 19.8 ms vs the
+  16.67 ms frame budget) — partitioned reads/multi-worker REJECTED; A13
+  walk-core extraction + module split by change reason, NO provider trait
+  hierarchy; A22-corrected (above); B04-persist NO-CHANGE; B12 recorded as
+  P2's coordination point. Lane plan L1–L9 (L1/L2/L3/L8 delegable, L4–L7
+  orchestrator, L9 last). Unresolved: L7's same-frame-first-poll contract,
+  L6's owner-rig cadence data, L8's dark-module Arc authorization.
+
 
 | ID | Area | State | Owner | Note |
 |---|---|---|---|---|
