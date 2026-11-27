@@ -120,6 +120,37 @@ composition smokes ok. Log: `Temp\opencode\ee\artifacts\gates-a24-render-weather
 This is the A24 equivalence-bar proof: the scripted route's weather campaign
 reproduces exactly on the real GPU through the explicit-dt plumbing.
 
+## E-8 Baseline measurement battery (2026-11-26, rig CPU 9800X3D, release, tree `263532f`)
+
+Seven harnesses run serially on the integrated tree; raw log (every command,
+exit code, and full output) at `Temp\opencode\ee\artifacts\baseline-battery.log`.
+These are the "before" numbers the P2/P3/P5 packages are judged against.
+
+**Persistence (Windows rig, LocalFile + SQLite, n=10–20):**
+- snapshot serialization (no I/O): median 0.129 ms / p99 0.240
+- snapshot publication (append incl. fsync): median 14.46 / p99 19.80 ms (SQLite: 12.53/19.69)
+- T1 journal transaction: median 7.78 ms; canonical confirmation 5.97 ms (SQLite 1.78); recovery 6.16 ms (SQLite 6.24)
+- store growth ~230,747 B per snapshot; lifetime growth ~31.0 B per execution (~23 exec/tick fixture)
+- compaction (150-tick history): 1.16 ms; compacted snapshot 124,968 B vs full 220,438 B (retain 100)
+- **PP-B3 retention section PANICS on Windows** — see NEW-SLICE-06 (the tier-gated reclamation-begin legitimately refuses on `ProcessCrashOnly` Windows; the harness unwraps it where local.rs's own tests cfg-gate). PP-B3 baselines remain pod-only.
+
+**Entity-scale (600 ticks × {1k,5k,20k} × {full,mixed,event-driven}, all DOUBLE-RUN IDENTICAL):**
+- 1k: full median 0.019/p99 0.034 · mixed 0.010/0.017 · event-driven 0.002/0.005 ms/tick
+- 5k: full 0.019/0.049 · mixed 0.011/0.031 · event-driven 0.002/0.011
+- 20k: full 0.019/0.065 · mixed 0.011/0.061 · event-driven 0.002/0.048
+- fingerprints recorded per cell in the log (e.g. 1k-full `04b35e00f34836b3`)
+
+**Sustained-load composition (the F-08/F-12 matrix):** D_base 154.1/84.1/13.7
+per tick at 1k full/mixed/event-driven; 200.0/200.0/69.2 at 5k (full and mixed
+saturate the 200 budget — the documented shape); per-lane backlog slopes in
+the log.
+
+**Behavior / locomotion / render / instrumentation:** sections complete in
+the log (exit 0 each); the §8.5-class numbers (witness census cost, E-09
+crossover, E-08 skip decomposition, per-NPC memory, CPU render path) are
+carried there — the E-8 register cites the artifact rather than duplicating
+every line.
+
 ## Measurement baselines
 
 (To be established in P0: first full build of the integration tree, then the
