@@ -29,6 +29,55 @@ work from THIS file alone.
   still-water composition, ring confinement, and its acceptance
   table) is the path to readable impacts; the sign-off walk's
   negative result is the package's motivating evidence.
+- **Reconciled for the sign-off review remediation's completion on
+  2026-11-27:** the independent sign-off review at `ec4eb3c`
+  (`docs/ERA2-REMEDIATION-SIGNOFF-ec4eb3c.md`) held Era-2 sign-off
+  across findings 20–28; all are now remediated on `main` through
+  three corrective PRs (plus the R10 fold-in), each green on all
+  five CI jobs with its measured evidence in its commits: **R7**
+  (PR #68, findings 20–21 — the memory lane's stable episode
+  identity across definite journal rejections and mid-flight apply
+  failures, the chain-authoritative reconciliation sweep, the
+  scoped confirmation, the late classification's own journal
+  transaction, and the recovered lane's tier materialization; four
+  deciding gates), **R8** (PR #69, finding 22 — both host seams
+  count `realloc`, and the composed wake gate attributes the world
+  callback through a matched control running the identical wake
+  path with the recording skipped: the differential zero on every
+  frame, the deliberate-callback-allocation negative control
+  proving the teeth), **R9** (PR #70, findings 23–26 — the headless
+  extension prerequisite and the platform-surface condition, the
+  both-predictions receiver-order discrimination (the correct
+  order's interval vs the reversed order's exact prediction, both
+  computed at the measured witness; the poison-fix exposure of the
+  windowed-surface extent clamp fixed beside it), the natural
+  birth's term separation (the displacement-only pair must carry
+  its own ink, with the inverse-ray support test), and the finite
+  kinematic extent at emitter admission), and **R10** (folded into
+  PR #70, findings 27–28 — the calibration-history amendment below,
+  the per-NPC drain census closing the redistribution escape, the
+  synthesis digests labeled predictions, and the
+  `--benchmark-ripple-visibility` pre-puddle density A/B: the
+  shipped 320:1 arm measured 15 admissions per 10 s window = the
+  1.5/s × 2.5 s ≈ 3.8 steady-state live rings, 160:1 doubling and
+  80:1 quadrupling the opportunity with zero refusals — the
+  opportunity is continuous; the per-ring movement is the
+  readability question, the owner's higher-admission walk decides
+  between a decimation re-pin and the puddle package). This pass
+  settles the §4 table at the PR #70 endpoint `ce55627` — main
+  **1419/2/33 Linux, 1368/2/33 Windows**, renderer release
+  **172/2**, heavy **651/46/64 Linux, 650/46/64 Windows** — every
+  count enforced by the runs on the exact trees (R7's `45910242798`
+  green at 649/648 heavy, R8's `45911022713` green at 651/650, the
+  R9+R10 runs `45914046788` and `45914624711` green with no count
+  moved — every deciding check in R9/R10 lives inside existing
+  test functions). STILL OPEN, by design: the puddle prototype
+  (question 7 — the density A/B printed above is the decision
+  input; the owner's higher-admission walk decides), the
+  cross-package warmed combined-view allocation scope (R8's
+  counters now make it measurable), and the owner decision lists
+  (NPC-AI §9, T-06 physics, the audio ambitions). Sign-off returns
+  to the owner and the next audit.
 - **Amended per the sign-off review's finding 27 (2026-11-27):**
   the remediation records below called the R3/R4 calibration
   rounds "never a test weakened" — that phrase overstated what the

@@ -1,8 +1,0 @@
-Ripple visibility A/B ΓÇö the sign-off review's pre-puddle diagnostic (the fixed gate camera, seed 0xdeadbeef, 600 frames Γëê 10 s at 60 Hz, the shipped warm start; pod-observational, never a CI threshold)
-  policy: lifetime 2.5 s, speed 0.8 m/s, width 0.35 m, amplitude 1, pool bound 32
-
-  shipped  (decimation 320): contacts 4809, admitted 15 (refused 0), live at end 4, max live 4, frames with live rings 600/600 (100%)
-  diagnostic (decimation 160): contacts 4809, admitted 30 (refused 0), live at end 8, max live 8, frames with live rings 600/600 (100%)
-  diagnostic (decimation 80): contacts 4809, admitted 60 (refused 0), live at end 15, max live 16, frames with live rings 600/600 (100%)
-
-  the decision input: at the shipped 320:1 the steady state is ~3.8 live rings (the admission rate 1.50/s x the 2.5 s lifetime; measured max 4, at end 4); the 160:1 arm doubles the opportunity, the 80:1 arm quadruples it toward the pool bound (the refusals census records any saturation). If the 160:1/80:1 censuses still read as unreadable on the rig's --corner --populated --weather rain walk, the per-ring MOVEMENT (the gain, the puddle's darkened water and tracked reflected edge) is the readability path ΓÇö the authored puddle package, per the review's question 7. If the higher admission reads clearly, a policy re-pin (the decimation, the owner's GO) is the cheaper correction.
