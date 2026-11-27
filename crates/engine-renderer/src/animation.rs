@@ -69,7 +69,12 @@ pub const HUMANOID_JOINTS: usize = 11;
 /// (`std::sync::OnceLock` — no external dependency for this.)
 static REST_POSE_BLOCK_CACHE: OnceLock<[[[f32; 4]; 4]; HUMANOID_JOINTS]> = OnceLock::new();
 
-/// The pose stride: 11 column-major mat4s of f32, 64 bytes each = 704 bytes.
+/// The pose stride: 11 column-major mat4s of f32, 64 bytes each = 704
+/// bytes. The per-joint 64 B IS one column-major mat4: 16 f32 × 4 B —
+/// four columns of four f32 (`[[f32; 4]; 4]`, packed column 0's
+/// x/y/z/w then column 1, ..., per [`pack_pose_bytes`]) — the exact
+/// `mat4x4<f32>` column-major layout the shaders read, so pose
+/// blocks upload with no conversion.
 pub const POSE_STRIDE: usize = HUMANOID_JOINTS * 64;
 
 /// A joint in the skeleton: the parent reference and the bind pivot in

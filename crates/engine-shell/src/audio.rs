@@ -298,6 +298,16 @@ impl Audio {
     /// it; no allocation, no synthesis, no polling). A no-op in the
     /// silent state; a mid-run playback failure degrades to the
     /// observable silent state and releases the audio resources.
+    ///
+    /// Push-rate contract: the underlying `SDL_PutAudioStreamData`
+    /// buffers unconditionally (verified in the vendored SDL 3.4.18),
+    /// so in-flight PCM is held by SDL and this path carries NO
+    /// in-flight-sample bound — the deliberate asymmetry with the
+    /// device layer's bounded refusal discipline ([`AudioDevice`],
+    /// below). The caller must not push faster than the device
+    /// drains: cue pushes ride discrete gameplay events, which is the
+    /// intended rate limit, and a sustained over-rate would grow
+    /// SDL's buffered PCM without bound.
     pub fn play(&mut self, cue: Cue) {
         let Some(streams) = self.streams.as_mut() else {
             return;
@@ -1217,6 +1227,12 @@ impl AudioDevice {
     /// and attenuated against the listener it was published with —
     /// the camera/pose layer's data, gains derived AT the callback,
     /// never in the trigger core). Bounded and fail-visible —
+    /// THE PRODUCER STALL BOUND (NEW-SHELL-6): the audio thread's
+    /// drain holds this lock only for the bounded ring copy (the
+    /// A25 corrective — the voice-start work runs unheld after
+    /// it), so this blocking acquisition waits at most one
+    /// bounded copy of ≤ `TRIGGER_QUEUE_CAPACITY` `Copy` slots
+    /// (microseconds), never a voice-start batch.
     /// refusals land in [`AudioStats::triggers_dropped`].
     pub fn submit_triggers(&mut self, triggers: &[SoundTrigger], listener: Listener) {
         self.shared.submit(triggers, listener);

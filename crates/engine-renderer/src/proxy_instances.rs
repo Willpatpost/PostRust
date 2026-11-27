@@ -259,6 +259,13 @@ pub fn pack_instances_bounded(
 /// sustained-load entity range the constant documents: one frame's
 /// whole population, not per kind), because one slot region of the
 /// GPU instance buffer holds exactly that many packed instances.
+/// The total is hand-summed over the FIXED kind set (`npc` +
+/// `vehicle` + `rain`): adding a new kind to this repack means
+/// extending the sum AND re-deriving the sustained-load total
+/// against [`MAX_INSTANCES`] — the slot region does not grow with
+/// the kind count, so a fourth kind consumes the same fixed budget,
+/// and only the capacity refusal (fired once the new sum exceeds
+/// the bound) catches the overcommit.
 pub fn repack_populations(
     buffer: &mut Vec<u8>,
     npc: &[ProxyInstance],

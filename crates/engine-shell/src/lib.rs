@@ -1,18 +1,25 @@
 //! Stage 1 SDL3 application shell — windowing, input intents, application
-//! lifecycle (lead-authorized 2026-10-19; TECH-ARCHITECTURE §6 Stage 1).
+//! lifecycle, and audio (lead-authorized 2026-10-19; TECH-ARCHITECTURE
+//! §6 Stage 1; audio's inclusion is the Cycle 3 P2 supersession recorded
+//! at the exclusion list below).
 //!
 //! Scope: a real SDL3 window with the OS event pump, a CPU-driven paced
-//! application loop, and an input-intent state machine (WASD movement
+//! application loop, an input-intent state machine (WASD movement
 //! axes, mouse-look deltas, key/button edges, focus loss/regain with
 //! stuck-key and stale-delta prevention, relative mouse capture, resize,
-//! quit). OS monotonic time is used for frame pacing only and never
-//! enters simulation logic; the authoritative campaign clock belongs to
-//! engine-core, is not present in Stage 1, and attaches in Stage 3 behind
-//! its own gate.
+//! quit), and the audio surfaces ([`audio`]: the one-shot cue surface
+//! and the SDL3 audio device layer). OS monotonic time is used for
+//! frame pacing only and never enters simulation logic; the
+//! authoritative campaign clock belongs to engine-core, is not present
+//! in Stage 1, and attaches in Stage 3 behind its own gate.
 //!
 //! Strictly excluded (Stage 1 authorization): Vulkan, ash, swapchains, GPU
 //! rendering/presentation, vsync, physics, ECS, world simulation, gameplay
-//! logic, multiplayer, persistence, audio, editor systems.
+//! logic, multiplayer, persistence, editor systems. Audio appeared in
+//! the ORIGINAL Stage 1 exclusion list; that exclusion is superseded
+//! for the [`audio`] module by the Cycle 3 P2 owner GO (2026-11-17,
+//! §2 P2) — audio is first-class shell scope now, and the
+//! supersession provenance is recorded in the module's own header.
 //!
 //! Binding and native-library strategy: the `sdl3` crate 0.20
 //! (vhspace/sdl3-rs, MIT) over `sdl3-sys` 0.7.2 (maia-s/sdl3-sys-rs,
@@ -59,6 +66,14 @@ pub use engine_core::diag::{Diagnostics, Level};
 /// buttons through the shell's curated surface rather than the SDL binding
 /// directly — the shell is the SDL boundary, and `engine-core` stays
 /// platform-independent.
+///
+/// API-stability coupling (recorded for the stability policy): these
+/// re-exports pass the `sdl3` crate's own enum types through unchanged,
+/// so the shell's public surface is coupled to the PINNED `sdl3`
+/// version (the vendored SDL 3.4.18 build — the binding strategy in
+/// this module's header). An `sdl3` upgrade can reshape these enums
+/// and therefore lands as a coordinated shell-API event, never as a
+/// routine dependency bump.
 pub use sdl3::keyboard::Keycode;
 pub use sdl3::mouse::MouseButton;
 
