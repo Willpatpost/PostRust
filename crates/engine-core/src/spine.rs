@@ -449,6 +449,28 @@ fn register_waiters_for_unmet_into(
     }
 }
 
+/// Executed-membership by seq over split borrows — the free-function
+/// form of [`Spine::is_executed_seq`] (the E3 complement
+/// representation: an allocated identity is executed iff below the
+/// frontier and not unfinished), so the split-borrow bulk-partition
+/// passes (the A08a suspension/resume arms) can evaluate dependencies
+/// while a map or queue iterator holds another field. The method
+/// delegates here — one source of truth for the membership
+/// expression, the `register_waiters_for_unmet_into` precedent.
+fn is_executed_seq_with(unfinished: &BTreeSet<u64>, next_seq: u64, seq: u64) -> bool {
+    seq < next_seq && !unfinished.contains(&seq)
+}
+
+/// Whether `event` still has unexecuted dependencies over split
+/// borrows — the free-function form of
+/// [`Spine::has_unmet_dependencies`], for the same in-place passes.
+fn has_unmet_dependencies_with(unfinished: &BTreeSet<u64>, next_seq: u64, event: &Event) -> bool {
+    event
+        .depends_on
+        .iter()
+        .any(|id| !is_executed_seq_with(unfinished, next_seq, id.seq))
+}
+
 impl<W: World> Spine<W> {
     pub fn new(world: W, budget: u32) -> Self {
         Self::with_diagnostics(world, budget, Diagnostics::new(Level::Off))
@@ -664,9 +686,10 @@ impl<W: World> Spine<W> {
     /// exactly one of Executed/Queued/Blocked/Held at every stable
     /// boundary, so `seq < next_seq ∧ seq ∉ unfinished` is executed
     /// (the E3 representation; identical semantics to the replaced
-    /// per-identity set).
+    /// per-identity set). Delegates to the free-function form over
+    /// split borrows.
     fn is_executed_seq(&self, seq: u64) -> bool {
-        seq < self.next_seq && !self.unfinished.contains(&seq)
+        is_executed_seq_with(&self.unfinished, self.next_seq, seq)
     }
 
     /// Maximum intended-due tick among executed events — a raw progress
@@ -918,31 +941,42 @@ impl<W: World> Spine<W> {
             &mut self.held_index,
             &mut matches,
         );
-        let blocked_matches: Vec<u64> = self
-            .blocked
-            .values()
-            .filter(|event| matches(&event_view(event, ObligationLocation::Blocked)))
-            .map(|event| event.id.seq)
-            .collect();
-        for seq in blocked_matches {
-            if let Some(event) = self.blocked.remove(&seq) {
-                // Leave the dependency-release path hold-unaware: drop
-                // this event's registrations on its unexecuted deps.
-                for dep in &event.depends_on {
-                    if !self.is_executed_seq(dep.seq)
-                        && let Some(waiters) = self.waiting_on.get_mut(&dep.seq)
-                    {
-                        waiters.retain(|&waiter| waiter != seq);
-                        if waiters.is_empty() {
-                            self.waiting_on.remove(&dep.seq);
-                        }
+        // The blocked arm of the same bulk-partition shape (A08a): one
+        // allocation-free in-place pass — `extract_if` is the
+        // retain-style compaction that yields the removed entries by
+        // value in canonical seq order, so the old
+        // collect-seqs-then-remove temp Vec disappears. The split
+        // field borrows are what make the in-place pass possible: the
+        // dependency check runs through the free-function helpers
+        // (never a whole-spine `&self` method call) while the map
+        // iterator holds `blocked`, and the borrow checker proves
+        // every touched field disjoint. Processing order (ascending
+        // seq) and every per-entry decision — registration cleanup,
+        // `held_index`/`held` insertion — are identical to the
+        // two-phase form; `unfinished` and `next_seq` are read-only
+        // here, so each entry is judged against the same fixed view.
+        let unfinished = &self.unfinished;
+        let next_seq = self.next_seq;
+        let extracted = self.blocked.extract_if(.., |_, event| {
+            matches(&event_view(event, ObligationLocation::Blocked))
+        });
+        for (seq, event) in extracted {
+            // Leave the dependency-release path hold-unaware: drop
+            // this event's registrations on its unexecuted deps.
+            for dep in &event.depends_on {
+                if !is_executed_seq_with(unfinished, next_seq, dep.seq)
+                    && let Some(waiters) = self.waiting_on.get_mut(&dep.seq)
+                {
+                    waiters.retain(|&waiter| waiter != seq);
+                    if waiters.is_empty() {
+                        self.waiting_on.remove(&dep.seq);
                     }
                 }
-                let pending = Pending::new(event);
-                self.held_index.insert((pending.due, pending.seq));
-                self.held.insert(pending.seq, pending);
-                suspended += 1;
             }
+            let pending = Pending::new(event);
+            self.held_index.insert((pending.due, pending.seq));
+            self.held.insert(pending.seq, pending);
+            suspended += 1;
         }
         self.suspension.suspended_total += u64::from(suspended);
         suspended
@@ -1095,36 +1129,61 @@ impl<W: World> Spine<W> {
     /// clock coherence is a property of the reconstructed state, never
     /// an erasure of historical due times (reviewer clarification C).
     pub fn resume_matching(&mut self, mut matches: impl FnMut(&ObligationView) -> bool) -> u32 {
-        let to_resume: Vec<u64> = self
-            .held
-            .values()
-            .filter(|pending| matches(&pending.view(ObligationLocation::Held)))
-            .map(|pending| pending.seq)
-            .collect();
+        // The A08a bulk-partition shape: one allocation-free in-place
+        // pass over the held map — `extract_if` is the retain-style
+        // compaction that yields the removed entries by value in
+        // canonical seq order, so the old collect-seqs-then-remove
+        // temp Vec disappears. The split field borrows
+        // (the `register_waiters_for_unmet_into` precedent: the
+        // free-function dependency helpers plus direct per-field
+        // access, never a whole-spine method call) let the pass
+        // update `held_index`, route entries to their lanes, and
+        // re-register blocked waiters while the map iterator holds
+        // `held` — the borrow checker proves every touched field
+        // disjoint. Per-entry decisions run in the same
+        // ascending-seq order against the same fixed `unfinished`
+        // view (resume never mutates it), so revalidation,
+        // registration, and lane routing are identical to the
+        // two-phase form.
+        let unfinished = &self.unfinished;
+        let next_seq = self.next_seq;
         let mut resumed = 0u32;
-        for seq in to_resume {
-            if let Some(pending) = self.held.remove(&seq) {
-                self.held_index.remove(&(pending.due, pending.seq));
-                if !self.has_unmet_dependencies(&pending.event) {
-                    match pending.event.field {
-                        Field::Near => self.near_queue.push(Reverse(pending)),
-                        Field::Far => self.far_queue.push(Reverse(pending)),
-                    }
-                } else {
-                    self.register_waiters_for_unmet(seq, &pending.event);
-                    self.blocked.insert(seq, pending.event);
+        let extracted = self.held.extract_if(.., |_, pending| {
+            matches(&pending.view(ObligationLocation::Held))
+        });
+        for (seq, pending) in extracted {
+            self.held_index.remove(&(pending.due, pending.seq));
+            if !has_unmet_dependencies_with(unfinished, next_seq, &pending.event) {
+                match pending.event.field {
+                    Field::Near => self.near_queue.push(Reverse(pending)),
+                    Field::Far => self.far_queue.push(Reverse(pending)),
                 }
-                resumed += 1;
+            } else {
+                register_waiters_for_unmet_into(&mut self.waiting_on, seq, &pending.event, |dep| {
+                    dep < next_seq && !unfinished.contains(&dep)
+                });
+                self.blocked.insert(seq, pending.event);
             }
+            resumed += 1;
         }
         self.suspension.resumed_total += u64::from(resumed);
         resumed
     }
 
-    /// Drains one lane, holding matching entries and re-pushing the
-    /// rest. Heap layout is rebuild-order-dependent but every observable
-    /// behavior (pop order, fingerprints) derives from the canonical
-    /// `(due, seq)` keys, so a rebuild is invisible.
+    /// Bulk-partitions one lane, holding matching entries and
+    /// heapifying the rest back into the same buffer — the A08a
+    /// linear shape (P2 design §4.2 step 1) replacing the old
+    /// pop-everything/re-push drain: `into_vec` consumes the heap in
+    /// O(1) reusing its buffer, `extract_if` is the retain-style
+    /// stable compaction that yields the removed entries by value (no
+    /// temp Vec — the held inserts receive them directly), and
+    /// `BinaryHeap::from` heapifies in O(N) with no allocation (the
+    /// buffer transfers). Net O(N) + O(M log H) with zero scratch
+    /// allocations, versus O(N log N) + one temp Vec per lane per
+    /// call. Heap layout is rebuild-order-dependent but every
+    /// observable behavior (pop order, fingerprints) derives from the
+    /// canonical `(due, seq)` keys — the retained multiset is
+    /// unchanged, so the rebuild is invisible.
     fn suspend_from_queue(
         queue: &mut BinaryHeap<Reverse<Pending>>,
         held: &mut BTreeMap<u64, Pending>,
@@ -1132,19 +1191,16 @@ impl<W: World> Spine<W> {
         matches: &mut impl FnMut(&ObligationView) -> bool,
     ) -> u32 {
         let mut suspended = 0u32;
-        let mut retained: Vec<Reverse<Pending>> = Vec::with_capacity(queue.len());
-        while let Some(Reverse(pending)) = queue.pop() {
-            if matches(&pending.view(ObligationLocation::Queued)) {
-                held_index.insert((pending.due, pending.seq));
-                held.insert(pending.seq, pending);
-                suspended += 1;
-            } else {
-                retained.push(Reverse(pending));
-            }
+        let mut items = std::mem::take(queue).into_vec();
+        let extracted = items.extract_if(.., |Reverse(pending)| {
+            matches(&pending.view(ObligationLocation::Queued))
+        });
+        for Reverse(pending) in extracted {
+            held_index.insert((pending.due, pending.seq));
+            held.insert(pending.seq, pending);
+            suspended += 1;
         }
-        for item in retained {
-            queue.push(item);
-        }
+        *queue = BinaryHeap::from(items);
         suspended
     }
 
@@ -1199,9 +1255,14 @@ impl<W: World> Spine<W> {
         reclassified
     }
 
-    /// Drains one lane, collecting matching obligations into `moved`
-    /// (the caller re-lanes and re-pushes them) and re-pushing the rest.
-    /// Same rebuild-invisibility argument as [`Self::suspend_from_queue`]:
+    /// Bulk-partitions one lane for reclassification, collecting
+    /// matching obligations into `moved` (the caller re-lanes and
+    /// re-pushes them) and heapifying the rest back into the same
+    /// buffer — the A08a linear shape (see
+    /// [`Self::suspend_from_queue`]): O(N) partition + heapify
+    /// instead of the O(N log N) pop/re-push drain, with zero scratch
+    /// allocations (the caller's `moved` Vec is the operation's
+    /// output, not scratch). Same rebuild-invisibility argument:
     /// observable order derives from the canonical `(due, seq)` keys.
     fn reclassify_queue(
         queue: &mut BinaryHeap<Reverse<Pending>>,
@@ -1213,17 +1274,14 @@ impl<W: World> Spine<W> {
         if target == source {
             return;
         }
-        let mut retained: Vec<Reverse<Pending>> = Vec::with_capacity(queue.len());
-        while let Some(Reverse(pending)) = queue.pop() {
-            if matches(&pending.view(ObligationLocation::Queued)) {
-                moved.push(pending);
-            } else {
-                retained.push(Reverse(pending));
-            }
+        let mut items = std::mem::take(queue).into_vec();
+        let extracted = items.extract_if(.., |Reverse(pending)| {
+            matches(&pending.view(ObligationLocation::Queued))
+        });
+        for Reverse(pending) in extracted {
+            moved.push(pending);
         }
-        for item in retained {
-            queue.push(item);
-        }
+        *queue = BinaryHeap::from(items);
     }
 
     // -------------------------------------------------------------- ticking
@@ -1917,12 +1975,10 @@ impl<W: World> Spine<W> {
     /// allocation: the Vec form this replaces allocated once per
     /// blocked transition and once per unblock re-validation, while
     /// both callers only ever needed this boolean (and, for suppressed
-    /// diagnostics, a count).
+    /// diagnostics, a count). Delegates to the free-function form over
+    /// split borrows (the A08a in-place passes share it).
     fn has_unmet_dependencies(&self, event: &Event) -> bool {
-        event
-            .depends_on
-            .iter()
-            .any(|id| !self.is_executed_seq(id.seq))
+        has_unmet_dependencies_with(&self.unfinished, self.next_seq, event)
     }
 
     /// The number of `event`'s unexecuted dependencies — only for the
@@ -2913,5 +2969,200 @@ mod tests {
         let mut enc = Encoder::new();
         write_record_entry(&mut enc, &record);
         assert_eq!(enc.into_bytes(), record_wire_bytes(&record));
+    }
+
+    // ------------------------------------------ A08a bulk-partition tests
+
+    /// A minimal deterministic world: the bulk-partition tests never
+    /// execute an event, so the handler is empty and the fingerprint
+    /// is a constant tag (the module's world never contributes state
+    /// differences).
+    struct NoopWorld;
+
+    impl World for NoopWorld {
+        fn execute(&mut self, _event: &Event, _ctx: &mut ExecCtx) {}
+        fn fingerprint(&self, fp: &mut Fingerprinter) {
+            fp.write_str("engine-core/spine/bulk-partition-tests/1");
+        }
+    }
+
+    /// A logical-time spec with an explicit class, lane, and payload —
+    /// the suspension battery's fixture shape, local to this module.
+    fn spec(class: u16, field: Field, due: u64, payload: u64) -> EventSpec {
+        EventSpec::new(
+            EventClass::new(class),
+            Schedule::AtLogicalTime { due: Tick(due) },
+            payload,
+        )
+        .in_field(field)
+    }
+
+    /// The canonical `(due, seq)` enumeration of every queued and
+    /// blocked obligation — exactly the order `collect_matching`
+    /// emits (sorted by the spine's priority key) and the order the
+    /// save encoder and lane fingerprints read.
+    fn canonical_keys<W: World>(spine: &Spine<W>) -> Vec<(u64, u64)> {
+        spine
+            .collect_matching(|_| true)
+            .iter()
+            .map(|view| (view.due.as_u64(), view.id.seq))
+            .collect()
+    }
+
+    /// The A08a partition rebuilds each lane's heap from its own
+    /// buffer (`into_vec` + heapify), so the proof these tests pin is
+    /// that the CANONICAL `(due, seq)` enumeration — which save bytes,
+    /// fingerprints, and `collect_matching` all derive from — is
+    /// exactly the pre-partition set minus the moved entries, in the
+    /// same order, for every one of the three operations, and that a
+    /// full suspend/resume cycle restores it element-for-element.
+    #[test]
+    fn bulk_partition_preserves_the_canonical_due_seq_order() {
+        let mut spine = Spine::new(NoopWorld, 100);
+        for i in 0..40u64 {
+            let class = u16::try_from(i % 4).expect("class fits u16");
+            let field = if i % 3 == 0 { Field::Far } else { Field::Near };
+            // Interleaved dues across classes and lanes, so no
+            // partition shortcut (class or lane) coincides with due
+            // order.
+            let due = 100 + (i % 7) * 10;
+            spine
+                .schedule(spec(class, field, due, i))
+                .expect("schedule");
+        }
+        let before = canonical_keys(&spine);
+        assert_eq!(before.len(), 40);
+        assert!(
+            before.windows(2).all(|pair| pair[0] < pair[1]),
+            "collect_matching emits strictly ascending (due, seq)"
+        );
+
+        // Suspend one region-owned class: the queued enumeration must
+        // be the original minus exactly the held identities, order
+        // untouched.
+        let region = EventClass::new(2);
+        assert_eq!(spine.suspend_matching(|view| view.class == region), 10);
+        let held_ids: BTreeSet<u64> = spine.held_view().iter().map(|view| view.id.seq).collect();
+        let expected: Vec<(u64, u64)> = before
+            .iter()
+            .copied()
+            .filter(|&(_, seq)| !held_ids.contains(&seq))
+            .collect();
+        assert_eq!(canonical_keys(&spine), expected);
+        assert_eq!(spine.pending_count(), 30, "held work left the lanes");
+
+        // Resume restores the original canonical enumeration exactly.
+        assert_eq!(spine.resume_matching(|view| view.class == region), 10);
+        assert_eq!(canonical_keys(&spine), before);
+        assert_eq!(spine.held_count(), 0);
+
+        // Reclassification moves obligations between lanes without
+        // touching the canonical order (only the lane column changes).
+        // Matching events ALREADY in the target lane are left as they
+        // are and not counted (the documented contract), so the moved
+        // count is the class's cross-lane population only: 7 of the
+        // 10 class-1 obligations sit in Near against a Far target.
+        assert_eq!(
+            spine.reclassify_matching(|view| view.class == EventClass::new(1), Field::Far),
+            7
+        );
+        assert_eq!(canonical_keys(&spine), before);
+        assert!(
+            spine
+                .collect_matching(|view| view.class == EventClass::new(1))
+                .iter()
+                .all(|view| view.field == Field::Far),
+            "the reclassified region sits in the target lane"
+        );
+        assert_eq!(
+            spine.pending_count(),
+            40,
+            "reclassification moves, never drops"
+        );
+    }
+
+    /// The partition walks each lane's internal buffer, not pop
+    /// order — sound only because the outcome is a function of the
+    /// logical multiset alone. Two spines hold the SAME obligations
+    /// with different internal layouts (one has been through
+    /// parity-suspend/resume rebuild churn, which reheapifies both
+    /// lanes); the same class-based suspension must then produce
+    /// identical canonical state on both. This is the property that
+    /// keeps the buffer-order predicate calls (every production
+    /// predicate is a pure function of the view) observationally
+    /// identical to the old pop-order walk.
+    #[test]
+    fn bulk_partition_outcomes_are_heap_layout_independent() {
+        let build = || {
+            let mut spine = Spine::new(NoopWorld, 100);
+            for i in 0..50u64 {
+                let class = u16::try_from(i % 5).expect("class fits u16");
+                let field = if i % 2 == 0 { Field::Far } else { Field::Near };
+                spine
+                    .schedule(spec(class, field, 100 + (i % 9) * 7, i))
+                    .expect("schedule");
+            }
+            spine
+        };
+        let mut churned = build();
+        assert_eq!(churned.suspend_matching(|view| view.payload % 2 == 0), 25);
+        assert_eq!(churned.resume_matching(|view| view.payload % 2 == 0), 25);
+        let fresh = build();
+        // Same logical state after the churn: the no-op cycle is
+        // fingerprint-invisible (also pinned by the suspension
+        // battery, here the precondition for the layout test).
+        assert_eq!(
+            churned.engine_fingerprint(),
+            fresh.engine_fingerprint(),
+            "the churn cycle is a state no-op"
+        );
+
+        let region = EventClass::new(3);
+        let mut partitioned = churned;
+        let mut control = fresh;
+        assert_eq!(
+            partitioned.suspend_matching(|view| view.class == region),
+            control.suspend_matching(|view| view.class == region),
+            "the same predicate moves the same count under either layout"
+        );
+        assert_eq!(partitioned.held_fingerprint(), control.held_fingerprint());
+        assert_eq!(
+            partitioned.lane_state_fingerprint(),
+            control.lane_state_fingerprint()
+        );
+        assert_eq!(
+            partitioned.engine_fingerprint(),
+            control.engine_fingerprint()
+        );
+        assert_eq!(canonical_keys(&partitioned), canonical_keys(&control));
+    }
+
+    /// The partition's degenerate shapes: empty lanes (a zero-length
+    /// `extract_if` over an empty buffer) and single-entry lanes
+    /// round-trip through suspend/resume/reclassify without loss —
+    /// the conservation identity holds at every step.
+    #[test]
+    fn bulk_partition_handles_empty_and_single_entry_lanes() {
+        let mut spine = Spine::new(NoopWorld, 10);
+        assert_eq!(spine.suspend_matching(|_| true), 0);
+        assert_eq!(spine.resume_matching(|_| true), 0);
+        assert_eq!(spine.reclassify_matching(|_| true, Field::Far), 0);
+        assert_eq!(spine.pending_count(), 0);
+
+        spine
+            .schedule(spec(0, Field::Near, 5, 1))
+            .expect("schedule");
+        assert_eq!(spine.suspend_matching(|_| true), 1);
+        assert_eq!(spine.pending_count(), 0, "the lone obligation is held");
+        assert_eq!(spine.resume_matching(|_| true), 1);
+        assert_eq!(spine.pending_count(), 1);
+        assert_eq!(spine.reclassify_matching(|_| true, Field::Far), 1);
+        spine.run_ticks(10);
+        assert_eq!(
+            spine.stats().executed,
+            1,
+            "the obligation survived every partition"
+        );
+        assert_eq!(spine.pending_count(), 0);
     }
 }
