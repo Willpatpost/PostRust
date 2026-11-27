@@ -305,7 +305,22 @@ fn shared_prerequisites_release_fanout_once_in_order() {
             .schedule(at(Field::Near, 1, payload).with_dependencies(vec![first, last, first]))
             .unwrap();
     }
-    spine.run_ticks(2);
+    // B01's housekeeping bound (the P2-L3 corrective, 2026-11-27): this
+    // fixture parks 2048 due-blocked events against a 127-event budget —
+    // a 16:1 housekeeping-to-budget ratio, adversarial by the design's
+    // own definition and exactly the storm shape the bound exists to
+    // rate-limit. The pre-B01 battery observed the whole herd parked
+    // after two ticks (the unbounded rate); the bound now parks
+    // ~190/tick (the 127 + 63 allowances across the phases), so the
+    // full park completes over ~11 ticks. The observation window
+    // widens from 2 to 30 ticks — the fixture's intent (every event
+    // parked exactly once, release fired once with the duplicate dep
+    // deduped, canonical order to completion, the mid-storm
+    // suspend/resume surviving) is unchanged and now ALSO covers the
+    // bounded cadence. The inline replica in spine.rs
+    // (release_storm_releases_atomically_then_defers) pins the atomic
+    // single-release semantics at the herd's exact shape.
+    spine.run_ticks(30);
     assert_eq!(spine.blocked_count(), 2048);
     assert_eq!(spine.world().executed, [0]);
     assert_eq!(spine.suspend_matching(|v| v.payload == 27), 1);
