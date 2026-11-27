@@ -29,6 +29,50 @@ work from THIS file alone.
   still-water composition, ring confinement, and its acceptance
   table) is the path to readable impacts; the sign-off walk's
   negative result is the package's motivating evidence.
+- **Amended per the sign-off review's finding 27 (2026-11-27):**
+  the remediation records below called the R3/R4 calibration
+  rounds "never a test weakened" — that phrase overstated what the
+  calibration history preserved, and the retained evidence now
+  carries the honest form (old predicate, measured counterexample,
+  replacement property, per substantive change):
+  - **R4's forced-field floor (round 6):** the first candidate
+    required a displayed-RGB MAJORITY of the differing pixels;
+    Ubuntu measured 12,087 of 97,961 = 12% (the darker lavapipe
+    mirror gives the UV displacement less rgb to move) while
+    Windows passed with a majority — the counterexample that
+    falsified the majority as a cross-platform property. The
+    replacement: the absolute floor of 5,000 displayed-RGB-
+    qualified pixels (2.4× margin under Ubuntu's measurement,
+    ~10× under Windows's) — a weaker predicate than the majority on
+    bright mirrors, a stronger one on dark ones, chosen for
+    cross-platform validity with the margin recorded. The majority
+    remains enforced where it is the acceptance property (the
+    rain broadside gate's upper-third majority — the R3 addition).
+  - **R3's receiver-blend witness floors (rounds 4–7):** the
+    original signed-dry PRESENCE floor became ABSOLUTE presence
+    (|wet−dry| ≥ 2 — a streak under bright ground dims it, which is
+    still presence), and the qualification floors fell
+    (wet 165→25, presence 15→3, contrast 50→8) — each fall pinned
+    from a measured near-miss on a platform the old floor excluded,
+    with the flip asserts carrying the discrimination. The R9
+    corrective (PR #70) then replaced the sign-flip predicate
+    itself with the both-predictions interval form — the review's
+    finding 24 demonstrated the flip's vacuity at dimming
+    witnesses (both orders dim), and the interval form decides at
+    any witness with the separation recorded.
+  - **R3's ripple campaign pin:** the exact production campaign
+    pin was re-measured for the documented contact-geometry change
+    (the world receiver plane — finding 12's correction moved the
+    landings); the old pin is historical, the new pin exact, and
+    the CHANGE is recorded as a production-policy change with its
+    cause, never as a gate weakening.
+  - **The count-only `ci:` corrections** (d35917a, 9c1d646, the
+    R6/R7/R8/R9 pins): test-count pins corrected from measured
+    actuals — a different class from predicate changes; no gate
+    floor, discriminator, or coverage moved in any of them.
+  The exact-count history and every red run's actuals remain
+  separately traceable in the commits; this amendment records the
+  predicate history the "never weakened" phrase collapsed.
 - **Reconciled for the Era-2 audit remediation's completion on
   2026-11-26:** the independent audit at `959889d`
   (`docs/ERA2-LIVING-WORLD-AUDIT-959889d.md`) held Era-2 sign-off
