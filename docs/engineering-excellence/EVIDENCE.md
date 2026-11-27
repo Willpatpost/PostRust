@@ -191,6 +191,20 @@ and the full allocation tuple printed. The owner's judgment is the standing
 authority for visual claims; the byte-equality and pixel gates carry the
 deterministic evidence beneath it.
 
+## E-10 The IA-09 fixture repair rig-verified (2026-11-27, rig, tree `435fc60`)
+
+The repaired `render_post` battery run in full on the real GPU (no name
+filter needed — the poison cascade is gone): **7 passed / 0 failed, exit 0,
+11.26 s.** Both depth fallbacks pass all 61 post-resize probes at **max error
+0/255** (D24_S8 and D16), the post-lifecycle reference probes green at the
+original extent, the pixel/discriminator/tiny-extent gates green, and the S1g
+`submit_frame` byte-equality gate re-confirmed in the same run (262,144-byte
+captures, 190,668 differing-bytes composed ink, allocations constant). The
+extent assertion is fail-visible in the gate. Log:
+`Temp\opencode\ee\artifacts\gates-ia09-rig.log`. The historical rig-pending
+clause is discharged: the oracle was always right; the capture extent was
+wrong.
+
 ## Measurement baselines
 
 (To be established in P0: first full build of the integration tree, then the
