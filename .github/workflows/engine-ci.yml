@@ -2169,7 +2169,17 @@ jobs:
           # while the predicate correctly required 46 — the same
           # stale-163 correction the renderer release battery got
           # at R4).
-          [ "$ignored" -eq 46 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 46"; exit 1; }
+          # ENGINEERING EXCELLENCE P4-S1G (2026-11-27, the
+          # refactor/engineering-excellence branch): the gpu-level
+          # submit_frame equivalence gate adds 1 #[ignore]d
+          # render_post test (submit_frame_matches_render_corner_
+          # bytes_plain_and_composed — RIG-VERIFIED on the RTX
+          # 5070 Ti: both byte-equality proofs green, the
+          # composed frame 190668 differing bytes from plain,
+          # allocations constant): ignored 46 -> 47 (measured on
+          # the lane tree with this step's own parse — 664/47/64
+          # Windows, passed and result lines unchanged).
+          [ "$ignored" -eq 47 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 47"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
