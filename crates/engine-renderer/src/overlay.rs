@@ -3,7 +3,7 @@
 use crate::glyph_atlas::{GlyphAtlas, GlyphQuad, push_glyph_quads};
 
 /// Overlay pipeline ABI. Solid triangles sample the sampler's white border.
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct OverlayVertex {
     pub pos: [f32; 2],
