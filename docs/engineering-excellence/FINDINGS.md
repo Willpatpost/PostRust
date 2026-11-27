@@ -57,6 +57,38 @@ corrected).
 | B15 | WORKSPACE | PARTIAL (rend half) | — | renderer dep closure tight (ash/bytemuck/nalgebra + engine-core); full workspace measurement pending P0/P6 |
 | B16 | ALL | UNTRIAGED | — | pending all auditors |
 
+## The Sol re-audit (2026-11-27, the continuation mandate at `8d34771`)
+
+**NOT complete — final integration NOT authorized.** Scores: cleanliness 7.4,
+modularity 7.2, scalability 6.0, maintainability 7.0, optimality 7.7,
+lightweight 8.3, speed 7.5 (provisional), documentation 7.4 — every category
+must independently reach 9/10 under the original directive. The verified
+improvements are acknowledged and retained; the internal corrective-audit
+closure is an intermediate milestone, NOT P7 acceptance. The outstanding
+original findings (per the reviewer): A05, A07, A08 (remaining), A09, A10/B06,
+B01, A03/A04/A06/A15 (migration incomplete), A11/A18/A19/A20/A23/B14, A22/B03
+(remaining), B08/B13, B10/B11/B12, A01/A02/A12/A13/A14/B15/B16. **The largest
+outstanding objective: engine work and resident memory proportional to
+relevant workload rather than global population, historical state, or
+demonstration-sized fixed capacities.**
+
+| R-ID | Sev | Summary | Orchestrator adjudication |
+|---|---|---|---|
+| R01 | major | SceneDescription::validate misses inverted draw ranges | **CONFIRMED by direct read**: [5,3) passes contiguity (end==next.start holds both) and underflows end−start downstream |
+| R02 | major | Scene bounds validation passes infinite endpoints | **CONFIRMED**: partial_cmp returns Some for infinities — [-inf,0] passes min<=max |
+| R03 | major | the accumulator iterates all ticks before the cap | **CONFIRMED**: O(elapsed/dt) iterations before MAX_TICKS_PER_FRAME applies — exact bounded arithmetic required |
+| R04 | major | deferred presentation skips crowd ticks the accumulator consumed | **CONFIRMED**: advance() consumes; weather ticks pre-submission; crowd steps post-presentation — the coherence gap |
+| R05 | minor | app.rs unbounded frame-interval Vec (NEW-SHELL-04 elevated) | ACCEPTED (registered P6; elevated priority) |
+| R06 | major | The scene interface's fixed material/texture/reflection prototype assumptions left as transitional-permanent | ACCEPTED (the S4–S6 continuation — not a new finding but the correct mandate framing) |
+| R07 | minor | The memory transaction lifecycle remains structurally complicated and copy-heavy | ACCEPTED (investigate safe consolidation) |
+
+**Standing orders from the re-audit:** reconcile the register/README with
+the actual HEAD; prioritize P2 spatial, P3 remaining, P4 migration, P5
+GPU/resource scalability; correct underlying mechanisms, not isolated guards;
+a design document or green battery is not evidence an unimplemented
+improvement is complete; continue autonomously; no merge until the full
+directive + lead + owner accept.
+
 ## Independent audit (astra, 2026-11-27, INDEPENDENT-AUDIT-be910bf.md)
 
 **Withholds acceptance at `be910bf` — accepted.** Every IA finding below is
