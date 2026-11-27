@@ -48,7 +48,7 @@ corrected).
 | B11 | SLICE | CONFIRMED (LOW) | — | occupancy-vs-visibility terminology (audits/slice.md) |
 | B13 | SLICE/PERSIST | CONFIRMED (HIGH) | — | verified: `worker.rs` send-then-`slot.recv()` round-trip at :635,687,745,792,837,877,921,1174; charter-known blocking bounded send on `submit_required`; P3 mapping of which calls can block sim/presentation |
 | B05 | CORE | FIXED-AWAITING-REVIEW | integrated `bceb3fa` | orchestrator-implemented `457d391` from the glm-5.3 design (witness corrected): combined-Y sum admission, velocity gate (the beyond-charter discovery), total kill-plane impact, observable cap_discard, saturating overflow_total; trajectory digest pin green; 3 discriminating tests; main +3 pin pending measurement |
-| B06 | CORE | CONFIRMED (auditor-located) | — | interaction.rs select_target sqrt+normalize per target, the exact-zero-distance tie question; combat.rs resolve_attack full hitbox scan — verify the tie contract before the P2 spatial package |
+| B06 | CORE | CONFIRMED + CONTRACT DECIDED | — | interaction.rs:12-13 documents "ties break by the lowest id" but the exact-zero-distance branch omits it (no test pins either behavior — the P2 design's verified finding); **orchestrator decision: implement the documented contract** (the docs are the authority; the code-docs divergence is a conformance defect, and the lowest-id tie is a determinism discriminator the module's own header promises); combat.rs resolve_attack full hitbox scan → the L5/L6 broad phases |
 | B07 | CORE | RESOLVED — NO-CHANGE (with evidence) | — | the glm-5.3 design's no-change recommendation CONFIRMED on verified evidence (designs/B07-validated-rule-policy.md): every caller in the repo passes a ≤1-rule table (corner_behavior 1 rule, grep-verified; the measurement/render gates the same shape), zero `.rules` mutation sites exist (write-once, grep-verified), `select_activity` short-circuits on due_commitment before the table walk (npc_behavior.rs:388-393, verified), and validate_rule_table is a nanosecond Option<u8> loop — the charter's own bar ("no type-state architecture for one tiny loop") decides it; per-call validation IS the safe boundary for raw `&[Rule]` policy (identity caching unsound while the field is `pub`); revisit triggers recorded in the design |
 | B08 | SHELL | CONFIRMED (deferred to measurement) | — | **auditor PASS verdict REFUTED by direct read** (mem::take at input.rs:199-203 moves the buffers out, leaving capacity-0 accumulators that reallocate on the next input-bearing frame — "reused via take" was backwards); disposition: the churn is human-scale at current workloads (edges are rare, idle frames allocate nothing) — the caller-owned-snapshot API change needs an input-event allocation census to justify; queued for the P0 measurement matrix |
 | B09 | REND | FIXED-AWAITING-REVIEW | integrated `9dce061` + corrective | lane `2ddef05` reviewed: metal literal fixed + never-existed display_surface removed + one focused test; **orchestrator corrective restored `VK_MVK_macos_surface`** (deprecated but REAL — legacy MoltenVK loaders advertise it; its removal re-opened the exact misclassification class the fix closes); lane citation inaccuracy recorded (VK_KHR_display does provide vkCreateDisplayPlaneSurfaceKHR); +1 test → pin correction at batch gate close; awaits batch gate run |
@@ -66,6 +66,23 @@ refutation is evidence too.
 
 ### Package designs (the architecture decision records)
 
+- **P2-simulation-spatial.md** (glm-5.3, 1,056 lines, citations verified at
+  `c7de072`): query inventory = 6 primitives in 3 families (D dynamic-actor,
+  S-box static, S-ray static); **NO universal index** — two family-scoped
+  broad phases (persistent uniform grid in CollisionWorld over both collider
+  lists; per-tick counting-sort census grid at the composition layer), linear
+  paths DEFAULT below measured gates, hash grid lookup-only-never-iterated +
+  candidates re-sorted to insertion order = bit-identical results incl. ties;
+  B01 = housekeeping cap as a second drain_due loop bound + derived
+  remaining-dependency counts (try_unblock O(1)), no spine replacement; A09 =
+  derived witness→keys index + phase merge (MemoryKey is event-first —
+  witnesses are not contiguous; the wire order preserved); the spine's
+  derived/canonical split makes counters wire-invisible by construction;
+  **pin correction verified: perception digest is `10766371085850726021`**
+  (npc_perception.rs:545 — CURRENT-STATUS:315 dropped the final digit, a doc
+  typo queued for the P6 pass); B06's exact-zero tie divergence confirmed
+  with the contract decision below. Lanes L1–L8 (L1–L3 orchestrator — spine/
+  semantics; L4–L6 lane-able with tight briefs; L7–L8 policy/config).
 - **P3-persistence-architecture.md** (glm-5.3, 943 lines, citations verified
   at `bceb3fa`): B02 caller-side wins first (bounded header-prefix reads,
   frontier-from-decoded-state) then recovery single-decode then a streaming
