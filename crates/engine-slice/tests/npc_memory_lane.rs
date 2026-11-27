@@ -991,6 +991,223 @@ fn a_late_classification_survives_the_reopen() {
     drop(recovered_book);
 }
 
+/// P1-B04 (the engineering-excellence corrective): a classification-sync
+/// flush whose journal capture SUCCEEDED but whose apply failed is
+/// completed by the apply only, AND the sync bookkeeping established at
+/// the failure boundary (the journal holds the sync as fact) means the
+/// flush condition does NOT fire a second transaction for the same sync
+/// — the first form of the fix left `journaled_classifications` stale
+/// here, re-flushing a duplicate episode on the next submit.
+#[test]
+fn a_journaled_classification_flush_completes_without_a_duplicate() {
+    let dir = TestDir::new("b04-journaled-flush");
+    let mut spine = make_spine();
+    let mut pipeline = fresh_pipeline(&dir);
+    let mut book = MemoryCommitBook::default();
+
+    // The record episode + the late classification (the finding-21
+    // shape): three records confirmed, the candidate classified AFTER
+    // the final record episode — a live sync the journal does not hold.
+    schedule_encounter(&mut spine, 1, EncounterKind::Altercation, 0, 0, Tick(5)).unwrap();
+    spine.run_ticks(5);
+    commit_witness_captures(&mut spine, &mut pipeline, &mut book, 0, true).unwrap();
+    assert_eq!(spine.world().lane.witness_conservation(0), (3, 0, 3));
+    let candidate_key = MemoryKey {
+        event: 1,
+        witness: 0,
+        kind: MemoryKind::ReputationCandidate,
+    };
+    assert_eq!(
+        spine.world_mut().lane.classify(&candidate_key, true),
+        engine_core::npc_memory::ClassifyOutcome::Classified,
+        "the live decision applies"
+    );
+    let current = spine.world().lane.witness_classifications(0);
+    assert!(
+        !current.is_empty(),
+        "the late classification exists to flush"
+    );
+
+    // THE INTERRUPTED FLUSH: the bridge stages and journals the
+    // classification-sync episode exactly as the flush does (the
+    // unit-marker span, the current sync as the plan), then the apply
+    // fails — the book records the unresolved episode at the journaled
+    // phase WITH the episode tracking and the sync snapshot (the
+    // journal-durable truth), exactly as the corrected failure path
+    // does.
+    let episode = book.episodes;
+    book.episodes += 1;
+    let consequence = ConsequenceId::new(0, episode, 0);
+    let position = engine_persist::envelope::SourcePosition {
+        head: None,
+        tick: spine.world().last_tick.as_u64(),
+    };
+    let span = engine_persist::consequence::OccurrenceSpan::new(0, 1).unwrap();
+    let envelope = engine_persist::envelope::ConsequenceEnvelope::capture(
+        consequence,
+        vec![engine_persist::envelope::ClassifiedSpan::new(
+            span,
+            engine_persist::envelope::DurabilityClass::DurableEligible,
+        )],
+        engine_persist::envelope::SignalLane::Captured,
+        engine_persist::envelope::CounterValues::default(),
+        engine_persist::envelope::SourceBaseline {
+            counters: engine_persist::envelope::CounterValues::default(),
+            award: engine_persist::consequence::AwardCheckpoint {
+                durable: engine_persist::consequence::Coverage::new(),
+                provisional: engine_persist::consequence::Coverage::new(),
+            },
+        },
+        position,
+    )
+    .unwrap();
+    pipeline.stage(envelope).unwrap();
+    let plan = engine_slice::npc_memory_lane::MemoryPlan {
+        witness: 0,
+        episode,
+        records: Vec::new(),
+        classifications: current.clone(),
+    }
+    .encode()
+    .unwrap();
+    pipeline
+        .capture(
+            position,
+            engine_persist::envelope::DurabilityClass::DurableEligible,
+            Vec::new(),
+            vec![engine_persist::journal::FrontierEntry { region: 0, episode }],
+            plan,
+        )
+        .unwrap();
+    // The apply NEVER runs — the book records the journaled unresolved
+    // state exactly as the corrected failure path does (the episode
+    // tracking and the sync snapshot established AT the boundary).
+    book.episode_keys.insert(episode, (consequence, Vec::new()));
+    book.journaled_classifications.insert(0, current);
+    book.unresolved = Some(engine_slice::npc_memory_lane::UnresolvedEpisode {
+        kind: engine_slice::npc_memory_lane::UnresolvedKind::ClassificationSync,
+        witness: 0,
+        episode,
+        consequence,
+        keys: Vec::new(),
+        journaled: true,
+    });
+
+    // THE COMPLETION: the next submit finishes the apply only — no new
+    // envelope, no second classification-sync transaction, the same
+    // consequence (the stale-snapshot form re-flushed a duplicate here).
+    let keys = commit_witness_captures(&mut spine, &mut pipeline, &mut book, 0, true).unwrap();
+    assert!(keys.is_empty(), "no new records — the completion only");
+    assert!(book.unresolved.is_none(), "the completion cleared it");
+    let mut confirmed = pipeline.confirmed_keys();
+    confirmed.sort_unstable();
+    assert_eq!(
+        confirmed,
+        vec![ConsequenceId::new(0, 0, 0), consequence],
+        "exactly TWO durable consequences: the record episode and the ONE classification-sync episode"
+    );
+    assert_eq!(
+        book.episodes,
+        episode + 1,
+        "the retry consumed no new episode id"
+    );
+
+    // THE COLD REOPEN: the classified score survives the interrupted
+    // flush (the journal holds the sync; the recovery applies it).
+    drop(pipeline);
+    let reopened = fresh_pipeline(&dir);
+    let recovered = recover_memory_lane(&reopened).unwrap();
+    let mut fresh_spine = make_spine();
+    let _recovered_book = install_recovered_lane(&mut fresh_spine, recovered);
+    assert_eq!(
+        fresh_spine.world().lane.reputation_score().unwrap(),
+        -3,
+        "the late classification survives the reopen"
+    );
+    drop(reopened);
+}
+
+/// P1-B04 (the engineering-excellence corrective): a classification-sync
+/// flush whose STAGE was definitely rejected (nothing durable) is
+/// re-staged by the retry under the SAME episode identity — the
+/// unit-marker span shape and a FRESH plan (the current sync) — never a
+/// new episode id. The first form of the fix built the record path's
+/// membership span over the empty key set, which fails closed
+/// (`OccurrenceSpan::new(0, 0)` is `Inverted`) and silently fell back
+/// to a fresh identity.
+#[test]
+fn an_unjournaled_classification_flush_retries_the_same_identity() {
+    let dir = TestDir::new("b04-unjournaled-flush");
+    let mut spine = make_spine();
+    let mut pipeline = fresh_pipeline(&dir);
+    let mut book = MemoryCommitBook::default();
+
+    // The same setup: the record episode confirmed, the late
+    // classification live (nothing journaled for it yet).
+    schedule_encounter(&mut spine, 1, EncounterKind::Altercation, 0, 0, Tick(5)).unwrap();
+    spine.run_ticks(5);
+    commit_witness_captures(&mut spine, &mut pipeline, &mut book, 0, true).unwrap();
+    assert_eq!(spine.world().lane.witness_conservation(0), (3, 0, 3));
+    let candidate_key = MemoryKey {
+        event: 1,
+        witness: 0,
+        kind: MemoryKind::ReputationCandidate,
+    };
+    assert_eq!(
+        spine.world_mut().lane.classify(&candidate_key, true),
+        engine_core::npc_memory::ClassifyOutcome::Classified,
+        "the live decision applies"
+    );
+
+    // THE FAILED FLUSH: the stage append was definitely rejected — the
+    // book records the unresolved classification-sync episode at the
+    // unjournaled phase (nothing durable, no bookkeeping).
+    let episode = book.episodes;
+    book.episodes += 1;
+    let consequence = ConsequenceId::new(0, episode, 0);
+    book.unresolved = Some(engine_slice::npc_memory_lane::UnresolvedEpisode {
+        kind: engine_slice::npc_memory_lane::UnresolvedKind::ClassificationSync,
+        witness: 0,
+        episode,
+        consequence,
+        keys: Vec::new(),
+        journaled: false,
+    });
+
+    // THE RETRY: the completion re-stages the SAME identity (the
+    // unit-marker span, the CURRENT sync as a fresh plan), journals,
+    // applies, and establishes the bookkeeping — then the flush
+    // condition sees the snapshot match and fires nothing.
+    let keys = commit_witness_captures(&mut spine, &mut pipeline, &mut book, 0, true).unwrap();
+    assert!(keys.is_empty(), "no new records — the retry only");
+    assert!(book.unresolved.is_none(), "the completion cleared it");
+    let mut confirmed = pipeline.confirmed_keys();
+    confirmed.sort_unstable();
+    assert_eq!(
+        confirmed,
+        vec![ConsequenceId::new(0, 0, 0), consequence],
+        "exactly TWO durable consequences under the SAME episode id the failure consumed"
+    );
+    assert_eq!(
+        book.episodes,
+        episode + 1,
+        "the retry consumed no new episode id"
+    );
+
+    // THE COLD REOPEN: the classified score survives.
+    drop(pipeline);
+    let reopened = fresh_pipeline(&dir);
+    let recovered = recover_memory_lane(&reopened).unwrap();
+    let mut fresh_spine = make_spine();
+    let _recovered_book = install_recovered_lane(&mut fresh_spine, recovered);
+    assert_eq!(
+        fresh_spine.world().lane.reputation_score().unwrap(),
+        -3,
+        "the late classification survives the reopen"
+    );
+    drop(reopened);
+}
+
 /// THE FINDING 20 JOURNALED ARM: an episode whose journal capture
 /// SUCCEEDED but whose apply failed (or whose session died between
 /// the two) is completed by the apply only — the retry never
@@ -1077,6 +1294,7 @@ fn a_journaled_unresolved_episode_completes_with_the_apply_only() {
         book.claimed.insert(*key);
     }
     book.unresolved = Some(engine_slice::npc_memory_lane::UnresolvedEpisode {
+        kind: engine_slice::npc_memory_lane::UnresolvedKind::Record,
         witness: 0,
         episode,
         consequence,
