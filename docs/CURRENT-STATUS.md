@@ -1,5 +1,19 @@
 # PostRust — Current Status Index
 
+> **BRANCH NOTICE (2026-11-27, the engineering-excellence program):** this
+> index describes **`main`** (settled at `5b93167`, Era 2 closed — see the
+> first bullet below). The **`refactor/engineering-excellence`** branch
+> carries the in-flight engineering-excellence program (~20 landed
+> capability changes: the renderer submission contract and scene
+> extraction, the pass coordinator, the persistence streaming reader and
+> clone reductions, the spine bulk-partition, the audit fix wave, and
+> more). That branch's live status, finding register, and evidence
+> manifest live in **`docs/engineering-excellence/`** (start at its
+> `README.md`) — read THERE for the branch state, HERE for the main
+> state. This index will be reconciled to the branch endpoint at the
+> integration PR (the owner's explicit GO gates the merge). The baseline
+> is preserved by the tag `pre-excellence-5b93167`.
+
 **Purpose:** the maintained, always-current index of what the engine actually
 is — integrated, tested, measured, and pending. The stage records in
 `docs/ENGINE-WORKSPACE-NARRATIVE.md` and `docs/` are **historical acceptance evidence, retained

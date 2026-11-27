@@ -88,14 +88,24 @@ table's own mixed conventions** (inline + tests/ dirs) — a test-heavy codebase
 by design; per-file prod counts feed A01 (split by change reason) and B15
 (footprint claims must cite these, not whole-file sizes).
 
-**IA-13 CORRECTION (2026-11-27, per the independent audit):** this census has
-known defects — it omits `crates/engine-core/tests/` entirely (11 tracked
-files, 4,471 nonempty lines), the shader glob (15 WGSL) misses the four
-compiled GLSL inputs (`.vert`/`.frag`, enumerated by build.rs), and the
-earlier "155k+" total overstated the table's own mixed-convention sum
-(134,949; adding the omitted core tests alone yields 139,420). A regeneration
-from the tag with ONE line-count convention is queued (P6); until then the
-per-crate PRODUCTION figures remain the useful column.
+**IA-13 regeneration (2026-11-27, one convention: nonempty lines, current
+branch head `0874dee`; E-2/E-5 superseded by this table):**
+
+| Crate | src prod | src inline-test | tests/ dir |
+|---|---:|---:|---:|
+| engine-core | 13,751 | 16,085 | 4,471 |
+| engine-persist | 45,831 | 39,754 | 8,684 |
+| engine-renderer | 22,320 | 6,970 | 0 |
+| engine-shell | 1,784 | 672 | 498 |
+| engine-slice | 42,797 | 6,478 | 57,374 |
+
+**Totals: production ≈ 126,483; test material ≈ 134,308 inline + 71,027
+tests-dir = 205,335.** Shader inputs: 15 WGSL + 4 GLSL (`overlay.frag/.vert`,
+`scene.frag/.vert` — enumerated from the tracked tree, 19 total). The
+earlier E-5's physical-line convention and its mixed totals are superseded;
+this table is the single-convention record. (The baseline-tag census differs
+only by the program's additions — the +1,467 S2, +569 S3, +1,799 L5, and the
+fix-wave lines.)
 
 ## E-6 First integration-batch gate run (2026-11-26, Windows rig, tree `3439633`)
 
