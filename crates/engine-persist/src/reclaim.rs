@@ -19,10 +19,12 @@
 //! identity list lives in the permanent metadata, never
 //! reserialized here.
 
+use std::collections::HashSet;
+
 use engine_core::{Decoder, Encoder, SaveError};
 
 use crate::hash::Hash;
-use crate::medium::{AppendOutcome, CanonicalMedium, MediumError, StoredObject};
+use crate::medium::{AppendOutcome, CanonicalMedium, MediumError, StoredObject, peek_domain};
 use crate::record::RevisionRecord;
 
 /// The reclamation-ledger object's versioned domain (the audit
@@ -3449,8 +3451,6 @@ pub(crate) fn collect_unit_objects(
     medium: &mut dyn CanonicalMedium,
     record_id: &Hash,
 ) -> Result<Vec<Hash>, MediumError> {
-    let head_record = medium.read_record(record_id)?;
-    let _ = &head_record;
     collect_unit_objects_via(&mut MediumReads::new(medium), record_id)
 }
 
@@ -3466,6 +3466,7 @@ pub(crate) fn collect_unit_objects_via<R: BeginReads>(
 ) -> Result<Vec<Hash>, MediumError> {
     let record = read_record_via(reads, record_id)?;
     let mut objects: Vec<Hash> = Vec::new();
+    let mut seen: HashSet<Hash> = HashSet::new();
     for (position, reference) in record.content_refs.iter().enumerate() {
         // (V2W-F3) The explicit hash-verified read of EVERY direct
         // reference — a corrupt or missing second (or later)
@@ -3473,15 +3474,14 @@ pub(crate) fn collect_unit_objects_via<R: BeginReads>(
         // missing-object classification here, before any authority
         // installs.
         let bytes = reads.read_object_bytes(reference)?;
-        if objects.contains(reference) {
+        if !seen.insert(*reference) {
             return Err(MediumError::Chain {
                 rule: "reclamation-ledger-v2/duplicate-unit-object",
             });
         }
         objects.push(*reference);
         if position == 0
-            && StoredObject::new(bytes.clone())?.domain()
-                == crate::composite_manifest::SESSION_SNAPSHOT_V2_DOMAIN
+            && peek_domain(&bytes)? == crate::composite_manifest::SESSION_SNAPSHOT_V2_DOMAIN
         {
             let manifest =
                 crate::composite_manifest::decode(&bytes).map_err(MediumError::Format)?;
@@ -3495,7 +3495,7 @@ pub(crate) fn collect_unit_objects_via<R: BeginReads>(
                 .map_err(|_error| MediumError::Chain {
                     rule: "reclamation-plan/composite-closure-verification",
                 })?;
-                if !objects.contains(&entry.identity) {
+                if !seen.insert(entry.identity) {
                     objects.push(entry.identity);
                 }
             }

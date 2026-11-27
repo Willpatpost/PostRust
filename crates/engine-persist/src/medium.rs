@@ -396,6 +396,17 @@ impl ObjectClass {
     }
 }
 
+/// Peeks the domain tag from borrowed bytes without allocation
+/// beyond the domain string itself. Used for domain classification
+/// where the full object storage is not yet needed.
+pub fn peek_domain(bytes: &[u8]) -> Result<String, MediumError> {
+    let mut dec = Decoder::new(bytes);
+    Ok(dec
+        .read_str(MAX_TAG_LEN, "stored-object")
+        .map_err(MediumError::Format)?
+        .to_owned())
+}
+
 /// The storage boundary the future CommitPipeline will operate over
 /// (§4.2's contract, typed). Every operation — including reads —
 /// serializes on the medium's OS-managed coordination, so a concurrent
