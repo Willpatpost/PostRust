@@ -151,6 +151,21 @@ crossover, E-08 skip decomposition, per-NPC memory, CPU render path) are
 carried there — the E-8 register cites the artifact rather than duplicating
 every line.
 
+## E-9 The owner's maximal-composition walk (2026-11-27, rig, tree `85a83b2`)
+
+The owner ran the maximal composition route (`--corner --populated --behavior
+--shadows --weather rain --wet --day-night 20 --post --free-look --audio`) on
+the integrated tree and judged **"Everything looks right to me"** — the visual
+non-regression acceptance for the entire landed program to date (all 15+
+findings' changes compose: the crowd, per-NPC shadows, rain, wet reflections
+with ripples, day/night, post, audio). The exit summary: 2,537 presented
+frames, validation warnings/errors **0/0**, 1 swapchain recreation (the
+resize), the audio device healthy (4,644 callbacks, 0 write rejections, worst
+callback 19.7 µs, 0 triggers dropped), 26 instances in 2 indirect draw calls,
+and the full allocation tuple printed. The owner's judgment is the standing
+authority for visual claims; the byte-equality and pixel gates carry the
+deterministic evidence beneath it.
+
 ## Measurement baselines
 
 (To be established in P0: first full build of the integration tree, then the
