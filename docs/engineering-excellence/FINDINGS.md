@@ -37,7 +37,7 @@ corrected).
 | A20 | REND | CONFIRMED | — | per-static-upload staging alloc/copy/submit/fence (vulkan.rs:3035-3199, textures.rs:61-202); folds NEW-REND-03 (no staging pool — same finding, more detail) |
 | A21 | CORE | FIXED-AWAITING-REVIEW | integrated `a213563` | orchestrator-implemented `3084a8a`: bounded retention (default 4096, amortized half-drain, lifetime `dropped_total`, NonZeroUsize capacity, opt-in echo documented); caller inventory showed all production paths run `Level::Off` — latent consumer defect closed, zero current behavior change; `&[Record]` API unchanged, `spine_main_path_allocations_are_pinned` green; +3 tests → main pin pending measured shard |
 | A22 | CORE/PERSIST | CONFIRMED (persist half) | — | confirmed_history grows unbounded, local.rs:3015-3028, no pruning; CORE half: spine.rs:1320-1354 ledger grows until explicit compact (audits/core.md) |
-| A23 | REND/SHELL | CONFIRMED (rend half) / N/A (shell half) | — | pose storage dynamic-offset per slot (skinned_draw.rs:949-950, POSE_STRIDE=704); the charter's shell clause (voice arrays) is NOT-APPLICABLE as written per auditor + orchestrator read — the voice pool is bounded-by-design with prebuilt PCM (a preserved strength); NEW-SHELL-05 notes the constructor-call-site documentation |
+| A23 | REND/SHELL | CONFIRMED (rend half) / MEASURED (shell half) | — | pose storage dynamic-offset per slot (skinned_draw.rs:949-950, POSE_STRIDE=704); shell half MEASURED by the thorough audit: device layer ≈434 KiB (voice pool 64×32B, ring 256×72B, scratch 24 KiB, resident PCM 399,360 B) + cue surface ≈326 KiB, all construction-time with residency pinned — no blanket replacement warranted; the open question is the two coexisting surfaces (NEW-SHELL-3, design review) |
 | A24 | SLICE | VERIFIED-CLOSED | integrated `1884582` | **rig-verified 2026-11-26:** all 11 `render_weather` Vulkan gates green on the RTX 5070 Ti (exit 0, 7.29 s) with the pinned values reproducing digit-for-digit (ink 17041, broadside 3482/2162, the allocation tuple, sweep 22/255, the term-separation counts) — the scripted route's census equivalence proven on the real GPU; heavy 664/46/64 measured (pin corrected); scripted route frame-indexed by design, free-look on one coherent accumulator (crowd+rain+day/night, monotone cycle, minimized accrual, dt bit-identity pinned `0x3c888889`); two defective lane rounds caught at review, final surgery by orchestrator |
 | A25 | SHELL | FIXED-AWAITING-REVIEW | integrated `7c30aee` | **auditor PASS verdict REFUTED by direct read** (start_voice ran inside the lock at audio.rs:912 — the auditor's "releases before heavy work" was backwards); orchestrator-implemented fix `fa13e26`: copy-out under try-lock → guard dropped → voice-start unheld; pairing preserved; shell battery green, zero test changes |
 | B01 | CORE | CONFIRMED | — | spine.rs:1767-1786 drain_due counts executions only (blocked moves don't count); charter's structural-gap framing stands (audits/core.md) |
@@ -86,11 +86,13 @@ refutation is evidence too.
 | NEW-SLICE-03 | SLICE | HYPOTHESIS (LOW) | — | evidence-collector loss semantics correct-by-design but undocumented; P6 doc note |
 | NEW-SLICE-04 | SLICE | HYPOTHESIS (LOW) | — | per-demo collision-world builders duplicate the pattern (acceptable demo isolation per auditor); P4/P6 shared-utility decision |
 | NEW-SLICE-05 | SLICE | CONFIRMED (LOW) | — | main.rs monolithic CLI dispatch cascade; P6 split candidate (cli.rs) |
-| NEW-SHELL-01 | SHELL | HYPOTHESIS (LOW) | — | SDL3 hint-name documentation note (platform.rs:45); P6 |
-| NEW-SHELL-02 | SHELL | NOT-APPLICABLE | — | REFUTED: let-chains on the pinned 1.99.1 toolchain (rust-toolchain.toml) — no minimum-version concern exists |
-| NEW-SHELL-03 | SHELL | HYPOTHESIS (MED) | — | loop pacing drift accumulation when consistently lagging (app.rs:266-270) — verify the actual pace_until/reset semantics before acting; may interact with the A24 accumulator discipline |
-| NEW-SHELL-04 | SHELL | HYPOTHESIS (LOW) | — | /proc VmRSS parse robustness (app.rs:292-303); P6 defensive note |
-| NEW-SHELL-05 | SHELL | HYPOTHESIS (LOW) | — | MixerCore construction-site documentation (audio.rs:830-838); P6 note |
+| NEW-SHELL-1 | SHELL | CONFIRMED (LOW) | — | cue-surface push path has no in-flight-sample bound (SDL_PutAudioStreamData buffers unconditionally — verified in vendored SDL 3.4.18); P6 doc/budget note to match the device layer's refusal discipline |
+| NEW-SHELL-2 | SHELL | CONFIRMED (LOW, grep-verified) | — | lib.rs:13-15 stale scope docs name audio as excluded while `pub mod audio` is first-class; P6 one-paragraph fix |
+| NEW-SHELL-3 | SHELL | CONFIRMED (design review) | — | two coexisting audio surfaces (cue push ~326 KiB vs callback mixer ~434 KiB, each its own SDL device) — an UNDECIDED design question; explicit DECISIONS.md disposition in P4/P6 |
+| NEW-SHELL-4 | SHELL | CONFIRMED (LOW, grep-verified) | — | app.rs:248 unbounded frame-interval Vec (+ Vec<f64> copy at :98) — the A21 shape in the shell; bundle with a P6 pass |
+| NEW-SHELL-5 | SHELL | CONFIRMED (INFO) | — | scancode-only events silently dropped, undocumented; one-line doc note |
+| NEW-SHELL-6 | SHELL | ADDRESSED by `fa13e26` | — | A25's producer-side mirror (submit_triggers' blocking lock could stall for a full 256-voice drain) — the integrated fix shrinks the critical section to the bounded ring copy, so the stall bound is now the copy; residual: document the bound at submit_triggers (P6) |
+| NEW-SHELL-7 | SHELL | CONFIRMED (INFO) | — | sdl3 Keycode/MouseButton re-exports couple the stable API to the pinned sdl3 version; record in the P6 API-stability policy |
 
 ## Auditor calibration record (charter §3)
 
@@ -143,12 +145,17 @@ refutation is evidence too.
   need orchestrator adjudication. No new findings beyond seeds (either the
   core is genuinely clean beyond the seeds or coverage was seed-focused —
   7 DEEP / 26 SKIM recorded honestly).
-- **qwen38-27b (shell, self-mislabeled gpt-oss-120b in its own report):** the
-  weakest audit of the five — BOTH seed verdicts wrong with backwards
-  reasoning (A25 "releases the lock before heavy work" — the lock was held
-  through start_voice; B08 "vectors are reused via take" — take gives the
-  buffer away, the opposite), one non-finding (let-chains vs a pinned
-  toolchain), and a provenance error (wrong auditor identity in the report
-  header). Both seeds were re-verified and reconciled by direct orchestrator
-  read; the new LOW/MED items registered as hypotheses pending verification.
-  Do not assign this model seed-verification work without full re-verification.
+- **qwen38-27b (shell — CORRECTED 2026-11-26):** delivered one of the two
+  best audits of the five (line-by-line coverage, byte-level A23
+  measurements, claims verified against the vendored SDL 3.4.18 source,
+  honest limitations, verdicts matching the orchestrator's independent
+  direct reads on A25/B08 exactly). **The earlier "weakest audit" entry was
+  an orchestrator bookkeeping error, now corrected**: the wrap-up nudges
+  were sent to crossed session IDs — the "shell" nudge reached the renderer
+  session (gpt-oss-120b), whose rushed re-audit produced the weak shell.md
+  that was previously reconciled here; the real shell auditor kept working
+  on its actual brief and delivered the thorough report. qwen38-27b is
+  exonerated; the weak artifact is retained in git history as the
+  misdirected-nudge product. Lesson recorded: session-ID bookkeeping in the
+  registry must be verified against each agent's actual brief before
+  nudges or attributions.
