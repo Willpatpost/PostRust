@@ -94,7 +94,7 @@ use crate::envelope::{
     PartialApplication, SignalLane, SourcePosition,
 };
 use crate::hash::Hash;
-use crate::journal::{JournalScan, TransactionId};
+use crate::journal::{CommittedTransaction, JournalScan, RecordedCancellation, TransactionId};
 
 /// The verified recovery anchor: the latest confirmed snapshot's
 /// authoritative consequential state (the generic B3 form — B4 maps
@@ -482,8 +482,28 @@ pub fn reconcile(
     journal: &JournalScan,
     confirmed: &BTreeMap<ConsequenceId, ConfirmedEvidence>,
 ) -> Result<RecoveryOutcome, RecoveryError> {
-    let canceled: BTreeSet<TransactionId> = journal
-        .cancellations
+    reconcile_from_parts(
+        anchor,
+        &journal.committed,
+        &journal.cancellations,
+        confirmed,
+    )
+}
+
+/// (P3-L4) The borrowed-parts form of [`reconcile`] — the identical
+/// pure function over the committed transactions and cancellations
+/// BY BORROW. The recovery's single-decode path derives its reconcile
+/// view from the opened journal's own classified state (the pipeline's
+/// one decoded graph) without materializing a second owned scan; every
+/// caller holding a [`JournalScan`] keeps the original entry point,
+/// which delegates here unchanged.
+pub fn reconcile_from_parts(
+    anchor: &RecoveryAnchor,
+    committed: &[CommittedTransaction],
+    cancellations: &[RecordedCancellation],
+    confirmed: &BTreeMap<ConsequenceId, ConfirmedEvidence>,
+) -> Result<RecoveryOutcome, RecoveryError> {
+    let canceled: BTreeSet<TransactionId> = cancellations
         .iter()
         .map(|cancellation| cancellation.target)
         .collect();
@@ -494,7 +514,7 @@ pub fn reconcile(
     // transaction). In-run only; dies with the process.
     let mut applied_units: BTreeMap<ConsequenceId, Vec<AppliedUnit>> = BTreeMap::new();
 
-    for transaction in &journal.committed {
+    for transaction in committed {
         if canceled.contains(&transaction.id) {
             // The durable termination record: a terminated
             // encounter's journaled intents never promote.
