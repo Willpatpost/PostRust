@@ -21,7 +21,8 @@ corrected).
 | A03 | REND | CONFIRMED | — | four render_corner* entry points + DemoScenePreference (audits/renderer.md) |
 | A04 | REND | CONFIRMED | — | render_frame 19 params (incl. wet; charter said ~18) — vulkan.rs:3974-3994 |
 | A05 | CORE | UNTRIAGED | — | pending auditor-core |
-| A06 | REND/SLICE | CONFIRMED | — | animation core is pure but lives INSIDE the renderer crate — placement is the P4 question (auditor read the purity as fine; the crate-coupling issue stands) |
+| A15 | SLICE | CONFIRMED (LOW, severity reduced) | — | wire discipline is correct (subsystems import only public APIs); the issue is the monolithic `corner_demo` dispatch + `main.rs` CLI cascade — P4/P6 extraction per the module classification map (audits/slice.md §2) |
+| A06 | REND/SLICE | CONFIRMED | — | animation core is pure but lives INSIDE the renderer crate — placement is the P4 question (auditor read the purity as fine; the crate-coupling issue stands); slice half verified: `corner_routes.rs` imports `engine_renderer::animation` directly (audits/slice.md) |
 | A07 | CORE | UNTRIAGED | — | pending auditor-core |
 | A08 | CORE | UNTRIAGED | — | pending auditor-core |
 | A09 | CORE | UNTRIAGED | — | pending auditor-core |
@@ -37,21 +38,21 @@ corrected).
 | A21 | CORE | UNTRIAGED | — | pending auditor-core |
 | A22 | CORE/PERSIST | CONFIRMED (persist half) | — | confirmed_history grows unbounded, local.rs:3015-3028, no pruning; CORE half pending |
 | A23 | REND/SHELL | CONFIRMED (rend half) | — | pose storage dynamic-offset per slot (skinned_draw.rs:949-950, POSE_STRIDE=704); SHELL half pending auditor-shell |
-| A24 | SLICE | UNTRIAGED | — | pending auditor-slice |
+| A24 | SLICE | CONFIRMED (HIGH) | — | verified: `corner_demo.rs:293,308` hardcoded `1.0/60.0`; `corner_weather.rs:267,282,384,393` per-frame hardcoded ticks; free-look loop at render cadence (audits/slice.md; orchestrator grep-verified) |
 | A25 | SHELL | UNTRIAGED | — | pending auditor-shell |
 | B01 | CORE | UNTRIAGED | — | pending auditor-core |
 | B02 | PERSIST | CONFIRMED | — | journal.rs:170-189 whole-file read ≤4 GiB; auditor's caller list (journal.rs:1115…3428) to be re-verified in P3 (line refs ambiguous across modules) |
 | B03 | PERSIST | CONFIRMED | — | composite_reader.rs:416-464,544 payload clones; reclaim.rs ~5686 bytes.clone(); pipeline.rs PendingAttempt clones; folds NEW-PERSIST-01/04 |
-| B04 | SLICE/PERSIST | PARTIAL | — | persist half: core state machine IS consolidated in pipeline.rs (PendingAttempt 1088-1313, retry identity preserved) — the charter's hypothesis concerns the SLICE bridge (npc_memory_lane.rs); verdict awaits auditor-slice |
+| B04 | SLICE/PERSIST | CONFIRMED | — | **orchestrator-read verification (npc_memory_lane.rs):** the record path's `mark_applied` failure records `UnresolvedEpisode` (954–967, retry completes the apply, never a second envelope); the classification flush (1166–1226) has NO equivalent — failure after `stage` → retry mints a NEW episode id + a SECOND journal transaction for the same sync (retry-identity inconsistency + write amplification). Auditor's quoted "bypass" comment FABRICATED (not in source) and "lost consequences" OVERSTATED (the durable journal holds unconfirmed transactions; recovery rebuilds; state converges); the flush is also partially guarded (`book.unresolved.is_none()` at 980). Persist half: core pipeline state machine consolidated. Disposition: P1/P3 transaction-lifecycle consolidation lane (charter's own direction), design-first — the S6 fuzz gate guards this semantics |
+| B10 | SLICE | CONFIRMED | — | replay/synthesis asymmetry verified in structure (audits/slice.md; line refs approximate) — measurement-quality fix alongside the measurement owner |
+| B11 | SLICE | CONFIRMED (LOW) | — | occupancy-vs-visibility terminology (audits/slice.md) |
+| B13 | SLICE/PERSIST | CONFIRMED (HIGH) | — | verified: `worker.rs` send-then-`slot.recv()` round-trip at :635,687,745,792,837,877,921,1174; charter-known blocking bounded send on `submit_required`; P3 mapping of which calls can block sim/presentation |
 | B05 | CORE | UNTRIAGED | — | pending auditor-core |
 | B06 | CORE | UNTRIAGED | — | pending auditor-core |
 | B07 | CORE | UNTRIAGED | — | pending auditor-core |
 | B08 | SHELL | UNTRIAGED | — | pending auditor-shell |
 | B09 | REND | CONFIRMED | ee/p1-b09-metal-surface | verified `vulkan.rs:1142`; lane IN-PROGRESS; auditor cross-checked the REST of PLATFORM_SURFACE_EXTENSIONS clean |
-| B10 | SLICE | UNTRIAGED | — | pending auditor-slice |
-| B11 | SLICE | UNTRIAGED | — | pending auditor-slice |
 | B12 | CORE | UNTRIAGED | — | pending auditor-core |
-| B13 | SLICE/PERSIST | PARTIAL | — | persist half: WorkerUnavailable/WorkerReplyLost propagation mapped (medium.rs:71-78,194-205); the blocking-send/HOL caller map is slice/worker.rs — awaits auditor-slice |
 | B14 | REND | CONFIRMED | — | full-size RGBA16F reflection targets per slot + HDR/bloom targets; P5 measurement package |
 | B15 | WORKSPACE | PARTIAL (rend half) | — | renderer dep closure tight (ash/bytemuck/nalgebra + engine-core); full workspace measurement pending P0/P6 |
 | B16 | ALL | UNTRIAGED | — | pending all auditors |
@@ -80,6 +81,11 @@ refutation is evidence too.
 | NEW-PERSIST-03 | PERSIST | CLOSED-FOLD | — | folds into A22 persist half |
 | NEW-PERSIST-04 | PERSIST | CONFIRMED (MED) | — | composite_reader memo hit still clones payload — B03 disposition candidate (Arc/shared verified backing); P3 |
 | NEW-PERSIST-05 | PERSIST | CONFIRMED (MED) | — | worker-unavailable propagates synchronously through append paths — B13 sub-item; P3 |
+| NEW-SLICE-01 | SLICE | HYPOTHESIS (MED) | — | no per-frame stall budget in demo render loops (render_demo/player_demo/playable/combat/encounter; auditor locations approximate/`likely` — verify before acting); P6 robustness |
+| NEW-SLICE-02 | SLICE | CONFIRMED (LOW) | — | shared `DEMO_TICK_HZ=60` (player_demo.rs:49, grep-verified) vs sim `DEFAULT_TICK_RATE_HZ` — document/configure the relationship; P6 |
+| NEW-SLICE-03 | SLICE | HYPOTHESIS (LOW) | — | evidence-collector loss semantics correct-by-design but undocumented; P6 doc note |
+| NEW-SLICE-04 | SLICE | HYPOTHESIS (LOW) | — | per-demo collision-world builders duplicate the pattern (acceptable demo isolation per auditor); P4/P6 shared-utility decision |
+| NEW-SLICE-05 | SLICE | CONFIRMED (LOW) | — | main.rs monolithic CLI dispatch cascade; P6 split candidate (cli.rs) |
 
 ## Auditor calibration record (charter §3)
 
@@ -91,3 +97,9 @@ refutation is evidence too.
 - **gpt-oss-120b (persist):** useful line-level census; verdict LABELS needed
   reconciliation against its own evidence (A13). Same model, same session
   type — verify labels, trust located facts.
+- **qwen36-35b (slice):** strong module classification + architectural
+  observations + honest limitations section; ONE FABRICATED QUOTE (B04's
+  "bypass" comment not in source), consequences overstated (data-loss claim
+  refuted by the journal's recovery classification), line refs off by ~5–15,
+  coverage table internally inconsistent (SKIM/UNEXAMINED overlap). Use for
+  mapping/classification; verify every quote and HIGH claim before acting.
