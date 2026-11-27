@@ -40,20 +40,21 @@ P0 baseline/census/measurement ──┬──> P1 direct improvements ──┐
 |---|---|---|
 | P0 | tag/branch done; census, coverage ledger, baseline measurements, architecture map | IN-PROGRESS — 4/5 area audits landed+verified (renderer, persist, slice, shell pending… core pending); census E-2/E-5 done; first gate baseline E-6 done; measurement matrix NOT STARTED |
 | P1 | A16 A17 A21 A25 B05 B07 B08 B09 B04(partial) B03(obvious) | 4 DONE integrated+gated (A16 `f9901f3`, A17 `3439633`, B09 `9dce061`+corrective, B04 `e31dc61`+corrective); A21/A25/B07/B08/B05 awaiting the core/shell audit reads |
-| P2 | A05 A07–A10 A22 A24 B01 B06 B12 | A24 lane RUNNING (`ee/p2-a24-fixed-timestep`); rest awaiting P0 audit + design |
-| P3 | A13 A22 B02 B03 B04 B12 B13 | NOT STARTED (persist audit in; design package after all audits) |
-| P4 | A01 A03–A06 A11 A12 A14 A15 B14 B15 | NOT STARTED (slice module-classification map in hand) |
+| P2 | A05 A07–A10 A22 A24 B01 B06 B12 | design LANDED (`designs/P2-simulation-spatial.md`); L1 (B06 tie) FIXED-AWAITING-REVIEW `356ef92`; L2/L3 spine lanes queued (orchestrator); L4–L6 lane-able; L7/L8 policy/config |
+| P3 | A13 A22 B02 B03 B04 B12 B13 | design LANDED (`designs/P3-persistence-architecture.md`); L1/L2 FIXED-AWAITING-REVIEW (`19fe59d`/`c084230`); L3 RUNNING (glm lane); L4–L7 orchestrator; L8/L9 queued |
+| P4 | A01 A03–A06 A11 A12 A14 A15 B14 B15 | design LANDED (`designs/P4-renderer-architecture.md`, the submission contract + S1–S6 DAG); S1 RUNNING (glm lane, additive-only); S2–S6 queued |
 | P5 | A11 A17–A20 A23 B14 | NOT STARTED (waits on P4 interfaces) |
 | P6 | A01–A06 A12–A15 B15 B16 | INCREMENTAL (LOW doc notes registered: NEW-REND-04/05/06, NEW-SLICE-02/03/05) |
 | P7 | full re-audit, rubric scoring, final report + PR | NOT STARTED |
 
 ## Next actions
 
-1. auditor-core + auditor-shell results → verify, reconcile register, unblock the A21/A25/B07/B08/B05 wave.
-2. lane-a24 (fixed timestep) → review diff (the 60fps equivalence bar + determinism boundary), integrate, gate.
-3. P0 measurement matrix (charter §8.2) on the integrated tree — SERIAL, no concurrent lanes building.
-4. P3 persistence design package (B02 streaming reads, B03 copy amplification, B13 worker map) from the persist audit + module map.
-5. Linux count confirmations ride the first PR's CI run (platform-uniform inferences recorded per pin commit).
+1. P3-L3 + P4-S1 lanes (glm-5.3, RUNNING) → verify diffs against the designs, integrate, gate.
+2. P4's DeviceLost typed arm (orchestrator — error-semantics class, deferred from S1).
+3. P2-L2/L3 spine lanes (orchestrator — the A08a bulk-partition and B01 accounting).
+4. P3-L4/L5 (recovery single-decode, streaming reader — orchestrator).
+5. The P6 doc pass (the stale lib.rs scope docs, the CURRENT-STATUS perception-digest typo, the NEW-REND/NEW-SHELL LOW notes).
+6. Linux count confirmations ride the first PR's CI run (platform-uniform inferences recorded per pin commit).
 
 ## File map
 
