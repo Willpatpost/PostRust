@@ -18,7 +18,7 @@ corrected).
 |---|---|---|---|---|
 | A01 | PERSIST/REND/CORE | CONFIRMED (persist+rend halves) | — | persist: local.rs ~12.9k, sqlite.rs ~8.3k, reclaim.rs ~6.9k, pipeline.rs ~3.6k whole-file (audits/persist.md); rend: vulkan.rs **6,122** lines (orchestrator-measured; auditor's 2.8k claim wrong), renderer.rs combinatorial entries ~620–998. CORE half pending auditor-core |
 | A02 | CORE/REND | UNTRIAGED | — | pending auditor-core (renderer half: scene_record/frame_prepare per charter) |
-| A03 | REND | CONFIRMED | — | four render_corner* entry points + DemoScenePreference (audits/renderer.md) |
+| A03 | REND | IN-PROGRESS (S1 landed) | integrated `954f843` | the FrameSubmission contract + submit_frame entry LANDED (additive-only, glm-5.3 `d4d0b52`): the pass-requirements declaration replaces the per-feature entry-shape for NEW consumers, the type-level equivalence test pins the adapter against the inline constructions; the four render_corner* methods stay byte-untouched until S6 removes them; remaining: S2 scene extraction, S3 coordinator, S6 deletion + the second scene |
 | A04 | REND | CONFIRMED | — | render_frame 19 params (incl. wet; charter said ~18) — vulkan.rs:3974-3994 |
 | A05 | CORE | CONFIRMED (core half) | — | lib.rs:97-111 constants hard-coded and baked into the save format (npc_world_save fixed-population arrays); P2 configurable-identity package |
 | A15 | SLICE | CONFIRMED (LOW, severity reduced) | — | wire discipline is correct (subsystems import only public APIs); the issue is the monolithic `corner_demo` dispatch + `main.rs` CLI cascade — P4/P6 extraction per the module classification map (audits/slice.md §2) |
