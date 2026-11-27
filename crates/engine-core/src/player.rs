@@ -66,7 +66,32 @@
 //! obligation at the 1 GHz bound accounts exactly, and the driver's
 //! total logical advancement is bounded to [`MAX_TOTAL_ADVANCE_NS`]
 //! with any clamping REPORTED, never silent.
+//!
+//! P2 L5 — the static-world broad phase (the scalability objective:
+//! engine work proportional to the relevant workload, not the global
+//! population). [`CollisionWorld`] carries a persistent uniform grid
+//! over BOTH collider lists (keyed by each collider's world AABB —
+//! the rotated list's cached one, the axis-aligned list's per-axis
+//! sorted interval), activated by a collider-count gate
+//! ([`GRID_COLLIDER_GATE`]). Below the gate every query is the exact
+//! linear walk, bit-identical, forever (the charter's retained
+//! small-workload fast path; every current demo world sits far below
+//! it). At or above it, each query gathers candidate collider INDICES
+//! from the cells under its conservative extent, RE-SORTS them to
+//! (list, index) insertion order, and runs the unchanged narrow
+//! phases over that ordered candidate slice. The grid is a LOOKUP
+//! STRUCTURE ONLY — never iterated — so the hash order is invisible,
+//! and because the candidate set is a conservative superset of the
+//! colliders that can affect any accumulator update (every update
+//! rule is strict-<, so a skipped collider is provably a no-op)
+//! evaluated in the linear walk's own order, EVERY result and EVERY
+//! mathematical tie is bit-identical between the two paths.
+//! Out-of-domain inputs (non-finite, or beyond [`GRID_CELL_LIMIT`])
+//! fail CLOSED onto the exact linear path — behavior never depends
+//! on the broad phase being available.
 
+use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
 use std::time::Duration;
 
 use crate::collision::{RotatedCollider, segment_rotated_hit};
@@ -101,6 +126,67 @@ pub const MAX_TICK_HZ: u32 = 1_000_000_000;
 /// and REPORTED via [`DriveStep::domain_clamped`] — never silently
 /// discarded.
 pub const MAX_TOTAL_ADVANCE_NS: u128 = u64::MAX as u128;
+
+/// The static broad phase's collider-count gate (P2 L5): worlds whose
+/// TOTAL collider count (the axis-aligned list plus the rotated list
+/// — the population every linear query walks) is below this take the
+/// exact existing linear paths, bit-identical, forever; at or above
+/// it the persistent uniform grid serves every query arm its
+/// candidates. 128 is the design's initial gate
+/// (docs/engineering-excellence/designs/P2-simulation-spatial.md
+/// §2.2), a measurement-pinned placeholder, not fashion: the E-8
+/// locomotion isolate shows collision queries are already ~½ the
+/// near lane's cost at 1000 movers against a tiny world, so the
+/// one-time static build amortizes over the per-tick per-mover query
+/// load at far smaller collider counts than a single-query world
+/// would — while the E-8 census/tick numbers show the linear scan is
+/// the cost/benefit optimum at every current demo world (tens of
+/// colliders). The grid exists for the scaling slope the flat E-8
+/// tick line hides.
+pub const GRID_COLLIDER_GATE: usize = 128;
+
+/// The uniform grid's cell edge (m) — the design's "cell size ~ query
+/// extent" derivation over the static family's extent census: the
+/// per-tick mover queries (the hot family: player and NPC boxes,
+/// extents ~0.6–2.4 m including one tick's travel and the [`SKIN`]
+/// margin) sit at the upper end, and every other family-S extent
+/// (reach 2.5 m, camera pull-in ~4.5 m) is within the ~one decade
+/// the design records. A power of two, so the
+/// `coordinate / GRID_CELL_SIZE` division is EXACT in f32 (no
+/// rounding in the cell mapping — the determinism discipline). The
+/// value is a cost knob only: the grid is conservative for ANY cell
+/// size, because insertion covers each collider's full world AABB
+/// and every query walks the full conservative extent of its own
+/// geometry.
+pub const GRID_CELL_SIZE: f32 = 2.0;
+
+/// The cell-index domain bound: |cell| < 2²¹ on every axis (the
+/// design's §2.2.6 numerical-domain contract, mirroring `perceive`'s
+/// fail-closed radius gate). With [`GRID_CELL_SIZE`] this admits
+/// world coordinates out to ±4,194,304 m — far beyond any
+/// region-local world. A collider whose AABB is non-finite or maps
+/// outside this domain poisons the whole broad phase (fail-closed):
+/// the world keeps the exact linear paths, so behavior is
+/// bit-identical by fallback rather than silently degrading. A QUERY
+/// extent outside the domain fails the same way, per query.
+pub const GRID_CELL_LIMIT: i32 = 1 << 21;
+
+/// The cell-walk crossover factor (the DDA stand-in): when a query's
+/// conservative extent spans more than this many cells PER COLLIDER
+/// in the world, the cell walk alone outcosts the linear path's
+/// per-collider evaluations (the per-item constants are comparable —
+/// one hash lookup vs one slab/SAT test), so the query takes the
+/// exact linear path. This is the design's own §2.6 waste trigger
+/// number ("> ~4× the ray's true cell crossings"), applied per query
+/// against the measured population instead of per world — the
+/// documented class it keeps linear is the LONG DIAGONAL RAY over a
+/// small world (a 120 m diagonal spans ~3.7 k cells: linear below
+/// ~1 k colliders, grid above, crossover decided by this guard, not
+/// by a fixed threshold). Bit-identity holds either way (the guard's
+/// fallback IS the linear path); the DDA refinement replaces it if
+/// measurement ever shows the guard engaging on a workload that
+/// matters.
+pub const GRID_CELL_WASTE_FACTOR: u64 = 4;
 
 /// Movement intent for one tick — the application maps its input
 /// snapshots onto this; the engine never sees keys or devices.
@@ -200,12 +286,254 @@ impl StaticCollider {
 /// (Cycle 4 C — see [`crate::collision`]), a ground plane, optional
 /// bounds. This is the reusable query contract — a future physics
 /// backend implements the same queries.
+///
+/// The static broad phase (P2 L5): `grid` holds the persistent
+/// uniform grid over both collider lists, activated when the total
+/// collider count reaches [`GRID_COLLIDER_GATE`]. It is maintained
+/// incrementally by the `with_*` builders (the write-once analysis:
+/// there is no post-construction collider-mutation API — colliders
+/// are only ever pushed, never removed or edited, and the game
+/// layer's `set_world` swaps whole worlds — so builder-time
+/// maintenance keeps the grid permanently consistent with the lists,
+/// with no dirty tracking and no query-time work). See the module
+/// docs for the bit-identity argument.
 #[derive(Debug, Clone, Default)]
 pub struct CollisionWorld {
     colliders: Vec<StaticCollider>,
     rotated: Vec<RotatedCollider>,
     bounds: Option<StaticCollider>,
     ground_y: f32,
+    /// The static broad phase. `Off` below the gate (and for the
+    /// empty default), `Grid` once activated, `Unusable` when a
+    /// collider's AABB is non-finite or outside the
+    /// [`GRID_CELL_LIMIT`] domain (permanently — the poisoning
+    /// collider never leaves).
+    grid: BroadPhase,
+}
+
+/// The static broad phase state. The grid is a LOOKUP STRUCTURE ONLY
+/// — it is never iterated: every query walks the cells under its own
+/// conservative extent in canonical row-major order, collects the
+/// candidate entries, and re-sorts them to (list, index) collider
+/// insertion order before the unchanged narrow phases run. The
+/// re-sorted candidate sequence is then exactly the linear walk's
+/// iteration order restricted to a conservative SUPERSET of the
+/// colliders that can affect the result — which is why every result
+/// and every tie is bit-identical to the linear path (the P2
+/// design's determinism trick; the skipped colliders are provable
+/// no-ops because every accumulator update rule is strict-<).
+#[derive(Debug, Clone, Default)]
+enum BroadPhase {
+    /// Below [`GRID_COLLIDER_GATE`] (or the empty default): every
+    /// query takes the exact existing linear path.
+    #[default]
+    Off,
+    /// The persistent uniform grid over both collider lists.
+    Grid(StaticGrid),
+    /// Activation was attempted but a collider's AABB is non-finite
+    /// or outside the [`GRID_CELL_LIMIT`] domain — permanently linear
+    /// (fail-closed; colliders never leave, so the poisoning AABB
+    /// never leaves either).
+    Unusable,
+}
+
+/// A trivially-cheap deterministic hasher for cell keys (FNV-1a over
+/// the key bytes). The grid is lookup-only — never iterated — so the
+/// hash choice is behavior-invisible by construction; it exists
+/// purely to keep per-cell lookups cheap (SipHash's DoS resistance
+/// buys nothing over engine-authored integer cell keys).
+#[derive(Clone, Default)]
+struct CellHasher(u64);
+
+impl CellHasher {
+    /// The FNV-1a offset basis.
+    const BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    /// The FNV-1a prime.
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+}
+
+impl Hasher for CellHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            // FNV-1a is DEFINED over wrapping arithmetic (the prime
+            // multiply intentionally exceeds u64).
+            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(Self::PRIME);
+        }
+    }
+}
+
+/// Builds [`CellHasher`]s (see its docs for why the default hasher is
+/// replaced).
+#[derive(Clone, Default)]
+struct CellHasherBuilder;
+
+impl BuildHasher for CellHasherBuilder {
+    type Hasher = CellHasher;
+
+    fn build_hasher(&self) -> CellHasher {
+        CellHasher(CellHasher::BASIS)
+    }
+}
+
+/// The uniform grid itself: OCCUPIED cells only (a hash grid — no
+/// dense world-space allocation, the galaxy rule), each carrying the
+/// collider entries inserted into it, in insertion order (push, never
+/// sorted — the candidate re-sort relies only on the indices, but
+/// keeping the per-cell lists in insertion order makes the
+/// construction itself canonical).
+#[derive(Debug, Clone, Default)]
+struct StaticGrid {
+    /// Cell key = (floor(x/s), floor(y/s), floor(z/s)) with
+    /// s = [`GRID_CELL_SIZE`]; value = (is_rotated, index into that
+    /// list).
+    cells: HashMap<[i32; 3], Vec<(bool, u32)>, CellHasherBuilder>,
+}
+
+/// The cell index of one coordinate: floor(coord /
+/// [`GRID_CELL_SIZE`]). The division is exact (power-of-two divisor),
+/// so the floor is exact for every finite input. `None` when the
+/// coordinate is non-finite or the cell lies outside the
+/// [`GRID_CELL_LIMIT`] domain — the caller's fail-closed signal.
+fn grid_cell_of(coordinate: f32) -> Option<i32> {
+    if !coordinate.is_finite() {
+        return None;
+    }
+    let cell = (coordinate / GRID_CELL_SIZE).floor();
+    // The f32 compare is exact (integer-valued cells, |cell| < 2^24
+    // in-range, and the limit is exactly representable), so the i32
+    // conversion below never saturates.
+    if cell.abs() >= GRID_CELL_LIMIT as f32 {
+        return None;
+    }
+    Some(cell as i32)
+}
+
+/// The inclusive cell span covering the (already sorted) interval
+/// [lo, hi]: floor(lo/s)..=floor(hi/s). Inclusive on both ends, so a
+/// collider whose face sits exactly ON a cell boundary is found by a
+/// query that merely touches it — the boundary-tight class the
+/// linear arms' `<=`/`>=` face conditions admit. `None` when
+/// non-finite or out of domain.
+fn grid_cell_span(lo: f32, hi: f32) -> Option<(i32, i32)> {
+    let lo_cell = grid_cell_of(lo)?;
+    let hi_cell = grid_cell_of(hi)?;
+    Some((lo_cell, hi_cell))
+}
+
+/// The per-axis cell spans covering a (sorted-per-axis) query extent,
+/// together with the total walked-cell count (checked multiply — an
+/// absurd span fails closed onto the linear path). Finiteness is
+/// validated on the RAW extent values BEFORE the per-axis sort —
+/// `f32::min`/`f32::max` swallow NaN, which would silently shrink a
+/// non-finite query onto the finite corner's cells while the linear
+/// arms still consult the raw NaN coordinates.
+fn grid_query_spans(min: [f32; 3], max: [f32; 3]) -> Option<([(i32, i32); 3], u64)> {
+    let mut spans = [(0i32, 0i32); 3];
+    let mut walked: u64 = 1;
+    for axis in 0..3 {
+        if !min[axis].is_finite() || !max[axis].is_finite() {
+            return None;
+        }
+        let lo = min[axis].min(max[axis]);
+        let hi = max[axis].max(min[axis]);
+        let (lo_cell, hi_cell) = grid_cell_span(lo, hi)?;
+        spans[axis] = (lo_cell, hi_cell);
+        let count = (hi_cell as i64 - lo_cell as i64 + 1).max(0) as u64;
+        walked = walked.checked_mul(count)?;
+    }
+    Some((spans, walked))
+}
+
+/// The full-grid build over both lists (the gate-crossing path and
+/// the test forcing path share it). `None` when any collider's AABB
+/// is non-finite or outside the cell domain (fail-closed — the world
+/// keeps the exact linear paths).
+fn build_static_grid(
+    colliders: &[StaticCollider],
+    rotated: &[RotatedCollider],
+) -> Option<StaticGrid> {
+    let mut grid = StaticGrid::default();
+    for (index, col) in colliders.iter().enumerate() {
+        if !grid.insert(false, index as u32, col.min, col.max) {
+            return None;
+        }
+    }
+    for (index, col) in rotated.iter().enumerate() {
+        let aabb = col.world_aabb();
+        if !grid.insert(true, index as u32, aabb.min, aabb.max) {
+            return None;
+        }
+    }
+    Some(grid)
+}
+
+impl StaticGrid {
+    /// Inserts one collider's entry into every cell its world AABB
+    /// covers. The AABB is sorted PER AXIS first: the linear narrow
+    /// phases consult INVERTED `StaticCollider` literals too (an
+    /// inverted interval can still overlap a straddling query box),
+    /// so the grid must cover the sorted span — the conservative
+    /// enclosure of every face value any linear arm can read.
+    /// Finiteness is validated on the RAW corners BEFORE the sort —
+    /// `f32::min`/`f32::max` swallow NaN, which would silently map a
+    /// non-finite collider onto the other corner's cells while the
+    /// linear arms still consult its raw NaN faces. Returns `false`
+    /// when the AABB is non-finite or outside the cell domain (the
+    /// caller poisons the broad phase, fail-closed).
+    fn insert(&mut self, rotated: bool, index: u32, min: [f32; 3], max: [f32; 3]) -> bool {
+        let mut spans = [(0i32, 0i32); 3];
+        for axis in 0..3 {
+            if !min[axis].is_finite() || !max[axis].is_finite() {
+                return false;
+            }
+            let lo = min[axis].min(max[axis]);
+            let hi = max[axis].max(min[axis]);
+            let Some(span) = grid_cell_span(lo, hi) else {
+                return false;
+            };
+            spans[axis] = span;
+        }
+        let entry = (rotated, index);
+        for cx in spans[0].0..=spans[0].1 {
+            for cy in spans[1].0..=spans[1].1 {
+                for cz in spans[2].0..=spans[2].1 {
+                    self.cells.entry([cx, cy, cz]).or_default().push(entry);
+                }
+            }
+        }
+        true
+    }
+
+    /// The conservative candidate set for precomputed query cell
+    /// spans: walk the covered cells row-major (the canonical order —
+    /// the design's rule; any fixed order would do, since the re-sort
+    /// restores the contract order), collect the entries, re-sort to
+    /// (list, index) insertion order, dedup. Duplicates (a collider
+    /// covering several walked cells) collapse here; they are
+    /// provably no-ops anyway (every accumulator update is
+    /// strict-<, so a re-evaluated collider never re-clamps), but
+    /// removing them keeps the candidate walk honest.
+    fn candidates(&self, spans: [(i32, i32); 3]) -> Vec<(bool, u32)> {
+        let mut entries: Vec<(bool, u32)> = Vec::new();
+        for cx in spans[0].0..=spans[0].1 {
+            for cy in spans[1].0..=spans[1].1 {
+                for cz in spans[2].0..=spans[2].1 {
+                    if let Some(cell) = self.cells.get(&[cx, cy, cz]) {
+                        entries.extend_from_slice(cell);
+                    }
+                }
+            }
+        }
+        // bool orders false (the axis-aligned list) before true (the
+        // rotated list): (list, index) == the linear walk's order.
+        entries.sort_unstable();
+        entries.dedup();
+        entries
+    }
 }
 
 impl CollisionWorld {
@@ -216,6 +544,7 @@ impl CollisionWorld {
             rotated: Vec::new(),
             bounds: None,
             ground_y,
+            grid: BroadPhase::Off,
         }
     }
 
@@ -223,6 +552,7 @@ impl CollisionWorld {
     pub fn with_box(mut self, base: [f32; 3], footprint: f32, height: f32) -> CollisionWorld {
         self.colliders
             .push(StaticCollider::from_base(base, footprint, height));
+        self.grid_after_push(false);
         self
     }
 
@@ -237,6 +567,7 @@ impl CollisionWorld {
     /// non-square geometry the square-footprint builder cannot express.
     pub fn with_collider(mut self, collider: StaticCollider) -> CollisionWorld {
         self.colliders.push(collider);
+        self.grid_after_push(false);
         self
     }
 
@@ -252,8 +583,161 @@ impl CollisionWorld {
     pub fn with_rotated_collider(mut self, collider: Option<RotatedCollider>) -> CollisionWorld {
         if let Some(collider) = collider {
             self.rotated.push(collider);
+            self.grid_after_push(true);
         }
         self
+    }
+
+    /// The broad-phase maintenance hook every collider push runs (the
+    /// write-once analysis: colliders are added only through the
+    /// consuming builders — there is no post-construction mutation
+    /// API, and the game layer's world swap replaces whole worlds —
+    /// so builder-time maintenance keeps the grid permanently
+    /// consistent with the lists, with no dirty tracking and no
+    /// query-time work). Below the gate this is a count check only;
+    /// AT the gate it builds the full grid once; past the gate each
+    /// push inserts just its own collider's covered cells.
+    fn grid_after_push(&mut self, pushed_rotated: bool) {
+        let total = self.colliders.len() + self.rotated.len();
+        // The pushed collider's entry data, read before any grid
+        // borrow (the push already happened).
+        let pushed = if pushed_rotated {
+            let index = self.rotated.len() - 1;
+            let aabb = self.rotated[index].world_aabb();
+            (true, index as u32, aabb.min, aabb.max)
+        } else {
+            let index = self.colliders.len() - 1;
+            let col = self.colliders[index];
+            (false, index as u32, col.min, col.max)
+        };
+        // mem::take moves the state out (Off/Unusable are free to
+        // move; the grid is one HashMap move) so the arms can assign
+        // the successor state without fighting the match borrow.
+        match std::mem::take(&mut self.grid) {
+            BroadPhase::Grid(mut grid) => {
+                let consistent = grid.insert(pushed.0, pushed.1, pushed.2, pushed.3);
+                self.grid = if consistent {
+                    BroadPhase::Grid(grid)
+                } else {
+                    // Poisoned by the pushed collider: permanently
+                    // linear (fail-closed).
+                    BroadPhase::Unusable
+                };
+            }
+            BroadPhase::Off if total >= GRID_COLLIDER_GATE => {
+                // The gate crossing: one full build over both lists.
+                self.grid = match build_static_grid(&self.colliders, &self.rotated) {
+                    Some(grid) => BroadPhase::Grid(grid),
+                    None => BroadPhase::Unusable,
+                };
+            }
+            state => self.grid = state,
+        }
+    }
+
+    /// The broad-phase candidates for a raw box query extent (no
+    /// expansion — the box-query arms' participation conditions all
+    /// imply strict overlap of the sorted intervals, which implies
+    /// shared cells). `None` for below-gate/poisoned worlds, for
+    /// out-of-domain extents, and when the [`GRID_CELL_WASTE_FACTOR`]
+    /// crossover guard fires (the cell walk would outcost the linear
+    /// narrow phases) — the exact linear path in every `None` case.
+    fn grid_candidates(
+        &self,
+        extent_min: [f32; 3],
+        extent_max: [f32; 3],
+    ) -> Option<Vec<(bool, u32)>> {
+        let BroadPhase::Grid(grid) = &self.grid else {
+            return None;
+        };
+        let (spans, walked) = grid_query_spans(extent_min, extent_max)?;
+        // The crossover guard (the DDA stand-in, documented on
+        // GRID_CELL_WASTE_FACTOR): more cells walked than 4 per
+        // collider means the walk alone outcosts the linear
+        // per-collider evaluations — take the exact linear path.
+        let population = (self.colliders.len() + self.rotated.len()) as u64;
+        if walked > GRID_CELL_WASTE_FACTOR * population {
+            return None;
+        }
+        Some(grid.candidates(spans))
+    }
+
+    /// The broad-phase candidates for one axis sweep: the SWEPT box
+    /// (the union of the box and its displaced self, per-axis sorted)
+    /// expanded by [`SKIN`] on the moving axis. The SKIN expansion is
+    /// required and sufficient: the axis-aligned arm's clamp faces
+    /// can sit up to SKIN past the swept extent (`face < allowed`
+    /// with `allowed ≤ delta` bounds the face within
+    /// SKIN of the sweep's leading edge — the tiny back-push class),
+    /// and the rotated arm's own pretest (the raw swept box,
+    /// touch-inclusive) is covered by the larger extent.
+    /// Over-expansion is harmless — conservativeness only ever adds
+    /// candidates the narrow phases then reject exactly. Non-finite
+    /// deltas take the exact linear path (their own NaN handling), as
+    /// does ANY non-finite player coordinate: a NaN on the moving
+    /// axis makes the rotated arm's SAT arithmetic emit the ±SKIN
+    /// resting-contact face from every pretest-passing collider (NaN
+    /// comparisons never gate) — a clamp pattern no finite cell span
+    /// can cover, so the raw check runs BEFORE the per-axis min/max
+    /// (which swallow NaN).
+    fn grid_candidates_for_sweep(
+        &self,
+        player_min: [f32; 3],
+        player_max: [f32; 3],
+        axis: usize,
+        delta: f32,
+    ) -> Option<Vec<(bool, u32)>> {
+        if !delta.is_finite() {
+            return None;
+        }
+        if (0..3).any(|a| !player_min[a].is_finite() || !player_max[a].is_finite()) {
+            return None;
+        }
+        let mut extent_min = player_min;
+        let mut extent_max = player_max;
+        let lo = player_min[axis].min(player_max[axis]);
+        let hi = player_max[axis].max(player_min[axis]);
+        extent_min[axis] = lo.min(lo + delta) - SKIN;
+        extent_max[axis] = hi.max(hi + delta) + SKIN;
+        self.grid_candidates(extent_min, extent_max)
+    }
+
+    /// The broad-phase candidates for a segment query: the segment's
+    /// raw AABB expanded by 2·`margin` on every axis. The expansion
+    /// must cover the narrow phases' own collider expansion — the
+    /// axis-aligned arm expands each box by exactly `margin` per
+    /// world axis, and the rotated arm's LOCAL expansion projects to
+    /// a horizontal world reach of `margin·(|cos yaw| + |sin yaw|)`
+    /// ≤ `margin·√2` (the C4-R1 enclosure discipline); 2·margin (an
+    /// exact power-of-two scale) bounds both. Negative or non-finite
+    /// margins take the exact linear path — the validated broad-phase
+    /// domain — as does any extent that lands outside the cell
+    /// domain (e.g. a far endpoint).
+    fn grid_candidates_for_segment(
+        &self,
+        from: [f32; 3],
+        to: [f32; 3],
+        margin: f32,
+    ) -> Option<Vec<(bool, u32)>> {
+        if !(margin.is_finite() && margin >= 0.0) {
+            return None;
+        }
+        // Raw-endpoint finiteness BEFORE the per-axis min/max (which
+        // swallow NaN — grid_query_spans's own raw check would then
+        // never see it): a NaN endpoint makes the linear slab IGNORE
+        // that axis (an infinite-slab hit pattern), which no finite
+        // cell span can cover — the exact linear path serves it.
+        if (0..3).any(|a| !from[a].is_finite() || !to[a].is_finite()) {
+            return None;
+        }
+        let expand = 2.0 * margin;
+        let mut extent_min = [0.0f32; 3];
+        let mut extent_max = [0.0f32; 3];
+        for axis in 0..3 {
+            extent_min[axis] = from[axis].min(to[axis]) - expand;
+            extent_max[axis] = from[axis].max(to[axis]) + expand;
+        }
+        self.grid_candidates(extent_min, extent_max)
     }
 
     /// The rotated colliders (empty in every pre-Cycle-4 world — the
@@ -279,11 +763,29 @@ impl CollisionWorld {
     /// nonpenetration check; contact at the [`SKIN`] margin is clear).
     /// The axis-aligned colliders are tested first, then the rotated
     /// colliders through the exact 2D separating-axis narrow phase.
+    /// At or above [`GRID_COLLIDER_GATE`] the broad phase supplies the
+    /// candidates (a conservative superset re-sorted to insertion
+    /// order — bit-identical results; see the module docs).
     pub fn box_overlaps(&self, min: [f32; 3], max: [f32; 3]) -> bool {
-        self.colliders
-            .iter()
-            .any(|col| (0..3).all(|a| min[a] < col.max[a] && max[a] > col.min[a]))
-            || self.rotated.iter().any(|col| col.overlaps_box(min, max))
+        if let Some(candidates) = self.grid_candidates(min, max) {
+            for (rotated, index) in candidates {
+                let overlaps = if rotated {
+                    self.rotated[index as usize].overlaps_box(min, max)
+                } else {
+                    let col = &self.colliders[index as usize];
+                    (0..3).all(|a| min[a] < col.max[a] && max[a] > col.min[a])
+                };
+                if overlaps {
+                    return true;
+                }
+            }
+            false
+        } else {
+            self.colliders
+                .iter()
+                .any(|col| (0..3).all(|a| min[a] < col.max[a] && max[a] > col.min[a]))
+                || self.rotated.iter().any(|col| col.overlaps_box(min, max))
+        }
     }
 
     /// Exact segment-vs-world intersection (C2-P1, challenge F2's
@@ -294,51 +796,46 @@ impl CollisionWorld {
     /// still registers exactly. `Some(0.0)` when the segment starts
     /// inside a collider; `None` when the segment misses every
     /// collider. The ground plane and bounds are NOT consulted (this
-    /// is a line-of-sight/pull-in query over the box world).
+    /// is a line-of-sight/pull-in query over the box world). At or
+    /// above [`GRID_COLLIDER_GATE`] the broad phase supplies the
+    /// candidates (bit-identical results; see the module docs) — for
+    /// segments the conservative extent is the segment's AABB
+    /// expanded by 2·margin (the C4-R1 enclosure bound), so a LONG
+    /// DIAGONAL ray spans many cells; the [`GRID_CELL_WASTE_FACTOR`]
+    /// crossover guard keeps such rays on the exact linear path until
+    /// the population makes the walk pay (the DDA stand-in — see the
+    /// const's docs).
     pub fn segment_hit(&self, from: [f32; 3], to: [f32; 3], margin: f32) -> Option<f32> {
-        let direction = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
         let mut best: Option<f32> = None;
-        for col in &self.colliders {
-            let mut t_enter = 0.0f32;
-            let mut t_exit = 1.0f32;
-            let mut missed = false;
-            for axis in 0..3 {
-                let lo = col.min[axis] - margin;
-                let hi = col.max[axis] + margin;
-                let d = direction[axis];
-                let origin = from[axis];
-                if d == 0.0 {
-                    if origin < lo || origin > hi {
-                        missed = true;
-                        break;
-                    }
+        if let Some(candidates) = self.grid_candidates_for_segment(from, to, margin) {
+            for (rotated, index) in candidates {
+                let hit = if rotated {
+                    segment_rotated_hit(from, to, &self.rotated[index as usize], margin)
+                        .map(|(t, _)| t)
                 } else {
-                    let mut t1 = (lo - origin) / d;
-                    let mut t2 = (hi - origin) / d;
-                    if t1 > t2 {
-                        std::mem::swap(&mut t1, &mut t2);
-                    }
-                    t_enter = t_enter.max(t1);
-                    t_exit = t_exit.min(t2);
-                    if t_enter > t_exit {
-                        missed = true;
-                        break;
-                    }
-                }
-            }
-            if !missed && t_exit >= 0.0 && t_enter <= 1.0 {
-                let t = t_enter.max(0.0);
-                if best.is_none_or(|best_t| t < best_t) {
+                    segment_aabb_t(from, to, margin, &self.colliders[index as usize])
+                };
+                if let Some(t) = hit
+                    && best.is_none_or(|best_t| t < best_t)
+                {
                     best = Some(t);
                 }
             }
-        }
-        for col in &self.rotated {
-            let Some((t, _)) = segment_rotated_hit(from, to, col, margin) else {
-                continue;
-            };
-            if best.is_none_or(|best_t| t < best_t) {
-                best = Some(t);
+        } else {
+            for col in &self.colliders {
+                if let Some(t) = segment_aabb_t(from, to, margin, col)
+                    && best.is_none_or(|best_t| t < best_t)
+                {
+                    best = Some(t);
+                }
+            }
+            for col in &self.rotated {
+                let Some((t, _)) = segment_rotated_hit(from, to, col, margin) else {
+                    continue;
+                };
+                if best.is_none_or(|best_t| t < best_t) {
+                    best = Some(t);
+                }
             }
         }
         best
@@ -351,7 +848,9 @@ impl CollisionWorld {
     /// overlap margin, so resting contact never blocks movement along
     /// the moving axis. The clamp targets sit [`SKIN`] short of each
     /// face, which is what makes tunneling impossible at any speed:
-    /// the box stops before crossing, it never passes through.
+    /// the box stops before crossing, it never passes through. At or
+    /// above [`GRID_COLLIDER_GATE`] the broad phase supplies the
+    /// candidates (bit-identical results; see the module docs).
     pub fn sweep_axis(
         &self,
         player_min: [f32; 3],
@@ -371,44 +870,34 @@ impl CollisionWorld {
                 hit = true;
             }
         }
-        for col in &self.colliders {
-            let mut overlaps_perpendicular = true;
-            for o in 0..3 {
-                if o == axis {
-                    continue;
-                }
-                if player_min[o] >= col.max[o] - SKIN || player_max[o] <= col.min[o] + SKIN {
-                    overlaps_perpendicular = false;
-                    break;
-                }
-            }
-            if !overlaps_perpendicular {
-                continue;
-            }
-            if delta > 0.0 && player_max[axis] <= col.min[axis] {
-                let face = col.min[axis] - SKIN - player_max[axis];
-                if face < allowed {
-                    allowed = face;
-                    hit = true;
-                }
-            } else if delta < 0.0 && player_min[axis] >= col.max[axis] {
-                let face = col.max[axis] + SKIN - player_min[axis];
-                if face > allowed {
-                    allowed = face;
-                    hit = true;
+        if let Some(candidates) =
+            self.grid_candidates_for_sweep(player_min, player_max, axis, delta)
+        {
+            for (rotated, index) in candidates {
+                let face = if rotated {
+                    self.rotated[index as usize].sweep_axis_box(player_min, player_max, axis, delta)
+                } else {
+                    sweep_aabb_face(
+                        player_min,
+                        player_max,
+                        axis,
+                        delta,
+                        &self.colliders[index as usize],
+                    )
+                };
+                if let Some(face) = face {
+                    apply_sweep_face(&mut allowed, &mut hit, face, delta);
                 }
             }
-        }
-        for col in &self.rotated {
-            if let Some(face) = col.sweep_axis_box(player_min, player_max, axis, delta) {
-                if delta > 0.0 {
-                    if face < allowed {
-                        allowed = face;
-                        hit = true;
-                    }
-                } else if face > allowed {
-                    allowed = face;
-                    hit = true;
+        } else {
+            for col in &self.colliders {
+                if let Some(face) = sweep_aabb_face(player_min, player_max, axis, delta, col) {
+                    apply_sweep_face(&mut allowed, &mut hit, face, delta);
+                }
+            }
+            for col in &self.rotated {
+                if let Some(face) = col.sweep_axis_box(player_min, player_max, axis, delta) {
+                    apply_sweep_face(&mut allowed, &mut hit, face, delta);
                 }
             }
         }
@@ -424,46 +913,40 @@ impl CollisionWorld {
     /// identically on every run and platform. Rotated colliders add
     /// their face-normal candidates after the axis-aligned ones (a
     /// mathematical tie keeps the axis-aligned push — the stable
-    /// first-wins order).
+    /// first-wins order). At or above [`GRID_COLLIDER_GATE`] the
+    /// broad phase supplies the candidates, re-sorted to this exact
+    /// iteration order (bit-identical results, ties included; see the
+    /// module docs).
     pub fn depenetration(&self, player_min: [f32; 3], player_max: [f32; 3]) -> Option<[f32; 3]> {
         let mut best: Option<([f32; 3], f32)> = None;
-        for col in &self.colliders {
-            let overlapping =
-                (0..3).all(|a| player_min[a] < col.max[a] && player_max[a] > col.min[a]);
-            if !overlapping {
-                continue;
-            }
-            for axis in 0..3 {
-                // Exiting through the min face moves the player's MAX
-                // face to it; through the max face, the player's MIN —
-                // the pushed-out box ends fully clear of the collider,
-                // never merely re-aligned with the near face.
-                let push_neg = col.min[axis] - SKIN - player_max[axis];
-                let push_pos = col.max[axis] + SKIN - player_min[axis];
-                // The ground plane is solid: a downward push that would
-                // cross it is not an escape (the ground clamp would push
-                // the player straight back into the box), so the
-                // negative candidate is invalid on the vertical axis.
-                let neg_valid = !(axis == 1 && player_min[1] + push_neg < self.ground_y);
-                let (push, magnitude) = if neg_valid && push_neg.abs() <= push_pos {
-                    (push_neg, push_neg.abs())
+        if let Some(candidates) = self.grid_candidates(player_min, player_max) {
+            for (rotated, index) in candidates {
+                let candidate = if rotated {
+                    self.rotated[index as usize].push_out_box(player_min, player_max, self.ground_y)
                 } else {
-                    (push_pos, push_pos.abs())
+                    depenetration_aabb_candidate(
+                        player_min,
+                        player_max,
+                        self.ground_y,
+                        &self.colliders[index as usize],
+                    )
                 };
-                let mut vector = [0.0f32; 3];
-                vector[axis] = push;
-                if best.is_none_or(|(_, best_magnitude)| magnitude < best_magnitude) {
-                    best = Some((vector, magnitude));
+                if let Some(candidate) = candidate {
+                    keep_depenetration(&mut best, candidate);
                 }
             }
-        }
-        for col in &self.rotated {
-            let Some((push, magnitude)) = col.push_out_box(player_min, player_max, self.ground_y)
-            else {
-                continue;
-            };
-            if best.is_none_or(|(_, best_magnitude)| magnitude < best_magnitude) {
-                best = Some((push, magnitude));
+        } else {
+            for col in &self.colliders {
+                if let Some(candidate) =
+                    depenetration_aabb_candidate(player_min, player_max, self.ground_y, col)
+                {
+                    keep_depenetration(&mut best, candidate);
+                }
+            }
+            for col in &self.rotated {
+                if let Some(candidate) = col.push_out_box(player_min, player_max, self.ground_y) {
+                    keep_depenetration(&mut best, candidate);
+                }
             }
         }
         best.map(|(vector, _)| vector)
@@ -498,6 +981,150 @@ impl CollisionWorld {
             clamped[1] = true;
         }
         clamped
+    }
+}
+
+/// The exact ray–AABB slab entry time of ONE axis-aligned collider —
+/// the per-collider half of [`CollisionWorld::segment_hit`]'s linear
+/// walk, shared verbatim by the grid path (single source of truth:
+/// both paths run this exact arithmetic, so the only possible
+/// difference between them is WHICH colliders run it, in what order —
+/// and the broad phase's candidate order is the linear order over a
+/// conservative superset). Returns the smallest `t` in `[0, 1]` at
+/// which the segment enters the collider expanded by `margin`, or
+/// `None` on a miss; `Some(0.0)` for a segment starting inside.
+fn segment_aabb_t(from: [f32; 3], to: [f32; 3], margin: f32, col: &StaticCollider) -> Option<f32> {
+    let direction = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+    let mut t_enter = 0.0f32;
+    let mut t_exit = 1.0f32;
+    let mut missed = false;
+    for axis in 0..3 {
+        let lo = col.min[axis] - margin;
+        let hi = col.max[axis] + margin;
+        let d = direction[axis];
+        let origin = from[axis];
+        if d == 0.0 {
+            if origin < lo || origin > hi {
+                missed = true;
+                break;
+            }
+        } else {
+            let mut t1 = (lo - origin) / d;
+            let mut t2 = (hi - origin) / d;
+            if t1 > t2 {
+                std::mem::swap(&mut t1, &mut t2);
+            }
+            t_enter = t_enter.max(t1);
+            t_exit = t_exit.min(t2);
+            if t_enter > t_exit {
+                missed = true;
+                break;
+            }
+        }
+    }
+    if !missed && t_exit >= 0.0 && t_enter <= 1.0 {
+        Some(t_enter.max(0.0))
+    } else {
+        None
+    }
+}
+
+/// The per-collider half of [`CollisionWorld::sweep_axis`]'s
+/// axis-aligned walk (shared verbatim by the grid path): the contact
+/// face this collider would clamp the move to, or `None` when it
+/// cannot clamp (the perpendicular [`SKIN`] gate, or a face on the
+/// wrong side / beyond the move — the caller's sign comparison then
+/// never sees it, exactly like the linear walk's arm conditions).
+fn sweep_aabb_face(
+    player_min: [f32; 3],
+    player_max: [f32; 3],
+    axis: usize,
+    delta: f32,
+    col: &StaticCollider,
+) -> Option<f32> {
+    for o in 0..3 {
+        if o == axis {
+            continue;
+        }
+        if player_min[o] >= col.max[o] - SKIN || player_max[o] <= col.min[o] + SKIN {
+            return None;
+        }
+    }
+    if delta > 0.0 && player_max[axis] <= col.min[axis] {
+        Some(col.min[axis] - SKIN - player_max[axis])
+    } else if delta < 0.0 && player_min[axis] >= col.max[axis] {
+        Some(col.max[axis] + SKIN - player_min[axis])
+    } else {
+        None
+    }
+}
+
+/// The sweep accumulator update — the linear walk's own rule, shared
+/// by the grid path: strictly-better faces only, so mathematical ties
+/// keep the earlier collider's clamp (the determinism rule; the
+/// strict-< is also what makes duplicate candidates provable no-ops).
+fn apply_sweep_face(allowed: &mut f32, hit: &mut bool, face: f32, delta: f32) {
+    if delta > 0.0 {
+        if face < *allowed {
+            *allowed = face;
+            *hit = true;
+        }
+    } else if face > *allowed {
+        *allowed = face;
+        *hit = true;
+    }
+}
+
+/// The per-collider half of [`CollisionWorld::depenetration`]'s
+/// axis-aligned walk (shared verbatim by the grid path): this
+/// collider's own minimal push over its three axes, under the
+/// strictly-smaller rule. Reducing per collider FIRST is
+/// order-isomorphic to the flat (collider, axis) candidate sequence —
+/// the strict-< rule composes associatively along a fixed order, so
+/// every tie resolves to the same push on both paths (pinned by the
+/// equivalence battery's tie fixtures).
+fn depenetration_aabb_candidate(
+    player_min: [f32; 3],
+    player_max: [f32; 3],
+    ground_y: f32,
+    col: &StaticCollider,
+) -> Option<([f32; 3], f32)> {
+    let overlapping = (0..3).all(|a| player_min[a] < col.max[a] && player_max[a] > col.min[a]);
+    if !overlapping {
+        return None;
+    }
+    let mut best: Option<([f32; 3], f32)> = None;
+    for axis in 0..3 {
+        // Exiting through the min face moves the player's MAX face to
+        // it; through the max face, the player's MIN — the pushed-out
+        // box ends fully clear of the collider, never merely
+        // re-aligned with the near face.
+        let push_neg = col.min[axis] - SKIN - player_max[axis];
+        let push_pos = col.max[axis] + SKIN - player_min[axis];
+        // The ground plane is solid: a downward push that would cross
+        // it is not an escape (the ground clamp would push the player
+        // straight back into the box), so the negative candidate is
+        // invalid on the vertical axis.
+        let neg_valid = !(axis == 1 && player_min[1] + push_neg < ground_y);
+        let (push, magnitude) = if neg_valid && push_neg.abs() <= push_pos {
+            (push_neg, push_neg.abs())
+        } else {
+            (push_pos, push_pos.abs())
+        };
+        let mut vector = [0.0f32; 3];
+        vector[axis] = push;
+        keep_depenetration(&mut best, (vector, magnitude));
+    }
+    best
+}
+
+/// The depenetration accumulator update — the linear walk's own rule,
+/// shared by the grid path: strictly-smaller magnitudes win, so
+/// mathematical ties keep the earlier candidate (deterministic on
+/// every run and platform).
+fn keep_depenetration(best: &mut Option<([f32; 3], f32)>, candidate: ([f32; 3], f32)) {
+    if best.is_none_or(|(_, best_magnitude)| candidate.1 < best_magnitude) {
+        *best = Some(candidate);
     }
 }
 
@@ -3053,6 +3680,816 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // P2 L5 — the static broad phase battery (the design's L5
+    // acceptance row: exhaustive small-world equivalence, ties
+    // explicit, the gate boundary, the fail-closed domains, and the
+    // scaling evidence).
+    // -----------------------------------------------------------------
+
+    /// A deterministic xorshift64* stream for fixture generation
+    /// (std-only, seeded per world, so every run of the battery
+    /// builds the IDENTICAL population — the no-RNG discipline
+    /// applied to tests).
+    struct FixtureRng(u64);
+
+    impl FixtureRng {
+        fn next_u32(&mut self) -> u32 {
+            debug_assert!(self.0 != 0, "a zero state would freeze the stream");
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 33) as u32
+        }
+
+        /// [0, 1) at 24-bit granularity.
+        fn unit(&mut self) -> f32 {
+            (self.next_u32() >> 8) as f32 / 16_777_216.0
+        }
+
+        fn range(&mut self, lo: f32, hi: f32) -> f32 {
+            lo + (hi - lo) * self.unit()
+        }
+    }
+
+    /// One fixture placement: a jittered lattice over ±60 m (dense
+    /// enough for real candidate sets), carrying the adversarial
+    /// placement classes the broad phase must survive — every 7th
+    /// base lands EXACTLY on cell boundaries (multiples of
+    /// [`GRID_CELL_SIZE`], the floor-edge class), and every 13th
+    /// stretches ~8× farther out (sparse cells, mostly-empty walks).
+    fn fixture_base(rng: &mut FixtureRng, index: usize) -> [f32; 3] {
+        let lattice = 3.0;
+        let x = (rng.range(-60.0, 60.0) / lattice).round() * lattice;
+        let z = (rng.range(-60.0, 60.0) / lattice).round() * lattice;
+        let y = if index.is_multiple_of(4) {
+            0.0
+        } else {
+            rng.range(0.0, 3.0)
+        };
+        if index % 13 == 5 {
+            [x * 8.0, y, z * 8.0]
+        } else if index.is_multiple_of(7) {
+            [
+                (x / GRID_CELL_SIZE).round() * GRID_CELL_SIZE,
+                y,
+                (z / GRID_CELL_SIZE).round() * GRID_CELL_SIZE,
+            ]
+        } else {
+            [x, y, z]
+        }
+    }
+
+    /// A deterministic mixed fixture world: `aabb_count` axis-aligned
+    /// boxes plus `rotated_count` yaw-rotated prisms, with inverted
+    /// literals (every 11th — the linear narrow phases consult
+    /// inverted intervals too, so the grid must cover the sorted
+    /// span), yaw-0 rotated colliders (every 5th — exact sin/cos, the
+    /// exact-tie-capable class), and arbitrary yaws elsewhere.
+    fn fixture_world(seed: u64, aabb_count: usize, rotated_count: usize) -> CollisionWorld {
+        let mut rng = FixtureRng(seed);
+        let mut world = CollisionWorld::new(0.0);
+        for index in 0..aabb_count {
+            let base = fixture_base(&mut rng, index);
+            let footprint = rng.range(0.4, 3.0);
+            let height = rng.range(0.3, 4.0);
+            if index % 11 == 3 {
+                let min = [
+                    base[0] - footprint / 2.0,
+                    base[1],
+                    base[2] - footprint / 2.0,
+                ];
+                let max = [
+                    base[0] + footprint / 2.0,
+                    base[1] + height,
+                    base[2] + footprint / 2.0,
+                ];
+                world = world.with_collider(StaticCollider { min: max, max: min });
+            } else {
+                world = world.with_box(base, footprint, height);
+            }
+        }
+        for index in 0..rotated_count {
+            let base = fixture_base(&mut rng, index + aabb_count);
+            let footprint = rng.range(0.4, 2.5);
+            let height = rng.range(0.3, 3.0);
+            let yaw = if index.is_multiple_of(5) {
+                0.0
+            } else {
+                rng.range(-3.1, 3.1)
+            };
+            world = world.with_rotated_collider(RotatedCollider::from_base_yaw(
+                base,
+                footprint,
+                rng.range(0.4, 2.5),
+                height,
+                yaw,
+            ));
+        }
+        world
+    }
+
+    /// Forces the broad phase on (building the grid from the current
+    /// lists, regardless of the gate) or off — the battery's control:
+    /// the SAME collider set through both paths must produce
+    /// bit-identical results. Returns whether the grid is active
+    /// after the call (a poisoned world cannot be forced on).
+    fn force_broad_phase(world: &mut CollisionWorld, on: bool) -> bool {
+        if on {
+            match build_static_grid(&world.colliders, &world.rotated) {
+                Some(grid) => {
+                    world.grid = BroadPhase::Grid(grid);
+                    true
+                }
+                None => {
+                    world.grid = BroadPhase::Unusable;
+                    false
+                }
+            }
+        } else {
+            world.grid = BroadPhase::Off;
+            false
+        }
+    }
+
+    /// Bit-level equality — the battery's claim IS bit-identity, so
+    /// even NaN results compare by their bit patterns.
+    fn same_f32(a: f32, b: f32) -> bool {
+        a.to_bits() == b.to_bits()
+    }
+
+    fn same_option_f32(a: Option<f32>, b: Option<f32>) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) => same_f32(a, b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn same_option_vec3(a: Option<[f32; 3]>, b: Option<[f32; 3]>) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) => a.iter().zip(b.iter()).all(|(a, b)| same_f32(*a, *b)),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn same_sweep(a: (f32, bool), b: (f32, bool)) -> bool {
+        same_f32(a.0, b.0) && a.1 == b.1
+    }
+
+    /// The L5 equivalence battery (the design's L5 acceptance row):
+    /// for fixture populations BELOW and ABOVE the gate, every query
+    /// arm through the grid path vs the exact linear path on the
+    /// IDENTICAL collider set — bit-for-bit, ties included. The
+    /// below-gate arm force-activates the grid (the gate otherwise
+    /// keeps those worlds linear); the above-gate arm force-disables
+    /// it on the control clone. Query placements mix pseudo-random
+    /// street points, collider-interior spawns (real depenetration
+    /// pushes), face-adjacent sweeps, and both segment regimes of the
+    /// [`GRID_CELL_WASTE_FACTOR`] guard (the 1000+100 population
+    /// lifts the crossover so the long diagonal runs the GRID arm).
+    #[test]
+    fn broad_phase_equivalence_battery() {
+        let config = PlayerConfig::default();
+        for (aabb_count, rotated_count) in [(40usize, 17usize), (96, 31), (150, 40), (1000, 100)] {
+            for seed in [0x5EED_0001u64, 0x5EED_0010, 0x5EED_0110] {
+                let world = fixture_world(seed, aabb_count, rotated_count);
+                let mut linear = world.clone();
+                force_broad_phase(&mut linear, false);
+                let mut grid = world.clone();
+                let grid_active = force_broad_phase(&mut grid, true);
+                assert!(
+                    grid_active,
+                    "seed {seed}: the fixture must be grid-usable \
+                     (every AABB finite and in-domain)"
+                );
+                let label = format!("{aabb_count}+{rotated_count} @ {seed}");
+
+                // Pseudo-random street placements, player-sized boxes.
+                let mut rng = FixtureRng(seed ^ 0x9E37_79B9_7F4A_7C15);
+                for query in 0..48 {
+                    let base = fixture_base(&mut rng, query);
+                    let (min, max) = player_box(base, &config);
+                    assert_eq!(
+                        grid.box_overlaps(min, max),
+                        linear.box_overlaps(min, max),
+                        "box_overlaps {label} q{query}"
+                    );
+                    assert!(
+                        same_option_vec3(
+                            grid.depenetration(min, max),
+                            linear.depenetration(min, max)
+                        ),
+                        "depenetration {label} q{query}"
+                    );
+                    for axis in 0..3 {
+                        for delta in [0.2, 1.7, -0.3, -9.0, 55.0, -55.0] {
+                            assert!(
+                                same_sweep(
+                                    grid.sweep_axis(min, max, axis, delta),
+                                    linear.sweep_axis(min, max, axis, delta)
+                                ),
+                                "sweep_axis {label} q{query} a{axis} d{delta}"
+                            );
+                        }
+                    }
+                    // Segments from the query base: a short
+                    // camera-like ray and a long cross-world diagonal
+                    // (which guard regime depends on the population),
+                    // each at three margins.
+                    for (to, kind) in [
+                        ([base[0] + 4.5, base[1] + 0.3, base[2] - 1.2], "short"),
+                        (
+                            [base[0] + 120.0, base[1] + 0.5, base[2] - 120.0],
+                            "diagonal",
+                        ),
+                    ] {
+                        for margin in [0.0, CAMERA_MARGIN, 0.75] {
+                            assert!(
+                                same_option_f32(
+                                    grid.segment_hit(base, to, margin),
+                                    linear.segment_hit(base, to, margin)
+                                ),
+                                "segment_hit {kind} {label} q{query} m{margin}"
+                            );
+                        }
+                    }
+                }
+
+                // Collider-interior spawns: overlapping boxes, real
+                // depenetration pushes, and face-adjacent sweeps.
+                for (index, col) in world.colliders().iter().enumerate().step_by(3) {
+                    let center = [
+                        (col.min[0] + col.max[0]) / 2.0,
+                        (col.min[1] + col.max[1]) / 2.0,
+                        (col.min[2] + col.max[2]) / 2.0,
+                    ];
+                    let (min, max) = player_box(center, &config);
+                    assert!(
+                        same_option_vec3(
+                            grid.depenetration(min, max),
+                            linear.depenetration(min, max)
+                        ),
+                        "interior depenetration {label} c{index}"
+                    );
+                    assert_eq!(
+                        grid.box_overlaps(min, max),
+                        linear.box_overlaps(min, max),
+                        "interior box_overlaps {label} c{index}"
+                    );
+                    let mut face = col.max;
+                    face[0] += SKIN * 4.0; // just past the +X face
+                    let (min, max) = player_box(face, &config);
+                    for delta in [0.5, -0.5] {
+                        assert!(
+                            same_sweep(
+                                grid.sweep_axis(min, max, 0, delta),
+                                linear.sweep_axis(min, max, 0, delta)
+                            ),
+                            "face sweep {label} c{index} d{delta}"
+                        );
+                    }
+                }
+                for (index, col) in world.rotated().iter().enumerate().step_by(2) {
+                    let (min, max) = player_box(col.center, &config);
+                    assert!(
+                        same_option_vec3(
+                            grid.depenetration(min, max),
+                            linear.depenetration(min, max)
+                        ),
+                        "rotated-interior depenetration {label} r{index}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The exact mathematical-tie classes (the design's L5
+    /// discriminating tests): equal-magnitude depenetration pushes
+    /// from DIFFERENT colliders — an observable tie, because the
+    /// winning push DIRECTION differs — plus the rotated-list
+    /// symmetric tie at yaw 0 (exact sin/cos, so the magnitudes are
+    /// bit-equal) and the equal-face sweep tie. The first candidate
+    /// in insertion order must win on BOTH paths.
+    #[test]
+    fn broad_phase_mathematical_ties_resolve_identically() {
+        // Two walls flanking a centered player box: wall X (x ∈
+        // [−2, −0.1], spanning z) yields a +X push of −0.1 + SKIN +
+        // 0.35; wall Z (z ∈ [−2, −0.1], spanning x) yields a +Z push
+        // of the SAME expression over the SAME values — bit-equal
+        // magnitudes. Whichever wall was inserted FIRST wins.
+        let tie_world = |z_first: bool| {
+            let wall_x = StaticCollider {
+                min: [-2.0, 0.0, -2.0],
+                max: [-0.1, 3.0, 2.0],
+            };
+            let wall_z = StaticCollider {
+                min: [-2.0, 0.0, -2.0],
+                max: [2.0, 3.0, -0.1],
+            };
+            let (first, second) = if z_first {
+                (wall_z, wall_x)
+            } else {
+                (wall_x, wall_z)
+            };
+            let mut world = CollisionWorld::new(0.0).with_collider(first);
+            // Padding to the gate (distant colliders, never
+            // interacting): the GRID arm runs.
+            for i in 0..GRID_COLLIDER_GATE - 2 {
+                world = world.with_box([400.0 + i as f32 * 4.0, 0.0, 400.0], 0.5, 0.5);
+            }
+            world.with_collider(second)
+        };
+        let (min, max) = ([-0.35, 0.0, -0.35], [0.35, 1.7, 0.35]);
+        for (z_first, expected_axis, label) in [(false, 0usize, "X-first"), (true, 2, "Z-first")] {
+            let world = tie_world(z_first);
+            assert!(
+                matches!(world.grid, BroadPhase::Grid(_)),
+                "{label}: the grid arm is active"
+            );
+            let mut linear = world.clone();
+            force_broad_phase(&mut linear, false);
+            let grid_push = world.depenetration(min, max).expect("the overlap resolves");
+            let linear_push = linear
+                .depenetration(min, max)
+                .expect("the overlap resolves");
+            assert!(
+                same_option_vec3(Some(grid_push), Some(linear_push)),
+                "{label}: the tie resolves identically"
+            );
+            let other = if expected_axis == 0 { 2 } else { 0 };
+            assert!(
+                linear_push[expected_axis] > 0.0
+                    && linear_push[other] == 0.0
+                    && linear_push[1] == 0.0,
+                "{label}: the FIRST wall's push wins the tie: {linear_push:?}"
+            );
+        }
+
+        // The rotated-list symmetric tie at yaw 0: two identical
+        // prisms flanking the player at ±1.05 — bit-equal local-X
+        // depths (0.35 + 0.75 − 1.05 + SKIN), opposite directions.
+        // The LOWER rotated index wins (the AABB padding has no
+        // overlap here, so the rotated arm owns the tie).
+        let flank = |center_x: f32| {
+            RotatedCollider::new([center_x, 1.5, 0.0], [0.75, 1.5, 2.0], 0.0).unwrap()
+        };
+        let mut rotated_world = CollisionWorld::new(0.0)
+            .with_rotated_collider(Some(flank(-1.05)))
+            .with_rotated_collider(Some(flank(1.05)));
+        for i in 0..GRID_COLLIDER_GATE - 2 {
+            rotated_world = rotated_world.with_box([400.0 + i as f32 * 4.0, 0.0, 400.0], 0.5, 0.5);
+        }
+        assert!(matches!(rotated_world.grid, BroadPhase::Grid(_)));
+        let mut linear = rotated_world.clone();
+        force_broad_phase(&mut linear, false);
+        let grid_push = rotated_world
+            .depenetration(min, max)
+            .expect("the flanks overlap");
+        let linear_push = linear.depenetration(min, max).expect("the flanks overlap");
+        assert!(same_option_vec3(Some(grid_push), Some(linear_push)));
+        assert!(
+            linear_push[0] > 0.0 && linear_push[1] == 0.0 && linear_push[2] == 0.0,
+            "the first rotated flank wins the tie: {linear_push:?}"
+        );
+
+        // The equal-face sweep tie (value-identical by nature — both
+        // walls clamp to the same allowed — but pinned): two walls at
+        // the same x-plane in different z bands, both straddling the
+        // player's z extent.
+        let mut sweep_world = CollisionWorld::new(0.0).with_collider(StaticCollider {
+            min: [3.0, 0.0, -2.0],
+            max: [5.0, 3.0, 0.1],
+        });
+        for i in 0..GRID_COLLIDER_GATE - 2 {
+            sweep_world = sweep_world.with_box([400.0 + i as f32 * 4.0, 0.0, 400.0], 0.5, 0.5);
+        }
+        sweep_world = sweep_world.with_collider(StaticCollider {
+            min: [3.0, 0.0, -0.1],
+            max: [5.0, 3.0, 2.0],
+        });
+        let mut linear = sweep_world.clone();
+        force_broad_phase(&mut linear, false);
+        let (grid_allowed, grid_hit) = sweep_world.sweep_axis(min, max, 0, 10.0);
+        let (linear_allowed, linear_hit) = linear.sweep_axis(min, max, 0, 10.0);
+        assert!(same_sweep(
+            (grid_allowed, grid_hit),
+            (linear_allowed, linear_hit)
+        ));
+        assert!(grid_hit && same_f32(grid_allowed, 3.0 - SKIN - 0.35));
+    }
+
+    /// The gate boundary (the L5 acceptance row): at 127 total
+    /// colliders the world is below the gate (the exact linear path);
+    /// the 128th push ACTIVATES the grid; the 129th keeps it
+    /// (incremental insertion). A refused rotated collider never
+    /// counts toward the gate. And the switch is behavior-invisible:
+    /// the AT-gate world answers bit-identically to its forced-linear
+    /// clone — the design's "at the threshold, the switch is correct"
+    /// in both directions.
+    #[test]
+    fn broad_phase_gate_boundary() {
+        let config = PlayerConfig::default();
+        let mut below = CollisionWorld::new(0.0);
+        for i in 0..64 {
+            below = below.with_box(
+                [
+                    (i % 8) as f32 * 3.0 - 10.0,
+                    0.0,
+                    (i / 8) as f32 * 3.0 - 10.0,
+                ],
+                1.0,
+                2.0,
+            );
+        }
+        for i in 0..63 {
+            below = below.with_rotated_collider(RotatedCollider::from_base_yaw(
+                [(i % 7) as f32 * 3.0 - 9.0, 0.0, (i / 7) as f32 * 3.0 - 9.0],
+                0.8,
+                0.8,
+                1.5,
+                0.3,
+            ));
+        }
+        assert_eq!(below.colliders().len() + below.rotated().len(), 127);
+        assert!(matches!(below.grid, BroadPhase::Off), "127: below the gate");
+
+        let at = below.clone().with_box([0.0, 0.0, 0.0], 1.0, 1.0);
+        assert_eq!(
+            at.colliders().len() + at.rotated().len(),
+            GRID_COLLIDER_GATE
+        );
+        assert!(
+            matches!(at.grid, BroadPhase::Grid(_)),
+            "the 128th push activates the grid"
+        );
+
+        let above = at.clone().with_box([6.0, 0.0, 6.0], 1.0, 1.0);
+        assert!(
+            matches!(above.grid, BroadPhase::Grid(_)),
+            "the 129th push keeps it (incremental insertion)"
+        );
+
+        // A refused rotated collider never enters the list, so it
+        // never counts toward the gate.
+        let mut refused = below.clone();
+        refused = refused.with_rotated_collider(None);
+        assert!(matches!(refused.grid, BroadPhase::Off));
+
+        // The switch is behavior-invisible at the exact boundary.
+        let mut linear = at.clone();
+        force_broad_phase(&mut linear, false);
+        let mut rng = FixtureRng(0xBEEF_CAFE);
+        for query in 0..32 {
+            let base = fixture_base(&mut rng, query);
+            let (min, max) = player_box(base, &config);
+            assert_eq!(
+                at.box_overlaps(min, max),
+                linear.box_overlaps(min, max),
+                "q{query}"
+            );
+            assert!(same_option_vec3(
+                at.depenetration(min, max),
+                linear.depenetration(min, max)
+            ));
+            for axis in 0..3 {
+                assert!(
+                    same_sweep(
+                        at.sweep_axis(min, max, axis, 1.3),
+                        linear.sweep_axis(min, max, axis, 1.3)
+                    ),
+                    "q{query} a{axis}"
+                );
+            }
+            let to = [base[0] + 20.0, base[1], base[2] - 15.0];
+            assert!(same_option_f32(
+                at.segment_hit(base, to, 0.1),
+                linear.segment_hit(base, to, 0.1)
+            ));
+        }
+    }
+
+    /// The fail-closed domains (the design's §2.2.6 numerical-domain
+    /// contract): a non-finite or out-of-domain collider AABB poisons
+    /// the broad phase permanently (the exact linear paths); an
+    /// out-of-domain QUERY extent, a negative margin, a non-finite
+    /// sweep delta, and the waste-guard regime each fall back per
+    /// query — behavior is bit-identical by fallback in every case.
+    #[test]
+    fn broad_phase_failclosed_domains() {
+        let config = PlayerConfig::default();
+        let healthy = fixture_world(0xFACE_1000, 150, 40);
+        assert!(matches!(healthy.grid, BroadPhase::Grid(_)));
+
+        // A non-finite collider poisons a previously-active grid...
+        let poisoned = healthy.clone().with_collider(StaticCollider {
+            min: [f32::NAN, 0.0, 0.0],
+            max: [1.0, 1.0, 1.0],
+        });
+        assert!(matches!(poisoned.grid, BroadPhase::Unusable));
+        // ...and it stays poisoned: further healthy pushes cannot
+        // resurrect it (colliders never leave).
+        let mut more = poisoned.clone();
+        for i in 0..10 {
+            more = more.with_box([50.0 + i as f32, 0.0, 50.0], 1.0, 1.0);
+        }
+        assert!(matches!(more.grid, BroadPhase::Unusable));
+
+        // An out-of-domain coordinate (|cell| ≥ GRID_CELL_LIMIT)
+        // does the same.
+        let domain_edge = GRID_CELL_LIMIT as f32 * GRID_CELL_SIZE;
+        let huge = healthy.clone().with_collider(StaticCollider {
+            min: [domain_edge, 0.0, 0.0],
+            max: [domain_edge + 1.0, 1.0, 1.0],
+        });
+        assert!(matches!(huge.grid, BroadPhase::Unusable));
+
+        // The poisoned world still answers bit-identically (fallback).
+        let mut linear = poisoned.clone();
+        force_broad_phase(&mut linear, false);
+        let (min, max) = player_box([0.0, 0.0, 0.0], &config);
+        assert!(same_option_vec3(
+            poisoned.depenetration(min, max),
+            linear.depenetration(min, max)
+        ));
+
+        // An out-of-domain QUERY on a healthy grid falls back per
+        // query: a far-out segment endpoint, and a far-spanning
+        // segment that still ends inside the world.
+        let mut linear = healthy.clone();
+        force_broad_phase(&mut linear, false);
+        let far = [domain_edge, 1.0, 0.0];
+        assert!(same_option_f32(
+            healthy.segment_hit(far, [far[0] + 5.0, 1.0, 0.0], 0.0),
+            linear.segment_hit(far, [far[0] + 5.0, 1.0, 0.0], 0.0)
+        ));
+        assert!(same_option_f32(
+            healthy.segment_hit(far, [0.0, 1.0, 0.0], 0.1),
+            linear.segment_hit(far, [0.0, 1.0, 0.0], 0.1)
+        ));
+
+        // A negative margin takes the linear path (the validated
+        // broad-phase domain) — the shrunk-interval geometry the raw
+        // slab arithmetic produces, identical either way.
+        assert!(same_option_f32(
+            healthy.segment_hit([-30.0, 1.0, 0.0], [30.0, 1.0, 0.0], -0.5),
+            linear.segment_hit([-30.0, 1.0, 0.0], [30.0, 1.0, 0.0], -0.5)
+        ));
+
+        // A non-finite sweep delta: the linear path's own NaN
+        // handling, identical through the fallback.
+        assert!(same_sweep(
+            healthy.sweep_axis(min, max, 0, f32::NAN),
+            linear.sweep_axis(min, max, 0, f32::NAN)
+        ));
+
+        // Non-finite QUERY coordinates (the raw-before-sort trap: the
+        // per-axis min/max swallow NaN, so the fallback must engage
+        // at the source — a NaN endpoint makes the linear slab treat
+        // that axis as an infinite slab, a NaN query box compares
+        // false everywhere). Every arm, identical through the
+        // fallback.
+        let nan_min = [f32::NAN, 0.0, 0.0];
+        let nan_max = [2.0, 2.0, 2.0];
+        assert_eq!(
+            healthy.box_overlaps(nan_min, nan_max),
+            linear.box_overlaps(nan_min, nan_max)
+        );
+        assert!(same_option_vec3(
+            healthy.depenetration(nan_min, nan_max),
+            linear.depenetration(nan_min, nan_max)
+        ));
+        for axis in 0..3 {
+            assert!(
+                same_sweep(
+                    healthy.sweep_axis(nan_min, nan_max, axis, 1.0),
+                    linear.sweep_axis(nan_min, nan_max, axis, 1.0)
+                ),
+                "NaN-box sweep a{axis}"
+            );
+            assert!(
+                same_sweep(
+                    healthy.sweep_axis(min, max, axis, 1.0),
+                    linear.sweep_axis(min, max, axis, 1.0),
+                ),
+                "sanity: the finite probe stays identical a{axis}"
+            );
+        }
+        assert!(same_option_f32(
+            healthy.segment_hit([f32::NAN, 1.0, 0.0], [10.0, 1.0, 0.0], 0.1),
+            linear.segment_hit([f32::NAN, 1.0, 0.0], [10.0, 1.0, 0.0], 0.1)
+        ));
+
+        // The waste-guard regime: a query box spanning the whole
+        // fixture (far more cells than GRID_CELL_WASTE_FACTOR per
+        // collider) takes the linear path — identical results.
+        let wide = ([-500.0, -5.0, -500.0], [500.0, 10.0, 500.0]);
+        assert_eq!(
+            healthy.box_overlaps(wide.0, wide.1),
+            linear.box_overlaps(wide.0, wide.1)
+        );
+        assert!(same_option_vec3(
+            healthy.depenetration(wide.0, wide.1),
+            linear.depenetration(wide.0, wide.1)
+        ));
+    }
+
+    /// The L5 scaling evidence — the design's §9.4 measurement shape,
+    /// observational: city-block populations at multiple collider
+    /// counts, each query arm through the grid path vs the
+    /// forced-linear clone, with least-squares slopes (ns per 1k
+    /// colliders), the one-time build cost, and the grid's resident
+    /// shape (cells / entries). Printed, not gated: generous sanity
+    /// bounds only (the F-06 no-thresholds-before-variance rule, and
+    /// the collision.rs Q512 characterization precedent). CAVEAT,
+    /// stated honestly: this runs under the UNOPTIMIZED test profile
+    /// — the slopes and the grid/linear RATIO are the evidence here;
+    /// absolute constants belong to the release-mode rig matrix
+    /// (§9, the measurement owner). Every probe is also bit-compared
+    /// against the linear path inline (the battery's claim, measured
+    /// on the very populations being timed).
+    #[test]
+    fn broad_phase_scaling_evidence() {
+        let config = PlayerConfig::default();
+        // The city-block shape: colliders on a 3 m lattice (1 m
+        // footprints — 2 m streets), every 8th a yaw-0.6 rotated
+        // prism, roughly square extents.
+        let city_block = |count: usize| {
+            let mut world = CollisionWorld::new(0.0);
+            let side = ((count as f64).sqrt().ceil() as usize).max(1);
+            for i in 0..count {
+                let base = [(i % side) as f32 * 3.0, 0.0, (i / side) as f32 * 3.0];
+                if i % 8 == 3 {
+                    world = world.with_rotated_collider(RotatedCollider::from_base_yaw(
+                        base, 1.2, 1.2, 2.0, 0.6,
+                    ));
+                } else {
+                    world = world.with_box(base, 1.0, 2.0);
+                }
+            }
+            world
+        };
+
+        fn mean_ns(queries: usize, mut run: impl FnMut()) -> f64 {
+            let start = std::time::Instant::now();
+            for _ in 0..queries {
+                run();
+            }
+            start.elapsed().as_secs_f64() / queries as f64 * 1e9
+        }
+
+        // Least-squares slope, ns per 1k colliders, over the measured
+        // (population, ns) pairs.
+        let slope = |points: &[(usize, f64)]| -> f64 {
+            let n = points.len() as f64;
+            let sum_x: f64 = points.iter().map(|(x, _)| *x as f64).sum();
+            let sum_y: f64 = points.iter().map(|(_, y)| *y).sum();
+            let sum_xy: f64 = points.iter().map(|(x, y)| *x as f64 * y).sum();
+            let sum_xx: f64 = points.iter().map(|(x, _)| (*x as f64) * (*x as f64)).sum();
+            (n * sum_xy - sum_x * sum_y) / (n * sum_xx - sum_x * sum_x) * 1000.0
+        };
+
+        // The probes: a street-center box (the per-tick miss case),
+        // an in-collider box (the depenetration hit case), a per-tick
+        // sweep, a camera-length segment along a street, and the long
+        // diagonal — the honest waste row (which regime the
+        // GRID_CELL_WASTE_FACTOR guard picks depends on the
+        // population: linear at 128/512, grid from 2048 up).
+        let street = [1.5, 0.0, 1.5];
+        let (s_min, s_max) = player_box(street, &config);
+        let (h_min, h_max) = player_box([0.0, 0.0, 0.0], &config);
+        let cam_from = [1.5, 1.6, 1.5];
+        let cam_to = [1.5, 1.6, 6.0];
+        let diag_from = [-60.0, 1.0, -60.0];
+        let diag_to = [60.0, 1.0, 60.0];
+
+        let sizes = [128usize, 512, 2048, 8192, 32768];
+        // Per-arm (population, ns) series: the six grid arms plus the
+        // linear reference arms measured alongside (box_miss stands
+        // for the mover arms, diag_ray for the segment arms).
+        let mut grid_series: Vec<Vec<(usize, f64)>> = vec![Vec::new(); 6];
+        let mut linear_box_series: Vec<(usize, f64)> = Vec::new();
+        let mut linear_diag_series: Vec<(usize, f64)> = Vec::new();
+        for size in sizes {
+            let queries = ((600_000 / size as u64).clamp(100, 5000)) as usize;
+            let build_start = std::time::Instant::now();
+            let world = city_block(size);
+            let build_ms = build_start.elapsed().as_secs_f64() * 1e3;
+            let mut linear = world.clone();
+            force_broad_phase(&mut linear, false);
+            assert!(
+                matches!(world.grid, BroadPhase::Grid(_)),
+                "the city world at {size} activates the grid"
+            );
+
+            // Inline bit-identity on the probe set (the battery's
+            // claim, restated on the timed populations).
+            assert!(same_option_vec3(
+                world.depenetration(s_min, s_max),
+                linear.depenetration(s_min, s_max)
+            ));
+            assert!(same_sweep(
+                world.sweep_axis(s_min, s_max, 0, 0.2),
+                linear.sweep_axis(s_min, s_max, 0, 0.2)
+            ));
+            assert!(same_option_f32(
+                world.segment_hit(diag_from, diag_to, 0.0),
+                linear.segment_hit(diag_from, diag_to, 0.0)
+            ));
+
+            let t = |world: &CollisionWorld| -> [f64; 6] {
+                [
+                    mean_ns(queries, || {
+                        world.box_overlaps(s_min, s_max);
+                    }),
+                    mean_ns(queries, || {
+                        world.depenetration(s_min, s_max);
+                    }),
+                    mean_ns(queries, || {
+                        world.depenetration(h_min, h_max);
+                    }),
+                    mean_ns(queries, || {
+                        world.sweep_axis(s_min, s_max, 0, 0.2);
+                    }),
+                    mean_ns(queries, || {
+                        world.segment_hit(cam_from, cam_to, CAMERA_MARGIN);
+                    }),
+                    mean_ns(queries, || {
+                        world.segment_hit(diag_from, diag_to, 0.0);
+                    }),
+                ]
+            };
+            let grid_times = t(&world);
+            let linear_times = t(&linear);
+            if let BroadPhase::Grid(grid) = &world.grid {
+                let entries: usize = grid.cells.values().map(Vec::len).sum();
+                println!(
+                    "[broad-phase-scaling] pop {size:6} · build {build_ms:8.3} ms · \
+                     cells {} · entries {entries} · queries {queries}",
+                    grid.cells.len()
+                );
+            }
+            println!(
+                "[broad-phase-scaling] pop {size:6} · ns/query grid vs linear — \
+                 box_miss {:9.1}/{:9.1} · dep_miss {:9.1}/{:9.1} · dep_hit {:9.1}/{:9.1} · \
+                 sweep {:9.1}/{:9.1} · cam_ray {:9.1}/{:9.1} · diag_ray {:9.1}/{:9.1}",
+                grid_times[0],
+                linear_times[0],
+                grid_times[1],
+                linear_times[1],
+                grid_times[2],
+                linear_times[2],
+                grid_times[3],
+                linear_times[3],
+                grid_times[4],
+                linear_times[4],
+                grid_times[5],
+                linear_times[5]
+            );
+            for (arm, value) in grid_times.iter().enumerate() {
+                grid_series[arm].push((size, *value));
+            }
+            linear_box_series.push((size, linear_times[0]));
+            linear_diag_series.push((size, linear_times[5]));
+            // Sanity bounds only (characterization, not a gate).
+            for ns in grid_times.iter().chain(linear_times.iter()) {
+                assert!(
+                    ns.is_finite() && *ns < 50_000_000.0,
+                    "pop {size}: a query arm is absurdly slow: {ns} ns"
+                );
+            }
+        }
+
+        // The fitted slopes (ns per 1k colliders), grid vs linear per
+        // arm — the delivery report's numbers.
+        let arms = [
+            "box_miss", "dep_miss", "dep_hit", "sweep", "cam_ray", "diag_ray",
+        ];
+        for (arm, series) in arms.iter().zip(&grid_series) {
+            let grid_slope = slope(series);
+            let (linear_slope, note) = if *arm == "box_miss" {
+                (slope(&linear_box_series), "")
+            } else if *arm == "diag_ray" {
+                (
+                    slope(&linear_diag_series),
+                    " (the guard's mixed regime: linear below ~1k pop, grid above)",
+                )
+            } else {
+                (
+                    slope(&linear_box_series),
+                    " (linear reference: box_miss arm)",
+                )
+            };
+            println!(
+                "[broad-phase-scaling] slope {arm:9}: grid {grid_slope:9.1} vs linear \
+                 {linear_slope:9.1} ns per 1k colliders{note}"
+            );
         }
     }
 }
