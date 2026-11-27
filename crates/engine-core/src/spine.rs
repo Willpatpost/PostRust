@@ -927,6 +927,14 @@ impl<W: World> Spine<W> {
     /// spine never assumes event classes mean regions (clarification B).
     /// Suspension happens between ticks; an executing event cannot be
     /// suspended.
+    ///
+    /// The predicate observes candidates in **canonical `(due, seq)`
+    /// order** within each lane (near first, then far), then the
+    /// blocked set in ascending-seq order — the contract the
+    /// pre-bulk-partition pop loop established (IA-02): a stateful
+    /// `FnMut` closure sees the identical visitation sequence on a
+    /// live spine and on a save→restored copy of the same spine, so
+    /// its selection can never depend on heap-rebuild layout.
     pub fn suspend_matching(&mut self, mut matches: impl FnMut(&ObligationView) -> bool) -> u32 {
         let mut suspended = 0u32;
         suspended += Self::suspend_from_queue(
@@ -1178,12 +1186,25 @@ impl<W: World> Spine<W> {
     /// stable compaction that yields the removed entries by value (no
     /// temp Vec — the held inserts receive them directly), and
     /// `BinaryHeap::from` heapifies in O(N) with no allocation (the
-    /// buffer transfers). Net O(N) + O(M log H) with zero scratch
+    /// buffer transfers). Net O(N log N) — the sort below dominates,
+    /// the same class as the old pop drain — with zero scratch
     /// allocations, versus O(N log N) + one temp Vec per lane per
-    /// call. Heap layout is rebuild-order-dependent but every
-    /// observable behavior (pop order, fingerprints) derives from the
-    /// canonical `(due, seq)` keys — the retained multiset is
-    /// unchanged, so the rebuild is invisible.
+    /// call for the pop loop.
+    ///
+    /// The taken buffer is **sorted into canonical `(due, seq)` order
+    /// before the partition** (IA-02): the public `FnMut` predicate
+    /// must observe candidates exactly where the old pop loop
+    /// observed them — canonical order, never the heap's
+    /// rebuild-dependent buffer order, which a save→restore rebuilds
+    /// differently from live scheduling (a stateful predicate's
+    /// selection would otherwise change across restore). The sort is
+    /// a transient reordering of the already-owned buffer —
+    /// allocation-free (`sort_unstable_by_key` never allocates,
+    /// unlike the stable sort's scratch), deterministic because
+    /// `(due, seq)` is unique per lane under dense allocation, and
+    /// invisible to every other observable: the retained multiset is
+    /// unchanged, so pop order, save bytes, and fingerprints — all
+    /// derived from the canonical keys — are identical.
     fn suspend_from_queue(
         queue: &mut BinaryHeap<Reverse<Pending>>,
         held: &mut BTreeMap<u64, Pending>,
@@ -1192,6 +1213,10 @@ impl<W: World> Spine<W> {
     ) -> u32 {
         let mut suspended = 0u32;
         let mut items = std::mem::take(queue).into_vec();
+        // Canonical visitation for the public predicate (IA-02): the
+        // buffer enters heap order; the predicate must exit it into
+        // `(due, seq)` order before any call.
+        items.sort_unstable_by_key(|Reverse(pending)| (pending.due, pending.seq));
         let extracted = items.extract_if(.., |Reverse(pending)| {
             matches(&pending.view(ObligationLocation::Queued))
         });
@@ -1217,6 +1242,15 @@ impl<W: World> Spine<W> {
     /// obligations are **not** reclassified here: `resume` restores
     /// their original lane, and the caller reclassifies after
     /// resumption if the region's policy changed.
+    ///
+    /// The predicate observes queued candidates in **canonical
+    /// `(due, seq)` order** within each source lane (near first, then
+    /// far — the target lane is skipped whole by the source == target
+    /// early return), then the blocked set in ascending-seq order —
+    /// the same canonical-visitation contract as
+    /// [`Self::suspend_matching`] (IA-02): identical visitation, and
+    /// therefore identical selection, on a live spine and on a
+    /// save→restored copy of the same spine.
     pub fn reclassify_matching(
         &mut self,
         mut matches: impl FnMut(&ObligationView) -> bool,
@@ -1259,11 +1293,14 @@ impl<W: World> Spine<W> {
     /// matching obligations into `moved` (the caller re-lanes and
     /// re-pushes them) and heapifying the rest back into the same
     /// buffer — the A08a linear shape (see
-    /// [`Self::suspend_from_queue`]): O(N) partition + heapify
-    /// instead of the O(N log N) pop/re-push drain, with zero scratch
+    /// [`Self::suspend_from_queue`]): the canonical pre-partition
+    /// sort plus O(N) partition and heapify, with zero scratch
     /// allocations (the caller's `moved` Vec is the operation's
-    /// output, not scratch). Same rebuild-invisibility argument:
-    /// observable order derives from the canonical `(due, seq)` keys.
+    /// output, not scratch). The sort gives the public predicate the
+    /// same canonical `(due, seq)` visitation the old pop loop had
+    /// (IA-02 — see [`Self::suspend_from_queue`]); every other
+    /// observable derives from the canonical keys, so the retained
+    /// multiset's rebuild stays invisible.
     fn reclassify_queue(
         queue: &mut BinaryHeap<Reverse<Pending>>,
         matches: &mut impl FnMut(&ObligationView) -> bool,
@@ -1275,6 +1312,10 @@ impl<W: World> Spine<W> {
             return;
         }
         let mut items = std::mem::take(queue).into_vec();
+        // Canonical visitation for the public predicate (IA-02): the
+        // buffer enters heap order; the predicate must exit it into
+        // `(due, seq)` order before any call.
+        items.sort_unstable_by_key(|Reverse(pending)| (pending.due, pending.seq));
         let extracted = items.extract_if(.., |Reverse(pending)| {
             matches(&pending.view(ObligationLocation::Queued))
         });
@@ -3164,5 +3205,223 @@ mod tests {
             "the obligation survived every partition"
         );
         assert_eq!(spine.pending_count(), 0);
+    }
+
+    // ----------------------------------- IA-02 canonical-visitation tests
+
+    /// A save-round-trip-capable no-op world: the IA-02 tests compare a
+    /// LIVE spine against a save→restored copy of the same spine, so the
+    /// world section must round-trip (an empty encoding — this world
+    /// never contributes state differences).
+    struct SaveableNoopWorld;
+
+    impl World for SaveableNoopWorld {
+        fn execute(&mut self, _event: &Event, _ctx: &mut ExecCtx) {}
+        fn fingerprint(&self, fp: &mut Fingerprinter) {
+            fp.write_str("engine-core/spine/ia02-tests/1");
+        }
+    }
+
+    impl SaveWorld for SaveableNoopWorld {
+        const SAVE_DOMAIN: &'static str = "engine-core/spine/ia02-world/1";
+
+        fn save(&self, _enc: &mut Encoder) {}
+
+        fn restore(_dec: &mut Decoder) -> Result<Self, SaveError> {
+            Ok(SaveableNoopWorld)
+        }
+    }
+
+    /// The IA-02 three-event fixture: near-lane obligations due
+    /// `[1, 3, 2]` in that insertion order. The live heap's internal
+    /// buffer then reads `[1, 3, 2]`, while the save encoder writes
+    /// lanes in canonical `(due, seq)` order — so a save→restored copy
+    /// of the SAME logical spine rebuilds its buffer as `[1, 2, 3]`.
+    /// Those two buffers are exactly the states a public `FnMut`
+    /// predicate must never be able to tell apart: visitation is the
+    /// canonical `(due, seq)` order on both (the pre-bulk-partition
+    /// pop loop's order).
+    fn ia02_fixture() -> Spine<SaveableNoopWorld> {
+        let mut spine = Spine::new(SaveableNoopWorld, 100);
+        for due in [1u64, 3, 2] {
+            spine
+                .schedule(spec(0, Field::Near, due, due))
+                .expect("schedule");
+        }
+        spine
+    }
+
+    /// IA-02's first mandatory witness (the audit's three-event
+    /// fixture): `suspend_matching`'s predicate must observe queued
+    /// candidates in the canonical `(due, seq)` order the pop loop
+    /// visited — never the heap's rebuild-dependent buffer order. A
+    /// stateful closure accepting its second call visits `[1, 2, 3]`
+    /// and holds the due-2 obligation, on a live spine AND on a
+    /// save→restored copy of the same spine: restore rebuilds the
+    /// lane buffer in a different order than live scheduling did,
+    /// and an unchanged public call must select identically on both
+    /// (the independent audit observed the selections — and the
+    /// resulting saves — diverging on the unsorted bulk path).
+    #[test]
+    fn suspension_visits_canonically_on_live_and_restored_spines() {
+        let mut live = ia02_fixture();
+        let mut visited: Vec<u64> = Vec::new();
+        let mut calls = 0u32;
+        assert_eq!(
+            live.suspend_matching(|view| {
+                visited.push(view.due.as_u64());
+                calls += 1;
+                calls == 2
+            }),
+            1,
+            "the stateful predicate accepts exactly its second call"
+        );
+        assert_eq!(
+            visited,
+            vec![1, 2, 3],
+            "queued candidates are visited in canonical (due, seq) order"
+        );
+        assert_eq!(
+            live.held_view()
+                .iter()
+                .map(|view| view.payload)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "the second canonical visit is the due-2 obligation"
+        );
+
+        // The decisive save→restore half: the same spine saved before
+        // suspension, restored from those bytes, identical closure.
+        let pristine = ia02_fixture();
+        let bytes = pristine.save_bytes();
+        let mut restored: Spine<SaveableNoopWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+        assert_eq!(
+            restored.save_bytes(),
+            bytes,
+            "precondition: the two spines initially serialize identically"
+        );
+        let mut restored_visited: Vec<u64> = Vec::new();
+        let mut restored_calls = 0u32;
+        assert_eq!(
+            restored.suspend_matching(|view| {
+                restored_visited.push(view.due.as_u64());
+                restored_calls += 1;
+                restored_calls == 2
+            }),
+            1,
+            "the stateful predicate accepts exactly its second call"
+        );
+        assert_eq!(
+            restored_visited,
+            vec![1, 2, 3],
+            "the restored spine's visitation is canonical too"
+        );
+        assert_eq!(
+            restored
+                .held_view()
+                .iter()
+                .map(|view| view.payload)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "the restored spine selects identically"
+        );
+        assert_eq!(
+            live.save_bytes(),
+            restored.save_bytes(),
+            "identical selections leave the two spines byte-identical"
+        );
+    }
+
+    /// IA-02's second mandatory witness: `reclassify_matching`'s
+    /// traversal carries the same canonical-visitation contract (its
+    /// near-lane arm runs the same bulk partition `suspend_matching`
+    /// does; the far-lane arm early-returns on target == source and
+    /// the blocked arm is empty in this fixture, so the predicate
+    /// observes exactly the near-lane walk). The identical stateful
+    /// closure moves the due-2 obligation to the far lane on a live
+    /// spine AND on a save→restored copy of the same spine.
+    #[test]
+    fn reclassification_visits_canonically_on_live_and_restored_spines() {
+        let mut live = ia02_fixture();
+        let mut visited: Vec<u64> = Vec::new();
+        let mut calls = 0u32;
+        assert_eq!(
+            live.reclassify_matching(
+                |view| {
+                    visited.push(view.due.as_u64());
+                    calls += 1;
+                    calls == 2
+                },
+                Field::Far
+            ),
+            1,
+            "the stateful predicate accepts exactly its second call"
+        );
+        assert_eq!(
+            visited,
+            vec![1, 2, 3],
+            "queued candidates are visited in canonical (due, seq) order"
+        );
+        assert_eq!(
+            live.collect_matching(|view| view.field == Field::Far)
+                .iter()
+                .map(|view| view.payload)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "the second canonical visit moves the due-2 obligation"
+        );
+        assert_eq!(live.near_pending_count(), 2);
+        assert_eq!(live.far_pending_count(), 1);
+        assert_eq!(
+            live.pending_count(),
+            3,
+            "reclassification moves, never drops"
+        );
+
+        // The decisive save→restore half, identical in shape to the
+        // suspension witness.
+        let pristine = ia02_fixture();
+        let bytes = pristine.save_bytes();
+        let mut restored: Spine<SaveableNoopWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+        assert_eq!(
+            restored.save_bytes(),
+            bytes,
+            "precondition: the two spines initially serialize identically"
+        );
+        let mut restored_visited: Vec<u64> = Vec::new();
+        let mut restored_calls = 0u32;
+        assert_eq!(
+            restored.reclassify_matching(
+                |view| {
+                    restored_visited.push(view.due.as_u64());
+                    restored_calls += 1;
+                    restored_calls == 2
+                },
+                Field::Far
+            ),
+            1,
+            "the stateful predicate accepts exactly its second call"
+        );
+        assert_eq!(
+            restored_visited,
+            vec![1, 2, 3],
+            "the restored spine's visitation is canonical too"
+        );
+        assert_eq!(
+            restored
+                .collect_matching(|view| view.field == Field::Far)
+                .iter()
+                .map(|view| view.payload)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "the restored spine selects identically"
+        );
+        assert_eq!(
+            live.save_bytes(),
+            restored.save_bytes(),
+            "identical selections leave the two spines byte-identical"
+        );
     }
 }
