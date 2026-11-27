@@ -3495,7 +3495,7 @@ pub(crate) fn collect_unit_objects_via<R: BeginReads>(
                 .map_err(|_error| MediumError::Chain {
                     rule: "reclamation-plan/composite-closure-verification",
                 })?;
-                if !seen.insert(entry.identity) {
+                if seen.insert(entry.identity) {
                     objects.push(entry.identity);
                 }
             }
@@ -7110,5 +7110,147 @@ mod tests {
         );
         drop(wrapped);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P3-L2's inversion guard: the manifest-closure loop ADDS the
+    /// closure's chunk identities. The lane's first form used
+    /// `!seen.insert(...)` — inverted against `HashSet::insert`'s
+    /// returns-true-when-new semantics — which silently DROPPED
+    /// every closure entry (the collected set would hold only the
+    /// content refs). The pre-collected-duplicate half of the
+    /// original dedupe is unreachable by construction (refs
+    /// overlapping closure identities refuse at duplicate-unit-
+    /// object; manifest-level duplicates refuse at decode) — the
+    /// load-bearing property is that every closure entry lands.
+    #[test]
+    fn closure_entries_are_all_collected() {
+        use crate::composite_manifest::{
+            CompositeManifest, HistoryKind, ManifestEntry, SectionKind, TAG_HEADER,
+            TAG_LEDGER_META, encode as encode_manifest,
+        };
+        use crate::hash::hash_object;
+        use crate::record::RevisionRecord;
+        use std::collections::HashMap;
+
+        struct FixedReads {
+            record_bytes: Vec<u8>,
+            objects: HashMap<crate::hash::Hash, Vec<u8>>,
+        }
+        impl super::BeginReads for FixedReads {
+            fn read_record_bytes(
+                &mut self,
+                _id: &crate::hash::Hash,
+            ) -> Result<Vec<u8>, crate::medium::MediumError> {
+                Ok(self.record_bytes.clone())
+            }
+            fn read_object_bytes(
+                &mut self,
+                hash: &crate::hash::Hash,
+            ) -> Result<Vec<u8>, crate::medium::MediumError> {
+                self.objects
+                    .get(hash)
+                    .cloned()
+                    .ok_or(crate::medium::MediumError::MissingObject { hash: *hash })
+            }
+        }
+
+        // Chunks first: a session-chunk envelope (domain, tag,
+        // payload); the manifest declares each chunk's content hash.
+        let chunk = |tag: &'static str| {
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str(crate::composite_manifest::SESSION_CHUNK_DOMAIN);
+            enc.write_str(tag);
+            enc.write_bytes(&[]);
+            let bytes = enc.into_bytes();
+            (hash_object(&bytes), bytes)
+        };
+        let (header_id, header_bytes) = chunk(TAG_HEADER);
+        let (near_id, near_bytes) = chunk(crate::composite_manifest::TAG_NEAR);
+        let (far_id, far_bytes) = chunk(crate::composite_manifest::TAG_FAR);
+        let (blocked_id, blocked_bytes) = chunk(crate::composite_manifest::TAG_BLOCKED);
+        let (held_id, held_bytes) = chunk(crate::composite_manifest::TAG_HELD);
+        let (ledger_meta_id, ledger_meta_bytes) = chunk(TAG_LEDGER_META);
+        let (ledger_id, ledger_bytes) = chunk(crate::composite_manifest::TAG_LEDGER_RECORDS);
+        let (world_id, world_bytes) = chunk(crate::composite_manifest::TAG_WORLD);
+        let (director_id, director_bytes) = chunk(crate::composite_manifest::TAG_DIRECTOR);
+        let entry = |tag: &'static str, identity| ManifestEntry {
+            tag,
+            identity,
+            payload_length: 0,
+            kind: SectionKind::Singleton,
+        };
+        let manifest = CompositeManifest {
+            history_kind: HistoryKind::Full,
+            ledger_boundary: 1,
+            composed_length: 0,
+            entries: vec![
+                entry(TAG_HEADER, header_id),
+                entry(crate::composite_manifest::TAG_NEAR, near_id),
+                entry(crate::composite_manifest::TAG_FAR, far_id),
+                entry(crate::composite_manifest::TAG_BLOCKED, blocked_id),
+                entry(crate::composite_manifest::TAG_HELD, held_id),
+                entry(TAG_LEDGER_META, ledger_meta_id),
+                ManifestEntry {
+                    tag: crate::composite_manifest::TAG_LEDGER_RECORDS,
+                    identity: ledger_id,
+                    payload_length: 0,
+                    kind: SectionKind::LedgerTail,
+                },
+                entry(crate::composite_manifest::TAG_WORLD, world_id),
+                entry(crate::composite_manifest::TAG_DIRECTOR, director_id),
+            ],
+        };
+        let manifest_bytes = encode_manifest(&manifest);
+        let manifest_identity = hash_object(&manifest_bytes);
+
+        // The production shape: the record's single content ref is
+        // the manifest (the root-only snapshot binding).
+        let parent = hash_object(b"closure-inversion-parent");
+        let record =
+            RevisionRecord::regular(parent, 0, 1).with_content_refs(vec![manifest_identity]);
+        let record_bytes = record.canonical_bytes();
+
+        let mut reads = FixedReads {
+            record_bytes,
+            objects: HashMap::from([
+                (manifest_identity, manifest_bytes),
+                (header_id, header_bytes),
+                (near_id, near_bytes),
+                (far_id, far_bytes),
+                (blocked_id, blocked_bytes),
+                (held_id, held_bytes),
+                (ledger_meta_id, ledger_meta_bytes),
+                (ledger_id, ledger_bytes),
+                (world_id, world_bytes),
+                (director_id, director_bytes),
+            ]),
+        };
+        let record_id = hash_object(b"closure-inversion-record");
+        let collected = super::collect_unit_objects_via(&mut reads, &record_id)
+            .expect("the fixture reads resolve");
+        // The ref contributes the manifest; the closure adds ALL
+        // NINE declared chunk identities.
+        assert_eq!(
+            collected.len(),
+            10,
+            "1 ref + 9 closure entries — none silently dropped"
+        );
+        assert_eq!(collected[0], manifest_identity);
+        for id in [
+            header_id,
+            near_id,
+            far_id,
+            blocked_id,
+            held_id,
+            ledger_meta_id,
+            ledger_id,
+            world_id,
+            director_id,
+        ] {
+            assert!(
+                collected.contains(&id),
+                "every closure entry is collected (the inverted form dropped them all)"
+            );
+        }
     }
 }
