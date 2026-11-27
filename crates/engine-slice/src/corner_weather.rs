@@ -1104,6 +1104,7 @@ mod tests {
             overflow: Some(engine_core::particle::SpawnOverflow { dropped: 1 }),
             active: engine_core::particle::PARTICLE_POOL_BOUND as u32 - 5,
             deaths: 5,
+            cap_discard: 0.0,
         };
         record_census(&mut spawned, &mut died, &mut refused, &saturation);
         assert_eq!(spawned, 0, "zero admissions recorded");
@@ -1130,6 +1131,7 @@ mod tests {
             overflow: None,
             active: 450,
             deaths: 550,
+            cap_discard: 0.0,
         };
         record_census(&mut spawned, &mut died, &mut refused, &fill);
         let mixed = engine_core::particle::TickReport {
@@ -1137,6 +1139,7 @@ mod tests {
             overflow: Some(engine_core::particle::SpawnOverflow { dropped: 960 }),
             active: 460,
             deaths: 30,
+            cap_discard: 0.0,
         };
         // The mixed tick's own per-tick identity:
         // active_before + admitted == deaths + active.
