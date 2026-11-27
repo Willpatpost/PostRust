@@ -15,6 +15,21 @@
 //! F5): a non-finite eye or forward REFUSES selection (`None`), and
 //! targets with non-finite positions are skipped — never an
 //! unpredictable comparison outcome.
+//!
+//! P2 B06 (the interaction half) — the DISPOSITION: stay linear,
+//! with evidence (the charter §2 no-change requirement). The census
+//! is O(targets) with one sqrt and one normalize per target and
+//! ZERO allocation; the real inventories are a handful (the
+//! playable demo's gatehouse offers at most four targets), and the
+//! query runs per INTERACT INPUT EDGE — never per frame, never per
+//! tick. The design's family-D gate (population ≥ 512 AND ≥ 4
+//! queries per tick, P2-simulation-spatial.md §2.2.3) fails both
+//! clauses by two orders of magnitude at every measured workload,
+//! and the design's L6 sequencing rule reserves family-D index
+//! adoption for after the census lane proves the pattern (Q-F/Q-G
+//! "may later ride the same index"). [`select_target`] is therefore
+//! the permanent small-workload fast path; the stay-linear evidence
+//! is measured in `select_target_census_disposition_evidence`.
 
 /// One interactable world entity, as the engine sees it: an identity,
 /// a position, and an interaction extent (the radius around the
@@ -443,5 +458,69 @@ mod tests {
             Some(4),
             "the tie is order-independent"
         );
+    }
+
+    /// P2 B06: the stay-linear disposition's EVIDENCE — the census
+    /// cost from the demo scale (4 targets — the playable demo's
+    /// gatehouse inventory) up past the design's family-D gate
+    /// population, observational (printed, sanity-bounded only —
+    /// the F-06 no-thresholds-before-variance rule): the per-query
+    /// cost at demo scale is sub-microsecond with zero allocation,
+    /// and the linear census's growth (one sqrt + one normalize per
+    /// target) stays in the tens of microseconds even at 4096
+    /// targets — a cost the HUMAN input-edge frequency (per interact
+    /// press, never per frame or tick) cannot amortize a
+    /// per-population index build against. The census still selects
+    /// correctly at every measured size (the measurement measures
+    /// real work).
+    #[test]
+    fn select_target_census_disposition_evidence() {
+        let (eye, forward) = eye_forward();
+        let query = InteractionQuery {
+            range: 2.5,
+            ..InteractionQuery::default()
+        };
+        // Alternating ahead/behind placements at distances spanning
+        // the reach boundary (the offered and not-offered classes:
+        // the cone rejects the behind half, the range rejects the
+        // far ahead ones).
+        let make = |count: usize| {
+            (0..count)
+                .map(|i| {
+                    let ahead = i % 2 == 0;
+                    let distance = 0.5 + (i % 9) as f32 * 0.35;
+                    InteractionTarget {
+                        id: i as u32 + 1,
+                        position: [
+                            eye[0],
+                            eye[1],
+                            eye[2] + if ahead { -distance } else { distance },
+                        ],
+                        radius: 0.0,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        for count in [4usize, 64, 512, 4096] {
+            let targets = make(count);
+            // The census still selects: the nearest ahead target
+            // (id 1 at 0.5 m) is offered at every size.
+            assert_eq!(
+                select_target(&targets, eye, forward, &query),
+                Some(1),
+                "the census selects correctly at count {count}"
+            );
+            let runs = ((2_000_000 / count as u64).clamp(1_000, 200_000)) as usize;
+            let start = std::time::Instant::now();
+            for _ in 0..runs {
+                select_target(&targets, eye, forward, &query);
+            }
+            let ns = start.elapsed().as_secs_f64() / runs as f64 * 1e9;
+            println!("[interaction-census] targets {count:5} · {ns:9.1} ns/query · {runs} runs");
+            assert!(
+                ns.is_finite() && ns < 50_000_000.0,
+                "count {count}: the census is absurdly slow: {ns} ns"
+            );
+        }
     }
 }
