@@ -47,9 +47,9 @@ corrected).
 | B10 | SLICE | CONFIRMED | — | replay/synthesis asymmetry verified in structure (audits/slice.md; line refs approximate) — measurement-quality fix alongside the measurement owner |
 | B11 | SLICE | CONFIRMED (LOW) | — | occupancy-vs-visibility terminology (audits/slice.md) |
 | B13 | SLICE/PERSIST | CONFIRMED (HIGH) | — | verified: `worker.rs` send-then-`slot.recv()` round-trip at :635,687,745,792,837,877,921,1174; charter-known blocking bounded send on `submit_required`; P3 mapping of which calls can block sim/presentation |
-| B05 | CORE | CONFIRMED (orchestrator-adjudicated) | — | **auditor label wrong again** (claimed the combined Y-excursion is checked): the direct read shows particle.rs:286-291 bounds position+velocity per axis and :293-294 checks gravity×life² SEPARATELY — the combined sum is never bounded (each part finite ≈1e38 passes, sum overflows); the auditor's other points (any finite nonnegative dt accepted incl. dt > remaining lifetime; dt*rate overflow-then-cap) align with the charter |
+| B05 | CORE | DESIGN-READY | — | designs/B05-particle-domain-contract.md (glm-5.3, orchestrator-verified): the design found a defect BEYOND the charter text — gravity VELOCITY accumulates g·life (not g·life²), so for life < 1 the velocity can overflow while every existing gate is green (class independently verified; **corrected witness: v₀=2e38, g=3e38, life=0.5 → final velocity 3.5e38 > f32::MAX — the design's own "g 6e38" witness is not a valid f32 and must not be copied by the implementing lane**); the design: fold gravity into the Y-excursion sum + a velocity gate, keep the dt domain open with a total kill_plane_impact, saturating overflow_total, TickReport cap-discard observability; RAIN_POLICY margin ~10² m vs 3.4e38 (36 orders); the four existing kinematic-refusal pins keep identical strings |
 | B06 | CORE | CONFIRMED (auditor-located) | — | interaction.rs select_target sqrt+normalize per target, the exact-zero-distance tie question; combat.rs resolve_attack full hitbox scan — verify the tie contract before the P2 spatial package |
-| B07 | CORE | CONFIRMED | — | npc_execution.rs:164 (evaluate_wake) and :246 (evaluate_witness) call validate_rule_table per invocation (orchestrator grep-verified) |
+| B07 | CORE | RESOLVED — NO-CHANGE (with evidence) | — | the glm-5.3 design's no-change recommendation CONFIRMED on verified evidence (designs/B07-validated-rule-policy.md): every caller in the repo passes a ≤1-rule table (corner_behavior 1 rule, grep-verified; the measurement/render gates the same shape), zero `.rules` mutation sites exist (write-once, grep-verified), `select_activity` short-circuits on due_commitment before the table walk (npc_behavior.rs:388-393, verified), and validate_rule_table is a nanosecond Option<u8> loop — the charter's own bar ("no type-state architecture for one tiny loop") decides it; per-call validation IS the safe boundary for raw `&[Rule]` policy (identity caching unsound while the field is `pub`); revisit triggers recorded in the design |
 | B08 | SHELL | CONFIRMED (deferred to measurement) | — | **auditor PASS verdict REFUTED by direct read** (mem::take at input.rs:199-203 moves the buffers out, leaving capacity-0 accumulators that reallocate on the next input-bearing frame — "reused via take" was backwards); disposition: the churn is human-scale at current workloads (edges are rare, idle frames allocate nothing) — the caller-owned-snapshot API change needs an input-event allocation census to justify; queued for the P0 measurement matrix |
 | B09 | REND | FIXED-AWAITING-REVIEW | integrated `9dce061` + corrective | lane `2ddef05` reviewed: metal literal fixed + never-existed display_surface removed + one focused test; **orchestrator corrective restored `VK_MVK_macos_surface`** (deprecated but REAL — legacy MoltenVK loaders advertise it; its removal re-opened the exact misclassification class the fix closes); lane citation inaccuracy recorded (VK_KHR_display does provide vkCreateDisplayPlaneSurfaceKHR); +1 test → pin correction at batch gate close; awaits batch gate run |
 | B12 | CORE | UNTRIAGED (caller analysis open) | — | the codec exists (npc_behavior.rs); the auditor honestly marked it UNEXAMINED (needs a full call-graph analysis); fold into the P2 world-representation package |
@@ -145,6 +145,19 @@ refutation is evidence too.
   need orchestrator adjudication. No new findings beyond seeds (either the
   core is genuinely clean beyond the seeds or coverage was seed-focused —
   7 DEEP / 26 SKIM recorded honestly).
+- **glm-5.3-w4a8 (design trial, B07+B05):** EXCELLENT — the strongest
+  delegated deliverable of the program: a complete caller inventory that
+  held up under verification, the mutation analysis that decides the
+  caching question, a no-change recommendation properly evidenced against
+  the charter's own bar (B07), and a genuine defect discovery beyond the
+  charter text (B05's gravity-velocity accumulation, class verified
+  independently by the orchestrator). One sloppiness caught: the design's
+  velocity-gate witness uses "g 6e38" which is not a valid f32 (the class
+  is real; the witness numbers were corrected in the register). Honest
+  coverage limits stated unprompted. **Decision: design work routes to
+  glm-5.3 by default** (cost noted by the owner, justified by quality);
+  implementation lanes remain case-by-case under the verify-everything
+  discipline; independent review stays cross-family per the charter.
 - **qwen38-27b (shell — CORRECTED 2026-11-26):** delivered one of the two
   best audits of the five (line-by-line coverage, byte-level A23
   measurements, claims verified against the vendored SDL 3.4.18 source,
