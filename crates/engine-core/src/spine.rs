@@ -1,7 +1,8 @@
 //! The event spine: canonical campaign clock, scheduling with deterministic
 //! `(due, seq)` queue priority, cross-class causal dependencies, per-tick
-//! budget with the near/far lane policy, the execution ledger, and the safe
-//! processed-through watermark.
+//! budget with the near/far lane policy, the housekeeping allowance that
+//! bounds parked-transition and waiter-release work per drain phase (B01),
+//! the execution ledger, and the safe processed-through watermark.
 //!
 //! Stage 3 (`docs/TECH-ARCHITECTURE.md` §2.4, §6): near and far lanes with
 //! the three-phase budget policy — the near reservation is a **guaranteed
@@ -17,7 +18,8 @@
 //! core in their stages.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
+use std::hash::{BuildHasher, Hasher};
 
 use crate::clock::Tick;
 use crate::diag::{Diagnostics, Level};
@@ -267,6 +269,13 @@ pub struct LaneReport {
     pub near_backlogged: bool,
     /// Due far work remained when the total budget was exhausted.
     pub far_backlogged: bool,
+    /// A drain phase this tick was stopped by the housekeeping
+    /// allowance — not the execution budget — while due work remained
+    /// queued in that phase's lane (B01). Recorded at the break: a
+    /// later redistribution phase in the same tick may still drain
+    /// that work, so this is the bound-fired signal; the end-of-tick
+    /// backlog state is `near_backlogged`/`far_backlogged`.
+    pub housekeeping_exhausted: bool,
 }
 
 /// Cumulative lane execution totals (observational, Stage 3): derivable
@@ -278,6 +287,11 @@ pub struct LaneTotals {
     pub far_executed: u64,
     pub near_backlogged_ticks: u64,
     pub far_backlogged_ticks: u64,
+    /// Ticks in which any drain phase was stopped by the housekeeping
+    /// allowance with due work remaining in that phase's lane (B01).
+    /// Observational like every `LaneTotals` field — never
+    /// fingerprinted, never serialized, never affecting scheduling.
+    pub housekeeping_exhausted_ticks: u64,
 }
 
 /// Observational suspension and reclassification counters (Stage 4
@@ -395,6 +409,36 @@ pub struct Spine<W: World> {
     blocked: BTreeMap<u64, Event>,
     /// dependency seq -> dependent seqs currently registered on it.
     waiting_on: BTreeMap<u64, Vec<u64>>,
+    /// Derived remaining-dependency counts over BLOCKED events only
+    /// (B01, P2 design §3.3(2)): seq → the number of UNIQUE unmet
+    /// dependencies at park time, decremented once per executed
+    /// prerequisite, so the release path's unblock decision is O(1)
+    /// instead of a full dependency-list revalidation. Lifecycle
+    /// follows `blocked` exactly: park creates the entry through the
+    /// same registration pass that dedups repeated dependency ids,
+    /// the completing release consumes it, suspension of a blocked
+    /// event drops it alongside its `waiting_on` registrations,
+    /// resume and the held-reconstruction rebuild recount through the
+    /// normal path, and restore rebuilds it from canonical state.
+    /// DERIVED — never serialized, never fingerprinted, rebuilt on
+    /// load (the `held_index` precedent).
+    ///
+    /// REPRESENTATION (the one deliberate deviation from the design
+    /// sketch's `BTreeMap`): a lookup-only `HashMap` over a cheap
+    /// FNV-1a hasher, pre-reserved at construction. A `BTreeMap`
+    /// allocates its root node at the FIRST park, which would move
+    /// the spine's pinned main-path allocation counts
+    /// (tests/spine_allocations.rs — 18/6880 cold, 9/3024 warm, an
+    /// investigation-never-silent-repin gate) for every spine that
+    /// ever parks; the pre-reserved hash map keeps every
+    /// park/release/unblock operation allocation-free in steady
+    /// state, the same property the reused handler scratch bought.
+    /// The map is never iterated by production code — keyed `get`,
+    /// `insert`, `remove`, and a key-only `retain` — so unordered
+    /// iteration can never reach an observable (the `fingerprint.rs`
+    /// rule; the L5 static grid's lookup-only hash map is the
+    /// precedent, hasher included).
+    remaining_deps: HashMap<u64, u32, RemainingDepsHasherBuilder>,
     /// The unfinished-id index — every identity currently holding an
     /// obligation (queued, blocked, or held). Under the ratified
     /// dense-allocation invariant (`known == [0, next_seq)` exactly,
@@ -456,15 +500,23 @@ pub struct Spine<W: World> {
     scratch_follow_ups: Vec<EventSpec>,
 }
 
-/// Registers a freshly blocked event on every unmet dependency. Its earlier
-/// registrations, if any, were removed when it left the blocked set.
-/// Repeated dependency IDs in a single event encounter the same last entry.
+/// Registers a freshly blocked event on every unmet dependency and
+/// returns the number of registrations performed — exactly the
+/// event's count of UNIQUE unmet dependencies: repeated dependency
+/// IDs encounter the same last entry (so they register, and count,
+/// once), and a waiter's registrations exist only while it is
+/// blocked (suspension and removal drop them with the blocked
+/// entry), so every distinct unmet dependency registers exactly
+/// once. The return value seeds the derived remaining-dependency
+/// count (B01): decremented once per executed prerequisite, it
+/// reaches zero exactly when the last unmet dependency resolves.
 fn register_waiters_for_unmet_into(
     waiting_on: &mut BTreeMap<u64, Vec<u64>>,
     dependent: u64,
     event: &Event,
     is_executed: impl Fn(u64) -> bool,
-) {
+) -> u32 {
+    let mut registered = 0;
     for id in &event.depends_on {
         if is_executed(id.seq) {
             continue;
@@ -472,8 +524,10 @@ fn register_waiters_for_unmet_into(
         let waiters = waiting_on.entry(id.seq).or_default();
         if waiters.last() != Some(&dependent) {
             waiters.push(dependent);
+            registered += 1;
         }
     }
+    registered
 }
 
 /// Executed-membership by seq over split borrows — the free-function
@@ -496,6 +550,117 @@ fn has_unmet_dependencies_with(unfinished: &BTreeSet<u64>, next_seq: u64, event:
         .depends_on
         .iter()
         .any(|id| !is_executed_seq_with(unfinished, next_seq, id.seq))
+}
+
+/// The constructor-time reservation for the derived
+/// remaining-dependency counts: enough entries that a spine whose
+/// steady blocked set fits inside it never allocates on the park or
+/// release path (the allocation-pin discipline — the pin's own
+/// module doc names index nodes as pinned structural costs; this
+/// reservation moves that structural cost to construction, outside
+/// every measured window). `[ASSUMPTION]` — a measurement
+/// placeholder in the `PERCEPTION_BUDGETS` tradition: the §9
+/// sustained matrix and adversarial graphs measure the real steady
+/// blocked-set sizes; beyond the reservation the map simply grows
+/// (amortized, never on the pinned scenario's path).
+const REMAINING_DEPS_RESERVE: usize = 16;
+
+/// A trivially-cheap deterministic hasher for the derived
+/// remaining-dependency counts (FNV-1a over the key bytes — the L5
+/// static grid's `CellHasher` precedent). The map is lookup-only —
+/// never iterated by production code — so the hash choice is
+/// behavior-invisible by construction; it exists purely to keep
+/// per-key lookups cheap (SipHash's DoS resistance buys nothing over
+/// engine-authored integer keys).
+#[derive(Clone, Default)]
+struct RemainingDepsHasher(u64);
+
+impl RemainingDepsHasher {
+    /// The FNV-1a offset basis.
+    const BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    /// The FNV-1a prime.
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+}
+
+impl Hasher for RemainingDepsHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            // FNV-1a is DEFINED over wrapping arithmetic (the prime
+            // multiply intentionally exceeds u64).
+            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(Self::PRIME);
+        }
+    }
+}
+
+/// Builds [`RemainingDepsHasher`]s (see its docs for why the default
+/// hasher is replaced).
+#[derive(Clone, Default)]
+struct RemainingDepsHasherBuilder;
+
+impl BuildHasher for RemainingDepsHasherBuilder {
+    type Hasher = RemainingDepsHasher;
+
+    fn build_hasher(&self) -> RemainingDepsHasher {
+        RemainingDepsHasher(RemainingDepsHasher::BASIS)
+    }
+}
+
+/// The per-drain-phase housekeeping allowance: one and a half times
+/// the phase's execution allowance, in u64 (overflow-free for any
+/// u32 cap; `housekeeping_cap(0) == 0` keeps zero-cap phases the
+/// exact no-ops they are today).
+///
+/// WHAT IT BOUNDS (B01, P2 design §3.3(1)): the per-tick work that
+/// is housekeeping rather than execution — each causality-blocked
+/// park (the pop + unmet scan + waiter registration) and each waiter
+/// release attempt costs one unit. NOT charged: the heap peek, the
+/// pop of an event that executes (that is the execution's own cost,
+/// accounted by the execution cap), and handler follow-up
+/// scheduling (part of the executed event's consequence — deferring
+/// it would reassign `next_seq` and change observable order, so it
+/// stays atomic with the execution). One unit per park and one per
+/// release attempt — the successful unblock's queue push folded
+/// into its attempt — is the granularity the design's own
+/// healthy-ratio derivation dictates: charging the push separately
+/// would put the healthy dependency-graph ratio at two units per
+/// event, above any `budget + budget/2` allowance, while the folded
+/// model keeps it at roughly one.
+///
+/// WHY ONE AND A HALF TIMES (the default's justification,
+/// measurement-pinned): the E-8 healthy sustained shape amortizes to
+/// roughly one housekeeping unit per event against an execution
+/// budget the events saturate (D_base 154 → 200 at budget 200), so
+/// `cap + cap/2` gives 50% headroom — a healthy tick never trips the
+/// bound, which is precisely the no-behavior-change property the
+/// lane's acceptance demands (sustained-matrix cells identical),
+/// while the adversarial shapes the lane targets (thundering herds
+/// on one prerequisite, mass due-blocked parking storms) exceed any
+/// proportional allowance by design and are cut off at it.
+/// `[ASSUMPTION]` — a placeholder in the `PERCEPTION_BUDGETS`
+/// tradition: the §9.7 sustained matrix and adversarial graphs
+/// measure the real housekeeping-per-execution ratio and re-pin this
+/// multiple.
+///
+/// The bound lives INSIDE `drain_due` (not in `run_tick`), so the
+/// three-phase near/far reservation arithmetic is untouched: each
+/// phase's housekeeping allowance is proportional to its execution
+/// allowance, preserving near/far fairness by construction.
+fn housekeeping_cap(cap: u32) -> u64 {
+    u64::from(cap) + u64::from(cap) / 2
+}
+
+/// One drain phase's outcome: the executions performed (the phase's
+/// consumption of the tick's execution budget) and whether the
+/// housekeeping allowance — not the execution cap — stopped the
+/// drain while due work remained queued in the phase's lane (B01's
+/// observable-exhaustion signal, recorded at the break).
+struct DrainOutcome {
+    executed: u32,
+    housekeeping_exhausted: bool,
 }
 
 impl<W: World> Spine<W> {
@@ -534,6 +699,10 @@ impl<W: World> Spine<W> {
             far_queue: BinaryHeap::new(),
             blocked: BTreeMap::new(),
             waiting_on: BTreeMap::new(),
+            remaining_deps: HashMap::with_capacity_and_hasher(
+                REMAINING_DEPS_RESERVE,
+                RemainingDepsHasherBuilder,
+            ),
             unfinished: BTreeSet::new(),
             ledger: Vec::new(),
             compacted: None,
@@ -1013,6 +1182,16 @@ impl<W: World> Spine<W> {
             self.held.insert(pending.seq, pending);
             suspended += 1;
         }
+        // The derived remaining-dependency counts follow the blocked
+        // map's lifecycle exactly: the suspended entries drop with
+        // their `waiting_on` registrations, and the survivors' counts
+        // are untouched — suspension executes nothing, so every
+        // survivor's unmet-dependency count is exactly what it was.
+        // The key-only retain keeps the map's lookup-only discipline
+        // (no unordered iteration reaches an observable).
+        let blocked = &self.blocked;
+        self.remaining_deps
+            .retain(|&seq, _| blocked.contains_key(&seq));
         self.suspension.suspended_total += u64::from(suspended);
         suspended
     }
@@ -1219,12 +1398,20 @@ impl<W: World> Spine<W> {
         }
         // Recovery can replace formerly completed identities with held ones.
         // Rebuild the derived reverse index so every surviving blocked event
-        // is registered on all dependencies that are now unfinished.
+        // is registered on all dependencies that are now unfinished — and
+        // rebuild the derived remaining-dependency counts through the same
+        // pass (B01): the removals may have resolved or newly unmet a
+        // survivor's dependencies, so every count is recomputed against the
+        // current unfinished set, exactly what the release path's O(1)
+        // check would consult.
         self.waiting_on.clear();
+        self.remaining_deps.clear();
         for event in self.blocked.values() {
-            register_waiters_for_unmet_into(&mut self.waiting_on, event.id.seq, event, |seq| {
-                seq < self.next_seq && !self.unfinished.contains(&seq)
-            });
+            let registered =
+                register_waiters_for_unmet_into(&mut self.waiting_on, event.id.seq, event, |seq| {
+                    seq < self.next_seq && !self.unfinished.contains(&seq)
+                });
+            self.remaining_deps.insert(event.id.seq, registered);
         }
         // The replacement semantics: the conservation identity holds
         // with the scheduled statistic adjusted by the delta.
@@ -1327,9 +1514,18 @@ impl<W: World> Spine<W> {
                     Field::Far => self.far_queue.push(Reverse(pending)),
                 }
             } else {
-                register_waiters_for_unmet_into(&mut self.waiting_on, seq, &pending.event, |dep| {
-                    dep < next_seq && !unfinished.contains(&dep)
-                });
+                let remaining = register_waiters_for_unmet_into(
+                    &mut self.waiting_on,
+                    seq,
+                    &pending.event,
+                    |dep| dep < next_seq && !unfinished.contains(&dep),
+                );
+                // Re-parking recounts through the normal path: the
+                // count reflects the dependencies unmet NOW (the
+                // suspension may have spanned prerequisite
+                // executions, and the old count left with the
+                // suspension).
+                self.remaining_deps.insert(seq, remaining);
                 self.blocked.insert(seq, pending.event);
             }
             resumed += 1;
@@ -1502,15 +1698,39 @@ impl<W: World> Spine<W> {
         self.clock = self.clock.saturating_add(1);
         let near_guaranteed = self.drain_due(Field::Near, self.near_reserve);
         let far_guaranteed = self.drain_due(Field::Far, self.budget - self.near_reserve);
-        let near_extra =
-            self.drain_due(Field::Near, self.budget - near_guaranteed - far_guaranteed);
+        let near_extra = self.drain_due(
+            Field::Near,
+            self.budget - near_guaranteed.executed - far_guaranteed.executed,
+        );
         let far_extra = self.drain_due(
             Field::Far,
-            self.budget - near_guaranteed - far_guaranteed - near_extra,
+            self.budget - near_guaranteed.executed - far_guaranteed.executed - near_extra.executed,
         );
-        let near_executed = near_guaranteed + near_extra;
-        let far_executed = far_guaranteed + far_extra;
+        let near_executed = near_guaranteed.executed + near_extra.executed;
+        let far_executed = far_guaranteed.executed + far_extra.executed;
         let executed = near_executed + far_executed;
+        // B01's observable-exhaustion signal, recorded at the break:
+        // any phase's drain was stopped by the housekeeping allowance
+        // while due work remained queued in that phase's lane. The
+        // execution-budget exhaustion below stays its own, untouched
+        // class (fingerprinted Stats) — each counter reports its own
+        // bound, and a tick may set either, both, or neither.
+        let housekeeping_exhausted = near_guaranteed.housekeeping_exhausted
+            || far_guaranteed.housekeeping_exhausted
+            || near_extra.housekeeping_exhausted
+            || far_extra.housekeeping_exhausted;
+        if housekeeping_exhausted {
+            self.lane_totals.housekeeping_exhausted_ticks += 1;
+            if self.diag.would_log(Level::Info) {
+                self.diag.log(
+                    Level::Info,
+                    format!(
+                        "housekeeping allowance exhausted at {} with due work remaining",
+                        self.clock
+                    ),
+                );
+            }
+        }
         let near_backlogged = self.lane_has_due_work(Field::Near);
         let far_backlogged = self.lane_has_due_work(Field::Far);
         if executed >= self.budget && (near_backlogged || far_backlogged) {
@@ -1537,6 +1757,7 @@ impl<W: World> Spine<W> {
             budget: self.budget,
             near_backlogged,
             far_backlogged,
+            housekeeping_exhausted,
         };
         self.clock
     }
@@ -2019,13 +2240,28 @@ impl<W: World> Spine<W> {
 
     // ------------------------------------------------------------ internals
 
-    /// Drains due events from one lane, executing up to `cap`.
-    /// Causality-blocked events park without consuming budget (no work
-    /// was done) and keep their original `(due, seq)` priority on
-    /// reentry.
-    fn drain_due(&mut self, field: Field, cap: u32) -> u32 {
+    /// Drains due events from one lane, executing up to `cap` and
+    /// performing at most [`housekeeping_cap`]`(cap)` units of
+    /// housekeeping work (B01). Causality-blocked events park without
+    /// consuming execution budget (no work was done) and keep their
+    /// original `(due, seq)` priority on reentry; each park and each
+    /// waiter release attempt costs one housekeeping unit. When the
+    /// housekeeping allowance is exhausted with due work remaining,
+    /// the drain stops and reports it — the un-drained events STAY
+    /// QUEUED with their `(due, seq)` untouched, exactly like
+    /// execution-budget exhaustion (late execution on a later tick,
+    /// never dropped; each later retry is itself a counted unit, so
+    /// the per-tick bound holds by construction). One execution and
+    /// its synchronous waiter release (E-10) are atomic and may
+    /// overshoot the allowance — the bound gates the next iteration,
+    /// never a half-released herd: a waiter whose prerequisite
+    /// executed must receive its remaining-count decrement, or the
+    /// derived invariant would strand it permanently.
+    fn drain_due(&mut self, field: Field, cap: u32) -> DrainOutcome {
         let mut executed = 0;
-        while executed < cap {
+        let mut housekeeping: u64 = 0;
+        let hk_cap = housekeeping_cap(cap);
+        while executed < cap && housekeeping < hk_cap {
             let head = match field {
                 Field::Near => self.near_queue.peek(),
                 Field::Far => self.far_queue.peek(),
@@ -2041,7 +2277,12 @@ impl<W: World> Spine<W> {
             .expect("queue head was just peeked");
             let event = pending.event;
             if !self.has_unmet_dependencies(&event) {
-                self.execute_now(event);
+                // The execution's synchronous waiter release is
+                // atomic with it (E-10) — the housekeeping units it
+                // consumes are accounted here and may overshoot the
+                // allowance; the loop bound above gates the next
+                // iteration, never the release itself.
+                housekeeping += self.execute_now(event);
                 executed += 1;
             } else {
                 // Due, but causality-blocked: parked, not dropped. Blocked
@@ -2060,11 +2301,25 @@ impl<W: World> Spine<W> {
                         ),
                     );
                 }
-                self.register_waiters_for_unmet(event.id.seq, &event);
+                let remaining = self.register_waiters_for_unmet(event.id.seq, &event);
+                self.remaining_deps.insert(event.id.seq, remaining);
                 self.blocked.insert(event.id.seq, event);
+                // One blocked park (the pop + unmet scan +
+                // registration): one housekeeping unit (B01).
+                housekeeping += 1;
             }
         }
-        executed
+        DrainOutcome {
+            executed,
+            // The exhaustion signal, recorded at the break: the
+            // allowance (not the execution cap — `executed < cap`
+            // discriminates) stopped the drain while due work
+            // remained queued in this phase's lane. A zero-cap phase
+            // can never report exhaustion (the loop never runs).
+            housekeeping_exhausted: executed < cap
+                && housekeeping >= hk_cap
+                && self.lane_has_due_work(field),
+        }
     }
 
     fn lane_has_due_work(&self, field: Field) -> bool {
@@ -2080,7 +2335,7 @@ impl<W: World> Spine<W> {
         }
     }
 
-    fn execute_now(&mut self, event: Event) {
+    fn execute_now(&mut self, event: Event) -> u64 {
         let id = event.id;
         let executed_tick = self.clock;
         let due = event.schedule.due();
@@ -2163,12 +2418,21 @@ impl<W: World> Spine<W> {
         }
         self.scratch_follow_ups = follow_ups;
 
-        // Release dependents that were waiting on this event.
+        // Release dependents that were waiting on this event (E-10:
+        // the synchronous waiter release). The whole loop is atomic
+        // with this execution — every waiter registered on the event
+        // must receive its remaining-count decrement NOW, or the
+        // derived invariant would strand it — so the housekeeping
+        // units it consumes (one per release attempt, B01) are
+        // returned for accounting and may overshoot the drain's
+        // allowance; the drain loop's bound gates the NEXT iteration.
+        let mut released: u64 = 0;
         if let Some(waiters) = self.waiting_on.remove(&event.id.seq) {
             for waiter in waiters {
-                self.try_unblock(waiter);
+                released += self.try_unblock(waiter);
             }
         }
+        released
     }
 
     /// Whether `event` still has unexecuted dependencies — the hot-path
@@ -2198,26 +2462,48 @@ impl<W: World> Spine<W> {
     /// registration the drain, resume, and restore paths
     /// share. Identical per-dependency iteration order and dedup to
     /// the slice form it replaces; allocation-free. Delegates to the
-    /// free-function form over split borrows.
-    fn register_waiters_for_unmet(&mut self, dependent: u64, event: &Event) {
+    /// free-function form over split borrows, and returns the
+    /// registration count that seeds the derived remaining-dependency
+    /// counter (B01 — see [`register_waiters_for_unmet_into`]).
+    fn register_waiters_for_unmet(&mut self, dependent: u64, event: &Event) -> u32 {
         let unfinished = &self.unfinished;
         let next_seq = self.next_seq;
         register_waiters_for_unmet_into(&mut self.waiting_on, dependent, event, |seq| {
             seq < next_seq && !unfinished.contains(&seq)
-        });
+        })
     }
 
-    fn try_unblock(&mut self, seq: u64) {
-        let Some(event) = self.blocked.get(&seq) else {
-            return;
+    /// Attempts to release one waiter of a just-executed event,
+    /// returning the housekeeping units consumed (one per attempt —
+    /// B01's charge; the successful unblock's queue push is folded
+    /// into the attempt, the granularity the design's
+    /// healthy-ratio derivation dictates). O(1) through the derived
+    /// remaining-dependency count: the count of UNIQUE unmet
+    /// dependencies at park time, decremented once per executed
+    /// prerequisite, is zero exactly when the old full-list
+    /// revalidation would pass — equivalent by the registration
+    /// dedup (repeated dependency ids register, and count, once) and
+    /// by the lifecycle rule that a waiter's registrations exist
+    /// only while it is blocked and the prerequisite unexecuted.
+    fn try_unblock(&mut self, seq: u64) -> u64 {
+        let Some(remaining) = self.remaining_deps.get_mut(&seq) else {
+            // Not currently blocked — the defensive no-op the
+            // full-list revalidation had (the lifecycle keeps waiter
+            // lists inside the blocked set).
+            return 0;
         };
-        // Only the completed prerequisite's waiter list was drained. Every
-        // other unmet prerequisite still has its original registration.
-        if self.has_unmet_dependencies(event) {
-            return;
+        if *remaining > 1 {
+            *remaining -= 1;
+            return 1;
         }
+        // The completing prerequisite resolves the waiter's last
+        // unmet dependency: consume the counter, then unblock. Only
+        // the completed prerequisite's waiter list was drained; the
+        // zero count proves every other prerequisite's list was
+        // consumed by its own execution.
+        self.remaining_deps.remove(&seq);
         let Some(event) = self.blocked.remove(&seq) else {
-            return;
+            return 1;
         };
         let due = event.schedule.due();
         if self.diag.would_log(Level::Trace) {
@@ -2228,6 +2514,7 @@ impl<W: World> Spine<W> {
             Field::Near => self.near_queue.push(Reverse(Pending::new(event))),
             Field::Far => self.far_queue.push(Reverse(Pending::new(event))),
         }
+        1
     }
 
     fn has_any_work(&self) -> bool {
@@ -2301,12 +2588,13 @@ fn fingerprint_deps(fp: &mut Fingerprinter, event: &Event) {
 // order), the held set (seq order), and the full execution ledger
 // (execution order). Derived — `known` (dense allocation), `executed`
 // (the complement of unfinished), `waiting_on`, `held_index`,
-// `max_executed_index` — is rebuilt from those canonical sources through
-// the same code paths the live spine uses. Observational — `LaneReport`,
-// `LaneTotals`, `SuspensionStats`, `Diagnostics` — is not logical state:
-// a restored spine resumes them at defaults, they never affect
-// scheduling, accounting, or fingerprints, and the boundary is documented
-// in the wire spec.
+// `max_executed_index`, `remaining_deps` (B01's derived
+// remaining-dependency counts) — is rebuilt from those canonical sources
+// through the same code paths the live spine uses. Observational —
+// `LaneReport`, `LaneTotals`, `SuspensionStats`, `Diagnostics` — is not
+// logical state: a restored spine resumes them at defaults, they never
+// affect scheduling, accounting, or fingerprints, and the boundary is
+// documented in the wire spec.
 
 /// Minimum encoded size of one obligation entry (wire-format spec
 /// §maxima): seq 8 + class 4 + field 1 + schedule kind 1 + due 8 +
@@ -2663,6 +2951,10 @@ impl<W: SaveWorld> Spine<W> {
             far_queue: BinaryHeap::new(),
             blocked: BTreeMap::new(),
             waiting_on: BTreeMap::new(),
+            remaining_deps: HashMap::with_capacity_and_hasher(
+                REMAINING_DEPS_RESERVE,
+                RemainingDepsHasherBuilder,
+            ),
             unfinished,
             ledger,
             compacted,
@@ -2694,7 +2986,12 @@ impl<W: SaveWorld> Spine<W> {
         // Blocked obligations and their waiter registrations, through
         // the live code paths (`has_unmet_dependencies` against the
         // rebuilt executed set, `register_waiters_for_unmet` with its
-        // dedup) — identical structures by construction. A blocked
+        // dedup) — identical structures by construction, including
+        // the derived remaining-dependency counts (B01): each entry
+        // is the registration pass's unique-unmet count, the same
+        // integer the live park path would have computed, so the
+        // restored spine's release path decrements from the identical
+        // starting point. A blocked
         // obligation without unmet dependencies is not a live state
         // (the release path would have returned it to its queue):
         // rejected, not repaired. Waiter-vec order may differ from the
@@ -2709,7 +3006,8 @@ impl<W: SaveWorld> Spine<W> {
                     "spine-save/blocked-without-unmet-deps",
                 ));
             }
-            spine.register_waiters_for_unmet(seq, &event);
+            let remaining = spine.register_waiters_for_unmet(seq, &event);
+            spine.remaining_deps.insert(seq, remaining);
             spine.blocked.insert(seq, event);
         }
 
@@ -3767,5 +4065,629 @@ mod tests {
             restored.ledger().iter().any(|record| record.id.seq == 0),
             "the reconstructed obligation executes under its own identity"
         );
+    }
+
+    // ------------------------------------- B01 accounting tests (P2 L3)
+
+    /// A world whose handler records executed payloads — the
+    /// accounting fixtures' execution-order witness (the NoopWorld
+    /// shape cannot observe order).
+    struct RecordingWorld {
+        executed: Vec<u64>,
+    }
+
+    impl World for RecordingWorld {
+        fn execute(&mut self, event: &Event, _ctx: &mut ExecCtx) {
+            self.executed.push(event.payload);
+        }
+        fn fingerprint(&self, fp: &mut Fingerprinter) {
+            fp.write_str("engine-core/spine/b01-tests/1");
+            for payload in &self.executed {
+                fp.write_u64(*payload);
+            }
+        }
+    }
+
+    /// A logical-time spec with dependencies — the accounting
+    /// fixtures' fixture shape.
+    fn dep_spec(class: u16, field: Field, due: u64, payload: u64, deps: Vec<EventId>) -> EventSpec {
+        EventSpec::new(
+            EventClass::new(class),
+            Schedule::AtLogicalTime { due: Tick(due) },
+            payload,
+        )
+        .in_field(field)
+        .with_dependencies(deps)
+    }
+
+    /// The number of UNIQUE unmet dependencies of `event` — the
+    /// full-list revalidation's answer, computed independently of the
+    /// spine's derived counter (the equivalence checker's oracle).
+    fn unique_unmet_deps<W: World>(spine: &Spine<W>, event: &Event) -> u32 {
+        let mut seen: BTreeSet<u64> = BTreeSet::new();
+        let mut count = 0;
+        for dep in &event.depends_on {
+            if !spine.is_executed_seq(dep.seq) && seen.insert(dep.seq) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// THE EQUIVALENCE ORACLE: the derived remaining-dependency counts
+    /// equal the full-list revalidation's answer for every blocked
+    /// event, and the counter map's lifecycle is exactly the blocked
+    /// map's — the property that makes `try_unblock`'s O(1) check
+    /// interchangeable with the O(deps) scan it replaced, at every
+    /// stable point the fixtures below pause at.
+    fn remaining_counts_match_full_revalidation<W: World>(spine: &Spine<W>) {
+        assert_eq!(
+            spine.remaining_deps.len(),
+            spine.blocked.len(),
+            "the derived counts live exactly on the blocked set"
+        );
+        for (seq, event) in &spine.blocked {
+            let count = spine
+                .remaining_deps
+                .get(seq)
+                .unwrap_or_else(|| panic!("blocked event {seq} has no derived remaining count"));
+            assert_eq!(
+                *count,
+                unique_unmet_deps(spine, event),
+                "the derived remaining count for {seq} must equal the full-list revalidation"
+            );
+        }
+    }
+
+    /// THE ADVERSARIAL FAN-IN PARKING STORM (B01's mass due-blocked
+    /// moves): 600 due events blocked on one far-future prerequisite
+    /// at budget 100 (housekeeping allowance 150 per phase). The bound
+    /// rate-limits parking to the allowance — 150 parks per drain
+    /// phase, 300 per tick across the guaranteed and redistribution
+    /// phases, never 600 in one drain as today — with the un-parked
+    /// events staying QUEUED under their original `(due, seq)` (never
+    /// dropped, each later retry a counted unit), the exhaustion
+    /// observable in the non-fingerprinted lane report and totals
+    /// while the execution budget never binds (zero executions, zero
+    /// `budget_exhausted_ticks` — the clean discrimination between
+    /// the two exhaustion classes), and every event still parking
+    /// exactly once across the deferral, with no deadlock.
+    #[test]
+    fn adversarial_parking_storm_is_housekeeping_bounded() {
+        let mut spine = Spine::new(
+            RecordingWorld {
+                executed: Vec::new(),
+            },
+            100,
+        );
+        let prereq = spine.schedule(spec(0, Field::Near, 100, 9999)).unwrap();
+        for i in 0..600u64 {
+            spine
+                .schedule(dep_spec(1, Field::Near, 1, i, vec![prereq]))
+                .unwrap();
+        }
+        // Tick 1: exactly the two phases' allowances park (150 + 150);
+        // the other 300 stay queued due — today's unbounded drain
+        // parks all 600 in the first phase.
+        spine.run_tick();
+        assert_eq!(spine.blocked_count(), 150 + 150);
+        assert_eq!(
+            spine.pending_count(),
+            301,
+            "the 300 un-drained waiters stay queued (plus the not-yet-due prerequisite), never dropped"
+        );
+        assert_eq!(spine.stats().executed, 0);
+        assert_eq!(
+            spine.stats().budget_exhausted_ticks,
+            0,
+            "the execution budget never bound — the housekeeping class discriminates"
+        );
+        assert!(spine.lane_report().housekeeping_exhausted);
+        assert_eq!(spine.lane_totals().housekeeping_exhausted_ticks, 1);
+        remaining_counts_match_full_revalidation(&spine);
+        // Tick 2: the parking completes (the final phase parks into an
+        // emptying queue); the (due, seq) order was untouched, so the
+        // parking proceeded in ascending seq.
+        spine.run_tick();
+        assert_eq!(
+            spine.blocked_count(),
+            600,
+            "the deferral parks everyone eventually"
+        );
+        assert_eq!(
+            spine.pending_count(),
+            1,
+            "only the not-yet-due prerequisite remains queued"
+        );
+        assert_eq!(
+            spine.stats().blocked_transitions,
+            600,
+            "each event parked exactly once — retries park, never re-park"
+        );
+        assert_eq!(spine.stats().executed, 0);
+        remaining_counts_match_full_revalidation(&spine);
+        // Ticks 3-9: the blocked set is passive — no due queued work,
+        // no housekeeping, no exhaustion signal, per-tick report reset.
+        spine.run_ticks(7);
+        assert_eq!(
+            spine.lane_totals().housekeeping_exhausted_ticks,
+            2,
+            "ticks 1-2 only"
+        );
+        assert!(!spine.lane_report().housekeeping_exhausted);
+        // The release at the prerequisite's due: one atomic storm,
+        // then the deferred executions under the execution cap alone
+        // (popping an executable event is the execution's own cost,
+        // not housekeeping) — progress to completion, no deadlock.
+        spine.run_to_completion(120);
+        assert_eq!(spine.stats().executed, 601);
+        let mut expected = vec![9999u64];
+        expected.extend(0..600);
+        assert_eq!(
+            spine.world().executed,
+            expected,
+            "canonical (due, seq) order preserved through the deferral"
+        );
+        assert_eq!(spine.lane_totals().housekeeping_exhausted_ticks, 3);
+    }
+
+    /// THE ADVERSARIAL FAN-OUT RELEASE STORM (B01's thundering herd on
+    /// one prerequisite): 600 parked waiters released by a single
+    /// execution against a 150-unit allowance. The release itself
+    /// completes ATOMICALLY (E-10 synchrony — every registered waiter
+    /// receives its remaining-count decrement; a half-released herd
+    /// would strand the derived invariant), the drain then stops on
+    /// the exhausted allowance with the unblocked waiters still queued
+    /// under their original `(due, seq)`, and the deferred waiters
+    /// execute over subsequent ticks in canonical order. On a pure
+    /// release storm the execution budget co-fires (a 600-storm at
+    /// budget 100 fills the cap through redistribution even as each
+    /// phase's drain stops) — the clean hk-vs-budget discrimination is
+    /// the parking storm's zero-execution shape above.
+    #[test]
+    fn adversarial_release_storm_is_atomic_bounded_and_deferred() {
+        let mut spine = Spine::new(
+            RecordingWorld {
+                executed: Vec::new(),
+            },
+            100,
+        );
+        let prereq = spine.schedule(spec(0, Field::Near, 10, 9999)).unwrap();
+        for i in 0..600u64 {
+            spine
+                .schedule(dep_spec(1, Field::Near, 1, i, vec![prereq]))
+                .unwrap();
+        }
+        // Ticks 1-2: the parking storm rate-limits (300 + 300); by
+        // tick 2 all 600 are parked.
+        spine.run_ticks(2);
+        assert_eq!(spine.blocked_count(), 600);
+        assert_eq!(spine.lane_totals().housekeeping_exhausted_ticks, 2);
+        remaining_counts_match_full_revalidation(&spine);
+        // Ticks 3-9: quiet (the blocked set is passive).
+        spine.run_ticks(7);
+        // Tick 10: the prerequisite pops (the only due queued work)
+        // and executes; its atomic release touches all 600 waiters —
+        // and executes; its atomic release touches all 600 waiters —
+        // 600 housekeeping units against the 150 allowance — so the
+        // guaranteed phase stops before popping a single unblocked
+        // waiter; the redistribution phase (a fresh allowance) then
+        // drains 99 under the execution cap. Nothing was dropped and
+        // nobody stayed blocked.
+        spine.run_tick();
+        assert_eq!(spine.stats().executed, 1 + 99);
+        assert_eq!(
+            spine.blocked_count(),
+            0,
+            "the storm unblocked completely — the release is atomic"
+        );
+        assert_eq!(
+            spine.pending_count(),
+            501,
+            "the unblocked waiters the allowance deferred stay queued (600 minus the 99 drained)"
+        );
+        assert!(spine.lane_report().housekeeping_exhausted);
+        assert_eq!(spine.lane_totals().housekeeping_exhausted_ticks, 3);
+        remaining_counts_match_full_revalidation(&spine);
+        // Ticks 11-16: the deferred waiters execute under the
+        // execution cap alone, in ascending (due, seq) order (the
+        // last tick drains the final one).
+        spine.run_ticks(6);
+        assert_eq!(spine.stats().executed, 601);
+        let mut expected = vec![9999u64];
+        expected.extend(0..600);
+        assert_eq!(spine.world().executed, expected);
+        assert!(
+            !spine.lane_report().housekeeping_exhausted,
+            "clean ticks are not exhausted"
+        );
+    }
+
+    /// THE HEALTHY RATIO NEVER TRIPS: the E-8 sustained shape — a
+    /// dependency graph whose housekeeping stays near one unit per
+    /// event against an execution budget the events saturate — drains
+    /// exactly as before (the design's acceptance: same executions,
+    /// same dues). 1000 waiters on one prerequisite at budget 1100
+    /// (allowance 1650): all 1000 park in one tick, and the release
+    /// plus all 1000 executions complete within the SAME tick — the
+    /// pre-B01 behavior, bit for bit.
+    #[test]
+    fn healthy_ratio_never_trips_the_allowance() {
+        let mut spine = Spine::new(
+            RecordingWorld {
+                executed: Vec::new(),
+            },
+            1100,
+        );
+        let prereq = spine.schedule(spec(0, Field::Near, 2, 9999)).unwrap();
+        for i in 0..1000u64 {
+            spine
+                .schedule(dep_spec(1, Field::Near, 1, i, vec![prereq]))
+                .unwrap();
+        }
+        spine.run_tick();
+        assert_eq!(
+            spine.blocked_count(),
+            1000,
+            "a healthy tick parks everything — no rate limit"
+        );
+        assert!(!spine.lane_report().housekeeping_exhausted);
+        assert_eq!(spine.stats().executed, 0);
+        spine.run_tick();
+        assert_eq!(
+            spine.stats().executed,
+            1001,
+            "the release and all executions complete in one tick, as before"
+        );
+        assert_eq!(spine.blocked_count(), 0);
+        assert_eq!(spine.stats().budget_exhausted_ticks, 0);
+        assert_eq!(spine.lane_totals().housekeeping_exhausted_ticks, 0);
+        remaining_counts_match_full_revalidation(&spine);
+    }
+
+    /// The derived counter's edge cases (the design's list): repeated
+    /// dependency ids count ONCE (the registration dedup — a naive
+    /// per-list count would strand the waiter at a value its single
+    /// prerequisite execution could never reach); a HELD dependency is
+    /// unfinished, not executed, so it keeps the count above zero
+    /// (held is not execution — the complement rule); and a dependency
+    /// that executed while the waiter was still QUEUED is simply
+    /// absent from the count (registration, and counting, happen only
+    /// at park).
+    #[test]
+    fn duplicate_and_held_dependencies_count_correctly() {
+        let mut spine = Spine::new(NoopWorld, 100);
+        let dup_a = spine.schedule(spec(0, Field::Near, 5, 0)).unwrap();
+        let dup_b = spine.schedule(spec(0, Field::Near, 6, 0)).unwrap();
+        let held = spine.schedule(spec(0, Field::Near, 50, 0)).unwrap();
+        let late = spine.schedule(spec(0, Field::Near, 20, 0)).unwrap();
+        // Deps [X, X, Y]: the duplicate counts once — 2, not 3.
+        let dup_waiter = spine
+            .schedule(dep_spec(1, Field::Near, 1, 0, vec![dup_a, dup_a, dup_b]))
+            .unwrap();
+        // Deps [X, H] with H suspended before the waiter parks: held
+        // is unmet — 2.
+        let held_waiter = spine
+            .schedule(dep_spec(2, Field::Near, 1, 0, vec![dup_a, held]))
+            .unwrap();
+        // Deps [Y, L] with Y executing at tick 6 while this waiter
+        // (due 7) is still queued: only L counts at park — 1.
+        let queued_waiter = spine
+            .schedule(dep_spec(3, Field::Near, 7, 0, vec![dup_b, late]))
+            .unwrap();
+        assert_eq!(spine.suspend_matching(|view| view.id == held), 1);
+
+        // Tick 1: the two due-1 waiters park.
+        spine.run_tick();
+        assert_eq!(spine.blocked_count(), 2);
+        assert_eq!(spine.remaining_deps.get(&dup_waiter.seq), Some(&2));
+        assert_eq!(spine.remaining_deps.get(&held_waiter.seq), Some(&2));
+        remaining_counts_match_full_revalidation(&spine);
+
+        // Tick 5: X executes — ONE decrement per waiter (X's waiter
+        // list holds each waiter once, the dedup), never two for the
+        // duplicated id.
+        spine.run_ticks(4);
+        assert_eq!(spine.remaining_deps.get(&dup_waiter.seq), Some(&1));
+        assert_eq!(
+            spine.remaining_deps.get(&held_waiter.seq),
+            Some(&1),
+            "held is not executed — the waiter stays blocked at a positive count"
+        );
+        assert_eq!(spine.blocked_count(), 2);
+        remaining_counts_match_full_revalidation(&spine);
+
+        // Tick 6: Y executes — the duplicate-dep waiter reaches zero
+        // and unblocks (a naive count of 3 would have stranded it at
+        // 1 forever: the deadlock the dedup prevents), then executes
+        // in the same drain. The queued waiter is not yet due.
+        spine.run_tick();
+        assert_eq!(spine.remaining_deps.get(&dup_waiter.seq), None);
+        assert_eq!(spine.blocked_count(), 1);
+        assert_eq!(
+            spine.stats().executed,
+            3,
+            "X, Y, and the unblocked duplicate-dep waiter"
+        );
+
+        // Tick 7: the queued waiter parks counting ONLY the still
+        // unmet L (Y executed while the waiter was queued — absent
+        // from the count).
+        spine.run_tick();
+        assert_eq!(
+            spine.remaining_deps.get(&queued_waiter.seq),
+            Some(&1),
+            "a dependency executed while the waiter was queued is absent from the count"
+        );
+        remaining_counts_match_full_revalidation(&spine);
+
+        // Tick 20: L executes — the queued waiter releases. Then
+        // resume H and let it execute at its due — the held-dep waiter
+        // releases through the O(1) path.
+        spine.run_ticks(13);
+        assert_eq!(spine.remaining_deps.get(&queued_waiter.seq), None);
+        assert_eq!(spine.resume_matching(|view| view.id == held), 1);
+        spine.run_ticks(30);
+        assert_eq!(spine.remaining_deps.get(&held_waiter.seq), None);
+        assert_eq!(spine.blocked_count(), 0);
+        assert_eq!(spine.stats().executed, 7);
+        assert!(spine.is_executed(held_waiter));
+    }
+
+    /// THE ONE EXISTING-BATTERY DIVERGENCE, CHARACTERIZED: the
+    /// lanes.rs `shared_prerequisites_release_fanout_once_in_order`
+    /// fixture's shape — 2048 waiters with duplicated prerequisite ids
+    /// at budget 127 / reserve 63 — is a 2048:127 housekeeping-to-
+    /// budget ratio, adversarial by the design's own definition and
+    /// exactly the shape B01 exists to bound. Under the allowance the
+    /// parking is rate-limited (567 of 2048 parked within two ticks —
+    /// the pre-B01 battery pinned 2048 here, the one conscious test
+    /// update the lane's landing requires), while the fixture's INTENT
+    /// assertions all hold: the prerequisites execute at their dues,
+    /// the release fires once with duplicates deduplicated, the
+    /// deferred waiters execute in canonical `(due, seq)` order to
+    /// completion, and suspend/resume mid-storm survives.
+    #[test]
+    fn release_fanout_stays_once_and_in_order_under_the_allowance() {
+        let mut spine = Spine::with_reservation(
+            RecordingWorld {
+                executed: Vec::new(),
+            },
+            127,
+            63,
+        );
+        let first = spine.schedule(spec(0, Field::Far, 2, 0)).unwrap();
+        let last = spine.schedule(spec(0, Field::Far, 4, 1)).unwrap();
+        for payload in 2..2050u64 {
+            spine
+                .schedule(dep_spec(
+                    1,
+                    Field::Near,
+                    1,
+                    payload,
+                    vec![first, last, first],
+                ))
+                .unwrap();
+        }
+        spine.run_ticks(2);
+        // THE RATE LIMIT (the diverged assertion): not all 2048 parked
+        // within two ticks. Conservation is exact — nothing dropped
+        // (2050 scheduled minus the one executed prerequisite):
+        assert_eq!(spine.blocked_count() + spine.pending_count(), 2049);
+        assert!(spine.blocked_count() < 2048);
+        assert!(spine.lane_totals().housekeeping_exhausted_ticks >= 1);
+        // The two ticks' execution semantics are unchanged:
+        assert_eq!(
+            spine.world().executed,
+            vec![0],
+            "the first prerequisite executed at its due, tick 2"
+        );
+        remaining_counts_match_full_revalidation(&spine);
+        // The fixture's own churn: suspend and resume one waiter
+        // mid-storm (the blocked arm — the derived counter drops with
+        // the blocked entry and recounts at resume).
+        assert_eq!(spine.suspend_matching(|v| v.payload == 27), 1);
+        assert_eq!(spine.resume_matching(|v| v.payload == 27), 1);
+        remaining_counts_match_full_revalidation(&spine);
+        // The intent: every obligation executes exactly once, the
+        // waiters in canonical order — `[first, last, first]` released
+        // once, duplicates deduplicated.
+        spine.run_to_completion(40);
+        assert_eq!(
+            spine.world().executed,
+            (0..2050u64).collect::<Vec<_>>(),
+            "release fan-out once, in (due, seq) order, to completion"
+        );
+        assert_eq!(spine.blocked_count(), 0);
+        assert_eq!(spine.pending_count(), 0);
+    }
+
+    /// THE SAVE/RESTORE EQUIVALENCE: a spine with a PARTIALLY released
+    /// blocked event (its derived count mid-decrement) saves, restores,
+    /// and re-saves byte-identically (the counter is derived, never
+    /// serialized — the wire format untouched by construction), the
+    /// restored spine rebuilds the SAME integer, and the two
+    /// continuations agree on every fingerprint and save byte.
+    #[test]
+    fn save_restore_rebuilds_remaining_counts_byte_identically() {
+        let mut spine = Spine::new(SaveableNoopWorld, 100);
+        let dep_early = spine.schedule(spec(0, Field::Near, 3, 0)).unwrap();
+        let dep_late = spine.schedule(spec(0, Field::Near, 5, 0)).unwrap();
+        let waiter = spine
+            .schedule(dep_spec(1, Field::Near, 1, 0, vec![dep_early, dep_late]))
+            .unwrap();
+        // Tick 1: the waiter parks on both (count 2). Tick 3: the
+        // early dependency executes — a PARTIAL release, count 1.
+        spine.run_ticks(3);
+        assert_eq!(spine.remaining_deps.get(&waiter.seq), Some(&1));
+        assert_eq!(spine.blocked_count(), 1);
+        remaining_counts_match_full_revalidation(&spine);
+        let bytes = spine.save_bytes();
+        let mut restored: Spine<SaveableNoopWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+        assert_eq!(
+            restored.save_bytes(),
+            bytes,
+            "the derived counter never reaches the wire"
+        );
+        assert_eq!(
+            restored.remaining_deps.get(&waiter.seq),
+            Some(&1),
+            "the same integer rebuilt from canonical state"
+        );
+        remaining_counts_match_full_revalidation(&restored);
+        // The continuations agree: the late dependency releases the
+        // waiter on both, and the final states are indistinguishable.
+        spine.run_ticks(10);
+        restored.run_ticks(10);
+        assert_eq!(spine.stats().executed, 3);
+        assert_eq!(restored.stats().executed, 3);
+        assert_eq!(spine.engine_fingerprint(), restored.engine_fingerprint());
+        assert_eq!(spine.state_fingerprint(), restored.state_fingerprint());
+        assert_eq!(spine.save_bytes(), restored.save_bytes());
+    }
+
+    /// THE LIFECYCLE EQUIVALENCE UNDER CHURN: across a scenario that
+    /// parks, partially releases, suspends a blocked event (dropping
+    /// its counter with its registrations), resumes it (re-parking
+    /// with a RECOUNTED counter), and replaces an unrelated queued
+    /// obligation through the held reconstruction (whose full rebuild
+    /// recomputes every surviving count), the derived counts equal the
+    /// full-list revalidation after every step — the O(1) check is
+    /// interchangeable with the O(deps) scan it replaced — and the
+    /// completing release drives the waiter home through the O(1)
+    /// path.
+    #[test]
+    fn derived_counts_survive_suspend_resume_and_reconstruction() {
+        let mut spine = Spine::new(SaveableNoopWorld, 100);
+        let a = spine.schedule(spec(0, Field::Near, 30, 0)).unwrap();
+        let b = spine.schedule(spec(0, Field::Near, 10, 0)).unwrap();
+        let w = spine
+            .schedule(dep_spec(1, Field::Near, 1, 0, vec![a, b]))
+            .unwrap();
+        spine.run_tick();
+        assert_eq!(spine.remaining_deps.get(&w.seq), Some(&2));
+        remaining_counts_match_full_revalidation(&spine);
+        // Tick 10: b executes — a partial release (count 1).
+        spine.run_ticks(9);
+        assert_eq!(spine.remaining_deps.get(&w.seq), Some(&1));
+        // Suspend the BLOCKED waiter: its counter dies with the
+        // blocked entry; resume re-parks it with a fresh count against
+        // the CURRENT unfinished set (only a remains unmet).
+        assert_eq!(spine.suspend_matching(|view| view.id == w), 1);
+        assert_eq!(
+            spine.remaining_deps.get(&w.seq),
+            None,
+            "the counter died with the blocked entry"
+        );
+        assert_eq!(spine.blocked_count(), 0);
+        assert_eq!(spine.resume_matching(|view| view.id == w), 1);
+        assert_eq!(
+            spine.remaining_deps.get(&w.seq),
+            Some(&1),
+            "re-park recounts: only a remains unmet"
+        );
+        remaining_counts_match_full_revalidation(&spine);
+        // The held reconstruction's full rebuild: removing an
+        // unrelated queued obligation (reinstalled as held under its
+        // own identity) re-registers every surviving blocked event and
+        // recomputes every derived count against the current
+        // unfinished set — w's count is value-identical.
+        let unrelated = spine.schedule(spec(2, Field::Near, 40, 0)).unwrap();
+        let replacement = Event {
+            id: unrelated,
+            class: EventClass::new(2),
+            schedule: Schedule::AtLogicalTime { due: Tick(40) },
+            payload: 7,
+            field: Field::Near,
+            depends_on: Vec::new(),
+        };
+        assert_eq!(
+            spine.try_reconstruct_held(|view| view.class == EventClass::new(2), vec![replacement]),
+            Ok(1)
+        );
+        assert_eq!(spine.remaining_deps.get(&w.seq), Some(&1));
+        remaining_counts_match_full_revalidation(&spine);
+        // Tick 30: a executes — the completing release zeroes the
+        // count, unblocks, and the waiter executes through the O(1)
+        // path. The held replacement never runs.
+        spine.run_ticks(20);
+        assert_eq!(spine.remaining_deps.get(&w.seq), None);
+        assert_eq!(spine.blocked_count(), 0);
+        assert!(spine.is_executed(w));
+        assert_eq!(
+            spine.stats().executed,
+            3,
+            "b, a, and w — the replacement stays held"
+        );
+    }
+
+    /// THE OBSERVABILITY SURFACE: the housekeeping-exhaustion signal
+    /// lives in the non-fingerprinted observational class only —
+    /// `LaneReport` (per-tick, reset every tick) and `LaneTotals`
+    /// (cumulative) — never in fingerprinted Stats and never on the
+    /// wire (restore resumes both at defaults). A zero-cap phase (the
+    /// far guaranteed phase under a full near reservation) can never
+    /// report exhaustion: its drain never runs, exactly as today.
+    #[test]
+    fn housekeeping_exhaustion_is_observational_only() {
+        // Defaults on a fresh spine.
+        let mut spine = Spine::with_reservation(NoopWorld, 10, 10);
+        assert!(!spine.lane_report().housekeeping_exhausted);
+        assert_eq!(spine.lane_totals().housekeeping_exhausted_ticks, 0);
+        // Far work due under a full near reservation: the far
+        // guaranteed phase has cap 0 (allowance 0 — the drain never
+        // runs, the cap-0 no-op preserved), and the redistribution
+        // phase that drains it is healthy — backlog is reported as
+        // backlog, never as housekeeping exhaustion.
+        spine.schedule(spec(0, Field::Far, 1, 0)).unwrap();
+        spine.run_tick();
+        assert_eq!(
+            spine.stats().executed,
+            1,
+            "the redistribution phase drains the far work"
+        );
+        assert!(!spine.lane_report().housekeeping_exhausted);
+        assert_eq!(spine.lane_totals().housekeeping_exhausted_ticks, 0);
+
+        // A parking storm at budget 2 (allowance 3 per phase): three
+        // parks trip the guaranteed phase, the fourth parks in the
+        // redistribution phase — the tick is flagged, the next
+        // (quiet) tick is not, and the cumulative total persists.
+        let mut storm = Spine::new(SaveableNoopWorld, 2);
+        let prereq = storm.schedule(spec(0, Field::Near, 50, 0)).unwrap();
+        for _ in 0..4u64 {
+            storm
+                .schedule(dep_spec(1, Field::Near, 1, 0, vec![prereq]))
+                .unwrap();
+        }
+        storm.run_tick();
+        assert_eq!(
+            storm.blocked_count(),
+            4,
+            "3 + 1 parks across the two phases"
+        );
+        assert!(storm.lane_report().housekeeping_exhausted);
+        assert_eq!(storm.lane_totals().housekeeping_exhausted_ticks, 1);
+        assert_eq!(storm.stats().budget_exhausted_ticks, 0);
+        storm.run_tick();
+        assert!(
+            !storm.lane_report().housekeeping_exhausted,
+            "the per-tick flag resets"
+        );
+        assert_eq!(storm.lane_totals().housekeeping_exhausted_ticks, 1);
+        // The observational class never reaches a fingerprint or the
+        // wire: identical logical state under different exhaustion
+        // history fingerprints identically (the digest pins and the
+        // determinism battery are the end-to-end witnesses).
+        let bytes = storm.save_bytes();
+        let restored: Spine<SaveableNoopWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+        assert_eq!(
+            restored.lane_totals().housekeeping_exhausted_ticks,
+            0,
+            "restore resumes the observational class at defaults"
+        );
+        assert_eq!(restored.engine_fingerprint(), storm.engine_fingerprint());
     }
 }
