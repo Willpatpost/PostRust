@@ -28,11 +28,19 @@
 //! device-free, BEFORE any resource is built — a refusal builds
 //! nothing and leaves the renderer untouched. The checks are the
 //! structural contracts the pass machinery relies on: one draw
-//! range per material in material order, the ranges contiguous
-//! and covering the vertex buffer (the shadow depth pass draws
-//! `[0, last.end)`), every material's albedo index inside the
-//! attached set, every texture at the procedural generator's
-//! byte contract, sane bounds, and the wet roles inside the mesh.
+//! range per material in material order, the ranges contiguous,
+//! covering the vertex buffer (the shadow depth pass draws
+//! `[0, last.end)`), and NON-INVERTED — start ≤ end per range, so
+//! the lit pass's `end - start` vertex count is overflow-free by
+//! construction on every admitted table (an empty range is the
+//! legal draws-nothing case); every material's albedo index
+//! inside the attached set; every texture at the procedural
+//! generator's byte contract; FINITE bounds and mirror-plane
+//! height (the shadow cascade's projection math and the wet
+//! reflection's mirrored camera consume them — nonfinite input
+//! degenerates both silently, so the admission domain is
+//! finite-only); the bounds ordered per axis (NaN refuses); and
+//! the wet roles inside the mesh.
 //! ONE boundary is a compile-time shape, not author freedom: the
 //! pass families' descriptor sets (the shadowed, skinned, and
 //! reflection per-material sets) are built for
@@ -76,18 +84,24 @@ pub(crate) const PASS_FAMILY_MATERIAL_COUNT: usize = 3;
 /// ranges are contiguous and cover the whole vertex buffer
 /// (validated: the shadow depth pass draws `[0, last.end)` as the
 /// whole scene; an author cannot leave a gap the depth pass
-/// would miss). An empty range is legal (that material draws
-/// nothing); the builder over an authored box table
-/// ([`crate::lit_mesh::mesh_from_boxes`]) emits the ground quad
-/// into material 0's range first — the wet receiver role's
-/// position in the corner authoring.
+/// would miss), and every range is NON-INVERTED — start ≤ end
+/// (validated: the lit pass computes `end - start` as the draw's
+/// vertex count, and the admission's chained contracts make that
+/// subtraction overflow-free on every admitted table). An empty
+/// range is legal (that material draws nothing — a vertexCount-0
+/// `cmd_draw` is a Vulkan no-op); the builder over an authored
+/// box table ([`crate::lit_mesh::mesh_from_boxes`]) emits the
+/// ground quad into material 0's range first — the wet receiver
+/// role's position in the corner authoring, and an empty
+/// `[n, n)` for any material the box table leaves unpopulated.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SceneMesh {
     /// The triangle-list vertices (three per primitive, the lit
     /// pipelines' 32-byte input — see [`LitVertex`]).
     pub vertices: Vec<LitVertex>,
-    /// One draw range per material, in material order: contiguous,
-    /// starting at 0, ending at `vertices.len()`.
+    /// One draw range per material, in material order: starting at
+    /// 0, contiguous, ending at `vertices.len()`, every range
+    /// non-inverted (start ≤ end — an empty range draws nothing).
     pub draws: Vec<Range<u32>>,
 }
 
@@ -118,6 +132,9 @@ pub struct GroundRoles {
     /// The receiver's world-plane height: the horizontal plane the
     /// wet camera mirrors across (`planar.rs`'s mirror functions
     /// consume it — the corner's value is the ground at y = 0).
+    /// FINITE (validated, the R02 domain): the mirrored camera is
+    /// `2 · plane_y − eye` arithmetic, so a NaN or ±inf plane
+    /// breaks the reflection silently rather than refusing.
     pub receiver_plane_y: f32,
     /// The reflected masses' draw ranges, in material order
     /// (position `i` ↔ material `1 + i`). May be empty (a range
@@ -154,6 +171,10 @@ pub struct SceneDescription {
     /// domain (the corner route's value folds
     /// `lit_scene::intersection_boxes()` through
     /// `shadows::scene_bounds`; now authored with the scene).
+    /// FINITE on every endpoint and ordered min ≤ max per axis
+    /// (validated, the R02 domain — `shadows::cascade_for` does
+    /// span/center arithmetic over these six floats, and
+    /// nonfinite endpoints silently degenerate the light matrix).
     pub bounds: SceneBounds,
     /// The wet ground's role-tagged ranges (see [`GroundRoles`]).
     pub ground: GroundRoles,
@@ -190,8 +211,11 @@ impl SceneDescription {
                 PASS_FAMILY_MATERIAL_COUNT
             )));
         }
-        // ---- the mesh's draw ranges: one per material, contiguous,
-        // covering the buffer (the depth pass draws [0, last.end)). ----
+        // ---- the mesh's draw ranges: one per material,
+        // non-inverted, contiguous, covering the buffer (the depth
+        // pass draws [0, last.end); the lit pass's per-range
+        // `end - start` is overflow-free on every admitted
+        // table). ----
         if mesh.vertices.is_empty() {
             return Err(RendererError::Vulkan("the scene mesh is empty".into()));
         }
@@ -210,6 +234,48 @@ impl SceneDescription {
                  whole buffer)",
                 mesh.draws[0].start
             )));
+        }
+        // ---- the re-audit's R01 hole, closed: every range
+        // NON-INVERTED. Before this check the four structural
+        // contracts (start at 0, contiguous, covering) all held for
+        // an inverted table like [[0,5],[5,3],[3,N]] — contiguity
+        // compares end to the NEXT start, so it holds on both
+        // sides of an inverted range — and the lit pass's draw
+        // loop (corner.rs) then computed `end - start` as the
+        // draw's vertex count, a u32 UNDERFLOW (a debug panic; a
+        // four-billion-vertex release draw).
+        //
+        // THE POLICY — start ≤ end, NOT start < end: an empty
+        // range [n, n) is a LEGAL draws-nothing table entry.
+        // `lit_mesh::mesh_from_boxes` emits exactly that for a
+        // material with no boxes in the authored table, and the
+        // wet roles already document the same legality for an
+        // empty `reflected` range. Downstream, an empty range is
+        // consumed SAFELY with no guard needed: `cmd_draw` with
+        // vertexCount 0 is a Vulkan no-op (corner.rs's lit loop),
+        // and the depth pass's whole-mesh draw reads only the
+        // LAST range's end (unchanged by interior empties).
+        //
+        // THE OVERFLOW-FREE PROOF this check completes: with
+        // start ≤ end per range, the four contracts chain into
+        //   0 = draws[0].start ≤ draws[0].end = draws[1].start ≤
+        //   … ≤ last.end = vertices.len(),
+        // so EVERY endpoint of EVERY range sits in
+        // [0, vertex_count] — each `end - start` is in
+        // [0, vertex_count] and each `start` (the draw's
+        // firstVertex) is inside the buffer. The subtraction the
+        // lit and reflection recorders perform is overflow-free
+        // on EVERY admitted description, by construction. ----
+        for (index, range) in mesh.draws.iter().enumerate() {
+            if range.start > range.end {
+                return Err(RendererError::Vulkan(format!(
+                    "the scene mesh's draw range {index} [{}, {}) is inverted \
+                     (every range must satisfy start ≤ end — the lit pass \
+                     computes end - start as the draw's vertex count, which \
+                     would underflow)",
+                    range.start, range.end
+                )));
+            }
         }
         for (index, pair) in mesh.draws.windows(2).enumerate() {
             if pair[0].end != pair[1].start {
@@ -258,9 +324,22 @@ impl SceneDescription {
                 )));
             }
         }
-        // ---- the shadow bounds: a sane world AABB. NaN refuses —
-        // `partial_cmp` returns `None` for NaN operands, so only a
-        // true `min ≤ max` ordering passes. ----
+        // ---- the shadow bounds: a sane, FINITE world AABB. The
+        // ordering check keeps its NaN refusal (`partial_cmp`
+        // returns `None` for NaN operands, so only a true
+        // `min ≤ max` passes). The finite check closes the
+        // re-audit's R02 hole: `partial_cmp` ORDERS infinities
+        // ([-inf, 0] and [-inf, +inf] compare `Less`, [inf, inf]
+        // compares `Equal`), so nonfinite endpoints passed the
+        // ordering — but the bounds' consumers do ARITHMETIC, not
+        // comparisons: `shadows::cascade_for`'s 8-corner walk
+        // turns ±inf endpoints into infinite spans (the scale
+        // `2/span` collapses to 0) and NaN centers
+        // ((-inf + inf) · 0.5), silently degenerating the light
+        // matrix the depth pass and the shadowed compare both
+        // read. FINITE-ONLY is the coherent numerical domain for
+        // authored scene floats the pass math consumes — the same
+        // discipline the wet mirror's plane height gets below. ----
         for axis in 0..3 {
             if !matches!(
                 bounds.min[axis].partial_cmp(&bounds.max[axis]),
@@ -272,11 +351,31 @@ impl SceneDescription {
                     bounds.min, bounds.max
                 )));
             }
+            if !bounds.min[axis].is_finite() || !bounds.max[axis].is_finite() {
+                return Err(RendererError::Vulkan(format!(
+                    "the scene bounds are not finite on axis {axis} (min {} vs \
+                     max {} — the shadow cascade's projection math consumes \
+                     the AABB and degenerates on nonfinite input)",
+                    bounds.min[axis], bounds.max[axis]
+                )));
+            }
         }
         // ---- the wet ground roles: inside the mesh; the receiver
         // non-empty (an empty receiver would silently disable the wet
         // re-draw); reflected ranges may be EMPTY (a legal no-op draw)
-        // but never inverted or outside the mesh. ----
+        // but never inverted or outside the mesh. The mirror plane
+        // FINITE (the re-audit's R02 class on the reflection's own
+        // authored float): `planar.rs` mirrors the wet camera across
+        // it (`2 · plane_y − eye`, the mirrored view-projection), and
+        // a NaN or ±inf plane propagates straight into the mirrored
+        // camera — a silently broken reflection, not a refusal. ----
+        if !ground.receiver_plane_y.is_finite() {
+            return Err(RendererError::Vulkan(format!(
+                "the wet ground's mirror-plane height {} is not finite (the \
+                 reflection camera mirrors across it)",
+                ground.receiver_plane_y
+            )));
+        }
         if ground.receiver.start >= ground.receiver.end {
             return Err(RendererError::Vulkan(format!(
                 "the wet ground's receiver range [{}, {}) is empty",
@@ -528,5 +627,185 @@ mod tests {
             scene.validate().is_err(),
             "an out-of-mesh reflected range must refuse"
         );
+    }
+
+    /// THE R01 WITNESS (the re-audit's confirmed pass-today shape,
+    /// verified RED at the lane's base `600bff2`: the table
+    /// [[0,5],[5,3],[3,N]] over the corner's own vertex count
+    /// passed validate — contiguity compares end to the NEXT
+    /// start, so it holds on both sides of an inverted range, and
+    /// the coverage check only reads the LAST end). The lit pass's
+    /// draw loop would then compute `3 - 5` as a u32 vertex count:
+    /// a debug panic, a four-billion-vertex release draw. The
+    /// non-inversion admission refuses it.
+    // The witness IS the inverted range the clippy lint exists to
+    // catch in production code — here it is the INPUT the refusal
+    // is proven on, so the lint is allowed for the literal alone.
+    #[allow(clippy::reversed_empty_ranges)]
+    #[test]
+    fn inverted_draw_ranges_are_refused() {
+        let mut scene = corner();
+        let vertex_count = scene.mesh.vertices.len() as u32;
+        scene.mesh.draws[0] = 0..5;
+        scene.mesh.draws[1] = 5..3;
+        scene.mesh.draws[2] = 3..vertex_count;
+        let error = scene.validate().expect_err("an inverted range must refuse");
+        let RendererError::Vulkan(text) = &error else {
+            panic!("the refusal is a Vulkan error: {error:?}");
+        };
+        assert!(
+            text.contains("draw range 1") && text.contains("inverted"),
+            "the refusal names the inverted range: {text}"
+        );
+        // The same inversion in the LAST range: the tail's start
+        // exceeds its end while every legacy check still holds —
+        // contiguity at the shared 127, coverage at the end value
+        // itself (126 == the vertex count).
+        let mut scene = corner();
+        let vertex_count = scene.mesh.vertices.len() as u32;
+        scene.mesh.draws[1] = scene.mesh.draws[0].end..vertex_count + 1;
+        scene.mesh.draws[2] = vertex_count + 1..vertex_count;
+        let error = scene.validate().expect_err("the inverted tail must refuse");
+        let RendererError::Vulkan(text) = &error else {
+            panic!("the refusal is a Vulkan error: {error:?}");
+        };
+        assert!(
+            text.contains("draw range 2") && text.contains("inverted"),
+            "the refusal names the inverted tail: {text}"
+        );
+    }
+
+    /// THE EMPTY-RANGE POLICY PIN (the R01 policy decision,
+    /// investigated and documented): admission requires
+    /// start ≤ end, NOT start < end — an empty material draw is
+    /// legal. The builder itself emits one
+    /// (`mesh_from_boxes` over a table that leaves a material
+    /// unpopulated emits `[n, n)` for it), and the downstream
+    /// consumption is safe with NO guard: a vertexCount-0
+    /// `cmd_draw` is a Vulkan no-op, and the depth pass's
+    /// whole-mesh draw reads only the last range's end. This
+    /// description — the corner's masses minus material 1's — is
+    /// the builder-faithful shape, empty middle range and empty
+    /// reflected role both, and it admits.
+    #[test]
+    fn an_empty_material_draw_is_legal() {
+        // A table with material-2 boxes ONLY: material 1's range
+        // comes out empty from the real builder.
+        let boxes = [crate::lit_scene::SceneBox {
+            min: [6.0, 0.0, -40.0],
+            max: [40.0, 9.0, -6.0],
+            material: 2,
+        }];
+        let (vertices, draws) =
+            crate::lit_mesh::mesh_from_boxes(&boxes, 40.0, 0.0, PASS_FAMILY_MATERIAL_COUNT);
+        assert_eq!(
+            draws[1],
+            draws[0].end..draws[0].end,
+            "the builder emits the empty range for the unpopulated material"
+        );
+        let mut scene = corner();
+        scene.mesh = SceneMesh {
+            vertices,
+            draws: draws.clone(),
+        };
+        scene.ground = GroundRoles {
+            receiver: draws[0].clone(),
+            receiver_plane_y: 0.0,
+            // The empty reflected role: the mirror reflects the
+            // material-1 mass that no longer exists — the
+            // documented legal no-op.
+            reflected: [draws[1].clone(), draws[2].clone()],
+        };
+        scene
+            .validate()
+            .expect("an empty material draw is a legal no-op draw");
+    }
+
+    /// THE R02 WITNESSES (the re-audit's confirmed pass-today
+    /// shapes, verified RED at the lane's base `600bff2`:
+    /// `partial_cmp` ORDERS infinities, so all of these passed
+    /// min ≤ max — [-inf, 0] and [-inf, +inf] compare `Less`,
+    /// [inf, inf] compares `Equal`). The bounds' consumer does
+    /// arithmetic, not comparisons — `cascade_for`'s 8-corner
+    /// walk over ±inf endpoints yields infinite spans (scale
+    /// `2/span` = 0) and NaN centers — so the admission domain is
+    /// finite-only.
+    #[test]
+    fn nonfinite_scene_bounds_are_refused() {
+        // [-inf, 0] on axis 0.
+        let mut scene = corner();
+        scene.bounds.min[0] = f32::NEG_INFINITY;
+        scene.bounds.max[0] = 0.0;
+        let error = scene.validate().expect_err("[-inf, 0] bounds must refuse");
+        let RendererError::Vulkan(text) = &error else {
+            panic!("the refusal is a Vulkan error: {error:?}");
+        };
+        assert!(
+            text.contains("not finite on axis 0"),
+            "the refusal names the axis and the domain: {text}"
+        );
+        // [0, +inf] on axis 0.
+        let mut scene = corner();
+        scene.bounds.min[0] = 0.0;
+        scene.bounds.max[0] = f32::INFINITY;
+        let error = scene.validate().expect_err("[0, +inf] bounds must refuse");
+        let RendererError::Vulkan(text) = &error else {
+            panic!("the refusal is a Vulkan error: {error:?}");
+        };
+        assert!(
+            text.contains("not finite on axis 0"),
+            "the refusal names the axis and the domain: {text}"
+        );
+        // [-inf, +inf] on axis 0.
+        let mut scene = corner();
+        scene.bounds.min[0] = f32::NEG_INFINITY;
+        scene.bounds.max[0] = f32::INFINITY;
+        let error = scene
+            .validate()
+            .expect_err("[-inf, +inf] bounds must refuse");
+        let RendererError::Vulkan(text) = &error else {
+            panic!("the refusal is a Vulkan error: {error:?}");
+        };
+        assert!(
+            text.contains("not finite on axis 0"),
+            "the refusal names the axis and the domain: {text}"
+        );
+        // [inf, inf] — the Equal shape that ALSO ordered before
+        // the finite check (partial_cmp returns Some(Equal)).
+        let mut scene = corner();
+        scene.bounds.min[1] = f32::INFINITY;
+        scene.bounds.max[1] = f32::INFINITY;
+        let error = scene.validate().expect_err("[inf, inf] bounds must refuse");
+        let RendererError::Vulkan(text) = &error else {
+            panic!("the refusal is a Vulkan error: {error:?}");
+        };
+        assert!(
+            text.contains("not finite on axis 1"),
+            "the refusal names the axis and the domain: {text}"
+        );
+    }
+
+    /// The R02 finite domain on the reflection's own authored
+    /// float (verified RED at the lane's base: a NaN mirror plane
+    /// passed validate): the wet camera mirrors across the plane
+    /// (`2 · plane_y − eye` in `planar.rs`), so a nonfinite plane
+    /// propagates into the mirrored view-projection instead of
+    /// refusing.
+    #[test]
+    fn a_nonfinite_mirror_plane_is_refused() {
+        for plane in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut scene = corner();
+            scene.ground.receiver_plane_y = plane;
+            let error = scene
+                .validate()
+                .expect_err("a nonfinite mirror plane must refuse");
+            let RendererError::Vulkan(text) = &error else {
+                panic!("the refusal is a Vulkan error: {error:?}");
+            };
+            assert!(
+                text.contains("mirror-plane height"),
+                "the refusal names the plane: {text}"
+            );
+        }
     }
 }
