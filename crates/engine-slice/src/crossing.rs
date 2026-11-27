@@ -24,14 +24,14 @@ use engine_persist::{
     AppendOutcome, AuthorityMode, AwardCheckpoint, AwardState, CHECKPOINT_METADATA_DOMAIN,
     CONSEQUENCE_BATCH_DOMAIN, CanonicalMedium, CaptureReceipt, CheckpointMetadata, ClassifiedSpan,
     CommitOutcome, CommitPipeline, ConfirmedEvidence, ConsequenceEnvelope, ConsequenceId,
-    CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash, JournalRotation, JournalScan,
-    KeyPhase, MediumError, OccurrenceSpan, PipelineError, PointerDurability,
-    RECLAMATION_COMPLETE_DOMAIN, RECLAMATION_LEDGER_DOMAIN, ReclaimUnit, ReclaimedIndexEntry,
-    ReclamationComplete, ReclamationLedger, ReconcileOutcome, Reconciliation, RecoveryAnchor,
-    RecoveryError, RevisionRecord, SignalLane, SkipEntry, SourceBaseline, SourcePosition,
-    StoredObject, T1Journal, TailState, active_journal_path, chain_range_digest,
-    compute_digest_seed, publish_checkpoint_mk, publish_reclamation_ledger,
-    read_journal_generations, reconcile, retire_journal_generations, rotate_session_journal,
+    CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash, JournalRotation, KeyPhase,
+    MediumError, OccurrenceSpan, PipelineError, PointerDurability, RECLAMATION_COMPLETE_DOMAIN,
+    RECLAMATION_LEDGER_DOMAIN, ReclaimUnit, ReclaimedIndexEntry, ReclamationComplete,
+    ReclamationLedger, ReconcileOutcome, Reconciliation, RecoveryAnchor, RecoveryError,
+    RevisionRecord, SignalLane, SkipEntry, SourceBaseline, SourcePosition, StoredObject, T1Journal,
+    TailState, active_journal_path, chain_range_digest, compute_digest_seed, publish_checkpoint_mk,
+    publish_reclamation_ledger, read_journal_generations, reconcile_from_parts,
+    retire_journal_generations, rotate_session_journal,
 };
 
 use crate::npc::{NPC_COUNT, NpcWorld, POSITION_DISCARDED, REGION_COUNT, REGION_GRID};
@@ -3128,14 +3128,15 @@ impl<S: MediumSource> SessionCrossing<S> {
         // BEFORE any recovery application mutates the world: the
         // verified scratch the first post-snapshot capture consumed.
         let scratch_at_snapshot: Vec<u64> = spine.world().pending_signals().to_vec();
-        // 2. The journal scan + the actionability filter: a durably
-        //    canceled transaction is never replayed. A journal file
-        //    that no longer exists (the historical T1 intents dropped
-        //    after canonical confirmation — the accepted B3 coherence
-        //    case: a confirmed consequence materialized in a verified
-        //    snapshot needs no historical T1) is an EMPTY scan: the
-        //    chain and the snapshot carry the truth. THE
-        //    active-journal resolution (PP-B3): the rotation's
+        // 2. The single journal decode + the actionability filter: a
+        //    durably canceled transaction is never replayed. A legacy
+        //    journal file that no longer exists (the historical T1
+        //    intents dropped after canonical confirmation — the
+        //    accepted B3 coherence case: a confirmed consequence
+        //    materialized in a verified snapshot needs no historical
+        //    T1) is an EMPTY recovery: the legacy open re-creates the
+        //    journal and the chain and the snapshot carry the truth.
+        //    THE active-journal resolution (PP-B3): the rotation's
         //    pointer beside the legacy path names the rotated
         //    journal; a missing pointer resolves the legacy itself —
         //    every pre-rotation campaign recovers identically.
@@ -3150,21 +3151,25 @@ impl<S: MediumSource> SessionCrossing<S> {
         // directory flush (Windows) this is the ratified no-op.
         engine_persist::reestablish_pointer_durability(journal_path)
             .map_err(PipelineError::Journal)?;
-        // A POINTER-RESOLVED journal that does not exist is a broken
-        // rotation state — fail closed, never the empty fallback. The
-        // absent-LEGACY case (no pointer present) keeps the accepted
-        // B3 coherence semantics: an empty scan, the chain and the
-        // snapshot carrying the truth.
-        let pointer_present = active_journal != journal_path;
-        // (V2-W F4) THE BOUND RECOVERY'S PROBE — BEFORE THE SCAN: a
+        // A POINTER-RESOLVED BOUND journal that does not exist (or is
+        // empty) is missing authoritative evidence — the bound arm
+        // below fails closed ("journal-root/missing-journal"), never
+        // the empty fallback. The absent-LEGACY case (no binding
+        // installed) keeps the accepted B3 coherence semantics: the
+        // legacy open re-creates the journal and the chain and the
+        // snapshot carry the truth (the no-journal recovery
+        // batteries pin it; a dangling legacy pointer behaves the
+        // same way — the accepted recovery never treats a missing
+        // legacy target as a broken rotation state).
+        // (V2-W F4) THE BOUND RECOVERY'S PROBE — BEFORE THE OPEN: a
         // campaign with an installed journal-root binding recovers
         // ONLY through the bound identities — the binding's location
         // must equal the supplied root's normalized location (a
         // foreign or relocated root refuses), and the binding
-        // SELECTS THE SCANNER: a bound campaign's active journal
+        // SELECTS THE OPENER: a bound campaign's active journal
         // carries the versioned bound header, which the legacy
-        // scanner refuses (the domain-tag mismatch) — the bound
-        // identity-verified scan replaces it (the active journal
+        // open refuses (the domain-tag mismatch) — the bound
+        // identity-verified open replaces it (the active journal
         // must carry the EXACT founding hash and root ID; a legacy,
         // foreign, or corrupt header refuses; a missing active is
         // MISSING authoritative evidence, fail closed — never the
@@ -3193,37 +3198,112 @@ impl<S: MediumSource> SessionCrossing<S> {
             None => None,
         };
         drop(probe);
-        let scan = match &bound_identities {
+        // (P3-L4) THE SINGLE DECODE: the journal is opened ONCE and
+        // both recovery views — the replay's committed/cancellation
+        // set and the reconcile view — are BORROWED from that opened
+        // state (the pipeline holds the same decoded graph; no second
+        // scan graph is materialized). The decode runs under the
+        // opened journal's sidecar lock, so the derived views ARE the
+        // pipeline's own state by construction: the former shape read
+        // the file twice — a lock-free scan, then the open's
+        // under-lock re-read — and replayed from the scan while the
+        // pipeline held the open's state, relying on nothing having
+        // mutated the file between the two reads. The error surfaces
+        // are preserved exactly:
+        // - The bound arm's InstallIncompatible details are
+        //   reproduced BEFORE the open by a bounded header-prefix
+        //   pre-check (the same `read_bound_header` classification
+        //   the old full scan ran, over the same prefix the L1
+        //   `read_prefix` surface delivers): a MISSING or EMPTY
+        //   active journal is "journal-root/missing-journal" (the old
+        //   scan's synthesized-NotFound shapes), damaged or foreign
+        //   evidence "journal-root/active-corrupt". The open's
+        //   committed-history corruption — the one classification
+        //   failure the prefix cannot see and the old scan refused
+        //   FIRST — keeps the same InstallIncompatible mapping; the
+        //   open-stage failures the old shape surfaced only AFTER a
+        //   successful scan (the sidecar handoff timeout, the
+        //   tail-truncation I/O) keep their PipelineError::Journal
+        //   mapping.
+        // - The legacy arm mapped EVERY failure — scan and open alike
+        //   — to PipelineError::Journal, so the single legacy open's
+        //   errors map identically. The old scan's NotFound fallback
+        //   arm was already unreachable (scan_file absorbs a missing
+        //   file into an empty scan — the documented B3 coherence
+        //   rule), and the accepted empty-recovery behavior it fed is
+        //   exactly what the legacy open's create-and-initialize
+        //   produces.
+        let journal = match &bound_identities {
             Some((founding, root_id)) => {
-                engine_persist::journal::scan_bound_file(&active_journal, founding, root_id)
-                    .map_err(|error| TransitionError::InstallIncompatible {
-                        region: 0,
-                        detail: match &error {
-                            engine_persist::JournalError::Io { source, .. }
-                                if source.kind() == std::io::ErrorKind::NotFound =>
-                            {
-                                "journal-root/missing-journal"
-                            }
-                            _ => "journal-root/active-corrupt",
-                        },
-                    })?
-            }
-            None => match T1Journal::scan_file(&active_journal) {
-                Ok(scan) => scan,
-                Err(engine_persist::JournalError::Io { source, .. })
-                    if source.kind() == std::io::ErrorKind::NotFound && !pointer_present =>
-                {
-                    JournalScan {
-                        committed: Vec::new(),
-                        cancellations: Vec::new(),
-                        tail: TailState::Clean,
+                // The header-evidence pre-check: the old scan's error
+                // mapping, on a bounded prefix read (never the whole
+                // file).
+                let bound_header_len =
+                    engine_persist::journal::bound_header_bytes(founding, root_id).len();
+                let header_state =
+                    engine_persist::journal::read_prefix(&active_journal, bound_header_len)
+                        .and_then(|prefix| {
+                            engine_persist::journal::read_bound_header(&prefix, founding, root_id)
+                        });
+                match header_state {
+                    Err(engine_persist::JournalError::Io { source, .. })
+                        if source.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        return Err(TransitionError::InstallIncompatible {
+                            region: 0,
+                            detail: "journal-root/missing-journal",
+                        });
                     }
+                    Err(_) => {
+                        return Err(TransitionError::InstallIncompatible {
+                            region: 0,
+                            detail: "journal-root/active-corrupt",
+                        });
+                    }
+                    Ok(engine_persist::journal::BoundHeaderState::Fresh) => {
+                        // An empty active journal is missing
+                        // authoritative evidence — the old scan's
+                        // synthesized-NotFound refusal, never the
+                        // empty fallback.
+                        return Err(TransitionError::InstallIncompatible {
+                            region: 0,
+                            detail: "journal-root/missing-journal",
+                        });
+                    }
+                    Ok(engine_persist::journal::BoundHeaderState::TornCreation { .. }) => {
+                        return Err(TransitionError::InstallIncompatible {
+                            region: 0,
+                            detail: "journal-root/active-corrupt",
+                        });
+                    }
+                    Ok(engine_persist::journal::BoundHeaderState::Matching { .. }) => {}
                 }
-                Err(error) => return Err(PipelineError::Journal(error).into()),
-            },
+                T1Journal::open_bound(&active_journal, founding, root_id).map_err(|error| {
+                    match error {
+                        // The committed-history corruption the old
+                        // full scan refused before the open ever ran:
+                        // the same fail-closed InstallIncompatible.
+                        engine_persist::JournalError::CorruptCommitted { .. } => {
+                            TransitionError::InstallIncompatible {
+                                region: 0,
+                                detail: "journal-root/active-corrupt",
+                            }
+                        }
+                        // The open-stage failures (the sidecar-lock
+                        // handoff timeout, the tail-truncation I/O):
+                        // the old shape surfaced these only after a
+                        // successful scan, as PipelineError::Journal.
+                        error => PipelineError::Journal(error).into(),
+                    }
+                })?
+            }
+            None => T1Journal::open(&active_journal).map_err(PipelineError::Journal)?,
         };
-        let canceled: HashSet<engine_persist::TransactionId> =
-            scan.cancellations.iter().map(|c| c.target).collect();
+        let canceled: HashSet<engine_persist::TransactionId> = journal
+            .cancellations()
+            .iter()
+            .map(|cancellation| cancellation.target)
+            .collect();
         // 3. The interleaved crossing restore + plan install — the
         //    actionable, post-snapshot deactivations in
         //    journal-sequence order, over the re-opened crossing.
@@ -3233,13 +3313,6 @@ impl<S: MediumSource> SessionCrossing<S> {
         //    re-applied), every later one claims against zero — the
         //    prior install's capture zeroed the scratch exactly as
         //    the live sequence did.
-        let journal = match bound_identities {
-            Some((founding, root_id)) => {
-                T1Journal::open_bound(&active_journal, &founding, &root_id)
-                    .map_err(PipelineError::Journal)?
-            }
-            None => T1Journal::open(&active_journal).map_err(PipelineError::Journal)?,
-        };
         let mut crossing = Self::open_at(source, journal, campaign)?;
         // The campaign journal ROOT (the review corrective F1): the
         // pointer's authoritative location — NOT the resolved active
@@ -3269,19 +3342,38 @@ impl<S: MediumSource> SessionCrossing<S> {
         // evidence can coherently account for lies strictly below
         // this bound.
         let allocation_frontier = spine.stats().scheduled;
-        for transaction in &scan.committed {
-            if canceled.contains(&transaction.id) {
-                continue;
-            }
-            if transaction.plan.is_empty() {
-                // A foreign (plan-less) claim: the application recovery
-                // cannot reconstruct its world effects — the anchor
-                // below surfaces it as unaccounted (the halt), never a
-                // silent partial restore.
-                continue;
-            }
-            let plan =
-                DeactivationPlan::restore(&transaction.plan).map_err(PipelineError::Format)?;
+        // (P3-L4) The replay iterates the SINGLE decoded state — the
+        // pipeline journal's own committed transactions, re-borrowed
+        // per transaction in a scoped block because the replay
+        // interleaves crossing mutations (the implicit reactivation
+        // below borrows the crossing mutably) that a whole-loop slice
+        // borrow cannot outlive. Everything heavy — the envelopes,
+        // the plan bytes — stays in the one decoded graph: each
+        // iteration takes only the plan's owned restore plus the
+        // exact envelope projection the application consumes.
+        let committed_len = crossing.pipeline.journal().transactions().len();
+        for index in 0..committed_len {
+            let (plan, envelope_milestones) = {
+                let transaction = &crossing.pipeline.journal().transactions()[index];
+                if canceled.contains(&transaction.id) {
+                    continue;
+                }
+                if transaction.plan.is_empty() {
+                    // A foreign (plan-less) claim: the application recovery
+                    // cannot reconstruct its world effects — the anchor
+                    // below surfaces it as unaccounted (the halt), never a
+                    // silent partial restore.
+                    continue;
+                }
+                let plan =
+                    DeactivationPlan::restore(&transaction.plan).map_err(PipelineError::Format)?;
+                let envelope_milestones: Vec<(usize, u64)> = transaction
+                    .envelopes
+                    .iter()
+                    .map(|envelope| (envelope.id.npc as usize, envelope.delta.milestones))
+                    .collect();
+                (plan, envelope_milestones)
+            };
             if plan.episode <= director.states()[plan.region].episode {
                 // A pre-snapshot deactivation: already materialized in
                 // the snapshot's ledger and world — never re-applied.
@@ -3387,14 +3479,13 @@ impl<S: MediumSource> SessionCrossing<S> {
                 }
                 director.transition_region(&mut spine, plan.region, plan.from_level, plan.tick);
             }
-            for envelope in &transaction.envelopes {
-                let npc = envelope.id.npc as usize;
+            for (npc, milestones) in envelope_milestones {
                 let base = if restored[npc] {
                     0
                 } else {
                     scratch_at_snapshot[npc]
                 };
-                let missing = envelope.delta.milestones.saturating_sub(base);
+                let missing = milestones.saturating_sub(base);
                 if missing > 0 {
                     spine.world_mut().apply_recovered_crossings(npc, missing);
                 }
@@ -3411,7 +3502,17 @@ impl<S: MediumSource> SessionCrossing<S> {
         //    attestation — PP-B2).
         let confirmed = crossing.pipeline.confirmed_evidence();
         let anchor = build_anchor(&spine, &director, &confirmed)?;
-        let outcome = reconcile(&anchor, &scan, &confirmed).map_err(TransitionError::Recovery)?;
+        // (P3-L4) The coherence verification borrows the single
+        // decoded journal's own committed transactions and
+        // cancellations — the same view the replay consumed, never a
+        // second scan graph.
+        let outcome = reconcile_from_parts(
+            &anchor,
+            crossing.pipeline.journal().transactions(),
+            crossing.pipeline.journal().cancellations(),
+            &confirmed,
+        )
+        .map_err(TransitionError::Recovery)?;
         if let Some(effect) = outcome.report.applied.first() {
             return Err(TransitionError::InstallIncompatible {
                 region: effect.id.region as usize,
@@ -6051,5 +6152,255 @@ mod c5c_reader_tests {
         assert_eq!(detail, "checkpoint-walk/completion-shape-mismatch");
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// (P3-L4) The recovery single-decode discriminating tests: the
+/// recovered crossing's own journal state — the ONE decode the
+/// recovery performs — equals the read-only scan's view of the same
+/// file (the view the former two-decode shape consumed as its
+/// separate first pass), proving the unified replay/reconcile derive
+/// from exactly the evidence the scan would have reported, with no
+/// behavioral drift.
+#[cfg(test)]
+mod recovery_single_decode_tests {
+    use super::*;
+    use crate::npc::{NpcConfig, NpcWorld, install_initial_schedules};
+    use crate::region::{RegionConfig, RegionDirector};
+    use engine_core::{LodLevel, PresenceSample, Spine};
+    use engine_persist::T1Journal;
+
+    /// A temporary campaign directory (the B3 test pattern, local to
+    /// this suite): a unique child of the system temp dir, removed on
+    /// drop.
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "s7-p3l4-single-decode-{name}-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            TestDir(path)
+        }
+
+        fn store(&self) -> std::path::PathBuf {
+            self.0.join("store")
+        }
+
+        fn journal(&self) -> std::path::PathBuf {
+            self.0.join("journal.t1")
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn near_region_4() -> PresenceSample {
+        PresenceSample {
+            position: (-100.0, 0.0),
+            velocity: (0.0, 0.0),
+        }
+    }
+
+    fn far_from_everything() -> PresenceSample {
+        PresenceSample {
+            position: (2000.0, 2000.0),
+            velocity: (0.0, 0.0),
+        }
+    }
+
+    /// The real pair (the crossing battery's own shape): the Lod-mode
+    /// spine plus the director, driven through the per-tick sequence.
+    fn scenario_pair(ticks: u64, presence: &PresenceSample) -> (Spine<NpcWorld>, RegionDirector) {
+        let config = NpcConfig {
+            region_lods_enabled: true,
+            ..NpcConfig::default()
+        };
+        let mut spine = Spine::with_reservation(NpcWorld::new(config.clone()), 200, 60);
+        install_initial_schedules(&mut spine, &config);
+        let mut director = RegionDirector::new(RegionConfig::default()).unwrap();
+        for _ in 0..ticks {
+            director.apply(&mut spine, std::slice::from_ref(presence));
+            spine.run_tick();
+        }
+        (spine, director)
+    }
+
+    /// The durable boundary (the crossing battery's own shape): every
+    /// region whose target under the presence differs routes through
+    /// the durable deactivation.
+    fn durable_boundary(
+        crossing: &mut SessionCrossing,
+        spine: &mut Spine<NpcWorld>,
+        director: &mut RegionDirector,
+        presence: &PresenceSample,
+    ) {
+        let now = spine.clock();
+        for region in 0..REGION_COUNT {
+            let current = director.levels()[region];
+            let next = director.target_level(region, std::slice::from_ref(presence));
+            if next == current {
+                continue;
+            }
+            if next == LodLevel::Dormant {
+                let _journaled = crossing
+                    .deactivate(spine, director, region, now)
+                    .expect("the deactivation commits");
+            } else if current == LodLevel::Dormant {
+                crossing
+                    .activate(spine, director, region, next, now)
+                    .expect("the activation installs");
+            } else {
+                director.transition_region(spine, region, next, now);
+            }
+        }
+    }
+
+    #[test]
+    fn the_recovered_journal_state_equals_the_read_only_scan() {
+        // The crash-recovery fixture (the crossing battery's W2
+        // window): the snapshot at the accrual peak, the durable far
+        // boundary (journal + install), the session lost. The
+        // recovery runs the SINGLE-DECODE path; the recovered
+        // crossing's pipeline journal — the one decoded state the
+        // replay and the reconcile both borrowed — must equal the
+        // read-only scan of the same file (the former first-decode
+        // view) in committed transactions AND cancellations, and the
+        // journal must be untouched by the replay (the reactivation
+        // and install paths journal nothing — the recovery's own
+        // documented contract).
+        let near = near_region_4();
+        let far = far_from_everything();
+        let (mut spine, mut director) = scenario_pair(150, &near);
+        let dir = TestDir::new("equality");
+        let journal = T1Journal::open(dir.journal()).unwrap();
+        let mut crossing =
+            SessionCrossing::open(&dir.store(), journal, "single-decode-campaign").unwrap();
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+        assert!(
+            director.levels()[4] == LodLevel::Dormant,
+            "the boundary deactivated region 4"
+        );
+        drop(crossing);
+        // The OLD view: the lock-free read-only classification the
+        // former two-decode shape consumed as its first pass.
+        let scan = T1Journal::scan_file(dir.journal()).unwrap();
+        assert!(
+            !scan.committed.is_empty(),
+            "the boundary journaled real deactivations"
+        );
+        // THE SINGLE-DECODE RECOVERY (the reactivation replay runs
+        // inside — the crossing mutations the scoped borrows exist to
+        // interleave with).
+        let (recovered_spine, recovered_director, recovered) =
+            SessionCrossing::recover(&dir.store(), &dir.journal(), "single-decode-campaign")
+                .expect("the recovery reconstructs the session");
+        assert_eq!(recovered_director.levels()[4], LodLevel::Dormant);
+        let _ = recovered_spine;
+        // THE EQUALITY: the recovered crossing's own journal state —
+        // identities, envelopes, plans, sequences — is exactly the
+        // read-only scan's view; the unified path replayed and
+        // reconciled from precisely the evidence the scan reports.
+        let recovered_journal = recovered.pipeline.journal();
+        assert_eq!(
+            recovered_journal.transactions(),
+            scan.committed,
+            "the single decode's committed set equals the read-only scan's"
+        );
+        assert_eq!(
+            recovered_journal.cancellations(),
+            scan.cancellations,
+            "the single decode's cancellation set equals the read-only scan's"
+        );
+    }
+
+    #[test]
+    fn the_bound_recovery_fails_closed_on_committed_history_corruption() {
+        // (P3-L4) The single-decode bound arm's committed-history
+        // corruption mapping: a MATCHING bound header over a
+        // corrupted committed interior (a capture frame's envelope
+        // bytes damaged in place — the first transaction's own commit
+        // then fails its count/digest checks) must fail the recovery
+        // with the SAME InstallIncompatible detail the old
+        // scan-first shape produced — the read-only scan refuses the
+        // identical bytes with CorruptCommitted, which the old
+        // crossing mapped to "journal-root/active-corrupt" — never a
+        // pipeline error from the open, and the damaged evidence
+        // stands untouched (no repair, no truncation).
+        let near = near_region_4();
+        let far = far_from_everything();
+        let (mut spine, mut director) = scenario_pair(150, &near);
+        let dir = TestDir::new("corrupt-committed");
+        let journal_root = dir.journal();
+        let mut crossing = SessionCrossing::open_bound_bootstrap(
+            &crate::store::StoreLocation::Directory(dir.store()),
+            &journal_root,
+            "single-decode-corrupt-campaign",
+        )
+        .expect("the bootstrap completes");
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+        assert_eq!(director.levels()[4], LodLevel::Dormant);
+        drop(crossing);
+        // Corrupt the committed interior: a byte deep inside the
+        // first capture frame's record (past the bound header and the
+        // frame's length prefix, inside the envelope payload).
+        let intact = std::fs::read(&journal_root).unwrap();
+        let founding = {
+            let mut medium = engine_persist::local::LocalFileMedium::open(dir.store()).unwrap();
+            engine_persist::reclaim::founding_identity_medium(&mut medium).unwrap()
+        };
+        let root_id = engine_persist::reclaim::journal_root_id(
+            &founding,
+            &engine_persist::reclaim::JournalRootBinding::normalize_location(&journal_root),
+        );
+        let header_len = engine_persist::journal::bound_header_bytes(&founding, &root_id).len();
+        let damage_at = header_len + 8 + 48;
+        assert!(
+            damage_at + 1 < intact.len(),
+            "the journal carries committed frames past the damage point"
+        );
+        let mut damaged = intact.clone();
+        damaged[damage_at] ^= 0xff;
+        std::fs::write(&journal_root, &damaged).unwrap();
+        // The HEAD-equivalence premise, verified on the real bytes:
+        // the read-only scan (the old first decode) refuses the
+        // damaged journal with committed-history corruption.
+        match engine_persist::journal::scan_bound_file(&journal_root, &founding, &root_id) {
+            Err(engine_persist::JournalError::CorruptCommitted { .. }) => {}
+            other => panic!("the read-only scan refuses the damaged history: {other:?}"),
+        }
+        // THE SINGLE-DECODE RECOVERY: the same refusal, the same
+        // InstallIncompatible detail the old scan-first mapping
+        // produced (the prefix pre-check passes — the header is
+        // intact — so the open's CorruptCommitted must be remapped,
+        // never surfaced as a pipeline error).
+        let error = match SessionCrossing::recover(
+            &dir.store(),
+            &journal_root,
+            "single-decode-corrupt-campaign",
+        ) {
+            Err(error) => error,
+            Ok(_recovered) => panic!("the corrupted committed history never recovers"),
+        };
+        assert!(
+            matches!(
+                &error,
+                TransitionError::InstallIncompatible { detail, .. }
+                    if *detail == "journal-root/active-corrupt"
+            ),
+            "the committed-history corruption keeps the scan-first refusal: {error:?}"
+        );
+        // The damaged evidence stands untouched.
+        assert_eq!(std::fs::read(&journal_root).unwrap(), damaged);
     }
 }

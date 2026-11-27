@@ -191,7 +191,7 @@ pub use reclaim::{
 pub use record::{AuthorityMode, RECORD_DOMAIN, RECORD_VERSION, RecordKind, RevisionRecord};
 pub use recovery::{
     AppliedEffect, ConfirmedEvidence, RecoveredParticipant, RecoveryAnchor, RecoveryError,
-    RecoveryOutcome, RecoveryReport, TransitionClassification, reconcile,
+    RecoveryOutcome, RecoveryReport, TransitionClassification, reconcile, reconcile_from_parts,
     reconstruct_episode_frontier,
 };
 pub use recovery_classification::{
