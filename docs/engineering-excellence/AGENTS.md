@@ -8,7 +8,8 @@ main checkout `C:\Users\Willp\Code\GitHub\PostRust` on
 | Agent | Role / Model | Base | Worktree / Branch | Package | Status |
 |---|---|---|---|---|---|
 | orchestrator (this session) | integration coordinator / glm-5.3-w4a8 | 5b93167 | main checkout, `refactor/engineering-excellence` | all | ACTIVE |
-| auditor-core | read-only audit, engine-core / MiMo-V2.6-Pro-RL | 5b93167 | read-only, no branch | P0 | RUNNING |
+| auditor-core | read-only audit, engine-core / MiMo-V2.6-Pro-RL | 5b93167 | read-only, no branch | P0 | RETIRED — wedged without producing anything (owner-observed: claimed running shells, wasn't); no calibration data; replaced below |
+| auditor-core-2 | read-only audit, engine-core / gpt-oss-120b | (records at report) | read-only, no branch | P0 | RUNNING — replacement dispatch with anti-wedge rules (incremental report file, tool-based reads, no cargo) |
 | auditor-persist | read-only audit, engine-persist / gpt-oss-120b | 5b93167 | read-only, no branch | P0 | COMPLETED — `audits/persist.md`; verdicts reconciled in FINDINGS.md (A13 label corrected) |
 | auditor-renderer | read-only audit, engine-renderer+shaders / gpt-oss-120b | 5b93167 | read-only, no branch | P0 | COMPLETED — `audits/renderer.md`; 2 claims refuted + 1 miscount on orchestrator verification (see FINDINGS.md calibration record) |
 | auditor-shell | read-only audit, engine-shell / qwen38-27b | 5b93167 | read-only, no branch | P0 | COMPLETED — `audits/shell.md`; both seed verdicts refuted on direct read and reconciled (see FINDINGS.md calibration) |
