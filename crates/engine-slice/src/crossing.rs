@@ -1006,13 +1006,17 @@ impl<S: MediumSource> SessionCrossing<S> {
         // conservative ambiguous-recovery policy — the automatic
         // repair is prohibited).
         if journal_path.exists() {
+            // Read only the bound header prefix; the full journal is not needed
+            // for the header check (the scan below is a separate full read).
+            let bound_header_len =
+                engine_persist::journal::bound_header_bytes(&founding, &root_id).len();
             let residue_bytes =
-                engine_persist::journal::read_journal_bytes(journal_path).map_err(|_error| {
-                    TransitionError::InstallIncompatible {
+                engine_persist::journal::read_prefix(journal_path, bound_header_len).map_err(
+                    |_error| TransitionError::InstallIncompatible {
                         region: 0,
                         detail: "journal-root/residue-unreadable",
-                    }
-                })?;
+                    },
+                )?;
             match engine_persist::journal::read_bound_header(&residue_bytes, &founding, &root_id) {
                 Err(_error) => {
                     return Err(TransitionError::InstallIncompatible {
