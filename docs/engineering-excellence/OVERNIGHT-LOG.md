@@ -363,3 +363,7 @@ crate-visible aliases (internal wiring; the full re-point a P6 fold item).
 Zero count movement (21/225/173 identical); the pose digest + FNV pins green.
 The E-S4 recommendation recorded (the B15 minimal-consumer re-measure).
 Verification run `46144553154` dispatched.
+
+**E-S3 verified green:** run `46144553154` at `fcecedd` — all five jobs
+success. The A06 extraction stands at E-S1+E-S2+E-S3 landed; E-S4 (the B15
+minimal-consumer re-measure) dispatched next.
