@@ -331,3 +331,19 @@ Zero count movement (173/0/0 measured identical); the pose FNV pins proven
 by name; the minimal lock delta ratified. The E-S3 recommendation recorded:
 re-point the root re-export (slice touches nothing on the shim's re-export
 surface). Verification run `46142180934` dispatched.
+
+## The T08 design landed + the combat guard's second-occurrence correction
+
+The T08 design (`ba0a089`, lane `16156a8`): Option A admission bounding —
+three caps before any graph mutation, the closed-form whole-tick ceiling,
+the E-10 release bounded-not-suspended, alternatives rejected with
+mechanisms. Implementation queued (3 staged spine commits).
+
+The E-S2 verification run `46142180934` failed on the combat 8192 diagonal
+probe (38.2 ms vs the 37.8 ms bound) — the **second occurrence**, firing
+the measured-actuals correction protocol: 4 → 6 µs/record with the three
+accumulated actuals in the test comment (39.5/38.2 at 8192, 51.3 at 32768),
+~1.37× headroom over the worst observed, a quadratic blowup still failing
+by 3×+. The siblings untouched (their own actuals, not yet fired). The
+covering run `46142938607` dispatched at `ba0a089` (E-S2 + the guard + the
+design docs).
