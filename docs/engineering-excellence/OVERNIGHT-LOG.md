@@ -515,3 +515,16 @@ compact consulting the frontier; the explicit administrative override as a
 distinct greppable authorization); arm 3 refuted; arm 4 documented with the
 option recorded. Pins corrected (main 1686/1635). Run `46164606020` dispatched.
 R1 running.
+
+## R1 landed (`3b4ba23`) — both review arms confirmed and fixed
+
+Arm A (the recycling hazard): the deterministic tcache-LIFO witness red; the
+lifetime-scoped content-digest identity landed (recorded only on successful
+regeneration; diverging digest → re-admission). Arm B (the submission
+ordering): the reviewer's exact hypothesis red (the refusal-established
+generation admitting the invalid retry); the CA-10 deferred-commit reorder
+landed. The orchestrator's local release measurement corrected the lane's
+own pin inference (233 measured vs 226 inferred from a stale base). Pins:
+main 1692/1641, renderer-release 233. The R2 batch verified green in
+isolation (`46164606020` at `1dcc3cb`); the R1 batch run `46166085364`
+dispatched at `3b4ba23`.
