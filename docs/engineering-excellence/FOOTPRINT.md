@@ -411,12 +411,41 @@ it links the whole workspace statically minus the demo's main.rs).
   `Version { 3, 4, 18 }`; closure shape unchanged (15 unique, the §6.3
   shell-consumer figure). Any future SDL upgrade is now a deliberate
   manifest edit, per the owner's clause.
-- **F-02 (MED — optional-dep candidate): rusqlite is unconditional in
-  engine-persist.** Local-only consumers pay 3.5 s of SQLite C compile +
-  10 external crates they never call. A `sqlite` feature gate is the
-  clean lever (§8); the counterweights: SqliteMedium is the documented
-  production fallback and the migration target, and engine-slice's test
-  harness dev-depends on it. Owner decision.
+- **F-02 (MED → RESOLVED 2026-11-28, D-EE-10 item 4 — the owner
+  APPROVED the `sqlite` feature gate): rusqlite WAS unconditional
+  in engine-persist.** The original finding: local-only consumers
+  paid 3.5 s of SQLite C compile + 10 external crates they never
+  call; the counterweights (SqliteMedium the documented production
+  fallback, `migrate_local_to_sqlite` public API, engine-slice's
+  test-harness dev-dep) made it the owner's call. **The
+  disposition (measured at this lane's tree, the
+  ee/persist-sqlite-feature-gate worktree):** rusqlite is now
+  `optional = true` behind engine-persist's `sqlite` feature —
+  **ENABLED BY DEFAULT** (ordinary consumers retain the full
+  functionality: the provider, the §6.1 migration, the backup);
+  engine-slice threads its own `sqlite` feature (default ON,
+  `default-features = false` on the persist edge) so the
+  integration tier is genuinely local-only under
+  `--no-default-features`. The measured fresh-minimal-consumer
+  differences (the §6.1 method, throwaway dirs outside the repo):
+  the **lock resolves 42 → 12 packages**; the unique closure
+  (`--edges normal,build,dev`) **26 → 12 real packages** — the
+  disappeared set is exactly the SQLite chain: rusqlite,
+  libsqlite3-sys, fallible-iterator, fallible-streaming-iterator,
+  hashlink, hashbrown 0.17.2, foldhash, smallvec, bitflags (linked)
+  plus the C toolchain cc, find-msvc-tools, pkg-config, shlex,
+  vcpkg (build-only) — **14 crates** (9 on the normal edge alone);
+  the **cold consumer build 16.9 s → 10.4 s (−6.5 s, −38%,
+  including the bundled SQLite C compile)**; the **consumer binary
+  2,378,240 → 658,944 B (−72%)**; the cold target dir 440.11 →
+  345.02 MiB. Both consumers RUN identically (the local medium's
+  open/validate/drop lifecycle). The no-weakening rule is enforced
+  at the store-selection seam: a `StoreLocation::Database`
+  selection in a local-only build refuses with the typed
+  `MediumError::SqliteNotBuilt` naming the missing feature — never
+  a silent local downgrade — and the CI carries the local-only leg
+  (the exclusion-map gate: 125 Windows / 124 Linux sqlite-gated
+  tests excluded, both batteries green).
 - **F-03 (design question, no quick fix): the renderer has no
   types-only surface.** Plain-data submission types (no device) still
   pull the full SDL static + ash + naga shader compile (41.9 s cold).
@@ -465,11 +494,16 @@ What the measurements say moves "lightweight" (and by how much, measured):
    deps, dev-deps closure-neutral in slice, feature-gated test fixtures
    pulling nothing. This is why 8.3 is already high; the residual cost is
    concentrated, not diffuse.
-2. **The sqlite feature gate (F-02)** would take a local-only persist
-   consumer from 24 external crates + 9.0 s to roughly 14 external + ~5 s
-   (the sha2 chain + core remain). The single highest-leverage
-   packaging decision available; needs the owner's call because it
-   reshapes the production-fallback story.
+2. **The sqlite feature gate (F-02) — IMPLEMENTED 2026-11-28 (D-EE-10
+   item 4, the owner's APPROVAL).** The prediction below held and is
+   now the measured record (F-02's disposition above): a local-only
+   persist consumer resolves **9 external crates** (the sha2 chain +
+   core remain; 14 fewer on the build edge — the C toolchain), builds
+   **6.5 s faster cold**, and links a **72% smaller binary**. The
+   production-fallback story is preserved by the default-ON feature
+   and the fail-visible `SqliteNotBuilt` refusal — never a silent
+   downgrade. (The pre-implementation estimate was 24 external +
+   9.0 s → ~14 external + ~5 s; the measured actuals are in F-02.)
 3. **A renderer types-only surface (F-03)** would take a
    submission-types consumer from 41.9 s / 54 crates to near
    engine-core's 2.9 s / 2 — but it is an API architecture project

@@ -37,9 +37,10 @@ use engine_core::{
     Event, EventClass, EventSpec, ExecCtx, Fingerprinter, HistoryKind, LodLevel, PresenceSample,
     Schedule, Spine, Tick, World,
 };
+#[cfg(feature = "sqlite")]
+use engine_persist::SqliteMedium;
 use engine_persist::{
-    AuthorityMode, CanonicalMedium, CommitOutcome, LocalFileMedium, RevisionRecord, SqliteMedium,
-    T1Journal,
+    AuthorityMode, CanonicalMedium, CommitOutcome, LocalFileMedium, RevisionRecord, T1Journal,
 };
 
 use crate::crossing::{SessionCrossing, restore_session, save_session};
@@ -348,114 +349,121 @@ pub fn run() {
     //     over the Database provider (the SQLite canonical medium,
     //     D-PP-1), printed alongside the file-medium numbers above as
     //     the reference comparison. The workload is identical.
-    println!("SQLite provider path (PP-B1 — the Database provider, the same workload):");
-    let (mut spine, mut director) = scenario_pair(150, &near);
-    let sqlite_root = campaign_dir("sqlite");
-    let sqlite_db = sqlite_root.join("store.db");
-    let journal = T1Journal::open(sqlite_root.join("journal.t1")).unwrap();
-    let mut crossing = SessionCrossing::open_at(
-        &StoreLocation::Database(sqlite_db.clone()),
-        journal,
-        "benchmark-sqlite",
-    )
-    .unwrap();
-    let mut sqlite_publication = Vec::new();
-    let mut db_bytes_before = std::fs::metadata(&sqlite_db).map(|m| m.len()).unwrap_or(0);
-    let mut sqlite_publication_growth = Vec::new();
-    for _ in 0..20 {
-        director.apply(&mut spine, std::slice::from_ref(&near));
-        spine.run_tick();
-        let start = Instant::now();
-        crossing.publish_snapshot(&spine, &director).unwrap();
-        sqlite_publication.push(start.elapsed());
-        let db_bytes_after = std::fs::metadata(&sqlite_db).map(|m| m.len()).unwrap_or(0);
-        sqlite_publication_growth.push(db_bytes_after - db_bytes_before);
-        db_bytes_before = db_bytes_after;
-    }
-    report(
-        "snapshot publication (the SQLite append incl. commit)",
-        &mut sqlite_publication,
-    );
-    let growth: u64 = sqlite_publication_growth.iter().sum();
-    println!(
-        "  db growth: ~{} B per snapshot publication (total {} B over 20)",
-        growth / 20,
-        growth
-    );
-    drop(crossing);
-    // The chain cold-open validation (the session open's founding→HEAD
-    // walk) over the SQLite database.
-    let start = Instant::now();
-    let _medium = SqliteMedium::open(&sqlite_db).unwrap();
-    println!(
-        "  chain cold-open validation at 21 revisions: {:.3} ms (db {db_bytes_before} B)",
-        start.elapsed().as_secs_f64() * 1e3
-    );
-    // The canonical confirmation over SQLite (fresh campaigns, the
-    // same discipline as the file-medium section).
-    let mut sqlite_confirmation = Vec::new();
-    for campaign in 0..10 {
+    //     (D-EE-10 item 4) The provider requires the `sqlite`
+    //     feature — the whole measured section exists only under it
+    //     (DEFAULT ON; a --no-default-features build is local-only
+    //     and prints the file-medium reference only).
+    #[cfg(feature = "sqlite")]
+    {
+        println!("SQLite provider path (PP-B1 — the Database provider, the same workload):");
         let (mut spine, mut director) = scenario_pair(150, &near);
-        let dir = campaign_dir(&format!("sqlite-txn-{campaign}"));
-        let journal = T1Journal::open(dir.join("journal.t1")).unwrap();
+        let sqlite_root = campaign_dir("sqlite");
+        let sqlite_db = sqlite_root.join("store.db");
+        let journal = T1Journal::open(sqlite_root.join("journal.t1")).unwrap();
         let mut crossing = SessionCrossing::open_at(
-            &StoreLocation::Database(dir.join("store.db")),
+            &StoreLocation::Database(sqlite_db.clone()),
             journal,
             "benchmark-sqlite",
         )
         .unwrap();
+        let mut sqlite_publication = Vec::new();
+        let mut db_bytes_before = std::fs::metadata(&sqlite_db).map(|m| m.len()).unwrap_or(0);
+        let mut sqlite_publication_growth = Vec::new();
+        for _ in 0..20 {
+            director.apply(&mut spine, std::slice::from_ref(&near));
+            spine.run_tick();
+            let start = Instant::now();
+            crossing.publish_snapshot(&spine, &director).unwrap();
+            sqlite_publication.push(start.elapsed());
+            let db_bytes_after = std::fs::metadata(&sqlite_db).map(|m| m.len()).unwrap_or(0);
+            sqlite_publication_growth.push(db_bytes_after - db_bytes_before);
+            db_bytes_before = db_bytes_after;
+        }
+        report(
+            "snapshot publication (the SQLite append incl. commit)",
+            &mut sqlite_publication,
+        );
+        let growth: u64 = sqlite_publication_growth.iter().sum();
+        println!(
+            "  db growth: ~{} B per snapshot publication (total {} B over 20)",
+            growth / 20,
+            growth
+        );
+        drop(crossing);
+        // The chain cold-open validation (the session open's founding→HEAD
+        // walk) over the SQLite database.
+        let start = Instant::now();
+        let _medium = SqliteMedium::open(&sqlite_db).unwrap();
+        println!(
+            "  chain cold-open validation at 21 revisions: {:.3} ms (db {db_bytes_before} B)",
+            start.elapsed().as_secs_f64() * 1e3
+        );
+        // The canonical confirmation over SQLite (fresh campaigns, the
+        // same discipline as the file-medium section).
+        let mut sqlite_confirmation = Vec::new();
+        for campaign in 0..10 {
+            let (mut spine, mut director) = scenario_pair(150, &near);
+            let dir = campaign_dir(&format!("sqlite-txn-{campaign}"));
+            let journal = T1Journal::open(dir.join("journal.t1")).unwrap();
+            let mut crossing = SessionCrossing::open_at(
+                &StoreLocation::Database(dir.join("store.db")),
+                journal,
+                "benchmark-sqlite",
+            )
+            .unwrap();
+            let now = spine.clock();
+            crossing
+                .deactivate(&mut spine, &mut director, 4, now)
+                .unwrap()
+                .expect("the scenario captured consequences");
+            let start = Instant::now();
+            let CommitOutcome::Confirmed(_) = crossing.commit_canonical().unwrap() else {
+                panic!("the confirmation confirms");
+            };
+            sqlite_confirmation.push(start.elapsed());
+            drop(crossing);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        report(
+            "canonical confirmation (commit_canonical, SQLite)",
+            &mut sqlite_confirmation,
+        );
+        // The session recovery over SQLite.
+        let (mut spine, mut director) = scenario_pair(150, &near);
+        let dir = campaign_dir("sqlite-recovery");
+        let recovery_db = dir.join("store.db");
+        let journal = T1Journal::open(dir.join("journal.t1")).unwrap();
+        let mut crossing = SessionCrossing::open_at(
+            &StoreLocation::Database(recovery_db.clone()),
+            journal,
+            "benchmark-sqlite",
+        )
+        .unwrap();
+        crossing.publish_snapshot(&spine, &director).unwrap();
         let now = spine.clock();
         crossing
             .deactivate(&mut spine, &mut director, 4, now)
             .unwrap()
             .expect("the scenario captured consequences");
-        let start = Instant::now();
-        let CommitOutcome::Confirmed(_) = crossing.commit_canonical().unwrap() else {
-            panic!("the confirmation confirms");
-        };
-        sqlite_confirmation.push(start.elapsed());
         drop(crossing);
+        let mut sqlite_recovery = Vec::new();
+        for _ in 0..10 {
+            let start = Instant::now();
+            let (_spine, _director, _crossing) = SessionCrossing::recover_at(
+                &StoreLocation::Database(recovery_db.clone()),
+                &dir.join("journal.t1"),
+                "benchmark-sqlite",
+            )
+            .unwrap();
+            sqlite_recovery.push(start.elapsed());
+        }
+        report(
+            "session recovery (recover_at, SQLite)",
+            &mut sqlite_recovery,
+        );
+        let _ = std::fs::remove_dir_all(&sqlite_root);
         let _ = std::fs::remove_dir_all(&dir);
     }
-    report(
-        "canonical confirmation (commit_canonical, SQLite)",
-        &mut sqlite_confirmation,
-    );
-    // The session recovery over SQLite.
-    let (mut spine, mut director) = scenario_pair(150, &near);
-    let dir = campaign_dir("sqlite-recovery");
-    let recovery_db = dir.join("store.db");
-    let journal = T1Journal::open(dir.join("journal.t1")).unwrap();
-    let mut crossing = SessionCrossing::open_at(
-        &StoreLocation::Database(recovery_db.clone()),
-        journal,
-        "benchmark-sqlite",
-    )
-    .unwrap();
-    crossing.publish_snapshot(&spine, &director).unwrap();
-    let now = spine.clock();
-    crossing
-        .deactivate(&mut spine, &mut director, 4, now)
-        .unwrap()
-        .expect("the scenario captured consequences");
-    drop(crossing);
-    let mut sqlite_recovery = Vec::new();
-    for _ in 0..10 {
-        let start = Instant::now();
-        let (_spine, _director, _crossing) = SessionCrossing::recover_at(
-            &StoreLocation::Database(recovery_db.clone()),
-            &dir.join("journal.t1"),
-            "benchmark-sqlite",
-        )
-        .unwrap();
-        sqlite_recovery.push(start.elapsed());
-    }
-    report(
-        "session recovery (recover_at, SQLite)",
-        &mut sqlite_recovery,
-    );
-    let _ = std::fs::remove_dir_all(&sqlite_root);
-    let _ = std::fs::remove_dir_all(&dir);
 
     // 6. The storage-growth sweep (the review corrective): the spine's
     //    execution LEDGER (one record per execution, serialized in
@@ -1047,46 +1055,51 @@ pub fn run() {
 
         // 9i — THE SQLITE PARITY (the tick, the deactivation tick, the
         // required confirmation, and the close over the Database
-        // provider).
-        let dir = campaign_dir("orchestration-sqlite");
-        let location = found_benchmark_store(&dir, true);
-        let (spine, director) = scenario_pair(150, &near);
-        let journal = T1Journal::open(dir.join("journal.t1")).unwrap();
-        let mut session =
-            OrchestratedSession::open(spine, director, &location, journal, "b5-bench").unwrap();
-        for _ in 0..50 {
-            session.tick(&near_presence).unwrap();
-        }
-        let mut sqlite_ticks = Vec::new();
-        for _ in 0..100 {
+        // provider). (D-EE-10 item 4) The provider requires the
+        // `sqlite` feature — the parity section exists only under it
+        // (DEFAULT ON; a --no-default-features build is local-only).
+        #[cfg(feature = "sqlite")]
+        {
+            let dir = campaign_dir("orchestration-sqlite");
+            let location = found_benchmark_store(&dir, true);
+            let (spine, director) = scenario_pair(150, &near);
+            let journal = T1Journal::open(dir.join("journal.t1")).unwrap();
+            let mut session =
+                OrchestratedSession::open(spine, director, &location, journal, "b5-bench").unwrap();
+            for _ in 0..50 {
+                session.tick(&near_presence).unwrap();
+            }
+            let mut sqlite_ticks = Vec::new();
+            for _ in 0..100 {
+                let start = Instant::now();
+                session.tick(&near_presence).unwrap();
+                sqlite_ticks.push(start.elapsed());
+            }
+            report(
+                "the SQLite authoritative tick (idle worker)",
+                &mut sqlite_ticks,
+            );
             let start = Instant::now();
-            session.tick(&near_presence).unwrap();
-            sqlite_ticks.push(start.elapsed());
+            session.tick(&far_presence).unwrap();
+            let sqlite_deactivation = start.elapsed();
+            let start = Instant::now();
+            session.commit_canonical().unwrap();
+            let sqlite_commit = start.elapsed();
+            println!(
+                "  the SQLite T1 deactivation tick: {:.3} ms; the SQLite required confirmation: {:.3} ms (n=1 each)",
+                sqlite_deactivation.as_secs_f64() * 1e3,
+                sqlite_commit.as_secs_f64() * 1e3
+            );
+            let start = Instant::now();
+            let close_report = session.close();
+            let sqlite_close = start.elapsed();
+            assert!(close_report.failure.is_none(), "{:?}", close_report.failure);
+            println!(
+                "  the SQLite graceful close: {:.3} ms (n=1)",
+                sqlite_close.as_secs_f64() * 1e3
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         }
-        report(
-            "the SQLite authoritative tick (idle worker)",
-            &mut sqlite_ticks,
-        );
-        let start = Instant::now();
-        session.tick(&far_presence).unwrap();
-        let sqlite_deactivation = start.elapsed();
-        let start = Instant::now();
-        session.commit_canonical().unwrap();
-        let sqlite_commit = start.elapsed();
-        println!(
-            "  the SQLite T1 deactivation tick: {:.3} ms; the SQLite required confirmation: {:.3} ms (n=1 each)",
-            sqlite_deactivation.as_secs_f64() * 1e3,
-            sqlite_commit.as_secs_f64() * 1e3
-        );
-        let start = Instant::now();
-        let close_report = session.close();
-        let sqlite_close = start.elapsed();
-        assert!(close_report.failure.is_none(), "{:?}", close_report.failure);
-        println!(
-            "  the SQLite graceful close: {:.3} ms (n=1)",
-            sqlite_close.as_secs_f64() * 1e3
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
     println!(
         "  PP-B4 boundaries: the optional publication path is asynchronous for the authority thread (a bounded enqueue; a typed Busy at the boundary); T1 durability and protected maintenance retain their accepted SYNCHRONOUS boundaries — never a claim that all persistence is nonblocking; the 16.667 ms frame budget is the comparison reference, never a guaranteed maximum"

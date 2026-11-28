@@ -3125,6 +3125,10 @@ mod a3_scratch_tests {
 
 #[cfg(all(test, feature = "composite-test-fixture"))]
 mod a3_tests {
+    // (D-EE-10 item 4) The a2_tests dormancy note applies here
+    // identically: unix-carried helpers, Windows's cross-platform
+    // tests are the SQLite twins (feature-gated).
+    #![cfg_attr(not(unix), allow(dead_code))]
     use super::*;
     use crate::medium::{CanonicalMedium, StoredObject};
 
@@ -3146,12 +3150,14 @@ mod a3_tests {
         (root.clone(), crate::LocalFileMedium::open(&root).unwrap())
     }
 
+    #[cfg(feature = "sqlite")]
     fn a3_sqlite_store(label: &str) -> (std::path::PathBuf, crate::SqliteMedium) {
         let path = temp_dir_path("sqlite", label).with_extension("db");
         let medium = crate::SqliteMedium::open(&path).unwrap();
         (path, medium)
     }
 
+    #[cfg(feature = "sqlite")]
     fn a3_sqlite_cleanup(path: &std::path::Path) {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
@@ -5292,6 +5298,8 @@ mod a3_tests {
     /// evidence on every platform — the exact single-batch
     /// partition and the multi-batch conditional premise over the
     /// transactional provider.
+    /// (D-EE-10 item 4) Requires the SQLite provider — feature-gated.
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_sqlite_twin_exact_partition() {
         let (path, mut medium) = a3_sqlite_store("t13");

@@ -476,7 +476,9 @@ mod exclusion_tests;
 /// cursor's Debug fingerprint) and the live trusted cursor's
 /// fingerprint. The fingerprints are comparable across providers
 /// because the cursor field sets are the identical §5.3.2 contract.
-#[cfg(test)]
+/// (D-EE-10 item 4) The battery itself requires the SQLite twin —
+/// both providers' seams exist only under the `sqlite` feature.
+#[cfg(all(test, feature = "sqlite"))]
 impl LocalFileMedium {
     pub(crate) fn walk_differential_cold(
         &self,

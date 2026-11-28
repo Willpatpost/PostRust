@@ -7,10 +7,28 @@ license.workspace = true
 
 [dependencies]
 engine-core = { path = "../engine-core" }
-rusqlite = { version = "0.40.2", features = ["bundled", "limits", "backup"] }
+# D-EE-10 item 4 (the owner APPROVED 2026-11-27): the SQLite
+# provider is an OPTIONAL dependency behind the `sqlite` Cargo
+# feature — ENABLED BY DEFAULT (ordinary consumers retain the full
+# functionality: the SqliteMedium provider, the §6.1 migration, the
+# backup capture). A --no-default-features build is LOCAL-ONLY:
+# rusqlite (and the bundled SQLite C compile, the F-02 measured
+# cost) never resolves, and every operation that REQUIRES the
+# provider fails visibly with the typed MediumError::SqliteNotBuilt
+# refusal — NEVER a silent local downgrade.
+rusqlite = { version = "0.40.2", features = ["bundled", "limits", "backup"], optional = true }
 sha2 = "0.11"
 
 [features]
+default = ["sqlite"]
+# The SQLite canonical-medium provider (D-EE-10 item 4): the whole
+# `sqlite` module (`SqliteMedium`, `SqliteMediumConfig`, the fault
+# seam), the `migrate` module (`migrate_local_to_sqlite` and its
+# types), the `MediumError::Sqlite` / `MigrationPending` variants,
+# and every sqlite-touching test battery. DEFAULT ON; a
+# --no-default-features build is local-only (the absent-type
+# surface is documented in the lib header).
+sqlite = ["dep:rusqlite"]
 # The K2-C1 compile-time activation barrier (the R8 corrective):
 # composite publication's test-only facility exists ONLY when this
 # feature is explicitly enabled — a normal production build (no
@@ -35,7 +53,7 @@ crash-test-seams = []
 
 [[test]]
 name = "composite_append"
-required-features = ["composite-test-fixture"]
+required-features = ["composite-test-fixture", "sqlite"]
 
 [[test]]
 name = "composite_reader"

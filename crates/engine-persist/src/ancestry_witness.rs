@@ -3694,6 +3694,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_discovery_twin_over_sqlite() {
         // (A1-1 §3.13) The provider-parity twin: the same
@@ -3847,6 +3848,13 @@ mod tests {
 
 #[cfg(all(test, feature = "composite-test-fixture"))]
 pub(crate) mod a12_tests {
+    // (D-EE-10 item 4) The fixture battery's helpers are carried on
+    // unix by the LocalFile twin regressions; on Windows their only
+    // cross-platform tests are the SQLite twins (feature-gated) —
+    // the non-unix dormancy marker (the A12IndexDoctor precedent)
+    // keeps a Windows local-only fixture build warning-clean
+    // without excluding any coverage.
+    #![cfg_attr(not(unix), allow(dead_code))]
     use super::*;
     use crate::medium::CanonicalMedium;
 
@@ -3883,12 +3891,14 @@ pub(crate) mod a12_tests {
         (root.clone(), crate::LocalFileMedium::open(root).unwrap())
     }
 
+    #[cfg(feature = "sqlite")]
     fn a12_sqlite_store(label: &str) -> (std::path::PathBuf, crate::SqliteMedium) {
         let path = std::env::temp_dir().join(format!("s7-a12-{}.db", a12_unique(label)));
         let medium = crate::SqliteMedium::open(&path).unwrap();
         (path, medium)
     }
 
+    #[cfg(feature = "sqlite")]
     fn a12_sqlite_cleanup(path: &std::path::Path) {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
@@ -4219,6 +4229,9 @@ pub(crate) mod a12_tests {
 
     /// The single-fire interception the stale-parent, Unknown,
     /// pass-divergence, and concurrent-competitor arms drive.
+    /// (D-EE-10 item 4) The double wraps the SQLite provider — the
+    /// whole interceptor exists only under the `sqlite` feature.
+    #[cfg(feature = "sqlite")]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum A12Arm {
         None,
@@ -4242,6 +4255,7 @@ pub(crate) mod a12_tests {
     /// A1-3 read-only regression observes the public verifier's
     /// write freedom), and retains the last competitor's record
     /// identity (the F2 arms install one beneath the publisher).
+    #[cfg(feature = "sqlite")]
     struct A12Wrapped {
         inner: crate::SqliteMedium,
         arm: A12Arm,
@@ -4252,6 +4266,7 @@ pub(crate) mod a12_tests {
         last_competitor: Option<Hash>,
     }
 
+    #[cfg(feature = "sqlite")]
     impl A12Wrapped {
         fn armed(inner: crate::SqliteMedium, arm: A12Arm) -> Self {
             A12Wrapped {
@@ -4298,6 +4313,7 @@ pub(crate) mod a12_tests {
         }
     }
 
+    #[cfg(feature = "sqlite")]
     impl CanonicalMedium for A12Wrapped {
         fn head(&mut self) -> Result<Option<Hash>, MediumError> {
             self.inner.head()
@@ -4570,6 +4586,7 @@ pub(crate) mod a12_tests {
         let _ = std::fs::remove_dir_all(&journal);
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_sqlite_publication_completes_and_survives_restart() {
         let (path, mut medium) = a12_sqlite_store("sqlite-positive");
@@ -4628,7 +4645,7 @@ pub(crate) mod a12_tests {
         let _ = std::fs::remove_dir_all(&journal);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "sqlite"))]
     #[test]
     fn the_witness_content_is_provider_independent() {
         // The same label, payloads, keys, ticks, and journal-root
@@ -4702,6 +4719,7 @@ pub(crate) mod a12_tests {
         let _ = std::fs::remove_dir_all(&journal);
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_oversized_member_refuses_before_any_append() {
         // The PASS-0 single-entry ceiling: a member whose canonical
@@ -5062,6 +5080,7 @@ pub(crate) mod a12_tests {
         let _ = std::fs::remove_dir_all(&journal);
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_stale_parent_retry_converges() {
         // (The A1-2 F2 corrective — the ordinary unrelated-head
@@ -5090,6 +5109,7 @@ pub(crate) mod a12_tests {
         let _ = std::fs::remove_dir_all(&journal);
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_unknown_not_installed_retries_to_accepted() {
         let (path, mut medium) = a12_sqlite_store("unknown-absent");
@@ -5112,6 +5132,7 @@ pub(crate) mod a12_tests {
         let _ = std::fs::remove_dir_all(&journal);
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_unknown_reconciles_installed_without_a_tier() {
         let (path, mut medium) = a12_sqlite_store("unknown-installed");
@@ -5137,6 +5158,7 @@ pub(crate) mod a12_tests {
         let _ = std::fs::remove_dir_all(&journal);
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_unverifiable_unknown_refuses_typed() {
         let (path, mut medium) = a12_sqlite_store("unverifiable");
@@ -5172,6 +5194,7 @@ pub(crate) mod a12_tests {
         let _ = std::fs::remove_dir_all(&journal);
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_pass1_divergence_refuses_without_publication() {
         // PASS 0 read the member's genuine bytes; PASS 1's re-read
@@ -5268,6 +5291,7 @@ pub(crate) mod a12_tests {
         let _ = std::fs::remove_dir_all(&journal);
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_kernel_discovery_is_bounded_not_per_shard() {
         // (The A1-2 F1 corrective) The bounded-kernel evidence: a
@@ -5336,6 +5360,7 @@ pub(crate) mod a12_tests {
         let _ = std::fs::remove_dir_all(&journal);
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_stale_cas_with_a_same_key_competitor_returns_the_tierless_duplicate() {
         // (The A1-2 F2 corrective) The concurrent same-key
@@ -5385,6 +5410,7 @@ pub(crate) mod a12_tests {
         let _ = std::fs::remove_dir_all(&journal);
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_stale_cas_with_a_conflicting_same_key_competitor_refuses_typed() {
         // (The A1-2 F2 corrective) The concurrent same-key CONFLICT:
@@ -5427,6 +5453,7 @@ pub(crate) mod a12_tests {
         let _ = std::fs::remove_dir_all(&journal);
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_unknown_retry_with_a_same_key_competitor_returns_the_duplicate() {
         // (The A1-2 F2 corrective) The same re-resolution on the
@@ -5949,6 +5976,7 @@ pub(crate) mod a12_tests {
     /// (A1-3) The read-only guarantee: the public verifier performs
     /// NO mutating medium call — no append, no reclaim, no begin,
     /// no checkpoint — over a complete witness.
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_public_verifier_is_read_only() {
         let (path, mut medium) = a12_sqlite_store("readonly");
@@ -6104,6 +6132,11 @@ pub(crate) mod a12_tests {
 
 #[cfg(all(test, feature = "composite-test-fixture"))]
 mod a13_tests {
+    // (D-EE-10 item 4) The a12_tests dormancy note applies here
+    // identically: unix-carried helpers, Windows's cross-platform
+    // tests are the SQLite twins (feature-gated).
+    #![cfg_attr(not(unix), allow(dead_code))]
+    #[cfg(any(unix, feature = "sqlite"))]
     use super::*;
     #[cfg(unix)]
     use crate::medium::CanonicalMedium;
@@ -6198,6 +6231,7 @@ mod a13_tests {
 
     /// The SQLite twin: the classification and the restart on the
     /// transactional provider.
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_public_verifier_sqlite_twin_survives_restart() {
         let path = std::env::temp_dir().join(format!(
@@ -6845,6 +6879,7 @@ mod bp1_production_tests {
         .unwrap()
     }
 
+    #[cfg(feature = "sqlite")]
     fn sqlite_store(label: &str) -> (std::path::PathBuf, crate::SqliteMedium) {
         let path = temp_path("sqlite", label).with_extension("db");
         let medium = crate::SqliteMedium::open(&path).unwrap();
@@ -6866,6 +6901,12 @@ mod bp1_production_tests {
     /// TRUE epochs, the ascending digest over the members EXCLUDING
     /// SK, the self-skip to p1), the MK, the plan, every audit, and
     /// the V2 begin. The caller supplies the medium.
+    /// (D-EE-10 item 4) On Windows its callers are the SQLite-lane
+    /// regressions (feature-gated); the unix LocalFile production
+    /// regressions carry it on every build — the non-unix dormancy
+    /// marker (the A12IndexDoctor precedent) keeps a Windows
+    /// local-only build warning-clean without excluding coverage.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn production_campaign(
         medium: &mut dyn CanonicalMedium,
         label: &str,
@@ -7010,6 +7051,7 @@ mod bp1_production_tests {
     /// the real production entry point, the feature-disabled build,
     /// the complete CP2 admission chain, and the published witness
     /// independently VERIFIED through the production A1-3 reader.
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_sqlite_production_publication_verifies() {
         let (path, mut medium) = sqlite_store("t1");
@@ -7057,6 +7099,7 @@ mod bp1_production_tests {
     /// installed witness resolves every deterministic key by the
     /// EXACT complete verification — never a fabricated durability —
     /// and the installed state remains Verified.
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_duplicate_publication_verifies_exactly() {
         let (path, mut medium) = sqlite_store("t3");
@@ -7169,6 +7212,7 @@ mod bp1_production_tests {
     /// checkpoint (PASS 0's begin authority refuses before any
     /// witness work) and a genuine campaign without the V2 begin
     /// (the begin authority's definite-absence refusal).
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_wrong_checkpoint_and_absent_begin_refuse() {
         let (path, mut store) = sqlite_store("t5");

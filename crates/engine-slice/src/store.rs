@@ -15,9 +15,11 @@
 
 use std::path::PathBuf;
 
+#[cfg(feature = "sqlite")]
+use engine_persist::SqliteMedium;
 use engine_persist::{
     AppendOutcome, CanonicalMedium, ChainSummary, LocalFileMedium, MediumError, Reconciliation,
-    RevisionRecord, SqliteMedium, SyncTier,
+    RevisionRecord, SyncTier,
 };
 
 /// Where a campaign's canonical store lives — the explicit provider
@@ -93,19 +95,45 @@ pub enum SessionStore {
     /// The reference implementation (the file medium).
     Local(LocalFileMedium),
     /// The production provider (PP-B1, the owner-ratified D-PP-1).
+    /// (D-EE-10 item 4) Present only under the `sqlite` feature —
+    /// DEFAULT ON; a --no-default-features build carries the local
+    /// medium only.
+    #[cfg(feature = "sqlite")]
     Sqlite(SqliteMedium),
 }
 
 impl SessionStore {
     /// Opens the store at the location (the provider selection is the
     /// location's shape — never inferred from content, never silent).
+    /// (D-EE-10 item 4, the owner's fail-visible rule) A
+    /// `StoreLocation::Database` selection in a build without the
+    /// `sqlite` feature refuses with the typed
+    /// [`MediumError::SqliteNotBuilt`] naming the missing feature —
+    /// **NEVER a silent downgrade to the local file medium** (the
+    /// weaker durability tier can never stand in for the transactional
+    /// one the location demands).
     pub fn open(location: &StoreLocation) -> Result<Self, MediumError> {
         match location {
             StoreLocation::Directory(root) => {
                 Ok(SessionStore::Local(LocalFileMedium::open(root.clone())?))
             }
             StoreLocation::Database(path) => {
-                Ok(SessionStore::Sqlite(SqliteMedium::open(path.clone())?))
+                #[cfg(feature = "sqlite")]
+                {
+                    Ok(SessionStore::Sqlite(SqliteMedium::open(path.clone())?))
+                }
+                #[cfg(not(feature = "sqlite"))]
+                {
+                    Err(MediumError::SqliteNotBuilt {
+                        detail: format!(
+                            "the campaign location {} names the SQLite database \
+                             provider, which this build excludes — rebuild with \
+                             engine-persist's `sqlite` feature (the default); \
+                             refusing, never a silent local downgrade",
+                            path.display()
+                        ),
+                    })
+                }
             }
         }
     }
@@ -115,6 +143,7 @@ impl SessionStore {
     pub fn location(&self) -> StoreLocation {
         match self {
             SessionStore::Local(medium) => StoreLocation::Directory(PathBuf::from(medium.root())),
+            #[cfg(feature = "sqlite")]
             SessionStore::Sqlite(medium) => StoreLocation::Database(medium.db_path().to_path_buf()),
         }
     }
@@ -126,6 +155,7 @@ impl SessionStore {
     pub fn checkpoint(&mut self) -> Result<(), MediumError> {
         match self {
             SessionStore::Local(_) => Ok(()),
+            #[cfg(feature = "sqlite")]
             SessionStore::Sqlite(medium) => medium.checkpoint_truncate(),
         }
     }
@@ -135,6 +165,7 @@ impl CanonicalMedium for SessionStore {
     fn head(&mut self) -> Result<Option<engine_persist::Hash>, MediumError> {
         match self {
             SessionStore::Local(medium) => medium.head(),
+            #[cfg(feature = "sqlite")]
             SessionStore::Sqlite(medium) => medium.head(),
         }
     }
@@ -149,6 +180,7 @@ impl CanonicalMedium for SessionStore {
         // its verification) — the forwarding is pure delegation.
         match self {
             SessionStore::Local(medium) => medium.append_admitted(admitted, expected_parent),
+            #[cfg(feature = "sqlite")]
             SessionStore::Sqlite(medium) => medium.append_admitted(admitted, expected_parent),
         }
     }
@@ -156,6 +188,7 @@ impl CanonicalMedium for SessionStore {
     fn read_record(&mut self, id: &engine_persist::Hash) -> Result<RevisionRecord, MediumError> {
         match self {
             SessionStore::Local(medium) => medium.read_record(id),
+            #[cfg(feature = "sqlite")]
             SessionStore::Sqlite(medium) => medium.read_record(id),
         }
     }
@@ -163,6 +196,7 @@ impl CanonicalMedium for SessionStore {
     fn read_object(&mut self, hash: &engine_persist::Hash) -> Result<Vec<u8>, MediumError> {
         match self {
             SessionStore::Local(medium) => medium.read_object(hash),
+            #[cfg(feature = "sqlite")]
             SessionStore::Sqlite(medium) => medium.read_object(hash),
         }
     }
@@ -170,6 +204,7 @@ impl CanonicalMedium for SessionStore {
     fn validate(&mut self) -> Result<ChainSummary, MediumError> {
         match self {
             SessionStore::Local(medium) => medium.validate(),
+            #[cfg(feature = "sqlite")]
             SessionStore::Sqlite(medium) => medium.validate(),
         }
     }
@@ -180,6 +215,7 @@ impl CanonicalMedium for SessionStore {
     ) -> Result<Reconciliation, MediumError> {
         match self {
             SessionStore::Local(medium) => medium.reconcile_unknown(candidate),
+            #[cfg(feature = "sqlite")]
             SessionStore::Sqlite(medium) => medium.reconcile_unknown(candidate),
         }
     }
@@ -187,6 +223,7 @@ impl CanonicalMedium for SessionStore {
     fn durability_tier(&self) -> SyncTier {
         match self {
             SessionStore::Local(medium) => medium.durability_tier(),
+            #[cfg(feature = "sqlite")]
             SessionStore::Sqlite(medium) => medium.durability_tier(),
         }
     }
@@ -198,6 +235,7 @@ impl CanonicalMedium for SessionStore {
     fn effective_object_byte_limit(&mut self) -> Result<u64, MediumError> {
         match self {
             SessionStore::Local(medium) => medium.effective_object_byte_limit(),
+            #[cfg(feature = "sqlite")]
             SessionStore::Sqlite(medium) => medium.effective_object_byte_limit(),
         }
     }
@@ -208,6 +246,7 @@ impl CanonicalMedium for SessionStore {
     ) -> Result<engine_persist::ReclaimOutcome, MediumError> {
         match self {
             SessionStore::Local(medium) => medium.reclaim(directive),
+            #[cfg(feature = "sqlite")]
             SessionStore::Sqlite(medium) => medium.reclaim(directive),
         }
     }
@@ -218,6 +257,7 @@ impl CanonicalMedium for SessionStore {
     ) -> Result<bool, MediumError> {
         match self {
             SessionStore::Local(medium) => medium.reclaim_pending(directive),
+            #[cfg(feature = "sqlite")]
             SessionStore::Sqlite(medium) => medium.reclaim_pending(directive),
         }
     }
@@ -237,6 +277,7 @@ impl CanonicalMedium for SessionStore {
         // implementation, unchanged.
         match self {
             SessionStore::Local(medium) => medium.begin_reclamation(audit, mk, tick),
+            #[cfg(feature = "sqlite")]
             SessionStore::Sqlite(medium) => medium.begin_reclamation(audit, mk, tick),
         }
     }
@@ -251,6 +292,7 @@ impl CanonicalMedium for SessionStore {
         // implementation, unchanged.
         match self {
             SessionStore::Local(medium) => medium.begin_reclamation_v2(mk, tick),
+            #[cfg(feature = "sqlite")]
             SessionStore::Sqlite(medium) => medium.begin_reclamation_v2(mk, tick),
         }
     }
@@ -263,6 +305,7 @@ impl CanonicalMedium for SessionStore {
         // V2 begin authority.
         match self {
             SessionStore::Local(medium) => medium.verify_begin_authority_v2(mk),
+            #[cfg(feature = "sqlite")]
             SessionStore::Sqlite(medium) => medium.verify_begin_authority_v2(mk),
         }
     }
@@ -278,6 +321,7 @@ impl CanonicalMedium for SessionStore {
             SessionStore::Local(medium) => {
                 medium.observe_range_terminal_under_coordination(expected, limits)
             }
+            #[cfg(feature = "sqlite")]
             SessionStore::Sqlite(medium) => {
                 medium.observe_range_terminal_under_coordination(expected, limits)
             }
@@ -293,7 +337,60 @@ impl CanonicalMedium for SessionStore {
         // installed-begin durability authority.
         match self {
             SessionStore::Local(medium) => medium.verify_begin_authority(audit, mk),
+            #[cfg(feature = "sqlite")]
             SessionStore::Sqlite(medium) => medium.verify_begin_authority(audit, mk),
         }
+    }
+}
+
+#[cfg(all(test, not(feature = "sqlite")))]
+mod store_selection_tests {
+    use super::*;
+
+    /// (D-EE-10 item 4, the owner's fail-visible rule) The
+    /// local-only build's provider-selection refusal: a
+    /// `StoreLocation::Database` selection FAILS VISIBLY with the
+    /// typed [`MediumError::SqliteNotBuilt`] naming the missing
+    /// `sqlite` feature — never a silent downgrade to the local
+    /// file medium, never a fresh local store opened in its place.
+    /// This test exists ONLY in the --no-default-features
+    /// configuration (the CI local-only leg executes it by name);
+    /// under the default feature set the SQLite arm is the code
+    /// under test and the refusal is unreachable.
+    #[test]
+    fn store_selection_refuses_database_without_the_sqlite_feature() {
+        let database = std::env::temp_dir().join("s7-ee10-sqlite-not-built-refusal.db");
+        match SessionStore::open(&StoreLocation::Database(database.clone())) {
+            Err(MediumError::SqliteNotBuilt { detail }) => {
+                assert!(
+                    detail.contains("sqlite"),
+                    "the refusal names the missing feature: {detail}"
+                );
+                assert!(
+                    detail.contains("local downgrade"),
+                    "the refusal states the no-silent-downgrade rule: {detail}"
+                );
+                assert!(
+                    detail.contains(&database.display().to_string()),
+                    "the refusal names the refusing location: {detail}"
+                );
+                // The refusal is loud end-to-end: the Display form
+                // names the feature too (the operator's fix).
+                let shown = format!("{}", MediumError::SqliteNotBuilt { detail });
+                assert!(shown.contains("`sqlite` feature is disabled"), "{shown}");
+            }
+            Ok(store) => panic!(
+                "the database selection must refuse typed in a local-only build, \
+                 never open or silently downgrade — a store opened at {}",
+                store.location().display_path()
+            ),
+            Err(other) => panic!(
+                "the refusal must be the typed SqliteNotBuilt, never another \
+                 failure form: {other}"
+            ),
+        }
+        // And nothing was opened: the typed refusal is the
+        // fail-closed outcome (no store handle, no side effect).
+        assert!(!database.exists());
     }
 }

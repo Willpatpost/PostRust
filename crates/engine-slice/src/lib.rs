@@ -3,6 +3,12 @@
 //! The binary is a thin stdin loop; all logic lives here so tests can drive
 //! the same code path without spawning a process.
 
+// (D-EE-10 item 4) The PP-B1 backup tool captures and verifies the
+// SQLITE campaign database — the module exists only under
+// engine-slice's `sqlite` feature (DEFAULT ON; a
+// --no-default-features build is local-only and carries no backup
+// surface — a database campaign cannot exist in such a build).
+#[cfg(feature = "sqlite")]
 pub mod backup;
 pub mod behavior_measurement;
 pub mod benchmark;

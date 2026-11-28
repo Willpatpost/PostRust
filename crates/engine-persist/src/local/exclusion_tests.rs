@@ -6520,6 +6520,7 @@ fn the_v2_begin_authority_refuses_the_mixed_and_absent_states() {
     }
 }
 
+#[cfg(feature = "sqlite")]
 #[test]
 fn the_v2_begin_sqlite_admission_and_authority_matrix() {
     // (V2X-CP2 §10 SQLITE) The transactional twin: the complete
