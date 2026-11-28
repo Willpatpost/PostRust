@@ -127,3 +127,20 @@ consecutive failures. Green logs preserved:
 `~/postrust-logs/t01-evidence/run46127751223-{ubuntu,windows}-heavy-GREEN.log`.
 Any later code change requalifies on its own exact-head run (the docs-only
 T38 landing `23c5249` touches no tested surface).
+
+## T07 — the design landed (the retention safe moving cut, S0)
+
+The design lane (`ee/overnight-t07-retention-design`, commit `69d4c0f`, integrated
+`4709abf`) delivered `designs/T07-retention-frontier.md`: the two-class eligibility
+model (static `ConsequenceFreedom` for permanently-consequence-free worlds; a
+per-consumer monotone eligible-prefix frontier for consequence-bearing ones), the
+frontier in-memory and never on the canonical wire (byte-identity by construction),
+the register rule with typed late-join refusal, observable lag/refusal counters
+(never shedding), and logical-head + amortized-compact storage preserving the
+`&[ExecutionRecord]` slice contract. Orchestrator verification before acceptance:
+docs-only commit; zero production consumers outside spine.rs (grep); the slice
+contract + drain + all eight must-switch sites verified line-exact. One
+discrepancy noted (41-vs-20 `self.ledger` census — pattern scope; the
+implementation re-derives the inventory fresh). Implementation queued behind the
+running build lanes, staged per the design (commit 1 the frontier, commit 2 the
+logical head), with the four measurement obligations named.

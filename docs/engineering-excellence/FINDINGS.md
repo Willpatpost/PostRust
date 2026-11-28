@@ -119,7 +119,7 @@ Classes: CONFIRMED (source-derived), HYPOTHESIS (reproduce-or-refute mandated), 
 | T04 | CONFIRMED (S0, owner contract) | A11/CA15 | dynamic geometry violates complete-primitive admission |
 | T05 | CONFIRMED + strong hypothesis | Q02-analog/A18 | raw caller generations not robust identity/shape contracts |
 | T06 | CONFIRMED latch gap | CA10/CA13 | error disposition can lose terminal device state, unusable slots |
-| T07 | CONFIRMED (S0 for consequences) | Q05/CA07 | retention acknowledgment a permanent assertion, not a safe moving cut |
+| T07 | CONFIRMED (S0 for consequences) | Q05/CA07 | **DESIGN LANDED `4709abf`** (`designs/T07-retention-frontier.md`, lane `69d4c0f` — orchestrator-verified before acceptance): the two-class eligibility + the per-consumer in-memory frontier + the logical-head storage; the implementation queued (staged: commit 1 frontier, commit 2 logical head) behind the running build lanes |
 | T08 | CONFIRMED | B01/Q03/CA03 | housekeeping observation does not bound scheduler work |
 | T09 | CONFIRMED | A08/CA08 | queued ops still traverse unrelated heap elements |
 | T10 | CONFIRMED | Q01/A10/CA05 | oversized lane bounded per object, not localized over many |
