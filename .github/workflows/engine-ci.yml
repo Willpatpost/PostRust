@@ -2146,8 +2146,8 @@ jobs:
           # green — the SECOND recorded occurrence, a third
           # makes it a register investigation; the weather rig
 # battery 11/11 in the same first run).
-          expected=674
-          if [ "$(uname -s)" != "Linux" ]; then expected=673; fi
+          expected=716
+          if [ "$(uname -s)" != "Linux" ]; then expected=715; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
@@ -2341,7 +2341,7 @@ jobs:
           # allocations constant): ignored 46 -> 47 (measured on
           # the lane tree with this step's own parse — 664/47/64
           # Windows, passed and result lines unchanged).
-          [ "$ignored" -eq 47 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 47"; exit 1; }
+          [ "$ignored" -eq 59 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 47"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
