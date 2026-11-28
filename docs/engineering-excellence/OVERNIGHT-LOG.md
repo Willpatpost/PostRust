@@ -412,3 +412,17 @@ tombstone rejection on the value-carrying-relocation finding (verified at
 region.rs:1037), per-class heaps strictly dominated, the keyed-lane
 contingency parked. Measure-first: stage 1's census + workload warrant
 decides implement-vs-park honestly. Stage-1 lane dispatched.
+
+## T09 — the honest PARK (the workload warrant failed)
+
+Stage 1 (lane `5b1afa7`, zero production change): the residual measured real
+(linear; CA-08's 3.8× reproduced at 3.72–3.83× at 100k; entries touched = N
+exactly) — but the workload warrant failed: the region director is the only
+production caller of the class-keyed transitions, its population
+compile-time-capped at ≤~875 unrelated queued at deactivation; the
+entity-scale harnesses never call the class-keyed APIs; the cadence
+hysteresis-gated at ≤0.3% of a 60 Hz frame. **PARK with the reopen trigger
+recorded** (≥5k unrelated queued at transition in a production/rig workload
+— the landed batteries are the ready-made slope evidence for the designed
+stage 2). CI pins corrected (`ff99da7`: main 1676/1625, lines 38). Run
+`46152480236` dispatched.
