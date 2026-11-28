@@ -112,6 +112,17 @@ pub(crate) struct VulkanContext {
     /// indirect-issuance observation's exact shape) into
     /// `FrameOutcome::arena_growth_events` → `RenderStats`.
     pub(super) arena_growth_events: Cell<u64>,
+    /// T02 (strict audit IV, §2.3 of the lifecycle design): the
+    /// RESOURCE EPOCH source — a context-monotonic counter minted
+    /// once per PUBLICATION of a resource identity (a mapped carve's
+    /// creation or growth-commit replacement). The population
+    /// stamps carry the epoch of the carve they vouch for, so a
+    /// replaced carve (a fresh epoch — the counter never repeats)
+    /// can never inherit a previous identity's stamps: resource
+    /// creation, replacement, and reset cannot collide with a
+    /// surviving stamp. Composes with T05's submission-time clears
+    /// (the identity window) — the epoch closes the RESOURCE window.
+    pub(super) resource_epochs: Cell<u64>,
     /// Diagnostic fault-injection seam: arms a one-shot plan for the
     /// corrective finding 3+8 verification. The `u32` ordinal is
     /// 1-based and decrements per MATCHING check across the renderer's
@@ -583,6 +594,7 @@ impl VulkanContext {
             sampler_creations: Cell::new(0),
             indirect_draws_issued: Cell::new(0),
             arena_growth_events: Cell::new(0),
+            resource_epochs: Cell::new(0),
             target_fault: Cell::new(None),
             lifecycle_fault: Cell::new(None),
             corner_pipeline_objects: Cell::new(0),
@@ -1246,6 +1258,19 @@ impl VulkanContext {
     pub(crate) fn record_arena_growth(&self) {
         self.arena_growth_events
             .set(self.arena_growth_events.get() + 1);
+    }
+
+    /// T02 §2.3: mints the next resource epoch — called at exactly
+    /// the sites that publish a mapped carve's IDENTITY (the carve's
+    /// initial creation and each growth-commit replacement; the
+    /// pipeline-replacement path assigns fresh epochs because the
+    /// replacement carves are fresh publications). The first minted
+    /// epoch is 1: the stamps' 0 means UNKNOWN and can never equal a
+    /// minted epoch, so a fresh carve can never inherit a stamp.
+    pub(crate) fn mint_resource_epoch(&self) -> u64 {
+        let next = self.resource_epochs.get() + 1;
+        self.resource_epochs.set(next);
+        next
     }
 
     /// Full teardown in manifest order (assumes swapchain/pipelines/frames

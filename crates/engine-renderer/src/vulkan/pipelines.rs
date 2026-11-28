@@ -141,6 +141,16 @@ pub(crate) struct PipelineState {
     pub region_capacity: u32,
     /// Byte size of one frame slot's region-scene region.
     pub region_slot_bytes: vk::DeviceSize,
+    /// T02 (strict audit IV, §2.3): the region carve's ALLOCATION
+    /// EPOCH — minted at this carve's publications (the initial
+    /// carve and the growth commit), keeping the carve-identity
+    /// protocol uniform across the three mapped carves. No stamp
+    /// consults it TODAY (region bytes carry no population stamps —
+    /// `upload_layers` runs unconditionally every frame, the
+    /// design's §2.2(f)); the field exists for the streaming
+    /// refinements that will stamp region content.
+    #[allow(dead_code)]
+    pub region_allocation_epoch: u64,
     pub(super) region_mapped: *mut core::ffi::c_void,
 }
 
@@ -294,6 +304,7 @@ impl PipelineState {
             region_vbo_memory: vk::DeviceMemory::null(),
             region_capacity: 0,
             region_slot_bytes: 0,
+            region_allocation_epoch: 0,
             region_mapped: core::ptr::null_mut(),
             proxy: None,
             shadows: None,
@@ -486,6 +497,9 @@ impl PipelineState {
             self.region_mapped = region_mapped;
             self.region_capacity = region_capacity;
             self.region_slot_bytes = region_slot_bytes;
+            // T02 §2.3: the growth commit publishes a new carve
+            // identity — mint the fresh epoch.
+            self.region_allocation_epoch = ctx.mint_resource_epoch();
             ctx.record_arena_growth();
             return Ok(());
         }
@@ -504,6 +518,8 @@ impl PipelineState {
         self.region_vbo = region_vbo;
         self.region_vbo_memory = region_vbo_memory;
         self.region_mapped = region_mapped;
+        // T02 §2.3: the initial carve's publication mints its epoch.
+        self.region_allocation_epoch = ctx.mint_resource_epoch();
         Ok(())
     }
 

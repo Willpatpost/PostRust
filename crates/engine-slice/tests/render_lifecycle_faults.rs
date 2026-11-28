@@ -984,6 +984,170 @@ fn never_signaling_attach_quarantine_survives_and_teardown_releases() {
     );
 }
 
+/// T02/L4 (the epoch gate's rig leg — the design's §6 L4 row: "the
+/// interrupted-growth red/green pair (fault-arm the ladder after a
+/// growth, retry, `population_writes_skipped == 0`)"): the
+/// end-to-end interrupted-growth property, driven with the design's
+/// own arm — `PoseGrowthIdle` on a frame whose demand grows the
+/// INSTANCE carve first (the ladder's order: region → instance →
+/// pose): the instance growth COMMITS (a fresh carve epoch
+/// published), then the pose growth's idle window fails the frame —
+/// the audit's primary arm, and exactly the shape whose delta-clear
+/// belt a downstream failure swallows. The RETRY then grows the pose
+/// carve (its own fresh epoch) and re-submits the population:
+/// `population_writes_skipped` must be FROZEN across the retry
+/// frames — every slot's region rewrites through the epoch
+/// mismatches (and on a live head the T05 repack clear beside them —
+/// the identity and resource windows composing), never a stale skip
+/// against the replaced carves' uninitialized bytes. The RED half of
+/// the pair is historical (constructible at the audit's SHA
+/// `096f8d9`, where neither the T05 clears nor the epochs existed);
+/// at the current head the green property is what the rig can prove,
+/// and the epoch arm in isolation is pinned CPU-side
+/// (`an_epoch_bump_rewrites_both_slots_without_any_clear` — the
+/// belt-missing shape with the bare gate's red witness shown
+/// directly). The submission adapter's debug byte-verify (the
+/// always-upload oracle's CPU-side twin) stays green throughout in
+/// debug builds.
+#[test]
+#[ignore = "requires a real Vulkan device and windows (the rig run: release, serial, archived per E-8)"]
+fn interrupted_growth_retry_rewrites_every_slot() {
+    let _guard = sdl_lock();
+    let (mut app, mut renderer) = lifecycle_renderer("T02 L4 interrupted growth");
+    let _ = app.frame();
+    let size = app.window().size_in_pixels();
+    let matrix = lifecycle_matrix(size);
+    attach_corner_scene(&mut renderer).expect("the scene attaches");
+    // A generation-carrying submit (the battery's own helper submits
+    // at generation 0 — always-dirty, no skips to observe; the epoch
+    // witness needs the opted-in protocol).
+    type PoseBlock = [[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS];
+    let submit_at = |renderer: &mut Renderer,
+                     instances: &[engine_renderer::proxy_instances::ProxyInstance],
+                     blocks: &[PoseBlock],
+                     generation: u64|
+     -> engine_renderer::FrameResult {
+        renderer
+            .submit_frame(corner_submission(
+                &matrix,
+                [0.0, 1.7, 15.0],
+                day_preset(),
+                None,
+                corner_bounds(),
+                Some(ProxyPopulation {
+                    instance_generation: generation,
+                    pose_generation: generation,
+                    npc: instances,
+                    npc_poses: blocks,
+                    npc_material: 1,
+                    vehicle: &[],
+                    vehicle_material: 2,
+                    rain: &[],
+                    rain_material: 0,
+                }),
+                None,
+                false,
+                None,
+                size,
+            ))
+            .expect("the populated frame renders")
+    };
+    // THE WARM POPULATION: two npcs at generation 5, four frames —
+    // both slots stamped, the between-tick skips observed (the R2
+    // win the epoch gate must preserve).
+    let small = engine_slice::census::repack::synthetic_population(2);
+    let small_poses: Vec<[[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS]> =
+        vec![engine_renderer::animation::rest_pose_block(); 2];
+    for _ in 0..4 {
+        submit_at(&mut renderer, &small, &small_poses, 5);
+    }
+    let warm_skips = renderer.stats().population_writes_skipped;
+    let warm_growth = renderer.stats().arena_growth_events;
+    assert!(
+        warm_skips > 0,
+        "the warm population observed the between-tick skips (the R2 win)"
+    );
+    // THE INTERRUPTED GROWTH: 200 instances/pose blocks (far past the
+    // carves' 64 floor) at generation 6. The ladder grows the
+    // INSTANCE carve (committed — a fresh epoch published) and then
+    // fails at the POSE growth's idle window: the frame dies after
+    // one growth committed and before any upload ran (the prepare
+    // phase precedes the acquire), the delta-clear belt exactly
+    // what this failure swallows.
+    let large = engine_slice::census::repack::synthetic_population(200);
+    let large_poses: Vec<[[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS]> =
+        vec![engine_renderer::animation::rest_pose_block(); 200];
+    renderer.inject_lifecycle_fault(LifecycleFaultSite::PoseGrowthIdle, 1);
+    let failed = renderer.submit_frame(corner_submission(
+        &matrix,
+        [0.0, 1.7, 15.0],
+        day_preset(),
+        None,
+        corner_bounds(),
+        Some(ProxyPopulation {
+            instance_generation: 6,
+            pose_generation: 6,
+            npc: &large,
+            npc_poses: &large_poses,
+            npc_material: 1,
+            vehicle: &[],
+            vehicle_material: 2,
+            rain: &[],
+            rain_material: 0,
+        }),
+        None,
+        false,
+        None,
+        size,
+    ));
+    match failed {
+        Err(engine_renderer::RendererError::InjectedFault(_)) => {}
+        other => panic!("the growing frame fails at the pose growth's idle, got {other:?}"),
+    }
+    let after_failure_growth = renderer.stats().arena_growth_events;
+    assert!(
+        after_failure_growth > warm_growth,
+        "the INSTANCE growth committed before the pose idle failed the frame ({} -> {})",
+        warm_growth,
+        after_failure_growth
+    );
+    // THE RETRY: the same growing population at the same generation.
+    // The pose growth now commits (its own fresh epoch); every
+    // slot's region must rewrite — population_writes_skipped FROZEN
+    // across the retry frames (a stale skip against the replaced
+    // carves is exactly the hazard).
+    let skipped_before_retry = renderer.stats().population_writes_skipped;
+    for _ in 0..4 {
+        let outcome = submit_at(&mut renderer, &large, &large_poses, 6);
+        assert!(outcome.presented, "the retry frame presents");
+    }
+    assert_eq!(
+        renderer.stats().population_writes_skipped,
+        skipped_before_retry,
+        "the interrupted-growth retry rewrote every region (no stale skip \
+         against the replaced carves)"
+    );
+    // The stable population then skips again (the R2 win preserved
+    // on the NEW carve epochs).
+    let before_stable = renderer.stats().population_writes_skipped;
+    for _ in 0..4 {
+        let outcome = submit_at(&mut renderer, &large, &large_poses, 6);
+        assert!(outcome.presented);
+    }
+    assert!(
+        renderer.stats().population_writes_skipped > before_stable,
+        "the stable population on the new carve skips again (the R2 win)"
+    );
+    let stats = renderer.stats();
+    assert_eq!(stats.validation_errors, 0, "{:?}", stats.recent_validation);
+    drop(renderer);
+    drop(app);
+    println!(
+        "T02 L4: the interrupted-growth retry rewrote every slot (skips frozen), \
+              the stable population skipped again on the new epochs"
+    );
+}
+
 /// T06/L1 (the lifecycle substrate's rig leg — the design's
 /// LIFECYCLE-T02-T03-T06-T16 §6 L1 row): the CA-13 latch absorbed
 /// into the `RendererLifecycle` state machine keeps every refusal

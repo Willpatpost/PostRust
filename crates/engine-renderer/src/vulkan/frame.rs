@@ -62,7 +62,7 @@ use super::{FenceTimeoutClass, classify_fence_timeout};
 use super::{corner, post_draw, proxy_draw, scene_record};
 use crate::config::{DemoScenePreference, DynamicClamp, FRAMES_IN_FLIGHT, PresentModePreference};
 use crate::overlay::OverlayVertex;
-use crate::proxy_instances::generation_write_needed;
+use crate::proxy_instances::population_write_needed;
 use crate::submission::FrameInputs;
 
 /// A single frame slot owns this mapping. The slot fence must have
@@ -201,6 +201,20 @@ pub(crate) struct PopulationStamps {
     /// written with ([npc, vehicle, rain]) — the indirect-count
     /// identity beside the generation.
     pub indirect_counts: [[u32; 3]; FRAMES_IN_FLIGHT as usize],
+    /// T02 (strict audit IV, §2.3): the per-slot EPOCH halves — the
+    /// allocation epoch of the carve each stamp's bytes were written
+    /// INTO, recorded together with those bytes at the upload site.
+    /// 0 = unknown (never equal to a minted epoch, which start at 1):
+    /// a REPLACED carve (a growth commit's or a pipeline
+    /// replacement's fresh publication) can never inherit a previous
+    /// identity's stamp — the resource-window half of the gate
+    /// [`crate::proxy_instances::population_write_needed`], the
+    /// correctness bearer the audit's delayed-invalidation finding
+    /// demanded (T05's submission-time clears close the identity
+    /// window; the two compose).
+    pub instance_epochs: [u64; FRAMES_IN_FLIGHT as usize],
+    pub pose_epochs: [u64; FRAMES_IN_FLIGHT as usize],
+    pub indirect_epochs: [u64; FRAMES_IN_FLIGHT as usize],
 }
 
 impl Default for PopulationStamps {
@@ -210,6 +224,9 @@ impl Default for PopulationStamps {
             pose: [0; FRAMES_IN_FLIGHT as usize],
             indirect: [0; FRAMES_IN_FLIGHT as usize],
             indirect_counts: [[0; 3]; FRAMES_IN_FLIGHT as usize],
+            instance_epochs: [0; FRAMES_IN_FLIGHT as usize],
+            pose_epochs: [0; FRAMES_IN_FLIGHT as usize],
+            indirect_epochs: [0; FRAMES_IN_FLIGHT as usize],
         }
     }
 }
@@ -251,6 +268,8 @@ impl PopulationStamps {
         self.instance = [0; FRAMES_IN_FLIGHT as usize];
         self.indirect = [0; FRAMES_IN_FLIGHT as usize];
         self.indirect_counts = [[0; 3]; FRAMES_IN_FLIGHT as usize];
+        self.instance_epochs = [0; FRAMES_IN_FLIGHT as usize];
+        self.indirect_epochs = [0; FRAMES_IN_FLIGHT as usize];
     }
 
     /// T05 — the POSE half's repack invalidation (the instance
@@ -259,6 +278,7 @@ impl PopulationStamps {
     /// the advancing pose half rewrites).
     pub(crate) fn clear_pose(&mut self) {
         self.pose = [0; FRAMES_IN_FLIGHT as usize];
+        self.pose_epochs = [0; FRAMES_IN_FLIGHT as usize];
     }
 }
 
@@ -727,20 +747,22 @@ pub(crate) fn render_frame(
     frames.image_index = image_index;
 
     // P5 §3.3 (A18/R2) — RESOURCE-REPLACEMENT INVALIDATION, the
-    // growth arm: any arena growth THIS frame (the delta over the
-    // baseline taken at entry — the ensure ladder in either
-    // preparation path, or the out-of-date arm's re-run, all of
-    // which precede this point) re-created a mapped carve at a
-    // larger size under `device_wait_idle` with NO content copy, so
-    // no population stamp can vouch for any slot's content anymore.
-    // Clearing forces one rewrite per slot — correctness first; the
-    // pow2 growth quantum bounds the events (and therefore the
-    // forced rewrites) to `log2(cap / 64)` per session. Conservative
-    // by design: a REGION growth (not an instance/pose buffer) also
-    // clears the population stamps — one redundant rewrite, never a
-    // stale skip. The recreation arm of the invalidation lives in
-    // `recreate_swapchain` (the pipeline replacement re-creates the
-    // instance and indirect buffers there).
+    // growth arm — DEMOTED TO A BELT by T02 (strict audit IV, §2.3):
+    // the epoch gate at the upload site
+    // ([`crate::proxy_instances::population_write_needed`], the
+    // carve's minted allocation epoch beside the generation) is the
+    // CORRECTNESS BEARER — a replaced carve's fresh epoch can never
+    // equal a surviving stamp's, so the delayed-invariant hazard the
+    // audit sketched (a growth event swallowed by a later error
+    // before this clear runs, the next frame's baseline absorbing
+    // the counter) is closed at the RESOURCE side, not by the call
+    // sequence. The clear is KEPT as defense-in-depth (one redundant
+    // rewrite per growth event — the growth events are log-bounded,
+    // and the belt also covers the conservative region-growth arm
+    // below); the recreation arm of the invalidation lives in
+    // `recreate_swapchain` (the pipeline replacement re-publishes
+    // the instance and indirect carves with FRESH EPOCHS there —
+    // the same rule at the replacement site).
     if ctx.arena_growth_events.get() != arena_growth_before {
         frames.population_stamps.clear();
     }
@@ -1507,8 +1529,20 @@ fn upload_frame_data(
         // always writes and resets the stamp, so an opted-in
         // generation can never skip against a slot holding some
         // other caller's bytes.
-        if generation_write_needed(
+        // T02 §2.3: the EXTENDED gate — the carve's allocation epoch
+        // beside the generation. A REPLACED carve (a growth commit
+        // or a pipeline replacement published a fresh epoch) can
+        // never inherit a surviving stamp, so the interrupted-growth
+        // hazard the audit sketched (growth commits, then a
+        // downstream failure swallows the delta clear, then a retry
+        // at the surviving generation) rewrites through the epoch
+        // mismatch — the correctness bearer; the frame flow's
+        // growth-delta clear below is the belt.
+        let instance_carve_epoch = proxy_state.allocation_epoch();
+        if population_write_needed(
+            frames.population_stamps.instance_epochs[slot],
             frames.population_stamps.instance[slot],
+            instance_carve_epoch,
             upload.instance_generation,
         ) {
             // CA-12 (F12): the admitted-counts-vs-physical-carve check
@@ -1526,6 +1560,7 @@ fn upload_frame_data(
             )?;
             unsafe { proxy_state.write_slot(slot, upload.bytes) };
             frames.population_stamps.instance[slot] = upload.instance_generation;
+            frames.population_stamps.instance_epochs[slot] = instance_carve_epoch;
         } else {
             outcome.population_writes_skipped += 1;
         }
@@ -1545,8 +1580,12 @@ fn upload_frame_data(
             && matches!(upload.mode, crate::ProxyDrawMode::Indirect)
         {
             let submitted_counts = [upload.npc_count, upload.vehicle_count, upload.rain_count];
-            if generation_write_needed(
+            // T02: the indirect block rides the INSTANCE carve's
+            // epoch (its buffer is published only beside that carve).
+            if population_write_needed(
+                frames.population_stamps.indirect_epochs[slot],
                 frames.population_stamps.indirect[slot],
+                instance_carve_epoch,
                 upload.instance_generation,
             ) || frames.population_stamps.indirect_counts[slot] != submitted_counts
             {
@@ -1559,6 +1598,7 @@ fn upload_frame_data(
                     )
                 };
                 frames.population_stamps.indirect[slot] = upload.instance_generation;
+                frames.population_stamps.indirect_epochs[slot] = instance_carve_epoch;
                 frames.population_stamps.indirect_counts[slot] = submitted_counts;
             } else {
                 outcome.population_writes_skipped += 1;
@@ -1577,8 +1617,17 @@ fn upload_frame_data(
             outcome.pose_supplied = (upload.pose_bytes.len() / crate::animation::POSE_STRIDE)
                 .min(u32::MAX as usize) as u32;
             outcome.pose_capacity = retained.blocks_capacity();
-            if generation_write_needed(frames.population_stamps.pose[slot], upload.pose_generation)
-            {
+            // T02 §2.3: the pose carve's epoch beside the pose
+            // generation — the same extended gate (the pose carve's
+            // growth commits mint fresh epochs; the retained state
+            // survives pipeline replacements, which do NOT re-mint).
+            let pose_carve_epoch = retained.allocation_epoch();
+            if population_write_needed(
+                frames.population_stamps.pose_epochs[slot],
+                frames.population_stamps.pose[slot],
+                pose_carve_epoch,
+                upload.pose_generation,
+            ) {
                 // CA-12 (F12): the same admitted-vs-carve backstop on the
                 // pose path (the instance check's own discipline — the
                 // pre-fix `debug_assert` alone gated this write in
@@ -1590,6 +1639,7 @@ fn upload_frame_data(
                 )?;
                 unsafe { retained.write_slot(slot, upload.pose_bytes) };
                 frames.population_stamps.pose[slot] = upload.pose_generation;
+                frames.population_stamps.pose_epochs[slot] = pose_carve_epoch;
             } else {
                 outcome.population_writes_skipped += 1;
             }
@@ -2317,6 +2367,7 @@ pub(crate) fn present_semaphore_len_for(current_len: usize, required: usize) -> 
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+    use crate::proxy_instances::generation_write_needed;
 
     /// THE A04 ZERO-COST STATEMENT (design §3.4, the type-level
     /// half): the collapsed parameter set is plain stack data —
@@ -2467,6 +2518,16 @@ mod policy_tests {
         let mut slot_instances = vec![Vec::<u8>::new(); slots];
         let mut slot_poses = vec![Vec::<u8>::new(); slots];
         let mut slot_indirect = vec![Vec::<u8>::new(); slots];
+        // T02 §2.3: the modeled carve epochs (the minted identities
+        // the extended gate compares). The growth events below
+        // replace a carve WITHOUT any stamp clear — the belt-missing
+        // shape the audit's delayed-invalidation finding sketched —
+        // so the ORACLE equality holds only if the epoch alone
+        // forces the rewrite (the red witness of the bare-generation
+        // gate: it would skip and keep the replaced carve's
+        // uninitialized bytes).
+        let mut instance_carve_epoch = 1_u64;
+        let mut pose_carve_epoch = 1_u64;
         // The oracle side: always-write (generation 0, fresh records,
         // every region copied every frame).
         let mut oracle_bytes = Vec::new();
@@ -2510,6 +2571,17 @@ mod policy_tests {
             } else {
                 (instance_generation, pose_generation)
             };
+            // T02: the modeled carve replacements — growth commits
+            // (or pipeline replacements) publishing FRESH epochs with
+            // no content copy and NO stamp clear (the belt's absence
+            // isolates the epoch gate: the oracle below still must
+            // match).
+            if frame % 17 == 5 {
+                instance_carve_epoch += 1;
+            }
+            if frame % 13 == 9 {
+                pose_carve_epoch += 1;
+            }
             // ---- The gated path (both levels) ----
             let instance_decision = repack_populations_generation(
                 &mut gated_bytes,
@@ -2545,26 +2617,44 @@ mod policy_tests {
             if pose_decision == crate::proxy_instances::GenerationDecision::Repacked {
                 stamps.clear_pose();
             }
-            if generation_write_needed(stamps.instance[slot], declared_instance) {
+            if population_write_needed(
+                stamps.instance_epochs[slot],
+                stamps.instance[slot],
+                instance_carve_epoch,
+                declared_instance,
+            ) {
                 slot_instances[slot].clear();
                 slot_instances[slot].extend_from_slice(&gated_bytes);
                 stamps.instance[slot] = declared_instance;
+                stamps.instance_epochs[slot] = instance_carve_epoch;
                 wrote += 1;
             } else {
                 skipped += 1;
             }
             let indirect_block = pack_indirect_block(396, 2, 552, 0, 6, 0);
-            if generation_write_needed(stamps.indirect[slot], declared_instance) {
+            if population_write_needed(
+                stamps.indirect_epochs[slot],
+                stamps.indirect[slot],
+                instance_carve_epoch,
+                declared_instance,
+            ) {
                 slot_indirect[slot] = indirect_block.to_vec();
                 stamps.indirect[slot] = declared_instance;
+                stamps.indirect_epochs[slot] = instance_carve_epoch;
                 wrote += 1;
             } else {
                 skipped += 1;
             }
-            if generation_write_needed(stamps.pose[slot], declared_pose) {
+            if population_write_needed(
+                stamps.pose_epochs[slot],
+                stamps.pose[slot],
+                pose_carve_epoch,
+                declared_pose,
+            ) {
                 slot_poses[slot].clear();
                 slot_poses[slot].extend_from_slice(&gated_poses);
                 stamps.pose[slot] = declared_pose;
+                stamps.pose_epochs[slot] = pose_carve_epoch;
                 wrote += 1;
             } else {
                 skipped += 1;
@@ -2627,10 +2717,143 @@ mod policy_tests {
         // itself: no further write is needed on either slot.
         for slot in 0..slots {
             assert!(
-                !generation_write_needed(stamps.instance[slot], instance_generation)
-                    || stamps.instance[slot] == 0,
-                "slot {slot}: a stable population needs no further instance write"
+                !population_write_needed(
+                    stamps.instance_epochs[slot],
+                    stamps.instance[slot],
+                    instance_carve_epoch,
+                    instance_generation
+                ) || stamps.instance[slot] == 0,
+                "slot {slot}: a stable population on a stable carve needs no further write"
             );
+        }
+    }
+
+    /// T02 (strict audit IV, §2.3) — THE EPOCH GATE'S DECISION TABLE,
+    /// isolated (the resource window alone, no repack clear, no
+    /// growth-delta belt): a REPLACED carve (a fresh minted epoch)
+    /// rewrites at EVERY generation — even the surviving one —
+    /// because the bytes vouched for the OLD identity; the unknown
+    /// stamp (epoch 0, never minted) writes; the stable
+    /// epoch+generation pair skips (the R2 reuse preserved exactly);
+    /// the generation-0 always-dirty rule is unchanged. This is the
+    /// CPU half of the interrupted-growth witness (the rig leg
+    /// drives the end-to-end property; the epoch arm is isolated
+    /// HERE because on a live head the T05 clears fire beside it).
+    #[test]
+    fn the_epoch_gate_decision_table_pins_the_resource_window() {
+        use crate::proxy_instances::population_write_needed;
+        // The stable pair skips (the R2 win, unchanged).
+        assert!(!population_write_needed(1, 7, 1, 7));
+        // A generation change at the same epoch writes.
+        assert!(population_write_needed(1, 7, 1, 8));
+        // Generation 0 is always-dirty.
+        assert!(population_write_needed(1, 7, 1, 0));
+        // THE EPOCH ARM: the carve was replaced (a fresh minted
+        // epoch) — the rewrite fires at EVERY generation, including
+        // the one the stamp already records (the delayed-
+        // invalidation hazard's exact shape: the growth committed,
+        // the frame failed before the delta clear, the retry
+        // presents the surviving generation).
+        assert!(population_write_needed(1, 7, 2, 7));
+        assert!(
+            population_write_needed(1, 0, 2, 0),
+            "generation 0 stays always-dirty"
+        );
+        assert!(population_write_needed(1, 7, 2, 8));
+        // The unknown stamp (epoch 0 — the initial state and what
+        // every clear resets to) can never equal a minted epoch
+        // (they start at 1): a fresh carve never inherits a stamp.
+        assert!(population_write_needed(0, 7, 1, 7));
+        assert!(population_write_needed(0, 0, 1, 0));
+        // A stamp written into an OLDER epoch of the SAME carve
+        // identity cannot occur (epochs are minted per publication);
+        // the table's symmetry is checked anyway — any mismatch
+        // writes.
+        assert!(population_write_needed(2, 7, 1, 7));
+    }
+
+    /// T02 §2.3 — THE BELT-MISSING WITNESS, slot-level: both slots
+    /// stamped at (epoch E, generation g); the carve's growth commit
+    /// publishes epoch E+1 with NO stamp clear (the frame flow's
+    /// delta-clear belt absent — the interrupted-growth shape); the
+    /// extended gate rewrites BOTH slots at the SAME generation g
+    /// (the bare-generation gate — the pre-fix rule — returns FALSE
+    /// and would keep vouching the replaced carve's uninitialized
+    /// bytes: the RED witness, constructible at the audit's SHA
+    /// where no T05 clear fired either). After the rewrite the
+    /// stable skip returns (the R2 win preserved).
+    #[test]
+    fn an_epoch_bump_rewrites_both_slots_without_any_clear() {
+        use crate::proxy_instances::{generation_write_needed, population_write_needed};
+        let slots = FRAMES_IN_FLIGHT as usize;
+        let mut stamps = PopulationStamps {
+            instance: [5; FRAMES_IN_FLIGHT as usize],
+            indirect: [5; FRAMES_IN_FLIGHT as usize],
+            pose: [5; FRAMES_IN_FLIGHT as usize],
+            instance_epochs: [1; FRAMES_IN_FLIGHT as usize],
+            indirect_epochs: [1; FRAMES_IN_FLIGHT as usize],
+            pose_epochs: [1; FRAMES_IN_FLIGHT as usize],
+            ..Default::default()
+        };
+        // The stable pair skips under BOTH gates (the pre-fix
+        // behavior at a stable carve).
+        for slot in 0..slots {
+            assert!(!generation_write_needed(stamps.instance[slot], 5));
+            assert!(!population_write_needed(
+                stamps.instance_epochs[slot],
+                stamps.instance[slot],
+                1,
+                5
+            ));
+        }
+        // THE CARVE REPLACEMENT (the growth commit's fresh epoch),
+        // with NO clear of any kind:
+        let replaced_epoch = 2;
+        for slot in 0..slots {
+            // The RED half: the bare-generation gate alone returns
+            // FALSE (it cannot see the carve's identity).
+            assert!(
+                !generation_write_needed(stamps.instance[slot], 5),
+                "the bare gate is exactly the delayed-invariant hazard"
+            );
+            // The GREEN half: the extended gate forces the rewrite.
+            assert!(
+                population_write_needed(
+                    stamps.instance_epochs[slot],
+                    stamps.instance[slot],
+                    replaced_epoch,
+                    5
+                ),
+                "slot {slot}: a replaced carve rewrites at the surviving generation"
+            );
+            // The write records the NEW epoch beside the generation.
+            stamps.instance_epochs[slot] = replaced_epoch;
+        }
+        // The stable skip returns on the new carve (the R2 win).
+        for slot in 0..slots {
+            assert!(!population_write_needed(
+                stamps.instance_epochs[slot],
+                stamps.instance[slot],
+                replaced_epoch,
+                5
+            ));
+        }
+        // T05's clears still reset the epoch halves (the identity
+        // window composing with the resource window).
+        stamps.clear_instance();
+        for slot in 0..slots {
+            assert_eq!(stamps.instance_epochs[slot], 0);
+            assert_eq!(stamps.indirect_epochs[slot], 0);
+            assert!(population_write_needed(
+                stamps.instance_epochs[slot],
+                stamps.instance[slot],
+                replaced_epoch,
+                5
+            ));
+        }
+        stamps.clear_pose();
+        for slot in 0..slots {
+            assert_eq!(stamps.pose_epochs[slot], 0);
         }
     }
 

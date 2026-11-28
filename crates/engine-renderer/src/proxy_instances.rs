@@ -217,6 +217,33 @@ pub fn generation_write_needed(stamp: u64, generation: u64) -> bool {
     generation == 0 || stamp != generation
 }
 
+/// T02 (strict audit IV, §2.3 of the lifecycle design): the
+/// EXTENDED pure decision function — the per-slot population write
+/// gate with the carve's ALLOCATION EPOCH beside the generation.
+/// Write iff `generation == 0` (always-dirty), OR the stamp's EPOCH
+/// differs from the live carve's epoch (a REPLACED carve — growth
+/// commit or pipeline replacement — can never inherit a previous
+/// identity's stamp: the minted epochs never repeat, and the stamps'
+/// 0 means unknown), OR the generations differ (the bare rule). The
+/// carve comparison happens at the call site where the live epoch is
+/// readable; THIS function is the pure decision both consume (the
+/// oracle harness in `vulkan/frame.rs` pins it against the
+/// always-write path, epoch arms included).
+///
+/// Composes with T05's submission-time clears (the identity window —
+/// a repacked buffer clears the stamps) and the frame flow's
+/// growth-delta belt: the epoch is the RESOURCE-window correctness
+/// bearer, the clears close the identity window, and the belt is
+/// defense-in-depth.
+pub fn population_write_needed(
+    stamp_epoch: u64,
+    stamp_generation: u64,
+    carve_epoch: u64,
+    generation: u64,
+) -> bool {
+    generation == 0 || stamp_epoch != carve_epoch || stamp_generation != generation
+}
+
 /// The deterministic sine/cosine of a turn fraction (the libm-free
 /// turn trigonometry — quadrant reduction plus fixed-order
 /// fixed-constant Taylor series, pure IEEE f32 arithmetic; the
