@@ -736,3 +736,121 @@ The orchestrator resumes in the morning, reviews your diffs against your
 claims, runs the rig gates, and integrates. That's normal, not distrust.
 
 **The bar is high and the evidence discipline is real. That is the point.**
+
+---
+
+## PART 9 — THE CODEBASE MAP (where everything lives, for the findings you'll work)
+
+### engine-core (the determinism core — the highest-care crate)
+
+| Module | What it is | Relevant findings |
+|---|---|---|
+| `src/spine.rs` (~5,300 lines) | THE spine: the event lanes (near/far BinaryHeaps), the blocked/held sets, drain_due (the four phases), the housekeeping charge model, the retention policy + compaction, the class index (CA-08), the fingerprints, save/restore | T07 T08 T09 T36 |
+| `src/world_config.rs` | WorldConfig + the validation bounds + SectionDecodeLimits docs | T21 |
+| `src/npc_world_save.rs` | the v1/v2 wire codecs, validate/restore, save_validated, the admission gates | T21 |
+| `src/npc_schedule.rs`, `npc_behavior.rs`, `npc_execution.rs`, `npc_perception.rs`, `npc_locomotion.rs`, `npc_memory.rs` | the NPC systems (schedule/behavior/execution/perception/locomotion/memory — each with its digest pins and campaign batteries) | T11 (the scale fixtures) |
+| `src/collision.rs`, `player.rs`, `combat.rs`, `interaction.rs`, `weapons.rs` | the spatial machinery (RotatedCollider with the validated replacements, StaticGrid + the oversized list, CombatIndex with the borrowed roster, the census) | T10 T11 T37 |
+| `src/particle.rs`, `ripple.rs`, `weather.rs`, `audio_mix.rs`, `audio_synth.rs`, `audio_triggers.rs` | the gameplay math (finite domains, deterministic paths) | T40 review |
+| `src/wire.rs`, `sha256.rs`, `fingerprint.rs`, `diag.rs` | serialization support | — |
+| `tests/` | determinism, lanes, lod, save_corruption, save_roundtrip, spatial_query_allocations, spine_allocations (THE allocation pins: 18/6880 cold, 9/3024 warm — never move unmeasured), spine_bookkeeping, spine_contracts, spine_history, suspension | the batteries |
+
+**The spine's critical invariants** (read before touching): canonical (due,seq)
+pop order; the wire byte-identical; the three fingerprint domains; the
+housekeeping allowance (1.5× [ASSUMPTION]); the retention eligibility token; the
+class index's lazy materialization (the allocation pins depend on it).
+
+### engine-persist
+
+| Module | What it is | Relevant findings |
+|---|---|---|
+| `src/pipeline.rs` (~4,500) | CommitAuthority/CommitVerifier, the pending slots, the settled watermark, the shed sets, RetentionStats + the residency estimates (R07) | T13 T14 T29 T30 |
+| `src/residency.rs` | the CA-17 stage-1 design record + cold_confirmed | T13 T14 |
+| `src/chain_walk.rs` (~560) | the unified walk core (the L9b differential battery pins it) | T29 |
+| `src/journal.rs` | the framed journal, the streaming hash (CA-18), the ceiling discipline | T29 T31 |
+| `src/local.rs` + `local/*` | the file provider (layout, head_protocol, walks, orphan, reclaim_exec, timings) | — |
+| `src/sqlite.rs` + `sqlite/*` | the SQLite provider (feature-gated: `sqlite` default-on; `--no-default-features` = local-only with the typed SqliteNotBuilt refusal) | T33 |
+| `src/composite_reader.rs`, `composite_manifest.rs`, `checkpoint.rs`, `reclaim/*`, `dark_reachability.rs`, `recovery*.rs` | the canonical mechanisms | T40 review |
+| `src/migrate.rs`, the backup paths | the provider migration + backup | T31 |
+
+**The persist batteries:** `cargo test -p engine-persist` (default) AND
+`--features composite-test-fixture` AND `--no-default-features` — all three,
+every time you touch this crate.
+
+### engine-renderer
+
+| Module | What it is | Relevant findings |
+|---|---|---|
+| `src/renderer.rs` | the public API (submit_frame, attach_scene with the CA-01 rollback, RenderStats) | T03 T06 |
+| `src/submission.rs`, `frame_plan.rs`, `frame_prepare.rs` | the safe layer (the validated submission, the plan's uses bits + demand counts, the extent-target ensures) | T04 T05 T20 |
+| `src/scene_description.rs` | the scene contract (validate, the typed TextureExtent/DrawTable from CA-14 stage 1) | T04 T12 T20 |
+| `src/config.rs` | RenderConfig + the budget newtypes + ArenaBudgets::validate (CA-12) + the F-03 region clamp | T04 T17 |
+| `src/proxy_instances.rs`, `animation.rs` | the population packing + the pose machinery (the R2 generations; animation.rs is the extraction target T19) | T05 T18 T19 |
+| `src/vulkan/context.rs`, `frame.rs`, `pipelines.rs`, `resources.rs`, `swapchain.rs`, `staging.rs`, `capture.rs` | the device layer (the ownership guards, the fence discipline, the staging pool, the fault seams: TargetFaultSite + LifecycleFaultSite + inject_device_loss) | T02 T03 T06 T15 T16 T17 T22 |
+| `src/vulkan/passes/*` | corner, proxy_draw, skinned_draw, reflection_draw (the SharedDepthTargets from R5), post_draw, shadow_draw | T03 T16 T24 |
+| `src/shaders/` | the WGSL: `core/` (21 shared fragments) + `variants/` (9 shells, composed at build) + the direct-compiled (ground_reflect with the R4 early-out) | T24 T40 review |
+| `build.rs` | the composition + the layout pins | — |
+
+**The renderer batteries:** `cargo test -p engine-renderer` debug AND release
+(the release count is CI-pinned: 232). The rig batteries (engine-slice's
+`#[ignore]`d set) are NOT runnable without the GPU.
+
+### engine-shell
+
+`src/app.rs` (the loop, the bounded interval collector from R05), `input.rs`
+(the B08 reuse + the repeat contract), `audio.rs` (the A25/CA-21 lock discipline,
+the CA-22 cue backpressure). Relevant: T34. The shell battery:
+`cargo test -p engine-shell` (41+ passed, the soak measurement opt-in).
+
+### engine-slice (the composition + demo)
+
+| Module | What it is | Relevant findings |
+|---|---|---|
+| `src/main.rs` + the demo modules (corner_demo, garage_demo, encounter_demo, combat_demo, playable_demo, persist_demo, render_demo, player_demo, sim_demo) | the routes (the all-routes R2 adoption) | T11 T36 |
+| `src/corner_population.rs`, `corner_routes.rs`, `corner_scene.rs` | the corner's population machinery (the dedup mapping — the zero-alloc three-way rule) | T05 T18 |
+| `src/region.rs`, `crossing.rs`, `npc_memory_lane.rs`, `session*.rs`, `store.rs`, `backup.rs`, `worker.rs` | the composition layer | T11 T28 T31 |
+| `src/census/*` | the P5 measurement harness (repack, attach, ripple, vram, composition — your CPU measurement instruments) | T11 T39 |
+| `tests/` | the rig batteries (render_*) + the census batteries + the persist suites (pp_b*) + the lifecycle fault battery | the gates |
+
+### The workflow and CI
+
+`.github/workflows/engine-ci.yml` (~2,350 lines): the main/renderer/heavy pins,
+the local-only leg, the result-line counts. **YAML-parse after every edit.**
+The heavy command: `cargo test -p engine-slice --features
+engine-slice/crash-test-seams` (default profile, NOT --release --ignored —
+that's the rig-gates form; the distinction is recorded in git `44da040`).
+
+### The interaction matrix (what touches what — the parallelization guide)
+
+| Finding | Files touched | Conflicts with |
+|---|---|---|
+| T07 | spine.rs (retention region) | T08/T09 (spine.rs other regions — SEQUENCE or carefully disjoint) |
+| T08 | spine.rs (execute_now/drain) | T07/T09 — same file |
+| T09 | spine.rs (the lane heaps) + DESIGN | T07/T08 — same file |
+| T04 | config.rs, pipelines.rs, frame_prepare.rs, submission.rs | T05 (proxy_instances) is disjoint; T03 (renderer.rs/frame.rs) partially |
+| T05 | proxy_instances.rs, renderer.rs (the retained records) | T04 partially, T18 (same machinery) |
+| T02 | frame.rs (the stamps) | T03/T06 (frame.rs) — ONE TEAM |
+| T03 | renderer.rs, corner.rs, staging.rs | T02/T06/T16 — ONE TEAM |
+| T06/T16 | vulkan.rs, frame.rs, staging.rs | T02/T03 — ONE TEAM |
+| T19 | the new crate + animation.rs + the consumers | disjoint from everything (the extraction is additive-first) |
+| T21 | npc_world_save.rs, world_config.rs | disjoint |
+| T10 | player.rs, combat.rs | disjoint |
+| T13/T14 | persist pipeline.rs, residency.rs | disjoint from core/renderer |
+| T11 | the slice fixtures + census | touches test files broadly — run AFTER the code lanes |
+
+**The rule:** one agent per file-set at a time. The spine trio (T07/T08/T09)
+and the renderer lifecycle quartet (T02/T03/T06/T16) each serialize internally.
+
+---
+
+## PART 10 — THE EVIDENCE ARCHIVE (what already exists, for your baselines)
+
+- `Temp\opencode\ee\artifacts\` (if your workspace has the same filesystem —
+  otherwise the EVIDENCE.md rows cite the numbers): gates-*.log for every
+  landing, the census before/afters, the witness reproductions.
+- EVIDENCE.md E-1..E-18: the measured manifest — E-12 (the R0 census), E-16
+  (R3's staging), E-17 (R2's dirty-gen), E-18 (R5's aliasing) are your
+  before-pictures for the renderer findings.
+- The rig-dependent verifications the dawn owes (keep this list current in
+  your log): every battery your GPU-deferred lanes name.
+
+*End of the directive. Work the waves. Leave the dawn handoff.*
