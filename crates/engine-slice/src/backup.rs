@@ -28,7 +28,13 @@
 //!   as incomplete; one that will not decode is refused as corrupt;
 //!   a set whose files do not match it is refused as incoherent (a
 //!   tampered file, or a mixed-time pairing of one backup's database
-//!   with another's journal).
+//!   with another's journal). (CA-18) Both journal-hash sites — the
+//!   capture's binding computation and the verification's re-hash —
+//!   stream the digest through one bounded buffer
+//!   ([`engine_persist::journal::hash_journal_file`]): every byte is
+//!   read, none materialized (the same SHA-256 and length the
+//!   whole-file read produced — the tool's last O(file) resident
+//!   allocation, retired).
 //! * **Usable only after verification**: [`verify_backup`] re-reads
 //!   the manifest, re-validates the captured chain (the actual
 //!   canonical-chain validation, read-only), re-hashes the journal,
@@ -36,7 +42,34 @@
 //!   must match the binding), and then RESTORES the pair into an
 //!   isolated scratch directory and runs the real B4 recovery
 //!   ([`SessionCrossing::recover_at`]) over it. A set is never
-//!   reported usable before that succeeds.
+//!   reported usable before that succeeds. The readback establishes
+//!   USABILITY (logical coherence on this machine) — never
+//!   durability; that is the tier below.
+//! * **The durability tier (CA-20), published precisely:** a
+//!   successful `backup_campaign` claims the POWER-LOSS-DURABLE
+//!   PUBLICATION of the set — every artifact's bytes are flushed
+//!   before the manifest rename (the database capture flushes itself
+//!   through `backup_into`; the journal copy flushes through the
+//!   same write handle that wrote it; `MANIFEST.tmp` flushes before
+//!   the rename — the classic atomic-publish discipline's first
+//!   half), and the destination directory entry is flushed AFTER the
+//!   rename through the platform's real directory-sync API (Unix:
+//!   `fsync` on a directory handle; Windows:
+//!   `FlushFileBuffers` on a write handle opened with
+//!   `FILE_FLAG_BACKUP_SEMANTICS` — the read-only-handle idiom the
+//!   code once swallowed with `let _` measurably fails
+//!   access-denied on Windows and never synced anything). A failure
+//!   at any of these boundaries is a typed
+//!   [`BackupError::Durability`] refusal propagated BEFORE durable
+//!   completion is reported — the set is never called complete on an
+//!   unproven flush. The honest caveats: the underlying storage must
+//!   honor `fsync`/`FlushFileBuffers` (a lying disk voids every
+//!   fsync contract, not this one); the SOURCE campaign's own
+//!   durability remains the medium's tier (§ the process-crash tier
+//!   on Windows), which the backup inherits, never improves; and
+//!   the verification's scratch recovery remains the usability
+//!   proof it always was. The report carries the tier
+//!   ([`BackupReport::durability`]) so no caller has to infer it.
 //! * **Never a quiet overwrite**: the backup refuses an existing
 //!   output directory; the verification writes only into its
 //!   ephemeral scratch; the source campaign receives no write except
@@ -48,11 +81,11 @@
 //!   concurrent activity, it never captures through it.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use engine_core::{Decoder, Encoder};
-use engine_persist::hash::{Hash, hash_object};
+use engine_persist::hash::Hash;
 use engine_persist::{
     CanonicalMedium, ChainSummary, MediumError, SqliteMedium, T1Journal, active_journal_path,
 };
@@ -107,6 +140,16 @@ pub enum BackupError {
     /// The scratch restoration did not recover through the real B4
     /// machinery — the set is not usable, whatever its bindings say.
     Verification { detail: String },
+    /// (CA-20) A durability boundary failed: an artifact flush or
+    /// the destination-directory sync refused — the set's
+    /// power-loss-durable publication could NOT be established, so
+    /// durable completion is never reported on top of it. The
+    /// `artifact` names which boundary; the `source` is the
+    /// platform's own refusal.
+    Durability {
+        artifact: &'static str,
+        source: std::io::Error,
+    },
     /// A medium-level failure, carried through.
     Medium(MediumError),
     /// Filesystem I/O during the tool's own file operations.
@@ -141,6 +184,14 @@ impl std::fmt::Display for BackupError {
             BackupError::Verification { detail } => {
                 write!(f, "the backup did not verify: {detail}")
             }
+            BackupError::Durability { artifact, source } => {
+                write!(
+                    f,
+                    "the backup set's durability could not be established \
+                     (the {artifact} flush refused: {source}) — durable \
+                     completion is never reported on an unproven flush"
+                )
+            }
             BackupError::Medium(error) => write!(f, "medium failure: {error}"),
             BackupError::Io { op, path, source } => {
                 write!(f, "backup I/O failure during {op} at {path}: {source}")
@@ -154,6 +205,7 @@ impl std::error::Error for BackupError {
         match self {
             BackupError::Medium(error) => Some(error),
             BackupError::Io { source, .. } => Some(source),
+            BackupError::Durability { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -170,6 +222,123 @@ pub struct BackupReport {
     pub summary: ChainSummary,
     /// The captured journal's SHA-256 (the manifest's binding).
     pub journal_sha256: Hash,
+    /// (CA-20) The durability tier the completed set established —
+    /// the published contract (see the module docs' durability-tier
+    /// bullet): what was flushed, in what order, and through which
+    /// platform API the manifest rename's directory entry was
+    /// flushed. A `backup_campaign` that returns `Ok` has proven
+    /// every boundary named there (a failed flush refuses with
+    /// [`BackupError::Durability`] before this report exists).
+    pub durability: DurabilityTier,
+}
+
+/// (CA-20) The durability tier a completed backup set carries: every
+/// artifact's bytes flushed before the manifest rename, the rename
+/// atomic, and the destination-directory entry flushed after it
+/// through the named platform method. The `directory_sync` field
+/// records WHICH platform arm performed the flush (the
+/// per-platform classification the audit asked for — the method is
+/// load-bearing evidence, not decoration: the read-only-handle
+/// idiom the code once used never synced anything on Windows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurabilityTier {
+    /// All artifacts flushed (the database capture, the journal copy,
+    /// the manifest tmp before its rename) AND the destination
+    /// directory entry flushed after the rename through
+    /// `directory_sync`.
+    SyncedAllArtifactsAndDirectory {
+        /// The platform arm that performed (and proved) the
+        /// destination-directory flush.
+        directory_sync: DirectorySyncMethod,
+    },
+}
+
+/// (CA-20) The platform arm that flushed the destination directory's
+/// entry after the manifest rename — each arm is the real
+/// directory-sync API of its platform (verified by the lane's probe
+/// on this machine: the Windows read-only-handle idiom fails
+/// access-denied and syncs nothing; the backup-semantics write
+/// handle flushes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectorySyncMethod {
+    /// Unix: `fsync` on a read-only directory handle (the `O_RDONLY`
+    /// + `fsync` idiom — valid on directories there).
+    UnixDirectoryFsync,
+    /// Windows: `FlushFileBuffers` on a write handle opened with
+    /// `FILE_FLAG_BACKUP_SEMANTICS` (the only std-reachable form
+    /// that both opens a directory and accepts the flush).
+    WindowsBackupSemanticsFlush,
+}
+
+/// (CA-20) The platform's real directory-sync arm — the per-platform
+/// classification this file's tier publication rests on.
+///
+/// Unix opens the directory read-only and `fsync`s it (the standard
+/// directory-durability idiom there). Windows opens the directory
+/// with write access AND `FILE_FLAG_BACKUP_SEMANTICS` (std's
+/// `OpenOptions::custom_flags`) and flushes that handle. The
+/// read-only idiom the code once swallowed with `let _` opens but
+/// then FAILS the flush with access-denied (probe-measured on this
+/// machine: `File::open(dir)` + `sync_all` is `PermissionDenied`,
+/// os error 5) — so on Windows it never synced anything, silently.
+/// Failures from the correct arm PROPAGATE (see
+/// [`classify_durability_failure`]): a directory entry that cannot
+/// be proven flushed is never reported as durable completion.
+fn sync_directory(dir: &Path) -> Result<DirectorySyncMethod, std::io::Error> {
+    #[cfg(unix)]
+    {
+        let handle = File::open(dir)?;
+        handle.sync_all()?;
+        Ok(DirectorySyncMethod::UnixDirectoryFsync)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let handle = OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)?;
+        handle.sync_all()?;
+        Ok(DirectorySyncMethod::WindowsBackupSemanticsFlush)
+    }
+}
+
+/// (CA-20) The journal capture: a bounded-buffer copy whose
+/// destination handle is flushed before returning — the captured
+/// bytes are provably out of the page cache, not merely written
+/// (`fs::copy` flushes nothing; a crash after it could lose the
+/// journal's tail while the manifest already binds its hash).
+fn copy_file_synced(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+    let mut reader = File::open(source)?;
+    let mut writer = File::create(destination)?;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read])?;
+    }
+    writer.sync_all()
+}
+
+/// (CA-20) The classified durability refusal: an artifact-flush or
+/// directory-sync failure becomes the typed
+/// [`BackupError::Durability`] the caller sees BEFORE durable
+/// completion is reported — never a swallowed `let _`, never a
+/// success on an unproven flush. The path is folded into the carried
+/// I/O error's message (the OS error alone names no file).
+fn classify_durability_failure(
+    artifact: &'static str,
+    path: &Path,
+    source: std::io::Error,
+) -> BackupError {
+    let detailed = std::io::Error::new(source.kind(), format!("{}: {source}", path.display()));
+    BackupError::Durability {
+        artifact,
+        source: detailed,
+    }
 }
 
 /// The offline capture boundary's journal half (the review
@@ -407,6 +576,9 @@ pub fn backup_campaign(
     source
         .backup_into(&backup_db)
         .map_err(BackupError::Medium)?;
+    // (CA-20) The database capture's flush is backup_into's own
+    // contract (the pages SQLite wrote are flushed before it
+    // returns) — recorded here for the tier's artifact inventory.
     let head_after = source.head().map_err(BackupError::Medium)?;
     if head_before != head_after {
         let before = head_before
@@ -436,21 +608,29 @@ pub fn backup_campaign(
         });
     }
     let backup_journal = output_dir.join(BACKUP_JOURNAL);
-    fs::copy(journal_path, &backup_journal)
-        .map_err(|e| io_err("copy the journal", journal_path, e))?;
+    // (CA-20) The journal capture flushes through the same write
+    // handle that copied it (`fs::copy` flushes nothing — a crash
+    // after it could lose the tail while the manifest already binds
+    // the hash); the failure is the classified durability refusal,
+    // never a swallowed `let _`. The refusal names the copy's
+    // DESTINATION — the artifact being written and flushed.
+    copy_file_synced(journal_path, &backup_journal)
+        .map_err(|e| classify_durability_failure("journal-copy flush", &backup_journal, e))?;
     // The boundary's work is done — release the journal lock before
     // the audit, manifest, and verification phases (they touch only
     // the captured files).
     drop(journal_guard);
     // (4) The captured set's own coherence: the database validates to
-    // the source's chain; the journal hash binds.
-    let journal_bytes =
-        engine_persist::journal::read_journal_bytes(&backup_journal).map_err(|error| {
+    // the source's chain; the journal hash binds. (CA-18) The hash
+    // and the byte length stream through one bounded buffer — every
+    // byte read, never materialized (the digest is over the complete
+    // file; the whole-file Vec was this tool's last O(file) resident).
+    let (journal_sha256, journal_bytes) =
+        engine_persist::journal::hash_journal_file(&backup_journal).map_err(|error| {
             BackupError::Incoherent {
                 detail: error.to_string(),
             }
         })?;
-    let journal_sha256 = hash_object(&journal_bytes);
     let mut audit = SqliteMedium::open_read_only(&backup_db).map_err(BackupError::Medium)?;
     let captured = audit.validate().map_err(BackupError::Medium)?;
     drop(audit);
@@ -477,14 +657,14 @@ pub fn backup_campaign(
         records: summary.records,
         campaign_id: summary.campaign_id.clone(),
         last_committed_tx: scan_last_committed(&backup_journal)?,
-        journal_bytes: journal_bytes.len() as u64,
+        journal_bytes,
         source_journal: journal_path.to_string_lossy().to_string(),
         captured_at_nanos,
         checkpointed: true,
         journal_locked: true,
         head_stable: true,
     };
-    write_manifest(output_dir, &manifest)?;
+    let directory_sync = write_manifest(output_dir, &manifest)?;
     // (6) Usable only after the verification: the isolated scratch
     // restoration and the real B4 recovery.
     verify_backup(output_dir)?;
@@ -492,6 +672,11 @@ pub fn backup_campaign(
         backup_dir: output_dir.to_path_buf(),
         summary,
         journal_sha256,
+        // (CA-20) The published tier: every artifact flushed before
+        // the manifest rename, the directory entry flushed after it
+        // through the named platform arm — a completed set carries
+        // its proof, a failed one never reaches this construction.
+        durability: DurabilityTier::SyncedAllArtifactsAndDirectory { directory_sync },
     })
 }
 
@@ -571,13 +756,16 @@ pub fn verify_backup(backup_dir: &Path) -> Result<ChainSummary, BackupError> {
             ),
         });
     }
-    let journal_bytes =
-        engine_persist::journal::read_journal_bytes(&backup_journal).map_err(|error| {
+    // The bindings: the actual chain validation and the journal hash
+    // (CA-18: streamed through one bounded buffer — the same digest
+    // the whole-file read produced, never the file-sized Vec).
+    let (journal_sha256, journal_bytes) =
+        engine_persist::journal::hash_journal_file(&backup_journal).map_err(|error| {
             BackupError::Incoherent {
                 detail: error.to_string(),
             }
         })?;
-    if hash_object(&journal_bytes) != manifest.journal_sha256 {
+    if journal_sha256 != manifest.journal_sha256 {
         return Err(BackupError::Incoherent {
             detail: "the captured journal does not hash to the manifest's binding \
                      — a tampered journal or a mixed-time pairing"
@@ -595,7 +783,7 @@ pub fn verify_backup(backup_dir: &Path) -> Result<ChainSummary, BackupError> {
                 .to_owned(),
         });
     }
-    if journal_bytes.len() as u64 != manifest.journal_bytes {
+    if journal_bytes != manifest.journal_bytes {
         return Err(BackupError::Incoherent {
             detail: "the captured journal's length does not match the manifest's \
                      binding — a tampered journal"
@@ -706,7 +894,10 @@ pub fn verify_backup(backup_dir: &Path) -> Result<ChainSummary, BackupError> {
     Ok(summary)
 }
 
-fn write_manifest(output_dir: &Path, manifest: &Manifest) -> Result<(), BackupError> {
+fn write_manifest(
+    output_dir: &Path,
+    manifest: &Manifest,
+) -> Result<DirectorySyncMethod, BackupError> {
     let tmp = output_dir.join(MANIFEST_TMP);
     let path = output_dir.join(MANIFEST_FILE);
     let mut file = File::create(&tmp).map_err(|e| io_err("create MANIFEST.tmp", &tmp, e))?;
@@ -716,8 +907,25 @@ fn write_manifest(output_dir: &Path, manifest: &Manifest) -> Result<(), BackupEr
         .map_err(|e| io_err("sync MANIFEST.tmp", &tmp, e))?;
     drop(file);
     fs::rename(&tmp, &path).map_err(|e| io_err("publish the manifest", &path, e))?;
-    let _ = File::open(output_dir).and_then(|dir| dir.sync_all());
-    Ok(())
+    // (CA-20) THE DESTINATION-DIRECTORY SYNC — the rename's
+    // durability boundary. The old shape swallowed this with
+    // `let _ = File::open(output_dir).and_then(|dir| dir.sync_all())`
+    // — an idiom that measurably FAILS access-denied on Windows (a
+    // read-only handle cannot flush there; the probe on this machine:
+    // os error 5) and so never synced anything, silently. The
+    // platform's real arm runs here (Unix: the directory fsync;
+    // Windows: the backup-semantics write-handle flush), and its
+    // failure is the classified [`BackupError::Durability`] refusal —
+    // durable completion is never reported on an unproven directory
+    // entry.
+    let directory_sync = sync_directory(output_dir).map_err(|e| {
+        classify_durability_failure(
+            "destination-directory sync after the manifest rename",
+            output_dir,
+            e,
+        )
+    })?;
+    Ok(directory_sync)
 }
 
 fn io_err(op: &'static str, path: &Path, source: std::io::Error) -> BackupError {
@@ -725,5 +933,299 @@ fn io_err(op: &'static str, path: &Path, source: std::io::Error) -> BackupError 
         op,
         path: path.display().to_string(),
         source,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crossing::SessionCrossing;
+    use crate::npc::{NpcConfig, NpcWorld, install_initial_schedules};
+    use crate::region::{RegionConfig, RegionDirector};
+    use crate::store::StoreLocation;
+    use engine_core::{LodLevel, PresenceSample, Spine};
+    use engine_persist::{CommitOutcome, T1Journal};
+
+    /// A unique temp root removed on drop (the pp_b1 battery's
+    /// discipline; no `tempfile` dependency).
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "s7-pp-b1-inline-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).expect("create test root");
+            TestDir(path)
+        }
+
+        fn db(&self) -> PathBuf {
+            self.0.join("store.db")
+        }
+
+        fn journal(&self) -> PathBuf {
+            self.0.join("journal.t1")
+        }
+
+        fn output(&self) -> PathBuf {
+            self.0.join("backup-set")
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn near_region_4() -> PresenceSample {
+        PresenceSample {
+            position: (-100.0, 0.0),
+            velocity: (0.0, 0.0),
+        }
+    }
+
+    fn far_from_region_4() -> PresenceSample {
+        PresenceSample {
+            position: (100.0, 0.0),
+            velocity: (0.0, 0.0),
+        }
+    }
+
+    /// The compact quiescent campaign (the pp_b1 battery's exact arc
+    /// at inline scale): a founded crossing, the near/far durable
+    /// boundaries (the far deactivations and the near re-activations
+    /// journaled), a confirming commit, and the ratified checkpoint —
+    /// then dropped, the graceful close the backup's offline boundary
+    /// requires.
+    fn quiescent_campaign(dir: &TestDir, campaign: &str) {
+        let near = near_region_4();
+        let far = far_from_region_4();
+        let config = NpcConfig {
+            region_lods_enabled: true,
+            ..NpcConfig::default()
+        };
+        let mut spine = Spine::with_reservation(NpcWorld::new(config.clone()), 200, 60);
+        install_initial_schedules(&mut spine, &config);
+        let mut director = RegionDirector::new(RegionConfig::default()).unwrap();
+        for _ in 0..150 {
+            director.apply(&mut spine, std::slice::from_ref(&near));
+            spine.run_tick();
+        }
+        let journal = T1Journal::open(dir.journal()).unwrap();
+        let mut crossing =
+            SessionCrossing::open_at(&StoreLocation::Database(dir.db()), journal, campaign)
+                .unwrap();
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        // The far boundary: every region the presence leaves goes
+        // Dormant through the crossing (journaled, installed).
+        let now = spine.clock();
+        for region in 0..crate::npc::REGION_COUNT {
+            let current = director.levels()[region];
+            let next = director.target_level(region, std::slice::from_ref(&far));
+            if next == current {
+                continue;
+            }
+            if next == LodLevel::Dormant {
+                let _journaled = crossing
+                    .deactivate(&mut spine, &mut director, region, now)
+                    .expect("the deactivation commits");
+            }
+        }
+        // The near boundary: the re-activations install the same
+        // regions back (the journal now holds both directions).
+        let now = spine.clock();
+        for region in 0..crate::npc::REGION_COUNT {
+            let current = director.levels()[region];
+            let next = director.target_level(region, std::slice::from_ref(&near));
+            if next == current {
+                continue;
+            }
+            if current == LodLevel::Dormant {
+                crossing
+                    .activate(&mut spine, &mut director, region, next, now)
+                    .expect("the activation installs");
+            }
+        }
+        for _ in 0..100 {
+            director.apply(&mut spine, std::slice::from_ref(&near));
+            spine.run_tick();
+        }
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        let CommitOutcome::Confirmed(_) = crossing.commit_canonical().unwrap() else {
+            panic!("the campaign confirms before the close");
+        };
+        crossing.checkpoint().unwrap();
+        drop(crossing);
+    }
+
+    /// (CA-18) THE MANIFEST-HASH EQUIVALENCE through the real backup
+    /// path: the streamed digest the manifest binds is exactly the
+    /// digest the retired whole-file read produced (the independent
+    /// oracle — `read_journal_bytes` + `hash_object`, still public),
+    /// the byte-length binding is the real file length, and the
+    /// TRUNCATION behavior is identical — a truncated captured
+    /// journal refuses verification with the same incoherent-set
+    /// refusal the whole-file implementation produced (the hash
+    /// mismatch the manifest binding catches downstream).
+    #[test]
+    fn the_streamed_manifest_hash_equals_the_whole_file_digest() {
+        let dir = TestDir::new("ca18-manifest-hash");
+        quiescent_campaign(&dir, "ca18-inline-campaign");
+        let report = backup_campaign(&dir.db(), &dir.journal(), &dir.output())
+            .expect("the quiescent backup captures, binds, and verifies");
+        // The independent oracle: the retired whole-file computation
+        // over the captured copy.
+        let whole = engine_persist::journal::read_journal_bytes(&dir.output().join(BACKUP_JOURNAL))
+            .unwrap();
+        let oracle = engine_persist::hash::hash_object(&whole);
+        assert_eq!(
+            report.journal_sha256, oracle,
+            "the streamed manifest digest is the whole-file digest"
+        );
+        assert_eq!(
+            fs::metadata(dir.output().join(BACKUP_JOURNAL))
+                .unwrap()
+                .len(),
+            whole.len() as u64
+        );
+        // The manifest's own binding decodes back to the same pair
+        // (the verification re-derived it through the stream).
+        let summary = verify_backup(&dir.output()).expect("the completed set re-verifies");
+        assert_eq!(summary, report.summary);
+        // TRUNCATION: cut the captured journal's tail — the streamed
+        // re-hash no longer matches the manifest's binding, the set
+        // refuses as incoherent (exactly the whole-file
+        // implementation's refusal; the pp_b1 battery's
+        // tampered-journal matrix stays the broader behavior pin).
+        let captured = dir.output().join(BACKUP_JOURNAL);
+        let bytes = fs::read(&captured).unwrap();
+        assert!(bytes.len() > 16);
+        fs::write(&captured, &bytes[..bytes.len() - 8]).unwrap();
+        assert!(matches!(
+            verify_backup(&dir.output()),
+            Err(BackupError::Incoherent { .. })
+        ));
+    }
+
+    /// (CA-20) THE TIER PUBLICATION through the real path: a
+    /// completed backup carries `SyncedAllArtifactsAndDirectory`
+    /// naming the platform arm that flushed the destination
+    /// directory — and the report exists ONLY after the verification
+    /// (the live-readback check retained: `backup_campaign` returns
+    /// `Ok` strictly after `verify_backup` succeeded).
+    #[test]
+    fn the_completed_backup_publishes_its_durability_tier() {
+        let dir = TestDir::new("ca20-tier");
+        quiescent_campaign(&dir, "ca20-inline-campaign");
+        let report = backup_campaign(&dir.db(), &dir.journal(), &dir.output())
+            .expect("the quiescent backup captures, flushes, and verifies");
+        let expected_method = if cfg!(windows) {
+            DirectorySyncMethod::WindowsBackupSemanticsFlush
+        } else {
+            DirectorySyncMethod::UnixDirectoryFsync
+        };
+        assert_eq!(
+            report.durability,
+            DurabilityTier::SyncedAllArtifactsAndDirectory {
+                directory_sync: expected_method
+            },
+            "the tier names the platform arm that proved the directory flush"
+        );
+        // The live readback still gates the report (usability, the
+        // tier is durability — the two proofs are different things).
+        assert!(verify_backup(&dir.output()).is_ok());
+    }
+
+    /// (CA-20, Windows) THE AUDIT'S RED EVIDENCE, KEPT AS THE
+    /// REGRESSION'S REASON: the read-only-handle directory-sync
+    /// idiom the old code swallowed with `let _` measurably FAILS on
+    /// Windows (access-denied — a read-only handle cannot flush), so
+    /// the destination-directory sync never synced anything, on any
+    /// backup, silently. The same directory then syncs through the
+    /// platform's real arm — the fix's green half.
+    #[cfg(windows)]
+    #[test]
+    fn the_swallowed_readonly_directory_sync_fails_on_windows_and_the_real_arm_works() {
+        let dir = TestDir::new("ca20-readonly-sync");
+        let output = dir.output();
+        fs::create_dir(&output).unwrap();
+        // The old idiom, verbatim: opens, then fails the flush.
+        let swallowed = File::open(&output).and_then(|handle| handle.sync_all());
+        assert!(
+            swallowed.is_err(),
+            "the read-only-handle flush must refuse on Windows (the swallowed \
+             `let _` synced nothing — the audit's finding, probe-measured)"
+        );
+        // The platform's real arm on the SAME directory: the
+        // backup-semantics write handle flushes.
+        assert_eq!(
+            sync_directory(&output).unwrap(),
+            DirectorySyncMethod::WindowsBackupSemanticsFlush
+        );
+    }
+
+    /// (CA-20) THE INJECTED SYNC FAILURE, PROPAGATED: a journal-copy
+    /// flush that cannot happen (the destination is a pre-existing
+    /// directory — the write handle cannot be created) surfaces as
+    /// the typed `BackupError::Durability` with the artifact named,
+    /// the path carried, and the I/O cause chained — never a
+    /// swallowed `let _`, never durable completion on an unproven
+    /// flush.
+    #[test]
+    fn a_failed_journal_copy_flush_propagates_the_durability_refusal() {
+        let dir = TestDir::new("ca20-injected-failure");
+        let source = dir.0.join("source-journal.t1");
+        fs::write(&source, b"journal-bytes").unwrap();
+        let destination = dir.0.join("destination-as-directory");
+        fs::create_dir(&destination).unwrap();
+        let failure = copy_file_synced(&source, &destination)
+            .map_err(|e| classify_durability_failure("journal-copy flush", &destination, e))
+            .unwrap_err();
+        let BackupError::Durability {
+            artifact,
+            source: cause,
+        } = &failure
+        else {
+            panic!("the failure must classify as Durability, got {failure:?}")
+        };
+        assert_eq!(artifact, &"journal-copy flush");
+        assert!(
+            cause.to_string().contains("destination-as-directory"),
+            "the carried cause names the failing path: {cause}"
+        );
+        assert!(std::error::Error::source(&failure).is_some());
+        assert!(failure.to_string().contains("journal-copy flush"));
+    }
+
+    /// (CA-20) The directory-sync refusal classification: a sync that
+    /// cannot run (the directory is absent) classifies as the typed
+    /// durability refusal naming the manifest-rename boundary — the
+    /// propagation arm `write_manifest` routes through.
+    #[test]
+    fn a_failed_directory_sync_classifies_the_renamed_manifest_boundary() {
+        let absent = TestDir::new("ca20-absent-dir").0.join("never-created");
+        let failure = sync_directory(&absent)
+            .map_err(|e| {
+                classify_durability_failure(
+                    "destination-directory sync after the manifest rename",
+                    &absent,
+                    e,
+                )
+            })
+            .unwrap_err();
+        let BackupError::Durability { artifact, .. } = &failure else {
+            panic!("the failure must classify as Durability, got {failure:?}")
+        };
+        assert_eq!(
+            artifact,
+            &"destination-directory sync after the manifest rename"
+        );
+        assert!(failure.to_string().contains("never reported"));
     }
 }

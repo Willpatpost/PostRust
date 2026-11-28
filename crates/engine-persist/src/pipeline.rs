@@ -697,6 +697,7 @@ impl From<JournalError> for PipelineError {
 /// authoritative effects, and the confirming revision with its epoch
 /// — the full provenance the receipt reports and the conflict checks
 /// compare.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmedEntry {
     pub coverage: Vec<ClassifiedSpan>,
     pub transaction: TransactionId,
@@ -907,6 +908,20 @@ pub struct RetentionStats {
     /// threshold ([`ROTATION_CADENCE_TRANSACTIONS`]) — the reported
     /// growth the maintenance layer acts on.
     pub exceeds_rotation_cadence: bool,
+    /// (CA-17) The confirmed map's ESTIMATED resident bytes — the
+    /// per-identity metadata the dedup authority retains (the fixed
+    /// `ConfirmedEntry` fields, the retained coverage spans, and the
+    /// map's own per-entry overhead), computed by the documented
+    /// formula in [`CommitVerifier::confirmed_residency_bytes`]. An
+    /// estimate (the B15 computed-carve discipline), structurally
+    /// testable: at fixed live obligations it grows LINEARLY in the
+    /// confirmed history — the finding's measured shape.
+    pub confirmed_residency_bytes: u64,
+    /// (CA-17) The shed discriminator set's ESTIMATED resident bytes
+    /// — one entry per identity whose coverage detail was shed, never
+    /// bounded by anything today (the watermark bounds WORK, not
+    /// residency).
+    pub shed_residency_bytes: u64,
 }
 
 impl RetentionStats {
@@ -1505,6 +1520,59 @@ impl<M: CanonicalMedium> CommitVerifier<M> {
     /// Every chain-confirmed identity.
     pub fn confirmed_keys(&self) -> Vec<ConsequenceId> {
         self.confirmed.keys().copied().collect()
+    }
+
+    /// (CA-17) The authenticated COLD membership/producer retrieval —
+    /// the chain-side answer for one identity, derived WITHOUT the
+    /// in-memory confirmed map: the same gap-aware head-down
+    /// hash-verified walk [`CommitVerifier::walk_chain`] runs,
+    /// targeted at one `ConsequenceId`, with the same
+    /// conflicting-reuse refusal (two chain revisions claiming the
+    /// identity fail closed, never guessed). Returns the entry a
+    /// FRESHLY OPENED pipeline's session walk would collect — the
+    /// eviction-boundary query surface: an identity whose coverage
+    /// detail was shed (or, under the residency design's future
+    /// eviction, whose entry left the hot map entirely) answers here
+    /// with its FULL chain-proven evidence, authenticated by the
+    /// medium's hash-verified reads. O(chain) per query — the honest
+    /// cold cost the residency design's measurement rows
+    /// characterize (see the `residency` module's design record).
+    pub fn cold_confirmed(
+        &mut self,
+        id: ConsequenceId,
+    ) -> Result<Option<ConfirmedEntry>, PipelineError> {
+        crate::residency::probe_confirmed(&mut self.medium, id)
+    }
+
+    /// (CA-17) The confirmed map's estimated resident bytes — the
+    /// documented formula: per entry, the fixed `ConfirmedEntry`
+    /// fields (`size_of::<ConfirmedEntry>()`), the retained coverage
+    /// spans (`capacity × size_of::<ClassifiedSpan>()`), the
+    /// `ConsequenceId` key, and the map's amortized per-entry node
+    /// share. An ESTIMATE (the map's exact node occupancy is std's
+    /// own business); the structural claim it exists to measure —
+    /// linear growth in confirmed history at fixed live obligations
+    /// — is pinned by the residency module's tests.
+    pub(crate) fn confirmed_residency_bytes(&self) -> u64 {
+        const BTREE_ENTRY_OVERHEAD: u64 = 48;
+        let fixed = std::mem::size_of::<ConfirmedEntry>() as u64
+            + std::mem::size_of::<ConsequenceId>() as u64
+            + BTREE_ENTRY_OVERHEAD;
+        let span = std::mem::size_of::<ClassifiedSpan>() as u64;
+        self.confirmed
+            .values()
+            .map(|entry| fixed + entry.coverage.capacity() as u64 * span)
+            .sum()
+    }
+
+    /// (CA-17) The shed discriminator set's estimated resident bytes
+    /// — one slot per shed identity (the key plus the set's amortized
+    /// slot overhead): unbounded in the shed population today, the
+    /// finding's second growth term.
+    pub(crate) fn shed_residency_bytes(&self) -> u64 {
+        const HASHSET_ENTRY_OVERHEAD: u64 = 32;
+        (std::mem::size_of::<ConsequenceId>() as u64 + HASHSET_ENTRY_OVERHEAD)
+            * self.shed_coverage.len() as u64
     }
 
     /// What `Accepted` establishes on this medium.
@@ -2275,6 +2343,18 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
         self.verifier.confirmed_keys()
     }
 
+    /// (CA-17) The authenticated cold membership/producer retrieval
+    /// (see [`CommitVerifier::cold_confirmed`]) — the pipeline-level
+    /// surface: the chain-side answer for one identity, full
+    /// provenance included, without the in-memory map. O(chain) per
+    /// query (the honest cold cost the residency design measures).
+    pub fn cold_confirmed(
+        &mut self,
+        id: ConsequenceId,
+    ) -> Result<Option<ConfirmedEntry>, PipelineError> {
+        self.verifier.cold_confirmed(id)
+    }
+
     /// (P3-L6) The retention/compaction observability surface — the
     /// settled-transaction watermark, the unsettled window the
     /// per-commit actionable scan pays for, the coverage-shed state,
@@ -2299,6 +2379,8 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
             actionable_scan_transactions: self.authority.scan_transactions,
             actionable_scan_envelopes: self.authority.scan_envelopes,
             exceeds_rotation_cadence: journal_transactions >= ROTATION_CADENCE_TRANSACTIONS,
+            confirmed_residency_bytes: self.verifier.confirmed_residency_bytes(),
+            shed_residency_bytes: self.verifier.shed_residency_bytes(),
         }
     }
 
