@@ -977,8 +977,8 @@ jobs:
           nodefault=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-nodefault.log)
           results=$(grep -c 'test result:' tests-nodefault.log || true)
           excluded=$((plain - nodefault))
-          expected_excluded=124
-          if [ "$(uname -s)" != "Linux" ]; then expected_excluded=125; fi
+          expected_excluded=132
+          if [ "$(uname -s)" != "Linux" ]; then expected_excluded=133; fi
           echo "persist battery: plain $plain passed, local-only $nodefault passed, $results result lines, excluded $excluded (expected $expected_excluded)"
           [ "$excluded" -eq "$expected_excluded" ] || { echo "LOCAL-ONLY EXCLUSION MAP MISMATCH: $excluded != $expected_excluded — the sqlite feature gate moved a test boundary"; exit 1; }
           [ "$results" -eq 11 ] || { echo "LOCAL-ONLY RESULT-LINE MISMATCH: $results != 11 (the lib + the ten sqlite-free integration binaries + the doctest)"; exit 1; }
