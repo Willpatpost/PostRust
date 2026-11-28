@@ -424,3 +424,195 @@ fn decreasing_execution_tick_is_rejected() {
         SaveError::Integrity("spine-save/ledger-order")
     ));
 }
+
+#[test]
+fn npc_world_save_v2_declarations_refuse_typed_before_any_allocation() {
+    // T21 (the corruption half of the decode-admission boundary):
+    // crafted npc-world-save/2 section bytes — a declaration whose
+    // whole-section minimum exceeds the bytes present, a truncation
+    // inside a column, and an adversarial duplicate id encoded
+    // through the total raw codec — all refuse typed (Limit /
+    // Truncated / Duplicate), never by panic or unbounded
+    // allocation, under the wire maximum AND a small configured
+    // budget alike.
+    use engine_core::lod::LodLevel;
+    use engine_core::npc_behavior::{NpcId, NpcIdentity};
+    use engine_core::npc_world_save::{NpcRegionBlock, NpcWorldSectionV2, SectionDecodeLimits};
+    use engine_core::world_config::WorldConfig;
+    use engine_core::{Decoder, Encoder};
+
+    // A plausible huge declaration: 2 regions, 64 identities, a
+    // grid, and 64 bytes of "records" — every per-field bound passes
+    // (the generic one-byte-per-element count bound included: 64
+    // identities, 65 bytes remaining after the count), but the
+    // section's own minimum (2 × 10 framing + 64 × 35 dormant
+    // identity bytes = 2,260) exceeds the 65 bytes actually
+    // remaining. The typed Limit fires before the block vector or
+    // any column reserves, under every budget.
+    let mut enc = Encoder::new();
+    enc.write_u64(1337); // seed
+    enc.write_u64(6); // activity period
+    enc.write_u64(4); // simplify factor
+    enc.write_u64(12); // commitment window
+    enc.write_u8(1); // region-LOD path enabled
+    enc.write_count(2); // region count
+    enc.write_count(64); // npc count
+    enc.write_u8(4); // region grid
+    for _ in 0..64 {
+        enc.write_u8(0xAA); // sixty-four bytes actually present
+    }
+    let bytes = enc.into_bytes();
+    for limits in [
+        SectionDecodeLimits::WIRE_MAXIMUM,
+        SectionDecodeLimits::new(64, u64::MAX),
+        SectionDecodeLimits::new(64, 1 << 20),
+    ] {
+        assert!(
+            matches!(
+                NpcWorldSectionV2::restore_with_limits(&mut Decoder::new(&bytes), &limits),
+                Err(SaveError::Limit {
+                    kind: "section-minimum-bytes",
+                    ..
+                })
+            ),
+            "the huge declaration refuses typed under {limits:?}"
+        );
+    }
+    // A truncation the minimum gate cannot see (an ACTIVE section
+    // sits above its all-dormant minimum, so the declaration's
+    // minimum fits while the input is cut inside a record column)
+    // still refuses typed at the read — the walk never repairs.
+    let mut enc = Encoder::new();
+    enc.write_u64(1337);
+    enc.write_u64(6);
+    enc.write_u64(4);
+    enc.write_u64(12);
+    enc.write_u8(1);
+    enc.write_count(1); // region count
+    enc.write_count(2); // npc count
+    enc.write_u8(4); // region grid
+    enc.write_u8(0); // near
+    enc.write_u8(0); // lod: Full (the section sits above its minimum)
+    enc.write_count(2); // identity count
+    for id in [0u32, 1] {
+        let identity = NpcIdentity {
+            id: NpcId(id),
+            home_cell: (0, 0),
+            region: 0,
+            appearance_seed: id,
+        };
+        for byte in identity.wire_bytes() {
+            enc.write_u8(byte);
+        }
+    }
+    for _ in 0..2 {
+        enc.write_u64(10); // steps
+    }
+    for _ in 0..2 {
+        enc.write_u64(1); // routine cursor
+    }
+    for _ in 0..2 {
+        enc.write_u8(0); // position x
+        enc.write_u8(0); // position y
+    }
+    for _ in 0..2 {
+        enc.write_u64(1); // represented-through
+    }
+    for _ in 0..2 {
+        enc.write_u64(0); // pending signal
+    }
+    for _ in 0..2 {
+        enc.write_u64(0); // milestone
+    }
+    for _ in 0..2 {
+        enc.write_u64(0); // credit
+    }
+    let bytes = enc.into_bytes();
+    // An above-minimum truncation (the ACTIVE section sits above its
+    // all-dormant minimum, so the whole-input gate passes while the
+    // input is 3 bytes short of the section's actual shape) refuses
+    // typed at the stride gate — the credits column's wire minimum
+    // (2 x 8 = 16) against the 13 bytes actually present — BEFORE
+    // its reservation.
+    let mut truncated = bytes.clone();
+    truncated.truncate(truncated.len() - 3);
+    assert!(matches!(
+        NpcWorldSectionV2::restore(&mut Decoder::new(&truncated)),
+        Err(SaveError::Limit {
+            kind: "credits-count",
+            ..
+        })
+    ));
+    // A cut inside the header itself refuses at the read — the walk
+    // never repairs, and no allocation has been made.
+    assert!(matches!(
+        NpcWorldSectionV2::restore(&mut Decoder::new(&bytes[..30])),
+        Err(SaveError::Truncated)
+    ));
+    // An adversarial duplicate id across regions, encoded through
+    // the TOTAL raw codec (encoding is never repair): the bounded
+    // cross-region merge refuses it typed, naming the id.
+    let duplicate = NpcWorldSectionV2 {
+        seed: 42,
+        activity_period: 5,
+        simplify_factor: 3,
+        commitment_window: 9,
+        region_lods_enabled: true,
+        config: WorldConfig {
+            region_count: 2,
+            npc_count: 3,
+            region_grid: 16,
+        },
+        regions: vec![
+            NpcRegionBlock {
+                near: true,
+                lod: LodLevel::Full,
+                identities: vec![
+                    NpcIdentity {
+                        id: NpcId(3),
+                        home_cell: (3, 0),
+                        region: 0,
+                        appearance_seed: 3,
+                    },
+                    NpcIdentity {
+                        id: NpcId(7),
+                        home_cell: (7, 0),
+                        region: 0,
+                        appearance_seed: 7,
+                    },
+                ],
+                steps: vec![3, 7],
+                routine_cursor: vec![1, 3],
+                positions: vec![(3, 0), (7, 0)],
+                represented_through: vec![engine_core::Tick(1), engine_core::Tick(2)],
+                milestones: vec![0, 1],
+                pending_signals: vec![0, 0],
+                credits: vec![0, 2],
+            },
+            NpcRegionBlock {
+                near: false,
+                lod: LodLevel::Dormant,
+                identities: vec![NpcIdentity {
+                    id: NpcId(7),
+                    home_cell: (7, 1),
+                    region: 1,
+                    appearance_seed: 77,
+                }],
+                steps: vec![7],
+                routine_cursor: Vec::new(),
+                positions: Vec::new(),
+                represented_through: Vec::new(),
+                milestones: vec![1],
+                pending_signals: Vec::new(),
+                credits: vec![0],
+            },
+        ],
+    };
+    let mut enc = Encoder::new();
+    duplicate.save(&mut enc); // the raw codec is total: it encodes the invalid section
+    let bytes = enc.into_bytes();
+    assert!(matches!(
+        NpcWorldSectionV2::restore(&mut Decoder::new(&bytes)),
+        Err(SaveError::Duplicate { seq: 7, .. })
+    ));
+}
