@@ -220,3 +220,29 @@ heavy/renderer unchanged; confirming run `46131503857` dispatched.
 
 **T07 CI-verified green:** run `46131503857` at `4d17f14` — all five jobs
 success; the main shard 1645/1594 pin arithmetic confirmed on both platforms.
+
+## T05 — the population identity contracts landed (`fd3f7da`, pins at `121aa5d`)
+
+The audit's hypothesis CONFIRMED by four distinct red witnesses captured
+pre-fix (the colliding-generation `Reused` against stale bytes on the
+release-shaped path; the byte-identical-payload partition change the
+byte-only oracle cannot see; the missed-bump debug panic as the sole
+tripwire; the slot-level and indirect gates skipping). The fix:
+`InstanceSourceToken`/`PoseSourceToken` — renderer-assigned identity
+derived from the submission's own borrows, private fields, gate-only
+metadata never in packed bytes or digests; token mismatch resets the
+half's generation record so the existing R2 gate re-admits; indirect-count
+identity separated from payload identity; slot invalidation moved to
+submission time; pose-index validation at admission/change (the T18
+direction). No caller adaptation; no digest pin moved. The residual
+allocator-address-recycling hazard documented with the revision-scoped
+`PopulationHandle` as future hardening. CI pins corrected at `121aa5d`
+(main 1650/1599/2/37, renderer-release 220/3) — and the pin batch caught
+the orchestrator's own near-miss echo/gate drift on the renderer-release
+step, prompting the class-level completion: the third shard centralized
+under the same variables as heavy/main, the selftest extended to guard it
+(20/20 green). The orchestrator's local gate re-run was housekeeper-refused
+at 24.45/32 GiB cgroup (page-cache-heavy; no OOM events) — the lane's
+recorded gates + diff review + the dispatched exact-head CI run carry the
+verification; the local re-run queued for when the memory axis eases.
+Confirming run `46133893849` dispatched.
