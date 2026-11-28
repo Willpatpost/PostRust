@@ -580,14 +580,27 @@ pub fn corner_instances_into(
         out.len(),
         "states and output instances are parallel"
     );
-    let mapping = crate::corner_population::stander_dedup_block_indices(
-        &states
-            .iter()
-            .map(|state| state.speed == 0.0)
-            .collect::<Vec<_>>(),
-    );
-
+    // The stander-dedup mapping, computed ZERO-ALLOC (the R2-corrective
+    // finding: the Vec-based helper form allocated exactly 2 heap objects
+    // per warmed frame — measured and pinned in the rig batteries' own
+    // scopes, then re-based to zero by this fix as the documented repin).
+    // The rule EXACTLY as stander_dedup_block_indices: a stander maps to
+    // the shared rest block 0; with standers present, walker j (in table
+    // order) maps to 1 + j; with NO standers, walker j maps to j (the
+    // identity mapping — byte-identical for all-walking populations).
+    let any_stander = states.iter().any(|state| state.speed == 0.0);
+    let mut walker_ordinal = 0u32;
     for (i, state) in states.iter().enumerate() {
+        let block = if state.speed == 0.0 {
+            0
+        } else if any_stander {
+            walker_ordinal += 1;
+            walker_ordinal
+        } else {
+            let index = walker_ordinal;
+            walker_ordinal += 1;
+            index
+        };
         out[i] = ProxyInstance {
             transform: InstanceTransform {
                 pos: [state.position[0], 0.02, state.position[1]],
@@ -596,7 +609,7 @@ pub fn corner_instances_into(
             },
             tint: table_tints[i],
             alpha: 1.0,
-            pose_index: mapping[i],
+            pose_index: block,
         };
     }
 }

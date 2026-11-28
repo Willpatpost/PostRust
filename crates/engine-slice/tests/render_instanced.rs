@@ -1321,10 +1321,10 @@ fn full_corner_population_matches_per_object_pixels() {
         let mapping_allocs = mapping_scope.count();
         drop(mapping_scope);
         assert_eq!(
-            mapping_allocs, 2,
-            "the dedup mapping's whole per-frame host cost: the stander-flag \
-             Vec<bool> and the block-index Vec<u32> inside corner_instances_into \
-             (movement in EITHER direction is a conscious documented repin)"
+            mapping_allocs, 0,
+            "the dedup mapping is ZERO-ALLOC since the two-pass inline form
+             (the orchestrator fix landing the corrective recommended follow-up;
+              the R2-corrective pinned the Vec form exact 2, this the documented re-base)"
         );
         let mut digests = std::collections::BTreeSet::new();
         for k in 4..12u64 {
@@ -3457,10 +3457,10 @@ fn composed_population_matches_per_object_pixels() {
         let mapping_allocs = mapping_scope.count();
         drop(mapping_scope);
         assert_eq!(
-            mapping_allocs, 2,
-            "the dedup mapping's whole per-frame host cost: the stander-flag \
-             Vec<bool> and the block-index Vec<u32> inside corner_instances_into \
-             (movement in EITHER direction is a conscious documented repin)"
+            mapping_allocs, 0,
+            "the dedup mapping is ZERO-ALLOC since the two-pass inline form
+             (the orchestrator fix landing the corrective recommended follow-up;
+              the R2-corrective pinned the Vec form exact 2, this the documented re-base)"
         );
 
         let mut digests = std::collections::BTreeSet::new();
@@ -4027,10 +4027,10 @@ fn composed_wake_campaign_past_log_boundaries_allocates_nothing() {
     let mapping_allocs = mapping_scope.count();
     drop(mapping_scope);
     assert_eq!(
-        mapping_allocs, 2,
-        "the dedup mapping's whole per-frame host cost: the stander-flag \
-         Vec<bool> and the block-index Vec<u32> inside corner_instances_into \
-         (movement in EITHER direction is a conscious documented repin)"
+        mapping_allocs, 0,
+        "the dedup mapping is ZERO-ALLOC since the two-pass inline form
+             (the orchestrator fix landing the corrective recommended follow-up;
+              the R2-corrective pinned the Vec form exact 2, this the documented re-base)"
     );
 
     let mut spine_alloc_events: u64 = 0;
