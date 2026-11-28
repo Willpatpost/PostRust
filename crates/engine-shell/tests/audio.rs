@@ -38,7 +38,11 @@ fn the_device_path_dispatch_and_lifecycle_are_clean() {
 
     // 2. The push-model dispatch: every cue through the real stream
     //    path, repeatedly, with bounded wall cost (each play is one
-    //    non-blocking buffered SDL call plus SDL's internal copy).
+    //    non-blocking buffered SDL call plus SDL's internal copy —
+    //    or, under CA-22's queue budget, one queued-bytes read and a
+    //    counted refusal: the dummy driver drains at its own pace,
+    //    so an overload burst may refuse fail-visibly, which keeps
+    //    the path bounded rather than breaking it).
     let start = std::time::Instant::now();
     let pushes = 100 * CUES.len() as u64;
     for _ in 0..100 {
@@ -59,6 +63,18 @@ fn the_device_path_dispatch_and_lifecycle_are_clean() {
         audio.status().is_active(),
         "the dummy device stays active after playback"
     );
+
+    // CA-22's refusal telemetry is readable on the real path: the
+    // budget is sized from the cue table (always > 0 on an active
+    // surface), and the refusal count is carried fail-visibly. The
+    // dummy driver's drain pace is platform/timing-dependent, so the
+    // count is PRINTED here, never asserted — the overload response
+    // itself (refusal visible, never silent unbounded growth) is
+    // pinned by the library battery's CueBackpressure tests.
+    let budget = audio.cue_queue_budget_bytes();
+    let refused = audio.cues_refused();
+    assert!(budget > 0, "an active surface carries a real budget");
+    println!("[audio-smoke] cue queue budget {budget} bytes/stream; {refused} cues refused");
 
     // 3. The refcounted lifecycle: five full initialize → play →
     //    drop cycles inside one platform — the SDL AUDIO subsystem

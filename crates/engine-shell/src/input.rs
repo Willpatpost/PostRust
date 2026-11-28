@@ -20,8 +20,11 @@
 //! Key-identity contract: the intent surface is keyed by `Keycode` —
 //! SDL's layout-mapped virtual key. Key events carrying only a
 //! scancode (`keycode: None`, a key with no layout mapping) have no
-//! intent identity and are silently dropped; scancode-level
-//! (physical-key, layout-independent) input is out of scope.
+//! intent identity and are silently dropped — presses, releases, and
+//! repeats alike (CA-23: the repeat counter is a mapped-key count,
+//! symmetric with the mapped-only press/release edge lists);
+//! scancode-level (physical-key, layout-independent) input is out of
+//! scope.
 
 use std::collections::HashSet;
 
@@ -44,8 +47,11 @@ pub struct InputSnapshot {
     pub keys_pressed: Vec<Keycode>,
     /// Keys that transitioned to released in this snapshot.
     pub keys_released: Vec<Keycode>,
-    /// Key-repeat events observed in this snapshot. Repeats are counted,
-    /// never reported as fresh presses.
+    /// Key-repeat events of layout-mapped keys observed in this
+    /// snapshot. Repeats are counted, never reported as fresh
+    /// presses; a keycode-less (scancode-only) repeat carries no
+    /// intent identity and is dropped like every other
+    /// keycode-less event (CA-23).
     pub key_repeats: u32,
     /// Mouse buttons pressed in this snapshot.
     pub mouse_pressed: Vec<MouseButton>,
@@ -136,14 +142,25 @@ impl InputState {
         match event {
             Event::Quit { .. } => self.quit_requested = true,
             Event::Window { win_event, .. } => self.process_window(*win_event),
+            // CA-23 (the doc/code alignment): the key-identity
+            // contract governs repeats too. The match arm binds
+            // `keycode: Some(key)` FIRST — a keycode-less
+            // (scancode-only) event has no intent identity and falls
+            // to the catch-all below, dropped whole, including its
+            // repeats; the pre-fix shape incremented the repeat
+            // counter before the keycode check, counting
+            // identity-less events the module doc promises to
+            // silently drop. Repeats are a MAPPED-KEY count,
+            // symmetric with the mapped-only
+            // `keys_pressed`/`keys_released` edges.
             Event::KeyDown {
-                keycode, repeat, ..
+                keycode: Some(key),
+                repeat,
+                ..
             } => {
                 if *repeat {
                     self.key_repeats += 1;
-                } else if let Some(key) = keycode
-                    && self.keys_held.insert(*key)
-                {
+                } else if self.keys_held.insert(*key) {
                     self.keys_pressed.push(*key);
                 }
             }
@@ -237,5 +254,78 @@ impl InputState {
         self.minimized = false;
         self.restored = false;
         snapshot
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sdl3::keyboard::{Mod, Scancode};
+
+    /// CA-23 — the repeat count follows the key-identity contract:
+    /// one MAPPED repeat counts; one UNMAPPED (keycode-less) repeat
+    /// is dropped whole — no counter movement, no press — exactly
+    /// like an ordinary unmapped press. The pre-fix shape incremented
+    /// the repeat counter BEFORE the keycode check, so the
+    /// scancode-only repeat was counted while the module doc promised
+    /// keycode-less events are "silently dropped"; this test fails on
+    /// that pre-fix shape (the second poll would read
+    /// `key_repeats: 1`).
+    ///
+    /// Driven through the identical production `process` branch
+    /// rather than SDL's event queue: the sdl3 wrapper's queue
+    /// conversion refuses `keycode: None` (`to_ll` returns None for a
+    /// keyboard event without a keycode), so a keycode-less KeyDown
+    /// cannot be synthesized through the pump at all — real hardware
+    /// delivers such events for keys with no layout mapping, which is
+    /// exactly the shape the contract covers.
+    #[test]
+    fn repeat_counting_follows_the_key_identity_contract() {
+        let key_down = |keycode: Option<Keycode>, repeat: bool| Event::KeyDown {
+            timestamp: 0,
+            window_id: 0,
+            keycode,
+            scancode: Some(Scancode::W),
+            keymod: Mod::empty(),
+            repeat,
+            which: 0,
+            raw: 0,
+        };
+        let mut state = InputState::new();
+
+        // One mapped press, then one mapped repeat — each in its own
+        // snapshot, the pump cadence.
+        state.process(&key_down(Some(Keycode::W), false));
+        let snapshot = state.poll();
+        assert_eq!(snapshot.keys_pressed, vec![Keycode::W], "the press lands");
+        state.process(&key_down(Some(Keycode::W), true));
+        let snapshot = state.poll();
+        assert_eq!(snapshot.key_repeats, 1, "a mapped repeat counts");
+        assert!(snapshot.keys_pressed.is_empty(), "a repeat is not a press");
+        assert_eq!(snapshot.move_forward, 1, "the key remains held");
+
+        // One unmapped repeat (keycode-less — the audit's witness
+        // shape): no intent identity, dropped whole before the
+        // counter.
+        state.process(&key_down(None, true));
+        let snapshot = state.poll();
+        assert_eq!(
+            snapshot.key_repeats, 0,
+            "a keycode-less repeat is silently dropped"
+        );
+        assert!(snapshot.keys_pressed.is_empty());
+
+        // One ordinary unmapped press: equally invisible — no
+        // counter, no edge, and the mapped key's held state is
+        // untouched.
+        state.process(&key_down(None, false));
+        let snapshot = state.poll();
+        assert_eq!(snapshot.key_repeats, 0);
+        assert!(snapshot.keys_pressed.is_empty());
+        assert!(state.is_held(Keycode::W));
+        assert_eq!(
+            snapshot.move_forward, 1,
+            "the keycode-less events changed nothing observable"
+        );
     }
 }

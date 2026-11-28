@@ -30,7 +30,10 @@
 //!   with the reason queryable through [`Audio::status`] — never an
 //!   error; a mid-run playback failure degrades the same way. The
 //!   explicit [`Audio::disabled`] headless mode never touches SDL
-//!   audio at all.
+//!   audio at all. An over-rate push against a stream's queue budget
+//!   (CA-22) is refused fail-visibly — counted in
+//!   [`Audio::cues_refused`], never a silent drop, never unbounded
+//!   buffered-PCM growth.
 //!
 //! # Era 2 package B part 2 — the SDL3 AUDIO DEVICE LAYER
 //! (the vertical slice's §2.1 device I/O, under the map's law)
@@ -184,6 +187,81 @@ impl AudioStatus {
     }
 }
 
+/// CA-22 — the legacy cue surface's backpressure: an explicit
+/// per-stream queue budget in app-side PCM bytes plus the refusal
+/// telemetry, the cue-surface counterpart of the device layer's
+/// bounded refusal discipline ([`AudioStats::triggers_dropped`] and
+/// the voice-steal count below). The pre-fix surface pushed through
+/// SDL's unconditionally-buffering `SDL_PutAudioStreamData` with NO
+/// in-flight bound, so a sustained over-rate would grow SDL's
+/// buffered PCM without limit.
+///
+/// RELATIONSHIP TO NEW-SHELL-3 (the owner's two-surface
+/// consolidation question): this fix deliberately does NOT answer
+/// it. Routing cues through the bounded mixer voices would be the
+/// consolidation itself — the owner's call, not this lane's. The
+/// budget stands alone on the legacy surface; a future
+/// consolidation that subsumes the cue streams into the device
+/// layer's bounded pool would delete this type along with the
+/// streams it guards.
+///
+/// The budget is PER STREAM (each cue owns its stream; SDL's queued
+/// bytes are per stream), sized at construction as four
+/// largest-cue PCM payloads: the intended rate — cue pushes riding
+/// discrete gameplay events, drained in under a second — never
+/// reaches it, while a sustained over-rate on one cue refuses
+/// fail-visibly once roughly two seconds of that cue's PCM is in
+/// flight (smaller cues proportionally more).
+#[derive(Debug, Clone, Copy)]
+struct CueBackpressure {
+    /// The per-stream budget: bytes of unconverted app-side PCM (mono
+    /// f32 at the synthesis rate — the same units SDL's
+    /// `queued_bytes` reports on the stream's input side).
+    budget_bytes: usize,
+    /// Cues refused because the stream's queued PCM plus the incoming
+    /// cue would exceed the budget — counted fail-visibly, never a
+    /// silent drop, never unbounded growth.
+    refused: u64,
+}
+
+impl CueBackpressure {
+    /// The policy constant: how many largest-cue payloads may be in
+    /// flight on one stream before the surface refuses.
+    const CUES_IN_FLIGHT: usize = 4;
+
+    /// Sizes the budget from the cue table (construction time, where
+    /// the samples are already synthesized). An empty table (the
+    /// disabled surface) sizes zero — never consulted, since the
+    /// disabled `play` returns before any budget check.
+    fn from_samples(samples: &[Vec<f32>]) -> CueBackpressure {
+        let largest = samples
+            .iter()
+            .map(|cue| cue.len() * size_of::<f32>())
+            .max()
+            .unwrap_or(0);
+        CueBackpressure {
+            budget_bytes: largest * Self::CUES_IN_FLIGHT,
+            refused: 0,
+        }
+    }
+
+    /// The admission decision: total in its inputs and
+    /// all-or-nothing — a cue is either fully enqueued or fully
+    /// refused, so the FIFO order of admitted cues (SDL's per-stream
+    /// queue order) is never disturbed, and a refusal never leaves a
+    /// partial cue behind. Refuses (counting the refusal fail-visibly)
+    /// when the stream's queued PCM plus the incoming cue would
+    /// exceed the budget.
+    fn admit(&mut self, queued_bytes: usize, incoming_bytes: usize) -> bool {
+        if queued_bytes.saturating_add(incoming_bytes) <= self.budget_bytes {
+            true
+        } else {
+            self.refused += 1;
+            false
+        }
+    }
+}
+
 /// The audio capability: a default playback device plus one bound
 /// stream per cue, carrying prebuilt procedural waveforms. Drop
 /// follows Rust's declaration-order field drops: the device closes
@@ -205,6 +283,9 @@ pub struct Audio {
     streams: Option<Vec<AudioStreamOwner>>,
     /// The prebuilt cue waveforms (48 kHz mono f32), indexed by cue.
     samples: Vec<Vec<f32>>,
+    /// CA-22's queue budget + refusal telemetry (see the type's docs
+    /// for the policy and the NEW-SHELL-3 relationship).
+    backpressure: CueBackpressure,
 }
 
 /// The cue sample rate (Hz).
@@ -222,6 +303,7 @@ impl Audio {
             device: None,
             streams: None,
             samples: Vec::new(),
+            backpressure: CueBackpressure::from_samples(&[]),
         }
     }
 
@@ -272,6 +354,7 @@ impl Audio {
             return Audio::disabled(&format!("binding the cue streams: {error}"));
         }
         let samples: Vec<Vec<f32>> = CUES.iter().map(|cue| cue_samples(*cue)).collect();
+        let backpressure = CueBackpressure::from_samples(&samples);
         let driver = subsystem.current_audio_driver().to_string();
         let device_name = device
             .name()
@@ -285,6 +368,7 @@ impl Audio {
             device: Some(device),
             streams: Some(streams),
             samples,
+            backpressure,
         }
     }
 
@@ -293,26 +377,57 @@ impl Audio {
         &self.status
     }
 
+    /// CA-22's refusal telemetry: cues refused by the queue budget —
+    /// counted fail-visibly so an overload is visible in the run
+    /// summary, never a silent drop.
+    pub fn cues_refused(&self) -> u64 {
+        self.backpressure.refused
+    }
+
+    /// CA-22's per-stream queue budget in app-side PCM bytes (four
+    /// largest-cue payloads; see [`CueBackpressure`]).
+    pub fn cue_queue_budget_bytes(&self) -> usize {
+        self.backpressure.budget_bytes
+    }
+
     /// Plays one cue: a single non-blocking push of the cue's
     /// prebuilt waveform into its stream (SDL's audio thread consumes
     /// it; no allocation, no synthesis, no polling). A no-op in the
     /// silent state; a mid-run playback failure degrades to the
     /// observable silent state and releases the audio resources.
     ///
-    /// Push-rate contract: the underlying `SDL_PutAudioStreamData`
-    /// buffers unconditionally (verified in the vendored SDL 3.4.18),
-    /// so in-flight PCM is held by SDL and this path carries NO
-    /// in-flight-sample bound — the deliberate asymmetry with the
-    /// device layer's bounded refusal discipline ([`AudioDevice`],
-    /// below). The caller must not push faster than the device
-    /// drains: cue pushes ride discrete gameplay events, which is the
-    /// intended rate limit, and a sustained over-rate would grow
-    /// SDL's buffered PCM without bound.
+    /// Push-rate contract (CA-22 — the explicit queue budget): the
+    /// underlying `SDL_PutAudioStreamData` buffers unconditionally
+    /// (verified in the vendored SDL 3.4.18), so without a budget a
+    /// sustained over-rate would grow SDL's buffered PCM without
+    /// bound. Each stream therefore carries an explicit byte budget
+    /// ([`CueBackpressure`]: four largest cues in flight): a push
+    /// that would exceed it is REFUSED fail-visibly — counted in
+    /// [`Audio::cues_refused`], never a silent drop, never unbounded
+    /// growth — which is the cue-surface counterpart of the device
+    /// layer's bounded refusal discipline. A failed queued-bytes
+    /// read degrades OPEN (treated as an empty queue: audio is
+    /// never a gameplay prerequisite, and the over-budget refusal
+    /// telemetry does not depend on it). The caller should still
+    /// not push faster than the device drains as a steady state —
+    /// cue pushes ride discrete gameplay events, which is the
+    /// intended rate limit; the budget is the overload backstop,
+    /// not the ordinary operating mode.
     pub fn play(&mut self, cue: Cue) {
         let Some(streams) = self.streams.as_mut() else {
             return;
         };
         let index = cue.index();
+        // CA-22: read SDL's own queued byte count on this cue's
+        // stream (the unconverted app-side PCM this surface pushed),
+        // then make the all-or-nothing admission against the budget.
+        let queued = streams[index]
+            .queued_bytes()
+            .map_or(0, |bytes| bytes.max(0) as usize);
+        let incoming = self.samples[index].len() * size_of::<f32>();
+        if !self.backpressure.admit(queued, incoming) {
+            return;
+        }
         if let Err(error) = streams[index].put_data_f32(&self.samples[index]) {
             self.status = AudioStatus::Silent {
                 reason: format!("playback failed mid-run: {error}"),
@@ -484,6 +599,99 @@ mod tests {
                 "{cue:?} carries energy (sum of squares {energy})"
             );
         }
+    }
+
+    /// CA-22 — the startup admission: a fresh (empty) stream admits
+    /// every cue, so ordinary playback never meets the budget. The
+    /// budget is sized from the LARGEST cue in the table, so the
+    /// first push of any cue — including the largest — is always
+    /// admitted; the resident PCM the surface may buffer is bounded
+    /// by construction (four largest cues per stream).
+    #[test]
+    fn the_cue_budget_admits_every_cue_on_an_empty_stream() {
+        let samples: Vec<Vec<f32>> = CUES.iter().map(|cue| cue_samples(*cue)).collect();
+        let largest = samples
+            .iter()
+            .map(|cue| cue.len() * size_of::<f32>())
+            .max()
+            .unwrap();
+        let mut backpressure = CueBackpressure::from_samples(&samples);
+        assert_eq!(
+            backpressure.budget_bytes,
+            largest * CueBackpressure::CUES_IN_FLIGHT,
+            "the budget is four largest-cue payloads"
+        );
+        for cue in &samples {
+            assert!(
+                backpressure.admit(0, cue.len() * size_of::<f32>()),
+                "an empty stream admits the cue (startup, resident PCM unbounded never)"
+            );
+        }
+        assert_eq!(backpressure.refused, 0, "no startup refusals");
+        // The disabled surface's budget is never consulted (play
+        // returns before the check), but it sizes honestly at zero.
+        let disabled = CueBackpressure::from_samples(&[]);
+        assert_eq!(disabled.budget_bytes, 0);
+    }
+
+    /// CA-22 — the overload response: admission is exact at the
+    /// budget boundary and refuses beyond it; every refusal is
+    /// COUNTED fail-visibly (never a silent drop); and the in-flight
+    /// PCM through this surface stays within the budget even against
+    /// a sustained over-rate with a device that NEVER drains (the
+    /// worst case — never a silent unbounded growth). The admission
+    /// is all-or-nothing per cue, so the FIFO order of admitted cues
+    /// (SDL's per-stream queue order) is never disturbed by a
+    /// refusal — audible ordering survives the overload.
+    #[test]
+    fn the_cue_overload_response_is_counted_and_bounded() {
+        let samples: Vec<Vec<f32>> = CUES.iter().map(|cue| cue_samples(*cue)).collect();
+        let largest = samples
+            .iter()
+            .map(|cue| cue.len() * size_of::<f32>())
+            .max()
+            .unwrap();
+        let budget = largest * CueBackpressure::CUES_IN_FLIGHT;
+        let incoming = samples[Cue::Fire.index()].len() * size_of::<f32>();
+        let mut backpressure = CueBackpressure::from_samples(&samples);
+        // The boundary: exactly at the budget admits, one byte over
+        // refuses — the decision is total and exact in its inputs.
+        assert!(
+            backpressure.admit(budget - incoming, incoming),
+            "exactly at the budget admits"
+        );
+        assert!(
+            !backpressure.admit(budget - incoming + 1, incoming),
+            "one byte past the budget refuses"
+        );
+        assert_eq!(backpressure.refused, 1, "the first refusal is counted");
+        // The sustained over-rate, worst case (a device that never
+        // drains): the in-flight level never exceeds the budget, and
+        // every refusal past it is counted.
+        let mut queued = 0usize;
+        let mut refused = 0u64;
+        for _ in 0..10_000 {
+            if backpressure.admit(queued, incoming) {
+                queued += incoming;
+            } else {
+                refused += 1;
+            }
+            assert!(
+                queued <= budget,
+                "in-flight PCM stays within the budget (never unbounded growth)"
+            );
+        }
+        assert!(refused > 0, "a never-draining overload actually refuses");
+        assert_eq!(
+            backpressure.refused,
+            1 + refused,
+            "every refusal counted fail-visibly"
+        );
+        // A drain restores admission (the budget is a level, not a
+        // latch): after the device consumes the in-flight PCM, an
+        // ordinary cue is admitted again.
+        assert!(backpressure.admit(0, incoming));
+        assert_eq!(backpressure.refused, 1 + refused, "the recovery admits");
     }
 }
 
@@ -725,6 +933,15 @@ struct AudioCounters {
 struct SharedAudio {
     commands: Mutex<SharedCommands>,
     counters: AudioCounters,
+    /// CA-21's test-only operation counter: the loop iterations
+    /// executed while HOLDING the command lock in `SharedAudio::
+    /// submit` — the audit's lock-held-work measurement (the
+    /// operation-count precedent: a test-only seam measuring the
+    /// identical production code, like the host-allocation counter
+    /// beside it). Test builds only; the production critical section
+    /// carries no counter of its own.
+    #[cfg(test)]
+    submit_lock_iterations: AtomicU64,
 }
 
 impl SharedAudio {
@@ -755,6 +972,8 @@ impl SharedAudio {
                 voices_stolen: AtomicU64::new(0),
                 triggers_dropped: AtomicU64::new(0),
             },
+            #[cfg(test)]
+            submit_lock_iterations: AtomicU64::new(0),
         }
     }
 
@@ -763,26 +982,48 @@ impl SharedAudio {
     /// lock acquisition and are queued as (trigger, listener) pairs,
     /// so the association survives any interleaving of producer and
     /// callback drain. Bounded, counting refusals fail-visibly.
+    ///
+    /// CA-21 (the A25 producer-side mirror): the lock-held work is
+    /// bounded by the RING'S FREE SPACE, never the caller's batch
+    /// length. Only the admitted prefix is traversed and copied
+    /// under the lock; the rejected tail is accounted with ONE
+    /// addition AFTER the guard drops (no atomic RMW under the lock
+    /// at all). The pre-fix shape walked the ENTIRE input slice
+    /// under the lock — a caller batch far past the ring capacity
+    /// kept the guard through every rejected item, each paying a
+    /// separate atomic increment, extending the audio thread's
+    /// `try_lock` deferral by the whole traversal. The admitted set,
+    /// its FIFO order, the per-slot listener pairing, and the
+    /// refused total are IDENTICAL to that shape: the first
+    /// `capacity − count` triggers of the batch, in order, each with
+    /// this publication's listener, and `len − admitted` refused.
     /// Mutex poisoning is recovered by taking the cell's payload
     /// anyway — the slots are plain Copy data, structurally valid
     /// through any panic (and the callback cannot panic: every path
     /// is a bounds-checked walk over fixed buffers, no unwrap, no
     /// division).
     fn submit(&self, triggers: &[SoundTrigger], listener: Listener) {
-        let mut commands = self
-            .commands
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for &trigger in triggers {
-            if commands.count >= TRIGGER_QUEUE_CAPACITY {
-                self.counters
-                    .triggers_dropped
-                    .fetch_add(1, Ordering::Relaxed);
-                continue;
+        let refused = {
+            let mut commands = self
+                .commands
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let admitted = triggers.len().min(TRIGGER_QUEUE_CAPACITY - commands.count);
+            for &trigger in &triggers[..admitted] {
+                #[cfg(test)]
+                self.submit_lock_iterations.fetch_add(1, Ordering::Relaxed);
+                let slot = (commands.head + commands.count) % TRIGGER_QUEUE_CAPACITY;
+                commands.ring[slot] = QueuedSound { trigger, listener };
+                commands.count += 1;
             }
-            let slot = (commands.head + commands.count) % TRIGGER_QUEUE_CAPACITY;
-            commands.ring[slot] = QueuedSound { trigger, listener };
-            commands.count += 1;
+            triggers.len() - admitted
+        };
+        // The rejected tail: ONE unheld addition — the same total the
+        // pre-fix per-item increments produced, in a single account.
+        if refused > 0 {
+            self.counters
+                .triggers_dropped
+                .fetch_add(refused as u64, Ordering::Relaxed);
         }
     }
 }
@@ -1232,7 +1473,11 @@ impl AudioDevice {
     /// A25 corrective — the voice-start work runs unheld after
     /// it), so this blocking acquisition waits at most one
     /// bounded copy of ≤ `TRIGGER_QUEUE_CAPACITY` `Copy` slots
-    /// (microseconds), never a voice-start batch.
+    /// (microseconds), never a voice-start batch. Since CA-21 the
+    /// producer's own critical section is bounded the same way:
+    /// it traverses only the admitted prefix (the ring's free
+    /// space, never the caller's batch length) and accounts the
+    /// rejected tail with one unheld addition.
     /// refusals land in [`AudioStats::triggers_dropped`].
     pub fn submit_triggers(&mut self, triggers: &[SoundTrigger], listener: Listener) {
         self.shared.submit(triggers, listener);
@@ -1531,6 +1776,168 @@ mod device_tests {
         assert_eq!(
             shared.counters.voices_stolen.load(Ordering::Relaxed),
             (TRIGGER_QUEUE_CAPACITY - VOICE_COUNT) as u64
+        );
+    }
+
+    /// CA-21 — the producer's LOCK-HELD WORK is bounded by the ring's
+    /// free space, never the caller's batch length: as the submitted
+    /// batch grows past the ring capacity, the loop executed under
+    /// the command lock stays at exactly the admitted count (the
+    /// ring's capacity, once full) while the refused tail grows
+    /// linearly. Measured through the `submit_lock_iterations`
+    /// operation counter — the operation-count seam (the same
+    /// discipline as the host-allocation counter: a test-only hook
+    /// measuring the IDENTICAL production `submit`). The pre-fix
+    /// shape walked the ENTIRE input slice under the lock with a
+    /// separate atomic increment per rejected item, so this counter
+    /// would have read the full batch length (e.g. 1024 at the last
+    /// row below) — the assertion has teeth against exactly that
+    /// regression.
+    #[test]
+    fn producer_lock_work_stays_bounded_as_batches_grow_past_capacity() {
+        for batch in [
+            TRIGGER_QUEUE_CAPACITY,
+            TRIGGER_QUEUE_CAPACITY + 44,
+            TRIGGER_QUEUE_CAPACITY * 4,
+            TRIGGER_QUEUE_CAPACITY * 16,
+        ] {
+            let (mut mixer, shared) = core();
+            let triggers: Vec<SoundTrigger> = (0..batch)
+                .map(|i| footstep_at([i as f32, 0.0, 0.0]))
+                .collect();
+            shared.submit(&triggers, Listener::default());
+            assert_eq!(
+                shared.submit_lock_iterations.load(Ordering::Relaxed),
+                TRIGGER_QUEUE_CAPACITY as u64,
+                "batch {batch}: the lock-held loop is the admitted prefix, not the batch"
+            );
+            assert_eq!(
+                shared.counters.triggers_dropped.load(Ordering::Relaxed),
+                (batch - TRIGGER_QUEUE_CAPACITY) as u64,
+                "batch {batch}: the refused tail is accounted exactly (one addition)"
+            );
+            // The ring holds exactly the admitted prefix, and the
+            // drain empties it into the bounded pool as before.
+            mixer.drain_commands();
+            assert!(
+                shared
+                    .commands
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .count
+                    == 0,
+                "batch {batch}: the drain empties the ring"
+            );
+            let active = mixer.voices.iter().filter(|voice| voice.active).count();
+            assert_eq!(active, VOICE_COUNT, "batch {batch}: the pool is the bound");
+        }
+    }
+
+    /// CA-21 — the overflow submit preserves the FIFO order and the
+    /// per-batch listener pairing EXACTLY (the finding-9 atomic
+    /// publication contract), with the refused tail accounted
+    /// identically: batch 1 (8 triggers, the north listener) fills
+    /// the ring partially; batch 2 (the ring's remaining free space
+    /// plus 28 more, the south listener) admits only that free space
+    /// and refuses the rest. The queued ring must read: batch 1's 8
+    /// commands in order carrying the north listener, then batch 2's
+    /// admitted prefix in order carrying the south listener — and
+    /// `triggers_dropped` == 28 exactly. The pre-fix and post-fix
+    /// shapes admit the SAME set (the first `capacity − count`
+    /// triggers of each batch, in order); this pins that the
+    /// restructured copy preserves it.
+    #[test]
+    fn overflow_submit_preserves_fifo_pairing_and_the_identical_refused_count() {
+        let (mut mixer, shared) = core();
+        let north = Listener {
+            position: [-3.0, 0.0, 0.0],
+            ..Listener::default()
+        };
+        let south = Listener {
+            position: [3.0, 0.0, 0.0],
+            forward: [0.0, 0.0, -1.0],
+            right: [-1.0, 0.0, 0.0],
+            ..Listener::default()
+        };
+        let first: Vec<SoundTrigger> = (0..8).map(|i| footstep_at([i as f32, 0.0, 0.0])).collect();
+        // The ring's remaining free space (capacity − 8) plus 28 more:
+        // exactly 28 refused.
+        let second_len = (TRIGGER_QUEUE_CAPACITY - 8) + 28;
+        let second: Vec<SoundTrigger> = (0..second_len)
+            .map(|i| footstep_at([100.0 + i as f32, 0.0, 0.0]))
+            .collect();
+        shared.submit(&first, north);
+        shared.submit(&second, south);
+        assert_eq!(
+            shared.counters.triggers_dropped.load(Ordering::Relaxed),
+            28,
+            "the refused tail of the oversized second batch, exactly"
+        );
+        {
+            let commands = shared
+                .commands
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(commands.count, TRIGGER_QUEUE_CAPACITY, "the ring is full");
+            assert_eq!(commands.head, 0, "nothing drained yet");
+            for slot in 0..TRIGGER_QUEUE_CAPACITY {
+                let queued = commands.ring[slot];
+                if slot < 8 {
+                    assert_eq!(
+                        queued.trigger.position[0], slot as f32,
+                        "batch 1's triggers sit in FIFO order"
+                    );
+                    assert_eq!(queued.listener, north, "batch 1's listener is paired");
+                } else {
+                    assert_eq!(
+                        queued.trigger.position[0],
+                        100.0 + (slot - 8) as f32,
+                        "batch 2's ADMITTED PREFIX sits in FIFO order after batch 1"
+                    );
+                    assert_eq!(queued.listener, south, "batch 2's listener is paired");
+                }
+            }
+        }
+        // And the drain consumes the full ring faithfully into the
+        // bounded pool: 256 starts against 64 voices steal 192 (the
+        // last 64 handouts win the pool — all batch-2 prefix
+        // triggers), each spatialized against ITS OWN south listener
+        // (hard left, left gain > 0, right gain exactly 0). This
+        // discriminates the stale-listener failure mode: a drain
+        // using the cell's INITIAL default listener would pan the
+        // +X batch-2 sources hard RIGHT instead.
+        mixer.drain_commands();
+        let mut hard_right = 0;
+        let mut hard_left = 0;
+        for voice in &mixer.voices {
+            if !voice.active || voice.looping {
+                continue;
+            }
+            if voice.gain.0 == 0.0 && voice.gain.1 > 0.0 {
+                hard_right += 1;
+            }
+            if voice.gain.1 == 0.0 && voice.gain.0 > 0.0 {
+                hard_left += 1;
+            }
+        }
+        assert_eq!(
+            shared
+                .commands
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .count,
+            0,
+            "the drain empties the full ring"
+        );
+        assert_eq!(
+            hard_left, VOICE_COUNT,
+            "the pool's voices all carry batch 2's south-listener gains"
+        );
+        assert_eq!(hard_right, 0, "no stale default-listener panning leaked in");
+        assert_eq!(
+            shared.counters.voices_stolen.load(Ordering::Relaxed),
+            (8 + (TRIGGER_QUEUE_CAPACITY - 8) - VOICE_COUNT) as u64,
+            "the pool bound steals the rest, fail-visible"
         );
     }
 
