@@ -4564,6 +4564,16 @@ mod r1a2_production_tests {
         shared_object: Hash,
         mk: Hash,
         plan_record: Hash,
+        /// (The standing handoff item, closed 2026-11-29.) Read only
+        /// inside the SQLite-gated discovery battery (the
+        /// `families[0]` assertion's `campaign.plan.batches.len()`
+        /// half) — under `--no-default-features` that reader is
+        /// compiled out while the unix-compiled ladder still
+        /// constructs the field, so the dormancy needs the sqlite
+        /// dimension here (the struct-level `not(unix)` marker
+        /// covering only the Windows half of the same class; the
+        /// A12IndexDoctor precedent).
+        #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
         plan: ReclaimPlan,
         audits: Vec<Hash>,
         begin: Hash,
