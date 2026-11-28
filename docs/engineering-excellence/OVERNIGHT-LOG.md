@@ -293,3 +293,23 @@ quarantine + retry, the never-signaling quarantine, the render_layers latch,
 the first-use deciding WSI validation run). CI pins corrected (`4affaaf`:
 renderer-release 227, main 1661/1610, heavy ignored 66). Confirming run
 `46139366087` dispatched.
+
+## The lifecycle confirming runs — the shared-runner flake record (honest)
+
+Run `46139366087` (at `4affaaf`): ubuntu-only failure —
+`combat_index_scaling_evidence` at pop 8192 measured 39.5 ms against the
+37.8 ms per-record bound (`a2e6e86`'s 5 ms + 4 µs/record), a 4.3% overshoot;
+windows/heavy/macos all green; the identical test passed on ubuntu in the
+three prior runs and in the retry. Run `46140155146` (at `65555e4`,
+docs-only delta): windows-only failure —
+`journal::tests::contended_writer_returns_busy_then_reopens_after_release`
+panicked on an internal synchronization `Timeout` under a heavily-loaded
+runner (the local-only battery ran 102 s); ubuntu green including the
+combat probe. Both failures are in crates the lifecycle lane does not
+touch (engine-core combat timing, engine-persist journal concurrency) —
+the shared-runner variance class the repo has recorded before (the
+S1g race-timing flake, `c432d44`'s message, with the protocol: a third
+occurrence makes it a register investigation). The combat bound carries
+the T39 evidence obligation: if the 8192 arm recurs, the per-record
+calibration revisits the accumulated CI actuals per the 877580f/3e0c729/
+a2e6e86 precedent. Third dispatch at the unchanged tree.
