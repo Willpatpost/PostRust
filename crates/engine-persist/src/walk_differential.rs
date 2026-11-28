@@ -571,6 +571,18 @@ fn run_sqlite_steps(medium: &SqliteMedium, steps: &[Step]) {
 /// the cleanup).
 struct Case {
     root: PathBuf,
+    /// The CURRENT call's scratch root (a fresh subdirectory per
+    /// `opened_pair` call — the Windows lesson, runs 46155517625 →
+    /// 46157193468: reuse-by-wipe depends on Windows delete
+    /// semantics, where a handle held anywhere in the tree — a
+    /// medium, a scanner, anything — makes `remove_dir_all` fail
+    /// with os error 32, and the failure mode is un-diagnosable from
+    /// the pod. A fresh subdirectory per call provides the SAME
+    /// isolation the wipe existed for (successive sub-cases never
+    /// observe each other's stores) with no deletion at all; the
+    /// whole case tree is cleaned best-effort at `Drop`, after the
+    /// mediums are gone).
+    current: std::cell::Cell<usize>,
 }
 
 impl Case {
@@ -584,15 +596,29 @@ impl Case {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
-        Case { root }
+        Case {
+            root,
+            current: std::cell::Cell::new(0),
+        }
+    }
+
+    /// The next per-call scratch root: a fresh subdirectory, never a
+    /// reused one. Interior mutability because the test battery
+    /// passes `&Case` through its helpers.
+    fn fresh_root(&self) -> PathBuf {
+        let n = self.current.get() + 1;
+        self.current.set(n);
+        self.root.join(format!("call-{n}"))
     }
 
     fn local_root(&self) -> PathBuf {
-        self.root.join("local")
+        let n = self.current.get();
+        self.root.join(format!("call-{n}")).join("local")
     }
 
     fn db_path(&self) -> PathBuf {
-        self.root.join("db.sqlite")
+        let n = self.current.get();
+        self.root.join(format!("call-{n}")).join("db.sqlite")
     }
 }
 
@@ -606,37 +632,15 @@ impl Drop for Case {
 /// observation mediums over it — the session open's cold walk
 /// establishes the trusted cursor on both (the foundations are valid
 /// and fully referenced by construction, so the local open's
-/// unreferenced-object sweep has nothing to act on). The case's
-/// scratch is WIPED first: every call builds from a clean root, so
+/// unreferenced-object sweep has nothing to act on). Every call
+/// builds in its OWN fresh subdirectory (`Case::fresh_root`) —
 /// successive sub-cases sharing one `Case` never observe each other's
-/// mutated stores (the prior sub-case's mediums are dropped at its
-/// block's end, before this runs).
+/// mutated stores, and nothing is ever deleted mid-test (the Windows
+/// delete-semantics trap, see `Case::current`'s doc).
 fn opened_pair(case: &Case, steps: &[Step]) -> (LocalFileMedium, SqliteMedium) {
-    // The wipe is LOUD on remnants (the Windows lesson, runs
-    // 46155517625 + 46156442963): a swallowed wipe failure surfaces
-    // later as a mystery unwrap in the clean open, far from its
-    // cause. It first RETRIES with a bounded backoff — the transient
-    // lock class is real on Windows CI runners (the scanner holding
-    // a brief handle on a freshly-written db, os error 32) and
-    // releases on its own — then fails HERE, naming the leftover, if
-    // anything survives.
-    let mut wipe_attempts = 0;
-    while let Err(error) = fs::remove_dir_all(&case.root) {
-        if !case.root.exists() {
-            break;
-        }
-        wipe_attempts += 1;
-        if wipe_attempts >= 3 {
-            panic!(
-                "the scratch wipe left remnants at {} after {wipe_attempts} attempts: \
-                 {error}",
-                case.root.display()
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250));
-    }
-    fs::create_dir_all(&case.root).unwrap();
-    let local_root = case.local_root();
+    let root = case.fresh_root();
+    fs::create_dir_all(&root).unwrap();
+    let local_root = root.join("local");
     {
         let scratch = LocalFileMedium::open(&local_root).unwrap();
         run_local_steps(&scratch, &local_root, steps);
