@@ -276,6 +276,63 @@ pub fn read_journal_bytes(path: &Path) -> Result<Vec<u8>, JournalError> {
     Ok(bytes)
 }
 
+/// (CA-18) The streaming whole-file hash — the SAME byte digest and
+/// length [`read_journal_bytes`] would return, computed through one
+/// bounded buffer instead of one file-sized `Vec`. The manifest's
+/// journal binding needs every byte READ (the SHA-256 is over the
+/// complete file), never every byte HELD: this is the last
+/// whole-file consumer (P3-L5 left the backup's hash sites as the
+/// documented legitimate whole-file reads; this retires the
+/// materialization while keeping the read).
+///
+/// **Semantics identical to the whole-file shape, by construction:**
+/// the metadata-first ceiling check at the same position
+/// (`check_journal_length` on `metadata().len()`), the read budgeted
+/// against the cap with the same fail-closed growth refusal (a file
+/// that exceeds [`MAX_JOURNAL_FILE_BYTES`] during the read refuses
+/// with the same typed `Limit` error the whole-file reader's
+/// tail-probe produced — both refuse, neither truncates), and the
+/// digest over exactly the bytes `read_journal_bytes` would have
+/// returned. The truncation behavior is therefore also identical: a
+/// truncated file hashes to its truncated bytes (the MANIFEST
+/// binding catches the mismatch downstream — the coherence check,
+/// unchanged). Working set: one [`HASH_STREAM_CHUNK_BYTES`] buffer
+/// regardless of file length, against the whole-file reader's
+/// exact-reserved O(file) allocation.
+pub fn hash_journal_file(path: &Path) -> Result<(Hash, u64), JournalError> {
+    let read_error = |e| io_err("hash journal", path, e);
+    let file = File::open(path).map_err(read_error)?;
+    check_journal_length(file.metadata().map_err(read_error)?.len())?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; HASH_STREAM_CHUNK_BYTES];
+    // The budget mirrors the whole-file reader's take-cap, plus one
+    // byte so an over-cap growth surfaces as the typed refusal rather
+    // than a silent truncation of the hashed prefix.
+    let mut reader = file.take(MAX_JOURNAL_FILE_BYTES + 1);
+    let mut hashed: u64 = 0;
+    loop {
+        let read = reader.read(&mut buffer).map_err(read_error)?;
+        if read == 0 {
+            break;
+        }
+        hashed += read as u64;
+        if hashed > MAX_JOURNAL_FILE_BYTES {
+            // The same refusal the whole-file reader's tail probe
+            // produced (identical error bytes: the cap + 1 value).
+            check_journal_length(MAX_JOURNAL_FILE_BYTES + 1)?;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let hash = Hash::from_bytes(digest.finalize().as_slice())
+        .expect("the sha-256 digest is exactly the hash width");
+    Ok((hash, hashed))
+}
+
+/// (CA-18) The streaming hash's buffer — one bounded working set for
+/// any journal length (the FrameReader discipline applied to the raw
+/// byte digest; the value is a standard chunk, not a format rule).
+const HASH_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
 /// The stable transaction identity — the SHA-256 over the stable
 /// identity material (consequential identities, classification,
 /// plan). A retry re-derives the same id; a genuinely new operation
@@ -4595,6 +4652,284 @@ mod tests {
         assert_eq!(scan.committed[0].envelopes, input.envelopes);
         assert_eq!(scan.committed[0].record_count, 2);
         assert_eq!(scan.committed[0].receipt(), receipt);
+    }
+
+    // ------------------------------------------- (CA-18) the streaming
+    // whole-file hash: the same digest and length the whole-file
+    // reader produces, through one bounded buffer (the backup's
+    // manifest binding — the last whole-file consumer).
+
+    /// Deterministic non-uniform bytes (a tiny LCG — no dependency,
+    /// no OS entropy; the content only needs to be non-uniform so a
+    /// dropped or doubled chunk can never hash to the same digest).
+    fn stream_bytes(len: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(len);
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        while bytes.len() < len {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            bytes.extend_from_slice(&state.to_le_bytes());
+        }
+        bytes.truncate(len);
+        bytes
+    }
+
+    fn write_stream_file(dir: &TestDir, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.0.join(name);
+        fs::write(&path, bytes).expect("write the measurement file");
+        path
+    }
+
+    #[test]
+    fn streaming_hash_equals_the_whole_file_reader_over_arbitrary_lengths() {
+        let dir = TestDir::new("ca18-hash-equality");
+        // The chunk boundaries and their off-by-one legs, the
+        // megabyte regime, and the multi-chunk regime — the digest
+        // must not depend on how the bounded reads tile the file.
+        let lengths = [
+            0usize,
+            1,
+            100,
+            HASH_STREAM_CHUNK_BYTES - 1,
+            HASH_STREAM_CHUNK_BYTES,
+            HASH_STREAM_CHUNK_BYTES + 1,
+            2 * HASH_STREAM_CHUNK_BYTES + 7,
+            1024 * 1024,
+            5 * 1024 * 1024,
+        ];
+        for (index, len) in lengths.iter().enumerate() {
+            let bytes = stream_bytes(*len);
+            let path = write_stream_file(&dir, &format!("shape-{index}.bin"), &bytes);
+            let (streamed, streamed_len) = hash_journal_file(&path).unwrap();
+            let whole = read_journal_bytes(&path).unwrap();
+            assert_eq!(
+                streamed_len,
+                whole.len() as u64,
+                "the length binding at {len} bytes"
+            );
+            assert_eq!(streamed, hash_object(&whole), "the digest at {len} bytes");
+        }
+    }
+
+    #[test]
+    fn streaming_hash_equals_the_whole_file_reader_on_journals_and_truncations() {
+        let dir = TestDir::new("ca18-hash-journals");
+        let path = dir.journal();
+        let mut journal = T1Journal::open(&path).unwrap();
+        for index in 1..=12u64 {
+            journal.append_transaction(&tx_input(index)).unwrap();
+        }
+        drop(journal);
+        let whole = read_journal_bytes(&path).unwrap();
+        let (streamed, streamed_len) = hash_journal_file(&path).unwrap();
+        assert_eq!(streamed_len, whole.len() as u64);
+        assert_eq!(streamed, hash_object(&whole));
+        // TRUNCATION BEHAVIOR IDENTICAL: a truncated copy hashes to
+        // exactly the bytes present on BOTH paths — the manifest
+        // binding catches the mismatch downstream (the coherence
+        // check, unchanged). Every truncation offset class: the
+        // header region, a frame-boundary neighborhood, mid-file,
+        // and the exact-tail legs.
+        let length = whole.len();
+        for offset in [
+            0usize,
+            1,
+            13,
+            101,
+            4096.min(length),
+            6_500.min(length),
+            length / 2,
+            length - 1,
+            length,
+        ] {
+            let truncated =
+                write_stream_file(&dir, &format!("trunc-{offset}.t1"), &whole[..offset]);
+            let (streamed, streamed_len) = hash_journal_file(&truncated).unwrap();
+            let reference = read_journal_bytes(&truncated).unwrap();
+            assert_eq!(
+                streamed_len,
+                reference.len() as u64,
+                "truncation at {offset}"
+            );
+            assert_eq!(streamed, hash_object(&reference), "truncation at {offset}");
+        }
+    }
+
+    #[test]
+    fn streaming_hash_refuses_the_over_ceiling_file_identically() {
+        let dir = TestDir::new("ca18-hash-ceiling");
+        let path = dir.0.join("over-ceiling.t1");
+        // A sparse file at the ceiling + 1 (instant on NTFS — no
+        // physical bytes): both readers route through the same
+        // metadata-first `check_journal_length` refusal before any
+        // byte is read (the L5 ceiling-pin shape — a real over-cap
+        // artifact is a multi-gigabyte file).
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_JOURNAL_FILE_BYTES + 1).unwrap();
+        drop(file);
+        let streamed = format!("{:?}", hash_journal_file(&path).unwrap_err());
+        let whole = format!("{:?}", read_journal_bytes(&path).unwrap_err());
+        assert_eq!(
+            streamed, whole,
+            "the same typed refusal, error bytes included"
+        );
+    }
+
+    /// (CA-18) THE PEAK-ALLOCATION MEASUREMENT SEAM — the honest RSS
+    /// proxy: a `#[global_allocator]` wrapper around
+    /// `std::alloc::System` that tracks the CURRENT THREAD's live
+    /// allocated bytes (and their peak) while a [`PeakAllocScope`]
+    /// guard is alive. The same pattern — and the same SAFETY
+    /// argument — as the shell's in-file host counter (audio.rs) and
+    /// slice's `tests/common` seam, placed here (inside
+    /// `#[cfg(test)]`) so the hash path's allocation law is measured
+    /// through the identical code without a new test binary.
+    ///
+    /// SAFETY (the `unsafe impl GlobalAlloc`): every method delegates
+    /// to `std::alloc::System` unchanged, inheriting its guarantees;
+    /// the counting state is `thread_local!` `Cell`s updated with no
+    /// allocation inside the allocator path (no reentrancy hazard);
+    /// `thread_local!` access inside `alloc` is sound for the
+    /// pre-initialized const form used here (a `Cell<bool>` fast-path
+    /// read without destructors, so no registration/alloc can occur
+    /// on first access). The workspace denies `unsafe_code`; this
+    /// test-support module needs the one `unsafe impl GlobalAlloc` a
+    /// counting allocator IS — the scoped allow keeps the deny
+    /// everywhere else (the shipped library code carries none).
+    mod hash_stream_alloc_seam {
+        #![allow(unsafe_code)]
+
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static MEASURING: Cell<bool> = const { Cell::new(false) };
+            static LIVE: Cell<u64> = const { Cell::new(0) };
+            static PEAK: Cell<u64> = const { Cell::new(0) };
+        }
+
+        #[global_allocator]
+        static HASH_STREAM_ALLOC: HashStreamAlloc = HashStreamAlloc;
+
+        /// Enables peak-live-bytes counting for the current thread
+        /// until dropped. The counters start at zero on creation.
+        pub struct PeakAllocScope;
+
+        impl PeakAllocScope {
+            pub fn new() -> Self {
+                LIVE.with(|live| live.set(0));
+                PEAK.with(|peak| peak.set(0));
+                MEASURING.with(|measuring| measuring.set(true));
+                PeakAllocScope
+            }
+
+            /// The peak live allocated bytes counted so far in this
+            /// scope.
+            pub fn peak(&self) -> u64 {
+                PEAK.with(|peak| peak.get())
+            }
+        }
+
+        impl Drop for PeakAllocScope {
+            fn drop(&mut self) {
+                MEASURING.with(|measuring| measuring.set(false));
+            }
+        }
+
+        struct HashStreamAlloc;
+
+        impl HashStreamAlloc {
+            fn charge(&self, size: usize) {
+                MEASURING.with(|measuring| {
+                    if measuring.get() {
+                        LIVE.with(|live| {
+                            let charged = live.get().saturating_add(size as u64);
+                            live.set(charged);
+                            PEAK.with(|peak| {
+                                if charged > peak.get() {
+                                    peak.set(charged);
+                                }
+                            });
+                        });
+                    }
+                });
+            }
+
+            fn discharge(&self, size: usize) {
+                MEASURING.with(|measuring| {
+                    if measuring.get() {
+                        LIVE.with(|live| live.set(live.get().saturating_sub(size as u64)));
+                    }
+                });
+            }
+        }
+
+        unsafe impl GlobalAlloc for HashStreamAlloc {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                self.charge(layout.size());
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                self.discharge(layout.size());
+                unsafe { System.dealloc(ptr, layout) }
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
+                self.discharge(old_layout.size());
+                self.charge(new_size);
+                unsafe { System.realloc(ptr, old_layout, new_size) }
+            }
+
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                self.charge(layout.size());
+                unsafe { System.alloc_zeroed(layout) }
+            }
+        }
+    }
+
+    /// (CA-18) THE MEASUREMENT ROW (pod-observational): the peak
+    /// thread-attributed allocated bytes during the journal hash, at
+    /// growing file lengths — flat for the streaming hash (one
+    /// bounded buffer, which is itself a stack array), O(file) for
+    /// the whole-file reader it replaces (the exact-reserved Vec).
+    #[test]
+    fn streaming_hash_working_set_is_bounded_over_growing_journal_lengths() {
+        let dir = TestDir::new("ca18-hash-working-set");
+        for len in [1024 * 1024usize, 8 * 1024 * 1024, 32 * 1024 * 1024] {
+            let bytes = stream_bytes(len);
+            let path = write_stream_file(&dir, &format!("row-{len}.bin"), &bytes);
+            let scope = hash_stream_alloc_seam::PeakAllocScope::new();
+            let (hash, hashed_len) = hash_journal_file(&path).unwrap();
+            let streaming_peak = scope.peak();
+            drop(scope);
+            assert_eq!(hashed_len, len as u64);
+            assert_eq!(hash, hash_object(&bytes));
+            // ONE BOUNDED WORKING SET at every length: the 64 KiB
+            // read buffer is a stack array, so the heap peak is only
+            // std's own path/metadata internals — bounded far below
+            // the buffer itself, and flat in the file length.
+            assert!(
+                streaming_peak < HASH_STREAM_CHUNK_BYTES as u64,
+                "the streaming peak {streaming_peak} B must stay bounded at {len} B"
+            );
+            // The whole-file reader's own row at the same length (the
+            // before measurement): the exact-reserved file-sized Vec.
+            let scope = hash_stream_alloc_seam::PeakAllocScope::new();
+            let whole = read_journal_bytes(&path).unwrap();
+            let whole_file_peak = scope.peak();
+            drop(scope);
+            assert!(
+                whole_file_peak >= len as u64,
+                "the whole-file reader exact-reserves the file ({whole_file_peak} B at {len} B)"
+            );
+            drop(whole);
+            println!(
+                "ca18 measurement row: journal length {len} B — streaming-hash peak \
+                 {streaming_peak} B, whole-file-reader peak {whole_file_peak} B"
+            );
+        }
     }
 }
 

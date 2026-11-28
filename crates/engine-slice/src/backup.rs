@@ -28,7 +28,13 @@
 //!   as incomplete; one that will not decode is refused as corrupt;
 //!   a set whose files do not match it is refused as incoherent (a
 //!   tampered file, or a mixed-time pairing of one backup's database
-//!   with another's journal).
+//!   with another's journal). (CA-18) Both journal-hash sites — the
+//!   capture's binding computation and the verification's re-hash —
+//!   stream the digest through one bounded buffer
+//!   ([`engine_persist::journal::hash_journal_file`]): every byte is
+//!   read, none materialized (the same SHA-256 and length the
+//!   whole-file read produced — the tool's last O(file) resident
+//!   allocation, retired).
 //! * **Usable only after verification**: [`verify_backup`] re-reads
 //!   the manifest, re-validates the captured chain (the actual
 //!   canonical-chain validation, read-only), re-hashes the journal,
@@ -52,7 +58,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use engine_core::{Decoder, Encoder};
-use engine_persist::hash::{Hash, hash_object};
+use engine_persist::hash::Hash;
 use engine_persist::{
     CanonicalMedium, ChainSummary, MediumError, SqliteMedium, T1Journal, active_journal_path,
 };
@@ -443,14 +449,16 @@ pub fn backup_campaign(
     // the captured files).
     drop(journal_guard);
     // (4) The captured set's own coherence: the database validates to
-    // the source's chain; the journal hash binds.
-    let journal_bytes =
-        engine_persist::journal::read_journal_bytes(&backup_journal).map_err(|error| {
+    // the source's chain; the journal hash binds. (CA-18) The hash
+    // and the byte length stream through one bounded buffer — every
+    // byte read, never materialized (the digest is over the complete
+    // file; the whole-file Vec was this tool's last O(file) resident).
+    let (journal_sha256, journal_bytes) =
+        engine_persist::journal::hash_journal_file(&backup_journal).map_err(|error| {
             BackupError::Incoherent {
                 detail: error.to_string(),
             }
         })?;
-    let journal_sha256 = hash_object(&journal_bytes);
     let mut audit = SqliteMedium::open_read_only(&backup_db).map_err(BackupError::Medium)?;
     let captured = audit.validate().map_err(BackupError::Medium)?;
     drop(audit);
@@ -477,7 +485,7 @@ pub fn backup_campaign(
         records: summary.records,
         campaign_id: summary.campaign_id.clone(),
         last_committed_tx: scan_last_committed(&backup_journal)?,
-        journal_bytes: journal_bytes.len() as u64,
+        journal_bytes,
         source_journal: journal_path.to_string_lossy().to_string(),
         captured_at_nanos,
         checkpointed: true,
@@ -571,13 +579,16 @@ pub fn verify_backup(backup_dir: &Path) -> Result<ChainSummary, BackupError> {
             ),
         });
     }
-    let journal_bytes =
-        engine_persist::journal::read_journal_bytes(&backup_journal).map_err(|error| {
+    // The bindings: the actual chain validation and the journal hash
+    // (CA-18: streamed through one bounded buffer — the same digest
+    // the whole-file read produced, never the file-sized Vec).
+    let (journal_sha256, journal_bytes) =
+        engine_persist::journal::hash_journal_file(&backup_journal).map_err(|error| {
             BackupError::Incoherent {
                 detail: error.to_string(),
             }
         })?;
-    if hash_object(&journal_bytes) != manifest.journal_sha256 {
+    if journal_sha256 != manifest.journal_sha256 {
         return Err(BackupError::Incoherent {
             detail: "the captured journal does not hash to the manifest's binding \
                      — a tampered journal or a mixed-time pairing"
@@ -595,7 +606,7 @@ pub fn verify_backup(backup_dir: &Path) -> Result<ChainSummary, BackupError> {
                 .to_owned(),
         });
     }
-    if journal_bytes.len() as u64 != manifest.journal_bytes {
+    if journal_bytes != manifest.journal_bytes {
         return Err(BackupError::Incoherent {
             detail: "the captured journal's length does not match the manifest's \
                      binding — a tampered journal"
@@ -725,5 +736,183 @@ fn io_err(op: &'static str, path: &Path, source: std::io::Error) -> BackupError 
         op,
         path: path.display().to_string(),
         source,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crossing::SessionCrossing;
+    use crate::npc::{NpcConfig, NpcWorld, install_initial_schedules};
+    use crate::region::{RegionConfig, RegionDirector};
+    use crate::store::StoreLocation;
+    use engine_core::{LodLevel, PresenceSample, Spine};
+    use engine_persist::{CommitOutcome, T1Journal};
+
+    /// A unique temp root removed on drop (the pp_b1 battery's
+    /// discipline; no `tempfile` dependency).
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "s7-pp-b1-inline-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).expect("create test root");
+            TestDir(path)
+        }
+
+        fn db(&self) -> PathBuf {
+            self.0.join("store.db")
+        }
+
+        fn journal(&self) -> PathBuf {
+            self.0.join("journal.t1")
+        }
+
+        fn output(&self) -> PathBuf {
+            self.0.join("backup-set")
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn near_region_4() -> PresenceSample {
+        PresenceSample {
+            position: (-100.0, 0.0),
+            velocity: (0.0, 0.0),
+        }
+    }
+
+    fn far_from_region_4() -> PresenceSample {
+        PresenceSample {
+            position: (100.0, 0.0),
+            velocity: (0.0, 0.0),
+        }
+    }
+
+    /// The compact quiescent campaign (the pp_b1 battery's exact arc
+    /// at inline scale): a founded crossing, the near/far durable
+    /// boundaries (the far deactivations and the near re-activations
+    /// journaled), a confirming commit, and the ratified checkpoint —
+    /// then dropped, the graceful close the backup's offline boundary
+    /// requires.
+    fn quiescent_campaign(dir: &TestDir, campaign: &str) {
+        let near = near_region_4();
+        let far = far_from_region_4();
+        let config = NpcConfig {
+            region_lods_enabled: true,
+            ..NpcConfig::default()
+        };
+        let mut spine = Spine::with_reservation(NpcWorld::new(config.clone()), 200, 60);
+        install_initial_schedules(&mut spine, &config);
+        let mut director = RegionDirector::new(RegionConfig::default()).unwrap();
+        for _ in 0..150 {
+            director.apply(&mut spine, std::slice::from_ref(&near));
+            spine.run_tick();
+        }
+        let journal = T1Journal::open(dir.journal()).unwrap();
+        let mut crossing =
+            SessionCrossing::open_at(&StoreLocation::Database(dir.db()), journal, campaign)
+                .unwrap();
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        // The far boundary: every region the presence leaves goes
+        // Dormant through the crossing (journaled, installed).
+        let now = spine.clock();
+        for region in 0..crate::npc::REGION_COUNT {
+            let current = director.levels()[region];
+            let next = director.target_level(region, std::slice::from_ref(&far));
+            if next == current {
+                continue;
+            }
+            if next == LodLevel::Dormant {
+                let _journaled = crossing
+                    .deactivate(&mut spine, &mut director, region, now)
+                    .expect("the deactivation commits");
+            }
+        }
+        // The near boundary: the re-activations install the same
+        // regions back (the journal now holds both directions).
+        let now = spine.clock();
+        for region in 0..crate::npc::REGION_COUNT {
+            let current = director.levels()[region];
+            let next = director.target_level(region, std::slice::from_ref(&near));
+            if next == current {
+                continue;
+            }
+            if current == LodLevel::Dormant {
+                crossing
+                    .activate(&mut spine, &mut director, region, next, now)
+                    .expect("the activation installs");
+            }
+        }
+        for _ in 0..100 {
+            director.apply(&mut spine, std::slice::from_ref(&near));
+            spine.run_tick();
+        }
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        let CommitOutcome::Confirmed(_) = crossing.commit_canonical().unwrap() else {
+            panic!("the campaign confirms before the close");
+        };
+        crossing.checkpoint().unwrap();
+        drop(crossing);
+    }
+
+    /// (CA-18) THE MANIFEST-HASH EQUIVALENCE through the real backup
+    /// path: the streamed digest the manifest binds is exactly the
+    /// digest the retired whole-file read produced (the independent
+    /// oracle — `read_journal_bytes` + `hash_object`, still public),
+    /// the byte-length binding is the real file length, and the
+    /// TRUNCATION behavior is identical — a truncated captured
+    /// journal refuses verification with the same incoherent-set
+    /// refusal the whole-file implementation produced (the hash
+    /// mismatch the manifest binding catches downstream).
+    #[test]
+    fn the_streamed_manifest_hash_equals_the_whole_file_digest() {
+        let dir = TestDir::new("ca18-manifest-hash");
+        quiescent_campaign(&dir, "ca18-inline-campaign");
+        let report = backup_campaign(&dir.db(), &dir.journal(), &dir.output())
+            .expect("the quiescent backup captures, binds, and verifies");
+        // The independent oracle: the retired whole-file computation
+        // over the captured copy.
+        let whole = engine_persist::journal::read_journal_bytes(&dir.output().join(BACKUP_JOURNAL))
+            .unwrap();
+        let oracle = engine_persist::hash::hash_object(&whole);
+        assert_eq!(
+            report.journal_sha256, oracle,
+            "the streamed manifest digest is the whole-file digest"
+        );
+        assert_eq!(
+            fs::metadata(dir.output().join(BACKUP_JOURNAL))
+                .unwrap()
+                .len(),
+            whole.len() as u64
+        );
+        // The manifest's own binding decodes back to the same pair
+        // (the verification re-derived it through the stream).
+        let summary = verify_backup(&dir.output()).expect("the completed set re-verifies");
+        assert_eq!(summary, report.summary);
+        // TRUNCATION: cut the captured journal's tail — the streamed
+        // re-hash no longer matches the manifest's binding, the set
+        // refuses as incoherent (exactly the whole-file
+        // implementation's refusal; the pp_b1 battery's
+        // tampered-journal matrix stays the broader behavior pin).
+        let captured = dir.output().join(BACKUP_JOURNAL);
+        let bytes = fs::read(&captured).unwrap();
+        assert!(bytes.len() > 16);
+        fs::write(&captured, &bytes[..bytes.len() - 8]).unwrap();
+        assert!(matches!(
+            verify_backup(&dir.output()),
+            Err(BackupError::Incoherent { .. })
+        ));
     }
 }
