@@ -109,6 +109,58 @@ use rows::{insert_object_once, insert_record_once};
 #[cfg(test)]
 use walks::walk_chain_excluding;
 
+/// (P3-L9b) The walk differential battery's observation seams —
+/// test-only, `pub(crate)` so the crate-root battery
+/// (`walk_differential.rs`) can observe this provider's CURRENT walk
+/// forms without widening any production surface: the cold walk
+/// (its summary plus the established cursor's Debug fingerprint),
+/// the live trusted cursor's fingerprint, and the raw connection the
+/// battery's corpus builder uses to hand-craft store rows (the same
+/// discipline the in-tree sqlite test batteries use through
+/// `medium.conn`). The fingerprints are comparable across providers
+/// because the cursor field sets are the identical §5.3.2 contract.
+#[cfg(test)]
+impl SqliteMedium {
+    pub(crate) fn walk_differential_cold(
+        &self,
+        head: Hash,
+        exclude: &BTreeSet<Hash>,
+    ) -> Result<(ChainSummary, String), MediumError> {
+        walk_chain_excluding(&self.conn, head, exclude)
+            .map(|walked| (walked.summary, format!("{:?}", walked.cursor)))
+    }
+
+    pub(crate) fn walk_differential_cursor(&self) -> Option<String> {
+        self.cursor.as_ref().map(|cursor| format!("{cursor:?}"))
+    }
+
+    pub(crate) fn walk_differential_conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Seeds the founding authority row exactly as the real append
+    /// path's founding does — the battery's hand-crafted foundations
+    /// must satisfy the same open-time cross-check
+    /// (`verify_authority_row`) the provider enforces on every
+    /// session open.
+    pub(crate) fn walk_differential_seed_authority(&self, record: &RevisionRecord) {
+        let RecordKind::Founding {
+            authority,
+            campaign_id,
+        } = &record.kind
+        else {
+            return;
+        };
+        let encoded = meta::authority_bytes(&record.id(), *authority, campaign_id);
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('authority', ?1)",
+                params![encoded],
+            )
+            .unwrap();
+    }
+}
+
 /// The connection configuration. The busy timeout IS the bounded
 /// contention retry (SQLite's internal backoff schedule); its expiry
 /// surfaces as the typed [`MediumError::Contention`] abort.

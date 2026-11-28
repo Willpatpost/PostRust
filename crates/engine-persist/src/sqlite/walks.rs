@@ -27,7 +27,12 @@ use super::rows::{load_referenced_object, load_referenced_record, record_exists}
 // ------------------------------------------------------------- the cursor
 
 /// The session-scoped trusted cursor (the §5.3.2 model — identical
-/// semantics to the file medium's).
+/// semantics to the file medium's). `Debug` is derived for the
+/// P3-L9b differential battery's cursor fingerprint (the field
+/// names, types, and order are the §5.3.2 contract, identical across
+/// providers — so the derived output is the byte-identical
+/// comparison form).
+#[derive(Debug)]
 pub(super) struct SqliteCursor {
     pub(super) head: Hash,
     pub(super) epoch: u64,

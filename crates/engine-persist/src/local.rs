@@ -106,6 +106,11 @@ pub(crate) const MAX_OBJECT_BYTES: u64 = MAX_BYTE_LEN;
 
 /// The ephemeral trusted cursor (§5.3.2) — session-scoped derived
 /// state rebuilt by the cold walk; never persisted to a file.
+/// `Debug` is derived for the P3-L9b differential battery's cursor
+/// fingerprint (the field names, types, and order are the §5.3.2
+/// contract, identical across providers — so the derived output is
+/// the byte-identical comparison form).
+#[derive(Debug)]
 struct Cursor {
     head: Hash,
     epoch: u64,
@@ -473,4 +478,28 @@ mod c5b_local_tests;
 mod c5d_local_tests;
 #[cfg(test)]
 mod exclusion_tests;
+
+/// (P3-L9b) The walk differential battery's observation seams —
+/// test-only, `pub(crate)` so the crate-root battery
+/// (`walk_differential.rs`) can observe this provider's CURRENT walk
+/// forms without widening any production surface: the pure
+/// virtual-exclusion cold walk (its summary plus the established
+/// cursor's Debug fingerprint) and the live trusted cursor's
+/// fingerprint. The fingerprints are comparable across providers
+/// because the cursor field sets are the identical §5.3.2 contract.
+#[cfg(test)]
+impl LocalFileMedium {
+    pub(crate) fn walk_differential_cold(
+        &self,
+        head: Hash,
+        exclude: &BTreeSet<Hash>,
+    ) -> Result<(ChainSummary, String), MediumError> {
+        self.cold_walk_excluding(head, exclude)
+            .map(|(summary, cursor)| (summary, format!("{cursor:?}")))
+    }
+
+    pub(crate) fn walk_differential_cursor(&self) -> Option<String> {
+        self.cursor.as_ref().map(|cursor| format!("{cursor:?}"))
+    }
+}
 use crate::record::{AuthorityMode, RevisionRecord};

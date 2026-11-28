@@ -74,6 +74,8 @@ mod migrate_tests;
 mod sqlite_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod walk_differential;
 
 pub use ancestry_accounting::{
     AccountingCounts, AccountingLimitations, AccountingLimits, Classification,
