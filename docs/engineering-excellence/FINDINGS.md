@@ -79,7 +79,7 @@ audit-claimed with verification-first mandated in each fix lane's brief.
 
 | ID | Area | State | Note |
 |---|---|---|---|
-| CA-01 (F01) | REND | REGISTERED (audit-claimed) | scene-attach failure atomicity — resources installed before pipelines, handle published after, a pipeline error leaves no-scene + retry-refused (Q10's precise shape) |
+| CA-01 | REND | **FIXED-AWAITING-RE-AUDIT** | integrated `483de34` (lane `bf04768`) | the CornerPipelineGroup guard + the attach rollback + the together-publishing; the worse-under-it finding (the step-by-step live PipelineState writes) also closed; 13/13 fault sites retry-attaching validation-clean on the rig |
 | CA-02 | CORE | **FIXED-AWAITING-RE-AUDIT** | integrated `b9709c6` (lane `9dce696`) | the decode admission: SectionDecodeLimits + the four pre-reservation gates + fallible try_reserve (the typed Overflow where the process aborted); the ~62x precision recorded; the counting-allocator census the documented follow-up |
 | CA-03 | CORE | **FIXED-AWAITING-RE-AUDIT** | integrated `b9709c6` (lane `9dce696`) | the HousekeepingStats observability + the atomic release/order contract documented before any cursor; the no-partial-release proof surface; the backlog slope published |
 | CA-04 (F04) | CI | **FIXED (verified before fix, `3311fd9`)** | the main result-line check 33 vs the tree's 34 + the heavy expected=674 glued into a comment (Linux comparing 674 actual against the stale 549) — both corrected |
@@ -88,8 +88,8 @@ audit-claimed with verification-first mandated in each fix lane's brief.
 | CA-07 | CORE | **FIXED-AWAITING-RE-AUDIT** | integrated `b9709c6` (lane `9dce696`) | the ConsequenceEligibility token + the refusal arm with lag; the equivalence pinned with unresolved consequences; the in-place drain (zero-allocation sustained loop); the per-firing operation-count table |
 | CA-08 (F08) | CORE | REGISTERED (audit-claimed) | regional transitions still scan the whole queue (A08's precise shape) |
 | CA-09 (F09) | CORE/SLICE | REGISTERED (audit-claimed) | the indexed query APIs' production adoption boundary (Q04's precise shape — the combat_demo linear caller named) |
-| CA-10 (F10) | REND | REGISTERED (audit-claimed) | post-acquire errors can strand a frame slot — the fence reset before the fallible upload/record/submit chain |
-| CA-11 (F11) | REND | REGISTERED (audit-claimed) | all three arena growth paths can lose newly allocated handles on a failed idle wait (R1's growth paths' failure atomicity) |
+| CA-10 | REND | **FIXED-AWAITING-RE-AUDIT** | integrated `483de34` (lane `bf04768`) | the deferred fence commit + dispose_failed_acquisition (the WSI-canonical release, the fence heal, the drain proof, the semaphore replacement, the typed FrameSlotUnrecoverable); 4/4 boundaries retrying in 6-26 ms where the strand was one 2-second timeout; the battery catching two draft designs at the device level |
+| CA-11 | REND | **FIXED-AWAITING-RE-AUDIT** | integrated `483de34` (lane `bf04768`) | the ScopedMappedBuffer guard at all three growth sites; 3/3 paths double-failed then retry-grown with the census pairs pinned |
 | CA-12 (F12) | REND | REGISTERED (audit-claimed) | config usize budgets vs u32 device carving — representability unvalidated across the boundary |
 | CA-13 (F13) | REND | REGISTERED (audit-claimed) | device loss flattened at the public boundary (A14 — the audit corrects the "every Vulkan outcome" overclaim: out-of-date IS typed) |
 | CA-14 (F14) | REND | REGISTERED (audit-claimed) | the public scene contract still encodes the first pass family's asset dimensions (Q06's precise shape) |
