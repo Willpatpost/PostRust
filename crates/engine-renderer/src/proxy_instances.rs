@@ -123,6 +123,78 @@ pub enum GenerationDecision {
     Reused,
 }
 
+/// T05 (strict audit IV) — the INSTANCE population's source
+/// identity: the cheap content-class token the renderer checks
+/// BESIDE the generation (the audit's "pointer-derived or
+/// caller-declared identity" — this is the pointer-derived form,
+/// DERIVED AND RECORDED BY THE RENDERER so no caller convention
+/// exists to get wrong). The token is the three kind slices'
+/// storage addresses plus their per-kind counts: the provenance
+/// evidence of WHO owns the generation space the submission
+/// declares into.
+///
+/// THE COLLISION CONTRACT (what the token makes unrepresentable):
+/// two LIVE sources — two independently owned populations
+/// interleaving submissions to one renderer, the audit's exact
+/// scenario — cannot present the same token, because live
+/// allocations occupy distinct addresses. A source that MOVES its
+/// storage (growth past capacity, a rebuild into a fresh Vec)
+/// presents a new token and is re-admitted: one redundant repack,
+/// the safe direction, never a stale skip. The only token two
+/// sources can share is the ALL-EMPTY token (every empty slice of
+/// the same element type dangles at the same alignment address) —
+/// and its packed payload is zero bytes, so a reuse against it is
+/// vacuously correct.
+///
+/// THE RESIDUAL HAZARD (documented, not hidden): allocator address
+/// recycling — source A dropped, source B's Vecs later allocated at
+/// A's exact addresses with the same counts and a colliding
+/// generation — can still present A's token. Content divergence
+/// there is caught by the missed-bump verify in debug/test; release
+/// keeps the renderer's pre-T05 behavior for that narrow case. The
+/// full hardening is the audit's revision-scoped population
+/// resource (a renderer-minted handle); this token is the cheap
+/// layer that closes the demonstrated LIVE-source collision without
+/// a single caller change.
+///
+/// The token never enters packed bytes, digests, or pins — it is
+/// gate-only metadata (plain `usize` addresses, no pointers, no
+/// unsafe).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InstanceSourceToken {
+    /// The npc kind slice's storage address (0 only in the default
+    /// record — a real slice's address, empty or not, is nonzero).
+    npc: usize,
+    /// The vehicle kind slice's storage address.
+    vehicle: usize,
+    /// The rain kind slice's storage address.
+    rain: usize,
+    /// The per-kind counts — the draw-shape facts the indirect
+    /// command block is a pure function of (folded here so a
+    /// partition change at a stable total is a re-admission, not a
+    /// byte-length-invisible skip).
+    npc_count: usize,
+    vehicle_count: usize,
+    rain_count: usize,
+}
+
+impl InstanceSourceToken {
+    /// Derives the token from a submission's borrowed kind slices —
+    /// the one construction path (the renderer's adapter is its
+    /// only caller; the fields stay private so no caller can forge
+    /// or guess a token).
+    pub fn of(npc: &[ProxyInstance], vehicle: &[ProxyInstance], rain: &[ProxyInstance]) -> Self {
+        Self {
+            npc: npc.as_ptr() as usize,
+            vehicle: vehicle.as_ptr() as usize,
+            rain: rain.as_ptr() as usize,
+            npc_count: npc.len(),
+            vehicle_count: vehicle.len(),
+            rain_count: rain.len(),
+        }
+    }
+}
+
 /// The dirty-generation protocol's WRITE gate (P5 §3.3, A18/R2):
 /// whether a frame slot's mapped region must receive this frame's
 /// bytes. The slot's stamp records the generation whose bytes it

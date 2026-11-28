@@ -102,15 +102,19 @@ pub struct ProxyPopulation<'a> {
     /// **The ownership contract** (the mutation invariant): bump
     /// this EXACTLY when any instance input changes — a re-packed
     /// crowd, a rebuilt rain pool, a retinted vehicle — and never
-    /// reuse a value after its population changed (the generation
-    /// space belongs to THIS population source; two interleaved
-    /// opted-in populations colliding at one generation is a caller
-    /// defect the debug verify mode catches). A missed bump renders
-    /// the prior population in release — the protocol's one real
-    /// hazard, made loud by [`crate::proxy_instances::
-    /// verify_population_generation`] in debug/test builds. The
-    /// indirect command block rides THIS generation (its bytes are a
-    /// pure function of the per-kind counts).
+    /// reuse a value after its population changed. The generation
+    /// space belongs to THIS population source; T05 (strict audit
+    /// IV) added the renderer-side identity records checked beside
+    /// the generation ([`crate::submission::PopulationGenerations`]),
+    /// so a SECOND source interleaving at a colliding generation is
+    /// re-admitted by the renderer itself (no caller-side global
+    /// identity convention to follow) — but a source that mutates
+    /// its own population in place without bumping remains the
+    /// protocol's one real hazard, made loud by
+    /// [`crate::proxy_instances::verify_population_generation`] in
+    /// debug/test builds. The indirect command block rides THIS
+    /// generation (its bytes are a pure function of the per-kind
+    /// counts, which the renderer now records beside the stamp).
     pub instance_generation: u64,
     /// P5 §3.3: the POSE population's generation — the same
     /// caller-owned claim for `npc_poses` (the garage's split: the
@@ -869,6 +873,7 @@ impl Renderer {
             sky: None,
             post: false,
             wet: None,
+            population_repacked: Default::default(),
         });
         let policy = self.frame_policy();
         let outcome = match vulkan::render_frame(
@@ -1110,6 +1115,29 @@ impl Renderer {
             &mut self.pose_bytes,
             &mut self.population_generations,
         )?;
+        // T05 (strict audit IV) — THE STAMP INVALIDATION AT
+        // SUBMISSION TIME: the adapter's regeneration report says
+        // the retained population bytes CHANGED this frame (an
+        // identity change, a count change, a bump, or the
+        // always-dirty generation-0 shape). No frame-slot stamp may
+        // keep vouching for bytes that were just regenerated — the
+        // colliding-generation hazard is exactly a second source
+        // re-admitting at the SAME nonzero number some slot's stamp
+        // already records, which the bare-generation gate would
+        // treat as a skip. Invalidating HERE (before the frame flow,
+        // where a deferred or failed frame never reaches the upload
+        // site) means the new source's next submission re-admits
+        // through the CPU gate and rewrites every slot once — the
+        // safe direction; a stable between-tick frame reports no
+        // regeneration and keeps its skips (the R2 win, and a bump
+        // already rewrote every slot once under the bare rule, so
+        // single-source write counts do not move).
+        if inputs.population_repacked.instance {
+            self.frames.population_stamps.clear_instance();
+        }
+        if inputs.population_repacked.pose {
+            self.frames.population_stamps.clear_pose();
+        }
         // The frame flow — the validated input set as ONE bundle
         // (A04, design §3.4): the same parameter set the former
         // entries handed `vulkan::render_frame` through fifteen

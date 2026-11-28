@@ -227,6 +227,21 @@ pub(crate) struct SubmissionPolicy {
 /// (the buffer always ends up holding the declared generation's
 /// bytes; the slot stamp decides only whether those bytes need
 /// copying into THIS slot's mapped region).
+///
+/// **T05 (strict audit IV) — the identity records beside the
+/// generation:** the raw caller generation is a PER-SOURCE counter
+/// (every demo's starts at 1), so the number alone cannot say WHO
+/// submitted it. `instance_source` / `pose_source` record the
+/// source token whose bytes each buffer holds; the adapter resets
+/// the generation record to unknown whenever a submission's token
+/// differs (a second source interleaving, or the same source after
+/// its storage moved), which forces the repack below — two LIVE
+/// sources with colliding generation spaces cannot wrongly skip
+/// (the audit's demonstrated collision, made unrepresentable at the
+/// renderer's own seam, with no caller-side identity convention to
+/// follow). See [`crate::proxy_instances::InstanceSourceToken`]'s
+/// docs for the collision contract and the residual recycling
+/// hazard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct PopulationGenerations {
     /// The generation whose bytes the retained instance buffer
@@ -235,6 +250,34 @@ pub(crate) struct PopulationGenerations {
     /// The generation whose bytes the retained pose buffer holds
     /// (the packed pose-block palette).
     pub pose: u64,
+    /// T05: the source whose bytes the retained instance buffer
+    /// holds (the default all-zero token matches no live
+    /// submission — the first submission always re-admits).
+    pub instance_source: crate::proxy_instances::InstanceSourceToken,
+    /// T05: the source whose bytes the retained pose buffer holds.
+    pub pose_source: crate::animation::PoseSourceToken,
+}
+
+/// T05 (strict audit IV) — the population halves' regeneration
+/// report the frame state consumes: whether this frame's CPU gate
+/// REPACKED the retained bytes (identity change, count change,
+/// generation bump, or the always-dirty generation-0 shape). The
+/// renderer uses it to invalidate the per-slot population stamps
+/// BEFORE the frame flow runs — a slot stamp records "this slot's
+/// mapped region holds THAT generation's bytes", and after a
+/// repack at a COLLIDING generation number (the second source's
+/// own counter presenting the same value) no stamp may keep
+/// vouching: the write half rewrites every slot once, the safe
+/// direction. A stable between-tick frame reports `false` for both
+/// halves and keeps its skips (the R2 win, unchanged — a bump
+/// already rewrote every slot once under the bare-generation rule,
+/// so single-source write counts do not move).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct PopulationRepacked {
+    /// The instance half (npc+vehicle+rain bytes) regenerated.
+    pub instance: bool,
+    /// The pose half (the pose-block palette) regenerated.
+    pub pose: bool,
 }
 
 /// The input half of one `vulkan::render_frame` call, typed — the
@@ -283,6 +326,13 @@ pub(crate) struct FrameInputs<'x> {
     /// The wet reflection's camera description (`None` keeps the dry
     /// path).
     pub wet: Option<vulkan::reflection_draw::WetCamera>,
+    /// T05: the population halves' regeneration report — whether
+    /// this frame's CPU gate repacked the retained instance/pose
+    /// bytes. The renderer invalidates the frame state's population
+    /// stamps on it before the frame flow runs (see
+    /// [`PopulationRepacked`]); `false` on every unpopulated shape
+    /// (nothing regenerated).
+    pub population_repacked: PopulationRepacked,
 }
 
 /// The missed-bump verify dispatch (P5 §3.3, A18/R2): on any reuse,
@@ -365,6 +415,19 @@ fn verify_population_reuse(
 /// independent reference path — a missed bump is loud; never a
 /// release production frame's cost).
 ///
+/// **T05 (strict audit IV) — the identity contract beside the
+/// generation:** `generations` also records each buffer's SOURCE
+/// token; a submission whose token differs (a second population
+/// source interleaving, the storage moved, or the per-kind
+/// partition changed at a stable total) resets that half's
+/// generation record to unknown and re-admits — two live sources
+/// with colliding generation spaces cannot wrongly skip. The
+/// pose-index admission check rides the same evidence: it runs on
+/// every admitted/changed frame and skips only the fully-reused
+/// between-tick frame (change-proportional validation, the T18
+/// direction). The output carries the halves' regeneration report
+/// ([`PopulationRepacked`]) for the renderer's stamp invalidation.
+///
 /// `material_table` is the attached scene's material count — the
 /// population validation's bound. `0` on the layers-only shape
 /// (unread there: no population path runs without a scene half).
@@ -397,6 +460,7 @@ pub(crate) fn adapt_frame<'a, 'x>(
             sky: None,
             post: false,
             wet: None,
+            population_repacked: PopulationRepacked::default(),
         });
     };
     let light = scene.light;
@@ -404,8 +468,10 @@ pub(crate) fn adapt_frame<'a, 'x>(
     let view_proj = camera.view_proj;
     // The population: the populated entries' own validation +
     // repack sequence, verbatim, with the repacks generation-gated
-    // (P5 §3.3). `None` skips every check exactly like the
+    // (P5 §3.3) and the identity records checked beside the
+    // generations (T05). `None` skips every check exactly like the
     // unpopulated entries.
+    let mut population_repacked = PopulationRepacked::default();
     let proxy = match &scene.population {
         Some(population) => {
             if population.npc_material >= material_table
@@ -421,6 +487,59 @@ pub(crate) fn adapt_frame<'a, 'x>(
                     population.rain_material
                 )));
             }
+            // T05 (strict audit IV) — THE IDENTITY GATE BESIDE THE
+            // GENERATION: derive the submission's source tokens and
+            // compare them against the buffers' records. On a
+            // mismatch (a second source interleaving — the audit's
+            // two populations beginning at generation 1 with
+            // identical counts — or the same source after its
+            // storage moved, or a per-kind repartition at a stable
+            // total, which the byte-length guard alone cannot see)
+            // the generation record resets to UNKNOWN, so the
+            // repack below re-admits: the retained bytes become the
+            // NEW source's, never a stale skip. The records mutate
+            // fail-safe — a later refusal leaves them at unknown,
+            // vouching for nothing. The tokens are renderer-derived
+            // (no caller convention; see the token types' docs for
+            // the collision contract and the recycling residual).
+            let instance_source = crate::proxy_instances::InstanceSourceToken::of(
+                population.npc,
+                population.vehicle,
+                population.rain,
+            );
+            let pose_source = crate::animation::PoseSourceToken::of(population.npc_poses);
+            if generations.instance_source != instance_source {
+                generations.instance_source = instance_source;
+                generations.instance = 0;
+            }
+            if generations.pose_source != pose_source {
+                generations.pose_source = pose_source;
+                generations.pose = 0;
+            }
+            // T18/T05 — THE POSE-INDEX ADMISSION PREDICATE: the
+            // per-npc pose-index scan below runs when the
+            // population is (re)admitted, not on a fully-reused
+            // frame (validation is change-proportional — the audit's
+            // "validate when the trusted resource is constructed or
+            // changed, not every unchanged frame"). The predicate is
+            // exactly the conjunction of both repack gates' Reused
+            // conditions as they stand AFTER the identity gate
+            // above (token match ⇒ the records were not reset), so
+            // it is true precisely when both halves will reuse —
+            // the frame whose bytes and whose pose-block count were
+            // both validated at admission. The debug_assert at the
+            // arm's tail pins the equivalence to the actual
+            // decisions (a drift tripwire, not a check of caller
+            // honesty: a missed bump inside a matching token is the
+            // protocol's documented release hazard, caught loudly
+            // by the verify below in debug/test).
+            let total = population.npc.len() + population.vehicle.len() + population.rain.len();
+            let full_reuse = population.instance_generation != 0
+                && population.pose_generation != 0
+                && generations.instance == population.instance_generation
+                && generations.pose == population.pose_generation
+                && instance_bytes.len() == total * crate::proxy_instances::INSTANCE_STRIDE
+                && pose_bytes.len() == population.npc_poses.len() * crate::animation::POSE_STRIDE;
             let instance_decision = crate::proxy_instances::repack_populations_generation(
                 instance_bytes,
                 population.npc,
@@ -434,13 +553,19 @@ pub(crate) fn adapt_frame<'a, 'x>(
             // The pose contract (the capture-refusal discipline):
             // every POPULATED npc's pose index must select a supplied
             // block; the block-count bound is the repack's own typed
-            // refusal below. The check runs on EVERY populated frame
-            // — generation-gated or not (a declared-identical
-            // population that outgrew its block list still refuses).
-            if population
-                .npc
-                .iter()
-                .any(|instance| instance.pose_index as usize >= population.npc_poses.len())
+            // refusal below. The check runs on every ADMITTED or
+            // CHANGED frame — generation-gated or not (a
+            // declared-identical population that outgrew its block
+            // list still refuses: a count change is a token change,
+            // which the identity gate above turned into a
+            // re-admission). Only the fully-reused between-tick
+            // frame skips it (its indices were validated at the
+            // admission this frame's records still vouch for).
+            if !full_reuse
+                && population
+                    .npc
+                    .iter()
+                    .any(|instance| instance.pose_index as usize >= population.npc_poses.len())
             {
                 return Err(RendererError::Vulkan(format!(
                     "a npc pose index falls outside the supplied pose blocks \
@@ -462,6 +587,13 @@ pub(crate) fn adapt_frame<'a, 'x>(
                 &mut generations.pose,
             )
             .map_err(RendererError::PosePack)?;
+            debug_assert!(
+                full_reuse
+                    == (instance_decision == crate::proxy_instances::GenerationDecision::Reused
+                        && pose_decision == crate::proxy_instances::GenerationDecision::Reused),
+                "the pose-index admission predicate and the repack gates \
+                 disagree — the identity layer drifted from the core gates"
+            );
             // The missed-bump debug verify (P5 §3.3's mandated
             // mitigation, dispatched above): on any reuse, debug and
             // test builds re-pack through the full-repack fallback
@@ -475,6 +607,12 @@ pub(crate) fn adapt_frame<'a, 'x>(
                 instance_decision,
                 pose_decision,
             )?;
+            // T05: the regeneration report the renderer's stamp
+            // invalidation consumes (see [`PopulationRepacked`]).
+            population_repacked.instance =
+                instance_decision == crate::proxy_instances::GenerationDecision::Repacked;
+            population_repacked.pose =
+                pose_decision == crate::proxy_instances::GenerationDecision::Repacked;
             Some(vulkan::proxy_draw::ProxyFrameUpload {
                 bytes: instance_bytes.as_slice(),
                 pose_bytes: pose_bytes.as_slice(),
@@ -565,6 +703,7 @@ pub(crate) fn adapt_frame<'a, 'x>(
         sky,
         post: scene.post,
         wet,
+        population_repacked,
     })
 }
 
@@ -665,6 +804,7 @@ mod tests {
             sky: None,
             post: false,
             wet: None,
+            population_repacked: PopulationRepacked::default(),
         };
         assert_eq!(
             inputs, expected,
@@ -740,6 +880,7 @@ mod tests {
                 light,
                 ripple: pack_ripple_field(Some(&field), RippleDebugMode::Off),
             }),
+            population_repacked: PopulationRepacked::default(),
         };
         assert_eq!(
             inputs, expected,
@@ -1106,5 +1247,160 @@ mod tests {
             (instance_generation, pose_generation),
             "the records hold the declared generations"
         );
+    }
+
+    /// T05 (strict audit IV) — THE ADAPTER-LEVEL COLLISION WITNESS:
+    /// two population SOURCES with colliding generation spaces (each
+    /// an independently owned crowd whose counters start at 1 — the
+    /// audit's exact scenario, `corner_demo`'s shape submitted by a
+    /// second owner) submit in succession at the SAME nonzero
+    /// generation with the SAME per-kind counts and DIFFERENT
+    /// content. The raw-generation CPU gate alone returns Reused and
+    /// the retained buffer keeps the FIRST source's bytes — in
+    /// debug/test the missed-bump verify panics on exactly this
+    /// (RED WITNESS: this test's pre-fix failure IS that panic), and
+    /// in a release production frame nothing catches it: the GPU
+    /// draws the wrong crowd. The identity contract (the source
+    /// records beside the generation) must make the second source
+    /// RE-ADMIT: repack, and the retained bytes become source B's.
+    #[test]
+    fn colliding_generation_spaces_re_admit_the_second_source() {
+        use crate::animation::{HUMANOID_JOINTS, rest_pose_block};
+        use crate::proxy_instances::{InstanceTransform, ProxyInstance, repack_populations};
+        let matrix = [
+            [0.9, 0.0, 0.0, 0.0],
+            [0.0, 0.9, 0.0, 0.0],
+            [0.0, 0.0, 0.9, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let light = crate::lit_scene::day_preset();
+        let policy = SubmissionPolicy {
+            proxy_draw_mode: ProxyDrawMode::default(),
+            ripple_debug: RippleDebugMode::default(),
+            instance_capacity: crate::proxy_instances::MAX_INSTANCES,
+            pose_capacity: crate::animation::MAX_POSE_BLOCKS,
+        };
+        // Two sources' instance lists — same per-kind counts (2 npc,
+        // 1 vehicle), different content, separately owned storage.
+        let instance = |x: f32, y: f32, turn: u16, tint: [f32; 3]| ProxyInstance {
+            transform: InstanceTransform {
+                pos: [x, 0.02, y],
+                turn,
+                scale: 1.0,
+            },
+            tint,
+            alpha: 1.0,
+            pose_index: 0,
+        };
+        let source_a = vec![
+            instance(1.0, -2.0, 1000, [0.9, 0.9, 0.9]),
+            instance(-3.0, 4.0, 40000, [0.8, 0.6, 0.5]),
+            instance(7.0, 1.0, 8192, [0.2, 0.4, 0.9]),
+        ];
+        let source_b = vec![
+            instance(12.0, 5.0, 2000, [0.1, 0.9, 0.3]),
+            instance(-8.0, -6.0, 30000, [0.5, 0.5, 0.1]),
+            instance(9.0, 3.0, 4096, [0.3, 0.2, 0.7]),
+        ];
+        // Each source's own pose palette (the same rest content —
+        // the instance half is this witness's subject).
+        let poses_a: Vec<[[[f32; 4]; 4]; HUMANOID_JOINTS]> =
+            vec![rest_pose_block(), rest_pose_block()];
+        let poses_b: Vec<[[[f32; 4]; 4]; HUMANOID_JOINTS]> =
+            vec![rest_pose_block(), rest_pose_block()];
+        // The submission builder: a local fn (a closure cannot
+        // express the shared parameter lifetime — the fuzz test's
+        // own note), taking the population slices as parameters so
+        // the same construction serves both sources and the stable
+        // resubmission.
+        fn build<'a>(
+            instances: &'a [ProxyInstance],
+            poses: &'a [[[[f32; 4]; 4]; HUMANOID_JOINTS]],
+            matrix: [[f32; 4]; 4],
+            light: crate::lit_scene::LightParams,
+        ) -> FrameSubmission<'a> {
+            FrameSubmission {
+                camera: FrameCamera {
+                    view_proj: matrix,
+                    eye: [4.0, 1.7, 12.0],
+                },
+                output: OutputTarget {
+                    window_size: (1280, 720),
+                },
+                layers: DynamicLayers::default(),
+                scene: Some(SceneFrame {
+                    light,
+                    shadows: None,
+                    population: Some(crate::renderer::ProxyPopulation {
+                        npc: &instances[..2],
+                        npc_poses: poses,
+                        npc_material: 0,
+                        vehicle: &instances[2..],
+                        vehicle_material: 0,
+                        rain: &[],
+                        rain_material: 0,
+                        instance_generation: 5,
+                        pose_generation: 5,
+                    }),
+                    sky: None,
+                    post: false,
+                    wet: None,
+                }),
+            }
+        }
+        let mut instance_bytes = Vec::new();
+        let mut pose_bytes = Vec::new();
+        let mut generations = PopulationGenerations::default();
+        // Source A admitted at generation 5.
+        let submission_a = build(&source_a, &poses_a, matrix, light);
+        adapt_frame(
+            policy,
+            &submission_a,
+            3,
+            &[],
+            &mut instance_bytes,
+            &mut pose_bytes,
+            &mut generations,
+        )
+        .expect("source A validates and admits");
+        let a_bytes = instance_bytes.clone();
+        // Source B — its OWN generation space, also at 5, the same
+        // counts, different content — must RE-ADMIT (repack), not
+        // reuse A's bytes. Pre-fix this is the RED arm: the raw gate
+        // reuses and the debug missed-bump verify panics (MISSED
+        // BUMP) — the release shape would silently draw A's crowd.
+        let submission_b = build(&source_b, &poses_b, matrix, light);
+        adapt_frame(
+            policy,
+            &submission_b,
+            3,
+            &[],
+            &mut instance_bytes,
+            &mut pose_bytes,
+            &mut generations,
+        )
+        .expect("source B re-admits through the identity contract");
+        let mut b_expected = Vec::new();
+        repack_populations(&mut b_expected, &source_b[..2], &source_b[2..], &[]).unwrap();
+        assert_eq!(
+            instance_bytes, b_expected,
+            "the retained bytes are source B's, not A's stale crowd"
+        );
+        assert_ne!(instance_bytes, a_bytes);
+        // And the new source's between-tick frames keep their R2
+        // reuse (the identity layer must not over-fire): a second B
+        // submission at the same generation reuses byte-identically.
+        let submission_b_again = build(&source_b, &poses_b, matrix, light);
+        adapt_frame(
+            policy,
+            &submission_b_again,
+            3,
+            &[],
+            &mut instance_bytes,
+            &mut pose_bytes,
+            &mut generations,
+        )
+        .expect("source B's stable resubmission validates");
+        assert_eq!(instance_bytes, b_expected, "the reuse regenerated nothing");
     }
 }

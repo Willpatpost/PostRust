@@ -182,11 +182,24 @@ pub(crate) struct FrameState {
 /// decision function shared by this frame state, the upload site,
 /// and the census's write leg; the oracle harness at this module's
 /// bottom pins the whole protocol against the always-write path.
+///
+/// **T05 (strict audit IV):** the indirect stamp carries its own
+/// per-kind count record (`indirect_counts`) — the indirect-count
+/// identity is SEPARATE from the payload identity. A submission can
+/// present byte-identical instance bytes under a different
+/// npc/vehicle/rain partition (the byte-only oracle's blind spot);
+/// the indirect gate then writes on the count change even at a
+/// matching generation, because the command block's bytes — the
+/// per-kind counts — moved while every byte-length stayed green.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PopulationStamps {
     pub instance: [u64; FRAMES_IN_FLIGHT as usize],
     pub pose: [u64; FRAMES_IN_FLIGHT as usize],
     pub indirect: [u64; FRAMES_IN_FLIGHT as usize],
+    /// T05: the per-kind counts each slot's indirect block was last
+    /// written with ([npc, vehicle, rain]) — the indirect-count
+    /// identity beside the generation.
+    pub indirect_counts: [[u32; 3]; FRAMES_IN_FLIGHT as usize],
 }
 
 impl Default for PopulationStamps {
@@ -195,6 +208,7 @@ impl Default for PopulationStamps {
             instance: [0; FRAMES_IN_FLIGHT as usize],
             pose: [0; FRAMES_IN_FLIGHT as usize],
             indirect: [0; FRAMES_IN_FLIGHT as usize],
+            indirect_counts: [[0; 3]; FRAMES_IN_FLIGHT as usize],
         }
     }
 }
@@ -213,6 +227,37 @@ impl PopulationStamps {
     /// cost negligible.
     pub(crate) fn clear(&mut self) {
         *self = Self::default();
+    }
+
+    /// T05 (strict audit IV) — the INSTANCE half's REPACK
+    /// invalidation: no slot's instance or indirect stamp may keep
+    /// vouching after the CPU half regenerated the retained bytes.
+    /// The hazard is the COLLIDING generation: a second source's own
+    /// counter can present the SAME nonzero number the stamps
+    /// already record, so the bare-generation gate would skip and
+    /// the mapped regions would keep the FIRST source's bytes. The
+    /// renderer calls this on every repacked instance half (the
+    /// [`crate::submission::PopulationRepacked`] signal), at
+    /// SUBMISSION time — before the frame flow, so a deferred or
+    /// failed frame has already invalidated (a later frame of the
+    /// new source re-admits through the CPU gate and writes both
+    /// slots). Every slot is cleared: the OTHER slot's stamp is
+    /// exactly the one that can equal the colliding generation. One
+    /// redundant rewrite per slot per regeneration event — a bump
+    /// already rewrote every slot once under the bare-generation
+    /// rule, so single-source write counts do not move.
+    pub(crate) fn clear_instance(&mut self) {
+        self.instance = [0; FRAMES_IN_FLIGHT as usize];
+        self.indirect = [0; FRAMES_IN_FLIGHT as usize];
+        self.indirect_counts = [[0; 3]; FRAMES_IN_FLIGHT as usize];
+    }
+
+    /// T05 — the POSE half's repack invalidation (the instance
+    /// method's mirror, scoped to the pose stamps alone: the
+    /// garage's split keeps the static instance half's skips while
+    /// the advancing pose half rewrites).
+    pub(crate) fn clear_pose(&mut self) {
+        self.pose = [0; FRAMES_IN_FLIGHT as usize];
     }
 }
 
@@ -1428,14 +1473,22 @@ fn upload_frame_data(
         // the pure proxy_indirect packing of the per-kind counts —
         // an instance-side fact — so the same stamp decision gates
         // it, tracked on its own stamp (the block is its own buffer,
-        // lazily created only in the indirect mode).
+        // lazily created only in the indirect mode). T05: the
+        // indirect-count identity is SEPARATE from the payload
+        // identity — the gate ALSO writes when the per-kind counts
+        // differ from the slot's record, because a partition change
+        // (byte-identical payload, different npc/vehicle/rain split)
+        // moves the command block's bytes while every byte-length
+        // oracle stays green.
         if let Some(indirect) = proxy_state.indirect.as_ref()
             && matches!(upload.mode, crate::ProxyDrawMode::Indirect)
         {
+            let submitted_counts = [upload.npc_count, upload.vehicle_count, upload.rain_count];
             if generation_write_needed(
                 frames.population_stamps.indirect[slot],
                 upload.instance_generation,
-            ) {
+            ) || frames.population_stamps.indirect_counts[slot] != submitted_counts
+            {
                 unsafe {
                     indirect.write_slot(
                         slot,
@@ -1445,6 +1498,7 @@ fn upload_frame_data(
                     )
                 };
                 frames.population_stamps.indirect[slot] = upload.instance_generation;
+                frames.population_stamps.indirect_counts[slot] = submitted_counts;
             } else {
                 outcome.population_writes_skipped += 1;
             }
@@ -2396,7 +2450,7 @@ mod policy_tests {
                 (instance_generation, pose_generation)
             };
             // ---- The gated path (both levels) ----
-            repack_populations_generation(
+            let instance_decision = repack_populations_generation(
                 &mut gated_bytes,
                 &instances,
                 &[],
@@ -2406,7 +2460,7 @@ mod policy_tests {
                 &mut generations.instance,
             )
             .unwrap();
-            repack_poses_generation(
+            let pose_decision = repack_poses_generation(
                 &mut gated_poses,
                 &poses[..],
                 crate::animation::MAX_POSE_BLOCKS,
@@ -2414,6 +2468,22 @@ mod policy_tests {
                 &mut generations.pose,
             )
             .unwrap();
+            // T05 (strict audit IV): the renderer's submission-time
+            // stamp invalidation, modeled — a REPACKED half's stamps
+            // reset on every slot before the gates (a colliding
+            // generation number from a second source must not keep
+            // a stamp vouching for the first source's bytes). For
+            // this single-source sequence the rule is
+            // outcome-identical to the former bare-generation gate
+            // (a bump already rewrote every slot once), which is
+            // exactly what the oracle below re-proves frame by
+            // frame.
+            if instance_decision == crate::proxy_instances::GenerationDecision::Repacked {
+                stamps.clear_instance();
+            }
+            if pose_decision == crate::proxy_instances::GenerationDecision::Repacked {
+                stamps.clear_pose();
+            }
             if generation_write_needed(stamps.instance[slot], declared_instance) {
                 slot_instances[slot].clear();
                 slot_instances[slot].extend_from_slice(&gated_bytes);
@@ -2575,6 +2645,98 @@ mod policy_tests {
             assert!(generation_write_needed(stamps.instance[slot], 5));
             assert!(generation_write_needed(stamps.pose[slot], 5));
             assert!(generation_write_needed(stamps.indirect[slot], 5));
+        }
+    }
+
+    /// T05 (strict audit IV) — THE SLOT-LEVEL COLLISION WITNESS,
+    /// green half: the CPU half REPACKED the retained buffer at a
+    /// generation some slot's stamp already records (two sources
+    /// with colliding generation spaces — the second source
+    /// re-admits at the same nonzero number, or a same-generation
+    /// count change forces the count guard). The bare-generation
+    /// gate (`generation_write_needed(stamp, generation)`) alone
+    /// returns FALSE and the mapped region would keep the FIRST
+    /// source's bytes — the RED run demonstrated exactly that skip.
+    /// The production rule (the renderer's stamp invalidation on
+    /// the [`crate::submission::PopulationRepacked`] signal,
+    /// [`PopulationStamps::clear_instance`]) resets the half's
+    /// stamps on every slot BEFORE the gate — modeled here as the
+    /// renderer performs it.
+    #[test]
+    fn a_colliding_generation_repack_must_rewrite_the_slot_regions() {
+        let slots = FRAMES_IN_FLIGHT as usize;
+        // Both slots consumed source A's generation-5 bytes.
+        let mut stamps = PopulationStamps {
+            instance: [5; FRAMES_IN_FLIGHT as usize],
+            indirect: [5; FRAMES_IN_FLIGHT as usize],
+            ..Default::default()
+        };
+        assert_eq!(slots, 2, "the pinned ping-pong shape");
+        // The CPU half repacked source B at the SAME generation 5
+        // (the collision): the renderer's submission-time
+        // invalidation fires — every slot, because the OTHER slot's
+        // stamp is exactly the one equal to the colliding
+        // generation.
+        stamps.clear_instance();
+        for slot in 0..slots {
+            assert!(
+                generation_write_needed(stamps.instance[slot], 5),
+                "slot {slot}: a repacked buffer at a colliding generation must rewrite"
+            );
+            assert!(
+                generation_write_needed(stamps.indirect[slot], 5),
+                "slot {slot}: the indirect block must follow the repack"
+            );
+        }
+    }
+
+    /// T05 — THE INDIRECT PARTITION COLLISION WITNESS, green half:
+    /// byte-identical instance payload, DIFFERENT npc/vehicle/rain
+    /// partition, same generation. The payload gate reuses
+    /// (correctly — the bytes are identical, even the adapter's
+    /// debug byte-verify passes), but the indirect command block is
+    /// a pure function of the PER-KIND COUNTS, which moved. The
+    /// production rule (the per-kind count record beside the
+    /// indirect stamp) writes on the count change even at a
+    /// matching generation — modeled here as the upload site
+    /// performs it. The RED run demonstrated the generation-only
+    /// gate skipping exactly this shape.
+    #[test]
+    fn an_indirect_partition_change_at_a_matching_generation_must_rewrite() {
+        let slots = FRAMES_IN_FLIGHT as usize;
+        // Both slots hold source A's (2 npc, 1 vehicle, 0 rain)
+        // indirect block at generation 5.
+        let recorded_counts = [2_u32, 1, 0];
+        let mut stamps = PopulationStamps {
+            indirect: [5; FRAMES_IN_FLIGHT as usize],
+            indirect_counts: [recorded_counts; FRAMES_IN_FLIGHT as usize],
+            ..Default::default()
+        };
+        // Source C: the same three instances, partitioned (1, 2, 0)
+        // — identical concatenated payload bytes, different counts.
+        let submitted_counts = [1_u32, 2, 0];
+        assert_ne!(recorded_counts, submitted_counts);
+        for slot in 0..slots {
+            let write = generation_write_needed(stamps.indirect[slot], 5)
+                || stamps.indirect_counts[slot] != submitted_counts;
+            assert!(
+                write,
+                "slot {slot}: the per-kind counts moved — the indirect \
+                 block must rewrite even at a matching generation"
+            );
+            // And the write records the new counts (the identity the
+            // next frame compares against).
+            stamps.indirect[slot] = 5;
+            stamps.indirect_counts[slot] = submitted_counts;
+        }
+        // A stable resubmission of source C now skips again (the
+        // counts record vouches — the R2 reuse preserved).
+        for slot in 0..slots {
+            assert!(
+                !(generation_write_needed(stamps.indirect[slot], 5)
+                    || stamps.indirect_counts[slot] != submitted_counts),
+                "slot {slot}: the recorded counts keep the stable skip"
+            );
         }
     }
 }

@@ -58,6 +58,36 @@ pub enum PosePackError {
     Capacity { capacity: usize, requested: usize },
 }
 
+/// T05 (strict audit IV) — the POSE population's source identity:
+/// [`crate::proxy_instances::InstanceSourceToken`]'s mirror for the
+/// pose-block palette (the evaluated-pose list a distinct source
+/// owns). The token is the blocks slice's storage address plus its
+/// length; the renderer derives and records it beside the pose
+/// generation, so two LIVE pose sources with colliding generation
+/// spaces cannot wrongly reuse each other's blocks, while a source
+/// that re-evaluates into stable storage (the demos' retained
+/// `poses` Vec, cleared and refilled in place) keeps its between-
+/// tick reuse. Same residual hazard and same future hardening as
+/// the instance token's docs — see there (the contract exists
+/// exactly once, referenced from the pose side).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PoseSourceToken {
+    blocks: usize,
+    blocks_count: usize,
+}
+
+impl PoseSourceToken {
+    /// Derives the token from a submission's borrowed pose blocks —
+    /// the one construction path (the renderer's adapter is its only
+    /// caller; the fields stay private).
+    pub fn of(blocks: &[[[[f32; 4]; 4]; HUMANOID_JOINTS]]) -> Self {
+        Self {
+            blocks: blocks.as_ptr() as usize,
+            blocks_count: blocks.len(),
+        }
+    }
+}
+
 /// The maximum number of pose blocks (the same bound as instances).
 pub const MAX_POSE_BLOCKS: usize = crate::proxy_instances::MAX_INSTANCES;
 
