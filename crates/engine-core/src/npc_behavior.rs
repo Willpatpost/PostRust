@@ -86,8 +86,11 @@ pub struct Activity {
 /// the commit pipeline). Wire-encodable through THIS module's codec
 /// — [`NpcIdentity::wire_bytes`]/[`NpcIdentity::from_wire`], the
 /// seam the docs claim, byte-exact through save/load (pinned by an
-/// asymmetric golden record and round trip).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// asymmetric golden record and round trip). `Eq` (P2 L8): every
+/// field is totally ordered wire data — the id, the home cell, the
+/// region tag, the seed — so the v2 save section's identity table
+/// derives `Eq` with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NpcIdentity {
     pub id: NpcId,
     /// The home cell on the region grid (the committed anchor).

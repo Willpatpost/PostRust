@@ -72,6 +72,7 @@ pub mod timing;
 pub mod weapons;
 pub mod weather;
 pub mod wire;
+pub mod world_config;
 
 mod sha256;
 
@@ -94,28 +95,43 @@ pub use player::{
     PlayerConfig, PlayerDriver, PlayerState, StaticCollider, StepOutcome, TraceEntry, camera_pose,
     camera_pose_obstructed, look_direction, player_box, step_player,
 };
-/// The game's region layout (Stage 3 metadata): eight logical
-/// regions. Authoritative in engine-core so every layer — the
-/// application's region director AND the persistence layer's shared
-/// session-snapshot anchor decoding — reads one constant (V2-W F4's
-/// authenticated retention: the rotation boundary's wire format is
-/// parameterized by this layout).
+/// The v1 wire formats' fixed region layout: eight logical regions.
+/// Authoritative in engine-core as **wire-format data** (P2 L8,
+/// A05's configuration boundary): a v1 save
+/// (`engine-slice/npc-world-save/1`) and the v1 region-director
+/// section encode eight regions BY DEFINITION, and the persistence
+/// layer's shared session-snapshot anchor decoding validates against
+/// this one constant. This is NOT world policy — the world's live
+/// partition is configuration ([`WorldConfig`], carried as data by
+/// the `npc-world-save/2` section); the application authors its own
+/// values (engine-slice's `npc` module), equal to this
+/// interpretation so every historical save stays byte-compatible.
 pub const REGION_COUNT: usize = 8;
 
-/// The game's Stage 4 workload: 1,000 stable NPC identities (the
-/// shared wire-format bound — see [`REGION_COUNT`]).
+/// The v1 wire formats' fixed workload: 1,000 stable NPC identities
+/// (the shared wire-format bound — see [`REGION_COUNT`]). Wire-format
+/// data, not world policy: a v1 save materializes exactly this
+/// population; a `npc-world-save/2` save carries its own
+/// ([`WorldConfig::npc_count`]).
 pub const NPC_COUNT: usize = 1000;
 
-/// Side length of the per-NPC region-local position grid (the shared
-/// wire-format bound — see [`REGION_COUNT`]).
+/// The v1 wire formats' fixed side length of the per-NPC region-local
+/// position grid (the shared wire-format bound — see
+/// [`REGION_COUNT`]). Wire-format data, not world policy: the v2
+/// section carries the grid side as data
+/// ([`WorldConfig::region_grid`]).
 pub const REGION_GRID: u8 = 16;
 
 /// The discarded-position sentinel (the shared wire-format value —
-/// see [`REGION_COUNT`]).
+/// see [`REGION_COUNT`]). Format data in both versions: the one
+/// off-grid exemption every position-bounds gate sanctions.
 pub const POSITION_DISCARDED: (u8, u8) = (u8::MAX, u8::MAX);
 
 pub use lod::{LodConfig, LodConfigError, LodController, LodLevel, PresenceSample};
-pub use npc_world_save::{NPC_WORLD_SAVE_DOMAIN, NpcSaveWorld, NpcWorldSection};
+pub use npc_world_save::{
+    NPC_WORLD_SAVE_DOMAIN, NPC_WORLD_SAVE_DOMAIN_V2, NpcRegionBlock, NpcSaveWorld, NpcSaveWorldV2,
+    NpcWorldSection, NpcWorldSectionV2,
+};
 pub use spine::{
     CompactionError, ExecCtx, HistoryKind, LaneReport, LaneTotals, ObligationLocation,
     ObligationView, ReconstructionError, ScheduleError, Spine, Stats, SuspensionStats, World,
@@ -125,3 +141,4 @@ pub use weapons::{
     SpreadField, WEAPON_COUNT, WeaponId, WeaponSet, WeaponSpec, try_fire,
 };
 pub use wire::{Decoder, Encoder, SaveError, SaveWorld};
+pub use world_config::{MAX_NPC_COUNT, MAX_REGION_COUNT, WorldConfig, WorldConfigError};
