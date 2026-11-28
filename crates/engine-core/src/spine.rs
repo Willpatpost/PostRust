@@ -934,6 +934,28 @@ pub struct Spine<W: World> {
     /// set, so every historical pin is mechanically preserved.
     unfinished: BTreeSet<u64>,
     ledger: Vec<ExecutionRecord>,
+    /// The logical head of the execution ledger (T07 §7's Option 4 —
+    /// the tail-shifting drain replacement): `[..head]` is the
+    /// physically present but already-summarized DEAD prefix,
+    /// `[head..]` the live tail every public view exposes.
+    /// INVARIANT: `head > 0` implies `compacted.is_some()` — the
+    /// dead prefix exists only after a compaction and a `Full` spine
+    /// always has `head == 0`, so the full-form save, `ledger()`,
+    /// the full-history fingerprints, and `try_ledger_full` never
+    /// observe a dead prefix; restore always rebuilds tight
+    /// (`head == 0`). The cut path bumps `head` — zero bytes moved,
+    /// zero allocations — and an amortized compact
+    /// (`Vec::drain(..head)`, still allocation-free, capacity
+    /// retained) fires when `head` reaches the live tail's size (the
+    /// classic amortization: each record is physically moved at most
+    /// once per discard batch, total moves ≤ total discarded records
+    /// over any prefix of the run), with physical residency
+    /// documented at worst `2 × live` at the trigger — never data
+    /// discarded to hit it. Representation-internal, never
+    /// fingerprinted, never serialized: the wire encodes the live
+    /// tail only, so a live spine with a dead prefix and its
+    /// restored tight image encode IDENTICAL bytes.
+    head: usize,
     /// The compacted-history state; `None` is `HistoryKind::Full`.
     /// The retained-record count is always the live ledger length
     /// (execution appends to the tail), so only the cumulative
@@ -1361,6 +1383,7 @@ impl<W: World> Spine<W> {
             ),
             unfinished: BTreeSet::new(),
             ledger: Vec::new(),
+            head: 0,
             compacted: None,
             max_executed_index: None,
             world,
@@ -1457,7 +1480,7 @@ impl<W: World> Spine<W> {
             None => HistoryKind::Full,
             Some(compacted) => HistoryKind::Compacted {
                 summarized_records: compacted.summarized_records,
-                retained_records: self.ledger.len() as u64,
+                retained_records: (self.ledger.len() - self.head) as u64,
                 prefix_summary: compacted.prefix_summary,
             },
         }
@@ -1466,9 +1489,11 @@ impl<W: World> Spine<W> {
     /// The retained execution records — the full ledger on a `Full`
     /// instance, the verbatim tail on a `Compacted` one (the
     /// explicitly named safe accessor; identical to [`Self::ledger`]
-    /// on `Full`).
+    /// on `Full`). The tail is the live view `&[head..]` — a dead
+    /// prefix (T07 §7) is pure physical slack, never logical, never
+    /// observable through this or any other public accessor.
     pub fn ledger_retained(&self) -> &[ExecutionRecord] {
-        &self.ledger
+        &self.ledger[self.head..]
     }
 
     /// The safe full-history request: `Some` on `Full`, `None` on
@@ -2929,22 +2954,30 @@ impl<W: World> Spine<W> {
     /// compaction is an explicit operation, never a silent default.
     /// The CALL is the driver's acknowledgment (each invocation an
     /// explicit, between-ticks decision); the policy cadence — the
-    /// automatic path — carries its own acknowledgment requirement
-    /// ([`ConsequenceEligibility`], CA-07).
+    /// automatic path — carries its own eligibility requirement (the
+    /// T07 two-class model: [`ConsequenceFreedom`] or the frontier,
+    /// CA-07).
     ///
-    /// **THE RETAINED-TAIL MOVE (CA-07's measured cost)**: the prefix
-    /// is hashed first (read-only), then removed IN PLACE through
-    /// [`Vec::drain`] — the retained tail memmoves down within the
-    /// ledger's own buffer, `retained × size_of::<ExecutionRecord>()`
-    /// bytes per invocation (the unavoidable cost of Vec prefix
-    /// removal), with NO fresh allocation and the high-water capacity
-    /// RETAINED (the pre-CA-07 `split_off` shape allocated a fresh
-    /// tight vector per compaction and forced a reallocation on the
-    /// next push past it — the drain shape keeps the sustained-load
-    /// loop allocation-free across every firing; pinned by the
-    /// retention tests).
+    /// **THE LOGICAL HEAD (T07 §7's Option 4 — the drain
+    /// replacement)**: the prefix is hashed first (read-only, the
+    /// same chain bytes as ever), then the cut becomes a `head` bump
+    /// — the summarized prefix stays physically present as the DEAD
+    /// prefix `[..head]` while every public view exposes the live
+    /// tail `[head..]`, so the cut itself moves ZERO bytes and
+    /// allocates nothing. An amortized compact
+    /// (`Vec::drain(..head)` — still allocation-free, the high-water
+    /// capacity RETAINED, as with the pre-T07 drain shape) fires
+    /// when `head` reaches the live tail's size: the classic
+    /// amortization bounding total record moves by total discarded
+    /// records over any prefix of the run (each record is physically
+    /// moved at most once per discard batch), at the documented
+    /// worst-case physical residency of `2 × live` — never data
+    /// discarded to hit it. Wire identity: the `spine-history/2`
+    /// section encodes the live tail only, so a live spine with a
+    /// dead prefix and its restored tight image encode IDENTICAL
+    /// bytes (pinned by the dead-prefix round-trip test).
     pub fn compact(&mut self, retain: u64) -> Result<HistoryKind, CompactionError> {
-        let ledger_len = self.ledger.len() as u64;
+        let ledger_len = (self.ledger.len() - self.head) as u64;
         if retain > ledger_len {
             return Err(CompactionError::RetainExceedsLedger { ledger_len, retain });
         }
@@ -2956,17 +2989,26 @@ impl<W: World> Spine<W> {
             Some(prior) => prior.prefix_summary,
             None => digest(SPINE_HISTORY_DOMAIN.as_bytes()),
         };
-        for record in &self.ledger[..cut as usize] {
+        for record in &self.ledger[self.head..self.head + cut as usize] {
             let mut hasher = Sha256::new();
             hasher.update(&chain);
             hasher.update(&record_wire_bytes(record));
             chain = hasher.finish();
         }
-        // The in-place prefix removal: the retained tail moves down
-        // within the same buffer (no allocation, capacity retained);
-        // the discarded prefix records are dropped as the drain
-        // yields them.
-        self.ledger.drain(..cut as usize);
+        // The logical-head bump: the summarized prefix becomes dead
+        // physical slack — zero bytes moved, zero allocations, the
+        // high-water capacity retained.
+        self.head += cut as usize;
+        // The amortized compact (the classic front-vs-back
+        // amortization): when the dead prefix reaches the live
+        // tail's size, one drain bounds the total moves by the total
+        // discards — each surviving record is physically moved at
+        // most once per discard batch, and the buffer never carries
+        // more than `2 × live` records at the trigger.
+        if self.head >= self.ledger.len() - self.head {
+            self.ledger.drain(..self.head);
+            self.head = 0;
+        }
         let summarized_records = match &self.compacted {
             Some(prior) => prior.summarized_records + cut,
             None => cut,
@@ -3179,8 +3221,7 @@ impl<W: World> Spine<W> {
     /// count what they read never need it.
     pub fn retention_ordinal_of(&self, id: EventId) -> Option<u64> {
         let summarized = self.standing_summarized_records();
-        let ordinal = self
-            .ledger
+        let ordinal = self.ledger[self.head..]
             .iter()
             .position(|record| record.id.seq == id.seq)? as u64;
         Some(summarized + ordinal + 1)
@@ -3261,9 +3302,8 @@ impl<W: World> Spine<W> {
     /// configured (no bound is declared, so no lag is defined).
     pub fn retention_lag_records(&self) -> u64 {
         match self.retention {
-            Some(policy) => {
-                (self.ledger.len() as u64).saturating_sub(policy.resident_bound_records())
-            }
+            Some(policy) => ((self.ledger.len() - self.head) as u64)
+                .saturating_sub(policy.resident_bound_records()),
             None => 0,
         }
     }
@@ -3321,7 +3361,7 @@ impl<W: World> Spine<W> {
         let Some(policy) = self.retention else {
             return;
         };
-        let ledger_len = self.ledger.len() as u64;
+        let ledger_len = (self.ledger.len() - self.head) as u64;
         let threshold = policy.resident_bound_records();
         if ledger_len <= threshold {
             return;
@@ -3753,8 +3793,11 @@ impl<W: World> Spine<W> {
         }
         fp.write_bytes(&compacted.prefix_summary);
         fp.write_u64(compacted.summarized_records);
-        fp.write_usize(self.ledger.len());
-        for record in &self.ledger {
+        // The compacted domains hash the LIVE view (T07 §7): a dead
+        // prefix is physical layout, never logical content — the
+        // fingerprint is identical under both storage shapes.
+        fp.write_usize(self.ledger.len() - self.head);
+        for record in &self.ledger[self.head..] {
             fp.write_u64(record.id.seq);
             fp.write_u8(field_byte(record.field));
             fp.write_u32(u32::from(record.class.0));
@@ -4610,6 +4653,10 @@ impl<W: SaveWorld> Spine<W> {
             ),
             unfinished,
             ledger,
+            // The logical head always rebuilds tight (T07 §7): the
+            // wire encodes the live tail only, so a restored spine
+            // carries no dead prefix.
+            head: 0,
             compacted,
             max_executed_index: None,
             world,
@@ -4775,8 +4822,12 @@ impl<W: SaveWorld> Spine<W> {
         }
         enc.write_bytes(&compacted.prefix_summary);
         enc.write_u64(compacted.summarized_records);
-        enc.write_count(self.ledger.len());
-        for record in &self.ledger {
+        // The v2 section encodes the LIVE tail only (T07 §7): the
+        // dead prefix is pure physical slack, never serialized — a
+        // live spine with a dead prefix and its restored tight image
+        // encode identical bytes.
+        enc.write_count(self.ledger.len() - self.head);
+        for record in &self.ledger[self.head..] {
             write_record_entry(enc, record);
         }
     }
@@ -7370,40 +7421,61 @@ mod tests {
         );
     }
 
-    /// THE RETAINED-TAIL MOVE, MEASURED (CA-07's mandated measurement):
-    /// at constant chunk size, one compaction's cost is exactly
-    /// `chunk` SHA-256 record hashes plus `retained` in-place record
-    /// moves (the [`Vec::drain`] prefix removal — the pre-CA-07
-    /// `split_off` shape additionally allocated a fresh tight vector
-    /// per firing and forced a reallocation on the next push past
-    /// it). The operation counts are exact and deterministic (the
-    /// IA-07 discipline: costs are operation counts until a
-    /// benchmark times them — wall-clock is deliberately not pinned
-    /// here); the capacity witness below is the allocation proof:
-    /// the in-place drain retains the high-water capacity across
-    /// every firing, so the sustained loop fires with ZERO ledger
-    /// allocations, while the bytes moved grow with the retained
-    /// history at constant chunk.
+    /// THE LOGICAL HEAD, MEASURED (T07 §7 — the CA-07 :6920 witness
+    /// INVERTED by the approved design's §5.9: the drain's per-firing
+    /// `retained`-record tail move becomes ZERO — the cut is a `head`
+    /// bump, the summarized prefix dead physical slack): per firing
+    /// that does not trigger the amortized compact, every surviving
+    /// record keeps its EXACT physical index (witnessed below; the
+    /// red-first witness `red_witness_drain_moves_surviving_records_
+    /// at_every_firing` failed against the drain with
+    /// `left: seq 200, right: seq 100` at physical index 100 before
+    /// this landed), and the amortized compact — one
+    /// `Vec::drain(..head)` when the dead prefix reaches the live
+    /// tail's size — bounds TOTAL moves by TOTAL discarded records
+    /// over any prefix of the run (each record physically moved at
+    /// most once per discard batch, amortized ≤ one move per
+    /// discarded record, versus the drain's one move per RETAINED
+    /// record per firing). The capacity witness stays the allocation
+    /// proof (the IA-07 discipline — operation counts, never
+    /// wall-clock): the buffer never shrinks and never regrows after
+    /// the first firing (the head bump and the amortized drain both
+    /// retain the high-water capacity, so the sustained loop fires
+    /// with ZERO ledger allocations), and after any firing the
+    /// capacity strictly exceeds the live tail.
     #[test]
-    fn policy_compaction_moves_the_tail_in_place_at_constant_chunk() {
-        const CHUNK: u64 = 300;
-        // Two retained-history sizes at the same chunk: the moves per
-        // firing are the retained-record counts after each cut.
-        for (retain, ticks) in [(128u64, 12u64), (300, 12u64)] {
+    fn policy_compaction_bumps_a_logical_head_with_amortized_moves() {
+        // Three regimes: the two CA-07 measured windows at chunk 300
+        // (retain 128 fires at ticks 5/8/11 from 500 down to 200
+        // live; retain 300 fires at ticks 7/10 from 700 down to 400
+        // live), and the wide-window regime at chunk 100 (retain 400
+        // fires at ticks 6-12 with the amortized compact co-firing
+        // at tick 10 — six pure head bumps around it).
+        for (retain, chunk, ticks) in [(128u64, 300u64, 12u64), (300, 300, 12), (400, 100, 12)] {
             let mut spine = Spine::new(SustainedWorld, 100);
             for i in 0..100u64 {
                 spine
                     .schedule(spec(5, Field::Near, 1, i))
                     .expect("schedule");
             }
-            spine.set_retention_policy(policy(retain, CHUNK), eligibility());
-            let mut moves: Vec<u64> = Vec::new();
+            spine.set_retention_policy(policy(retain, chunk), eligibility());
             let mut capacity_high_water: usize = 0;
+            let mut total_moves: u64 = 0;
+            let mut total_discarded: u64 = 0;
+            let mut discarded_since_compact: u64 = 0;
+            let mut firings: u64 = 0;
+            let mut pure_bumps: u64 = 0;
             for tick in 1..=ticks {
+                // The pre-firing physical snapshot: the survivors'
+                // exact positions (the zero-move oracle).
+                let pre_physical: Vec<EventId> =
+                    spine.ledger.iter().map(|record| record.id).collect();
+                let pre_head = spine.head;
+                let pre_len = spine.ledger.len();
                 spine.run_tick();
                 // The capacity witness: never shrinks, never regrows
-                // after the first firing (drain keeps the buffer;
-                // split_off would have re-allocated it tight).
+                // after the first firing (the head bump and the
+                // amortized drain both keep the buffer).
                 let capacity = spine.ledger.capacity();
                 assert!(
                     capacity >= capacity_high_water,
@@ -7411,47 +7483,175 @@ mod tests {
                 );
                 capacity_high_water = capacity_high_water.max(capacity);
                 let stats = spine.retention_stats();
-                if stats.compactions > moves.len() as u64 {
-                    // The firing's move count: the retained tail's
-                    // length after the cut (exactly the records
-                    // drain moved down within the buffer).
-                    moves.push(spine.ledger_retained().len() as u64);
+                if stats.compactions > firings {
+                    firings = stats.compactions;
+                    let cut = stats.last_chunk;
+                    assert_eq!(cut, chunk, "tick {tick}: the chunk is constant");
+                    total_discarded += cut;
+                    discarded_since_compact += cut;
+                    let live = spine.ledger.len() - spine.head;
+                    if spine.head == 0 && spine.ledger.len() < pre_len {
+                        // The amortized compact co-fired this tick:
+                        // the drain moved exactly the live tail down
+                        // (live records moved), bounded by the
+                        // discards since the last compact.
+                        assert!(
+                            discarded_since_compact >= live as u64,
+                            "tick {tick}: the compact's {live} moves ≤ the \
+                             {discarded_since_compact} discards since the last compact \
+                             (retain {retain})"
+                        );
+                        total_moves += live as u64;
+                        discarded_since_compact = 0;
+                    } else {
+                        // The pure head bump: zero bytes moved — the
+                        // head advanced by exactly the cut, no record
+                        // was removed (the tick's arrivals appended
+                        // beyond the pre-firing physical length), and
+                        // EVERY pre-firing record — dead prefix
+                        // included — keeps its exact physical index.
+                        assert_eq!(
+                            spine.head,
+                            pre_head + cut as usize,
+                            "tick {tick}: the cut is a head bump (retain {retain})"
+                        );
+                        assert!(
+                            spine.ledger.len() >= pre_len,
+                            "tick {tick}: nothing was removed (retain {retain})"
+                        );
+                        for (offset, id) in pre_physical.iter().enumerate() {
+                            assert_eq!(
+                                spine.ledger[offset].id, *id,
+                                "tick {tick}: physical index {offset} stable across the \
+                                 firing (retain {retain})"
+                            );
+                        }
+                        pure_bumps += 1;
+                    }
+                    // The amortized bound, cumulative at every firing.
+                    assert!(
+                        total_moves <= total_discarded,
+                        "tick {tick}: total moves {total_moves} ≤ total discards \
+                         {total_discarded} (retain {retain})"
+                    );
+                    // The capacity discriminator: after any firing
+                    // the buffer strictly exceeds the live tail (the
+                    // high-water survives the cuts — a fresh tight
+                    // vector per firing would have made them equal).
+                    assert!(
+                        spine.ledger.capacity() > spine.ledger_retained().len(),
+                        "the high-water capacity survives every firing (retain {retain})"
+                    );
                 }
             }
             let stats = spine.retention_stats();
-            assert_eq!(stats.last_chunk, CHUNK, "the chunk is constant");
-            assert_eq!(stats.max_chunk, CHUNK);
-            // The published cost table: per firing, `CHUNK` hashes +
-            // `retained` moves — the moves grow with the retained
-            // history at constant chunk (128-retain moves 200 per
-            // firing; 300-retain moves 400 per firing).
-            assert!(
-                moves.iter().all(|&retained_after| retained_after >= retain),
-                "every firing retains at least the verbatim window"
-            );
+            assert_eq!(stats.last_chunk, chunk, "the chunk is constant");
+            assert_eq!(stats.max_chunk, chunk);
             assert_eq!(
-                moves.len() as u64,
-                stats.compactions,
-                "one move-count sample per firing (retain {retain})"
+                stats.summarized_total, total_discarded,
+                "the discard accounting matches the cadence (retain {retain})"
             );
-            // The capacity discriminator: after the first firing the
-            // buffer is strictly larger than the retained tail (the
-            // high-water survives the cuts — split_off's fresh tight
-            // vector would have made them equal).
-            assert!(
-                spine.ledger.capacity() > spine.ledger_retained().len(),
-                "the in-place drain retains the high-water capacity (retain {retain})"
-            );
-            if retain == 300 {
-                // Bound 600: firings at ticks 7 and 10, each cutting
-                // one 300 chunk from 700 down to 400 retained.
-                assert_eq!(moves, vec![400, 400]);
+            // The published per-regime shape: retain 128 co-fires the
+            // amortized compact at every firing (chunk 300 > the
+            // 200-record live window — moves 200 per firing, still ≤
+            // the 300 discarded); retain 300's first firing is a pure
+            // bump and its second co-fires the compact (400 moves ≤
+            // 600 discards); the wide window bumps six times around
+            // its one compact (500 moves ≤ 700 discards).
+            if retain == 128 {
+                assert_eq!(firings, 3);
+                assert_eq!(pure_bumps, 0);
+                assert_eq!(total_moves, 600);
+            } else if retain == 300 {
+                assert_eq!(firings, 2);
+                assert_eq!(pure_bumps, 1);
+                assert_eq!(total_moves, 400);
             } else {
-                // Bound 428: firings at ticks 5, 8, and 11, each
-                // cutting one 300 chunk from 500 down to 200 retained.
-                assert_eq!(moves, vec![200, 200, 200]);
+                assert_eq!(firings, 7);
+                assert_eq!(pure_bumps, 6);
+                assert_eq!(total_moves, 500);
             }
+            assert!(
+                total_moves <= total_discarded,
+                "the amortized bound over the whole run (retain {retain})"
+            );
         }
+    }
+
+    /// THE DEAD-PREFIX ROUND TRIP (T07 §5.9): a live spine carrying a
+    /// dead prefix (`head > 0`, physical slack present — only ever
+    /// after a compaction, per the head invariant) and its restored
+    /// tight image encode IDENTICAL bytes (the `spine-history/2`
+    /// section encodes the live tail only; the dead prefix is pure
+    /// physical slack, never logical, never serialized), the restore
+    /// rebuilds TIGHT (`head == 0`, the physical length equal to the
+    /// live length), and every public observable — history kind,
+    /// compacted fingerprint, stats — agrees between the two storage
+    /// shapes of the same logical state.
+    #[test]
+    fn dead_prefix_round_trips_byte_identical_and_restores_tight() {
+        let mut spine = Spine::new(SustainedWorld, 100);
+        for i in 0..100u64 {
+            spine
+                .schedule(spec(5, Field::Near, 1, i))
+                .expect("schedule");
+        }
+        spine.set_retention_policy(policy(400, 100), eligibility());
+        spine.run_ticks(8);
+        // Firings at ticks 6, 7, and 8: head 300, live 500, physical
+        // 800 — the dead prefix present and the invariant holding.
+        assert_eq!(spine.retention_stats().compactions, 3);
+        assert_eq!(spine.head, 300);
+        assert_eq!(spine.ledger_retained().len(), 500);
+        assert_eq!(
+            spine.ledger.len(),
+            spine.ledger_retained().len() + spine.head,
+            "the physical buffer is the live tail plus the dead prefix"
+        );
+        assert!(
+            spine.compacted.is_some(),
+            "the head invariant: head > 0 implies compacted.is_some()"
+        );
+        let bytes = spine.save_bytes();
+        let restored: Spine<SustainedWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+        assert_eq!(
+            restored.save_bytes(),
+            bytes,
+            "the dead prefix never reaches the wire — the round trip is byte-identical"
+        );
+        assert_eq!(restored.head, 0, "the restore rebuilds tight");
+        assert_eq!(restored.ledger.len(), restored.ledger_retained().len());
+        assert_eq!(restored.ledger.len(), spine.ledger_retained().len());
+        assert_eq!(restored.history_kind(), spine.history_kind());
+        assert_eq!(
+            restored.compacted_fingerprint(),
+            spine.compacted_fingerprint(),
+            "the compacted domain hashes the live view — identical under both shapes"
+        );
+        assert_eq!(restored.stats(), spine.stats());
+        assert_eq!(restored.retention_policy(), None);
+    }
+
+    /// THE IN-MEMORY EXECUTION-RECORD STRIDE, ASSERTED (T07 §8's
+    /// mandated measurement — the design's ~40 B estimate corrected
+    /// by the measured actual, exactly as the obligation requires):
+    /// the default representation reorders fields to minimize
+    /// padding, giving 8 (seq) + 8 (intended due) + 8 (executed
+    /// tick) + 2 (class) + 1 (field) + 1 (schedule kind) + 1 (late)
+    /// and 1 trailing pad, totaling 32. This is the unit the
+    /// retention cost reasoning prices — the pre-T07 drain's
+    /// per-firing bytes moved (`retained × 32`), the resident-bytes
+    /// estimate (`records × 32` against the ~31 B wire record), and
+    /// the amortized compact's move bound.
+    #[test]
+    fn execution_record_stride_is_thirty_two_bytes() {
+        assert_eq!(
+            std::mem::size_of::<ExecutionRecord>(),
+            32,
+            "the documented in-memory stride — a move here is a cost-model change, \
+             never a silent one"
+        );
     }
 
     // ------------------------------- T07 retention-frontier tests (Class 2)
