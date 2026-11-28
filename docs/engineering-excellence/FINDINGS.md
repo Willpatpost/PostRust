@@ -70,6 +70,38 @@ corrected).
 | Q09 | CORE | **FIXED (measured NO-CHANGE)** | integrated `bce11d3` (lane `e4d5c38`) | the allocation census measured: the linear arms and the census warm path exactly zero (pinned), the mover arms 1 alloc/32 B against the 100-585x win, the adversarial rows honest with the DDA trigger; the scratch-handle trigger named at the Q04 adoption seam |
 | Q10 | REND | CONFIRMED (owner re-audit) | — | scene-attachment failure atomicity when resources attach but pipeline creation fails (the S6 ensure path's partial-failure surface) |
 | Q11 | DOCS | CONFIRMED (owner re-audit) | — | the program README, package DAG, and finding register vs the actual tree — one authoritative current-status representation |
+### The Codex full-engine audit (2026-11-28, at `95408c9` — `docs/engineering-excellence/audits/full-95408c9/`)
+
+An additional independent audit (23 findings, two executable witnesses). The four
+highest-impact claims were verified by direct reproduction before acceptance
+(CA-04 both halves, CA-16, CA-05, CA-06); the remainder are registered
+audit-claimed with verification-first mandated in each fix lane's brief.
+
+| ID | Area | State | Note |
+|---|---|---|---|
+| CA-01 (F01) | REND | REGISTERED (audit-claimed) | scene-attach failure atomicity — resources installed before pipelines, handle published after, a pipeline error leaves no-scene + retry-refused (Q10's precise shape) |
+| CA-02 (F02) | CORE | REGISTERED (audit-claimed) | npc-world decode resource admission — valid wire ranges vs affordable decoder work are different contracts; caller-configurable limits + checked reservation (Q07's precise shape) |
+| CA-03 (F03) | CORE | REGISTERED (audit-claimed) | scheduler housekeeping — a blocked move charging one while registering multiple dependency edges; the bounded-work contract (Q03/B01's precise shape) |
+| CA-04 (F04) | CI | **FIXED (verified before fix, `3311fd9`)** | the main result-line check 33 vs the tree's 34 + the heavy expected=674 glued into a comment (Linux comparing 674 actual against the stale 549) — both corrected |
+| CA-05 (F05) | CORE | **CONFIRMED (witness reproduced, exit 101)** | RotatedCollider's public mutable fields vs private cached bounds — a legal field edit leaves the cached frame/world AABB stale; the translated box misses what the rebuilt box hits |
+| CA-06 (F06) | CORE | **CONFIRMED (witness reproduced, exit 101)** | the v2 section's in-memory validate() never inspects active positions while restore does — (4,0) passes validation and fails its own round-trip |
+| CA-07 (F07) | CORE | REGISTERED (audit-claimed) | compaction's consequence eligibility is caller-established only; the retained-tail copy cost during compaction unmeasured (Q05's precise shape) |
+| CA-08 (F08) | CORE | REGISTERED (audit-claimed) | regional transitions still scan the whole queue (A08's precise shape) |
+| CA-09 (F09) | CORE/SLICE | REGISTERED (audit-claimed) | the indexed query APIs' production adoption boundary (Q04's precise shape — the combat_demo linear caller named) |
+| CA-10 (F10) | REND | REGISTERED (audit-claimed) | post-acquire errors can strand a frame slot — the fence reset before the fallible upload/record/submit chain |
+| CA-11 (F11) | REND | REGISTERED (audit-claimed) | all three arena growth paths can lose newly allocated handles on a failed idle wait (R1's growth paths' failure atomicity) |
+| CA-12 (F12) | REND | REGISTERED (audit-claimed) | config usize budgets vs u32 device carving — representability unvalidated across the boundary |
+| CA-13 (F13) | REND | REGISTERED (audit-claimed) | device loss flattened at the public boundary (A14 — the audit corrects the "every Vulkan outcome" overclaim: out-of-date IS typed) |
+| CA-14 (F14) | REND | REGISTERED (audit-claimed) | the public scene contract still encodes the first pass family's asset dimensions (Q06's precise shape) |
+| CA-15 (F15) | REND | REGISTERED (audit-claimed) | triangle-list boundary misalignment between passes not checked at admission |
+| CA-16 (F16) | PERSIST/CI | **FIXED (verified before fix, `3311fd9`)** | the crash-seam facade regression from the L9 split — the exact CI heavy command E0432; the two names restored |
+| CA-17 (F17) | PERSIST | REGISTERED (audit-claimed) | confirmed identity storage grows with history despite the watermark (Q08's precise shape) |
+| CA-18 (F18) | SLICE/PERSIST | REGISTERED (audit-claimed) | backup materializes the whole journal twice (capture + verification) — the streaming reader didn't remove this consumer |
+| CA-19 (F19) | PERSIST | REGISTERED (audit-claimed) | SQLite backup's two path representations (lossy VACUUM INTO vs native open) |
+| CA-20 (F20) | SLICE | REGISTERED (audit-claimed) | backup's durability tier — the destination-directory sync failure ignored |
+| CA-21 (F21) | SHELL | REGISTERED (audit-claimed) | the audio ring's producer lock work unbounded in caller batch length |
+| CA-22 (F22) | SHELL | REGISTERED (audit-claimed) | the legacy cue stream lacks the mixer's backpressure (NEW-SHELL-1/3) |
+| CA-23 (F23) | SHELL | REGISTERED (audit-claimed) | scancode-only repeats increment the snapshot before the keycode check vs the doc's "silently dropped" |
 ## The Sol re-audit (2026-11-27, the continuation mandate at `8d34771`)
 
 **NOT complete — final integration NOT authorized.** Scores: cleanliness 7.4,
