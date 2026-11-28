@@ -403,3 +403,12 @@ source; the stage-2 mechanics (streaming verified reads + borrow-not-clone)
 removing classes 2+3 with no format change; the authenticated prefix summary
 designed to the field level and PARKED as DECISION-T29-prefix-summary (five
 points, nothing decided). Implementation dispatched for commits 1–2.
+
+## The T09 design landed (`eb5e668`)
+
+The dual-representation indexed lane (Plain/Keyed enum adopting at the
+class-index materialization instant — pins held by construction), the
+tombstone rejection on the value-carrying-relocation finding (verified at
+region.rs:1037), per-class heaps strictly dominated, the keyed-lane
+contingency parked. Measure-first: stage 1's census + workload warrant
+decides implement-vs-park honestly. Stage-1 lane dispatched.
