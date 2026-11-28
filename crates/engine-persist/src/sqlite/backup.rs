@@ -81,6 +81,27 @@ impl SqliteMedium {
         self.conn
             .backup("main", target, None)
             .map_err(|e| sqlite_err("backup the capture", e))?;
+        // (CA-20) The capture's own artifact flush: the pages are
+        // SQLite's writes into a fresh file — flush them explicitly
+        // so the capture function's contract is "a complete,
+        // flushed file", never "bytes the pager may still hold"
+        // (whatever SQLite's own sync discipline did, this is
+        // provable from the caller).
+        {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(target)
+                .map_err(|e| MediumError::Io {
+                    op: "flush the capture",
+                    path: target.display().to_string(),
+                    source: e,
+                })?;
+            file.sync_all().map_err(|e| MediumError::Io {
+                op: "flush the capture",
+                path: target.display().to_string(),
+                source: e,
+            })?;
+        }
         // The captured file must carry the medium's own persistent
         // journal mode: the page copy carries the source's WAL header,
         // and the read-only audit open verifies WAL (never sets it).
