@@ -9,8 +9,8 @@
 use std::time::{Duration, Instant};
 
 use engine_shell::{
-    DriverPreference, Keycode, Level, LoopControl, MouseButton, RunSummary, ShellApp, ShellConfig,
-    resident_set_kib,
+    DriverPreference, IntervalRetention, Keycode, Level, LoopControl, MouseButton, RunSummary,
+    ShellApp, ShellConfig, resident_set_kib,
 };
 
 /// Runs the Stage 1 shell window. With `dummy`, uses SDL's dummy driver
@@ -113,6 +113,19 @@ pub fn run_soak(seconds: u64, real: bool) -> Result<(), String> {
         driver,
     };
     let mut app = ShellApp::new(config)?;
+    // R05, the exact-benchmark separation: the soak is a MEASUREMENT
+    // route — its p50/p95/p99 are benchmark reports, which must be
+    // whole-run exact percentiles (the measurement discipline: exact
+    // sample percentile estimates for benchmark reports), so this run
+    // opts into exact interval retention — the shell's documented
+    // escape hatch. The default bounded window would report the most
+    // recent ~68 s only (capacity 4096 at 60 fps). The soak is
+    // duration-bounded, so the exact retention's per-frame growth is
+    // bounded with it; the interactive window demo above deliberately
+    // KEEPS the bounded default (it is exactly the long-lived run the
+    // bound protects, and its exit summary labels the sample's
+    // provenance instead of misreporting it).
+    app.set_interval_retention(IntervalRetention::Exact);
     println!(
         "soak: application loop for {seconds}s ({} driver), 60 fps target ...",
         if real { "real" } else { "dummy" }
@@ -162,6 +175,25 @@ fn print_summary(summary: &RunSummary) {
         stats.max_ms,
         summary.quit_reason
     );
+    // R05 statistics honesty: the percentile provenance is printed WITH
+    // the numbers — a bounded window's percentiles never silently pass
+    // themselves off as whole-run figures (count/avg/max are whole-run
+    // exact in every mode; only the percentiles follow the retention).
+    let sample = summary.interval_sample;
+    match sample.capacity {
+        Some(capacity) => println!(
+            "intervals: bounded most-recent window — capacity {}, retained {} of {} \
+             frames ({} dropped): p50/p95/p99 are over the window",
+            capacity.get(),
+            sample.retained,
+            summary.frames,
+            sample.dropped_total
+        ),
+        None => println!(
+            "intervals: exact whole-run retention — {} samples",
+            sample.retained
+        ),
+    }
     if let (Some(start), Some(end)) = (summary.rss_start_kib, summary.rss_end_kib) {
         println!(
             "resident memory: {start} KiB -> {end} KiB ({:+} KiB)",
