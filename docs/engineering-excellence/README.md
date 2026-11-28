@@ -139,8 +139,8 @@ references in older records describe the baseline tree, not this one.
    beyond), Q07 (configurable npc-world decode admission), Q08 (proportional
    active working sets + authenticated cold historical retrieval), Q10
    (scene-attach failure atomicity).
-4. The renderer admission invariants R01+R02 and the timing pair R03+R04 —
-   CONFIRMED majors from the Sol re-audit, no lane ever dispatched (the
+4. R01-R04 LANDED long ago (the admission invariants `343824b`/`3a426b9`, the accumulator and presentation coherence `0462cfe`/`bb38504`) - the Q11 lane mis-diagnosed these as never-dispatched (the register rows carried stale pre-landing dispositions); the git history corrected it, the rows now carry their SHAs.
+
    earlier "RUNNING" claim here was wrong; queued).
 5. Retained obligations: A08's regional scheduler locality, R07 (the memory
    transaction lifecycle consolidation investigation), B08 (input churn,
