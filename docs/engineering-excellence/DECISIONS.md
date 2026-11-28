@@ -68,3 +68,42 @@ record; this is the register摘要 with the operative clauses):
    locality, R07, B08/B13, and the coverage/performance obligations
    retained. Continue autonomously past the queued P5 lanes; every
    category ≥9/10; stop only at the final owner integration gate.
+
+## D-EE-11 — the overnight-review owner rulings (2026-11-29, at `2639ec2`)
+
+The independent reviewer accepted the overnight progress (provisional scores
+8.1/8.6/7.9/8.0/8.5/8.8/8.1/7.8 — not closure) and ruled on the four pending
+decisions. Verbatim effect (the directive is the authority; this is the
+register digest):
+
+1. **T29 prefix-summary — CONDITIONALLY APPROVED**: investigation,
+   implementation and comparative testing authorized; NOT an unconditional
+   replacement of per-open historical integrity with publication-time
+   verification; the experimental path opt-in while trust properties are
+   established; conservative cursor reconstruction first, compact
+   representations via comparative evidence; exact authority/confirmation/
+   survivor-walk/reclaim semantics preserved; the fault matrix proven
+   (missing/corrupted objects, corrupted/stale/interrupted summaries,
+   provider disagreement); "a valid summary is not proof that all historical
+   underlying bytes remain readable"; the contradictory cold-open
+   measurements reconciled before architectural use.
+2. **T09 indexed queued-transition — APPROVED**: the dual-representation
+   indexed-lane implementation proceeds (not permanently parked on the
+   current director's population — PostRust targets future compositions);
+   the heap's hot-path properties preserved; deterministic ordering,
+   save/restore equivalence, allocation evidence, comparative performance
+   small→genuinely-large; the BTreeMap keyed-lane NOT automatically approved
+   (contingency requiring comparative justification).
+3. **T13/CA-17 stage 2 eviction — APPROVED**: proceed NOW with the
+   rotation-authored ledger and bounded hot cache; ODU-measured provisional
+   thresholds clearly labeled configurable pending rig calibration; the
+   absence of rig census not blocking; authenticated membership, canonical
+   recovery, exact idempotency, old-save compatibility, consequence
+   authority preserved; no false confirmation, duplicate consequence, unsafe
+   reclamation, unbounded cold-miss; **T14 developed in coordination** (the
+   cold path becomes load-bearing).
+4. **T08 measurement/calibration — APPROVED**: the sustained and adversarial
+   matrix on ODU now; D/F/K and the 1.5× provisional, not permanent;
+   configurability + typed observable admission retained; mandatory
+   consequence-bearing gameplay events never discarded for a performance
+   budget.

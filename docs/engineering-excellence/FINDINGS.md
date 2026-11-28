@@ -153,6 +153,17 @@ Classes: CONFIRMED (source-derived), HYPOTHESIS (reproduce-or-refute mandated), 
 | T38 | CONFIRMED (recurred) | Q11/B16 | **RECONCILIATION PASS LANDED 2026-11-28** (`ee/overnight-t38-register`): the six stale RUNNING rows (registry + README + FINDINGS: p5-r1/r4, l9b, sdl-pin, q01-q02-q09, q11, ca05/ca06, ca09, the A06 ratification tail, the CI pins block) corrected against the actual git history; the durable maintenance obligation (every landing updates register + README together) restated below the README's authoritative-status header |
 | T39 | CONFIRMED (S0-gating) | B10 | exact-tree workload-matched measurement methodology |
 | T40 | OBLIGATION (open) | B16 | whole-source coverage + threat/usage ledger |
+### The overnight-review corrective findings (2026-11-29, at `2639ec2` — R1–R6, confirm-or-refute with witnesses)
+
+| ID | Linked | State | Note |
+|---|---|---|---|
+| R1 | T05 | REGISTERED | the pointer-derived source token admitting allocator address-recycling collisions (lifetime-scoped identity required); the submission.rs ordering (instance generation updated through repacking BEFORE the pose-index admission check) — the regression witness: invalid changed instance population, unchanged pose source/generation, initial refusal, identical retry; an unsuccessful admission must not establish a reusable validated generation |
+| R2 | T07 | REGISTERED | acknowledgments beyond executed history; ordinary explicit compaction bypassing the consumer frontier; incomplete consumer registration; authenticated consumer progress vs arbitrary numeric acks; safe compaction vs explicitly authorized administrative operations |
+| R3 | T08 | REGISTERED | the follow-up cap cropping excess events and publishing telemetry AFTER handler execution — can mandatory consequences be lost following a world mutation? The typed admission/transactional reservation/deterministic deferral contract; the restored legacy graph exception and runtime-bound changes — no universal work-ceiling claims while admitted existing graphs can exceed them |
+| R4 | T04 | REGISTERED | complete triangles necessary but not always sufficient — explicit engine-owned admission units and batch/object atomicity so callers don't independently prevent partial authored geometry |
+| R5 | T21 | REGISTERED | the 64-byte-granularity accounting a reservation estimate not a universal allocator bound; the actual production save/session restore paths traced; finite aggregate admission budgets where external/untrusted input enters; wire compatibility without conflating compatibility limits with affordable execution limits |
+| R6 | T39 | REGISTERED | the CI timing-threshold corrections reviewed collectively; deterministic work counts/allocation censuses/complexity witnesses preferred for algorithmic CI gates; precise latency reserved for repeated controlled measurements; no progressive relaxation of regression discrimination for runner variability |
+
 ## The Sol re-audit (2026-11-27, the continuation mandate at `8d34771`)
 
 **NOT complete — final integration NOT authorized.** Scores: cleanliness 7.4,
