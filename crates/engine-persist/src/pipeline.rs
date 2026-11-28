@@ -922,6 +922,40 @@ pub struct RetentionStats {
     /// bounded by anything today (the watermark bounds WORK, not
     /// residency).
     pub shed_residency_bytes: u64,
+    /// (R07) The authority's tracked-key map's ESTIMATED resident
+    /// bytes — the per-identity phase bookkeeping: per entry, the
+    /// fixed `KeyStatus` fields, the `ConsequenceId` key, and the
+    /// map's amortized per-entry node share (the CA-17 formula
+    /// discipline). Linear in the generation's journaled identities
+    /// at fixed live obligations; bounded generationally by the
+    /// rotation's retirement (the reopened authority reseeds from the
+    /// smaller journal).
+    pub tracked_residency_bytes: u64,
+    /// (R07) The staged accrual's ESTIMATED resident bytes — per
+    /// staged envelope, the fixed struct plus the sub-span and
+    /// dependency heap. Boundary-scoped (drained by the capture; a
+    /// crash loses it honestly — P0-5): bounded by one capture
+    /// boundary's batch, never by history.
+    pub staged_residency_bytes: u64,
+    /// (R07) The retained unresolved canonical attempt's ESTIMATED
+    /// resident bytes — the pending slot's single retained copy (the
+    /// revision record with its idempotency-key/content-ref/
+    /// dependency heap, the batch content identity, the per-key
+    /// evidence with the coverage heap, and the frozen ticks).
+    /// Attempt-scoped: ZERO whenever no attempt is retained (the
+    /// P3-L3 single-copy shape — at most one live attempt exists).
+    pub pending_residency_bytes: u64,
+    /// (R07) The journal's decoded committed history's ESTIMATED
+    /// resident bytes — the in-memory T1 state the session holds:
+    /// per committed transaction, the fixed skeleton, the COMPLETE
+    /// envelopes (fixed struct + sub-span and dependency heap), the
+    /// plan, the frontier, and the dependency heap; per cancellation,
+    /// the record and its detail; plus the committed-index,
+    /// canceled-id, and session-acknowledgment lookups (the formula
+    /// lives at [`T1Journal::decoded_residency_bytes`]). Linear in
+    /// the generation's committed transactions; bounded
+    /// generationally by the rotation.
+    pub journal_residency_bytes: u64,
 }
 
 impl RetentionStats {
@@ -1266,6 +1300,41 @@ impl CommitAuthority {
         ticks
     }
 
+    /// (R07) The tracked-key map's estimated resident bytes — the
+    /// CA-17 formula discipline: per entry, the `KeyStatus` fixed
+    /// fields, the `ConsequenceId` key, and the map's amortized
+    /// per-entry node share. An ESTIMATE (std's exact node occupancy
+    /// is its own business); the structural claim — linear in the
+    /// generation's journaled identities at fixed live obligations —
+    /// is pinned by the residency module's R07 census test.
+    pub(crate) fn tracked_residency_bytes(&self) -> u64 {
+        const BTREE_ENTRY_OVERHEAD: u64 = 48;
+        (std::mem::size_of::<ConsequenceId>() as u64
+            + std::mem::size_of::<KeyStatus>() as u64
+            + BTREE_ENTRY_OVERHEAD)
+            * self.keys.len() as u64
+    }
+
+    /// (R07) The staged accrual's estimated resident bytes — per
+    /// staged envelope, the fixed struct plus the sub-span and
+    /// dependency heap (the same formula discipline). The
+    /// boundary-scoped surface: a crash loses it honestly (P0-5), so
+    /// it is bounded by one capture boundary's batch, never by
+    /// history.
+    pub(crate) fn staged_residency_bytes(&self) -> u64 {
+        let fixed = std::mem::size_of::<ConsequenceEnvelope>() as u64;
+        let span = std::mem::size_of::<ClassifiedSpan>() as u64;
+        let id = std::mem::size_of::<ConsequenceId>() as u64;
+        self.staged
+            .iter()
+            .map(|envelope| {
+                fixed
+                    + envelope.sub_spans.capacity() as u64 * span
+                    + envelope.dependencies.capacity() as u64 * id
+            })
+            .sum()
+    }
+
     /// Promotes every tracked key the view holds confirmed evidence
     /// for — today's walk-closing promotion loop, run by the facade
     /// exactly when a walk completed (idempotent; the entry's
@@ -1573,6 +1642,43 @@ impl<M: CanonicalMedium> CommitVerifier<M> {
         const HASHSET_ENTRY_OVERHEAD: u64 = 32;
         (std::mem::size_of::<ConsequenceId>() as u64 + HASHSET_ENTRY_OVERHEAD)
             * self.shed_coverage.len() as u64
+    }
+
+    /// (R07) The retained unresolved canonical attempt's estimated
+    /// resident bytes — the pending slot's single retained copy (the
+    /// P3-L3 write-at-uncertainty-or-acceptance shape): the revision
+    /// record (with its idempotency-key, content-ref, and dependency
+    /// heap), the batch content identity, the per-key evidence (the
+    /// identity, the tuple's fixed fields, the map's node share, and
+    /// the coverage heap), and the frozen per-transaction ticks.
+    /// Attempt-scoped by construction: ZERO whenever no attempt is
+    /// retained, and at most ONE live attempt exists.
+    pub(crate) fn pending_residency_bytes(&self) -> u64 {
+        const BTREE_ENTRY_OVERHEAD: u64 = 48;
+        let Some(attempt) = &self.pending else {
+            return 0;
+        };
+        let mut total = std::mem::size_of::<RevisionRecord>() as u64
+            + Hash::WIDTH
+            + attempt
+                .record
+                .idempotency_key
+                .as_ref()
+                .map_or(0, |key| key.capacity() as u64)
+            + attempt.record.content_refs.capacity() as u64 * Hash::WIDTH
+            + attempt.record.depends_on.capacity() as u64 * Hash::WIDTH;
+        let span = std::mem::size_of::<ClassifiedSpan>() as u64;
+        for (coverage, _, _) in attempt.keys.values() {
+            total += std::mem::size_of::<ConsequenceId>() as u64
+                + std::mem::size_of::<AttemptedKey>() as u64
+                + BTREE_ENTRY_OVERHEAD
+                + coverage.capacity() as u64 * span;
+        }
+        total += (std::mem::size_of::<TransactionId>() as u64
+            + std::mem::size_of::<u64>() as u64
+            + BTREE_ENTRY_OVERHEAD)
+            * attempt.ticks.len() as u64;
+        total
     }
 
     /// What `Accepted` establishes on this medium.
@@ -2381,6 +2487,10 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
             exceeds_rotation_cadence: journal_transactions >= ROTATION_CADENCE_TRANSACTIONS,
             confirmed_residency_bytes: self.verifier.confirmed_residency_bytes(),
             shed_residency_bytes: self.verifier.shed_residency_bytes(),
+            tracked_residency_bytes: self.authority.tracked_residency_bytes(),
+            staged_residency_bytes: self.authority.staged_residency_bytes(),
+            pending_residency_bytes: self.verifier.pending_residency_bytes(),
+            journal_residency_bytes: self.authority.journal().decoded_residency_bytes(),
         }
     }
 
