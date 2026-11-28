@@ -99,9 +99,9 @@ audit-claimed with verification-first mandated in each fix lane's brief.
 | CA-18 (F18) | SLICE/PERSIST | REGISTERED (audit-claimed) | backup materializes the whole journal twice (capture + verification) — the streaming reader didn't remove this consumer |
 | CA-19 (F19) | PERSIST | REGISTERED (audit-claimed) | SQLite backup's two path representations (lossy VACUUM INTO vs native open) |
 | CA-20 (F20) | SLICE | REGISTERED (audit-claimed) | backup's durability tier — the destination-directory sync failure ignored |
-| CA-21 (F21) | SHELL | REGISTERED (audit-claimed) | the audio ring's producer lock work unbounded in caller batch length |
-| CA-22 (F22) | SHELL | REGISTERED (audit-claimed) | the legacy cue stream lacks the mixer's backpressure (NEW-SHELL-1/3) |
-| CA-23 (F23) | SHELL | REGISTERED (audit-claimed) | scancode-only repeats increment the snapshot before the keycode check vs the doc's "silently dropped" |
+| CA-21 | SHELL | **FIXED-AWAITING-RE-AUDIT** | integrated `42ff2a1` (lane `ce2dab5`) | the producer lock bounded (the A25 mirror; red demonstrated); the admitted set, FIFO, pairing, refused total provably identical |
+| CA-22 | SHELL | **FIXED-AWAITING-RE-AUDIT** | integrated `42ff2a1` (lane `ce2dab5`) | the cue backpressure (the explicit budget + refusal telemetry; the mixer-voice routing left as the owner NEW-SHELL-3 consolidation); the 800-push burst refusing 687 fail-visibly |
+| CA-23 | SHELL | **FIXED-AWAITING-RE-AUDIT** | integrated `42ff2a1` (lane `ce2dab5`) | repeats a mapped-key count (the intent contract); red demonstrated |
 ## The Sol re-audit (2026-11-27, the continuation mandate at `8d34771`)
 
 **NOT complete — final integration NOT authorized.** Scores: cleanliness 7.4,
