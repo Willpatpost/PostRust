@@ -503,13 +503,15 @@ pub struct Renderer {
     /// calls, losslessly), so the CPU typed-refusal boundary and
     /// the device carve ceiling are the same number by construction.
     arena_budgets: ArenaBudgets,
-    /// CA-13 (F13/A14): the device-loss latch. `None` until the
-    /// first [`crate::RendererError::DeviceLost`] leaves a
-    /// device-touching entry; from then on every public
-    /// frame/attach/capture entry refuses with the typed variant
-    /// WITHOUT touching the dead device (repeated submissions on a
-    /// lost device are prevented, not retried).
-    device_lost: vulkan::DeviceLossLatch,
+    /// T06 (strict audit IV, §4.1): the renderer's LIFECYCLE state —
+    /// CA-13's device-loss latch absorbed as the `DeviceLost` state
+    /// (first observation wins, stable operation context, `refusal`
+    /// delegating — the landed behavior preserved exactly) plus the
+    /// NEW terminality: ANY `FrameSlotUnrecoverable` (ordinary
+    /// source included) and the §4.3 stuck-fence class POISON, every
+    /// device-touching entry refusing with the typed reason. See
+    /// [`vulkan::RendererLifecycle`].
+    lifecycle: vulkan::RendererLifecycle,
 }
 
 /// The Era-1 sky layer's frame description (the per-frame
@@ -778,7 +780,7 @@ impl Renderer {
             proxy_draw_mode: ProxyDrawMode::default(),
             ripple_debug: RippleDebugMode::Off,
             arena_budgets,
-            device_lost: vulkan::DeviceLossLatch::default(),
+            lifecycle: vulkan::RendererLifecycle::new(),
         })
     }
 
@@ -830,7 +832,7 @@ impl Renderer {
         // loss refuses without touching the dead device
         // (`render_frame` delegates here, so this gate covers both
         // entries).
-        if let Some(refusal) = self.device_lost.refusal() {
+        if let Some(refusal) = self.lifecycle.refusal() {
             return Err(refusal);
         }
         // The F-05 overlay-vertex reuse (the audit's measured
@@ -885,14 +887,21 @@ impl Renderer {
             &frame,
         ) {
             Ok(outcome) => outcome,
-            // CA-13 (F13/A14): the error passes the latch on its way
-            // out — a device loss (or a terminal slot failure whose
-            // SOURCE is one) latches for every later entry.
+            // CA-13 (F13/A14) + T06: the error passes the lifecycle
+            // on its way out — a device loss latches for every later
+            // entry, and a terminal slot failure or a §4.3 stuck
+            // fence POISONS it (every later device-touching entry
+            // refused with the typed reason).
             Err(error) => {
-                self.device_lost.observe(&error);
+                self.lifecycle.note_recreate(self.frames.needs_recreate);
+                self.lifecycle.observe(&error);
                 return Err(error);
             }
         };
+        // T06 §4.1: the deferred-recreation intent mirrored into the
+        // lifecycle (internal-only, NOT an error state — the next
+        // proceeding frame's recreation block consumes it).
+        self.lifecycle.note_recreate(self.frames.needs_recreate);
         Ok(self.finish_frame(outcome))
     }
 
@@ -931,7 +940,7 @@ impl Renderer {
         // CA-13 (F13/A14): the device-loss entry gate — attach is a
         // device-touching entry (uploads, pipeline creation); a
         // latched loss refuses without touching the dead device.
-        if let Some(refusal) = self.device_lost.refusal() {
+        if let Some(refusal) = self.lifecycle.refusal() {
             return Err(refusal);
         }
         // CA-01 (attach atomicity): the attach is a STAGED
@@ -954,7 +963,7 @@ impl Renderer {
             // CA-13: the loss latches on its way out (the uploads
             // inside the attach are device work).
             Err(error) => {
-                self.device_lost.observe(&error);
+                self.lifecycle.observe(&error);
                 return Err(error);
             }
         };
@@ -978,7 +987,7 @@ impl Renderer {
             self.ctx.release_staged_scene_resources();
             // CA-13: the pipeline creation is device work — the loss
             // latches here too.
-            self.device_lost.observe(&error);
+            self.lifecycle.observe(&error);
             return Err(error);
         }
         // Full success — publish the retained facts and the handle
@@ -1004,7 +1013,7 @@ impl Renderer {
         if let Err(error) = self.ctx.drain_staging() {
             // CA-13: the drain is device work — a device loss latches
             // on its way out like every other device-touching step.
-            self.device_lost.observe(&error);
+            self.lifecycle.observe(&error);
             return Err(error);
         }
         Ok(handle)
@@ -1047,7 +1056,7 @@ impl Renderer {
         // CA-13 (F13/A14): the device-loss entry gate — a latched
         // loss refuses without touching the dead device (repeated
         // submissions on a lost device are prevented, not retried).
-        if let Some(refusal) = self.device_lost.refusal() {
+        if let Some(refusal) = self.lifecycle.refusal() {
             return Err(refusal);
         }
         // Scene/attach coherence (the design's §3.3 order step 1):
@@ -1153,14 +1162,21 @@ impl Renderer {
             &frame,
         ) {
             Ok(outcome) => outcome,
-            // CA-13 (F13/A14): the error passes the latch on its way
-            // out — a device loss (or a terminal slot failure whose
-            // SOURCE is one) latches for every later entry.
+            // CA-13 (F13/A14) + T06: the error passes the lifecycle
+            // on its way out — a device loss latches for every later
+            // entry, and a terminal slot failure or a §4.3 stuck
+            // fence POISONS it (every later device-touching entry
+            // refused with the typed reason).
             Err(error) => {
-                self.device_lost.observe(&error);
+                self.lifecycle.note_recreate(self.frames.needs_recreate);
+                self.lifecycle.observe(&error);
                 return Err(error);
             }
         };
+        // T06 §4.1: the deferred-recreation intent mirrored into the
+        // lifecycle (internal-only, NOT an error state — the next
+        // proceeding frame's recreation block consumes it).
+        self.lifecycle.note_recreate(self.frames.needs_recreate);
         Ok(self.finish_frame(outcome))
     }
 
@@ -1199,7 +1215,7 @@ impl Renderer {
     pub fn request_shadow_map_capture(&mut self) -> Result<(), RendererError> {
         // CA-13 (F13/A14): the device-loss entry gate — the shadow
         // state's lazy ensure is device work.
-        if let Some(refusal) = self.device_lost.refusal() {
+        if let Some(refusal) = self.lifecycle.refusal() {
             return Err(refusal);
         }
         if self.pipes.shadows.is_none() {
@@ -1211,7 +1227,7 @@ impl Renderer {
                 ));
             }
             if let Err(error) = self.pipes.ensure_shadow_resources(&self.ctx) {
-                self.device_lost.observe(&error);
+                self.lifecycle.observe(&error);
                 return Err(error);
             }
         }
@@ -1228,14 +1244,14 @@ impl Renderer {
     pub fn take_shadow_map_capture(&mut self) -> Result<Option<ShadowMapReadback>, RendererError> {
         // CA-13 (F13/A14): the device-loss entry gate — the readback
         // fence wait is device work.
-        if let Some(refusal) = self.device_lost.refusal() {
+        if let Some(refusal) = self.lifecycle.refusal() {
             return Err(refusal);
         }
         let depths =
             match vulkan::take_shadow_readback(&self.ctx, &mut self.pipes, &mut self.frames) {
                 Ok(depths) => depths,
                 Err(error) => {
-                    self.device_lost.observe(&error);
+                    self.lifecycle.observe(&error);
                     return Err(error);
                 }
             };
@@ -1455,7 +1471,7 @@ impl Renderer {
         // CA-13 (F13/A14): the device-loss entry gate — a capture on
         // a latched-dead renderer can never complete; refuse without
         // touching the device.
-        if let Some(refusal) = self.device_lost.refusal() {
+        if let Some(refusal) = self.lifecycle.refusal() {
             return Err(refusal);
         }
         vulkan::request_capture(&mut self.frames)
@@ -1469,13 +1485,13 @@ impl Renderer {
     pub fn take_frame_capture(&mut self) -> Result<Option<CapturedFrame>, RendererError> {
         // CA-13 (F13/A14): the device-loss entry gate — the fence
         // wait is device work on a dead device.
-        if let Some(refusal) = self.device_lost.refusal() {
+        if let Some(refusal) = self.lifecycle.refusal() {
             return Err(refusal);
         }
         match vulkan::take_capture(&self.ctx, &mut self.frames) {
             Ok(capture) => Ok(capture),
             Err(error) => {
-                self.device_lost.observe(&error);
+                self.lifecycle.observe(&error);
                 Err(error)
             }
         }
@@ -1500,7 +1516,19 @@ impl Renderer {
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        vulkan::device_idle(&self.ctx).ok();
+        // T06 §4.2 — observe-on-every-exit, DISPOSALS INCLUDED: the
+        // pre-teardown idle's result is no longer discarded
+        // (`.ok()`): the lifecycle enters `Destroying` and a loss
+        // observed at the idle is recorded through the same
+        // classification (nothing further is refused — drop must
+        // complete — and the destroy sequence below proceeds on the
+        // loss-abandon semantics: after `ERROR_DEVICE_LOST` the
+        // `vkDestroy*`/`vkFree*` calls remain the spec's supported
+        // teardown path).
+        self.lifecycle.begin_destroy();
+        if let Err(error) = vulkan::device_idle(&self.ctx) {
+            self.lifecycle.observe(&error);
+        }
         self.frames.destroy(&self.ctx);
         // Framebuffers before the render pass they reference.
         self.swapchain.destroy(&self.ctx);

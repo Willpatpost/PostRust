@@ -324,14 +324,59 @@ impl StagingPool {
                     self.watermark = entry.end;
                 }
                 Err(vk::Result::TIMEOUT) => {
-                    return Err(RendererError::Vulkan(format!(
-                        "staging drain: fence wait timed out after {} ns \
-                         (a stuck upload submission — {} bound bytes stay \
-                         unretired; constructing a fresh renderer is the \
-                         supported path)",
-                        super::WAIT_TIMEOUT_NS,
-                        self.bound_region_bytes()
-                    )));
+                    // T06 §4.3 (the pool class): the timeout is
+                    // classified through ONE `get_fence_status`
+                    // before the submission is called stuck — a loss
+                    // masquerading as a timeout surfaces as the
+                    // TYPED loss (the audit's T16 demand), and a
+                    // fence that signaled between the wait and the
+                    // poll retires normally (never a false stuck
+                    // report). The genuinely-stuck arm keeps the
+                    // typed staging-timeout shape (§5.4: the honest
+                    // state — the regions stay bound), unchanged.
+                    // SAFETY: the fence is owned by the entry.
+                    let polled = unsafe { ctx.device.get_fence_status(entry.fence) };
+                    match super::classify_fence_timeout(polled) {
+                        super::FenceTimeoutClass::Signaled => {
+                            ctx.record_upload_wait(wait_started.elapsed());
+                            self.in_flight.pop_front();
+                            debug_assert_eq!(
+                                entry.start, self.watermark,
+                                "the drain retires in bump order"
+                            );
+                            // SAFETY: the poll proved the fence
+                            // signaled — the command buffer is not
+                            // pending; each handle owned exactly once.
+                            unsafe {
+                                ctx.device.destroy_fence(entry.fence, None);
+                                ctx.device
+                                    .free_command_buffers(self.command_pool, &[entry.command]);
+                            }
+                            self.watermark = entry.end;
+                        }
+                        super::FenceTimeoutClass::Stuck => {
+                            return Err(RendererError::Vulkan(format!(
+                                "staging drain: fence wait timed out after {} ns \
+                                 (a stuck upload submission — {} bound bytes stay \
+                                 unretired; constructing a fresh renderer is the \
+                                 supported path)",
+                                super::WAIT_TIMEOUT_NS,
+                                self.bound_region_bytes()
+                            )));
+                        }
+                        super::FenceTimeoutClass::DeviceLost => {
+                            return Err(RendererError::DeviceLost {
+                                operation: "get_fence_status (staging drain, after wait timeout)"
+                                    .into(),
+                            });
+                        }
+                        super::FenceTimeoutClass::PollError(error) => {
+                            return Err(RendererError::vk(
+                                error,
+                                "get_fence_status (staging drain)",
+                            ));
+                        }
+                    };
                 }
                 Err(error) => return Err(RendererError::vk(error, "staging drain")),
             }
@@ -700,12 +745,47 @@ impl<'a> StagingBatch<'a> {
                         pool.retire_signaled(self.ctx);
                         Ok(())
                     }
-                    Err(vk::Result::TIMEOUT) => Err(RendererError::Vulkan(format!(
-                        "staging upload: fence wait timed out after {} ns \
-                         (a stuck upload submission; constructing a fresh \
-                         renderer is the supported path)",
-                        super::WAIT_TIMEOUT_NS
-                    ))),
+                    Err(vk::Result::TIMEOUT) => {
+                        // T06 §4.3 (the pool class, the InlineWait
+                        // site): ONE `get_fence_status` classifies
+                        // the timeout before the submission is
+                        // called stuck — a loss surfacing typed, a
+                        // fence that signaled in between retiring
+                        // normally. THE STUCK ARM'S CONTRACT (T03's
+                        // in-flight-destination rule, landing at L2):
+                        // the entry IS in flight (pushed above
+                        // BEFORE this wait) and its destinations must
+                        // NOT be destroyed by the caller on this
+                        // error — a timeout is not completion. The
+                        // typed staging-timeout shape is unchanged
+                        // (§5.4).
+                        // SAFETY: the fence is owned by the entry.
+                        let polled = unsafe { self.ctx.device.get_fence_status(fence) };
+                        match super::classify_fence_timeout(polled) {
+                            super::FenceTimeoutClass::Signaled => {
+                                self.ctx.record_upload_submit(wait_started.elapsed());
+                                pool.retire_signaled(self.ctx);
+                                Ok(())
+                            }
+                            super::FenceTimeoutClass::Stuck => Err(RendererError::Vulkan(format!(
+                                "staging upload: fence wait timed out after {} ns \
+                                 (a stuck upload submission; constructing a fresh \
+                                 renderer is the supported path)",
+                                super::WAIT_TIMEOUT_NS
+                            ))),
+                            super::FenceTimeoutClass::DeviceLost => {
+                                Err(RendererError::DeviceLost {
+                                    operation:
+                                        "get_fence_status (staging inline wait, after timeout)"
+                                            .into(),
+                                })
+                            }
+                            super::FenceTimeoutClass::PollError(error) => Err(RendererError::vk(
+                                error,
+                                "get_fence_status (staging inline wait)",
+                            )),
+                        }
+                    }
                     Err(error) => Err(RendererError::vk(error, "staging upload wait")),
                 }
             }

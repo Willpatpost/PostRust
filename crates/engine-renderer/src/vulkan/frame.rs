@@ -58,6 +58,7 @@ use super::pipelines::PipelineState;
 use super::resources::create_mapped_buffer;
 use super::swapchain::{SwapchainState, mark_suboptimal};
 use super::uploads::{LayerPriority, upload_layers};
+use super::{FenceTimeoutClass, classify_fence_timeout};
 use super::{corner, post_draw, proxy_draw, scene_record};
 use crate::config::{DemoScenePreference, DynamicClamp, FRAMES_IN_FLIGHT, PresentModePreference};
 use crate::overlay::OverlayVertex;
@@ -927,10 +928,44 @@ fn wait_slot_fence(
     // resetting first would leave that guard waiting on a fence only
     // THIS frame's submission will signal — the 240-pacing-against-FIFO
     // wedge (rig finding, 2026-10-20: "wait image fence timed out").
-    unsafe {
+    //
+    // T06 §4.3: a TIMEOUT is classified through ONE `get_fence_status`
+    // before the fence is called stuck — the wait's bounded timeout
+    // surfaces as the TYPED stuck-fence refusal only when the device
+    // itself reports the fence unsignaled (a loss at the poll surfaces
+    // as the typed loss instead; a fence that signaled between the
+    // wait and the poll proceeds — never a false stuck report).
+    let waited = unsafe {
         ctx.device
             .wait_for_fences(&[frames.in_flight[slot]], true, WAIT_TIMEOUT_NS)
-            .map_err(|error| RendererError::vk(error, "wait_for_fences (slot fence timed out — a submission never completed; presenting faster than the present mode drains?)"))?;
+    };
+    match waited {
+        Ok(()) => {}
+        Err(vk::Result::TIMEOUT) => match classify_fence_timeout(unsafe {
+            ctx.device.get_fence_status(frames.in_flight[slot])
+        }) {
+            FenceTimeoutClass::Signaled => {}
+            FenceTimeoutClass::Stuck => {
+                return Err(RendererError::StuckFence {
+                    site: "wait_slot_fence (the slot's previous submission)",
+                });
+            }
+            FenceTimeoutClass::DeviceLost => {
+                return Err(RendererError::DeviceLost {
+                    operation: "get_fence_status (slot fence, after wait timeout)".into(),
+                });
+            }
+            FenceTimeoutClass::PollError(error) => {
+                return Err(RendererError::vk(error, "get_fence_status (slot fence)"));
+            }
+        },
+        Err(error) => {
+            return Err(RendererError::vk(
+                error,
+                "wait_for_fences (slot fence timed out — a submission never completed; \
+                 presenting faster than the present mode drains?)",
+            ));
+        }
     }
 
     // Allocation can fail. Grow only the fenced slot, before acquire, so
@@ -1068,15 +1103,41 @@ fn guard_image_and_read_timestamps(
 ) -> Result<Option<f64>, RendererError> {
     if let Some(image_fence) = mut_at(&mut frames.images_in_flight, image_index as usize) {
         if *image_fence != vk::Fence::null() {
-            unsafe {
+            let waited = unsafe {
                 ctx.device
                     .wait_for_fences(&[*image_fence], true, WAIT_TIMEOUT_NS)
-                    .map_err(|error| {
-                        RendererError::vk(
-                            error,
-                            "wait image fence (timed out — a submission never completed)",
-                        )
-                    })?;
+            };
+            match waited {
+                Ok(()) => {}
+                // T06 §4.3: the same one-poll classification as the
+                // slot wait — a timeout is stuck only when the device
+                // says so, and a loss at the poll surfaces typed.
+                Err(vk::Result::TIMEOUT) => {
+                    let polled = unsafe { ctx.device.get_fence_status(*image_fence) };
+                    match classify_fence_timeout(polled) {
+                        FenceTimeoutClass::Signaled => {}
+                        FenceTimeoutClass::Stuck => {
+                            return Err(RendererError::StuckFence {
+                                site: "guard_image (the image's previous submission)",
+                            });
+                        }
+                        FenceTimeoutClass::DeviceLost => {
+                            return Err(RendererError::DeviceLost {
+                                operation: "get_fence_status (image fence, after wait timeout)"
+                                    .into(),
+                            });
+                        }
+                        FenceTimeoutClass::PollError(error) => {
+                            return Err(RendererError::vk(error, "get_fence_status (image fence)"));
+                        }
+                    }
+                }
+                Err(error) => {
+                    return Err(RendererError::vk(
+                        error,
+                        "wait image fence (timed out — a submission never completed)",
+                    ));
+                }
             }
         }
         // The per-image ownership STAGING (CA-10): the slot fence is

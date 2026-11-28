@@ -721,3 +721,86 @@ fn device_loss_is_typed_and_latched() {
     drop(app);
     println!("CA-13 device loss: typed at the boundary, latched across every entry");
 }
+
+/// T06/L1 (the lifecycle substrate's rig leg — the design's
+/// LIFECYCLE-T02-T03-T06-T16 §6 L1 row): the CA-13 latch absorbed
+/// into the `RendererLifecycle` state machine keeps every refusal
+/// surface — including `render_layers`, the frame entry the CA-13
+/// battery's submit-only leg did not exercise — AND the renderer
+/// with a latched loss DROPS cleanly (the §4.2 disposal discipline:
+/// the lifecycle enters `Destroying`, the idle's error is observed
+/// rather than discarded, and the destroy sequence proceeds on the
+/// loss-abandon semantics — `vkDestroy*`/`vkFree*` remain the
+/// supported teardown path after `ERROR_DEVICE_LOST`). The
+/// loss-from-`get_fence_status` arms (§4.3's poll classification on
+/// a REAL loss) are owner-validation territory per the design's own
+/// honest limit §7.2: `inject_device_loss` models only the acquire
+/// site, so those arms are pinned by the CPU classification tables
+/// (`the_fence_poll_classifications_table_every_arm`) until a real
+/// loss is observed on the rig.
+#[test]
+#[ignore = "requires a real Vulkan device and windows (the rig run: release, serial, archived per E-8)"]
+fn lifecycle_latch_covers_render_layers_and_the_loss_renderer_drops_cleanly() {
+    let _guard = sdl_lock();
+    let (mut app, mut renderer) = lifecycle_renderer("T06 L1 lifecycle substrate");
+    let _ = app.frame();
+    let size = app.window().size_in_pixels();
+    attach_corner_scene(&mut renderer).expect("the scene attaches");
+    for _ in 0..3 {
+        let outcome = submit_plain_scene_frame(&mut renderer, &lifecycle_matrix(size), size);
+        assert!(outcome.presented, "the warm frame presents");
+    }
+    // The injected loss at the acquire site (the one seam that
+    // models the terminal outcome faithfully).
+    renderer.inject_device_loss();
+    match renderer.submit_frame(corner_submission(
+        &lifecycle_matrix(size),
+        [0.0, 1.7, 15.0],
+        day_preset(),
+        None,
+        corner_bounds(),
+        None,
+        None,
+        false,
+        None,
+        size,
+    )) {
+        Err(engine_renderer::RendererError::DeviceLost { operation }) => assert_eq!(
+            operation, "acquire_next_image",
+            "the lifecycle's DeviceLost state carries CA-13's first context"
+        ),
+        other => panic!("the typed loss refusal, got {other:?}"),
+    }
+    // THE RENDER_LAYERS GATE (the frame entry the CA-13 battery did
+    // not exercise): refused with the same first observation's
+    // context, without touching the dead device (an unarmed call
+    // that reached the device would present a real frame).
+    let refused = renderer.render_layers(
+        &engine_slice::math::identity(),
+        &[],
+        None,
+        &[],
+        None,
+        size,
+    );
+    match refused {
+        Err(engine_renderer::RendererError::DeviceLost { operation }) => assert_eq!(
+            operation, "acquire_next_image",
+            "render_layers refuses through the same lifecycle gate"
+        ),
+        other => panic!("the render_layers latched refusal, got {other:?}"),
+    }
+    // Validation clean before the drop (the losses are the
+    // injection's, not a real driver error).
+    let stats = renderer.stats();
+    assert_eq!(stats.validation_errors, 0, "{:?}", stats.recent_validation);
+    // THE §4.2 DISPOSAL: the latched renderer drops cleanly — the
+    // lifecycle's Destroying observability state records the idle's
+    // result instead of discarding it, and the ordered teardown
+    // (frames → swapchain → pipes → context) completes on the
+    // loss-abandon semantics. A panic or a wedged drop fails the
+    // test right here.
+    drop(renderer);
+    drop(app);
+    println!("T06 L1: the lifecycle latch covers render_layers; the loss renderer drops cleanly");
+}
