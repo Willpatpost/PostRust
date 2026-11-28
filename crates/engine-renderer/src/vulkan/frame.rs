@@ -158,6 +158,18 @@ pub(crate) struct FrameState {
     pub timestamps_written: [bool; FRAMES_IN_FLIGHT as usize],
     /// A present reported suboptimal — recreate before the next frame.
     pub needs_recreate: bool,
+    /// T06 (strict audit IV, §4.4): the FIRST-USE tracking — per
+    /// swapchain image, whether that image has EVER been presented
+    /// or render-submitted (a rendered image ends the frame in
+    /// `PRESENT_SRC` via the render pass's final layout). The
+    /// release-present of a NEVER-presented image would present it
+    /// in its initial `UNDEFINED` layout — the WSI premise the
+    /// audit refuses to trust — so the acquisition disposition's
+    /// first-use arm submits the minimal `UNDEFINED→PRESENT_SRC`
+    /// transition first (see [`dispose_failed_acquisition`]). Reset
+    /// at every swapchain recreation (the new chain's images are
+    /// fresh); grown with the per-image tables.
+    pub image_ever_presented: Vec<bool>,
     /// The 6-F shadow-map readback handshake (single-flight, like
     /// the color capture; survives pipeline replacements).
     pub(crate) shadow_readback: ShadowReadbackState,
@@ -301,6 +313,7 @@ impl FrameState {
             timestamps_supported: ctx.timestamp_valid_bits > 0,
             timestamps_written: [false; FRAMES_IN_FLIGHT as usize],
             needs_recreate: false,
+            image_ever_presented: Vec::new(),
             surface_probe_pending: false,
             shadow_readback: ShadowReadbackState::default(),
             frame_slot: 0,
@@ -376,6 +389,11 @@ impl FrameState {
             .map_err(|error| RendererError::vk(error, "create present semaphore"))?;
             self.present_semaphores.push(semaphore);
         }
+        // T06 §4.4: the first-use table grows with the per-image
+        // tables (the grown entries are fresh — never presented).
+        while self.image_ever_presented.len() < needed {
+            self.image_ever_presented.push(false);
+        }
         Ok(())
     }
 
@@ -404,6 +422,9 @@ impl FrameState {
         swapchain_image_count: u32,
     ) -> Result<(), RendererError> {
         self.images_in_flight = vec![vk::Fence::null(); swapchain_image_count as usize];
+        // T06 §4.4: the new chain's images are FRESH (initial layout
+        // UNDEFINED, never presented) — the first-use table resets.
+        self.image_ever_presented = vec![false; swapchain_image_count as usize];
         self.sync_present_semaphores(ctx, swapchain_image_count)
     }
 
@@ -1227,22 +1248,34 @@ fn commit_slot_fence(
 /// release defines the disposition for each piece:
 ///
 /// **The acquired image + the acquire semaphore** — RETURNED
-/// together: the WSI-canonical release presents the image WAITING
-/// `image_available[slot]`, so the presentation is ordered against
-/// the acquire's implicit layout transition (the sync-validation
-/// WRITE_AFTER_READ the rig caught when an earlier draft presented
-/// with no waits) and the wait consumes the signal at the
-/// presentation — one operation returning the image to the pool and
-/// retiring the semaphore's signal. The content is whatever the
-/// image last held (the failed frame drew nothing into it — a
-/// visible one-frame staleness on an already-reported error path).
-/// An out-of-date refusal is the normal path's own deferred-
-/// recreation arm (latch the intent, probe next frame); because a
-/// REJECTED present may not have consumed the wait, the semaphore
-/// is then REPLACED (below) rather than trusted. A HARD present
-/// failure holds the image (the pool shrinks by one, fail-visible
-/// as the typed acquire timeout once failures exhaust it) and the
-/// semaphore is replaced the same way.
+/// together through the T06 §4.4 first-use disposition: a
+/// PREVIOUSLY-PRESENTED image (the presentation engine hands it
+/// back effectively in `PRESENT_SRC`) takes the WSI-canonical
+/// release — presenting it WAITING `image_available[slot]` (the
+/// sync-validation WRITE_AFTER_READ the rig caught when an earlier
+/// draft presented with no waits, the wait consuming the signal at
+/// the presentation — one operation returning the image to the pool
+/// and retiring the semaphore's signal; the content is whatever the
+/// image last held, a visible one-frame staleness on an
+/// already-reported error path). A NEVER-presented image (the first
+/// acquisition on a fresh swapchain, the frame failing before
+/// recording) is in its initial `UNDEFINED` layout, and presenting
+/// it in that state is the WSI premise the audit refuses to trust —
+/// that arm submits the MINIMAL `UNDEFINED → PRESENT_SRC_KHR`
+/// transition first (one barrier, no accesses, `TOP_OF_PIPE →
+/// BOTTOM_OF_PIPE`), the submit waiting `image_available[slot]` at
+/// `COLOR_ATTACHMENT_OUTPUT` and signaling the image's present
+/// semaphore, then presents waiting THAT semaphore: the release is
+/// layout-legal BY CONSTRUCTION, premise-independent (the rig's
+/// core validation remains the arbiter of the premise itself). An
+/// out-of-date refusal is the normal path's own deferred-recreation
+/// arm (latch the intent, probe next frame); because a REJECTED
+/// present may not have consumed its wait, the direct arm REPLACES
+/// the acquire semaphore (below) and the transition arm REPLACES
+/// the present semaphore (the transition submit already consumed
+/// the acquire wait). A HARD present failure holds the image (the
+/// pool shrinks by one, fail-visible as the typed acquire timeout
+/// once failures exhaust it) and replaces the same semaphore.
 ///
 /// **The slot fence** — healed when the fence-state discriminator
 /// (`get_fence_status`) finds it unsignaled: the fence is SIGNALED
@@ -1315,41 +1348,199 @@ fn dispose_failed_acquisition(
             *image_fence = vk::Fence::null();
         }
     }
-    // The image return + the acquire semaphore's consume: the
-    // WSI-canonical release present (see the doc above).
-    let present_wait_semaphores = [frames.image_available[slot]];
-    let present_swapchains = [swapchain.swapchain];
-    let present_image_indices = [image_index];
-    let present_info = vk::PresentInfoKHR::default()
-        .wait_semaphores(&present_wait_semaphores)
-        .swapchains(&present_swapchains)
-        .image_indices(&present_image_indices);
-    let semaphore_trusted = match unsafe {
-        ctx.swapchain_ext
-            .queue_present(ctx.graphics_queue, &present_info)
-    } {
-        Ok(suboptimal) => {
-            if suboptimal {
-                mark_suboptimal(&mut frames.needs_recreate);
+    // The image return + the acquire semaphore's consume. T06 §4.4 —
+    // THE FIRST-USE DISPOSITION: a previously-presented (or
+    // render-submitted) image is effectively in `PRESENT_SRC` when
+    // the presentation engine hands it back, and the WSI-canonical
+    // release presents it WAITING `image_available[slot]` (today's
+    // behavior, unchanged — the sync-validation WRITE_AFTER_READ the
+    // rig caught when an earlier draft presented with no waits, the
+    // wait consuming the signal at the presentation). A
+    // NEVER-presented image (the first acquisition on a fresh
+    // swapchain, the frame failing before recording) is in its
+    // initial `UNDEFINED` layout — presenting it in that state is
+    // the WSI premise the audit refuses to trust, so that arm
+    // submits the MINIMAL transition instead: one-barrier command
+    // buffer (`UNDEFINED → PRESENT_SRC_KHR`, `srcAccessMask = 0`,
+    // `dstAccessMask = 0` — the WSI-acquire idiom; general queue
+    // families in scope since the barrier's stages are
+    // `TOP_OF_PIPE → BOTTOM_OF_PIPE`), submitted waiting
+    // `image_available[slot]` at `COLOR_ATTACHMENT_OUTPUT` and
+    // signaling the image's present semaphore, then the present
+    // waits THAT semaphore. The transition submit carries no fence
+    // (the slot fence's heal is the separate empty-submit idiom
+    // below, and signaling an already-signaled fence is invalid) —
+    // the DRAIN PROOF below completes it before this function
+    // returns, so nothing pending survives the disposition.
+    let ever_presented = frames
+        .image_ever_presented
+        .get(image_index as usize)
+        .copied()
+        .unwrap_or(false);
+    // Which semaphore may hold an unconsumed signal when the
+    // release present was rejected or failed (the replacement arm
+    // below): the direct arm's acquire semaphore, the transition
+    // arm's present semaphore (the transition submit consumed the
+    // acquire wait itself).
+    let mut replace_present_semaphore = false;
+    let semaphore_trusted = if !first_use_release_needs_transition(ever_presented) {
+        // THE PREVIOUSLY-PRESENTED ARM — today's direct release.
+        let present_wait_semaphores = [frames.image_available[slot]];
+        let present_swapchains = [swapchain.swapchain];
+        let present_image_indices = [image_index];
+        let present_info = vk::PresentInfoKHR::default()
+            .wait_semaphores(&present_wait_semaphores)
+            .swapchains(&present_swapchains)
+            .image_indices(&present_image_indices);
+        match unsafe {
+            ctx.swapchain_ext
+                .queue_present(ctx.graphics_queue, &present_info)
+        } {
+            Ok(suboptimal) => {
+                if suboptimal {
+                    mark_suboptimal(&mut frames.needs_recreate);
+                }
+                // A processed present consumed the wait: the
+                // semaphore is trusted idle once the drain below
+                // completes. The image is now in the presentation
+                // engine's hands in PRESENT_SRC — the first-use
+                // tracking marks it.
+                if let Some(ever) = frames.image_ever_presented.get_mut(image_index as usize) {
+                    *ever = true;
+                }
+                true
             }
-            // A processed present consumed the wait: the semaphore
-            // is trusted idle once the drain below completes.
-            true
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                // The normal present path's own deferred arm: the
+                // presentation is gone, the recreation intent and the
+                // deferral hint latch. A rejected present may not have
+                // consumed the wait — the semaphore is replaced below.
+                mark_suboptimal(&mut frames.needs_recreate);
+                frames.surface_probe_pending = true;
+                false
+            }
+            Err(_present_error) => {
+                // The image stays held (pool shrinkage, fail-visible as
+                // the typed acquire timeout once failures exhaust it);
+                // the semaphore may hold its signal — replaced below.
+                false
+            }
         }
-        Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-            // The normal present path's own deferred arm: the
-            // presentation is gone, the recreation intent and the
-            // deferral hint latch. A rejected present may not have
-            // consumed the wait — the semaphore is replaced below.
-            mark_suboptimal(&mut frames.needs_recreate);
-            frames.surface_probe_pending = true;
-            false
+    } else {
+        // THE FIRST-USE ARM — the minimal transition submit, then
+        // the present waiting the PRESENT semaphore.
+        let present_semaphore = match frames.present_semaphore_for(ctx, image_index) {
+            Ok(semaphore) => semaphore,
+            Err(release_error) => {
+                return RendererError::FrameSlotUnrecoverable {
+                    source: Box::new(error),
+                    release: Box::new(release_error),
+                };
+            }
+        };
+        let command = frames.command_buffers[slot];
+        let image = swapchain.images[image_index as usize];
+        let transition = (|| unsafe {
+            ctx.device
+                .begin_command_buffer(
+                    command,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(|error| RendererError::vk(error, "release transition begin"))?;
+            // SAFETY: the command buffer is recording; the image is
+            // the acquired swapchain image (the reset at the top of
+            // this disposal discarded any partial recording — the
+            // frame's commands never executed, so the image's layout
+            // is its initial UNDEFINED); the barrier is the WSI
+            // first-use idiom (no accesses, top-of-pipe to
+            // bottom-of-pipe).
+            ctx.device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[vk::ImageMemoryBarrier::default()
+                    .image(image)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                    )
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::empty())
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)],
+            );
+            ctx.device
+                .end_command_buffer(command)
+                .map_err(|error| RendererError::vk(error, "release transition end"))?;
+            let wait_semaphores = [frames.image_available[slot]];
+            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let signal_semaphores = [present_semaphore];
+            let commands = [command];
+            let submits = [vk::SubmitInfo::default()
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&commands)
+                .signal_semaphores(&signal_semaphores)];
+            // SAFETY: the command buffer was just recorded and ended;
+            // no fence (the drain proof below completes the
+            // submission before this disposal returns).
+            ctx.device
+                .queue_submit(ctx.graphics_queue, &submits, vk::Fence::null())
+                .map_err(|error| RendererError::vk(error, "release transition submit"))
+        })();
+        if let Err(release_error) = transition {
+            return RendererError::FrameSlotUnrecoverable {
+                source: Box::new(error),
+                release: Box::new(release_error),
+            };
         }
-        Err(_present_error) => {
-            // The image stays held (pool shrinkage, fail-visible as
-            // the typed acquire timeout once failures exhaust it);
-            // the semaphore may hold its signal — replaced below.
-            false
+        // The transition submit consumed the acquire wait: the
+        // ACQUIRE semaphore is trusted (the drain below completes
+        // the submission). The present now waits the PRESENT
+        // semaphore the transition signaled.
+        let present_wait_semaphores = [present_semaphore];
+        let present_swapchains = [swapchain.swapchain];
+        let present_image_indices = [image_index];
+        let present_info = vk::PresentInfoKHR::default()
+            .wait_semaphores(&present_wait_semaphores)
+            .swapchains(&present_swapchains)
+            .image_indices(&present_image_indices);
+        match unsafe {
+            ctx.swapchain_ext
+                .queue_present(ctx.graphics_queue, &present_info)
+        } {
+            Ok(suboptimal) => {
+                if suboptimal {
+                    mark_suboptimal(&mut frames.needs_recreate);
+                }
+                if let Some(ever) = frames.image_ever_presented.get_mut(image_index as usize) {
+                    *ever = true;
+                }
+                true
+            }
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                mark_suboptimal(&mut frames.needs_recreate);
+                frames.surface_probe_pending = true;
+                // The acquire semaphore was consumed by the
+                // transition submit; the PRESENT semaphore may hold
+                // its signal (a rejected present may not have
+                // consumed the wait) — the replacement arm below
+                // replaces it.
+                replace_present_semaphore = true;
+                true
+            }
+            Err(_present_error) => {
+                replace_present_semaphore = true;
+                true
+            }
         }
     };
     // The fence heal (see the doc above): one empty submission
@@ -1407,6 +1598,42 @@ fn dispose_failed_acquisition(
             }
         };
         frames.image_available[slot] = fresh;
+    }
+    if replace_present_semaphore {
+        // T06 §4.4 (the first-use arm's rejected-present shape): the
+        // transition submit consumed the acquire wait, but the
+        // PRESENT semaphore it signaled may hold an unconsumed
+        // signal (the rejected present may not have waited it) — a
+        // future submission signaling it again would signal an
+        // already-signaled binary semaphore. REPLACE it under the
+        // same drain proof (no queued operation refers to it), and
+        // do NOT mark the image ever-presented (the presentation was
+        // rejected — the image's layout is the transition's
+        // PRESENT_SRC, tracked at the successful arms only).
+        if let Some(&stale) = frames.present_semaphores.get(image_index as usize)
+            && stale != vk::Semaphore::null()
+        {
+            unsafe {
+                ctx.device.destroy_semaphore(stale, None);
+            }
+        }
+        let fresh = match unsafe {
+            ctx.device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+        }
+        .map_err(|error| RendererError::vk(error, "release (present semaphore replacement)"))
+        {
+            Ok(fresh) => fresh,
+            Err(release_error) => {
+                return RendererError::FrameSlotUnrecoverable {
+                    source: Box::new(error),
+                    release: Box::new(release_error),
+                };
+            }
+        };
+        if (image_index as usize) < frames.present_semaphores.len() {
+            frames.present_semaphores[image_index as usize] = fresh;
+        }
     }
     error
 }
@@ -2264,6 +2491,17 @@ fn submit_command_buffer(
             .queue_submit(ctx.graphics_queue, &[submit_info], frames.in_flight[slot])
             .map_err(|error| RendererError::vk(error, "queue_submit"))?;
     }
+    // T06 §4.4: a COMPLETED render submission leaves the acquired
+    // image in `PRESENT_SRC` (the render pass's final layout) — the
+    // first-use tracking marks it, so a later failed frame's
+    // release-present takes the previously-presented arm (the
+    // direct release idiom) rather than the transition submit.
+    if let Some(ever) = frames
+        .image_ever_presented
+        .get_mut(frames.image_index as usize)
+    {
+        *ever = true;
+    }
     if frames.timestamps_supported {
         frames.timestamps_written[slot] = true;
     }
@@ -2298,6 +2536,13 @@ fn present_image(
     } {
         Ok(present_suboptimal) => {
             outcome.presented = true;
+            // T06 §4.4: a successful present hands the image to the
+            // presentation engine in `PRESENT_SRC` — the first-use
+            // tracking marks it (a later release-present of this
+            // image is the previously-presented arm).
+            if let Some(ever) = frames.image_ever_presented.get_mut(image_index as usize) {
+                *ever = true;
+            }
             if present_suboptimal || outcome.suboptimal {
                 outcome.suboptimal = true;
                 mark_suboptimal(&mut frames.needs_recreate);
@@ -2357,6 +2602,19 @@ pub(crate) fn timestamp_sample_ready(supported: bool, written: bool) -> bool {
     supported && written
 }
 
+/// T06 (strict audit IV, §4.4): the release-present's ARM SELECTION —
+/// the previously-presented arm keeps the direct release (the
+/// WSI-canonical idiom); a NEVER-presented image (never presented and
+/// never render-submitted — initial layout `UNDEFINED`) takes the
+/// minimal transition submit, making the release layout-legal BY
+/// CONSTRUCTION. Pure — the arm-selection half only; the WSI premise
+/// itself (whether a direct present of an UNDEFINED image would be
+/// accepted) is the rig's core-validation question, deliberately NOT
+/// relied upon.
+pub(crate) fn first_use_release_needs_transition(ever_presented: bool) -> bool {
+    !ever_presented
+}
+
 /// Presentation-wait semaphore table growth (corrective finding C): the
 /// table only ever grows to cover the required length — entries are never
 /// invalidated, because recreation idles the device first.
@@ -2385,6 +2643,23 @@ mod policy_tests {
         assert_copy::<InternalFrame<'static>>();
         assert_copy::<FramePlan>();
         assert_copy::<FrameOutcome>();
+    }
+
+    /// T06 §4.4: the first-use arm selection — a never-presented
+    /// image takes the transition submit; a presented or
+    /// render-submitted image (either marks it) keeps the direct
+    /// release. The WSI premise itself is rig territory (the design's
+    /// honest limit); the arm SELECTION is this pure half.
+    #[test]
+    fn the_first_use_release_selects_the_transition_only_for_never_presented_images() {
+        assert!(
+            first_use_release_needs_transition(false),
+            "a never-presented image (initial UNDEFINED) takes the transition submit"
+        );
+        assert!(
+            !first_use_release_needs_transition(true),
+            "a presented or render-submitted image (PRESENT_SRC) keeps the direct release"
+        );
     }
 
     #[test]

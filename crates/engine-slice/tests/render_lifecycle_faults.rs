@@ -1148,6 +1148,106 @@ fn interrupted_growth_retry_rewrites_every_slot() {
     );
 }
 
+/// T06/L5 (the first-use disposition's DECIDING rig run — the
+/// design's §6 L5 row: "fresh swapchain → first-acquire fault →
+/// validation clean on the transition submit (or the fallback arm
+/// taken and documented); the WSI spec premise settled with the
+/// layer's actual verdict recorded"): a NEVER-presented image (the
+/// fresh renderer's first acquisition — no frame has presented or
+/// render-submitted any image yet) failing at a post-acquire
+/// boundary BEFORE recording takes the release's TRANSITION arm:
+/// the minimal `UNDEFINED → PRESENT_SRC_KHR` barrier submit waiting
+/// the acquire semaphore and signaling the present semaphore, then
+/// the present waiting THAT semaphore. THE CORE VALIDATION VERDICT
+/// over this disposition is the deciding evidence (the audit
+/// refused to trust the old comment's "acquire performs an implicit
+/// transition" premise; the transition makes the release
+/// layout-legal BY CONSTRUCTION, premise-independent). The
+/// previously-presented arm (the direct release-present, the
+/// pre-L5 behavior) is exercised beside it — after successful
+/// frames, the same fault's release stays validation-clean.
+#[test]
+#[ignore = "requires a real Vulkan device and windows (the rig run: release, serial, archived per E-8)"]
+fn first_use_release_presents_through_the_transition_validation_clean() {
+    let _guard = sdl_lock();
+    let (mut app, mut renderer) = lifecycle_renderer("T06 L5 first-use disposition");
+    let _ = app.frame();
+    let size = app.window().size_in_pixels();
+    let matrix = lifecycle_matrix(size);
+    attach_corner_scene(&mut renderer).expect("the scene attaches");
+    // ---- THE FIRST-USE ARM: the renderer has presented NOTHING —
+    // the first acquired image is never-presented (initial layout
+    // UNDEFINED). The upload boundary fails the frame before any
+    // recording; the release must take the TRANSITION submit.
+    renderer.inject_lifecycle_fault(LifecycleFaultSite::FrameUpload, 1);
+    match renderer.submit_frame(corner_submission(
+        &matrix,
+        [0.0, 1.7, 15.0],
+        day_preset(),
+        None,
+        corner_bounds(),
+        None,
+        None,
+        false,
+        None,
+        size,
+    )) {
+        Err(engine_renderer::RendererError::InjectedFault(_)) => {}
+        other => panic!("the first frame fails at the upload boundary, got {other:?}"),
+    }
+    // THE DECIDING ASSERTION: the transition submit + the
+    // semaphore-waited present are validation-clean (sync
+    // validation ON — a layout-illegal present of an UNDEFINED
+    // image is exactly what the layer would flag).
+    let mut stats = renderer.stats();
+    assert_eq!(
+        stats.validation_errors, 0,
+        "the first-use transition release is validation-clean: {:?}",
+        stats.recent_validation
+    );
+    // ---- THE PREVIOUSLY-PRESENTED ARM: successful frames present
+    // (every image the swapchain hands back is now
+    // ever-presented); the same fault's release takes the DIRECT
+    // arm — the pre-L5 behavior, still validation-clean.
+    for _ in 0..4 {
+        let outcome = submit_plain_scene_frame(&mut renderer, &matrix, size);
+        assert!(outcome.presented, "the warm frame presents");
+    }
+    renderer.inject_lifecycle_fault(LifecycleFaultSite::FrameUpload, 1);
+    match renderer.submit_frame(corner_submission(
+        &matrix,
+        [0.0, 1.7, 15.0],
+        day_preset(),
+        None,
+        corner_bounds(),
+        None,
+        None,
+        false,
+        None,
+        size,
+    )) {
+        Err(engine_renderer::RendererError::InjectedFault(_)) => {}
+        other => panic!("the later frame fails at the upload boundary, got {other:?}"),
+    }
+    stats = renderer.stats();
+    assert_eq!(
+        stats.validation_errors, 0,
+        "the previously-presented direct release is validation-clean: {:?}",
+        stats.recent_validation
+    );
+    // The renderer remains fully usable (the slot was released on
+    // both arms — the CA-10 discipline unchanged).
+    for _ in 0..3 {
+        let outcome = submit_plain_scene_frame(&mut renderer, &matrix, size);
+        assert!(outcome.presented, "the post-failure frame presents");
+    }
+    stats = renderer.stats();
+    assert_eq!(stats.validation_errors, 0, "{:?}", stats.recent_validation);
+    drop(renderer);
+    drop(app);
+    println!("T06 L5: the first-use transition release and the direct arm both validation-clean");
+}
+
 /// T06/L1 (the lifecycle substrate's rig leg — the design's
 /// LIFECYCLE-T02-T03-T06-T16 §6 L1 row): the CA-13 latch absorbed
 /// into the `RendererLifecycle` state machine keeps every refusal
