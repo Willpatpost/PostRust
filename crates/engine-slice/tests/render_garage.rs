@@ -150,8 +150,14 @@ fn the_garage_renders_through_the_public_api_with_its_own_known_answers() {
     };
 
     // ---- LEG 1 + 2: the composed frame, double-run ----
-    // One warm composed frame first (the one-time post/sky/wet/shadow
-    // lazy targets build HERE, never inside a compared capture).
+    // TWO warm composed frames (the rig-caught corrective):
+    // FRAMES_IN_FLIGHT is 2 and the second slot's lazily-created
+    // per-slot resources (their device memories) land on the SECOND
+    // submission — warming one frame left the constancy leg reading
+    // that one-time slot warmup as a per-frame allocation (+1
+    // device_memory on the rig). The corner batteries warm past both
+    // slots for the same reason; the one-time post/sky/wet/shadow
+    // lazy targets build HERE, never inside a compared capture.
     let composed = garage_submission(
         &matrix,
         camera.position,
@@ -163,6 +169,17 @@ fn the_garage_renders_through_the_public_api_with_its_own_known_answers() {
         size,
     );
     assert!(renderer.submit_frame(composed).unwrap().presented);
+    assert!(renderer.submit_frame(composed).unwrap().presented);
+    // The capture machinery's destination buffer is ALSO a one-time
+    // allocation (render_post/render_sky's "this test's first capture"
+    // accounting — a mapped buffer + its device memory): LEG 3's
+    // compared frames are this renderer's first captures, so the
+    // destination must be warmed here too or the constancy leg reads
+    // the capture machinery as a per-frame allocation (the +1
+    // device_memory the rig caught).
+    renderer.request_frame_capture().unwrap();
+    assert!(renderer.submit_frame(composed).unwrap().presented);
+    let _ = renderer.take_frame_capture().unwrap().unwrap();
     let warm = renderer.allocations();
     renderer.request_frame_capture().unwrap();
     assert!(renderer.submit_frame(composed).unwrap().presented);
@@ -318,18 +335,91 @@ fn the_garage_renders_through_the_public_api_with_its_own_known_answers() {
             // implementation-territory band; the garage's faces are
             // metres wide, so the interior dominates — the margin is
             // world-metres, not texel-scaled).
-            let box_ = match expected.box_index {
-                Some(index) => &boxes[index],
-                None => continue, // the ground quad: no perimeter in the table
-            };
+            // The edge margin, the corner gate's Finding-14 form (the
+            // rig-caught corrective): infer the FACE axis (the axis
+            // whose bound the hit touches — distance ~0 by
+            // definition) and measure the perimeter on the two
+            // TANGENTIAL axes only. The lane's first form measured
+            // all three axes, so every face hit carried its own
+            // face-axis zero and landed in the skip band — zero
+            // texels compared.
+            let mut on_face = 0;
+            let mut tangential = [true; 3];
             let mut min_edge = f32::MAX;
-            for (axis, hit_axis) in hit.iter().enumerate() {
-                let lo = (box_.min[axis] - hit_axis).abs();
-                let hi = (box_.max[axis] - hit_axis).abs();
-                min_edge = min_edge.min(lo).min(hi);
+            match expected.box_index {
+                Some(index) => {
+                    let box_ = &boxes[index];
+                    for axis in 0..3 {
+                        if (box_.min[axis] - hit[axis]).abs() < 1e-3
+                            || (box_.max[axis] - hit[axis]).abs() < 1e-3
+                        {
+                            tangential[axis] = false;
+                            on_face += 1;
+                        }
+                    }
+                    if on_face >= 2 {
+                        // A corner-edge graze (two bounds touched — a
+                        // roof/wall edge): genuinely ambiguous
+                        // coverage. Implementation territory — skip.
+                        skipped += 1;
+                        continue;
+                    }
+                    for axis in 0..3 {
+                        if !tangential[axis] {
+                            continue;
+                        }
+                        let lo = (box_.min[axis] - hit[axis]).abs();
+                        let hi = (box_.max[axis] - hit[axis]).abs();
+                        min_edge = min_edge.min(lo).min(hi);
+                    }
+                    if min_edge == f32::MAX {
+                        // Interior to all three axes (the ray entered
+                        // through a face it has left behind): the
+                        // conservative full-margin form.
+                        for (axis, hit_axis) in hit.iter().enumerate() {
+                            let lo = (box_.min[axis] - hit_axis).abs();
+                            let hi = (box_.max[axis] - hit_axis).abs();
+                            min_edge = min_edge.min(lo).min(hi);
+                        }
+                    }
+                }
+                None => {
+                    // The ground quad: no perimeter in the BOX table,
+                    // but the drawn floor IS a bounded quad — the
+                    // mesh's plate spans ±GARAGE_EXTENT on X/Z at
+                    // y = GROUND_Y (mesh_from_boxes' added receiver
+                    // quad). The corner gate's plate-perimeter logic
+                    // on the tangential axes (X/Z) — plus the case
+                    // the corner's oversized plate never faces: the
+                    // garage's plate EQUALS the cascade AABB, so the
+                    // ray shear lands some ground hits BEYOND the
+                    // drawn floor — no geometry exists there, the GPU
+                    // texel is clear, and it compares as a clear
+                    // texel rather than against the phantom ground
+                    // depth.
+                    let plate = engine_slice::garage_scene::GARAGE_EXTENT;
+                    for &axis in &[0, 2] {
+                        let lo = (-plate - hit[axis]).abs();
+                        let hi = (plate - hit[axis]).abs();
+                        min_edge = min_edge.min(lo).min(hi);
+                    }
+                }
             }
             if min_edge < 0.1 {
                 skipped += 1;
+                continue;
+            }
+            if expected.box_index.is_none()
+                && (hit[0].abs() > engine_slice::garage_scene::GARAGE_EXTENT
+                    || hit[2].abs() > engine_slice::garage_scene::GARAGE_EXTENT)
+            {
+                // A ground hit beyond the drawn floor plate: the
+                // clear-texel comparison (the perimeter band above
+                // already absorbed the transition).
+                if !gpu.is_finite() || (gpu - 1.0).abs() > 1e-4 {
+                    mismatches += 1;
+                }
+                compared += 1;
                 continue;
             }
             if !gpu.is_finite() || (gpu - expected.depth).abs() > 1e-3 {

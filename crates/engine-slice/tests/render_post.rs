@@ -2435,6 +2435,18 @@ fn injected_target_failures_unwind_every_handle_and_never_strand_a_slot() {
                 palette: day.sky,
                 disc_dir: sun_dir,
             });
+            // Phase-state reset (the rig-caught corrective): without
+            // this, `wet_frame`/`post_on` carry the PREVIOUS cell's
+            // arms (phase 1's wet cell leaves both set), so every
+            // cell here ran with the post AND wet plans armed —
+            // pre-building the reflection bundle on the "post-only"
+            // warm frames and leaving the injected wet faults nothing
+            // to fire on (Wet/Image returned Ok with the bundle
+            // cached; the poison cascade then failed the six cells
+            // behind it). Each arm below sets exactly the state its
+            // cell isolates.
+            post_on = false;
+            wet_frame = None;
 
             // Set up the appropriate state for the site.
             match site {
@@ -2659,6 +2671,11 @@ fn injected_target_failures_unwind_every_handle_and_never_strand_a_slot() {
             palette: day.sky,
             disc_dir: sun_dir,
         });
+        // Phase-state reset (the same rig-caught corrective as the
+        // matrix above): the late Wet cell leaves `wet_frame`/`post_on`
+        // set for the late Shadow cell otherwise.
+        post_on = false;
+        wet_frame = None;
 
         match site {
             TargetFaultSite::Post => {
@@ -3282,6 +3299,32 @@ fn submit_frame_corner_frames_double_run_deterministic_plain_and_composed() {
             .presented,
         "the plain warm frame"
     );
+    // Warm the capture machinery's destination buffer too (a mapped
+    // buffer + its device memory — render_post's own "this test's
+    // first capture" accounting): the constancy asserts below span
+    // this renderer's first captures, so the destination must be
+    // warm here or the one-time capture allocation reads as a
+    // per-frame cost (the +1 device_memory the rig caught).
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                None,
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size,
+            ))
+            .unwrap()
+            .presented,
+        "the capture-warming plain frame"
+    );
+    let _ = renderer.take_frame_capture().unwrap().unwrap();
     let plain_allocations = renderer.allocations();
     renderer.request_frame_capture().unwrap();
     assert!(
