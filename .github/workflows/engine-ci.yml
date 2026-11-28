@@ -1612,25 +1612,30 @@ jobs:
           workspaces: "engine -> target"
       # (CI-C2 §6) The workspace-membership guard: the sharding
       # partition is package-exact, so the package set itself is the
-      # coverage contract. Exactly the five authorized members — a
+      # coverage contract. Exactly the six authorized members — a
       # NEW package REFUSES here by name (an explicit inventory
       # review, never a silent omission); new test targets inside
       # existing packages run automatically but shift the pinned
       # counts below (the documented maintenance obligation).
-      - name: Workspace inventory guard (exactly the five authorized packages)
+      - name: Workspace inventory guard (exactly the six authorized packages)
         shell: bash
         run: |
           # Package ids are "<path>#<version>" (the pinned toolchain's
           # cargo metadata format), so the member name is the final
           # path segment before the #version suffix.
+          # T19 (2026-11-28): 5 -> 6 — engine-animation added (the
+          # owner-approved A06 extraction per D-EE-10 §2; this guard
+          # refused by design at the integration and the inventory
+          # review happened: the new member is pure pose math, deps
+          # bytemuck only, no consumer-closure growth).
           members=$(cargo metadata --no-deps --format-version 1 | grep -oE '"workspace_members":\[[^]]*\]' | grep -oE '[A-Za-z0-9_-]+#[0-9][0-9.]*' | sed 's/#.*//' | sort)
           count=$(printf '%s\n' "$members" | wc -l)
           echo "workspace members ($count): $(printf '%s\n' "$members" | tr '\n' ' ')"
-          [ "$count" -eq 5 ] || { echo "WORKSPACE INVENTORY CHANGED: $count members, expected exactly 5 — the package sharding requires an explicit inventory review"; exit 1; }
-          for pkg in engine-core engine-persist engine-renderer engine-shell engine-slice; do
+          [ "$count" -eq 6 ] || { echo "WORKSPACE INVENTORY CHANGED: $count members, expected exactly 6 — the package sharding requires an explicit inventory review"; exit 1; }
+          for pkg in engine-core engine-persist engine-renderer engine-shell engine-slice engine-animation; do
             printf '%s\n' "$members" | grep -qx "$pkg" || { echo "MISSING EXPECTED PACKAGE: $pkg"; exit 1; }
           done
-          echo "inventory guard: exactly the five authorized packages"
+          echo "inventory guard: exactly the six authorized packages"
       # (CI-C2 F2) The heavy-shard battery and its exact-count gates.
       # Expected executed totals (established at the accepted CI-C1
       # baseline from real inventories — locally executed AND parsed
