@@ -268,6 +268,27 @@ pub struct RenderStats {
     pub overlay_truncated_vertices: u64,
     pub overlay_supplied_peak_vertices: u32,
     pub overlay_capacity_vertices: u32,
+    /// P5 §1.3 (A11/R1): the instance carve's current per-slot
+    /// capacity, instances (the max over frames — the carve only
+    /// grows; 0 until the first populated frame, the region
+    /// discipline). Landing P4 §3.6's named-but-unlanded
+    /// observability: the budget and its use are reported, not a
+    /// hidden global.
+    pub instance_capacity: u32,
+    /// P5 §1.3: the peak total population supplied in one frame
+    /// (npc + vehicle + rain — the demand the carve sized against).
+    pub instance_peak_used: u32,
+    /// P5 §1.3: the pose carve's current per-slot capacity, blocks
+    /// (0 until the first populated frame).
+    pub pose_capacity: u32,
+    /// P5 §1.3: the peak pose blocks supplied in one frame.
+    pub pose_peak_used: u32,
+    /// P5 §1.6: monotonic count of arena GROWTH events — carve
+    /// re-creations at a larger size (the initial demand-sized carve
+    /// is not an event; each event stalled its frame once under
+    /// `device_wait_idle`, bounded by the pow2 quantum to at most
+    /// `log2(cap / 64)` per session and carves never shrink).
+    pub arena_growth_events: u64,
     gpu_timing: TimingSamples,
     /// The negotiated depth format (corrective finding 4, F):
     /// the renderer's chosen depth format, reported so tests can
@@ -559,6 +580,11 @@ impl Renderer {
             overlay_truncated_vertices: 0,
             overlay_supplied_peak_vertices: 0,
             overlay_capacity_vertices: 0,
+            instance_capacity: 0,
+            instance_peak_used: 0,
+            pose_capacity: 0,
+            pose_peak_used: 0,
+            arena_growth_events: 0,
             gpu_timing: TimingSamples::default(),
             depth_format: format!("{:?}", depth_format),
         };
@@ -802,6 +828,8 @@ impl Renderer {
         let policy = SubmissionPolicy {
             proxy_draw_mode: self.proxy_draw_mode,
             ripple_debug: self.ripple_debug,
+            instance_capacity: self.config.instance_capacity.0,
+            pose_capacity: self.config.pose_capacity.0,
         };
         let frame_policy = self.frame_policy();
         let inputs = adapt_frame(
@@ -900,6 +928,9 @@ impl Renderer {
             present_preference: self.config.present_mode,
             replace_pipelines: self.config.replace_pipelines,
             demo_scene: self.config.demo_scene,
+            instance_capacity: self.config.instance_capacity.0,
+            pose_capacity: self.config.pose_capacity.0,
+            region_capacity: self.config.region_capacity.0,
         }
     }
 
@@ -928,6 +959,16 @@ impl Renderer {
             .stats
             .overlay_capacity_vertices
             .max(outcome.overlay.capacity);
+        // P5 §1.3 (A11/R1): the arena facts, the same accumulate
+        // discipline (capacities are maxima — the carves only grow;
+        // peaks are maxima; growth events accumulate). Deferred and
+        // unpopulated frames carry zeros, contributing nothing.
+        self.stats.instance_capacity = self.stats.instance_capacity.max(outcome.instance_capacity);
+        self.stats.instance_peak_used =
+            self.stats.instance_peak_used.max(outcome.instance_supplied);
+        self.stats.pose_capacity = self.stats.pose_capacity.max(outcome.pose_capacity);
+        self.stats.pose_peak_used = self.stats.pose_peak_used.max(outcome.pose_supplied);
+        self.stats.arena_growth_events += u64::from(outcome.arena_growth_events);
         if outcome.presented {
             self.stats.frames_presented += 1;
         }

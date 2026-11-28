@@ -265,6 +265,10 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
         replace_pipelines: options.replace_pipelines,
         demo_scene: DemoScenePreference::Included,
         depth_format: DepthFormatPreference::Auto,
+        // P5 R1 (A11): the arena budgets stay at their DEFAULTS here —
+        // ..Default::default() fills today's constants (the demos'
+        // populations never approach the caps).
+        ..Default::default()
     };
     let mut renderer =
         Renderer::new(app.window(), render_config).map_err(|error| error.to_string())?;

@@ -298,6 +298,9 @@ fn the_default_omits_and_the_explicit_opt_in_preserves_the_demo_scene() {
         replace_pipelines: true,
         demo_scene: DemoScenePreference::Included,
         depth_format: DepthFormatPreference::Auto,
+        // P5 R1 (A11): the arena budgets at their DEFAULTS (the
+        // second renderer carries the same caps as the first).
+        ..RenderConfig::default()
     };
     let mut opt_in_renderer = Renderer::new(app.window(), opt_in_config)
         .expect("the opt-in renderer constructs under the software ICD");

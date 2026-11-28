@@ -691,9 +691,23 @@ pub fn repack_poses(
     buffer: &mut Vec<u8>,
     blocks: &[[[[f32; 4]; 4]; HUMANOID_JOINTS]],
 ) -> Result<(), PosePackError> {
-    if blocks.len() > MAX_POSE_BLOCKS {
+    repack_poses_bounded(buffer, blocks, MAX_POSE_BLOCKS)
+}
+
+/// The bounded form (P5 §1.3, A11/R1): the caller-supplied cap is
+/// the CONFIGURED budget ([`crate::config::PoseCapacity`] — default
+/// [`MAX_POSE_BLOCKS`]), mirroring
+/// [`crate::proxy_instances::repack_populations_bounded`]: the CAP,
+/// never the current carve, is the typed refusal's boundary, and the
+/// GPU pose carve grows toward this cap on demand.
+pub fn repack_poses_bounded(
+    buffer: &mut Vec<u8>,
+    blocks: &[[[[f32; 4]; 4]; HUMANOID_JOINTS]],
+    capacity: usize,
+) -> Result<(), PosePackError> {
+    if blocks.len() > capacity {
         return Err(PosePackError::Capacity {
-            capacity: MAX_POSE_BLOCKS,
+            capacity,
             requested: blocks.len(),
         });
     }
@@ -2108,6 +2122,34 @@ mod tests {
             "a smaller pack keeps the capacity"
         );
         assert_eq!(buffer.len(), POSE_STRIDE);
+    }
+
+    /// P5 §1.3 (A11/R1): the CONFIGURED cap is the pose repack's
+    /// typed-refusal boundary — the instance carve's mirror (a
+    /// smaller budget refuses at exactly that budget; the default
+    /// form is the bounded form at MAX_POSE_BLOCKS).
+    #[test]
+    fn pose_repack_refusal_boundary_is_the_configured_cap() {
+        let rest = rest_pose_block();
+        let blocks: Vec<_> = vec![rest; 24];
+        let mut buffer = Vec::new();
+        repack_poses_bounded(&mut buffer, &blocks, 24).unwrap();
+        assert_eq!(buffer.len(), 24 * POSE_STRIDE);
+        let prior = buffer.clone();
+        assert_eq!(
+            repack_poses_bounded(&mut buffer, &blocks, 23),
+            Err(PosePackError::Capacity {
+                capacity: 23,
+                requested: 24
+            })
+        );
+        assert_eq!(buffer, prior, "the refusal left the prior bytes intact");
+        // The default form delegates at the constant.
+        let mut bounded = Vec::new();
+        repack_poses_bounded(&mut bounded, &blocks, MAX_POSE_BLOCKS).unwrap();
+        let mut constant = Vec::new();
+        repack_poses(&mut constant, &blocks).unwrap();
+        assert_eq!(bounded, constant);
     }
 
     /// rest_pose_block: equals skin_matrices at the zero pose,

@@ -272,10 +272,30 @@ pub fn repack_populations(
     vehicle: &[ProxyInstance],
     rain: &[ProxyInstance],
 ) -> Result<(), InstancePackError> {
+    repack_populations_bounded(buffer, npc, vehicle, rain, MAX_INSTANCES)
+}
+
+/// The bounded form (P5 §1.3, A11/R1): the caller-supplied cap is
+/// the CONFIGURED budget ([`crate::config::InstanceCapacity`] —
+/// the renderer's construction-time config, default
+/// [`MAX_INSTANCES`]), the typed refusal's boundary. The refusal
+/// itself is byte-identical to the constant-bounded form at the
+/// same cap — same error shape, same payloads — because the CAP,
+/// never the current carve, is the boundary: the GPU instance
+/// carve grows toward this cap on demand (the overlay's reserve
+/// pattern), so an in-cap population always fits the carve by the
+/// time the bytes are written.
+pub fn repack_populations_bounded(
+    buffer: &mut Vec<u8>,
+    npc: &[ProxyInstance],
+    vehicle: &[ProxyInstance],
+    rain: &[ProxyInstance],
+    capacity: usize,
+) -> Result<(), InstancePackError> {
     let total = npc.len() + vehicle.len() + rain.len();
-    if total > MAX_INSTANCES {
+    if total > capacity {
         return Err(InstancePackError::Capacity {
-            capacity: MAX_INSTANCES,
+            capacity,
             requested: total,
         });
     }
@@ -690,6 +710,40 @@ mod tests {
             })
         );
         assert_eq!(buffer, prior);
+    }
+
+    /// P5 §1.3 (A11/R1): the CONFIGURED cap is the typed refusal's
+    /// boundary — a smaller budget refuses at exactly that budget
+    /// with the same error shape and payloads (the CAP, never the
+    /// current carve, is the boundary; the carve grows toward the
+    /// cap, so an in-budget population always fits it).
+    #[test]
+    fn repack_refusal_boundary_is_the_configured_cap() {
+        let (npc, vehicle, rain) = fixture_populations();
+        let total = npc.len() + vehicle.len() + rain.len();
+        let mut buffer = Vec::new();
+        // At the configured cap: packs (the demand-sized carve holds
+        // it by construction — the ensure grows first).
+        repack_populations_bounded(&mut buffer, &npc, &vehicle, &rain, total).unwrap();
+        assert_eq!(buffer.len(), total * INSTANCE_STRIDE);
+        let prior = buffer.clone();
+        // One past the configured cap: the SAME typed refusal, with
+        // the configured capacity in the payload.
+        assert_eq!(
+            repack_populations_bounded(&mut buffer, &npc, &vehicle, &rain, total - 1),
+            Err(InstancePackError::Capacity {
+                capacity: total - 1,
+                requested: total
+            })
+        );
+        assert_eq!(buffer, prior, "the refusal left the prior bytes intact");
+        // The default (constant-bounded) form is the bounded form at
+        // MAX_INSTANCES — byte-identical delegation.
+        let mut bounded = Vec::new();
+        repack_populations_bounded(&mut bounded, &npc, &vehicle, &rain, MAX_INSTANCES).unwrap();
+        let mut constant = Vec::new();
+        repack_populations(&mut constant, &npc, &vehicle, &rain).unwrap();
+        assert_eq!(bounded, constant);
     }
 
     /// The retained buffer reuses its capacity across frames (the

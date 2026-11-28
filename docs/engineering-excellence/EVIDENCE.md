@@ -585,6 +585,105 @@ failed** (the lane's base count — untouched); the batteries'
 non-ignored portions: census_ripple 1/1i, render_weather 1/11i,
 render_reflection 0/7i — all ok.
 
+## E-15 P5 R1 — the demand-sized arenas measured (2026-11-27, lane worktree tree `1ea3e05`+R1, branch `ee/p5-r1-arenas-budgets`; rig GPU RTX 5070 Ti, release, real windows, the E-7/E-12 discipline)
+
+A11/A23's §1.3 landing: the three mapped carves (instance, pose,
+region) size at demand under configured caps (RenderConfig's three
+budget fields, defaults = today's constants); the typed refusals
+byte-identical at the CAP (the cap, never the carve, is the
+boundary); growth = one `device_wait_idle` re-creation per carve
+(counted in `RenderStats::arena_growth_events`, the initial
+demand-sized carve is not an event). All commands below exit 0
+unless noted.
+
+**§1.5 — the residency scaling rows (rig GPU, release; the battery
+`census_vram::arena_residency_scaling_rows`):** resident mapped
+bytes per carve, BEFORE (the constant carves) vs AFTER (the
+demand-sized carves, warmed frames at each population):
+
+| population | inst supplied/carved | pose supplied/carved | instance B before/after | pose B before/after | events |
+|---|---|---|---|---|---:|
+| garage (6+1) | 7/64 | 6/64 | 786,432/12,288 | 5,767,168/90,112 | 0 |
+| corner (24+2) | 26/64 | 24/64 | 786,432/12,288 | 5,767,168/90,112 | 0 |
+| 1k | 1,002/1,024 | 1,000/1,024 | 786,432/196,608 | 5,767,168/1,441,792 | 0 |
+| 4k (at cap) | 4,096/4,096 | 4,096/4,096 | 786,432/786,432 | 5,767,168/5,767,168 | 0 |
+
+The design's named asymmetry measured: the corner's pose carve
+drops 5,767,168 → 90,112 B (1.56% of the before carve — the 64-
+block demand quantum's floor against 24 blocks used), the garage's
+to the same floor; the 1k rows land within 2× of the used bytes
+(the pow2 quantum); the 4k rows sit AT the default caps, so the
+at-cap batteries' pins hold by construction (before == after).
+
+**§1.5 — the growth gate boundary (rig GPU, release; the battery
+`census_vram::arena_growth_gate_boundary`, 4 legs, 1 passed):**
+(1) 100 → 300 instances/poses under the 4,096 cap: each carve
+grows ONCE (128 → 512; `arena_growth_events` 0 → 2; exactly +1
+device_memory per carve after the capture path is warmed — the
+a6e5adc discipline applied to the arena), the growth frame's
+capture is BYTE-IDENTICAL to a from-frame-1 reference renderer's,
+and the same population again allocates nothing (steady state).
+(2) a 200-instance configured cap: 201 refuses with exactly
+`InstancePackError::Capacity { capacity: 200, requested: 201 }`
+(the CAP, never the carve, is the boundary); 150 renders (carve
+200). (3) a 500-vertex configured region budget: 612 supplied
+after a 100-vertex first frame grows the carve 128 → 500 (one
+event) AND truncates exactly 112 — the F-03 counter reports the
+truncation the same-frame growth did NOT mask (the counter is
+never cleared). (4) the pose growth under the SHADOWED family
+(the heaviest sync path — the retained buffer re-created while
+the per-generation shadowed sets bind it): validation 0 across
+the growth and the following shadowed frames (the stale-binding
+rewrite is clean).
+
+**§9.1/§9.4/§9.5/§9.6/§9.2 re-runs (rig GPU + CPU, release):**
+the full §9.1 VRAM census table (24 cells, 3 passed — every
+family × extent tuple matches E-12's counter shape: the demand
+sizing changes carve SIZES, never allocation COUNTS); the §9.4
+attach census unchanged (corner/garage: 5 submits, 1 staged pair,
+794,624 B tails, tex-bytes 1,589,248 — the attach path touches no
+arena); the §9.5 ripple rows within noise of E-12 (saturation
++39% 720p / +51% 1440p over empty on p50 this run); the §9.6
+maximal-composition curves validation 0/0 at all four extents
+(median gpu-ms 0.065/0.115/0.184/0.365 at 720p/1080p/1440p/4K);
+the §9.2 repack matrix byte columns identical (672/4,224 /
+2,496/16,896 / 96,000/704,000 / 393,216/2,883,584 B — the repack
+bytes are unchanged by the bounded forms).
+
+**The population gates re-run on the rig GPU (release, serial):**
+render_instanced 8/8 (the N-vs-1 pixel equivalence, the indirect
+mechanism's +1 memory pin, the replace-pipelines lifecycle, and
+the 4,200-frame wake campaign's `renderer.allocations()` constancy
+— the 26-instance population's carve is stable, no growth events
+mid-campaign); render_post 7/7 (the (8,4,16,0) composition delta
+— the lazy families' one-time allocation COUNTS unchanged by the
+demand sizing); render_reflection 7/7, render_shadows 4/4,
+render_corner 1/1, render_garage 1/1, render_sky 1/1,
+render_weather 11/11 (the rain warmed-constancy leg re-based per
+the a6e5adc discipline: one pool-bound 1,024-streak warm frame
+sizes the instance carve past the field's churn before the
+baseline — see the D-EE-06 map in the lane handoff),
+render_glyph_atlas 1/1, render_encounter 1/1.
+
+**Lane gates:** `cargo fmt --all -- --check` exit 0; `cargo
+clippy -p engine-renderer -p engine-slice --all-targets --
+-D warnings` exit 0; `cargo test -p engine-renderer` 195 passed /
+0 failed debug AND release (= 190 baseline + 5 new: the budget
+defaults pin, the arena quantum table, the §1.5 scaling
+predictions, the configured-cap refusals both kinds);
+`cargo test -p engine-slice --lib` 157 passed / 0 failed (the
+base tree's own count — this lane adds no slice lib test); `cargo check --workspace
+--all-targets` exit 0. OBSERVED (pre-existing, NOT this lane —
+reproduced on the base tree `1ea3e05` via stash): the
+`census_repack` non-ignored smoke's `median_us > 0.0` assert
+flakes in RELEASE on this machine (the 672 B garage slot-write
+median reads 0.00 µs — timing granularity); the debug-profile run
+(the gate profile) passes 2/1i. The four offscreen-gated smokes
+(render_overflow, render_orientation, render_scene_separation,
+s6_evidence's device leg) require SDL_VIDEODRIVER=offscreen +
+headless-surface Vulkan, unavailable in this loader — the
+orchestrator's rig bar.
+
 ## Measurement baselines
 
 Established: E-8 is the baseline battery (2026-11-26, tree `263532f` — the

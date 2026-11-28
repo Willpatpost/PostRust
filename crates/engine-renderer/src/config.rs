@@ -141,11 +141,75 @@ pub enum TargetFaultStage {
     Framebuffer,
 }
 
+/// P5 §1.3 (A11/R1): the instance arena's configured HARD CAP — the
+/// typed-refusal boundary ([`crate::proxy_instances::InstancePackError::Capacity`]
+/// fires above it). The CAP, never the current carve, is the
+/// boundary: the carve itself is demand-sized under this cap (see
+/// [`arena_capacity_for`]), so "graceful capacity saturation" is
+/// preserved exactly — a supply above the cap refuses with the same
+/// typed error whether the carve is at 64 instances or at the cap.
+///
+/// The DEFAULT is [`crate::proxy_instances::MAX_INSTANCES`] —
+/// today's constant — so every existing `RenderConfig` construction
+/// (none of them name a budget field) resolves to exactly the
+/// pre-P5 cap: refusals byte-identical, callers unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstanceCapacity(pub usize);
+
+impl Default for InstanceCapacity {
+    fn default() -> Self {
+        Self(crate::proxy_instances::MAX_INSTANCES)
+    }
+}
+
+/// P5 §1.3 (A11/R1): the pose arena's configured hard cap — the
+/// typed-refusal boundary ([`crate::animation::PosePackError::Capacity`]
+/// fires above it), mirroring [`InstanceCapacity`] (the pose bound
+/// has always mirrored the instance bound). The DEFAULT is
+/// [`crate::animation::MAX_POSE_BLOCKS`] — today's constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoseCapacity(pub usize);
+
+impl Default for PoseCapacity {
+    fn default() -> Self {
+        Self(crate::animation::MAX_POSE_BLOCKS)
+    }
+}
+
+/// P5 §1.3 (A11/R1): the dynamic region-scene arena's configured
+/// budget, in PER-FRAME-SLOT vertices (one frame's world+foreground
+/// output must fit one slot; the F-03 clamp truncates above it,
+/// fail-visible with the counters). The DEFAULT is the closed
+/// form's per-slot share —
+/// `region_scene_capacity_vertices() / FRAMES_IN_FLIGHT` =
+/// `((8 + 1000) * 36 + 512)` = 36,800 — whose derivation
+/// (8 Full regions + 1000 NPC proxy boxes at 36 non-indexed
+/// vertices, plus the 512 hand margin) stays documented at
+/// [`crate::scene::region_scene_capacity_vertices`]. This is the
+/// A05-coupling closure the P4 design named: the renderer's buffer
+/// size is now a CONFIGURED budget whose default DERIVES from the
+/// closed form, not the demo arithmetic welded into the carve site
+/// — no engine-core constant ties the simulation's shape to the
+/// renderer's residency after this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionCapacity(pub u32);
+
+impl Default for RegionCapacity {
+    fn default() -> Self {
+        Self(crate::scene::region_scene_capacity_vertices() / FRAMES_IN_FLIGHT)
+    }
+}
+
 /// Renderer configuration. Presentation *pacing* (frame-rate targets,
 /// uncapped measurement) stays in the application — the renderer never
 /// imposes an engine-wide frame-rate ceiling, and rendering cadence is
 /// deliberately independent of the future fixed-rate campaign simulation
 /// (Stage 3, gated).
+///
+/// Since P5 §1.3 (A11/R1) the three mapped arenas (instance, pose,
+/// region) are demand-sized under the three budget fields below; the
+/// fields' DEFAULTS are today's constants, so a config that names none
+/// of them behaves at the cap exactly as the pre-P5 renderer did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RenderConfig {
     pub present_mode: PresentModePreference,
@@ -173,6 +237,16 @@ pub struct RenderConfig {
     /// state). The chosen depth format is reported in the renderer's
     /// stats.
     pub depth_format: DepthFormatPreference,
+    /// P5 §1.3 (A11/R1): the instance arena's hard cap (see
+    /// [`InstanceCapacity`]). Default = MAX_INSTANCES.
+    pub instance_capacity: InstanceCapacity,
+    /// P5 §1.3 (A11/R1): the pose arena's hard cap (see
+    /// [`PoseCapacity`]). Default = MAX_POSE_BLOCKS.
+    pub pose_capacity: PoseCapacity,
+    /// P5 §1.3 (A11/R1): the region arena's per-slot vertex budget
+    /// (see [`RegionCapacity`]). Default = the closed form's
+    /// per-slot share, 36,800.
+    pub region_capacity: RegionCapacity,
 }
 
 /// Frames simultaneously in flight (sync objects per slot). Fixed at 2 for
@@ -281,6 +355,41 @@ pub(crate) fn dynamic_geometry_clamp(supplied: usize, capacity: u32) -> DynamicC
         drawn: supplied.min(capacity),
         truncated: supplied.saturating_sub(capacity),
     }
+}
+
+/// The demand quantum's floor (P5 §1.3's `[ASSUMPTION]`, documented
+/// here per the design): the smallest carve any of the three mapped
+/// arenas starts at. 64 keeps a first frame's tiny population from
+/// producing a micro-carve that would re-grow on nearly every early
+/// frame (1 → 2 → 4 → … would be six events before the population
+/// merely reaches the floor), while bounding the growth-event count
+/// to `log2(cap / 64)` — at most 6 for the default 4,096-instance
+/// caps, exactly the design's "≤ 6 events 64→4096" amortization.
+pub(crate) const ARENA_FLOOR: u32 = 64;
+
+/// The demand-quantum arithmetic every P5 §1.3 arena shares — the
+/// overlay slot's proven `capacity_for` shape
+/// (`vulkan/frame.rs`'s `OverlaySlot::capacity_for`) generalized to
+/// three carves and given the 64 floor above:
+///
+/// - `required` is clamped to the configured `cap` FIRST (a supply
+///   above the cap never grows past it — the cap, not the carve, is
+///   the refusal/truncation boundary);
+/// - a `required` at or below the current carve keeps it (steady
+///   state: no event, no allocation);
+/// - otherwise the carve is the next power of two at or above
+///   `max(required, ARENA_FLOOR)`, clamped to the cap (so a demand
+///   at or above the cap lands exactly ON the cap — the pre-P5
+///   full carve, byte-identical behavior for over-cap workloads).
+///
+/// Pure — unit-testable without a GPU; the quantum table and the
+/// §1.5 scaling predictions are pinned in this module's tests.
+pub(crate) fn arena_capacity_for(current: u32, required: u32, cap: u32) -> u32 {
+    let required = required.min(cap);
+    if required <= current {
+        return current;
+    }
+    required.max(ARENA_FLOOR).next_power_of_two().min(cap)
 }
 
 #[cfg(test)]
@@ -476,6 +585,199 @@ mod tests {
         assert_eq!((empty.drawn, empty.truncated), (0, 0));
         let unallocated = dynamic_geometry_clamp(1_000, 0);
         assert_eq!((unallocated.drawn, unallocated.truncated), (0, 1_000));
+    }
+
+    /// P5 §1.3 (A11/R1): the budget defaults ARE today's constants —
+    /// the compatibility contract at the cap. A config that names no
+    /// budget field behaves exactly as the pre-P5 renderer at every
+    /// boundary (typed refusals, F-03 truncation, the full carve for
+    /// over-cap supplies).
+    #[test]
+    fn arena_budget_defaults_are_todays_constants() {
+        use crate::animation::MAX_POSE_BLOCKS;
+        use crate::proxy_instances::MAX_INSTANCES;
+        use crate::scene::region_scene_capacity_vertices;
+
+        assert_eq!(InstanceCapacity::default().0, MAX_INSTANCES);
+        assert_eq!(PoseCapacity::default().0, MAX_POSE_BLOCKS);
+        assert_eq!(MAX_POSE_BLOCKS, MAX_INSTANCES, "the pose mirror holds");
+        assert_eq!(
+            RegionCapacity::default().0,
+            region_scene_capacity_vertices() / FRAMES_IN_FLIGHT
+        );
+        assert_eq!(RegionCapacity::default().0, 36_800);
+        // The whole-config default carries them (the derive chains
+        // through each field's own Default).
+        let config = RenderConfig::default();
+        assert_eq!(config.instance_capacity, InstanceCapacity(MAX_INSTANCES));
+        assert_eq!(config.pose_capacity, PoseCapacity(MAX_POSE_BLOCKS));
+        assert_eq!(config.region_capacity, RegionCapacity(36_800));
+    }
+
+    /// P5 §1.3: the demand quantum — the overlay's capacity_for
+    /// shape with the 64 floor, pinned across the whole decision
+    /// table (steady state, first demand, doubling growth, the cap
+    /// clamp, and the at-cap landing that keeps over-cap workloads
+    /// byte-identical with the pre-P5 full carve).
+    #[test]
+    fn arena_quantum_tables() {
+        // Steady state: a demand at or below the current carve keeps
+        // it — no event, no allocation.
+        for (current, required) in [
+            (0_u32, 0_u32),
+            (64, 1),
+            (64, 64),
+            (128, 100),
+            (4_096, 4_096),
+        ] {
+            assert_eq!(
+                arena_capacity_for(current, required, 4_096),
+                current,
+                "steady state at ({current}, {required})"
+            );
+        }
+        // First demand: the floor, then powers of two.
+        for (required, carved) in [
+            (1_u32, 64_u32),
+            (63, 64),
+            (64, 64),
+            (65, 128),
+            (100, 128),
+            (128, 128),
+            (129, 256),
+            (1_000, 1_024),
+            (2_049, 4_096),
+        ] {
+            assert_eq!(
+                arena_capacity_for(0, required, 4_096),
+                carved,
+                "first demand {required}"
+            );
+        }
+        // Doubling growth from an existing carve.
+        for (current, required, grown) in [
+            (64_u32, 65_u32, 128_u32),
+            (128, 300, 512),
+            (512, 513, 1_024),
+            (64, 4_096, 4_096),
+        ] {
+            assert_eq!(
+                arena_capacity_for(current, required, 4_096),
+                grown,
+                "growth from {current} under {required}"
+            );
+        }
+        // The cap clamps: a supply at or above the cap lands exactly
+        // ON the cap (never past it), matching the pre-P5 carve —
+        // the render_overflow shape (37,800 demanded of the 36,800
+        // default budget still carves exactly 36,800).
+        assert_eq!(arena_capacity_for(0, 4_096, 4_096), 4_096);
+        assert_eq!(arena_capacity_for(0, 4_097, 4_096), 4_096);
+        assert_eq!(arena_capacity_for(128, 100_000, 4_096), 4_096);
+        assert_eq!(arena_capacity_for(0, 37_800, 36_800), 36_800);
+        // A configured cap below the floor still clamps (a budget of
+        // 8 carves 8 — the configured boundary is always honored),
+        // and a degenerate ZERO cap carves nothing here (the device
+        // paths' creation floor of 1 keeps a valid buffer while the
+        // CAP refuses/truncates everything — see the ensure sites).
+        // A live carve never SHRINKS when the cap drops below it
+        // (config is construction-time; the steady-state arm holds).
+        assert_eq!(arena_capacity_for(0, 100, 8), 8);
+        assert_eq!(arena_capacity_for(0, 100, 0), 0);
+        assert_eq!(arena_capacity_for(128, 100, 0), 128);
+    }
+
+    /// P5 §1.5's scaling row, computed (the carve is a pure function
+    /// of demand and cap — the predictions the device batteries and
+    /// the census assert against): resident mapped bytes per carve
+    /// at the census populations, before (the constant carves) vs
+    /// after (the demand-sized carves). The pose row is the design's
+    /// named asymmetry — 5,767,168 B carved against 16,896 B used at
+    /// the corner (0.29%) — and the after-row is the ≤ 2× used-bytes
+    /// bound the design demands (rounded to the power-of-two
+    /// quantum).
+    #[test]
+    fn arena_scaling_predictions_the_95_census_row() {
+        use crate::animation::{MAX_POSE_BLOCKS, POSE_STRIDE};
+        use crate::proxy_instances::{INSTANCE_STRIDE, MAX_INSTANCES};
+        use crate::scene::region_scene_capacity_vertices;
+
+        let instance_cap = MAX_INSTANCES as u32;
+        let pose_cap = MAX_POSE_BLOCKS as u32;
+        // (label, instances supplied, pose blocks supplied)
+        let populations = [
+            ("garage", 7_u32, 6_u32),
+            ("corner", 26, 24),
+            ("1k", 1_002, 1_000),
+            ("4k", 4_096, 4_096),
+        ];
+        let before_instance = MAX_INSTANCES as u64 * INSTANCE_STRIDE as u64 * 2;
+        let before_pose = MAX_POSE_BLOCKS as u64 * POSE_STRIDE as u64 * 2;
+        for (label, instances, poses) in populations {
+            let carved_instances = arena_capacity_for(0, instances, instance_cap);
+            let carved_poses = arena_capacity_for(0, poses, pose_cap);
+            let after_instance =
+                carved_instances as u64 * INSTANCE_STRIDE as u64 * FRAMES_IN_FLIGHT as u64;
+            let after_pose = carved_poses as u64 * POSE_STRIDE as u64 * FRAMES_IN_FLIGHT as u64;
+            // The design's bound: the after carve is within a 2×
+            // factor of the used bytes rounded to the power-of-two
+            // quantum — with the quantum's 64 FLOOR as the floor of
+            // the bound (the tiny demos' carves ARE the floor: the
+            // garage's 7-instance population carves 64, the design's
+            // documented demand quantum) — whenever the demand is
+            // under the cap.
+            if instances < instance_cap {
+                assert!(
+                    after_instance
+                        <= u64::from(ARENA_FLOOR.max(instances.saturating_mul(2)))
+                            * INSTANCE_STRIDE as u64
+                            * FRAMES_IN_FLIGHT as u64,
+                    "{label}: instance carve {after_instance} B vs used {} B",
+                    u64::from(instances) * INSTANCE_STRIDE as u64 * FRAMES_IN_FLIGHT as u64
+                );
+            }
+            if poses < pose_cap {
+                assert!(
+                    after_pose
+                        <= u64::from(ARENA_FLOOR.max(poses.saturating_mul(2)))
+                            * POSE_STRIDE as u64
+                            * FRAMES_IN_FLIGHT as u64,
+                    "{label}: pose carve {after_pose} B vs used {} B",
+                    u64::from(poses) * POSE_STRIDE as u64 * FRAMES_IN_FLIGHT as u64
+                );
+            }
+            println!(
+                "{label}: instance {before_instance} -> {after_instance} B \
+                 (carve {carved_instances}, supplied {instances}); \
+                 pose {before_pose} -> {after_pose} B \
+                 (carve {carved_poses}, supplied {poses})"
+            );
+        }
+        // The named headline rows, exact: the corner's pose carve and
+        // the at-cap 4k rows (the 4k population lands ON the caps —
+        // the before and after carves coincide, which is why every
+        // at-cap battery's pins hold unchanged).
+        let corner = populations[1];
+        assert_eq!(corner.1, 26);
+        assert_eq!(
+            arena_capacity_for(0, corner.2, pose_cap),
+            64,
+            "the corner's 24 blocks carve the floor"
+        );
+        assert_eq!(64 * POSE_STRIDE * 2, 90_112, "the corner's after carve, B");
+        assert_eq!(
+            arena_capacity_for(0, 4_096, instance_cap) as u64 * INSTANCE_STRIDE as u64 * 2,
+            before_instance,
+            "the 4k instance carve is the full carve (at cap)"
+        );
+        assert_eq!(
+            arena_capacity_for(0, 4_096, pose_cap) as u64 * POSE_STRIDE as u64 * 2,
+            before_pose,
+            "the 4k pose carve is the full carve (at cap)"
+        );
+        // The region's default budget derivation stays the closed
+        // form's per-slot share (the A05-coupling closure's pin).
+        assert_eq!(region_scene_capacity_vertices(), 36_800 * FRAMES_IN_FLIGHT);
     }
 
     #[test]

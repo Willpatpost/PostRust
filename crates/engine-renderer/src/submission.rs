@@ -191,7 +191,13 @@ impl std::fmt::Debug for WetFrame<'_> {
 /// the two settings that stay renderer-owned (set through
 /// [`crate::Renderer::set_proxy_draw_mode`] and
 /// [`crate::Renderer::set_ripple_debug_mode`]) until their migration
-/// steps move them into the submission. `Copy` — collected from the
+/// steps move them into the submission, PLUS the two population
+/// caps (P5 §1.3, A11/R1) — the construction-time budget fields
+/// ([`crate::config::InstanceCapacity`] /
+/// [`crate::config::PoseCapacity`]) the adapter's repacks bound
+/// against, collected here so the typed refusals fire at the
+/// CONFIGURED cap (defaults = today's constants; the CAP, never the
+/// current carve, is the boundary). `Copy` — collected from the
 /// renderer before the mutable frame flow begins.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SubmissionPolicy {
@@ -201,6 +207,12 @@ pub(crate) struct SubmissionPolicy {
     /// The TEST-ONLY ripple debug lane (see [`RippleDebugMode`]);
     /// `Off` in every production frame.
     pub ripple_debug: RippleDebugMode,
+    /// P5 §1.3: the instance arena's configured cap — the instance
+    /// repack's typed-refusal boundary.
+    pub instance_capacity: usize,
+    /// P5 §1.3: the pose arena's configured cap — the pose repack's
+    /// typed-refusal boundary.
+    pub pose_capacity: usize,
 }
 
 /// The input half of one `vulkan::render_frame` call, typed — the
@@ -323,11 +335,12 @@ pub(crate) fn adapt_frame<'a, 'x>(
                     population.rain_material
                 )));
             }
-            crate::proxy_instances::repack_populations(
+            crate::proxy_instances::repack_populations_bounded(
                 instance_bytes,
                 population.npc,
                 population.vehicle,
                 population.rain,
+                policy.instance_capacity,
             )
             .map_err(RendererError::ProxyPack)?;
             // The pose contract (the capture-refusal discipline):
@@ -351,8 +364,12 @@ pub(crate) fn adapt_frame<'a, 'x>(
                         .unwrap_or(0)
                 )));
             }
-            crate::animation::repack_poses(pose_bytes, population.npc_poses)
-                .map_err(RendererError::PosePack)?;
+            crate::animation::repack_poses_bounded(
+                pose_bytes,
+                population.npc_poses,
+                policy.pose_capacity,
+            )
+            .map_err(RendererError::PosePack)?;
             Some(vulkan::proxy_draw::ProxyFrameUpload {
                 bytes: instance_bytes.as_slice(),
                 pose_bytes: pose_bytes.as_slice(),
@@ -479,10 +496,13 @@ mod tests {
         let light = crate::lit_scene::day_preset();
         let size = (1280_u32, 720_u32);
         // The renderer-level policy the entry reads from its own
-        // fields: the production proxy mode, the shipped debug lane.
+        // fields: the production proxy mode, the shipped debug lane,
+        // and the default population caps (P5 §1.3 — the constants).
         let policy = SubmissionPolicy {
             proxy_draw_mode: ProxyDrawMode::default(),
             ripple_debug: RippleDebugMode::default(),
+            instance_capacity: crate::proxy_instances::MAX_INSTANCES,
+            pose_capacity: crate::animation::MAX_POSE_BLOCKS,
         };
 
         // ---- Configuration 1: the plain all-off frame ----
@@ -636,6 +656,8 @@ mod tests {
         let policy = SubmissionPolicy {
             proxy_draw_mode: ProxyDrawMode::default(),
             ripple_debug: RippleDebugMode::default(),
+            instance_capacity: crate::proxy_instances::MAX_INSTANCES,
+            pose_capacity: crate::animation::MAX_POSE_BLOCKS,
         };
         // An empty-kind population carrying material index 3: no
         // repack work, no pose blocks — the validation is the only

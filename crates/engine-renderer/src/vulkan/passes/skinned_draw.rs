@@ -59,34 +59,44 @@
 //! keeps the finding-A per-generation re-ensure.
 //!
 //! THE ALIGNMENT PROOF (minStorageBufferOffsetAlignment): every
-//! slot's dynamic offset is `slot * 2,883,584`, and 2,883,584 =
-//! 4096 × 704 with 704 = 44 × 16 — a multiple of 16, hence of every
-//! power-of-two alignment ≥ 1 the Vulkan spec permits for storage
-//! buffers. The constructor still ASSERTS the multiple against the
-//! live device's limit and fails typed otherwise (the proof covers
-//! the spec's minimums; a driver reporting something exotic gets the
+//! slot's dynamic offset is `slot * slot_stride` where `slot_stride`
+//! is the carved blocks × [`crate::animation::POSE_STRIDE`] (704).
+//! Since P5 §1.3 (A11/R1) the carve is DEMAND-SIZED under the
+//! configured pose cap — `max(64, first-demand)` blocks rounded to
+//! the power of two, doubling on growth — so the proof covers the
+//! QUANTUM, not one constant: 704 = 44 × 16 — a multiple of 16 —
+//! and every carve is 64-or-more blocks, hence a multiple of
+//! 64 × 704 = 2^6 × 2^6 × 11, hence of every power-of-two
+//! alignment ≥ 1 the Vulkan spec permits for storage buffers
+//! (minStorageBufferOffsetAlignment ∈ [1, 256]). The constructor and
+//! the growth path both still ASSERT the multiple against the live
+//! device's limit and fail typed otherwise (the proof covers the
+//! spec's minimums; a driver reporting something exotic gets the
 //! refusal, not the undefined behavior).
 //!
 //! THE POSE BLOCK CONTRACT: the caller's blocks are in POSE-INDEX
 //! order (block i serves every npc whose `pose_index` is i — the
 //! safe layer validates `max(npc pose_index) < blocks.len()` before
-//! any frame state is touched); at most [`MAX_POSE_BLOCKS`] blocks
-//! (the typed refusal, never truncation).
+//! any frame state is touched); at most the CONFIGURED POSE CAP
+//! blocks (the typed refusal, never truncation — the CAP, never the
+//! current carve, is the boundary since P5 §1.3).
 
 use super::corner::CornerResources;
 use super::{
     RendererError, VulkanContext, create_mapped_buffer, create_shader_module,
     descriptors::create_sets,
 };
-use crate::animation::{MAX_POSE_BLOCKS, POSE_STRIDE};
+use crate::animation::POSE_STRIDE;
 use crate::config::FRAMES_IN_FLIGHT;
 use crate::proxy_instances::INSTANCE_STRIDE;
 use crate::proxy_mesh::ProxyVertex;
 use ash::vk;
 
-/// The pose storage buffer's slot stride: one 704-byte block per
-/// possible pose index (MAX_POSE_BLOCKS), one region per frame slot.
-const SLOT_STRIDE: u64 = MAX_POSE_BLOCKS as u64 * POSE_STRIDE as u64;
+// The FULL-CAP pose stride (the default cap's —
+// `crate::animation::MAX_POSE_BLOCKS * POSE_STRIDE`) is the
+// closed-form derivation the demand quantum grows toward; since
+// P5 §1.3 the LIVE stride is the carved `blocks_capacity *
+// POSE_STRIDE` (see the header's alignment proof).
 
 /// The pass families' material-count shape — the attach-time
 /// contract's own constant (P4 S2: the lit/shadowed/skinned/
@@ -133,6 +143,10 @@ pub(crate) struct SkinnedRetained {
     memory: vk::DeviceMemory,
     mapped: *mut core::ffi::c_void,
     slot_stride: u64,
+    /// The pose carve's per-slot capacity, BLOCKS (P5 §1.3: the
+    /// demand-sized carve `slot_stride` derives from —
+    /// `blocks_capacity * POSE_STRIDE == slot_stride`).
+    blocks_capacity: u32,
     set_layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
     sets: [vk::DescriptorSet; MATERIAL_COUNT],
@@ -142,37 +156,53 @@ pub(crate) struct SkinnedRetained {
     pipeline_layout: vk::PipelineLayout,
 }
 
+/// The alignment proof's live check, shared by the construction and
+/// the growth path (P5 §1.3: the check RE-RUNS per growth — the
+/// header's quantum arithmetic covers the spec's minimums; the
+/// device gets the final word).
+///
+/// SAFETY: querying the live physical device this context was built
+/// on (the corner's own build does the same).
+fn check_slot_alignment(ctx: &VulkanContext, slot_stride: u64) -> Result<(), RendererError> {
+    let limits = unsafe {
+        ctx.instance
+            .get_physical_device_properties(ctx.physical_device)
+    }
+    .limits;
+    let min_alignment = limits.min_storage_buffer_offset_alignment.max(1);
+    if !slot_stride.is_multiple_of(min_alignment) {
+        return Err(RendererError::Vulkan(format!(
+            "the pose buffer's slot stride {slot_stride} is not a multiple of the \
+             device's minStorageBufferOffsetAlignment {min_alignment}"
+        )));
+    }
+    Ok(())
+}
+
 impl SkinnedRetained {
     /// Builds the whole retained state against the corner's
-    /// resources. Partial-construction safe: `release` frees
-    /// exactly what exists (null handles denote partial
-    /// construction — the corrective-finding-G discipline).
+    /// resources. `blocks` is the pose carve's per-slot capacity,
+    /// BLOCKS (P5 §1.3, A11/R1: the demand quantum's choice at the
+    /// first populated frame — `max(64, first-demand)` rounded to
+    /// the power of two, clamped to the configured cap; was the
+    /// MAX_POSE_BLOCKS constant). Partial-construction safe:
+    /// `release` frees exactly what exists (null handles denote
+    /// partial construction — the corrective-finding-G discipline).
     pub(super) fn new(
         ctx: &VulkanContext,
         corner: &CornerResources,
+        blocks: u32,
     ) -> Result<Self, RendererError> {
+        let slot_stride = u64::from(blocks) * POSE_STRIDE as u64;
         // The alignment proof's live check (the header's arithmetic
         // covers the spec minimums; the device gets the final word).
-        // SAFETY: querying the live physical device this context was
-        // built on (the corner's own build does the same).
-        let limits = unsafe {
-            ctx.instance
-                .get_physical_device_properties(ctx.physical_device)
-        }
-        .limits;
-        let min_alignment = limits.min_storage_buffer_offset_alignment.max(1);
-        if !SLOT_STRIDE.is_multiple_of(min_alignment) {
-            return Err(RendererError::Vulkan(format!(
-                "the pose buffer's slot stride {SLOT_STRIDE} is not a multiple of the \
-                 device's minStorageBufferOffsetAlignment {min_alignment}"
-            )));
-        }
-
+        check_slot_alignment(ctx, slot_stride)?;
         let mut partial = SkinnedRetained {
             buffer: vk::Buffer::null(),
             memory: vk::DeviceMemory::null(),
             mapped: core::ptr::null_mut(),
-            slot_stride: SLOT_STRIDE,
+            slot_stride,
+            blocks_capacity: blocks,
             set_layout: vk::DescriptorSetLayout::null(),
             pool: vk::DescriptorPool::null(),
             sets: [vk::DescriptorSet::null(); MATERIAL_COUNT],
@@ -183,6 +213,98 @@ impl SkinnedRetained {
             return Err(error);
         }
         Ok(partial)
+    }
+
+    /// P5 §1.3 (A11/R1): grows the pose carve to `target` blocks per
+    /// slot when `target` exceeds the current capacity — the
+    /// DEVICE-LIFETIME tier's growth path (the design's §1.3): the
+    /// pose storage is bound as STORAGE_BUFFER_DYNAMIC with the
+    /// concrete per-slot range in the sets, so a growth re-creates
+    /// the buffer AND rewrites binding 5 of every set that binds it.
+    /// A no-op at or below the current capacity (the steady state).
+    ///
+    /// # The growth path's sync discipline (the heaviest of the
+    /// three tiers)
+    /// `device_wait_idle` FIRST (the reflection/post targets'
+    /// rebuild-safety proof shape — "only a recreation — already
+    /// device-idle — can change either"): the old buffer is read by
+    /// (a) pending submissions through ANY pipeline generation's
+    /// retained sets and (b) the SHADOWED-POPULATED family's sets
+    /// (per-generation, binding 5 against this same buffer — their
+    /// stale-binding re-ensure is the pipeline state's own
+    /// [`ShadowedProxyResources::ensure_pose_binding`], run by the
+    /// ensure ladder right after this call). The new buffer is
+    /// created BEFORE the old one dies (a failure leaves the prior
+    /// state fully intact); the sets are rewritten while nothing is
+    /// in flight; the alignment check RE-RUNS per growth (the
+    /// header's quantum proof, against the live device, exactly as
+    /// at construction); the event is counted on the context's
+    /// monotonic arena-growth counter. No content copy — every
+    /// frame that draws from a slot's region first wrote it (the
+    /// instance buffer's own argument). The pool, set layout, sets,
+    /// and pipeline layout SURVIVE (the pipelines reference the
+    /// layout, never the buffer), so no pipeline is rebuilt.
+    pub(super) fn ensure_capacity(
+        &mut self,
+        ctx: &VulkanContext,
+        target: u32,
+    ) -> Result<(), RendererError> {
+        if u64::from(target) <= u64::from(self.blocks_capacity) {
+            return Ok(());
+        }
+        let slot_stride = u64::from(target) * POSE_STRIDE as u64;
+        check_slot_alignment(ctx, slot_stride)?;
+        let (buffer, memory, mapped) = create_mapped_buffer(
+            ctx,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            slot_stride * FRAMES_IN_FLIGHT as u64,
+        )?;
+        // The replacement point: everything above can fail with the
+        // prior state intact; below this line the swap is
+        // commit-only (update_descriptor_sets cannot fail). The
+        // stall is the renderer's own ordered-teardown helper
+        // (device_wait_idle, typed).
+        super::device_idle(ctx)?;
+        let storage_dynamic = vk::DescriptorType::STORAGE_BUFFER_DYNAMIC;
+        for set in self.sets {
+            let poses = [vk::DescriptorBufferInfo::default()
+                .buffer(buffer)
+                .range(slot_stride)];
+            // SAFETY: the sets are this state's own, allocated for
+            // exactly this binding (the construction write's shape);
+            // the device is idle so no pending command buffer
+            // references them.
+            unsafe {
+                ctx.device.update_descriptor_sets(
+                    &[vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(5)
+                        .descriptor_type(storage_dynamic)
+                        .buffer_info(&poses)],
+                    &[],
+                );
+            }
+        }
+        unsafe {
+            if !self.mapped.is_null() {
+                ctx.device.unmap_memory(self.memory);
+            }
+            ctx.device.destroy_buffer(self.buffer, None);
+            ctx.device.free_memory(self.memory, None);
+        }
+        self.buffer = buffer;
+        self.memory = memory;
+        self.mapped = mapped;
+        self.slot_stride = slot_stride;
+        self.blocks_capacity = target;
+        ctx.record_arena_growth();
+        Ok(())
+    }
+
+    /// The pose carve's per-slot capacity (blocks) — the
+    /// observability read and the growth logic's current value.
+    pub(super) fn blocks_capacity(&self) -> u32 {
+        self.blocks_capacity
     }
 
     fn build(
@@ -260,12 +382,12 @@ impl SkinnedRetained {
             // stages because those gates never asserted
             // validation_errors). With the concrete range the
             // effective view is [pose_offset, pose_offset +
-            // SLOT_STRIDE) — exactly this slot's region, and tighter
+            // slot_stride) — exactly this slot's region, and tighter
             // than WHOLE_SIZE (the shader cannot index past its
             // slot's bound).
             let poses = [vk::DescriptorBufferInfo::default()
                 .buffer(self.buffer)
-                .range(SLOT_STRIDE)];
+                .range(self.slot_stride)];
             let write = vk::WriteDescriptorSet::default().dst_set(*set);
             // SAFETY: fresh sets; the corner resources and the pose
             // buffer outlive the pool (owned by this state / the
@@ -544,7 +666,8 @@ impl SkinnedRetained {
     /// frame flow satisfies immediately before this call) — and
     /// `bytes` must be at most `slot_stride` long (the safe layer's
     /// validated bound: the repack's capacity refusal caps the
-    /// blocks at MAX_POSE_BLOCKS).
+    /// blocks at the CONFIGURED pose cap, and the carve grows to
+    /// the demand under that cap before this write).
     pub(super) unsafe fn write_slot(&self, slot: usize, bytes: &[u8]) {
         debug_assert!(bytes.len() <= self.slot_stride as usize);
         // SAFETY: the documented caller contract — this slot's fence
@@ -572,7 +695,6 @@ impl SkinnedRetained {
     }
 
     /// The per-slot region size (bytes).
-    #[allow(dead_code)]
     pub(super) fn slot_bytes(&self) -> u64 {
         self.slot_stride
     }
@@ -861,6 +983,19 @@ pub(crate) struct ShadowedProxyResources {
     skinned_shadowed_hdr: Option<vk::Pipeline>,
     /// The vehicle receiving pipeline's HDR variant (the same shape).
     plain_shadowed_hdr: Option<vk::Pipeline>,
+    /// The pose buffer handle this state's binding-5 sets were
+    /// written against (P5 §1.3, A11/R1): the staleness token for
+    /// [`Self::ensure_pose_binding`]. The retained pose storage can
+    /// GROW mid-session (a re-created buffer at a larger per-slot
+    /// stride), and this family's sets — unlike the retained's own,
+    /// which the growth rewrites — are PER-GENERATION, so a growth
+    /// leaves them pointing at a destroyed buffer until this
+    /// re-ensure rewrites them.
+    pose_binding_buffer: vk::Buffer,
+    /// The pose region RANGE this state's binding-5 sets were
+    /// written with (the retained's live slot stride at build time —
+    /// re-recorded together with the buffer above).
+    pose_binding_range: u64,
 }
 
 impl ShadowedProxyResources {
@@ -895,6 +1030,8 @@ impl ShadowedProxyResources {
             plain_shadowed_set_layout: vk::DescriptorSetLayout::null(),
             skinned_shadowed_hdr: None,
             plain_shadowed_hdr: None,
+            pose_binding_buffer: retained.pose_buffer(),
+            pose_binding_range: retained.slot_bytes(),
         };
         if let Err(error) = partial.build(ctx, shadows, retained, corner, main_render_pass) {
             partial.release(ctx);
@@ -951,7 +1088,7 @@ impl ShadowedProxyResources {
             .range(64)];
         let poses = [vk::DescriptorBufferInfo::default()
             .buffer(retained.pose_buffer())
-            .range(SLOT_STRIDE)];
+            .range(retained.slot_bytes())];
         // SAFETY: a fresh set; the shadow uniform and pose buffer
         // outlive this pool (their states own them).
         unsafe {
@@ -1052,7 +1189,7 @@ impl ShadowedProxyResources {
                     .range(super::shadow_draw::SHADOW_FRAME_PARAMS_SIZE)];
                 let poses = [vk::DescriptorBufferInfo::default()
                     .buffer(retained.pose_buffer())
-                    .range(SLOT_STRIDE)];
+                    .range(retained.slot_bytes())];
                 let write = vk::WriteDescriptorSet::default().dst_set(set);
                 // SAFETY: fresh sets; every resource outlives the
                 // pool (the states own them).
@@ -1196,6 +1333,69 @@ impl ShadowedProxyResources {
             "plain shadowed proxy pipeline",
         )?;
 
+        Ok(())
+    }
+
+    /// P5 §1.3 (A11/R1): re-ensures this state's binding-5 sets
+    /// against the RETAINED pose storage's CURRENT buffer and range.
+    /// A no-op while the recorded binding matches (the steady state
+    /// — the staleness token is the buffer handle and slot range the
+    /// build wrote); after a pose-carve GROWTH the retained buffer
+    /// was re-created, so this rewrites the skinned DEPTH set and
+    /// every skinned shadowed receiving set's binding 5 (the plain
+    /// vehicle family has no pose binding — the build's own shape).
+    ///
+    /// # The sync discipline
+    /// The rewrite happens only when STALE, under
+    /// `device_wait_idle`: a previously-submitted command buffer may
+    /// still bind these sets (the growth already drained the device,
+    /// but this re-ensure also covers the shadowed frame that FOLLOWS
+    /// a growth by a frame or more — the frame whose ladder reaches
+    /// the shadowed family after the growth frame's did not), and
+    /// updating a descriptor set while a pending command buffer
+    /// references it is the hazard the stall precludes. Bounded by
+    /// the growth-event count (rare, counted on the context's
+    /// monotonic arena counter — this stall is that event's tail,
+    /// not a new one).
+    pub(super) fn ensure_pose_binding(
+        &mut self,
+        ctx: &VulkanContext,
+        retained: &SkinnedRetained,
+    ) -> Result<(), RendererError> {
+        let buffer = retained.pose_buffer();
+        let range = retained.slot_bytes();
+        if self.pose_binding_buffer == buffer && self.pose_binding_range == range {
+            return Ok(());
+        }
+        // SAFETY: device_wait_idle proves no pending command buffer
+        // binds these sets; the sets are this state's own, allocated
+        // for exactly this binding (the build's own write shape).
+        // The stall is the renderer's own ordered-teardown helper.
+        super::device_idle(ctx)?;
+        let storage_dynamic = vk::DescriptorType::STORAGE_BUFFER_DYNAMIC;
+        let poses = [vk::DescriptorBufferInfo::default()
+            .buffer(buffer)
+            .range(range)];
+        let write = |set: vk::DescriptorSet| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(5)
+                .descriptor_type(storage_dynamic)
+                .buffer_info(&poses)
+        };
+        // The depth set first, then every skinned receiving set (the
+        // plain vehicle family has no pose binding — the build's own
+        // shape); two updates, no allocation.
+        // SAFETY: the writes reference only this state's own sets and
+        // the live retained buffer; the device is idle.
+        unsafe {
+            ctx.device
+                .update_descriptor_sets(&[write(self.skinned_depth_set)], &[]);
+            let receiving = self.skinned_shadowed_sets.map(write);
+            ctx.device.update_descriptor_sets(&receiving, &[]);
+        }
+        self.pose_binding_buffer = buffer;
+        self.pose_binding_range = range;
         Ok(())
     }
 

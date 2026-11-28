@@ -147,8 +147,10 @@ pub(crate) fn prepare_frame(
     // completeness). Each ensure_* is idempotent (an existence check),
     // so calling it twice (before and after recreation) is safe. The
     // uses arrive as the frame's plan (S3: the ONE derivation, this
-    // and the two re-run sites below its three consumers).
-    pipes.ensure_frame_targets_and_resources(ctx, swapchain, slot, plan)?;
+    // and the two re-run sites below its three consumers). P5 §1.3:
+    // the policy's arena caps ride along — the carves size by the
+    // plan's demand counts under them.
+    pipes.ensure_frame_targets_and_resources(ctx, swapchain, slot, plan, policy)?;
 
     // A previous present reported suboptimal — recreate before drawing
     // (verification requirement: suboptimal must eventually trigger
@@ -160,7 +162,7 @@ pub(crate) fn prepare_frame(
         // variant pipelines exist on the new generation (finding 6).
         // The plan is the SAME declaration re-consumed (S3: one
         // derivation, this is the second consumer).
-        pipes.ensure_frame_targets_and_resources(ctx, swapchain, slot, plan)?;
+        pipes.ensure_frame_targets_and_resources(ctx, swapchain, slot, plan, policy)?;
         return Ok(FramePreparationResult::Recreated);
     }
 
@@ -267,7 +269,7 @@ pub(crate) fn prepare_after_recreation(
     // passes). The plan is the SAME declaration re-consumed (S3:
     // one derivation, this is the third consumer).
     let slot = frames.frame_slot;
-    pipes.ensure_frame_targets_and_resources(ctx, swapchain, slot, plan)?;
+    pipes.ensure_frame_targets_and_resources(ctx, swapchain, slot, plan, policy)?;
 
     // The targets were ensured pre-acquire against the OLD
     // generation — repeat preparation against the replacement

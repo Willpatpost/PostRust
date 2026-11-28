@@ -138,6 +138,14 @@ pub(crate) struct PassUses {
 /// cascade needs beyond them — the wet ground re-draw's placement.
 /// Derived ONCE per frame (see [`FramePlan::derive`]); `Copy`; read
 /// by direct field access at every consumer.
+///
+/// Since P5 §1.3 (A11/R1) the plan also carries the frame's DEMAND
+/// COUNTS — the populations and layer sizes the arena carves size
+/// against. Still a declaration, not a data carrier (counts, never
+/// bytes): the lazy-ensure ladder reads them to size/grow the three
+/// mapped carves (instance, pose, region) toward their configured
+/// caps BEFORE the frame's uploads, exactly where it already read
+/// the uses bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FramePlan {
     /// The pass-uses declaration — THE explicit-uses bit set.
@@ -150,6 +158,19 @@ pub(crate) struct FramePlan {
     /// branch and inside `post_draw`'s record — from the same two
     /// facts; now written once here and consumed by both.
     pub ground: GroundRedrawPass,
+    /// P5 §1.3: this frame's total dynamic-geometry supply (world
+    /// plus foreground vertices, saturating — the region arena's
+    /// demand quantum; the F-03 clamp stays the fail-visible
+    /// boundary at the configured cap).
+    pub region_demand_vertices: u32,
+    /// P5 §1.3: this frame's total proxy population (npc, vehicle,
+    /// and rain counts summed, saturating — the instance arena's
+    /// demand).
+    pub instance_demand: u32,
+    /// P5 §1.3: this frame's pose-block supply — the repacked pose
+    /// bytes over [`crate::animation::POSE_STRIDE`] (the pose
+    /// arena's demand; exactly the blocks the safe layer validated).
+    pub pose_demand_blocks: u32,
 }
 
 impl FramePlan {
@@ -195,6 +216,26 @@ impl FramePlan {
             wet: wet.is_some(),
             overlay: !hud.is_empty() || !debug_overlay.is_empty(),
         };
+        // P5 §1.3: the demand counts, derived ONCE beside the uses —
+        // the same saturating conversions the F-03 clamp uses (a
+        // supply beyond u32::MAX degrades instead of wrapping; the
+        // structural bound, not memory luck). The pose count is the
+        // repacked bytes over POSE_STRIDE — exactly the block count
+        // the safe layer's repack validated (blocks × POSE_STRIDE
+        // bytes, by the repack's own construction).
+        let region_demand_vertices = (region_vertices
+            .len()
+            .saturating_add(foreground_vertices.len()))
+        .min(u32::MAX as usize) as u32;
+        let instance_demand = proxy.map_or(0, |upload| {
+            upload
+                .npc_count
+                .saturating_add(upload.vehicle_count)
+                .saturating_add(upload.rain_count)
+        });
+        let pose_demand_blocks = proxy.map_or(0, |upload| {
+            (upload.pose_bytes.len() / crate::animation::POSE_STRIDE).min(u32::MAX as usize) as u32
+        });
         // The wet receiver's placement (finding 14): the re-draw runs
         // inside whichever scene pass this frame records through —
         // the HDR one when the post chain replaced the main pass, the
@@ -210,7 +251,13 @@ impl FramePlan {
         } else {
             GroundRedrawPass::None
         };
-        FramePlan { uses, ground }
+        FramePlan {
+            uses,
+            ground,
+            region_demand_vertices,
+            instance_demand,
+            pose_demand_blocks,
+        }
     }
 }
 
@@ -254,6 +301,8 @@ mod tests {
         let policy = SubmissionPolicy {
             proxy_draw_mode: ProxyDrawMode::default(),
             ripple_debug: RippleDebugMode::default(),
+            instance_capacity: crate::proxy_instances::MAX_INSTANCES,
+            pose_capacity: crate::animation::MAX_POSE_BLOCKS,
         };
         let world = [crate::scene::SceneVertex {
             pos: [0.0, 0.0, 0.0],
@@ -356,6 +405,20 @@ mod tests {
             // The wet receiver lands inside the post chain's HDR
             // scene pass (post replaced the main pass).
             ground: GroundRedrawPass::Hdr,
+            // P5 §1.3's demand counts: world + foreground vertex
+            // totals, the population's kind counts, and the pose
+            // blocks — all derived from the same submission fields
+            // (this configuration's population slices are all EMPTY,
+            // so the populated demands read 0 while the bits read
+            // on).
+            region_demand_vertices: (submission.layers.world.len()
+                + submission
+                    .layers
+                    .foreground
+                    .map_or(0, |layer| layer.vertices.len()))
+                as u32,
+            instance_demand: 0,
+            pose_demand_blocks: 0,
         };
         assert_eq!(plan, expected, "the everything-on frame's plan");
 
@@ -396,6 +459,9 @@ mod tests {
                 overlay: false,
             },
             ground: GroundRedrawPass::Main,
+            region_demand_vertices: 0,
+            instance_demand: 0,
+            pose_demand_blocks: 0,
         };
         assert_eq!(plan, expected, "the wet-without-post frame's plan");
 
@@ -433,6 +499,9 @@ mod tests {
                 overlay: false,
             },
             ground: GroundRedrawPass::None,
+            region_demand_vertices: 0,
+            instance_demand: 0,
+            pose_demand_blocks: 0,
         };
         assert_eq!(plan, expected, "the all-off corner frame's plan");
 
@@ -470,6 +539,12 @@ mod tests {
                 overlay: true,
             },
             ground: GroundRedrawPass::None,
+            // The layers-only frame's world batch is the 1-vertex
+            // fixture — the region demand counts exactly it (no
+            // foreground, no population).
+            region_demand_vertices: submission.layers.world.len() as u32,
+            instance_demand: 0,
+            pose_demand_blocks: 0,
         };
         assert_eq!(plan, expected, "the layers-only frame's plan");
     }
@@ -520,6 +595,8 @@ mod tests {
             SubmissionPolicy {
                 proxy_draw_mode: ProxyDrawMode::Indirect,
                 ripple_debug: RippleDebugMode::default(),
+                instance_capacity: crate::proxy_instances::MAX_INSTANCES,
+                pose_capacity: crate::animation::MAX_POSE_BLOCKS,
             },
             &submission,
         );
@@ -531,6 +608,8 @@ mod tests {
             SubmissionPolicy {
                 proxy_draw_mode: ProxyDrawMode::Instanced,
                 ripple_debug: RippleDebugMode::default(),
+                instance_capacity: crate::proxy_instances::MAX_INSTANCES,
+                pose_capacity: crate::animation::MAX_POSE_BLOCKS,
             },
             &submission,
         );
