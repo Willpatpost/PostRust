@@ -4,7 +4,7 @@
 //! ride the shared staging pool (the per-texture combined allocation
 //! survives only as the pool-unavailable fallback, verbatim).
 
-use super::staging::{FlushMode, StagingBatch};
+use super::staging::{FlushDisposition, FlushMode, StagingBatch};
 use super::{RendererError, VulkanContext, find_memory_type, with_upload_commands};
 use ash::vk;
 
@@ -34,19 +34,41 @@ impl Texture {
         extent: vk::Extent2D,
         texels: &[u8],
     ) -> Result<Self, RendererError> {
-        let mut batch = ctx.begin_staging_batch();
+        // T16 §5.1: the typed begin — `Ok(None)` is the per-object
+        // fallback (sticky unsupported-memory, or a TRANSIENT
+        // pressure failure that retries the backing next call); a
+        // device error at the pool propagates (never masked).
+        let mut batch = ctx.begin_staging_batch()?;
         match &mut batch {
             Some(batch) => {
                 let texture = Self::upload_pooled(batch, ctx, format, extent, texels)?;
-                if let Err(error) = batch.flush(FlushMode::InlineWait) {
-                    // The flush failed (submit or wait): the partial
-                    // texture must not survive its never-submitted or
-                    // stuck upload.
-                    let mut texture = texture;
-                    texture.destroy(ctx);
-                    return Err(error);
+                // T16/T03: the flush's TYPED disposition — the
+                // cleanup decision depends on whether the batch is
+                // PENDING. `NotSubmitted` (nothing pending — the
+                // submit failed, or the wait proved completion before
+                // a poll surfaced device health) keeps today's
+                // destroy. `SubmittedUnwaited` (the batch IS in
+                // flight) keeps today's destroy AT THIS STAGE; L3
+                // lands the in-flight-destination rule (the
+                // textures.rs:41–48 hazard — the destination hands
+                // off to the ticket's quarantine instead).
+                match batch.flush(FlushMode::InlineWait) {
+                    FlushDisposition::Completed => Ok(texture),
+                    FlushDisposition::NotSubmitted(error)
+                    | FlushDisposition::SubmittedUnwaited { error, .. } => {
+                        // The partial texture must not survive its
+                        // never-submitted or (at this stage) stuck
+                        // upload.
+                        let mut texture = texture;
+                        texture.destroy(ctx);
+                        Err(error)
+                    }
+                    // Structurally impossible: only the Deferred arm
+                    // constructs this variant, and no wait runs here.
+                    FlushDisposition::Deferred { .. } => {
+                        unreachable!("an InlineWait flush never defers")
+                    }
                 }
-                Ok(texture)
             }
             None => Self::upload_unpooled(ctx, format, extent, texels),
         }

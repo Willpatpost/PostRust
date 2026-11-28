@@ -628,10 +628,6 @@ pub(crate) fn classify_fence_timeout(poll: Result<bool, vk::Result>) -> FenceTim
 /// (propagates to the caller's observe/latch — T06's composition),
 /// `Failed` propagates typed. The twin of [`classify_fence_timeout`]
 /// for the non-blocking poll path. Pure — unit-pinned.
-// Consumed by the L2 ordered-prefix retirement (§5.2); declared here
-// with the §4.3 twin so the pure classification substrate lands as
-// one unit (the design's L1 row).
-#[allow(dead_code)]
 pub(crate) enum FencePoll {
     Signaled,
     Pending,
@@ -639,10 +635,6 @@ pub(crate) enum FencePoll {
     Failed(vk::Result),
 }
 
-// Consumed by the L2 ordered-prefix retirement (§5.2); declared here
-// with the §4.3 twin so the pure classification substrate lands as
-// one unit (the design's L1 row).
-#[allow(dead_code)]
 pub(crate) fn classify_fence_status(poll: Result<bool, vk::Result>) -> FencePoll {
     match poll {
         Ok(signaled) if signaled => FencePoll::Signaled,

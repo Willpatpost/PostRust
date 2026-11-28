@@ -458,7 +458,7 @@ impl ProxyResources {
         // pool is groundwork for, not this milestone's claim). The
         // census: 3 per-object submits → 1. The pool-unavailable arm
         // keeps the per-object helper.
-        let mut staging_batch = ctx.begin_staging_batch();
+        let mut staging_batch = ctx.begin_staging_batch()?;
         let npc_bytes = bytemuck::cast_slice(npc);
         (self.npc_vbo, self.npc_memory) = match &mut staging_batch {
             Some(batch) => create_device_local_buffer_staged(
@@ -499,7 +499,14 @@ impl ProxyResources {
             ),
         }?;
         if let Some(batch) = staging_batch.as_mut() {
-            batch.flush(FlushMode::InlineWait)?;
+            // T16/T03: the flush's TYPED disposition — the `.error()` half is
+            // behavior-identical to the former `?` at this stage
+            // (the partial state's destroy releases the
+            // destinations); L3 lands the in-flight-destination
+            // rule for the SubmittedUnwaited arm.
+            if let Some(error) = batch.flush(FlushMode::InlineWait).error() {
+                return Err(error);
+            }
         }
         (self.instances, self.instances_memory, self.instances_mapped) = create_mapped_buffer(
             ctx,

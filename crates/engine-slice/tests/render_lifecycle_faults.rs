@@ -722,6 +722,93 @@ fn device_loss_is_typed_and_latched() {
     println!("CA-13 device loss: typed at the boundary, latched across every entry");
 }
 
+/// T16/L2 (the staging typing's rig leg — the design's §6 L2 row:
+/// "the fault battery on a live queue (never-signaling fence, poll-
+/// error arms)"): the CLASSIFIED ordered-prefix poll on a real queue
+/// — a never-signaling fence (the `StagingFenceNeverSignals` seam,
+/// one-shot) stuck at the in-flight HEAD keeps its region bound
+/// (R3's in-flight safety, re-proven under the classified poll: the
+/// old `Vec<bool>` + `.is_ok()` masking collected every fence's
+/// status and treated every ERROR as unsignaled; the new poll
+/// classifies each status and STOPS at the first pending entry),
+/// and a RETRY batch behind the stuck head stages and completes
+/// cleanly without retiring past it — the prefix property on a live
+/// queue. The drain's typed staging-timeout shape is preserved
+/// (§5.4: unchanged), and the teardown's CLASSIFIED idle (§5.4)
+/// releases the stuck entries (the drop completes — the audit's
+/// "don't assert device_idle succeeded when result was ignored"
+/// answered with the classification). The poll-ERROR arms (a loss
+/// at the poll) are owner-validation territory per the design's
+/// §7.2 — pinned by the CPU classification tables until a real loss
+/// is observed on the rig.
+#[test]
+#[ignore = "requires a real Vulkan device and windows (the rig run: release, serial, archived per E-8)"]
+fn classified_ordered_prefix_poll_keeps_the_stuck_head_bound() {
+    let _guard = sdl_lock();
+    let (mut app, mut renderer) = lifecycle_renderer("T16 L2 classified prefix poll");
+    let _ = app.frame();
+    // THE STUCK HEAD: the attach's deferred batch flushes with NO
+    // fence signal (the seam's structurally real never-signaling
+    // fence), so the attach's batch-end drain times out.
+    renderer.inject_lifecycle_fault(LifecycleFaultSite::StagingFenceNeverSignals, 1);
+    match attach_corner_scene(&mut renderer) {
+        Err(engine_renderer::RendererError::Vulkan(message)) => assert!(
+            message.contains("staging drain"),
+            "the typed drain timeout, preserved (§5.4): {message}"
+        ),
+        other => panic!("the never-signaling fence fails the attach's drain, got {other:?}"),
+    }
+    let stuck = renderer.allocations();
+    assert_eq!(
+        stuck.upload_submits, 2,
+        "the batch WAS submitted (the census counts it; the atlas batch retired)"
+    );
+    assert!(
+        stuck.staging_bound_region_bytes > 0,
+        "the never-signaling region stays bound under the classified poll"
+    );
+    // THE RETRY BEHIND THE STUCK HEAD: the seam is one-shot (the
+    // retry's flush carries a real fence), so the retry's batch
+    // stages at fresh offsets past the stuck region, its fence
+    // SIGNALS — and the ordered prefix still refuses to retire past
+    // the stuck head (the prefix property; the bound bytes now cover
+    // both regions). The retry's own drain times out on the head, so
+    // the attach fails again — the pool state, not a masking
+    // regression, is the witness.
+    match attach_corner_scene(&mut renderer) {
+        Err(engine_renderer::RendererError::Vulkan(message)) => assert!(
+            message.contains("staging drain"),
+            "the retry's drain still waits the stuck HEAD first: {message}"
+        ),
+        other => panic!("the retry fails at the stuck head's drain, got {other:?}"),
+    }
+    let after_retry = renderer.allocations();
+    assert_eq!(
+        after_retry.upload_submits,
+        stuck.upload_submits + 1,
+        "the retry's batch submitted once more (its own fence is real)"
+    );
+    assert!(
+        after_retry.staging_bound_region_bytes > stuck.staging_bound_region_bytes,
+        "the retry's region joins the bound set behind the stuck head \
+         (bound {} -> {} — the prefix never retires past a pending entry)",
+        stuck.staging_bound_region_bytes,
+        after_retry.staging_bound_region_bytes
+    );
+    let stats = renderer.stats();
+    assert_eq!(stats.validation_errors, 0, "{:?}", stats.recent_validation);
+    // THE §5.4 TEARDOWN: the classified idle makes the stuck entries'
+    // release legal — the drop completes (a wedged teardown fails
+    // right here).
+    drop(renderer);
+    drop(app);
+    println!(
+        "T16 L2: the classified prefix keeps the stuck head bound ({} bytes), the retry \
+         stages behind it, the teardown releases",
+        after_retry.staging_bound_region_bytes
+    );
+}
+
 /// T06/L1 (the lifecycle substrate's rig leg — the design's
 /// LIFECYCLE-T02-T03-T06-T16 §6 L1 row): the CA-13 latch absorbed
 /// into the `RendererLifecycle` state machine keeps every refusal
@@ -775,14 +862,8 @@ fn lifecycle_latch_covers_render_layers_and_the_loss_renderer_drops_cleanly() {
     // not exercise): refused with the same first observation's
     // context, without touching the dead device (an unarmed call
     // that reached the device would present a real frame).
-    let refused = renderer.render_layers(
-        &engine_slice::math::identity(),
-        &[],
-        None,
-        &[],
-        None,
-        size,
-    );
+    let refused =
+        renderer.render_layers(&engine_slice::math::identity(), &[], None, &[], None, size);
     match refused {
         Err(engine_renderer::RendererError::DeviceLost { operation }) => assert_eq!(
             operation, "acquire_next_image",
