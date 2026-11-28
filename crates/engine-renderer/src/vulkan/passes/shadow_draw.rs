@@ -786,13 +786,16 @@ impl ShadowResources {
         retained: Option<&skinned_draw::SkinnedRetained>,
         upload: Option<&proxy_draw::ProxyFrameUpload<'_>>,
     ) {
-        // The whole attached mesh, one draw: the ranges are
-        // contiguous and cover the buffer (the attach validation's
-        // contract), so the LAST range's end is the vertex count —
-        // the former `draws[2].end` for the three-range corner
-        // table, now stated over any validated table.
-        let (vertices, draws) = corner.mesh();
-        let total = draws.last().map_or(0, |range| range.end);
+        // The whole attached mesh, one draw: the count is the TYPED
+        // admission's whole-mesh fact (CA-14/CA-15 — the retained
+        // DrawTable's `whole_mesh_vertex_count`, a validated
+        // triangle-list boundary, not a re-derivation from the raw
+        // table): the ranges are contiguous, covering, and
+        // triangle-aligned, so `[0, count)` assembles exactly the
+        // primitive set the lit pass's per-material ranges
+        // assemble.
+        let (vertices, _) = corner.mesh();
+        let total = corner.whole_mesh_vertex_count();
         let clear = [vk::ClearValue {
             depth_stencil: vk::ClearDepthStencilValue {
                 depth: 1.0,

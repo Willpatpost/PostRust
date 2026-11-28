@@ -146,6 +146,14 @@ pub(crate) struct VulkanContext {
     /// the FIRST acquire site of the next frame so the retry acquire
     /// inside the out-of-date arm is structurally real.
     acquire_out_of_date_armed: Cell<bool>,
+    /// CA-13's one-shot acquire DEVICE-LOSS injection (F13/A14's
+    /// verification knob — the `VK_ERROR_DEVICE_LOST` acquire path,
+    /// unreachable from the test API otherwise): consumed at the
+    /// FIRST acquire site of the next frame, where the generic error
+    /// arm converts it through [`RendererError::vk`] into the TYPED
+    /// [`RendererError::DeviceLost`] the renderer's latch consumes.
+    /// Diagnostic-only, test-only.
+    acquire_device_lost_armed: Cell<bool>,
     /// Creation counts for Era-1 target builders' Vulkan objects (the
     /// review's finding 8 acquisitions: image, memory, view, framebuffer
     /// — post chain, wet chain, shadow chain). These are monotonic
@@ -519,6 +527,7 @@ impl VulkanContext {
             arena_replacements: Cell::new(0),
             arena_replacement_frees: Cell::new(0),
             acquire_out_of_date_armed: Cell::new(false),
+            acquire_device_lost_armed: Cell::new(false),
             target_images: Cell::new(0),
             target_image_views: Cell::new(0),
             target_framebuffers: Cell::new(0),
@@ -817,6 +826,49 @@ impl VulkanContext {
         self.acquire_out_of_date_armed.replace(false)
     }
 
+    /// Arms the one-shot acquire DEVICE-LOSS injection (CA-13's
+    /// verification knob — F13/A14: the `VK_ERROR_DEVICE_LOST`
+    /// acquire path, unreachable from the test API otherwise; real
+    /// device removal stays a separate validation question, the
+    /// audit's own boundary). Diagnostic-only, test-only: consumed
+    /// at the FIRST acquire site of the next frame, where the
+    /// generic error arm converts it through [`RendererError::vk`]
+    /// into the typed [`RendererError::DeviceLost`] — the faithful
+    /// driver contract (DEVICE_LOST means no image was acquired),
+    /// the same argument as the out-of-date knob.
+    pub(crate) fn set_acquire_device_lost(&self) {
+        self.acquire_device_lost_armed.set(true);
+    }
+
+    /// Returns and disarms the one-shot acquire device-loss plan.
+    /// `true` exactly once after `set_acquire_device_lost`, then
+    /// `false` until the next arm.
+    pub(crate) fn take_acquire_device_lost(&self) -> bool {
+        self.acquire_device_lost_armed.replace(false)
+    }
+
+    /// CA-12 (F12): the pose arena's binding-5 descriptor facts,
+    /// read once at construction for the shared representable-
+    /// capacity validation
+    /// ([`crate::config::ArenaBudgets::validate`]): the
+    /// `STORAGE_BUFFER_DYNAMIC` range ceiling
+    /// (`maxStorageBufferRange`) and offset-alignment requirement
+    /// (`minStorageBufferOffsetAlignment`) the pose carve's per-slot
+    /// stride must fit. SAFETY: querying the live physical device
+    /// this context was built on (the corner's own build does the
+    /// same).
+    pub(crate) fn pose_binding_limits(&self) -> (u64, u64) {
+        let limits = unsafe {
+            self.instance
+                .get_physical_device_properties(self.physical_device)
+        }
+        .limits;
+        (
+            u64::from(limits.max_storage_buffer_range),
+            limits.min_storage_buffer_offset_alignment.max(1),
+        )
+    }
+
     /// Create a target image, incrementing the creation counter on
     /// success. The caller's `what` string is used for error
     /// reporting. SAFETY: callers pass valid image create info for
@@ -935,7 +987,7 @@ impl VulkanContext {
     pub(crate) fn ensure_skinned_retained(
         &mut self,
         required_blocks: u32,
-        cap: usize,
+        cap: u32,
     ) -> Result<(), RendererError> {
         // The growth dispatch: take the retained state out so the
         // growth path can borrow the context (its device, its
@@ -944,11 +996,8 @@ impl VulkanContext {
         // buffer before the old one dies, so an error leaves the
         // prior state exactly as it was).
         if let Some(mut retained) = self.skinned_retained.take() {
-            let target = crate::config::arena_capacity_for(
-                retained.blocks_capacity(),
-                required_blocks,
-                cap as u32,
-            );
+            let target =
+                crate::config::arena_capacity_for(retained.blocks_capacity(), required_blocks, cap);
             let result = retained.ensure_capacity(self, target);
             self.skinned_retained = Some(retained);
             return result;
@@ -964,9 +1013,10 @@ impl VulkanContext {
         // degenerate zero-cap config refuses every non-empty pose
         // supply at the CAP while the empty supply keeps a valid
         // (704 B, 16-aligned) buffer — a zero-sized VkBuffer is
-        // spec-invalid, never created.
-        let capacity =
-            crate::config::arena_capacity_for(0, required_blocks.max(1), cap as u32).max(1);
+        // spec-invalid, never created. (CA-12: `cap` is the
+        // construction-VALIDATED u32 — device-checked against the
+        // binding-5 range/alignment at `Renderer::new`.)
+        let capacity = crate::config::arena_capacity_for(0, required_blocks.max(1), cap).max(1);
         let retained = skinned_draw::SkinnedRetained::new(self, corner, capacity)?;
         self.skinned_retained = Some(retained);
         Ok(())

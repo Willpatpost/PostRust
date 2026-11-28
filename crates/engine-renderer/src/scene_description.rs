@@ -32,17 +32,23 @@
 //! structural contracts the pass machinery relies on: one draw
 //! range per material in material order, the ranges contiguous,
 //! covering the vertex buffer (the shadow depth pass draws
-//! `[0, last.end)`), and NON-INVERTED — start ≤ end per range, so
+//! `[0, last.end)`), NON-INVERTED — start ≤ end per range, so
 //! the lit pass's `end - start` vertex count is overflow-free by
 //! construction on every admitted table (an empty range is the
-//! legal draws-nothing case); every material's albedo index
-//! inside the attached set; every texture at the procedural
-//! generator's byte contract; FINITE bounds and mirror-plane
-//! height (the shadow cascade's projection math and the wet
-//! reflection's mirrored camera consume them — nonfinite input
-//! degenerates both silently, so the admission domain is
-//! finite-only); the bounds ordered per axis (NaN refuses); and
-//! the wet roles inside the mesh.
+//! legal draws-nothing case); and TRIANGLE-ALIGNED boundaries
+//! (CA-15/F15) — every draw and wet-role boundary a multiple of
+//! [`VERTICES_PER_TRIANGLE`], so the depth pass's whole-mesh draw
+//! and the lit/reflection passes' per-range draws assemble the
+//! SAME primitive set (the mesh draws' typed admission is
+//! [`SceneMesh::admit_draws`], the retained
+//! [`DrawTable`]); every material's albedo index inside the
+//! attached set; every texture at the TYPED extent's byte
+//! contract ([`TextureExtent`] — CA-14's bounded first step);
+//! FINITE bounds and mirror-plane height (the shadow cascade's
+//! projection math and the wet reflection's mirrored camera
+//! consume them — nonfinite input degenerates both silently, so
+//! the admission domain is finite-only); the bounds ordered per
+//! axis (NaN refuses); and the wet roles inside the mesh.
 //! ONE boundary is a compile-time shape, not author freedom: the
 //! pass families' descriptor sets (the shadowed, skinned, and
 //! reflection per-material sets) are built for
@@ -94,6 +100,151 @@ pub use crate::lit_mesh::LitVertex;
 /// side of the boundary.
 pub const PASS_FAMILY_MATERIAL_COUNT: usize = 3;
 
+/// CA-15 (F15): the number of vertices one primitive of the scene
+/// mesh's topology consumes. Every pipeline that draws the attached
+/// mesh — the lit pass's per-material ranges
+/// (`corner.rs`'s `draw`), the shadow depth pass's whole-mesh draw
+/// (`shadow_draw.rs`'s `record_depth_pass`), and the reflection's
+/// receiver/redraw and reflected ranges (`reflection_draw.rs`) —
+/// assembles it as a NON-INDEXED TRIANGLE LIST (the pipelines'
+/// `vk::PrimitiveTopology::TRIANGLE_LIST` input-assembly state), so
+/// a primitive boundary sits at every vertex index that is a
+/// multiple of this constant. A draw/role range boundary that is
+/// NOT such a multiple splits a primitive: the whole-buffer draw
+/// and the per-range draws then assemble DIFFERENT primitive sets
+/// from the same vertices (the audit's disagreement — the depth
+/// pass's shadow map covers triangles the lit pass never draws, and
+/// vice versa), and a range whose LENGTH is not a multiple assembles
+/// an incomplete trailing primitive. The admission
+/// ([`SceneMesh::admit_draws`], the [`GroundRoles`] checks in
+/// [`SceneDescription::validate`]) rejects both shapes at attach.
+pub const VERTICES_PER_TRIANGLE: u32 = 3;
+
+/// CA-15 (F15): whether a vertex index sits ON a primitive boundary
+/// of the triangle-list topology (a multiple of
+/// [`VERTICES_PER_TRIANGLE`]) — the alignment every admitted draw
+/// and wet-role range boundary must carry. Pure.
+pub fn triangle_list_boundary(vertex_index: u32) -> bool {
+    vertex_index.is_multiple_of(VERTICES_PER_TRIANGLE)
+}
+
+/// CA-14 (Q06 — the bounded first step of the scene-contract
+/// generalization; see `scene_contract_design` for the full plan):
+/// the TYPED texture extent. Before this type the admission checked
+/// the albedo set's bytes against a magic arithmetic
+/// (`TEXTURE_SIZE * TEXTURE_SIZE * 4`) with the extent implicit in
+/// the number, and the upload re-stated it as a bare `Extent2D`
+/// built from the generator's constant — the first pass family's
+/// authored shape was knowledge duplicated at every consumer. The
+/// typed extent names the shape ONCE: the admission matches bytes
+/// against it ([`Self::matches`]), and the upload consumes the same
+/// value ([`SceneDescription::albedo_extent`]) — the generator's
+/// constants and the consumers' expectations are single-sourced
+/// through the type.
+///
+/// The first family's single square RGBA8 extent stays the compiled
+/// shape today (the same documented boundary as
+/// [`PASS_FAMILY_MATERIAL_COUNT`]); per-material extents and
+/// non-RGBA8 formats are the design record's migration plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextureExtent {
+    /// The extent's width in texels.
+    pub width: u32,
+    /// The extent's height in texels.
+    pub height: u32,
+    /// The bytes one texel carries (RGBA8 = 4 — the paired upload
+    /// format is `vk::Format::R8G8B8A8_UNORM`).
+    pub bytes_per_texel: u32,
+}
+
+impl TextureExtent {
+    /// The procedural albedo contract's extent — the first pass
+    /// family's authored shape (256×256 RGBA8), single-sourced from
+    /// the generator's own constants: the drift the byte-check used
+    /// to leave implicit is now a type-level pin (the generator, the
+    /// admission, and the upload read the SAME shape).
+    pub const PROC_ALBEDO: Self = Self {
+        width: crate::proc_texture::TEXTURE_SIZE,
+        height: crate::proc_texture::TEXTURE_SIZE,
+        bytes_per_texel: 4,
+    };
+
+    /// The extent's byte length — the admission's exact-match bound.
+    /// Saturating: an absurd authored extent (whose product would
+    /// overflow `u64`) never matches a real byte slice, so it
+    /// refuses rather than wrapping.
+    pub fn byte_len(self) -> u64 {
+        (self.width as u64)
+            .saturating_mul(self.height as u64)
+            .saturating_mul(self.bytes_per_texel as u64)
+    }
+
+    /// Whether a byte slice carries exactly this extent's shape
+    /// (`width × height × bytes_per_texel` bytes, row-major).
+    pub fn matches(self, bytes: &[u8]) -> bool {
+        bytes.len() as u64 == self.byte_len()
+    }
+}
+
+/// CA-14 + CA-15: the ADMITTED material/draw table — the typed form
+/// [`SceneMesh`]'s draw ranges take at admission. Built ONLY by
+/// [`SceneMesh::admit_draws`], which performs the whole structural
+/// contract (one range per material in material order, first start
+/// at 0, every range non-inverted, contiguous, covering the whole
+/// vertex buffer, and — CA-15's addition — every boundary
+/// TRIANGLE-ALIGNED), so every consumer reads a table whose ranges
+/// assemble the SAME primitive set however they are grouped:
+///
+/// - the lit pass draws each material's range separately
+///   (`firstVertex = range.start`, `vertexCount = end − start`);
+/// - the shadow depth pass draws the WHOLE buffer as one range
+///   (`[0, whole_mesh_vertex_count)`);
+/// - the reflection re-draws the receiver and reflected ranges.
+///
+/// With every boundary a multiple of
+/// [`VERTICES_PER_TRIANGLE`], all three groupings partition the same
+/// authored triangles — the pre-fix admission checked ordering,
+/// coverage and bounds but NOT alignment, so a boundary inside a
+/// triangle (a table contiguous, covering, non-inverted, and
+/// misaligned) made the depth pass's absolute-triangle assembly
+/// disagree with the lit pass's per-range assembly. The typed
+/// retention (the upload path keeps the admitted table, not the raw
+/// ranges) is the first step of the CA-14 generalization: the
+/// pass families' consumption goes through named admission facts
+/// ([`Self::ranges`], [`Self::whole_mesh_vertex_count`]) instead of
+/// re-deriving them from the raw table at each draw site.
+///
+/// `Default` is the PARTIAL-CONSTRUCTION placeholder only (an
+/// empty table over zero vertices — `CornerResources`'s build
+/// initializes the real table through [`SceneMesh::admit_draws`]
+/// before any draw can run); it is never drawn.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DrawTable {
+    /// The per-material draw ranges, in material order (validated:
+    /// see [`SceneMesh::admit_draws`]).
+    ranges: Vec<Range<u32>>,
+    /// The whole-buffer vertex count (the last range's end — the
+    /// depth pass's whole-mesh draw count, a validated
+    /// triangle-aligned tail).
+    vertex_count: u32,
+}
+
+impl DrawTable {
+    /// The per-material draw ranges in material order — the lit
+    /// pass's bind-per-range consumption.
+    pub fn ranges(&self) -> &[Range<u32>] {
+        &self.ranges
+    }
+
+    /// The whole-buffer vertex count — the shadow depth pass's
+    /// whole-mesh draw (`[0, vertex_count)`), the typed admission
+    /// fact the pass reads instead of re-deriving it from the raw
+    /// table.
+    pub fn whole_mesh_vertex_count(&self) -> u32 {
+        self.vertex_count
+    }
+}
+
 /// One static lit mesh: world-space triangle-list vertices plus
 /// ONE draw range per material, in MATERIAL ORDER — range `i`
 /// draws material `i`'s triangles through material `i`'s
@@ -118,8 +269,171 @@ pub struct SceneMesh {
     pub vertices: Vec<LitVertex>,
     /// One draw range per material, in material order: starting at
     /// 0, contiguous, ending at `vertices.len()`, every range
-    /// non-inverted (start ≤ end — an empty range draws nothing).
+    /// non-inverted (start ≤ end — an empty range draws nothing) and
+    /// every boundary triangle-aligned (a multiple of
+    /// [`VERTICES_PER_TRIANGLE`]). Validated whole by
+    /// [`Self::admit_draws`] — the typed constructor
+    /// [`SceneDescription::validate`] and the upload path both
+    /// consume.
     pub draws: Vec<Range<u32>>,
+}
+
+impl SceneMesh {
+    /// CA-14 + CA-15: admits the draw table WHOLE — the typed
+    /// constructor that performs every structural contract the pass
+    /// machinery relies on, returning the retained
+    /// [`DrawTable`]. A refusal builds nothing (the
+    /// capture-refusal discipline, attach-time form). The checks,
+    /// in order:
+    ///
+    /// 1. **One range per material** (`draws.len() ==
+    ///    material_count`) — the lit pass binds one descriptor set
+    ///    per range.
+    /// 2. **First start at 0** — the shadow depth pass draws
+    ///    `[0, last.end)` as the whole scene; an author cannot
+    ///    leave a gap the depth pass would miss.
+    /// 3. **Every range NON-INVERTED** (start ≤ end) — the R01
+    ///    hole: the lit pass computes `end - start` as the draw's
+    ///    vertex count, a u32 underflow on an inverted table. An
+    ///    empty `[n, n)` is legal (a vertexCount-0 `cmd_draw` is a
+    ///    Vulkan no-op).
+    /// 4. **Contiguous** — range `i`'s end is range `i+1`'s start.
+    /// 5. **Covering** — the last range's end is the vertex count.
+    /// 6. **Every boundary TRIANGLE-ALIGNED** (CA-15/F15) — every
+    ///    range's start AND the vertex count are multiples of
+    ///    [`VERTICES_PER_TRIANGLE`]. Together with contiguity and
+    ///    coverage this makes EVERY boundary (interior ends
+    ///    included, and every range's length) aligned, so the depth
+    ///    pass's whole-buffer draw and the lit pass's per-range
+    ///    draws assemble the SAME primitive set; before this check
+    ///    a boundary inside a triangle passed every legacy check
+    ///    and split a primitive between materials.
+    pub fn admit_draws(&self, material_count: usize) -> Result<DrawTable, RendererError> {
+        if self.draws.len() != material_count {
+            return Err(RendererError::Vulkan(format!(
+                "the scene mesh has {} draw ranges but the material table has \
+                 {} entries (one range per material, in material order)",
+                self.draws.len(),
+                material_count
+            )));
+        }
+        if self.draws[0].start != 0 {
+            return Err(RendererError::Vulkan(format!(
+                "the scene mesh's first draw range starts at {} (the ranges \
+                 must start at vertex 0 — the shadow depth pass draws the \
+                 whole buffer)",
+                self.draws[0].start
+            )));
+        }
+        // ---- the re-audit's R01 hole, closed: every range
+        // NON-INVERTED. Before this check the four structural
+        // contracts (start at 0, contiguous, covering) all held for
+        // an inverted table like [[0,5],[5,3],[3,N]] — contiguity
+        // compares end to the NEXT start, so it holds on both
+        // sides of an inverted range — and the lit pass's draw
+        // loop (corner.rs) then computed `end - start` as the
+        // draw's vertex count, a u32 UNDERFLOW (a debug panic; a
+        // four-billion-vertex release draw).
+        //
+        // THE POLICY — start ≤ end, NOT start < end: an empty
+        // range [n, n) is a LEGAL draws-nothing table entry.
+        // `lit_mesh::mesh_from_boxes` emits exactly that for a
+        // material with no boxes in the authored table, and the
+        // wet roles already document the same legality for an
+        // empty `reflected` range. Downstream, an empty range is
+        // consumed SAFELY with no guard needed: `cmd_draw` with
+        // vertexCount 0 is a Vulkan no-op (corner.rs's lit loop),
+        // and the depth pass's whole-mesh draw reads only the
+        // LAST range's end (unchanged by interior empties).
+        //
+        // THE OVERFLOW-FREE PROOF this check completes: with
+        // start ≤ end per range, the four contracts chain into
+        //   0 = draws[0].start ≤ draws[0].end = draws[1].start ≤
+        //   … ≤ last.end = vertices.len(),
+        // so EVERY endpoint of EVERY range sits in
+        // [0, vertex_count] — each `end - start` is in
+        // [0, vertex_count] and each `start` (the draw's
+        // firstVertex) is inside the buffer. The subtraction the
+        // lit and reflection recorders perform is overflow-free
+        // on EVERY admitted description, by construction. ----
+        for (index, range) in self.draws.iter().enumerate() {
+            if range.start > range.end {
+                return Err(RendererError::Vulkan(format!(
+                    "the scene mesh's draw range {index} [{}, {}) is inverted \
+                     (every range must satisfy start ≤ end — the lit pass \
+                     computes end - start as the draw's vertex count, which \
+                     would underflow)",
+                    range.start, range.end
+                )));
+            }
+        }
+        for (index, pair) in self.draws.windows(2).enumerate() {
+            if pair[0].end != pair[1].start {
+                return Err(RendererError::Vulkan(format!(
+                    "the scene mesh's draw ranges must be contiguous (range \
+                     {index} ends at {} but range {} starts at {})",
+                    pair[0].end,
+                    index + 1,
+                    pair[1].start
+                )));
+            }
+        }
+        let vertex_count = self.vertices.len() as u32;
+        if self
+            .draws
+            .last()
+            .is_none_or(|range| range.end != vertex_count)
+        {
+            return Err(RendererError::Vulkan(format!(
+                "the scene mesh's last draw range ends at {} but the mesh has \
+                 {} vertices (the ranges must cover the whole buffer)",
+                self.draws.last().map_or(0, |range| range.end),
+                vertex_count
+            )));
+        }
+        // ---- CA-15 (F15): the triangle-list boundary contract. The
+        // checks above prove every boundary sits in
+        // [0, vertex_count]; THIS check proves each sits ON a
+        // primitive boundary. The failure shape it refuses: a table
+        // contiguous, covering, and non-inverted whose boundary
+        // falls INSIDE a triangle — the depth pass's whole-buffer
+        // draw assembles primitives at absolute indices
+        // 0, 3, 6, … while the lit pass's material-`i` draw
+        // assembles at `range.start, range.start + 3, …`, so a
+        // misaligned boundary makes the two passes assemble
+        // DIFFERENT primitive sets from the same vertices (the
+        // shadow map covers triangles the lit pass never draws,
+        // and vice versa), and a range whose length is not a
+        // multiple of 3 assembles an incomplete trailing
+        // primitive. Checking every range's start (which, through
+        // contiguity, is every interior end) plus the vertex count
+        // (the tail) makes every boundary and every range length
+        // aligned. ----
+        for (index, range) in self.draws.iter().enumerate() {
+            if !triangle_list_boundary(range.start) {
+                return Err(RendererError::Vulkan(format!(
+                    "the scene mesh's draw range {index} starts at vertex {} — \
+                     inside a triangle (triangle-list boundaries are multiples \
+                     of {}; the depth pass's whole-mesh draw and the lit pass's \
+                     per-range draws would assemble different primitive sets)",
+                    range.start, VERTICES_PER_TRIANGLE
+                )));
+            }
+        }
+        if !triangle_list_boundary(vertex_count) {
+            return Err(RendererError::Vulkan(format!(
+                "the scene mesh has {vertex_count} vertices — not a multiple of \
+                 {} (the tail splits a triangle: the depth pass's whole-mesh \
+                 draw would assemble a primitive set the per-range draws \
+                 cannot)",
+                VERTICES_PER_TRIANGLE
+            )));
+        }
+        Ok(DrawTable {
+            ranges: self.draws.clone(),
+            vertex_count,
+        })
+    }
 }
 
 /// The wet-ground reflection's role-tagged mesh ranges — the
@@ -228,98 +542,21 @@ impl SceneDescription {
                 PASS_FAMILY_MATERIAL_COUNT
             )));
         }
-        // ---- the mesh's draw ranges: one per material,
-        // non-inverted, contiguous, covering the buffer (the depth
-        // pass draws [0, last.end); the lit pass's per-range
-        // `end - start` is overflow-free on every admitted
-        // table). ----
+        // ---- the mesh's draw table: the TYPED admission (CA-14's
+        // bounded first step — the structural checks moved INTO
+        // [`SceneMesh::admit_draws`]'s typed constructor, with
+        // CA-15's triangle-alignment contracts added); the admitted
+        // table is what the upload path retains. ----
         if mesh.vertices.is_empty() {
             return Err(RendererError::Vulkan("the scene mesh is empty".into()));
         }
-        if mesh.draws.len() != materials.len() {
-            return Err(RendererError::Vulkan(format!(
-                "the scene mesh has {} draw ranges but the material table has \
-                 {} entries (one range per material, in material order)",
-                mesh.draws.len(),
-                materials.len()
-            )));
-        }
-        if mesh.draws[0].start != 0 {
-            return Err(RendererError::Vulkan(format!(
-                "the scene mesh's first draw range starts at {} (the ranges \
-                 must start at vertex 0 — the shadow depth pass draws the \
-                 whole buffer)",
-                mesh.draws[0].start
-            )));
-        }
-        // ---- the re-audit's R01 hole, closed: every range
-        // NON-INVERTED. Before this check the four structural
-        // contracts (start at 0, contiguous, covering) all held for
-        // an inverted table like [[0,5],[5,3],[3,N]] — contiguity
-        // compares end to the NEXT start, so it holds on both
-        // sides of an inverted range — and the lit pass's draw
-        // loop (corner.rs) then computed `end - start` as the
-        // draw's vertex count, a u32 UNDERFLOW (a debug panic; a
-        // four-billion-vertex release draw).
-        //
-        // THE POLICY — start ≤ end, NOT start < end: an empty
-        // range [n, n) is a LEGAL draws-nothing table entry.
-        // `lit_mesh::mesh_from_boxes` emits exactly that for a
-        // material with no boxes in the authored table, and the
-        // wet roles already document the same legality for an
-        // empty `reflected` range. Downstream, an empty range is
-        // consumed SAFELY with no guard needed: `cmd_draw` with
-        // vertexCount 0 is a Vulkan no-op (corner.rs's lit loop),
-        // and the depth pass's whole-mesh draw reads only the
-        // LAST range's end (unchanged by interior empties).
-        //
-        // THE OVERFLOW-FREE PROOF this check completes: with
-        // start ≤ end per range, the four contracts chain into
-        //   0 = draws[0].start ≤ draws[0].end = draws[1].start ≤
-        //   … ≤ last.end = vertices.len(),
-        // so EVERY endpoint of EVERY range sits in
-        // [0, vertex_count] — each `end - start` is in
-        // [0, vertex_count] and each `start` (the draw's
-        // firstVertex) is inside the buffer. The subtraction the
-        // lit and reflection recorders perform is overflow-free
-        // on EVERY admitted description, by construction. ----
-        for (index, range) in mesh.draws.iter().enumerate() {
-            if range.start > range.end {
-                return Err(RendererError::Vulkan(format!(
-                    "the scene mesh's draw range {index} [{}, {}) is inverted \
-                     (every range must satisfy start ≤ end — the lit pass \
-                     computes end - start as the draw's vertex count, which \
-                     would underflow)",
-                    range.start, range.end
-                )));
-            }
-        }
-        for (index, pair) in mesh.draws.windows(2).enumerate() {
-            if pair[0].end != pair[1].start {
-                return Err(RendererError::Vulkan(format!(
-                    "the scene mesh's draw ranges must be contiguous (range \
-                     {index} ends at {} but range {} starts at {})",
-                    pair[0].end,
-                    index + 1,
-                    pair[1].start
-                )));
-            }
-        }
-        let vertex_count = mesh.vertices.len() as u32;
-        if mesh
-            .draws
-            .last()
-            .is_none_or(|range| range.end != vertex_count)
-        {
-            return Err(RendererError::Vulkan(format!(
-                "the scene mesh's last draw range ends at {} but the mesh has \
-                 {} vertices (the ranges must cover the whole buffer)",
-                mesh.draws.last().map_or(0, |range| range.end),
-                vertex_count
-            )));
-        }
+        let draws = mesh.admit_draws(materials.len())?;
+        let vertex_count = draws.whole_mesh_vertex_count();
         // ---- the albedo set: every material's index inside it, every
-        // texture at the generator's byte contract. ----
+        // texture at the TYPED extent's byte contract (CA-14's
+        // bounded first step — the extent is named and typed, the
+        // same value the upload consumes through
+        // [`Self::albedo_extent`]). ----
         for (index, material) in materials.iter().enumerate() {
             if material.texture as usize >= textures.textures.len() {
                 return Err(RendererError::Vulkan(format!(
@@ -330,14 +567,17 @@ impl SceneDescription {
                 )));
             }
         }
-        let texture_bytes =
-            (crate::proc_texture::TEXTURE_SIZE * crate::proc_texture::TEXTURE_SIZE * 4) as usize;
+        let extent = self.albedo_extent();
         for (index, texture) in textures.textures.iter().enumerate() {
-            if texture.len() != texture_bytes {
+            if !extent.matches(texture) {
                 return Err(RendererError::Vulkan(format!(
                     "scene texture {index} is {} bytes; the procedural albedo \
-                     contract is TEXTURE_SIZE²·4 ({texture_bytes})",
-                    texture.len()
+                     contract is the typed extent {}×{}×{} B/texel ({} bytes)",
+                    texture.len(),
+                    extent.width,
+                    extent.height,
+                    extent.bytes_per_texel,
+                    extent.byte_len()
                 )));
             }
         }
@@ -380,11 +620,25 @@ impl SceneDescription {
         // ---- the wet ground roles: inside the mesh; the receiver
         // non-empty (an empty receiver would silently disable the wet
         // re-draw); reflected ranges may be EMPTY (a legal no-op draw)
-        // but never inverted or outside the mesh. The mirror plane
-        // FINITE (the re-audit's R02 class on the reflection's own
-        // authored float): `planar.rs` mirrors the wet camera across
-        // it (`2 · plane_y − eye`, the mirrored view-projection), and
-        // a NaN or ±inf plane propagates straight into the mirrored
+        // but never inverted or outside the mesh; and — CA-15 (F15)
+        // — every role boundary TRIANGLE-ALIGNED: the wet re-draw
+        // re-rasterizes the receiver with `firstVertex = start` and
+        // the mirror pass draws each reflected range the same way,
+        // so a role boundary inside a triangle makes the re-draw
+        // assemble primitives the lit pass never drew (a receiver
+        // [1, 7) over a ground quad authored at [0, 6) rasterizes
+        // the slivers (1,2,3)(4,5,6) — geometry no pass authored),
+        // and a role LENGTH that is not a multiple of 3 assembles an
+        // incomplete trailing primitive. The policy is uniform,
+        // empty ranges included: a role range is a position IN the
+        // mesh's primitive structure, and an author pointing inside
+        // a primitive is an authoring error refused fail-visibly
+        // (the builder emits only aligned boundaries — every quad is
+        // six vertices). The mirror plane FINITE (the re-audit's
+        // R02 class on the reflection's own authored float):
+        // `planar.rs` mirrors the wet camera across it
+        // (`2 · plane_y − eye`, the mirrored view-projection), and a
+        // NaN or ±inf plane propagates straight into the mirrored
         // camera — a silently broken reflection, not a refusal. ----
         if !ground.receiver_plane_y.is_finite() {
             return Err(RendererError::Vulkan(format!(
@@ -406,6 +660,28 @@ impl SceneDescription {
                 ground.receiver.start, ground.receiver.end
             )));
         }
+        // CA-15: the receiver's two boundaries (start for the
+        // re-draw's firstVertex, length for its vertexCount).
+        if !triangle_list_boundary(ground.receiver.start) {
+            return Err(RendererError::Vulkan(format!(
+                "the wet ground's receiver range starts at vertex {} — inside \
+                 a triangle (triangle-list boundaries are multiples of {}; the \
+                 wet re-draw would rasterize primitives the lit pass never \
+                 drew)",
+                ground.receiver.start, VERTICES_PER_TRIANGLE
+            )));
+        }
+        if !triangle_list_boundary(ground.receiver.end - ground.receiver.start) {
+            return Err(RendererError::Vulkan(format!(
+                "the wet ground's receiver range [{}, {}) is {} vertices long — \
+                 not a multiple of {} (the wet re-draw would assemble an \
+                 incomplete trailing triangle)",
+                ground.receiver.start,
+                ground.receiver.end,
+                ground.receiver.end - ground.receiver.start,
+                VERTICES_PER_TRIANGLE
+            )));
+        }
         for (index, range) in ground.reflected.iter().enumerate() {
             if range.start > range.end {
                 return Err(RendererError::Vulkan(format!(
@@ -421,8 +697,40 @@ impl SceneDescription {
                     range.start, range.end
                 )));
             }
+            // CA-15: the reflected range's boundaries, the receiver
+            // check's own contract (an empty range must still sit ON
+            // a boundary — the uniform role policy above).
+            if !triangle_list_boundary(range.start) {
+                return Err(RendererError::Vulkan(format!(
+                    "the wet ground's reflected range {index} starts at vertex \
+                     {} — inside a triangle (triangle-list boundaries are \
+                     multiples of {}; the mirror pass would draw primitives \
+                     the lit pass never drew)",
+                    range.start, VERTICES_PER_TRIANGLE
+                )));
+            }
+            if !triangle_list_boundary(range.end - range.start) {
+                return Err(RendererError::Vulkan(format!(
+                    "the wet ground's reflected range {index} [{}, {}) is {} \
+                     vertices long — not a multiple of {} (the mirror pass \
+                     would assemble an incomplete trailing triangle)",
+                    range.start,
+                    range.end,
+                    range.end - range.start,
+                    VERTICES_PER_TRIANGLE
+                )));
+            }
         }
         Ok(())
+    }
+
+    /// CA-14 (Q06): the albedo set's TYPED extent — the shape every
+    /// texture was validated against and the upload's `Extent2D`
+    /// source. The first pass family's single square RGBA8 shape
+    /// today ([`TextureExtent::PROC_ALBEDO`]); per-set extents are
+    /// the design record's migration plan (`scene_contract_design`).
+    pub fn albedo_extent(&self) -> TextureExtent {
+        TextureExtent::PROC_ALBEDO
     }
 }
 
@@ -865,5 +1173,252 @@ mod tests {
                 "the refusal names the plane: {text}"
             );
         }
+    }
+
+    /// THE CA-15 WITNESS (F15 — the triangle-list boundary split,
+    /// verified against the pre-fix admission at the lane's base):
+    /// a table CONTIGUOUS, COVERING, and NON-INVERTED — passing
+    /// every legacy check — whose boundary falls INSIDE a triangle.
+    /// The baseline's ground quad is [0, 6); a boundary at 5 splits
+    /// its second triangle (verts 3, 4, 5): the depth pass's
+    /// whole-buffer draw assembles triangles at absolute indices
+    /// 0, 3, 6, … while material 0's lit draw assembles at 0, 3 and
+    /// material 1's starts at 5 — different primitive sets from the
+    /// same vertices (the shadow map covers triangles the lit pass
+    /// never draws, and vice versa). The triangle-aligned admission
+    /// refuses it, next to the VALID three-vertex boundary that
+    /// admits (the split sits one vertex from a legal boundary).
+    #[test]
+    fn misaligned_draw_boundaries_are_refused() {
+        // A boundary inside the ground quad's second triangle.
+        let mut scene = valid_scene();
+        scene.mesh.draws[0] = 0..5;
+        scene.mesh.draws[1] = 5..scene.mesh.draws[1].end;
+        let error = scene
+            .validate()
+            .expect_err("a mid-triangle draw boundary must refuse");
+        let RendererError::Vulkan(text) = &error else {
+            panic!("the refusal is a Vulkan error: {error:?}");
+        };
+        assert!(
+            text.contains("draw range 1") && text.contains("inside a triangle"),
+            "the refusal names the range and the split: {text}"
+        );
+        // The same split one material later (a boundary inside a
+        // box's wall quad): [0, 6), [6, 37), [37, 66).
+        let mut scene = valid_scene();
+        let end = scene.mesh.draws[1].end;
+        scene.mesh.draws[1] = scene.mesh.draws[1].start..end + 1;
+        scene.mesh.draws[2] = end + 1..scene.mesh.draws[2].end;
+        let error = scene
+            .validate()
+            .expect_err("a mid-mesh misaligned boundary must refuse");
+        let RendererError::Vulkan(text) = &error else {
+            panic!("the refusal is a Vulkan error: {error:?}");
+        };
+        assert!(
+            text.contains("draw range 2") && text.contains("inside a triangle"),
+            "the refusal names the range and the split: {text}"
+        );
+        // THE TAIL: a vertex count that is not a multiple of 3 —
+        // contiguous and covering (the last range ends exactly at
+        // the buffer) but the whole-mesh draw would assemble a
+        // primitive set the per-range draws cannot.
+        let mut scene = valid_scene();
+        scene.mesh.vertices.push(scene.mesh.vertices[0]);
+        let last = scene.mesh.draws.last_mut().expect("three ranges");
+        last.end += 1;
+        let error = scene
+            .validate()
+            .expect_err("a misaligned vertex count must refuse");
+        let RendererError::Vulkan(text) = &error else {
+            panic!("the refusal is a Vulkan error: {error:?}");
+        };
+        assert!(
+            text.contains("not a multiple of 3"),
+            "the refusal names the tail split: {text}"
+        );
+        // The VALID three-vertex boundary one vertex away admits —
+        // the baseline itself (the ink gates' scenes: the corner and
+        // garage tables are exactly this shape, so their captures
+        // are unchanged by the admission).
+        valid_scene()
+            .validate()
+            .expect("the aligned baseline still admits");
+    }
+
+    /// CA-15 on the WET ROLES: a receiver or reflected range that
+    /// starts inside a triangle (the re-draw would rasterize
+    /// primitives no pass authored) or carries a length that is not
+    /// a multiple of 3 (an incomplete trailing primitive) refuses —
+    /// and an EMPTY reflected range must still sit ON a boundary
+    /// (the uniform role policy: a role range is a position in the
+    /// mesh's primitive structure).
+    #[test]
+    fn misaligned_wet_role_boundaries_are_refused() {
+        // A receiver starting inside the ground quad's first
+        // triangle: [1, 7) — start misaligned, length aligned.
+        let mut scene = valid_scene();
+        scene.ground.receiver = 1..7;
+        let error = scene
+            .validate()
+            .expect_err("a misaligned receiver start must refuse");
+        let RendererError::Vulkan(text) = &error else {
+            panic!("the refusal is a Vulkan error: {error:?}");
+        };
+        assert!(
+            text.contains("receiver range") && text.contains("inside a triangle"),
+            "the refusal names the receiver split: {text}"
+        );
+        // A receiver whose LENGTH splits a triangle: [0, 5) — start
+        // aligned, length misaligned.
+        let mut scene = valid_scene();
+        scene.ground.receiver = 0..5;
+        let error = scene
+            .validate()
+            .expect_err("a misaligned receiver length must refuse");
+        let RendererError::Vulkan(text) = &error else {
+            panic!("the refusal is a Vulkan error: {error:?}");
+        };
+        assert!(
+            text.contains("receiver range")
+                && text.contains("not a multiple of 3")
+                && text.contains("incomplete trailing triangle"),
+            "the refusal names the incomplete primitive: {text}"
+        );
+        // A reflected range with both splits: [7, 12).
+        let mut scene = valid_scene();
+        scene.ground.reflected[0] = 7..12;
+        let error = scene
+            .validate()
+            .expect_err("a misaligned reflected range must refuse");
+        let RendererError::Vulkan(text) = &error else {
+            panic!("the refusal is a Vulkan error: {error:?}");
+        };
+        assert!(
+            text.contains("reflected range 0") && text.contains("inside a triangle"),
+            "the refusal names the reflected split: {text}"
+        );
+        // A reflected range whose length splits a triangle: [6, 11).
+        let mut scene = valid_scene();
+        scene.ground.reflected[0] = 6..11;
+        let error = scene
+            .validate()
+            .expect_err("a misaligned reflected length must refuse");
+        let RendererError::Vulkan(text) = &error else {
+            panic!("the refusal is a Vulkan error: {error:?}");
+        };
+        assert!(
+            text.contains("reflected range 0") && text.contains("not a multiple of 3"),
+            "the refusal names the reflected length: {text}"
+        );
+        // An EMPTY reflected range at a misaligned position refuses
+        // under the uniform policy (it draws nothing, but the author
+        // is pointing inside a primitive — fail-visible, never a
+        // silent oddity).
+        let mut scene = valid_scene();
+        scene.ground.reflected[1] = 4..4;
+        let error = scene
+            .validate()
+            .expect_err("an empty-but-misaligned reflected range must refuse");
+        let RendererError::Vulkan(text) = &error else {
+            panic!("the refusal is a Vulkan error: {error:?}");
+        };
+        assert!(
+            text.contains("reflected range 1") && text.contains("inside a triangle"),
+            "the refusal names the empty-but-misaligned range: {text}"
+        );
+        // The VALID shapes next to every split above admit: the
+        // baseline's roles (the builder's own boundaries).
+        valid_scene()
+            .validate()
+            .expect("the aligned roles still admit");
+    }
+
+    /// CA-14 + CA-15's valid-case pin (the ink-gate coherence): the
+    /// shared builder's output is triangle-aligned at EVERY
+    /// boundary (each quad is exactly six vertices — two complete
+    /// triangles), and the typed admission reproduces the raw
+    /// table's facts. Every live scene (the corner, the garage, the
+    /// fixtures) builds through this builder, so the alignment
+    /// admission changes none of them — the rig's capture gates
+    /// (the ink gates) keep their exact color/depth agreement.
+    #[test]
+    fn the_builder_output_is_triangle_aligned_and_the_admission_reproduces_it() {
+        let scene = valid_scene();
+        let table = scene
+            .mesh
+            .admit_draws(PASS_FAMILY_MATERIAL_COUNT)
+            .expect("the builder's table admits");
+        // Every boundary (each start, each end) is a multiple of 3.
+        for range in table.ranges() {
+            assert!(
+                triangle_list_boundary(range.start),
+                "start {} is a primitive boundary",
+                range.start
+            );
+            assert!(
+                triangle_list_boundary(range.end),
+                "end {} is a primitive boundary",
+                range.end
+            );
+            assert!(triangle_list_boundary(range.end - range.start));
+        }
+        // The typed table reproduces the raw table's facts.
+        assert_eq!(table.ranges(), scene.mesh.draws.as_slice());
+        assert_eq!(
+            table.whole_mesh_vertex_count(),
+            scene.mesh.vertices.len() as u32
+        );
+        // The builder's own quads: six vertices each, so every
+        // material's range is a multiple of 6 (two triangles per
+        // quad — the alignment is structural, not incidental).
+        for range in table.ranges() {
+            assert_eq!(
+                (range.end - range.start) % 6,
+                0,
+                "the box-authored range [{}, {}) is quad-multiples",
+                range.start,
+                range.end
+            );
+        }
+    }
+
+    /// CA-14 (Q06): the typed texture extent pins the procedural
+    /// contract — the extent's facts are the generator's own
+    /// constants (single-sourced), the byte length is the exact
+    /// match bound, and the admission's texture check reads the
+    /// typed shape (the refusal names the extent, not a magic
+    /// byte count).
+    #[test]
+    fn the_typed_texture_extent_pins_the_procedural_contract() {
+        let extent = TextureExtent::PROC_ALBEDO;
+        assert_eq!(extent.width, crate::proc_texture::TEXTURE_SIZE);
+        assert_eq!(extent.height, crate::proc_texture::TEXTURE_SIZE);
+        assert_eq!(extent.bytes_per_texel, 4);
+        assert_eq!(
+            extent.byte_len(),
+            u64::from(crate::proc_texture::TEXTURE_SIZE * crate::proc_texture::TEXTURE_SIZE * 4)
+        );
+        assert_eq!(extent.byte_len(), 262_144, "256×256×4");
+        // The generator's own output matches the typed extent (the
+        // single-sourcing pin: generator, admission, and upload read
+        // one shape).
+        assert!(extent.matches(&crate::proc_texture::procedural_texture(0)));
+        assert!(!extent.matches(&[]));
+        assert!(!extent.matches(&vec![0_u8; 262_143]));
+        assert!(!extent.matches(&vec![0_u8; 262_145]));
+        // An absurd authored extent saturates instead of wrapping —
+        // and therefore never matches a real byte slice.
+        let absurd = TextureExtent {
+            width: u32::MAX,
+            height: u32::MAX,
+            bytes_per_texel: u32::MAX,
+        };
+        assert_eq!(absurd.byte_len(), u64::MAX);
+        assert!(!absurd.matches(&vec![0_u8; 1_000]));
+        // The description's accessor hands the same typed shape to
+        // the upload path.
+        assert_eq!(valid_scene().albedo_extent(), TextureExtent::PROC_ALBEDO);
     }
 }

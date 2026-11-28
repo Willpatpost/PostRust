@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use sdl3::video::Window as SdlWindow;
 
-use crate::config::{RenderConfig, TargetFaultSite, TargetFaultStage, present_mode_str};
+use crate::config::{
+    ArenaBudgets, RenderConfig, TargetFaultSite, TargetFaultStage, present_mode_str,
+};
 use crate::overlay::{AtlasText, OverlayVertex};
 use crate::scene::SceneVertex;
 use crate::scene_description::{SceneDescription, SceneHandle};
@@ -403,6 +405,22 @@ pub struct Renderer {
     /// frame (with the proxy mode); `Off` by default and in every
     /// production frame.
     ripple_debug: RippleDebugMode,
+    /// CA-12 (F12): the three arena budgets VALIDATED at
+    /// construction — the shared representable capacity (`u32`, the
+    /// pose arena device-checked against the binding-5 storage
+    /// range/alignment). The ONE trio every later boundary reads:
+    /// the frame policy's carve caps AND the submission policy's
+    /// repack caps (widened to `usize` only at the public repack
+    /// calls, losslessly), so the CPU typed-refusal boundary and
+    /// the device carve ceiling are the same number by construction.
+    arena_budgets: ArenaBudgets,
+    /// CA-13 (F13/A14): the device-loss latch. `None` until the
+    /// first [`crate::RendererError::DeviceLost`] leaves a
+    /// device-touching entry; from then on every public
+    /// frame/attach/capture entry refuses with the typed variant
+    /// WITHOUT touching the dead device (repeated submissions on a
+    /// lost device are prevented, not retried).
+    device_lost: vulkan::DeviceLossLatch,
 }
 
 /// The Era-1 sky layer's frame description (the per-frame
@@ -534,6 +552,31 @@ impl Renderer {
         let atlas_text = AtlasText::default();
         let (mut ctx, validation_active, sync_validation) =
             VulkanContext::new(window, atlas_text.atlas(), &config)?;
+        // CA-12 (F12): the shared representable-capacity validation,
+        // at construction, against the LIVE device — the audit's
+        // "validate a shared representable capacity at construction;
+        // include device limits, per-slot sizes and dynamic-offset
+        // alignment": the three configured `usize` budgets narrow
+        // ONCE here (a budget outside the representable `u32`
+        // domain refuses, named — the pre-fix `cap as u32` sites at
+        // the carves silently wrapped it to a different number), and
+        // the pose budget checks the binding-5 storage range and
+        // offset alignment its cap-clamped carve would bind. The
+        // ladder discipline: this is the context's own stage — a
+        // refusal destroys exactly what exists so far.
+        let (max_storage_buffer_range, min_storage_buffer_offset_alignment) =
+            ctx.pose_binding_limits();
+        let arena_budgets = match ArenaBudgets::validate(
+            &config,
+            max_storage_buffer_range,
+            min_storage_buffer_offset_alignment,
+        ) {
+            Ok(budgets) => budgets,
+            Err(error) => {
+                ctx.destroy();
+                return Err(error);
+            }
+        };
         // P4 S6: the `Corner` construction preference is deleted —
         // authored scene content reaches the renderer ONLY through
         // [`Self::attach_scene`] (the demo and every test attach
@@ -643,6 +686,8 @@ impl Renderer {
             pose_bytes: Vec::new(),
             proxy_draw_mode: ProxyDrawMode::default(),
             ripple_debug: RippleDebugMode::Off,
+            arena_budgets,
+            device_lost: vulkan::DeviceLossLatch::default(),
         })
     }
 
@@ -690,6 +735,13 @@ impl Renderer {
         debug_text: Option<&str>,
         window_size: (u32, u32),
     ) -> Result<FrameResult, RendererError> {
+        // CA-13 (F13/A14): the device-loss entry gate — a latched
+        // loss refuses without touching the dead device
+        // (`render_frame` delegates here, so this gate covers both
+        // entries).
+        if let Some(refusal) = self.device_lost.refusal() {
+            return Err(refusal);
+        }
         // The F-05 overlay-vertex reuse (the audit's measured
         // candidate): the glyph vertices are rebuilt into the
         // renderer's own retained buffer — the capacity from the
@@ -732,14 +784,23 @@ impl Renderer {
             wet: None,
         });
         let policy = self.frame_policy();
-        let outcome = vulkan::render_frame(
+        let outcome = match vulkan::render_frame(
             &mut self.ctx,
             &mut self.swapchain,
             &mut self.pipes,
             &mut self.frames,
             policy,
             &frame,
-        )?;
+        ) {
+            Ok(outcome) => outcome,
+            // CA-13 (F13/A14): the error passes the latch on its way
+            // out — a device loss (or a terminal slot failure whose
+            // SOURCE is one) latches for every later entry.
+            Err(error) => {
+                self.device_lost.observe(&error);
+                return Err(error);
+            }
+        };
         Ok(self.finish_frame(outcome))
     }
 
@@ -775,6 +836,12 @@ impl Renderer {
     /// their own description through this call, and the second
     /// scene (engine-slice's garage) proves the boundary.
     pub fn attach_scene(&mut self, scene: SceneDescription) -> Result<SceneHandle, RendererError> {
+        // CA-13 (F13/A14): the device-loss entry gate — attach is a
+        // device-touching entry (uploads, pipeline creation); a
+        // latched loss refuses without touching the dead device.
+        if let Some(refusal) = self.device_lost.refusal() {
+            return Err(refusal);
+        }
         // CA-01 (attach atomicity): the attach is a STAGED
         // transaction. The resources install FIRST (the pipeline
         // group binds their descriptor layout), but until the group
@@ -790,7 +857,15 @@ impl Renderer {
         // refused ("a scene is already attached") and the renderer
         // was unusable for scene-backed frames — the stranded
         // no-scene state the audit's CA-01 named.
-        let attached = attach_description(&mut self.ctx, scene)?;
+        let attached = match attach_description(&mut self.ctx, scene) {
+            Ok(attached) => attached,
+            // CA-13: the loss latches on its way out (the uploads
+            // inside the attach are device work).
+            Err(error) => {
+                self.device_lost.observe(&error);
+                return Err(error);
+            }
+        };
         // The corner-family pipelines (P4 S6): the scene attaches
         // AFTER construction, so the lit/proxy/rain objects — which
         // bind the ATTACHED scene's descriptor layout — are assembled
@@ -809,6 +884,9 @@ impl Renderer {
             // and the error propagates — the retry re-runs the whole
             // attach from a clean context.
             self.ctx.release_staged_scene_resources();
+            // CA-13: the pipeline creation is device work — the loss
+            // latches here too.
+            self.device_lost.observe(&error);
             return Err(error);
         }
         // Full success — publish the retained facts and the handle
@@ -853,6 +931,12 @@ impl Renderer {
         &mut self,
         submission: FrameSubmission<'_>,
     ) -> Result<FrameResult, RendererError> {
+        // CA-13 (F13/A14): the device-loss entry gate — a latched
+        // loss refuses without touching the dead device (repeated
+        // submissions on a lost device are prevented, not retried).
+        if let Some(refusal) = self.device_lost.refusal() {
+            return Err(refusal);
+        }
         // Scene/attach coherence (the design's §3.3 order step 1):
         // a SceneFrame requires an ATTACHED scene — attach_scene is
         // the only way to bring one (the Corner preference's
@@ -900,8 +984,13 @@ impl Renderer {
         let policy = SubmissionPolicy {
             proxy_draw_mode: self.proxy_draw_mode,
             ripple_debug: self.ripple_debug,
-            instance_capacity: self.config.instance_capacity.0,
-            pose_capacity: self.config.pose_capacity.0,
+            // CA-12 (F12): the CONSTRUCTION-VALIDATED budgets — the
+            // same `u32` numbers the device carve clamps against
+            // (widened losslessly to the public repack's `usize`
+            // boundary), so the CPU typed refusal and the carve
+            // ceiling are one number.
+            instance_capacity: self.arena_budgets.instance as usize,
+            pose_capacity: self.arena_budgets.pose as usize,
         };
         let frame_policy = self.frame_policy();
         let inputs = adapt_frame(
@@ -918,14 +1007,23 @@ impl Renderer {
         // positional parameters, with the frame plan derived once
         // at the bundle's construction.
         let frame = InternalFrame::new(inputs);
-        let outcome = vulkan::render_frame(
+        let outcome = match vulkan::render_frame(
             &mut self.ctx,
             &mut self.swapchain,
             &mut self.pipes,
             &mut self.frames,
             frame_policy,
             &frame,
-        )?;
+        ) {
+            Ok(outcome) => outcome,
+            // CA-13 (F13/A14): the error passes the latch on its way
+            // out — a device loss (or a terminal slot failure whose
+            // SOURCE is one) latches for every later entry.
+            Err(error) => {
+                self.device_lost.observe(&error);
+                return Err(error);
+            }
+        };
         Ok(self.finish_frame(outcome))
     }
 
@@ -962,6 +1060,11 @@ impl Renderer {
     /// consume the request — it survives until the next SHADOWED
     /// frame runs the depth pass.
     pub fn request_shadow_map_capture(&mut self) -> Result<(), RendererError> {
+        // CA-13 (F13/A14): the device-loss entry gate — the shadow
+        // state's lazy ensure is device work.
+        if let Some(refusal) = self.device_lost.refusal() {
+            return Err(refusal);
+        }
         if self.pipes.shadows.is_none() {
             if self.scene.is_none() {
                 return Err(RendererError::Vulkan(
@@ -970,7 +1073,10 @@ impl Renderer {
                         .into(),
                 ));
             }
-            self.pipes.ensure_shadow_resources(&self.ctx)?;
+            if let Err(error) = self.pipes.ensure_shadow_resources(&self.ctx) {
+                self.device_lost.observe(&error);
+                return Err(error);
+            }
         }
         vulkan::request_shadow_readback(&mut self.frames)
     }
@@ -983,7 +1089,19 @@ impl Renderer {
     /// `CaptureDropped` if the shadow state was replaced after the
     /// readback recorded (the recording buffer was destroyed with it).
     pub fn take_shadow_map_capture(&mut self) -> Result<Option<ShadowMapReadback>, RendererError> {
-        let depths = vulkan::take_shadow_readback(&self.ctx, &mut self.pipes, &mut self.frames)?;
+        // CA-13 (F13/A14): the device-loss entry gate — the readback
+        // fence wait is device work.
+        if let Some(refusal) = self.device_lost.refusal() {
+            return Err(refusal);
+        }
+        let depths =
+            match vulkan::take_shadow_readback(&self.ctx, &mut self.pipes, &mut self.frames) {
+                Ok(depths) => depths,
+                Err(error) => {
+                    self.device_lost.observe(&error);
+                    return Err(error);
+                }
+            };
         Ok(depths.map(|depths| ShadowMapReadback {
             extent: crate::shadows::SHADOW_MAP_EXTENT,
             depths,
@@ -1000,9 +1118,13 @@ impl Renderer {
             present_preference: self.config.present_mode,
             replace_pipelines: self.config.replace_pipelines,
             demo_scene: self.config.demo_scene,
-            instance_capacity: self.config.instance_capacity.0,
-            pose_capacity: self.config.pose_capacity.0,
-            region_capacity: self.config.region_capacity.0,
+            // CA-12 (F12): the CONSTRUCTION-VALIDATED budgets — the
+            // `u32` domain the carves and the repack share (the
+            // pre-fix `usize` fields re-narrowed at the carve sites,
+            // the audit's two-domains defect).
+            instance_capacity: self.arena_budgets.instance,
+            pose_capacity: self.arena_budgets.pose,
+            region_capacity: self.arena_budgets.region,
         }
     }
 
@@ -1154,6 +1276,20 @@ impl Renderer {
         self.ctx.set_acquire_out_of_date();
     }
 
+    /// Arms a one-shot DEVICE-LOSS injection (CA-13's verification
+    /// knob — F13/A14): the next frame's FIRST acquire site returns
+    /// `VK_ERROR_DEVICE_LOST` instead of the real call, so the typed
+    /// classification ([`RendererError::DeviceLost`], the operation
+    /// context riding the variant) and the entry-gate latch are
+    /// exercisable on a live device — real device removal stays a
+    /// separate validation question (the audit's own boundary).
+    /// Diagnostic-only, test-only: never produced by a real device
+    /// call. The `&mut self` is intentional (the one-shot intent
+    /// encoded in the type — the seam's own rule).
+    pub fn inject_device_loss(&mut self) {
+        self.ctx.set_acquire_device_lost();
+    }
+
     pub fn stats(&self) -> &RenderStats {
         &self.stats
     }
@@ -1175,6 +1311,12 @@ impl Renderer {
     /// REFUSAL never poisons frame synchronization: the frame renders
     /// normally and a later request can try again.
     pub fn request_frame_capture(&mut self) -> Result<(), RendererError> {
+        // CA-13 (F13/A14): the device-loss entry gate — a capture on
+        // a latched-dead renderer can never complete; refuse without
+        // touching the device.
+        if let Some(refusal) = self.device_lost.refusal() {
+            return Err(refusal);
+        }
         vulkan::request_capture(&mut self.frames)
     }
 
@@ -1184,7 +1326,18 @@ impl Renderer {
     /// `Ok(None)` when no capture completed. Read promptly — a later
     /// capture overwrites the shared destination buffer.
     pub fn take_frame_capture(&mut self) -> Result<Option<CapturedFrame>, RendererError> {
-        vulkan::take_capture(&self.ctx, &mut self.frames)
+        // CA-13 (F13/A14): the device-loss entry gate — the fence
+        // wait is device work on a dead device.
+        if let Some(refusal) = self.device_lost.refusal() {
+            return Err(refusal);
+        }
+        match vulkan::take_capture(&self.ctx, &mut self.frames) {
+            Ok(capture) => Ok(capture),
+            Err(error) => {
+                self.device_lost.observe(&error);
+                Err(error)
+            }
+        }
     }
 
     /// The most recent capture refusal or drop, if any (`None` in the

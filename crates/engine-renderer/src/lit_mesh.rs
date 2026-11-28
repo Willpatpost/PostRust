@@ -45,7 +45,14 @@ fn quad(vertices: &mut Vec<LitVertex>, corners: [[f32; 3]; 4], normal: [f32; 3],
 /// walls and roof (the underside is buried in the ground). The
 /// ranges are contiguous and cover the whole vertex buffer — the
 /// shape [`crate::scene_description::SceneDescription::validate`]
-/// requires and the shadow depth pass's whole-mesh draw assumes.
+/// requires and the shadow depth pass's whole-mesh draw assumes —
+/// and every quad emits exactly SIX vertices (two complete
+/// triangles), so every boundary the builder emits is
+/// TRIANGLE-ALIGNED (the CA-15 admission contract —
+/// [`crate::scene_description::VERTICES_PER_TRIANGLE`]): the
+/// depth pass's whole-mesh draw and the lit pass's per-material
+/// ranges assemble the same primitive set for every builder-authored
+/// scene.
 pub fn mesh_from_boxes(
     boxes: &[SceneBox],
     ground_extent: f32,

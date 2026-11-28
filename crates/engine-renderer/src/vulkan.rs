@@ -249,11 +249,99 @@ pub enum RendererError {
         source: Box<RendererError>,
         release: Box<RendererError>,
     },
+    /// CA-13 (F13, the A14-corrected shape): the device was LOST —
+    /// a live operation returned `VK_ERROR_DEVICE_LOST`. `operation`
+    /// carries the context (the call that observed it:
+    /// "queue_submit", "acquire_next_image", ...). NOT the whole
+    /// flattened surface: the out-of-date family keeps the frame
+    /// flow's own typed deferral/retry handling
+    /// (`acquire_with_retry`, `present_image`), and the acquire
+    /// timeout keeps its dedicated message — this variant is the
+    /// DEVICE-LOSS class the `Vulkan(String)` conversion used to
+    /// swallow into a formatted string.
+    ///
+    /// Once observed, the renderer LATCHES the loss (see
+    /// [`DeviceLossLatch`]): every later frame/attach/capture entry
+    /// refuses with this variant WITHOUT touching the dead device —
+    /// repeated submissions on a lost device are prevented, not
+    /// retried — and constructing a fresh renderer is the supported
+    /// path. Real device removal and remediation stay a separate
+    /// owner validation question (the audit's own boundary).
+    DeviceLost {
+        /// The operation that observed the loss (the error context).
+        operation: String,
+    },
 }
 
 impl RendererError {
     pub(crate) fn vk(result: vk::Result, what: &str) -> Self {
-        RendererError::Vulkan(format!("{what}: {result:?}"))
+        // CA-13 (F13/A14): device loss is TYPED at the single choke
+        // point every flattened conversion funnels through — the
+        // operation context rides the variant and the renderer's
+        // entry gates latch it. Every other result keeps the
+        // formatted-string conversion (out-of-date is handled typed
+        // BEFORE this point at its two sites; the acquire timeout
+        // has its own arm).
+        if result == vk::Result::ERROR_DEVICE_LOST {
+            RendererError::DeviceLost {
+                operation: what.to_string(),
+            }
+        } else {
+            RendererError::Vulkan(format!("{what}: {result:?}"))
+        }
+    }
+}
+
+/// CA-13 (F13/A14): the renderer's device-loss latch — the terminal
+/// state that prevents repeated submissions on a lost device. The
+/// FIRST [`RendererError::DeviceLost`] observed leaving a
+/// device-touching entry latches its operation; every later
+/// frame/attach/capture entry consults [`Self::refusal`] FIRST and
+/// returns the typed refusal without touching the device.
+///
+/// Pure state (one `Option<String>`) so the discipline is
+/// unit-testable without a GPU (the mock-free seam discipline); the
+/// REAL-loss path is the classification in [`RendererError::vk`]
+/// plus the injected-loss battery run on a live device (the rig
+/// leg in engine-slice's `render_lifecycle_faults` —
+/// `Renderer::inject_device_loss`, the faithful one-shot
+/// `VK_ERROR_DEVICE_LOST` at the acquire site).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct DeviceLossLatch {
+    operation: Option<String>,
+}
+
+impl DeviceLossLatch {
+    /// The entry gate: `Some(DeviceLost)` once latched, carrying the
+    /// FIRST observation's operation context (stable across later
+    /// observations).
+    pub(crate) fn refusal(&self) -> Option<RendererError> {
+        self.operation
+            .as_ref()
+            .map(|operation| RendererError::DeviceLost {
+                operation: operation.clone(),
+            })
+    }
+
+    /// Observes an error on its way OUT of a device-touching entry:
+    /// the first device loss latches — top-level, or the SOURCE of a
+    /// terminal [`RendererError::FrameSlotUnrecoverable`] (a lost
+    /// device also fails the CA-10 release ladder's own submits and
+    /// waits; the loss is the reason the slot could not be released,
+    /// so the terminal wrap still latches). Later observations never
+    /// overwrite the first context. Pure.
+    pub(crate) fn observe(&mut self, error: &RendererError) {
+        let operation = match error {
+            RendererError::DeviceLost { operation } => Some(operation.clone()),
+            RendererError::FrameSlotUnrecoverable { source, .. } => match source.as_ref() {
+                RendererError::DeviceLost { operation } => Some(operation.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if self.operation.is_none() {
+            self.operation = operation;
+        }
     }
 }
 
@@ -305,6 +393,11 @@ impl std::fmt::Display for RendererError {
                 "frame slot unrecoverable: the post-acquire release for the frame error \
                  ({source}) itself failed ({release}) — this renderer's frame-slot \
                  synchronization can no longer be trusted; construct a fresh renderer"
+            ),
+            RendererError::DeviceLost { operation } => write!(
+                f,
+                "the Vulkan device was lost ({operation}); the renderer refuses further \
+                 device work on it — construct a fresh renderer"
             ),
         }
     }
@@ -399,6 +492,131 @@ mod policy_tests {
             proxy_draw_call_count(ProxyDrawMode::Indirect, 0, 0, 0),
             0,
             "empty population"
+        );
+    }
+
+    /// CA-13 (F13/A14): the classification choke point —
+    /// `VK_ERROR_DEVICE_LOST` maps to the TYPED variant carrying the
+    /// operation context; every other result keeps the formatted
+    /// string (out-of-date is handled typed BEFORE this point at its
+    /// two frame-flow sites, so it appears here only as the generic
+    /// arm's string form).
+    #[test]
+    fn device_lost_is_typed_at_the_conversion_choke_point() {
+        for (result, what) in [
+            (vk::Result::ERROR_DEVICE_LOST, "acquire_next_image"),
+            (vk::Result::ERROR_DEVICE_LOST, "queue_submit"),
+            (vk::Result::ERROR_DEVICE_LOST, "queue_present"),
+            (vk::Result::ERROR_DEVICE_LOST, "device_wait_idle"),
+            (vk::Result::ERROR_DEVICE_LOST, "wait image fence"),
+        ] {
+            match RendererError::vk(result, what) {
+                RendererError::DeviceLost { operation } => {
+                    assert_eq!(operation, what, "the operation context rides the variant")
+                }
+                other => panic!("{what}: expected the typed device loss, got {other:?}"),
+            }
+        }
+        // The neighbors stay strings — the audit's own correction:
+        // ONLY the device-loss class is lifted out of the flattening.
+        assert!(matches!(
+            RendererError::vk(vk::Result::ERROR_OUT_OF_DATE_KHR, "queue_present"),
+            RendererError::Vulkan(_)
+        ));
+        assert!(matches!(
+            RendererError::vk(vk::Result::ERROR_INITIALIZATION_FAILED, "create_buffer"),
+            RendererError::Vulkan(_)
+        ));
+        let RendererError::Vulkan(text) =
+            RendererError::vk(vk::Result::ERROR_OUT_OF_DATE_KHR, "queue_present")
+        else {
+            unreachable!("checked above")
+        };
+        assert_eq!(text, "queue_present: ERROR_OUT_OF_DATE_KHR");
+        // The Display names the loss and the supported path.
+        let lost = RendererError::DeviceLost {
+            operation: "queue_submit".into(),
+        };
+        let text = lost.to_string();
+        assert!(
+            text.contains("device was lost") && text.contains("queue_submit"),
+            "the display carries the operation: {text}"
+        );
+    }
+
+    /// CA-13 (F13/A14): the latch's discipline, pure — the first
+    /// device loss latches its operation, later observations never
+    /// overwrite the first context, non-loss errors never latch, and
+    /// the terminal FrameSlotUnrecoverable whose SOURCE is a device
+    /// loss latches through the wrap (a lost device also fails the
+    /// release ladder; the loss is the reason the slot could not be
+    /// released).
+    #[test]
+    fn the_device_loss_latch_is_first_observation_wins() {
+        let mut latch = DeviceLossLatch::default();
+        assert_eq!(latch.refusal(), None, "a fresh latch refuses nothing");
+        // A non-loss error observes nothing.
+        latch.observe(&RendererError::Vulkan("queue_present: ...".into()));
+        latch.observe(&RendererError::InjectedFault("FrameSubmit".into()));
+        assert_eq!(latch.refusal(), None, "ordinary errors never latch");
+        // The first loss latches with its operation.
+        latch.observe(&RendererError::DeviceLost {
+            operation: "acquire_next_image".into(),
+        });
+        match latch.refusal() {
+            Some(RendererError::DeviceLost { operation }) => {
+                assert_eq!(operation, "acquire_next_image")
+            }
+            other => panic!("the latched refusal is the typed loss: {other:?}"),
+        }
+        // A LATER loss at another operation never overwrites the
+        // first context (the entry gate reports the original site).
+        latch.observe(&RendererError::DeviceLost {
+            operation: "queue_submit".into(),
+        });
+        match latch.refusal() {
+            Some(RendererError::DeviceLost { operation }) => {
+                assert_eq!(
+                    operation, "acquire_next_image",
+                    "the first observation's context is stable"
+                )
+            }
+            other => panic!("the latched refusal is the typed loss: {other:?}"),
+        }
+        // The terminal wrap whose source is a loss latches through
+        // the FrameSlotUnrecoverable shell (a fresh latch proves the
+        // wrap alone latches; the source's operation is the context).
+        let mut wrap_latch = DeviceLossLatch::default();
+        let wrap = RendererError::FrameSlotUnrecoverable {
+            source: Box::new(RendererError::DeviceLost {
+                operation: "queue_submit".into(),
+            }),
+            release: Box::new(RendererError::DeviceLost {
+                operation: "release submit (fence heal)".into(),
+            }),
+        };
+        wrap_latch.observe(&wrap);
+        match wrap_latch.refusal() {
+            Some(RendererError::DeviceLost { operation }) => {
+                assert_eq!(
+                    operation, "queue_submit",
+                    "the wrap's SOURCE is the context"
+                )
+            }
+            other => panic!("the wrap latches as the typed loss: {other:?}"),
+        }
+        // A terminal wrap from an ORDINARY failure (the CA-10 class)
+        // does not latch a device loss — the slot is stranded, the
+        // device is not gone.
+        let mut ordinary_wrap = DeviceLossLatch::default();
+        ordinary_wrap.observe(&RendererError::FrameSlotUnrecoverable {
+            source: Box::new(RendererError::InjectedFault("FrameSubmit".into())),
+            release: Box::new(RendererError::Vulkan("release failed".into())),
+        });
+        assert_eq!(
+            ordinary_wrap.refusal(),
+            None,
+            "an ordinary terminal wrap is not a device loss"
         );
     }
 }

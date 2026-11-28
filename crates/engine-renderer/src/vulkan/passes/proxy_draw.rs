@@ -948,7 +948,9 @@ impl ProxyResources {
         self.release(ctx);
     }
 
-    /// The per-slot region size (bytes).
+    /// The per-slot region size (bytes) — CA-12's admitted-vs-carve
+    /// upload backstop reads it beside the capacity (the write's
+    /// true byte bound, not the count's implied one).
     pub(super) fn slot_bytes(&self) -> u64 {
         self.slot_bytes
     }

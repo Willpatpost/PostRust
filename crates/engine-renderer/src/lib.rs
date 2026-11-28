@@ -60,6 +60,7 @@ pub mod shadows;
 pub mod sky;
 
 mod renderer;
+mod scene_contract_design;
 mod scene_description;
 mod submission;
 mod vulkan;
@@ -81,7 +82,8 @@ pub use renderer::{
     ShadowMapReadback, SkyFrame,
 };
 pub use scene_description::{
-    GroundRoles, LitVertex, PASS_FAMILY_MATERIAL_COUNT, SceneDescription, SceneHandle, SceneMesh,
+    DrawTable, GroundRoles, LitVertex, PASS_FAMILY_MATERIAL_COUNT, SceneDescription, SceneHandle,
+    SceneMesh, TextureExtent, VERTICES_PER_TRIANGLE, triangle_list_boundary,
 };
 pub use submission::{
     DynamicLayers, FrameCamera, FrameSubmission, OutputTarget, SceneBounds, SceneFrame,
