@@ -276,3 +276,20 @@ reviewed and accepted: the lane's memory-pressure sweep removed three
 COMPLETED lanes' target caches (t01-ci 6.7 GiB, t04 2.32 GiB, t19 1.35 GiB —
 all integrated, no work lost, only cold rebuilds). CI pins corrected
 (`a19c773`: main 1654/1603, lines 37). Confirming run `46138588717`.
+
+## The lifecycle cluster implemented (L1–L5, T02/T03/T06/T16)
+
+The lane (five staged commits `0238b86`/`de8bedd`/`c5b4c4b`/`e348850`/`e688c01`,
+14 files, +3216/−271): the lifecycle substrate with the release-half latch arm;
+the typed staging availability + classified ordered-prefix poll + ticket RAII;
+the commit-on-readiness attach transaction with ticket-tied quarantine and the
+in-flight-destination rule at every InlineWait caller; the carve allocation
+epochs composing with T05's identity clears; the first-use transition release.
+Orchestrator verification: gates re-run (227/227 debug+release, faults battery
+0/10, exit 0); the scope flag accepted (four additional device-layer files the
+design's binding plan requires). Six rig-deferred batteries written and named
+(the interrupted-growth retry, the classified prefix, the drain-timeout
+quarantine + retry, the never-signaling quarantine, the render_layers latch,
+the first-use deciding WSI validation run). CI pins corrected (`4affaaf`:
+renderer-release 227, main 1661/1610, heavy ignored 66). Confirming run
+`46139366087` dispatched.
