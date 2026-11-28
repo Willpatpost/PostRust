@@ -280,7 +280,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_non_utf8_target_backs_up_at_the_native_name() {
-        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::ffi::OsStringExt as _;
 
         let (path, mut medium) = founded_chain("ca19-non-unicode");
         let parent = path.parent().unwrap().to_path_buf();
