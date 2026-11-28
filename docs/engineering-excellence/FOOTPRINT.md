@@ -322,6 +322,15 @@ For each engine crate C ∈ {core, persist, renderer, shell, slice}, at
 - **engine-slice**: one pure library helper, `engine_slice::math::
   camera_forward(0.0, 0.0, 0.0)` — no demo mode entered. Output:
   `camera forward at yaw=pitch=roll=0: [-0.0, -0.0, -1.0]`.
+- **engine-animation** (the E-S4 row, added 2026-11-28): build the
+  humanoid skeleton (`humanoid_skeleton`), sample `walk_clip()` at four
+  phases (0/0.25/0.5/0.75 of the duration), `compose_joint_matrices`,
+  `SkinBind::from_skeleton` + `skin_matrices_bound`, `rest_pose_block`
+  (asserted bit-exact identity), `pack_pose_bytes`, and
+  `pose_sequence_digest(&clip, &skeleton, 64)` asserted against the pinned
+  `2_694_074_108_253_436_588`. Output ends `pose_sequence_digest(64
+  samples) = 2694074108253436588` / `digest pin REPRODUCED standalone:
+  OK` (full output in §6.3a).
 
 ### 6.3 Results (all exit 0; single cold runs, this rig)
 
@@ -332,6 +341,7 @@ For each engine crate C ∈ {core, persist, renderer, shell, slice}, at
 | engine-shell | 44.5 s | 15 | 21 | yes |
 | engine-renderer | 41.9 s | 54 | 61 | yes |
 | engine-slice | 52.6 s | 71 | 87 | yes |
+| engine-animation † | **3.5 s** | **8** (self + crate + bytemuck chain) | 8 | yes |
 
 Isolation measurements (cost attribution, `cargo clean -p <crate>` +
 timed rebuild, exit 0):
@@ -346,6 +356,77 @@ timed rebuild, exit 0):
 
 The slice consumer's own binary: 6,655,488 B (6.35 MiB, debug profile —
 it links the whole workspace statically minus the demo's main.rs).
+
+### 6.3a E-S4 — the engine-animation consumer (2026-11-28, the overnight Linux pod, NOT the rig)
+
+† This row was measured on a different host than every other row in this
+table and carries its own environment; the timing is order-of-magnitude
+evidence only (the crate counts are host-independent). The owner-approved
+A06 extraction (D-EE-10 §2) landed `engine-animation` — pure pose/skeleton
+evaluation, single dependency `bytemuck` — through stages E-S1..E-S3; this
+row (the decision record §4 E-S4 re-measure) was taken at tree `c510ed6`
+on the lane worktree `ee/overnight-es4-remeasure`.
+
+The consumer (the §6.1 method): a scratch crate OUTSIDE the workspace
+(`<worktree>/consumer/`, its own empty `[workspace]` table so cargo never
+resolves into the repo's workspace; never committed), exactly one
+dependency — `engine-animation` by path — and the surface quoted in §6.2.
+Every cargo invocation went through the build housekeeper (lane
+`es4-measure`, one cargo command at a time; several exit-75 cgroup-memory
+refusals retried with backoff, none fatal). Environment: Linux pod, 12 CPU
+quota (cgroup `cpu.max 1200000 100000`), cgroup memory 32 GiB (sibling
+lanes held 23.8–24.8 GiB during the run), rustc/cargo 1.99.1 (exactly the
+repo's `rust-toolchain.toml` pin), `CARGO_BUILD_JOBS=4`,
+`CARGO_INCREMENTAL=0`. Every command below exited 0.
+
+- **Fresh lock** (`cargo generate-lockfile` → `cargo fetch`, untimed):
+  **8 packages** — consumer + engine-animation + bytemuck 1.25.2 +
+  bytemuck_derive 1.12.1 + proc-macro2 1.0.107 + quote 1.0.47 + syn 3.0.10
+  + unicode-ident 1.0.27. Version identity vs the committed workspace
+  lock: identical except **syn 3.0.10 vs 3.0.9** (bytemuck_derive's caret
+  requirement; a pure proc-macro, no native code — no F-01-class native
+  drift, and bytemuck itself resolved to exactly the workspace's 1.25.2).
+- **Closure** (`cargo tree --edges normal,build --prefix none`, F-07
+  explicit): **8 unique / 7 external** — engine-animation plus the 6-crate
+  bytemuck chain (bytemuck, bytemuck_derive, proc-macro2, quote, syn,
+  unicode-ident). The `normal`, `normal,build`, and `normal,build,dev`
+  trees are IDENTICAL (8 unique each) — this closure has no build-script
+  and no dev edges at all. The crate's own workspace-lock closure
+  (`cargo tree -p engine-animation --edges normal,build --prefix none`)
+  is 7 unique (syn 3.0.9 there). Target filtering: linux-gnu host, and
+  engine-animation declares no target-gated dependencies — nothing is
+  invisible to this tree (the §2 Windows `cfg(unix)` caveat does not
+  apply).
+- **Cold `cargo build`** (dev profile, fresh lane target dir): **3.46 s
+  wall** (cargo's own figure 3.40 s), 8 crates. Cold `cargo build
+  --release`: 3.44 s wall.
+- **Binary**: release **493,296 B** (0.47 MiB); debug 4,757,888 B
+  (4.54 MiB); the cold lane target directory 51 MiB.
+- **The run (the §4 E-S4 gate — the consumer must RUN, not just
+  compile)**: `cargo run -q` AND `cargo run --release -q` both exit 0 with
+  identical output:
+  `joints=11 pose_stride=704B keyframes=8 clip_duration=1.1s` ·
+  `rest_pose_block: bit-exact identity = true` · the four sampled phases
+  printing the walk table's offline-sampled values (pelvis vault dy
+  ±0.02, torso pitch ±655 turns, upper_leg_l pitch ±3604 turns at the 90°
+  marks) · `pose_sequence_digest(64 samples) = 2694074108253436588` ==
+  the pinned `2_694_074_108_253_436_588` — **the digest pin reproduces
+  standalone, in both the dev and the release profile.**
+
+**The comparison (honest, cross-rig):** the ratified expectation (§1.5,
+F-03: "≈ the bytemuck chain, 6-7 crates, near-core class") is CONFIRMED
+exactly, in neither direction off — the measured closure IS the 6-crate
+bytemuck chain plus engine-animation (7 external, 8 with the consumer).
+Against the B15 rows: **8 unique vs core's 2 and renderer's 54** (−46
+crates / −85% vs the renderer consumer a pose-evaluation consumer had to
+build before the extraction); **3.5 s cold vs 2.9 s (core) and 41.9 s
+(renderer)** — near-core class, with the caveat that those two figures are
+the Windows rig and this one the Linux pod at jobs=4 under a 12-CPU quota,
+so the seconds are order-of-magnitude and the crate counts are the hard
+comparison. The F-03 lever's animation slice is REALIZED with these
+numbers; the lever's other half (a types-only `FrameCamera`/
+`SceneBounds` consumer of engine-renderer) remains unrealized — F-03's
+disposition below.
 
 ### 6.4 Consumability verdicts (public API without internal knowledge)
 
@@ -372,6 +453,13 @@ it links the whole workspace statically minus the demo's main.rs).
   by design; the charter's "application demos/benchmarks should not be
   required for library use" is satisfied for the four library crates and
   structurally N/A for slice itself.
+- **engine-animation: excellent (the E-S4 row, 2026-11-28).** A consumer
+  exercising the full pose-evaluation surface — skeleton, walk-clip
+  sampling, joint composition, bound skin matrices, rest block, packed
+  bytes, the digest pin as the run-proof — needs zero internal knowledge,
+  one path dependency, and compiles in near-core class (8 crates, ~3.5 s
+  cold on the pod). This is the F-03 benefit the A06 extraction was
+  dispatched to materialize, now measured rather than assumed.
 
 ## 7. Findings
 
@@ -454,6 +542,24 @@ it links the whole workspace statically minus the demo's main.rs).
   cannot avoid it. A submission-types split would be an API architecture
   change (P4/P6); the closure discipline itself is tight (16 normal
   unique — the FINDINGS B15 rend-half claim holds for the full crate).
+  **DISPOSITION (2026-11-28, A06 E-S4 — the animation slice REALIZED;
+  owner GO per D-EE-10 §2):** the one unambiguously pure island named
+  above IS now its own crate — `engine-animation` (E-S1 extraction, E-S2
+  consumer rewire, E-S3 shim deletion, E-S4 this measurement, at tree
+  `c510ed6`). A pose-evaluation consumer — skeleton, walk-clip sampling,
+  `compose_joint_matrices`, `SkinBind` + `skin_matrices_bound`,
+  `rest_pose_block`, `pack_pose_bytes`, the pinned
+  `pose_sequence_digest` as the run-proof — now compiles **8 unique
+  crates (7 external: engine-animation + the 6-crate bytemuck chain)
+  in ~3.5 s cold on the overnight pod**, against the 54-crate / 41.9 s
+  renderer closure the same consumer had to build before the extraction
+  (§6.3a; the digest pin reproduces standalone in both dev and release).
+  Near-core class, exactly the §1.5 ratification. **The other half of
+  F-03 is UNCHANGED and remains open:** engine-renderer still offers no
+  types-only surface for plain `FrameCamera`/`SceneBounds` consumers —
+  the submission-types split stays the registered P4/P6
+  API-architecture question, now with the animation slice's realized
+  numbers as its precedent.
 - **F-04 (LOW): ash compiles twice per profile** (72.6 MB + 68.4 MB
   rlibs) — sdl3-sys's build-script metadata tree carries its own
   feature-diverged ash copy. Inherent to sdl3-sys packaging; no
@@ -509,7 +615,12 @@ What the measurements say moves "lightweight" (and by how much, measured):
    engine-core's 2.9 s / 2 — but it is an API architecture project
    (P4/P6), not a packaging tweak, and the S6 Garage second scene proved
    the current public API works; the cost is adoption friction, not
-   correctness.
+   correctness. **Update (2026-11-28, A06 E-S4): the animation slice of
+   this lever is REALIZED and measured** — `engine-animation`'s minimal
+   consumer compiles 8 unique crates in ~3.5 s cold on the overnight pod
+   (§6.3a, F-03's disposition), the exact near-core class this item
+   predicted for it; the submission-types half remains the open P4/P6
+   question.
 4. **Pinning sdl3-sys exactly (F-01)** costs nothing and protects the
    native-identity invariant the architecture already claims.
 5. **Not levers**: the SDL static build time (38.4 s) is the accepted
