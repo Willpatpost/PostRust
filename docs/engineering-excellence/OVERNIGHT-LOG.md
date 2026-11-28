@@ -636,3 +636,11 @@ guards could add deterministic cells-walked/entries-visited counters beside
 the timing bounds (the T09 pattern), making the algorithmic discrimination
 fully count-based; not urgent because the deterministic teeth already exist
 per-guard and the timing rows carry the runner-noise headroom explicitly.
+
+## R5 landed (`dd18b77`) — all six review findings resolved
+
+The entry map (no untrusted input in the tree today; the v2 API's zero
+production consumers); `for_config` landed; the census designed and parked
+(the unsafe-exception ruling). Pins: main 1702/1651. The R-item set is
+complete: R1–R6 all resolved with witnesses, refutations, or documented
+boundaries.
