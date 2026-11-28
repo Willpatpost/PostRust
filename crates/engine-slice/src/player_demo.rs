@@ -366,9 +366,10 @@ pub fn run_player_demo(options: PlayerOptions) -> Result<(), String> {
     // discipline: capacity is reused, no per-frame growth).
     let mut player_proxy: Vec<SceneVertex> = Vec::new();
 
+    let mut snapshot = InputSnapshot::default();
     loop {
         let frame_start = Instant::now();
-        let mut snapshot = app.frame();
+        app.frame_into(&mut snapshot);
         let sprint_held = controls.map_frame(&mut snapshot, |key| app.is_held(key));
         if snapshot.focus_lost || snapshot.minimized {
             driver.clear_pending_input();

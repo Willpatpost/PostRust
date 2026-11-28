@@ -360,9 +360,10 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
     // identical to the allocating form, proven by test).
     let mut region_scratch: Vec<engine_renderer::scene::SceneVertex> = Vec::new();
 
+    let mut snapshot = InputSnapshot::default();
     loop {
         let frame_start = Instant::now();
-        let snapshot = app.frame();
+        app.frame_into(&mut snapshot);
         if snapshot.quit_requested || snapshot.keys_pressed.contains(&Keycode::Escape) {
             break;
         }

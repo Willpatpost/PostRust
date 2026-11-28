@@ -111,9 +111,10 @@ pub fn run(
     let mut warm: Option<engine_renderer::AllocationStats> = None;
     let mut presented: u64 = 0;
     let limit = frames.map(|n| n.clamp(1, 1_000_000));
+    let mut input = engine_shell::InputSnapshot::default();
     loop {
         let frame_start = Instant::now();
-        let input = app.frame();
+        app.frame_into(&mut input);
         if input.quit_requested || input.keys_pressed.contains(&Keycode::Escape) {
             break;
         }

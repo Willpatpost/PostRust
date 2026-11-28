@@ -168,12 +168,13 @@ fn measure(
     let mut previous_bytes = 0;
     let mut warm_counters = EncounterCounters::default();
     let lag = FRAMES_IN_FLIGHT as usize;
+    let mut snapshot = engine_shell::InputSnapshot::default();
     // Read the two outstanding timestamps after the last measured submission.
     // The drain submits the final prepared frame without advancing simulation.
     for index in 0..WARMUP + SAMPLES + lag {
         let recording = (WARMUP..WARMUP + SAMPLES).contains(&index);
         let start = Instant::now();
-        let snapshot = app.frame();
+        app.frame_into(&mut snapshot);
         if snapshot.quit_requested || snapshot.minimized || app.window().size_in_pixels() != EXTENT
         {
             return Err("benchmark interrupted by close, minimize, or resize".into());

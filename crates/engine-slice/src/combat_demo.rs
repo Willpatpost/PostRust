@@ -1746,9 +1746,10 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
     // byte-identical with the vignette on or off).
     let mut defeat_started_at: Option<Instant> = None;
 
+    let mut snapshot = InputSnapshot::default();
     loop {
         let frame_start = Instant::now();
-        let mut snapshot = app.frame();
+        app.frame_into(&mut snapshot);
         let sprint_held = controls.map_frame(&mut snapshot, |key| app.is_held(key));
         if snapshot.focus_lost || snapshot.minimized {
             demo.driver.clear_pending_input();

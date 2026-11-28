@@ -453,6 +453,14 @@ impl ShellApp {
         self.input.poll()
     }
 
+    /// Replaces the caller's snapshot with this frame's intents. Repeated
+    /// polls reuse its four edge buffers up to their respective high-water
+    /// marks. Drop the snapshot to release that storage.
+    pub fn frame_into(&mut self, snapshot: &mut InputSnapshot) {
+        self.input.reuse_edge_buffers(snapshot);
+        *snapshot = self.frame();
+    }
+
     /// Runs the CPU-paced application loop until quit is requested or the
     /// callback returns [`LoopControl::Quit`]. Pacing uses OS monotonic
     /// time exclusively; if the loop falls behind the target cadence it
@@ -472,9 +480,10 @@ impl ShellApp {
         let mut control = LoopControl::Continue;
         let mut quit_reason = QuitReason::Callback;
 
+        let mut snapshot = InputSnapshot::default();
         while control == LoopControl::Continue && !self.input.quit_requested() {
             next_frame_at += self.frame_target;
-            let snapshot = self.frame();
+            self.frame_into(&mut snapshot);
             control = on_frame(self, &snapshot);
             if self.input.quit_requested() {
                 // A window close or SDL quit request is the observable

@@ -2816,10 +2816,11 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
     // capacity is reused every frame — no per-frame allocation).
     let mut region_scratch: Vec<engine_renderer::scene::SceneVertex> = Vec::new();
 
+    let mut snapshot = InputSnapshot::default();
     'run: loop {
         let frame_start = Instant::now();
         let input_start = frame_start;
-        let snapshot = app.frame();
+        app.frame_into(&mut snapshot);
         if snapshot.quit_requested || snapshot.keys_pressed.contains(&Keycode::Escape) {
             break;
         }

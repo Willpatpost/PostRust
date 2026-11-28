@@ -1057,9 +1057,10 @@ pub fn run(
     let mut gpu = Distribution::new(count);
     let mut previous = Instant::now();
 
+    let mut input = engine_shell::InputSnapshot::default();
     for i in 0..measured.end + lag {
         let frame_start = Instant::now();
-        let input = app.frame();
+        app.frame_into(&mut input);
         if input.quit_requested || input.minimized || app.window().size_in_pixels() != size {
             return Err("route interrupted by close, minimize or resize".into());
         }
@@ -1347,9 +1348,10 @@ fn run_free_look(
     // no-recreation regime — the offscreen smoke's own — is the
     // gated one, and a resized session prints instead of asserting).
     let mut warm: Option<AllocationStats> = None;
+    let mut snapshot = engine_shell::InputSnapshot::default();
     loop {
         let frame_start = Instant::now();
-        let snapshot = app.frame();
+        app.frame_into(&mut snapshot);
         if snapshot.quit_requested || snapshot.keys_pressed.contains(&Keycode::Escape) {
             break;
         }
