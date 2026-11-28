@@ -8,6 +8,13 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
+// The Unix directory-sync arms (the post-rename root flush and the
+// objects-directory flush) need File; Windows compiles those arms out.
+// (The L9 split originally dropped this import — a Unix-only compile
+// break the Windows-side local gates could never see; caught by the
+// first real cross-platform CI run, the T01 lesson.)
+#[cfg(unix)]
+use std::fs::File;
 use std::io::{self, Write};
 use std::time::Instant;
 
