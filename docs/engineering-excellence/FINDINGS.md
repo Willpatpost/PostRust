@@ -95,10 +95,10 @@ audit-claimed with verification-first mandated in each fix lane's brief.
 | CA-14 (F14) | REND | REGISTERED (audit-claimed) | the public scene contract still encodes the first pass family's asset dimensions (Q06's precise shape) |
 | CA-15 (F15) | REND | REGISTERED (audit-claimed) | triangle-list boundary misalignment between passes not checked at admission |
 | CA-16 (F16) | PERSIST/CI | **FIXED (verified before fix, `3311fd9`)** | the crash-seam facade regression from the L9 split — the exact CI heavy command E0432; the two names restored |
-| CA-17 (F17) | PERSIST | REGISTERED (audit-claimed) | confirmed identity storage grows with history despite the watermark (Q08's precise shape) |
-| CA-18 (F18) | SLICE/PERSIST | REGISTERED (audit-claimed) | backup materializes the whole journal twice (capture + verification) — the streaming reader didn't remove this consumer |
-| CA-19 (F19) | PERSIST | REGISTERED (audit-claimed) | SQLite backup's two path representations (lossy VACUUM INTO vs native open) |
-| CA-20 (F20) | SLICE | REGISTERED (audit-claimed) | backup's durability tier — the destination-directory sync failure ignored |
+| CA-17 | PERSIST | **FIXED-AWAITING-RE-AUDIT (stage 1; the eviction designed + gated)** | integrated `5b36258` (lane `c2663d9`) | the cold retrieval landed (`cold_confirmed`, both providers, the fail-closed arms); the residency measured (linear ~195-216 B/identity); stage 2 (the rotation-authored ledger + eviction) gated on the measured cold-latency rows with the [ASSUMPTION] owner decisions |
+| CA-18 | SLICE/PERSIST | **FIXED-AWAITING-RE-AUDIT** | integrated `5b36258` (lane `a6084cd`) | the streaming hash (peak 182-184 B vs 1-32 MiB whole-file); the manifest wire unchanged |
+| CA-19 | PERSIST | **FIXED-AWAITING-RE-AUDIT** | integrated `5b36258` (lane `abeb2ed`) | the native sqlite3_backup path (one lossless boundary, the overwrite typed) |
+| CA-20 | SLICE | **FIXED-AWAITING-RE-AUDIT** | integrated `5b36258` (lane `a757ebc`) | the durability tier published + made real (the probe proving the old idiom failed 100% on Windows); the typed propagation before durable completion |
 | CA-21 | SHELL | **FIXED-AWAITING-RE-AUDIT** | integrated `42ff2a1` (lane `ce2dab5`) | the producer lock bounded (the A25 mirror; red demonstrated); the admitted set, FIFO, pairing, refused total provably identical |
 | CA-22 | SHELL | **FIXED-AWAITING-RE-AUDIT** | integrated `42ff2a1` (lane `ce2dab5`) | the cue backpressure (the explicit budget + refusal telemetry; the mixer-voice routing left as the owner NEW-SHELL-3 consolidation); the 800-push burst refusing 687 fail-visibly |
 | CA-23 | SHELL | **FIXED-AWAITING-RE-AUDIT** | integrated `42ff2a1` (lane `ce2dab5`) | repeats a mapped-key count (the intent contract); red demonstrated |
