@@ -169,9 +169,21 @@ struct ReflectionTargets {
     color_images: Vec<vk::Image>,
     color_memories: Vec<vk::DeviceMemory>,
     color_views: Vec<vk::ImageView>,
+    /// THE B14/R5 TWO-PHASE DEPTH OWNERSHIP: on a CREATING build
+    /// (no matching shared bundle — the wet-first order) these hold
+    /// the registered handles for the fault-injection unwind until
+    /// the build's COMMIT moves them into the shared bundle, leaving
+    /// both vectors EMPTY in a committed bundle; on a REUSING build
+    /// (the post-first order) they stay empty throughout — this
+    /// family's framebuffers bind its OWN `depth_views` over the
+    /// shared images either way.
     depth_images: Vec<vk::Image>,
     depth_memories: Vec<vk::DeviceMemory>,
     depth_views: Vec<vk::ImageView>,
+    /// The negotiated depth format's aspect flags (corrective
+    /// finding 4's mapping) — the B14/R5 depth WAW barrier's
+    /// subresource range over the shared image.
+    depth_aspect: vk::ImageAspectFlags,
     framebuffers: Vec<vk::Framebuffer>,
     /// The reflected lit pipeline's per-material × slot sets.
     reflected_pool: vk::DescriptorPool,
@@ -747,15 +759,23 @@ impl ReflectionResources {
     }
 
     /// Builds (or rebuilds) the extent-bound target bundle — a
-    /// no-op when the extent and view set match. The rebuild-safety
-    /// proof is the post package's (only a recreation — already
-    /// device-idle — can change either). The cache key is the extent
+    /// no-op when the extent and view set match. The cache key is the extent
     /// plus the swapchain GENERATION (corrective finding 7): a
     /// retired chain's numerical view handle could recur after
     /// destruction (Vulkan permits handle reuse), but a generation
     /// never repeats, and a larger image count on the new chain
     /// forces a rebuild instead of indexing past the bundle's
     /// framebuffers.
+    ///
+    /// THE B14/R5 STALE-PATH CONTRACT: the coordinated stale release
+    /// in `frame_prepare::ensure_extent_targets` — which runs before
+    /// this with the same key — owns releasing a STALE bundle (both
+    /// families' framebuffers must die before the shared depth
+    /// images they view, so no family may release its own stale
+    /// bundle unilaterally); a Some-but-stale bundle here is an
+    /// internal ordering defect and fails visibly rather than
+    /// risking the cross-family view lifetime.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn ensure_targets(
         &mut self,
         ctx: &VulkanContext,
@@ -764,6 +784,7 @@ impl ReflectionResources {
         hdr_pass: vk::RenderPass,
         swapchain_generation: u64,
         depth_format: vk::Format,
+        shared_depth: &mut Option<super::post_draw::SharedDepthTargets>,
     ) -> Result<(), RendererError> {
         if let Some(targets) = &self.targets
             && targets.extent == (extent.width, extent.height)
@@ -771,9 +792,10 @@ impl ReflectionResources {
         {
             return Ok(());
         }
-        let mut old = self.targets.take();
-        if let Some(old) = &mut old {
-            old.release(ctx);
+        if self.targets.is_some() {
+            return Err(RendererError::Vulkan(
+                "the reflection targets are stale past the coordinated extent release".into(),
+            ));
         }
         self.targets = Some(ReflectionTargets::build(
             ctx,
@@ -790,8 +812,36 @@ impl ReflectionResources {
             self.ripple_base,
             self.ripple_stride,
             depth_format,
+            shared_depth,
         )?);
         Ok(())
+    }
+
+    /// The coordinated stale release's reflection half (B14/R5):
+    /// release this state's extent-bound bundle when its key no
+    /// longer matches — BEFORE the shared depth images (the
+    /// framebuffers inside bind views of them). `frame_prepare`
+    /// calls the post state's twin first, then this, then the shared
+    /// bundle's own `release_if_stale`.
+    pub(super) fn release_stale_targets(
+        &mut self,
+        ctx: &VulkanContext,
+        extent: vk::Extent2D,
+        swapchain_generation: u64,
+    ) {
+        let stale = self.targets.as_ref().is_some_and(|targets| {
+            targets.extent != (extent.width, extent.height)
+                || targets.swapchain_generation != swapchain_generation
+        });
+        if stale {
+            // SAFETY: the coordinated release runs only on the
+            // stale key (a recreation path — already device-idle);
+            // this family's framebuffers die before the shared
+            // images it views (the caller's order).
+            if let Some(mut targets) = self.targets.take() {
+                targets.release(ctx);
+            }
+        }
     }
 
     /// Writes this slot's MIRRORED FrameParams region (the
@@ -960,14 +1010,32 @@ impl ReflectionResources {
     /// dependency (finding 9) provides the producer-side scope for
     /// the final transition, making the barrier belt-and-suspenders.
     ///
+    /// THE B14/R5 DEPTH-PAIR WAW (the aliasing's synchronization):
+    /// when `shared_depth_image` is Some — exactly the frames whose
+    /// scene pass is the HDR one (wet AND post; the frame flow passes
+    /// the shared image only there) — the scene pass that follows
+    /// clears and writes the SAME depth image the reflection pass
+    /// just wrote, and the pass object's own in-dependency carries an
+    /// EMPTY src access mask (finding 9's form), so the WAW's
+    /// availability needs this explicit scope: the reflection pass's
+    /// depth writes (EARLY and LATE fragment tests) made available
+    /// and visible before the scene pass's depth clear and writes.
+    /// This is the ONLY new synchronization the aliasing introduces
+    /// — one extra barrier call on wet+post frames, ordering passes
+    /// the render-pass sequence already orders.
+    ///
     /// # Safety
     /// `cmd` must be recording, between the reflection pass and the
-    /// scene pass; `slot` is this frame's slot.
+    /// scene pass; `slot` is this frame's slot; `shared_depth_image`
+    /// is Some only when this frame's scene pass binds the shared
+    /// depth image (the HDR scene pass) and is that slot's image
+    /// handle from the live shared bundle.
     pub(super) unsafe fn record_read_barrier(
         &self,
         ctx: &VulkanContext,
         cmd: vk::CommandBuffer,
         slot: usize,
+        shared_depth_image: Option<vk::Image>,
     ) {
         let targets = self
             .targets
@@ -1002,6 +1070,46 @@ impl ReflectionResources {
                 &[],
                 &[to_read],
             );
+        }
+        if let Some(image) = shared_depth_image {
+            let depth_waw = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .image(image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: targets.depth_aspect,
+                    level_count: 1,
+                    layer_count: 1,
+                    ..Default::default()
+                })
+                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED);
+            // SAFETY: the reflection pass above wrote this slot's
+            // shared depth image (its framebuffer binds a view of
+            // it); the scene pass that follows clears and writes the
+            // same image (its framebuffer binds its own view). The
+            // barrier makes the reflection pass's depth writes
+            // available and visible before the scene pass's — the
+            // WAW the shared image introduces; both stages cover the
+            // depth writes (the tests at EARLY, the shader-side
+            // writes at LATE) and the scene pass's clear (ordered at
+            // EARLY by its own in-dependency, which chains after
+            // this barrier's dst scope).
+            unsafe {
+                ctx.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                    vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[depth_waw],
+                );
+            }
         }
     }
 
@@ -1130,6 +1238,7 @@ impl ReflectionTargets {
         ripple_base: u32,
         ripple_stride: u32,
         depth_format: vk::Format,
+        shared_depth: &mut Option<super::post_draw::SharedDepthTargets>,
     ) -> Result<ReflectionTargets, RendererError> {
         let mut partial = ReflectionTargets {
             extent: (extent.width, extent.height),
@@ -1140,6 +1249,7 @@ impl ReflectionTargets {
             depth_images: Vec::new(),
             depth_memories: Vec::new(),
             depth_views: Vec::new(),
+            depth_aspect: super::depth_aspect(depth_format),
             framebuffers: Vec::new(),
             reflected_pool: vk::DescriptorPool::null(),
             reflected_sets: [vk::DescriptorSet::null(); 6],
@@ -1161,9 +1271,32 @@ impl ReflectionTargets {
             ripple_stride,
             swapchain_generation,
             depth_format,
+            shared_depth,
         ) {
             partial.release(ctx);
             return Err(error);
+        }
+        // THE B14/R5 COMMIT (the depth pair's creating arm — the
+        // wet-first order): every fallible step succeeded, so the
+        // depth images and memories this build registered become the
+        // SHARED bundle (this family's framebuffers above bound its
+        // own views of them; the post chain's next build creates its
+        // views over them). The vectors empty here, making this
+        // bundle's release a no-op for them; the fault path above
+        // already released whatever existed.
+        if !partial.depth_images.is_empty() {
+            let shared = super::post_draw::SharedDepthTargets::new(
+                (extent.width, extent.height),
+                swapchain_generation,
+                std::mem::take(&mut partial.depth_images),
+                std::mem::take(&mut partial.depth_memories),
+            );
+            // The coordinated stale release in `frame_prepare` owns
+            // a prior bundle's death; this belt covers an impossible
+            // stale survivor without leaking it.
+            if let Some(mut old) = shared_depth.replace(shared) {
+                old.release(ctx);
+            }
         }
         Ok(partial)
     }
@@ -1183,8 +1316,9 @@ impl ReflectionTargets {
         tail_stride: u32,
         ripple_base: u32,
         ripple_stride: u32,
-        _swapchain_generation: u64,
+        swapchain_generation: u64,
         depth_format: vk::Format,
+        shared_depth: &Option<super::post_draw::SharedDepthTargets>,
     ) -> Result<(), RendererError> {
         let slots = FRAMES_IN_FLIGHT as usize;
 
@@ -1269,7 +1403,21 @@ impl ReflectionTargets {
             Ok(())
         };
         let color_usage = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED;
-        for _slot in 0..slots {
+        // THE B14/R5 DEPTH PAIR (the shared images): when the shared
+        // bundle already matches this extent and generation (the
+        // POST-FIRST order — the post chain's build created the
+        // images), this family creates only its OWN views over them
+        // (the reuse arm — the views are this bundle's own, released
+        // with it; the framebuffers below bind them); otherwise (the
+        // WET-FIRST order, or the first build after the coordinated
+        // stale release of a recreation) this build creates the
+        // images + memories into its own partial — the
+        // fault-injection registration — which the build's COMMIT
+        // moves into the shared bundle.
+        let shared_matches = shared_depth.as_ref().is_some_and(|shared| {
+            shared.matches((extent.width, extent.height), swapchain_generation)
+        });
+        for slot in 0..slots {
             // Color images: aspect is COLOR.
             create_image(
                 REFLECTION_FORMAT,
@@ -1283,15 +1431,31 @@ impl ReflectionTargets {
             // The HDR depth attachment's format is the renderer's
             // negotiated depth format (corrective finding 4), passed
             // as `depth_format`.
-            create_image(
-                depth_format,
-                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-                super::depth_aspect(depth_format),
-                &mut self.depth_images,
-                &mut self.depth_memories,
-                &mut self.depth_views,
-                "reflection depth image",
-            )?;
+            if let Some(shared) = shared_depth.as_ref()
+                && shared_matches
+            {
+                // SAFETY: the shared bundle outlives this bundle (the
+                // release order); the view is registered to this
+                // partial immediately.
+                super::post_draw::create_shared_depth_view(
+                    ctx,
+                    TargetFaultSite::Wet,
+                    shared.images()[slot],
+                    depth_format,
+                    &mut self.depth_views,
+                    "reflection depth view (shared image)",
+                )?;
+            } else {
+                create_image(
+                    depth_format,
+                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                    super::depth_aspect(depth_format),
+                    &mut self.depth_images,
+                    &mut self.depth_memories,
+                    &mut self.depth_views,
+                    "reflection depth image",
+                )?;
+            }
         }
         for slot in 0..slots {
             let attachments = [self.color_views[slot], self.depth_views[slot]];

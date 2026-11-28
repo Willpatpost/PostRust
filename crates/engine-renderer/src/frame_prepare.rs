@@ -308,6 +308,16 @@ pub(crate) fn prepare_after_recreation(
 /// headers). Before S3 this pair existed twice, verbatim, in
 /// `prepare_frame` and `prepare_after_recreation`.
 ///
+/// THE B14/R5 COORDINATED STALE RELEASE (the shared-depth
+/// ownership rule): both families' framebuffers bind views of the
+/// SHARED per-slot depth images (the aliasing), so a stale-key
+/// release must take the families' bundles FIRST — their
+/// framebuffers and their own depth views — and the shared images
+/// LAST; no family may release its own stale bundle unilaterally
+/// (the other family's framebuffers could still hold views of the
+/// images being destroyed). The three releases below run in exactly
+/// that order on the same key, before either family's build.
+///
 /// The CAPTURE destination ensure deliberately stays OUT (each path
 /// calls it at its own position — `prepare_frame` before this pair,
 /// `prepare_after_recreation` after it; the order difference is
@@ -320,6 +330,26 @@ fn ensure_extent_targets(
     swapchain: &crate::vulkan::SwapchainState,
     plan: &FramePlan,
 ) -> Result<(), crate::vulkan::RendererError> {
+    // THE B14/R5 COORDINATED STALE RELEASE: post bundle, reflection
+    // bundle, then the shared depth images (every family framebuffer
+    // and depth view dies before the images it views — the
+    // object-lifetime rule the sharing makes load-bearing). All
+    // three keys move together (only a recreation changes them), so
+    // this is all-or-nothing per recreation; a no-op on the steady
+    // key.
+    if let Some(post_state) = &mut pipes.post {
+        post_state.release_stale_targets(ctx, swapchain.extent, swapchain.generation);
+    }
+    if let Some(reflection_state) = &mut pipes.reflection {
+        reflection_state.release_stale_targets(ctx, swapchain.extent, swapchain.generation);
+    }
+    if let Some(shared_depth) = &mut pipes.shared_depth {
+        shared_depth.release_if_stale(
+            ctx,
+            (swapchain.extent.width, swapchain.extent.height),
+            swapchain.generation,
+        );
+    }
     if plan.uses.post
         && let Some(post_state) = &mut pipes.post
     {
@@ -328,6 +358,7 @@ fn ensure_extent_targets(
             swapchain.extent,
             &swapchain.views,
             swapchain.generation,
+            &mut pipes.shared_depth,
         )?;
     }
     if plan.uses.wet
@@ -341,6 +372,7 @@ fn ensure_extent_targets(
             post_state.hdr_render_pass(),
             swapchain.generation,
             swapchain.depth_format,
+            &mut pipes.shared_depth,
         )?;
     }
     Ok(())

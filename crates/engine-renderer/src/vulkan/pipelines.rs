@@ -104,6 +104,18 @@ pub(crate) struct PipelineState {
     /// renderer always carries the post state; the post CHAIN
     /// itself stays optional.
     pub reflection: Option<reflection_draw::ReflectionResources>,
+    /// THE B14/R5 SHARED DEPTH ATTACHMENTS (P5's aliasing decision —
+    /// the depth pair): the per-slot full-extent depth images the
+    /// HDR scene pass and the wet reflection pass ALIAS (one image,
+    /// both families' framebuffers). Created by whichever
+    /// extent-bound family built first (post or wet — the creation
+    /// registered to that family's partial for the fault-injection
+    /// unwind, then MOVED here at its build's commit); the second
+    /// family creates only its own views. Released AFTER both
+    /// families' bundles (their framebuffers bind views of these
+    /// images — the coordinated stale release in `frame_prepare`
+    /// and this struct's `destroy` order below maintain it).
+    pub shared_depth: Option<post_draw::SharedDepthTargets>,
     /// The skinned proxy family's PASS-BOUND pipelines (the
     /// main-pass skinned lit pipeline + the lazy HDR variant),
     /// created LAZILY at the first populated frame — the
@@ -288,6 +300,7 @@ impl PipelineState {
             sky: None,
             post: None,
             reflection: None,
+            shared_depth: None,
             skinned: None,
             shadowed_proxy: None,
         };
@@ -1668,6 +1681,15 @@ impl PipelineState {
             }
             if let Some(reflection) = self.reflection.take() {
                 reflection.destroy(ctx);
+            }
+            // THE B14/R5 RELEASE ORDER (load-bearing): the shared
+            // depth images die only AFTER both families' bundles —
+            // their framebuffers bound views of these images, and
+            // the object-lifetime rule requires every view (and the
+            // framebuffers referencing it) destroyed before the
+            // image it views.
+            if let Some(mut shared_depth) = self.shared_depth.take() {
+                shared_depth.release(ctx);
             }
             if let Some(mut skinned) = self.skinned.take() {
                 skinned.release(ctx);
