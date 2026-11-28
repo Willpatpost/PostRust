@@ -58,13 +58,24 @@
 //! D-family half this type adds). The wall-vs-target occlusion and
 //! tie semantics are byte-frozen by the tests below and the
 //! engine-slice combat/encounter batteries.
+//!
+//! Q02 — the roster/ownership contract: [`CombatIndex`] BORROWS the
+//! roster it was built over (the `CensusIndex` precedent), so it can
+//! never serve a different-content roster through a grid built over
+//! another — the pre-Q02 length-only guard passed exactly that case
+//! and served a wrong answer (the discriminating test reconstructs
+//! it). Q01 — the bounded construction: a hitbox covering more than
+//! [`GRID_OVERSIZED_CELL_LIMIT`] cells goes to the grid's oversized
+//! list (one resident entry, consulted by every query), so no
+//! finite in-domain hitbox can amplify the index.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
 
 use crate::event::EventClass;
 use crate::player::{
-    CollisionWorld, GRID_CELL_LIMIT, GRID_CELL_SIZE, GRID_CELL_WASTE_FACTOR, StaticCollider,
+    CollisionWorld, GRID_CELL_LIMIT, GRID_CELL_SIZE, GRID_CELL_WASTE_FACTOR,
+    GRID_OVERSIZED_CELL_LIMIT, StaticCollider,
 };
 
 /// The combat event payload namespace's type tag (the top 16 bits of
@@ -343,7 +354,11 @@ pub fn resolve_attack(
 /// target scan — over the full slice, or over the index's
 /// conservative candidates re-sorted to slice order. The only
 /// possible difference between the two paths is WHICH combatants
-/// the scan visits, in what order.
+/// the scan visits, in what order. INVARIANT (Q02's ownership
+/// contract): when `index` is `Some`, `targets` IS the index's
+/// borrowed `population` — the only call site passes exactly that,
+/// so the candidates (gathered from the grid built over that same
+/// slice) index into the slice they were gathered from.
 fn resolve_attack_over(
     world: &CollisionWorld,
     request: &AttackRequest,
@@ -371,9 +386,7 @@ fn resolve_attack_over(
     let wall_t = world.segment_hit(request.origin, to, request.profile.occlusion_margin);
     let wall_distance = wall_t.map(|t| t * request.profile.range);
     let mut best: Option<(CombatantId, f32)> = None;
-    if let Some(candidates) =
-        index.and_then(|index| index.candidates(targets.len(), request.origin, to))
-    {
+    if let Some(candidates) = index.and_then(|index| index.candidates(request.origin, to)) {
         for position in candidates {
             consider_combatant(
                 &targets[position as usize],
@@ -582,17 +595,30 @@ fn combat_query_spans(from: [f32; 3], to: [f32; 3]) -> Option<([(i32, i32); 3], 
 /// inserted into it, in insertion order (push, never sorted — the
 /// candidate re-sort relies only on the positions, but keeping the
 /// per-cell lists in insertion order makes the construction itself
-/// canonical). Lookup-only — never iterated.
+/// canonical). Lookup-only — never iterated. Plus the OVERSIZED list
+/// (Q01's bounded construction, the StaticGrid twin): hitboxes whose
+/// covered-cell count exceeds [`GRID_OVERSIZED_CELL_LIMIT`] — one
+/// resident entry each, consulted by every query.
 #[derive(Debug, Clone, Default)]
 struct CombatantGrid {
     /// Cell key = (floor(x/s), floor(y/s), floor(z/s)) with
     /// s = [`GRID_CELL_SIZE`]; value = slice positions.
     cells: HashMap<[i32; 3], Vec<u32>, CellHasherBuilder>,
+    /// VALID hitboxes covering more than [`GRID_OVERSIZED_CELL_LIMIT`]
+    /// cells (or whose coverage overflows the checked product): ONE
+    /// entry each, universally consulted. A finite in-domain hitbox
+    /// can never amplify the index's memory or build time — the
+    /// resident-entry bound (cap + 1) per combatant.
+    oversized: Vec<u32>,
 }
 
 impl CombatantGrid {
     /// Inserts one VALID combatant's entry into every cell its
-    /// hitbox covers. The caller has already validated the box
+    /// hitbox covers — unless the coverage exceeds
+    /// [`GRID_OVERSIZED_CELL_LIMIT`], in which case the position goes
+    /// to the OVERSIZED list as one entry (Q01's bounded
+    /// construction, identical to the static grid's mechanism). The
+    /// caller has already validated the box
     /// ([`Combatant::hit_box_valid`] — finite, `min <= max` on every
     /// axis), so no per-axis sort is needed here (unlike the static
     /// grid, whose linear arms also consult inverted collider
@@ -601,7 +627,8 @@ impl CombatantGrid {
     /// outside the [`GRID_CELL_LIMIT`] domain — the caller poisons
     /// the index (fail-closed), because an out-of-domain VALID box
     /// is hit-able by the linear path and therefore cannot simply
-    /// be skipped.
+    /// be skipped; the domain rule wins over the oversized list
+    /// exactly as it does in the static grid.
     fn insert(&mut self, position: u32, min: [f32; 3], max: [f32; 3]) -> bool {
         let mut spans = [(0i32, 0i32); 3];
         for axis in 0..3 {
@@ -609,6 +636,23 @@ impl CombatantGrid {
                 return false;
             };
             spans[axis] = span;
+        }
+        // The covered-cell count, checked (a whole-domain hitbox's
+        // product exceeds u64 — itself proof it is over the cap).
+        let mut covered: u64 = 1;
+        for span in &spans {
+            let per_axis = (span.1 - span.0 + 1) as u64;
+            match covered.checked_mul(per_axis) {
+                Some(product) => covered = product,
+                None => {
+                    self.oversized.push(position);
+                    return true;
+                }
+            }
+        }
+        if covered > GRID_OVERSIZED_CELL_LIMIT {
+            self.oversized.push(position);
+            return true;
         }
         for cx in spans[0].0..=spans[0].1 {
             for cy in spans[1].0..=spans[1].1 {
@@ -623,13 +667,18 @@ impl CombatantGrid {
     /// The conservative candidate set for precomputed query cell
     /// spans: walk the covered cells row-major (the canonical order
     /// — any fixed order would do, since the re-sort restores the
-    /// contract order), collect the positions, re-sort to slice
+    /// contract order), collect the positions PLUS the entire
+    /// oversized list (Q01: every query consults it — conservative
+    /// correctness with oversized hitboxes present), re-sort to slice
     /// position (the linear scan's own iteration order), dedup.
     /// Duplicates (a hitbox covering several walked cells) collapse
     /// here; they are provable no-ops anyway (the accumulator
     /// accepts only a strictly smaller (distance, id) pair, so a
     /// re-evaluated combatant never re-displaces), but removing them
-    /// keeps the candidate walk honest.
+    /// keeps the candidate walk honest. The oversized entries enter
+    /// the SAME re-sort, so the candidate sequence is exactly the
+    /// linear scan's iteration order over a conservative superset —
+    /// bit-identity holds, ties included.
     fn candidates(&self, spans: [(i32, i32); 3]) -> Vec<u32> {
         let mut positions: Vec<u32> = Vec::new();
         for cx in spans[0].0..=spans[0].1 {
@@ -641,6 +690,7 @@ impl CombatantGrid {
                 }
             }
         }
+        positions.extend_from_slice(&self.oversized);
         positions.sort_unstable();
         positions.dedup();
         positions
@@ -755,35 +805,66 @@ enum CombatPhase {
 /// **Fail-closed domains:** a VALID hitbox outside the cell domain
 /// poisons the index for its roster ([`CombatPhase::Unusable`]); a
 /// non-finite query extent (e.g. a `to` that overflowed at huge
-/// range), an out-of-domain extent, the [`GRID_CELL_WASTE_FACTOR`]
-/// crossover guard, or a `targets` slice whose length differs from
-/// the built roster (the structural mismatch guard — the index is
-/// valid only for the exact slice it was built over) each fall back
-/// to the exact linear path PER QUERY. Behavior never depends on
-/// the broad phase being available.
+/// range), an out-of-domain extent, or the
+/// [`GRID_CELL_WASTE_FACTOR`] crossover guard each fall back to the
+/// exact linear path PER QUERY. Behavior never depends on the broad
+/// phase being available.
+///
+/// **THE ROSTER/OWNERSHIP CONTRACT (Q02):** the index BORROWS the
+/// roster it was built over — `population: &'p [Combatant]` — so it
+/// cannot outlive it and cannot serve any other slice. This replaces
+/// the pre-Q02 shape (a stored roster LENGTH, checked per query),
+/// whose guard missed exactly the dangerous case: a SAME-LENGTH
+/// different-content roster passed the length check and the grid
+/// then served candidates gathered from the BUILT roster's
+/// hitboxes against the PASSED roster's boxes — a wrong answer
+/// (demonstrated, not hypothetical: the Q02 discriminating test
+/// reconstructs the old call and shows it missing a target the
+/// linear scan over the passed roster hits). A pointer check would
+/// not close it either (a public mutable roster can change contents
+/// without changing its address — the same reasoning that keeps
+/// `interaction.rs`'s per-call census linear); a per-query content
+/// fingerprint would cost O(n) per query, defeating the index. The
+/// borrow is the only sound-by-construction shape, and it is this
+/// engine's own established pattern: the census index handle
+/// (`npc_perception::CensusIndexScratch::build`) returns a handle
+/// borrowing BOTH the caller's scratch and the population slice for
+/// exactly this reason ("staleness is impossible by construction —
+/// drop the handle, mutate the population, rebuild"). The composition
+/// contract that follows: REBUILD the index whenever the roster
+/// mutates (the encounter's `encounter_targets` cadence — roster
+/// and index are rebuilt together, in one scope, so the borrow is
+/// natural); a stale index over a mutated roster is a borrow-check
+/// error, never a silent wrong answer. No production call site
+/// exists yet (the `FireContext` adoption seam is Q04's), so the
+/// contract changes cost nothing to adopt.
 #[derive(Debug, Clone, Default)]
-pub struct CombatIndex {
-    /// The roster length at build time — the structural guard: a
-    /// resolve against a different-length slice takes the linear
-    /// path (a same-length-but-different roster is a caller
-    /// contract violation this guard cannot see; rebuilding the
-    /// index with the new roster is the caller's responsibility,
-    /// documented here).
-    population: usize,
+pub struct CombatIndex<'p> {
+    /// The roster this index was built over and serves — BORROWED
+    /// (Q02's ownership contract: the handle cannot outlive the
+    /// roster, and every resolve reads THIS slice, so a
+    /// different-content roster can never be served through a grid
+    /// built over another; mutation requires dropping the handle
+    /// first — the borrow checker enforces the rebuild cadence).
+    population: &'p [Combatant],
     phase: CombatPhase,
 }
 
-impl CombatIndex {
-    /// Builds the index over one roster. Below
+impl<'p> CombatIndex<'p> {
+    /// Builds the index over one roster, borrowing it. Below
     /// [`COMBAT_INDEX_GATE`] the result is the inert linear index
     /// (the retained small-workload fast path — every current
     /// scenario); at or above it the grid is built, unless a VALID
     /// hitbox lies outside the cell domain (then permanently linear
     /// for this roster, fail-closed). INVALID hitboxes never poison
-    /// — they are skipped, exactly as the linear scan skips them.
-    pub fn build(targets: &[Combatant]) -> CombatIndex {
+    /// — they are skipped, exactly as the linear scan skips them;
+    /// oversized VALID hitboxes (coverage over
+    /// [`GRID_OVERSIZED_CELL_LIMIT`]) go to the grid's oversized
+    /// list — one resident entry, universally consulted (Q01's
+    /// bounded construction).
+    pub fn build(targets: &'p [Combatant]) -> CombatIndex<'p> {
         let mut index = CombatIndex {
-            population: targets.len(),
+            population: targets,
             phase: CombatPhase::Linear,
         };
         if targets.len() >= COMBAT_INDEX_GATE {
@@ -796,34 +877,28 @@ impl CombatIndex {
     }
 
     /// Resolves one attack over the roster this index was built
-    /// from — the IDENTICAL contract to [`resolve_attack`]
-    /// (validation, occlusion, selection, ties, refusals): the only
-    /// difference is the candidate source, and the result is
-    /// bit-identical by construction (see the type's docs).
-    /// `targets` must be the slice this index was built over; a
-    /// length mismatch falls back to the exact linear path (never a
-    /// wrong answer — at worst the linear cost). Allocates the
-    /// candidate list per query (the linear primitive never does;
-    /// the composition weighs that against its roster size).
-    pub fn resolve_attack(
-        &self,
-        world: &CollisionWorld,
-        request: &AttackRequest,
-        targets: &[Combatant],
-    ) -> HitResolution {
-        resolve_attack_over(world, request, targets, Some(self))
+    /// from (the borrowed `population` — there is no `targets`
+    /// parameter to get wrong, Q02's point) — the IDENTICAL contract
+    /// to [`resolve_attack`] (validation, occlusion, selection,
+    /// ties, refusals): the only difference is the candidate source,
+    /// and the result is bit-identical by construction (see the
+    /// type's docs). Allocates the candidate list per query (the
+    /// linear primitive never does; the composition weighs that
+    /// against its roster size — see the Q09 allocation census,
+    /// `tests/spatial_query_allocations.rs`).
+    pub fn resolve_attack(&self, world: &CollisionWorld, request: &AttackRequest) -> HitResolution {
+        resolve_attack_over(world, request, self.population, Some(self))
     }
 
     /// The broad-phase candidates for one trace, or `None` to take
-    /// the exact linear path: below gate / poisoned / mismatched
-    /// slice / non-finite or out-of-domain extent / waste guard.
-    fn candidates(&self, population: usize, from: [f32; 3], to: [f32; 3]) -> Option<Vec<u32>> {
+    /// the exact linear path: below gate / poisoned / non-finite or
+    /// out-of-domain extent / waste guard. The population is the
+    /// borrowed roster by construction — the pre-Q02 length-mismatch
+    /// guard is deleted (unrepresentable under the borrow).
+    fn candidates(&self, from: [f32; 3], to: [f32; 3]) -> Option<Vec<u32>> {
         let CombatPhase::Grid(grid) = &self.phase else {
             return None;
         };
-        if population != self.population {
-            return None;
-        }
         let (spans, walked) = combat_query_spans(from, to)?;
         // The crossover guard (the DDA stand-in, the static family's
         // own GRID_CELL_WASTE_FACTOR): more cells walked than 4 per
@@ -832,7 +907,7 @@ impl CombatIndex {
         // documented class it keeps linear is the LONG DIAGONAL ray
         // over a small roster (a 170 m diagonal spans ~3.7 k cells:
         // linear below ~1 k combatants, grid above).
-        if walked > GRID_CELL_WASTE_FACTOR * self.population as u64 {
+        if walked > GRID_CELL_WASTE_FACTOR * self.population.len() as u64 {
             return None;
         }
         Some(grid.candidates(spans))
@@ -1866,9 +1941,9 @@ mod tests {
     /// bit-identical results). Returns whether the grid is active
     /// after the call (an out-of-domain VALID box cannot be forced
     /// on — the fail-closed domain).
-    fn force_index_on(targets: &[Combatant]) -> (CombatIndex, bool) {
+    fn force_index_on(targets: &[Combatant]) -> (CombatIndex<'_>, bool) {
         let mut index = CombatIndex {
-            population: targets.len(),
+            population: targets,
             phase: CombatPhase::Linear,
         };
         match build_combatant_grid(targets) {
@@ -2033,7 +2108,7 @@ mod tests {
                                 occlusion_margin: margin,
                             },
                         };
-                        let grid_result = index.resolve_attack(world, &request, &roster);
+                        let grid_result = index.resolve_attack(world, &request);
                         let linear_result = resolve_attack(world, &request, &roster);
                         assert!(
                             same_resolution(grid_result, linear_result),
@@ -2084,8 +2159,8 @@ mod tests {
                     };
                     assert!(
                         same_resolution(
-                            index.resolve_attack(&world, &request, &roster),
-                            rev_index.resolve_attack(&world, &request, &reversed)
+                            index.resolve_attack(&world, &request),
+                            rev_index.resolve_attack(&world, &request)
                         ),
                         "{label} perm q{query}: slice order leaks into the grid path"
                     );
@@ -2114,7 +2189,7 @@ mod tests {
         for roster in [&[a, b], &[b, a]] {
             let (index, active) = force_index_on(roster);
             assert!(active);
-            let grid_result = index.resolve_attack(&world, &forward, roster);
+            let grid_result = index.resolve_attack(&world, &forward);
             let linear_result = resolve_attack(&world, &forward, roster);
             assert!(
                 same_resolution(grid_result, linear_result),
@@ -2142,7 +2217,7 @@ mod tests {
         for roster in pairs {
             let (index, active) = force_index_on(roster);
             assert!(active);
-            let grid_result = index.resolve_attack(&world, &forward, roster);
+            let grid_result = index.resolve_attack(&world, &forward);
             let linear_result = resolve_attack(&world, &forward, roster);
             assert!(
                 same_resolution(grid_result, linear_result),
@@ -2167,11 +2242,12 @@ mod tests {
             max: [1.0, 3.0, -1.0],
         });
         let tied = box_at(5, [-0.5, 0.0, -2.0], [0.5, 1.8, -1.0]);
-        let (index, active) = force_index_on(&[tied]);
+        let tied_roster = [tied];
+        let (index, active) = force_index_on(&tied_roster);
         assert!(active);
         let tie_request = request([0.0, 1.6, 0.0], [0.0, 0.0, -1.0], 10.0);
-        let grid_result = index.resolve_attack(&tie_world, &tie_request, &[tied]);
-        let linear_result = resolve_attack(&tie_world, &tie_request, &[tied]);
+        let grid_result = index.resolve_attack(&tie_world, &tie_request);
+        let linear_result = resolve_attack(&tie_world, &tie_request, &tied_roster);
         assert!(same_resolution(grid_result, linear_result));
         assert!(
             matches!(
@@ -2189,7 +2265,7 @@ mod tests {
         let boundary_request = request([0.0, 1.6, 0.0], [0.0, 0.0, -1.0], 4.0);
         let (index, active) = force_index_on(&at_range);
         assert!(active);
-        let grid_result = index.resolve_attack(&world, &boundary_request, &at_range);
+        let grid_result = index.resolve_attack(&world, &boundary_request);
         assert!(same_resolution(
             grid_result,
             resolve_attack(&world, &boundary_request, &at_range)
@@ -2206,7 +2282,7 @@ mod tests {
         let point_blank = request([0.0, 1.6, 0.0], [0.0, 0.0, -1.0], 30.0);
         let (index, active) = force_index_on(&inside);
         assert!(active);
-        let grid_result = index.resolve_attack(&world, &point_blank, &inside);
+        let grid_result = index.resolve_attack(&world, &point_blank);
         assert!(same_resolution(
             grid_result,
             resolve_attack(&world, &point_blank, &inside)
@@ -2233,7 +2309,7 @@ mod tests {
         let (index, active) = force_index_on(&roster);
         assert!(active, "invalid hitboxes never poison the combat index");
         let skip_request = request([0.0, 1.6, 0.0], [0.0, 0.0, -1.0], 30.0);
-        let grid_result = index.resolve_attack(&world, &skip_request, &roster);
+        let grid_result = index.resolve_attack(&world, &skip_request);
         assert!(same_resolution(
             grid_result,
             resolve_attack(&world, &skip_request, &roster)
@@ -2245,12 +2321,14 @@ mod tests {
     /// combatants the index is the inert linear fast path (the
     /// default is structural, not caller discipline); the 128th
     /// combatant ACTIVATES the grid; the switch is
-    /// behavior-invisible at the exact boundary; the structural
-    /// mismatch guard falls back to linear; the out-of-domain VALID
-    /// box poisons (permanently linear for the roster) while a trace
-    /// that genuinely REACHES the far box still hits it (the
-    /// fallback's honesty); an out-of-domain QUERY extent and the
-    /// waste-guard regime fall back per query on a healthy grid.
+    /// behavior-invisible at the exact boundary; a different-length
+    /// roster is simply a different index under Q02's borrowing
+    /// contract (the old structural-mismatch guard, superseded); the
+    /// out-of-domain VALID box poisons (permanently linear for the
+    /// roster) while a trace that genuinely REACHES the far box
+    /// still hits it (the fallback's honesty); an out-of-domain
+    /// QUERY extent and the waste-guard regime fall back per query
+    /// on a healthy grid.
     #[test]
     fn combat_index_gate_boundary() {
         let world = CollisionWorld::new(0.0).with_collider(StaticCollider {
@@ -2265,7 +2343,7 @@ mod tests {
             matches!(below_index.phase, CombatPhase::Linear),
             "127: below the gate"
         );
-        assert_eq!(below_index.population, 127);
+        assert_eq!(below_index.population.len(), 127);
 
         // The 128th combatant crosses the gate: the grid activates.
         let at_roster = fixture_roster(0x0B06_0001, 128, Shape::Spread, false);
@@ -2296,31 +2374,41 @@ mod tests {
             };
             assert!(
                 same_resolution(
-                    at_index.resolve_attack(&world, &request, &at_roster),
+                    at_index.resolve_attack(&world, &request),
                     resolve_attack(&world, &request, &at_roster)
                 ),
                 "q{query}: the gate switch is behavior-invisible"
             );
             assert!(
                 same_resolution(
-                    below_index.resolve_attack(&world, &request, &below),
+                    below_index.resolve_attack(&world, &request),
                     resolve_attack(&world, &request, &below)
                 ),
                 "q{query}: the below-gate index is the linear path"
             );
         }
 
-        // The structural mismatch guard: an index built over 128
-        // resolving a DIFFERENT-length slice falls back to the exact
-        // linear path — never a wrong answer.
+        // Q02's ownership contract at the boundary: the index answers
+        // over ITS OWN borrowed roster — the old API's separate
+        // `targets` parameter (whose length-only guard passed a
+        // same-length different-content roster and served a WRONG
+        // answer) no longer exists. The discriminating witness lives
+        // in `combat_index_roster_contract_refuses_wrong_roster`
+        // below; here the boundary re-proves that an index built
+        // over a DIFFERENT-length roster is a different index that
+        // answers over that roster — the length-mismatch fallback of
+        // the old guard is now simply the borrow.
         let grown = fixture_roster(0x0B06_0002, 140, Shape::Spread, false);
+        let grown_index = CombatIndex::build(&grown);
+        assert!(matches!(grown_index.phase, CombatPhase::Grid(_)));
         let mismatch_request = request([0.0, 1.6, 0.0], [0.0, 0.0, -1.0], 30.0);
         assert!(
             same_resolution(
-                at_index.resolve_attack(&world, &mismatch_request, &grown),
+                grown_index.resolve_attack(&world, &mismatch_request),
                 resolve_attack(&world, &mismatch_request, &grown)
             ),
-            "a length-mismatched resolve falls back to linear"
+            "the grown roster's own index answers it — a different \
+             slice is a different index, never a fallback"
         );
 
         // The fail-closed domain: a VALID hitbox outside the cell
@@ -2344,7 +2432,7 @@ mod tests {
         );
         let near_request = request([0.0, 1.6, 0.0], [0.0, 0.0, -1.0], 30.0);
         assert!(same_resolution(
-            far_index.resolve_attack(&world, &near_request, &far_roster),
+            far_index.resolve_attack(&world, &near_request),
             resolve_attack(&world, &near_request, &far_roster)
         ));
         let reaching = AttackRequest {
@@ -2357,7 +2445,7 @@ mod tests {
             },
         };
         assert!(same_resolution(
-            far_index.resolve_attack(&world, &reaching, &far_roster),
+            far_index.resolve_attack(&world, &reaching),
             resolve_attack(&world, &reaching, &far_roster)
         ));
         assert!(
@@ -2371,7 +2459,7 @@ mod tests {
         // An out-of-domain QUERY extent on a HEALTHY grid (a trace
         // to x = +5,000,000 m) falls back per query — bit-identical.
         assert!(same_resolution(
-            at_index.resolve_attack(&world, &reaching, &at_roster),
+            at_index.resolve_attack(&world, &reaching),
             resolve_attack(&world, &reaching, &at_roster)
         ));
 
@@ -2389,8 +2477,260 @@ mod tests {
             },
         };
         assert!(same_resolution(
-            at_index.resolve_attack(&world, &diagonal, &at_roster),
+            at_index.resolve_attack(&world, &diagonal),
             resolve_attack(&world, &diagonal, &at_roster)
+        ));
+    }
+
+    /// Q02's DISCRIMINATING TEST — the case the old length-only
+    /// guard could not see: a SAME-LENGTH different-CONTENT roster.
+    /// The pre-Q02 API accepted `index.resolve_attack(world,
+    /// request, targets)` with `targets` a separate slice; when that
+    /// slice had the built roster's length but different hitboxes,
+    /// the grid served candidates gathered from the BUILT roster's
+    /// cells against the PASSED roster's boxes — a wrong answer. The
+    /// reconstruction below emulates exactly that old call with the
+    /// current internals (the grid over roster A, the narrow phase
+    /// over roster B) and pins that it MISSES a target the linear
+    /// scan over B hits; then pins the contract that replaced it:
+    /// the index answers over ITS OWN borrowed roster (bit-identical
+    /// to the linear scan over that roster), a mutated roster gets a
+    /// REBUILT index (the documented cadence), and the wrong cross
+    /// call is no longer expressible on the public API.
+    #[test]
+    fn combat_index_roster_contract_refuses_wrong_roster() {
+        let world = CollisionWorld::new(0.0);
+        // Roster A: 128 combatants (the gate), all far off the -Z
+        // firing line — combatant 5 sits at x ≈ 900 (cell 450), far
+        // outside the trace's cell span.
+        let mut roster_a = Vec::with_capacity(COMBAT_INDEX_GATE);
+        for i in 0..COMBAT_INDEX_GATE as u32 {
+            let base = if i == 5 {
+                [900.0, 0.0, 900.0]
+            } else {
+                [
+                    10.0 + (i % 16) as f32 * 3.0,
+                    0.0,
+                    10.0 + (i / 16) as f32 * 3.0,
+                ]
+            };
+            roster_a.push(box_at(
+                i + 1,
+                [base[0] - 0.45, base[1], base[2] - 0.45],
+                [base[0] + 0.45, base[1] + 1.8, base[2] + 0.45],
+            ));
+        }
+        let index_a = CombatIndex::build(&roster_a);
+        assert!(matches!(index_a.phase, CombatPhase::Grid(_)));
+
+        // Roster B: SAME LENGTH, one different content — combatant 5
+        // moved onto the firing line (the box the trace now hits).
+        let mut roster_b = roster_a.clone();
+        roster_b[5] = box_at(6, [-0.5, 0.0, -5.0], [0.5, 1.8, -4.0]);
+        assert_eq!(
+            roster_a.len(),
+            roster_b.len(),
+            "same length by construction"
+        );
+
+        let request = AttackRequest {
+            attacker: 0,
+            origin: [0.0, 1.6, 0.0],
+            direction: [0.0, 0.0, -1.0],
+            profile: AttackProfile {
+                range: 30.0,
+                occlusion_margin: 0.0,
+            },
+        };
+
+        // The linear authorities: A has nobody on the line (Miss),
+        // B has combatant 5's box at entry z = −4 (Hit, distance 4).
+        let linear_a = resolve_attack(&world, &request, &roster_a);
+        let linear_b = resolve_attack(&world, &request, &roster_b);
+        assert!(matches!(linear_a, HitResolution::Miss { .. }));
+        assert!(
+            matches!(
+                linear_b,
+                HitResolution::Hit {
+                    target: 6,
+                    distance,
+                    ..
+                } if same_f32(distance, 4.0)
+            ),
+            "the moved box is on the line: {linear_b:?}"
+        );
+
+        // THE OLD API'S WRONG ANSWER, reconstructed: candidates from
+        // A's grid (position 5's A-cell at x ≈ 900 is NOT in the
+        // trace's cell span, so it is not a candidate), narrow phase
+        // over B's boxes — the moved target is invisible to the
+        // walk, exactly what `index_a.resolve_attack(world, &req,
+        // &roster_b)` computed before Q02. It is a THIRD answer
+        // that matches NEITHER authority: a Miss over a roster the
+        // linear scan Hits.
+        let to = point_at(
+            request.origin,
+            unit_direction(request.direction).unwrap(),
+            30.0,
+        );
+        let mut best: Option<(CombatantId, f32)> = None;
+        let old_style_candidates = index_a.candidates(request.origin, to).expect(
+            "the grid arm serves this trace (the waste guard does not \
+             fire at this population and extent)",
+        );
+        assert!(
+            !old_style_candidates.contains(&5),
+            "the moved combatant's OLD cell is outside the trace's span — \
+             the setup's premise"
+        );
+        for position in old_style_candidates {
+            consider_combatant(&roster_b[position as usize], &request, to, None, &mut best);
+        }
+        let old_style = match best {
+            Some((target, distance)) => HitResolution::Hit {
+                target,
+                distance,
+                point: point_at(
+                    request.origin,
+                    unit_direction(request.direction).unwrap(),
+                    distance,
+                ),
+            },
+            None => HitResolution::Miss {
+                kind: MissKind::Clear,
+            },
+        };
+        assert!(
+            !same_resolution(old_style, linear_b),
+            "the pre-Q02 cross-roster call served a WRONG answer: \
+             {old_style:?} where the linear authority over the passed \
+             roster says {linear_b:?}"
+        );
+        assert!(matches!(old_style, HitResolution::Miss { .. }));
+
+        // THE NEW CONTRACT: the index answers over its OWN roster —
+        // bit-identical to that roster's linear authority — and the
+        // cross-roster call is not expressible (there is no targets
+        // parameter). The mutation cadence: rebuild for roster B.
+        assert!(same_resolution(
+            index_a.resolve_attack(&world, &request),
+            linear_a
+        ));
+        let index_b = CombatIndex::build(&roster_b);
+        assert!(matches!(index_b.phase, CombatPhase::Grid(_)));
+        assert!(same_resolution(
+            index_b.resolve_attack(&world, &request),
+            linear_b
+        ));
+        // ...and the rebuilt index's answer is the HIT, not the old
+        // wrong Miss: the moved box's NEW cell is in the span.
+        assert!(matches!(
+            index_b.resolve_attack(&world, &request),
+            HitResolution::Hit { target: 6, .. }
+        ));
+    }
+
+    /// Q01's combat twin — the bounded-construction proof for the
+    /// combatant grid: a VALID hitbox spanning (nearly) the whole
+    /// cell domain produces ONE oversized entry (never the ~6.4×10¹⁹
+    /// per-cell amplification the unbounded insertion loop would
+    /// attempt), the index stays ACTIVE (an in-domain oversized
+    /// hitbox is not a poison — conservative correctness preserved
+    /// through the universally-consulted oversized list), and the
+    /// resolve over it is bit-identical to the linear authority,
+    /// including a trace that genuinely hits the huge box.
+    #[test]
+    fn combat_index_oversized_hitbox_is_bounded_not_amplified() {
+        let world = CollisionWorld::new(0.0);
+        // The control roster at the gate: human-scale bodies.
+        let mut control = fixture_roster(0x0D06_0001, COMBAT_INDEX_GATE, Shape::Spread, false);
+        let control_index = CombatIndex::build(&control);
+        assert!(matches!(control_index.phase, CombatPhase::Grid(_)));
+        let CombatPhase::Grid(control_grid) = &control_index.phase else {
+            unreachable!("checked above");
+        };
+
+        // The whole-domain hitbox appended (same length + 1):
+        // coverage (4,000,001)³ ≈ 6.4×10¹⁹ cells — beyond u64, over
+        // the cap by any measure, every coordinate finite and IN
+        // domain.
+        control.push(Combatant {
+            id: 9_001,
+            hit_box: StaticCollider {
+                min: [-4_000_000.0; 3],
+                max: [4_000_000.0; 3],
+            },
+        });
+        let huge_index = CombatIndex::build(&control);
+        assert!(
+            matches!(huge_index.phase, CombatPhase::Grid(_)),
+            "an in-domain oversized hitbox keeps the index ACTIVE — \
+             oversized, never a poison"
+        );
+        let CombatPhase::Grid(huge_grid) = &huge_index.phase else {
+            unreachable!("checked above");
+        };
+        assert_eq!(
+            huge_grid.oversized,
+            vec![COMBAT_INDEX_GATE as u32],
+            "the whole-domain hitbox is ONE oversized entry (its slice \
+             position)"
+        );
+        assert_eq!(
+            huge_grid.cells, control_grid.cells,
+            "the whole-domain hitbox contributed ZERO cell entries"
+        );
+        let total = control.len();
+        let entries: usize = huge_grid.cells.values().map(Vec::len).sum();
+        assert!(
+            entries + huge_grid.oversized.len() <= (GRID_OVERSIZED_CELL_LIMIT as usize + 1) * total,
+            "the resident-entry bound: (cap + 1) per combatant"
+        );
+
+        // Equivalence with the huge hitbox present: every trace hits
+        // it (every box contains every origin) — the oversized
+        // candidate supplies the Hit, bit-identical to the linear
+        // authority over the same roster.
+        let inside = AttackRequest {
+            attacker: 0,
+            origin: [0.0, 1.6, 0.0],
+            direction: [0.0, 0.0, -1.0],
+            profile: AttackProfile {
+                range: 30.0,
+                occlusion_margin: 0.0,
+            },
+        };
+        let grid_result = huge_index.resolve_attack(&world, &inside);
+        assert!(same_resolution(
+            grid_result,
+            resolve_attack(&world, &inside, &control)
+        ));
+        assert!(
+            matches!(
+                grid_result,
+                HitResolution::Hit {
+                    target: 9_001,
+                    distance: 0.0,
+                    ..
+                }
+            ),
+            "the trace starts inside the huge box: entry t = 0"
+        );
+        // A trace into empty space far away still hits the huge box
+        // (it covers everything) — the oversized list is consulted
+        // by EVERY query.
+        let far = AttackRequest {
+            attacker: 0,
+            origin: [1_000_000.0, 1.6, 1_000_000.0],
+            direction: [0.0, 0.0, -1.0],
+            profile: AttackProfile {
+                range: 30.0,
+                occlusion_margin: 0.0,
+            },
+        };
+        assert!(same_resolution(
+            huge_index.resolve_attack(&world, &far),
+            resolve_attack(&world, &far, &control)
         ));
     }
 
@@ -2502,7 +2842,7 @@ mod tests {
             for request in [&shot, &diagonal, &miss] {
                 assert!(
                     same_resolution(
-                        index.resolve_attack(&world, request, &roster),
+                        index.resolve_attack(&world, request),
                         resolve_attack(&world, request, &roster)
                     ),
                     "pop {size}: the timed probe is bit-identical"
@@ -2522,15 +2862,16 @@ mod tests {
                     }),
                 ]
             };
-            let grid_times = t(&|request| index.resolve_attack(&world, request, &roster));
+            let grid_times = t(&|request| index.resolve_attack(&world, request));
             let linear_times = t(&|request| resolve_attack(&world, request, &roster));
             if let CombatPhase::Grid(grid) = &index.phase {
                 let entries: usize = grid.cells.values().map(Vec::len).sum();
                 println!(
                     "[combat-index-scaling] pop {size:6} · roster build {roster_build_ms:8.3} ms \
                      · index build {index_build_ms:8.3} ms · cells {} · entries {entries} · \
-                     queries {queries}",
-                    grid.cells.len()
+                     oversized {} · queries {queries}",
+                    grid.cells.len(),
+                    grid.oversized.len()
                 );
             }
             println!(

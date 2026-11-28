@@ -30,6 +30,16 @@
 //! "may later ride the same index"). [`select_target`] is therefore
 //! the permanent small-workload fast path; the stay-linear evidence
 //! is measured in `select_target_census_disposition_evidence`.
+//!
+//! Q02 ASSESSMENT (the spatial-machinery hardening lane): the
+//! roster/ownership contract question does not arise here —
+//! [`select_target`] holds no index and receives its target slice
+//! IN the call, so there is no build/query gap where a stale or
+//! same-length-different roster could be served (the per-call
+//! validation rule B07 recorded for raw `&[Rule]` tables). If a
+//! future family-D interaction index is ever adopted, it carries
+//! the borrowed-population contract `CombatIndex` and `CensusIndex`
+//! hold.
 
 /// One interactable world entity, as the engine sees it: an identity,
 /// a position, and an interaction extent (the radius around the

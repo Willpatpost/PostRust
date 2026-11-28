@@ -431,7 +431,10 @@ impl CensusIndexScratch {
     /// returned handle borrows BOTH this scratch and `population`,
     /// so it cannot outlive either — the grid is per-batch, never
     /// persistent, and staleness is impossible by construction
-    /// (drop the handle, mutate the population, rebuild).
+    /// (drop the handle, mutate the population, rebuild). This is
+    /// the borrowed-population ownership contract Q02 generalized
+    /// across the spatial machinery (`CombatIndex` carries the same
+    /// shape); the census landed it first.
     pub fn build<'p, 's>(&'s mut self, population: &'p [NpcRecord]) -> Option<CensusIndex<'p, 's>> {
         let Self { build, candidates } = self;
         if !build_grid(build, population) {
@@ -490,6 +493,13 @@ impl CensusIndexScratch {
 /// The flat layout is therefore a pure function of the population
 /// slice — no HashMap iteration anywhere (the module contract), so
 /// the layout is deterministic on every run and platform.
+///
+/// Q01 ASSESSMENT (the spatial-machinery hardening lane): this build
+/// has NO cell-amplification path — each record occupies exactly
+/// ONE cell (the counting sort's premise), so a record's resident
+/// contribution is one entry regardless of any extent: the
+/// oversized-collider mechanism the static and combatant grids
+/// carry is structurally unnecessary here.
 fn build_grid(build: &mut CensusBuildBuffers, population: &[NpcRecord]) -> bool {
     build.buckets.clear();
     build.spans.clear();

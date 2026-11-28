@@ -88,7 +88,15 @@
 //! mathematical tie is bit-identical between the two paths.
 //! Out-of-domain inputs (non-finite, or beyond [`GRID_CELL_LIMIT`])
 //! fail CLOSED onto the exact linear path — behavior never depends
-//! on the broad phase being available.
+//! on the broad phase being available. Bounded construction (Q01):
+//! a collider covering more than [`GRID_OVERSIZED_CELL_LIMIT`] cells
+//! is stored on the grid's oversized list — one resident entry,
+//! consulted by every query, entering the same candidate re-sort —
+//! so no finite in-domain collider can amplify the grid's memory or
+//! build time (total resident entries are bounded by
+//! (cap + 1) × collider count; the oversized-equivalence battery
+//! pins the bit-identity and the insertion-order tie with oversized
+//! colliders present).
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
@@ -187,6 +195,47 @@ pub const GRID_CELL_LIMIT: i32 = 1 << 21;
 /// measurement ever shows the guard engaging on a workload that
 /// matters.
 pub const GRID_CELL_WASTE_FACTOR: u64 = 4;
+
+/// The per-collider cell-occupancy cap (Q01 — the bounded-construction
+/// contract): a collider whose world AABB covers more than this many
+/// grid cells is OVERSIZED. It is stored on the grid's dedicated
+/// oversized list as ONE resident entry — never amplified into
+/// per-cell entries — and EVERY query consults that list unconditionally,
+/// so conservative correctness is preserved exactly (an oversized
+/// collider is always a candidate, the same re-sort-to-insertion-order
+/// discipline applies, and results stay bit-identical to the linear
+/// path; the oversized-equivalence battery pins this, order ties
+/// included).
+///
+/// THE BOUND this cap establishes: total resident grid entries ≤
+/// ( [`GRID_OVERSIZED_CELL_LIMIT`] + 1 ) × total collider count —
+/// each in-cells collider contributes at most the cap's worth of
+/// entries, each oversized collider exactly one. Without it, a single
+/// finite, IN-DOMAIN collider (e.g. one spanning ±4,000,000 m on
+/// every axis — well inside the [`GRID_CELL_LIMIT`] coordinate
+/// domain) covers ~6.4×10¹⁹ cells and the insertion loop amplifies
+/// one collider into more cell entries than could ever be allocated:
+/// the amplification Q01 names. The cap does NOT replace the
+/// fail-closed domain rules: a collider that is non-finite or maps
+/// outside the cell domain still poisons the broad phase (the linear
+/// arms consult raw NaN faces, so no grid can conservatively cover
+/// them); only a collider that is finite, in-domain, AND beyond the
+/// cap becomes oversized.
+///
+/// THE VALUE (a cost knob, like [`GRID_CELL_SIZE`]): the shipped and
+/// fixture geometry census tops out at 3×3×3 = 27 covered cells (a
+/// 3 m footprint, 4 m tall block straddling cell boundaries at the
+/// 2 m cell size); 64 admits more than double that margin, so no
+/// real collider changes behavior. Beyond the cap a collider is
+/// geographically structural — an arena wall, a terrain slab — the
+/// class the oversized list exists for. The trade the knob sets: an
+/// oversized collider costs every query one extra candidate
+/// evaluation (the list is universally consulted), an in-cells
+/// collider costs memory and build work proportional to its coverage.
+/// 64 puts that trade where a collider must span roughly 8× the hot
+/// query extents (the 0.6–2.4 m mover family) before it becomes
+/// universally consulted instead of cell-localized.
+pub const GRID_OVERSIZED_CELL_LIMIT: u64 = 64;
 
 /// Movement intent for one tick — the application maps its input
 /// snapshots onto this; the engine never sees keys or devices.
@@ -384,13 +433,23 @@ impl BuildHasher for CellHasherBuilder {
 /// collider entries inserted into it, in insertion order (push, never
 /// sorted — the candidate re-sort relies only on the indices, but
 /// keeping the per-cell lists in insertion order makes the
-/// construction itself canonical).
+/// construction itself canonical), plus the OVERSIZED list (Q01's
+/// bounded construction: colliders covering more than
+/// [`GRID_OVERSIZED_CELL_LIMIT`] cells, one resident entry each,
+/// consulted by every query).
 #[derive(Debug, Clone, Default)]
 struct StaticGrid {
     /// Cell key = (floor(x/s), floor(y/s), floor(z/s)) with
     /// s = [`GRID_CELL_SIZE`]; value = (is_rotated, index into that
     /// list).
     cells: HashMap<[i32; 3], Vec<(bool, u32)>, CellHasherBuilder>,
+    /// Colliders whose covered-cell count exceeds
+    /// [`GRID_OVERSIZED_CELL_LIMIT`] (or overflows the checked
+    /// product — a whole-domain collider): ONE entry each, in
+    /// insertion order, universally consulted. Never deduplicated
+    /// against the cells (an oversized collider is in NO cell), so
+    /// the candidate dedup sees each oversized entry exactly once.
+    oversized: Vec<(bool, u32)>,
 }
 
 /// The cell index of one coordinate: floor(coord /
@@ -473,17 +532,25 @@ fn build_static_grid(
 
 impl StaticGrid {
     /// Inserts one collider's entry into every cell its world AABB
-    /// covers. The AABB is sorted PER AXIS first: the linear narrow
-    /// phases consult INVERTED `StaticCollider` literals too (an
-    /// inverted interval can still overlap a straddling query box),
-    /// so the grid must cover the sorted span — the conservative
-    /// enclosure of every face value any linear arm can read.
-    /// Finiteness is validated on the RAW corners BEFORE the sort —
-    /// `f32::min`/`f32::max` swallow NaN, which would silently map a
-    /// non-finite collider onto the other corner's cells while the
-    /// linear arms still consult its raw NaN faces. Returns `false`
-    /// when the AABB is non-finite or outside the cell domain (the
-    /// caller poisons the broad phase, fail-closed).
+    /// covers — unless the coverage exceeds
+    /// [`GRID_OVERSIZED_CELL_LIMIT`], in which case the collider goes
+    /// to the OVERSIZED list as one entry (Q01's bounded
+    /// construction: no finite in-domain collider can amplify the
+    /// grid, because its resident contribution is capped at either
+    /// its coverage or exactly one entry). The AABB is sorted PER
+    /// AXIS first: the linear narrow phases consult INVERTED
+    /// `StaticCollider` literals too (an inverted interval can still
+    /// overlap a straddling query box), so the grid must cover the
+    /// sorted span — the conservative enclosure of every face value
+    /// any linear arm can read. Finiteness is validated on the RAW
+    /// corners BEFORE the sort — `f32::min`/`f32::max` swallow NaN,
+    /// which would silently map a non-finite collider onto the other
+    /// corner's cells while the linear arms still consult its raw NaN
+    /// faces. Returns `false` when the AABB is non-finite or outside
+    /// the cell domain (the caller poisons the broad phase,
+    /// fail-closed) — the domain rules win over the oversized list,
+    /// because no cell span can conservatively cover a raw NaN face
+    /// or an out-of-domain coordinate the linear arms still read.
     fn insert(&mut self, rotated: bool, index: u32, min: [f32; 3], max: [f32; 3]) -> bool {
         let mut spans = [(0i32, 0i32); 3];
         for axis in 0..3 {
@@ -496,6 +563,25 @@ impl StaticGrid {
                 return false;
             };
             spans[axis] = span;
+        }
+        // The covered-cell count, checked (a whole-domain collider's
+        // product exceeds u64 — itself proof it is over the cap).
+        // Over-limit or overflow: ONE oversized entry, never the
+        // per-cell amplification.
+        let mut covered: u64 = 1;
+        for span in &spans {
+            let per_axis = (span.1 - span.0 + 1) as u64;
+            match covered.checked_mul(per_axis) {
+                Some(product) => covered = product,
+                None => {
+                    self.oversized.push((rotated, index));
+                    return true;
+                }
+            }
+        }
+        if covered > GRID_OVERSIZED_CELL_LIMIT {
+            self.oversized.push((rotated, index));
+            return true;
         }
         let entry = (rotated, index);
         for cx in spans[0].0..=spans[0].1 {
@@ -511,12 +597,21 @@ impl StaticGrid {
     /// The conservative candidate set for precomputed query cell
     /// spans: walk the covered cells row-major (the canonical order —
     /// the design's rule; any fixed order would do, since the re-sort
-    /// restores the contract order), collect the entries, re-sort to
+    /// restores the contract order), collect the entries PLUS the
+    /// entire oversized list (Q01: every query consults it — an
+    /// oversized collider can overlap any extent, so conservative
+    /// correctness requires it as a candidate always), re-sort to
     /// (list, index) insertion order, dedup. Duplicates (a collider
     /// covering several walked cells) collapse here; they are
     /// provably no-ops anyway (every accumulator update is
     /// strict-<, so a re-evaluated collider never re-clamps), but
-    /// removing them keeps the candidate walk honest.
+    /// removing them keeps the candidate walk honest. The oversized
+    /// entries enter the SAME re-sort — they are (list, index) pairs
+    /// like any other — so the candidate sequence stays exactly the
+    /// linear walk's iteration order over a conservative superset:
+    /// bit-identity holds with oversized colliders present, ties
+    /// included (the oversized-equivalence battery pins the order tie
+    /// explicitly).
     fn candidates(&self, spans: [(i32, i32); 3]) -> Vec<(bool, u32)> {
         let mut entries: Vec<(bool, u32)> = Vec::new();
         for cx in spans[0].0..=spans[0].1 {
@@ -528,6 +623,7 @@ impl StaticGrid {
                 }
             }
         }
+        entries.extend_from_slice(&self.oversized);
         // bool orders false (the axis-aligned list) before true (the
         // rotated list): (list, index) == the linear walk's order.
         entries.sort_unstable();
@@ -4300,6 +4396,283 @@ mod tests {
         ));
     }
 
+    /// Q01's amplification case, the bound proof: a collider spanning
+    /// (nearly) the whole cell domain — every coordinate finite and
+    /// IN domain, coverage ~(4×10⁶)³ = 6.4×10¹⁹ cells, beyond u64 and
+    /// beyond any allocation — produces ONE oversized entry, not the
+    /// per-cell amplification the unbounded insertion loop would
+    /// attempt (effectively a build-time hang/OOM for ONE collider).
+    /// The resident-entry bound holds at the population: the cell map
+    /// is IDENTICAL to the same world without the huge collider (it
+    /// contributed zero cell entries), and total entries stay within
+    /// ( [`GRID_OVERSIZED_CELL_LIMIT`] + 1 ) per collider. The huge
+    /// collider is NOT a poison (in-domain and finite — conservative
+    /// correctness is preserved through the universally-consulted
+    /// oversized list) while an out-of-domain collider still poisons
+    /// (the fail-closed domain contract, unchanged), and queries over
+    /// the huge world answer bit-identically to the linear oracle.
+    #[test]
+    fn broad_phase_oversized_collider_is_bounded_not_amplified() {
+        let config = PlayerConfig::default();
+        // 128 small boxes (the gate): the control grid.
+        let mut control = CollisionWorld::new(0.0);
+        for i in 0..GRID_COLLIDER_GATE {
+            control = control.with_box(
+                [(i % 16) as f32 * 3.0, 0.0, (i / 16) as f32 * 3.0],
+                1.0,
+                2.0,
+            );
+        }
+        assert!(matches!(control.grid, BroadPhase::Grid(_)));
+        let BroadPhase::Grid(control_grid) = &control.grid else {
+            unreachable!("checked above");
+        };
+        let control_entries: usize = control_grid.cells.values().map(Vec::len).sum();
+
+        // The whole-domain collider: ±4,000,000 m per axis — every
+        // cell |2×10⁶| < GRID_CELL_LIMIT, so it is IN domain and
+        // finite; its coverage (4,000,001)³ ≈ 6.4×10¹⁹ cells exceeds
+        // u64 itself, which is over the cap by any measure. Both
+        // routes to the oversized list are exercised: this one
+        // (checked-multiply overflow) and, below, a ~10⁹-cell
+        // coverage that fits u64 but exceeds the cap.
+        let world = control.clone().with_collider(StaticCollider {
+            min: [-4_000_000.0; 3],
+            max: [4_000_000.0; 3],
+        });
+        let BroadPhase::Grid(grid) = &world.grid else {
+            panic!(
+                "an in-domain finite oversized collider keeps the grid \
+                 ACTIVE (oversized, never a poison)"
+            );
+        };
+        assert_eq!(
+            grid.oversized,
+            vec![(false, GRID_COLLIDER_GATE as u32)],
+            "the whole-domain collider is ONE oversized entry"
+        );
+        assert_eq!(
+            grid.cells, control_grid.cells,
+            "the whole-domain collider contributed ZERO cell entries — \
+             the cell map is identical to the control world's"
+        );
+        let entries: usize = grid.cells.values().map(Vec::len).sum();
+        let total = world.colliders().len() + world.rotated().len();
+        assert_eq!(entries, control_entries);
+        assert!(
+            entries + grid.oversized.len() <= (GRID_OVERSIZED_CELL_LIMIT as usize + 1) * total,
+            "the resident-entry bound: (cap + 1) per collider — got \
+             {entries} cell entries + {} oversized over {total} colliders",
+            grid.oversized.len()
+        );
+
+        // The count-overflow-free route: a ±1000 m collider covers
+        // (1001)³ ≈ 10⁹ cells — representable in u64, far over the
+        // cap — same ONE oversized entry, same untouched cell map.
+        let moderate = control.clone().with_collider(StaticCollider {
+            min: [-1000.0; 3],
+            max: [1000.0; 3],
+        });
+        let BroadPhase::Grid(moderate_grid) = &moderate.grid else {
+            panic!("the in-domain oversized collider keeps the grid active");
+        };
+        assert_eq!(
+            moderate_grid.oversized,
+            vec![(false, GRID_COLLIDER_GATE as u32)]
+        );
+        assert_eq!(moderate_grid.cells, control_grid.cells);
+
+        // The fail-closed domain contract is untouched: an
+        // out-of-domain collider still poisons (permanently linear),
+        // exactly as before the oversized mechanism existed.
+        let domain_edge = GRID_CELL_LIMIT as f32 * GRID_CELL_SIZE;
+        let poisoned = control.clone().with_collider(StaticCollider {
+            min: [domain_edge, 0.0, 0.0],
+            max: [domain_edge + 1.0, 1.0, 1.0],
+        });
+        assert!(
+            matches!(poisoned.grid, BroadPhase::Unusable),
+            "out-of-domain still poisons — the oversized list never \
+             weakens the fail-closed domain rules"
+        );
+
+        // Equivalence with the whole-domain collider present: every
+        // query box overlaps it, depenetration resolves inside it,
+        // segments start inside it — bit-identical to the linear
+        // oracle through the universally-consulted oversized list.
+        let mut linear = world.clone();
+        force_broad_phase(&mut linear, false);
+        let (min, max) = player_box([0.0, 5.0, 0.0], &config);
+        assert!(world.box_overlaps(min, max), "inside the huge collider");
+        assert_eq!(world.box_overlaps(min, max), linear.box_overlaps(min, max));
+        assert!(same_option_vec3(
+            world.depenetration(min, max),
+            linear.depenetration(min, max)
+        ));
+        assert!(same_sweep(
+            world.sweep_axis(min, max, 1, -4.0),
+            linear.sweep_axis(min, max, 1, -4.0)
+        ));
+        assert!(same_option_f32(
+            world.segment_hit([0.0, 5.0, 0.0], [0.0, -5.0, 0.0], 0.0),
+            linear.segment_hit([0.0, 5.0, 0.0], [0.0, -5.0, 0.0], 0.0)
+        ));
+    }
+
+    /// Q01's equivalence case: queries over worlds WITH oversized
+    /// colliders present are bit-identical to the linear oracle — the
+    /// oversized entries enter the same re-sort-to-insertion-order
+    /// candidate discipline. The DISCRIMINATING ORDER TIE: an
+    /// oversized slab (insertion index 0) and a local box (index 1)
+    /// offer bit-equal depenetration magnitudes with DIFFERENT
+    /// directions (+Y vs +X) — the first-in-insertion-order candidate
+    /// must win on BOTH paths, so an implementation that appended the
+    /// oversized entries after the sort (or skipped the re-sort for
+    /// them) would flip the tie and fail this test. Also pins the
+    /// sweep clamp and segment hit ON the oversized slab (the
+    /// universally-consulted candidate), plus a pseudo-random query
+    /// battery over the mixed world.
+    #[test]
+    fn broad_phase_oversized_queries_bit_identical_with_order_tie() {
+        let config = PlayerConfig::default();
+        // The oversized slab first (insertion index 0): y ∈ [0, 2],
+        // x/z ±4,000,000 m — coverage ~3.2×10¹³ cells, in-domain,
+        // over the cap.
+        let slab = StaticCollider {
+            min: [-4_000_000.0, 0.0, -4_000_000.0],
+            max: [4_000_000.0, 2.0, 4_000_000.0],
+        };
+        // The local tie box (index 1): its +X push is the SAME
+        // expression as the slab's +Y push (col.max + SKIN −
+        // player_min, both 2.0 + SKIN − 1.0) — bit-equal magnitudes,
+        // different directions.
+        let tie_box = StaticCollider {
+            min: [-1.0, 0.0, -2.0],
+            max: [2.0, 2.0, 2.0],
+        };
+        let mut world = CollisionWorld::new(0.0)
+            .with_collider(slab)
+            .with_collider(tie_box);
+        // Padding to the gate (distant, never interacting).
+        for i in 0..GRID_COLLIDER_GATE - 2 {
+            world = world.with_box([400.0 + i as f32 * 4.0, 0.0, 400.0], 0.5, 0.5);
+        }
+        // A second, ROTATED oversized collider (the rotated-list
+        // arm): a 60 m × 60 m prism whose world AABB spans ~3.5 k
+        // cells.
+        let rotated_big = RotatedCollider::new([50.0, 1.0, 0.0], [30.0, 1.0, 30.0], 0.6).unwrap();
+        world = world.with_rotated_collider(Some(rotated_big));
+        let BroadPhase::Grid(grid) = &world.grid else {
+            panic!("the mixed oversized world keeps the grid active");
+        };
+        assert_eq!(
+            grid.oversized,
+            vec![(false, 0), (true, 0)],
+            "the slab (axis-aligned index 0) and the big prism (rotated \
+             index 0) are the two oversized entries, in push order"
+        );
+        let mut linear = world.clone();
+        force_broad_phase(&mut linear, false);
+
+        // THE ORDER TIE: the player straddles both the slab and the
+        // box at pos [1.35, 1.0, 0.0] (player_min.x == player_min.y ==
+        // 1.0 exactly). The slab's +Y push and the box's +X push are
+        // bit-equal (2.0 + SKIN − 1.0); the slab was inserted FIRST,
+        // so its push must win on both paths.
+        let (min, max) = player_box([1.35, 1.0, 0.0], &config);
+        let grid_push = world
+            .depenetration(min, max)
+            .expect("the straddle resolves");
+        let linear_push = linear
+            .depenetration(min, max)
+            .expect("the straddle resolves");
+        assert!(
+            same_option_vec3(Some(grid_push), Some(linear_push)),
+            "the oversized-present depenetration is bit-identical"
+        );
+        assert!(
+            linear_push[1] > 0.0 && linear_push[0] == 0.0 && linear_push[2] == 0.0,
+            "the FIRST-in-insertion-order oversized slab wins the \
+             magnitude tie (its +Y push): {linear_push:?}"
+        );
+
+        // The sweep clamp ON the oversized slab: a player above it
+        // sweeps down and must stop SKIN short of its top face —
+        // only the universally-consulted oversized list can supply
+        // that candidate (the slab is in NO cell).
+        let (above_min, above_max) = player_box([1.35, 5.0, 0.0], &config);
+        let (grid_allowed, grid_hit) = world.sweep_axis(above_min, above_max, 1, -4.0);
+        let (linear_allowed, linear_hit) = linear.sweep_axis(above_min, above_max, 1, -4.0);
+        assert!(same_sweep(
+            (grid_allowed, grid_hit),
+            (linear_allowed, linear_hit)
+        ));
+        assert!(
+            grid_hit && grid_allowed > -3.0 && grid_allowed < -2.99,
+            "the oversized slab clamps the downward sweep at its top \
+             face (2 + SKIN − 5): {grid_allowed}"
+        );
+
+        // The segment through the oversized slab (and the tie box,
+        // whose top shares the y = 2 plane — the minimum wins
+        // identically either way).
+        let segment = world.segment_hit([1.35, 5.0, 0.0], [1.35, -5.0, 0.0], 0.0);
+        assert!(same_option_f32(
+            segment,
+            linear.segment_hit([1.35, 5.0, 0.0], [1.35, -5.0, 0.0], 0.0)
+        ));
+        let t = segment.expect("the segment crosses the slab");
+        assert!((t - 0.3).abs() < 1e-6, "enters at the y = 2 top: {t}");
+
+        // Above the slab: clear of everything (the slab's y ≤ 2).
+        assert_eq!(
+            world.box_overlaps(above_min, above_max),
+            linear.box_overlaps(above_min, above_max)
+        );
+        assert!(!world.box_overlaps(above_min, above_max));
+        // Inside the slab band: overlapping.
+        let (in_min, in_max) = player_box([1.35, 1.0, 0.0], &config);
+        assert!(world.box_overlaps(in_min, in_max));
+
+        // The pseudo-random battery over the mixed world: street
+        // placements, interior spawns, sweeps, and segments (short
+        // and long — the long diagonal rides the waste guard's
+        // regime decision, both arms bit-identical).
+        let mut rng = FixtureRng(0x0D06_5EED);
+        for query in 0..24 {
+            let base = fixture_base(&mut rng, query);
+            let (q_min, q_max) = player_box(base, &config);
+            assert_eq!(
+                world.box_overlaps(q_min, q_max),
+                linear.box_overlaps(q_min, q_max),
+                "q{query}"
+            );
+            assert!(same_option_vec3(
+                world.depenetration(q_min, q_max),
+                linear.depenetration(q_min, q_max)
+            ));
+            for axis in 0..3 {
+                assert!(
+                    same_sweep(
+                        world.sweep_axis(q_min, q_max, axis, 1.1),
+                        linear.sweep_axis(q_min, q_max, axis, 1.1)
+                    ),
+                    "q{query} a{axis}"
+                );
+            }
+            let to = [base[0] + 20.0, base[1] + 0.4, base[2] - 15.0];
+            assert!(same_option_f32(
+                world.segment_hit(base, to, 0.1),
+                linear.segment_hit(base, to, 0.1)
+            ));
+            let far_to = [base[0] + 120.0, base[1] + 0.5, base[2] - 120.0];
+            assert!(same_option_f32(
+                world.segment_hit(base, far_to, CAMERA_MARGIN),
+                linear.segment_hit(base, far_to, CAMERA_MARGIN)
+            ));
+        }
+    }
+
     /// The L5 scaling evidence — the design's §9.4 measurement shape,
     /// observational: city-block populations at multiple collider
     /// counts, each query arm through the grid path vs the
@@ -4431,8 +4804,9 @@ mod tests {
                 let entries: usize = grid.cells.values().map(Vec::len).sum();
                 println!(
                     "[broad-phase-scaling] pop {size:6} · build {build_ms:8.3} ms · \
-                     cells {} · entries {entries} · queries {queries}",
-                    grid.cells.len()
+                     cells {} · entries {entries} · oversized {} · queries {queries}",
+                    grid.cells.len(),
+                    grid.oversized.len()
                 );
             }
             println!(
