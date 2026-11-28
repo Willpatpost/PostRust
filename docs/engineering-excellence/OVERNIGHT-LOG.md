@@ -604,3 +604,11 @@ caller splittable mid-object at real capacities; the boundary strengthened
 with the lattice theorem and the unit-aligned-budget lever; the engine-owned
 units designed and parked; the census's latent rig red corrected (114).
 Pins: main 1698/1647, renderer-release 236. Run `46168694243` dispatched.
+
+**R3+R4 verified green:** run `46168694243` at `d1a2d92` — all five jobs
+(main 1698/1647/2/38, renderer-release 236/3 confirmed on all platforms).
+R1–R4 of the six review findings are resolved; R5 (T21 production budgets)
+and R6 (T39 timing-threshold discipline) queue next, then the D-EE-11
+approved development: T09-impl (the indexed lane), T13+T14 coordinated
+(the eviction + the cold path, provisional pod thresholds), the T08
+sustained/adversarial matrix.
