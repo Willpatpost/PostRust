@@ -18,9 +18,11 @@ use std::sync::Arc;
 
 use engine_core::{LodLevel, PresenceSample, Spine};
 use engine_persist::{
-    AppendOutcome, AuthorityMode, CanonicalMedium, ChainSummary, CommitOutcome, CommitPipeline,
-    ConsequenceEnvelope, ConsequenceId, MediumError, RevisionRecord, StoredObject, T1Journal,
-    UnknownReason,
+    AppendOutcome, AuthorityMode, AwardCheckpoint, CanonicalMedium, ChainSummary, CommitOutcome,
+    CommitPipeline, ConfirmationReceipt, ConsequenceEnvelope, ConsequenceId, CounterValues,
+    Coverage, DurabilityClass, MediumError, OccurrenceSpan, RevisionRecord, SignalLane,
+    SourceBaseline, SourcePosition, StoredObject, T1Journal, UnknownReason,
+    WORKER_STATS_SAMPLE_RING, WorkerOpClass,
 };
 use engine_slice::crossing::{SessionCrossing, TransitionError};
 use engine_slice::npc::{NpcConfig, NpcWorld, REGION_COUNT, install_initial_schedules};
@@ -751,4 +753,347 @@ fn work_admitted_before_poison_gets_an_honest_refusal() {
     );
     drop(source);
     worker.join().unwrap();
+}
+
+// ------------------------------------------ the P3-L7 B13 instrumentation suite
+//
+// The queue-wait vs service-time separation (the measurement half
+// of the deferred-confirmation question): every admitted job
+// carries its admission instant and class; the loop's dequeue and
+// terminal paths record the split; `IoWorker::worker_stats`/
+// `WorkerSource::worker_stats` expose it (the
+// `CommitPipeline::retention_stats` precedent — never serialized,
+// never a fingerprint input, a fresh worker resumes at defaults).
+
+/// The design's §2.3.4 discriminating test (3): the SEPARATION is
+/// real. The park fault (the deterministic barrier — never a
+/// guessed duration) parks the worker HOLDING the first job; eight
+/// more jobs are admitted behind it and wait the whole hold; the
+/// release drains FIFO. The same run must then show BOTH windows on
+/// the correct sides: the held job's SERVICE covers the park, the
+/// queued jobs' accumulated QUEUE WAIT covers eight holds — with
+/// the arithmetic airtight (every queued job was admitted before
+/// the hold started and dequeued after the release, so each wait
+/// is at least the measured hold; the recording lands BEFORE each
+/// reply, so the assertions read a complete census — no polling).
+#[test]
+fn queue_wait_and_service_time_are_separated_by_the_stats() {
+    let dir = TestDir::new("stats-separation");
+    let worker = found_worker(&dir.store(), false);
+    // A fresh worker snapshots all defaults (the
+    // restore-resumes-at-defaults discipline).
+    let fresh = worker.worker_stats();
+    assert_eq!(fresh.totals().jobs, 0);
+    assert_eq!(fresh.recent.len(), 0);
+    assert_eq!(worker.source().unwrap().worker_stats().totals().jobs, 0);
+    // Park the worker holding the first job — the deterministic
+    // barrier proves the worker HOLDS it before the queue backs up.
+    worker.fault_control().set(WorkerFault::ParkNext);
+    let held_slot = worker.submit_probe(MediumOp::Head).unwrap();
+    while !worker.fault_control().park_entered() {
+        std::hint::spin_loop();
+    }
+    // Eight more jobs admitted while the worker holds the first —
+    // nonblocking admissions, so all eight land inside the park.
+    let mut queued_slots = Vec::new();
+    for _ in 0..8 {
+        queued_slots.push(worker.submit_probe(MediumOp::Head).unwrap());
+    }
+    // The measured hold: from after the admissions to the release.
+    let hold_started = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    worker.fault_control().release_park();
+    let held = hold_started.elapsed();
+    // Every reply observed ⇒ every job already recorded (the record
+    // precedes the reply action by construction).
+    assert!(held_slot.recv().unwrap().is_ok());
+    for slot in queued_slots {
+        assert!(slot.recv().unwrap().is_ok());
+    }
+    worker.fault_control().clear();
+    let stats = worker.worker_stats();
+    let head = stats.class(WorkerOpClass::Head);
+    assert_eq!(head.jobs, 9);
+    assert_eq!(stats.recent.len(), 9);
+    assert!(stats.recent.iter().all(|s| s.class == WorkerOpClass::Head));
+    // The held job's SERVICE covers the park (the park is inside its
+    // dequeue→reply window — deterministic).
+    assert!(head.service_nanos >= held.as_nanos() as u64);
+    // The eight queued jobs' QUEUE WAIT covers the hold each: every
+    // one was admitted before `hold_started` and dequeued after the
+    // release (monotonic arithmetic; the 20 ms slack is engineering
+    // margin only).
+    let wait_floor = 8u64
+        * held
+            .saturating_sub(std::time::Duration::from_millis(20))
+            .as_nanos() as u64;
+    assert!(
+        head.queue_wait_nanos >= wait_floor,
+        "queue wait {} must cover eight holds (floor {wait_floor})",
+        head.queue_wait_nanos
+    );
+    // THE SEPARATION: the accumulated wait of the queued jobs is a
+    // multiple of the single-job park service in the same run.
+    assert!(head.queue_wait_nanos >= 2 * head.service_nanos);
+    worker.join().unwrap();
+}
+
+/// One scripted commit sequence through ANY medium (the child
+/// fixture's shape): stage one envelope, capture the boundary,
+/// confirm canonically — returning the receipt (the exact revision,
+/// epoch, keys, tier, and label).
+fn scripted_commit<M: CanonicalMedium>(medium: M, journal: PathBuf) -> ConfirmationReceipt {
+    let mut pipeline = CommitPipeline::open(medium, T1Journal::open(journal).unwrap()).unwrap();
+    pipeline
+        .stage(
+            ConsequenceEnvelope::capture(
+                ConsequenceId::new(1, 1, 7),
+                vec![durable_span()],
+                SignalLane::Captured,
+                CounterValues::default(),
+                SourceBaseline {
+                    counters: CounterValues::default(),
+                    award: AwardCheckpoint {
+                        durable: Coverage::new(),
+                        provisional: Coverage::new(),
+                    },
+                },
+                SourcePosition {
+                    head: None,
+                    tick: 400,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    pipeline
+        .capture(
+            SourcePosition {
+                head: None,
+                tick: 400,
+            },
+            DurabilityClass::DurableEligible,
+            Vec::new(),
+            vec![engine_persist::FrontierEntry {
+                region: 1,
+                episode: 1,
+            }],
+            Vec::new(),
+        )
+        .unwrap();
+    match pipeline.commit_canonical().unwrap() {
+        CommitOutcome::Confirmed(receipt) => receipt,
+        other => panic!("the scripted commit must confirm: {other:?}"),
+    }
+}
+
+/// The (P3-L7) zero-perturbation proof: the SAME scripted commit
+/// sequence through a DIRECT `SessionStore` pipeline and through
+/// the INSTRUMENTED worker transport produces byte-identical
+/// persistence — the identical confirmation receipt, the T1 journal
+/// file byte-for-byte, and every file in the content-addressed
+/// store tree byte-for-byte — while the worker's stats provably
+/// counted the commit-path jobs (the instrumentation was LIVE when
+/// the identical bytes were produced). The SQLite arm keeps the
+/// weaker chain-summary equality (the existing
+/// `worker_parity_with_the_legacy_provider_sqlite` precedent)
+/// because a raw database file is not byte-deterministic across
+/// runs (WAL/page reuse); the file medium's tree is content-derived
+/// and therefore the strong oracle.
+#[test]
+fn the_instrumented_transport_is_byte_identical_to_the_direct_provider() {
+    let direct_dir = TestDir::new("bytes-direct");
+    let worker_dir = TestDir::new("bytes-worker");
+    // The same pre-worker founding act on both sides, then the same
+    // script — one direct, one through the instrumented queue.
+    let direct_receipt = scripted_commit(
+        SessionStore::open(&found_location(&direct_dir.store(), false)).unwrap(),
+        direct_dir.journal(),
+    );
+    let worker = found_worker(&worker_dir.store(), false);
+    let medium = worker.source().unwrap().open_medium().unwrap();
+    let worker_receipt = scripted_commit(medium, worker_dir.journal());
+    // THE RECEIPT: the exact revision, epoch, keys, tier, and label
+    // agree — the confirmed event is the same one.
+    assert_eq!(direct_receipt, worker_receipt);
+    // The journal: byte-for-byte (T1 frames are content-derived;
+    // no path or time ever enters them).
+    let direct_journal = std::fs::read(direct_dir.journal()).unwrap();
+    let worker_journal = std::fs::read(worker_dir.journal()).unwrap();
+    assert_eq!(direct_journal, worker_journal);
+    // The store trees: byte-for-byte, file by file (the sorted
+    // relative-path census; `HEAD.lock` is created empty on every
+    // open, so both trees carry it identically).
+    let direct_tree = store_tree(&direct_dir.store());
+    let worker_tree = store_tree(&worker_dir.store());
+    assert_eq!(direct_tree.len(), worker_tree.len());
+    for ((direct_name, direct_bytes), (worker_name, worker_bytes)) in
+        direct_tree.iter().zip(worker_tree.iter())
+    {
+        assert_eq!(direct_name, worker_name);
+        assert_eq!(
+            direct_bytes, worker_bytes,
+            "the store file {direct_name} differs between the direct and \
+             the instrumented worker run"
+        );
+    }
+    // THE INSTRUMENTATION WAS LIVE: the worker counted the
+    // commit-path jobs while producing those identical bytes — the
+    // append and the read-back walk both rode the queue.
+    let stats = worker.worker_stats();
+    assert!(stats.class(WorkerOpClass::Append).jobs >= 1);
+    assert!(stats.class(WorkerOpClass::Read).jobs >= 1);
+    assert!(stats.class(WorkerOpClass::Head).jobs >= 1);
+    assert!(stats.totals().jobs >= 3);
+    worker.join().unwrap();
+}
+
+/// The store tree as a sorted (relative path, bytes) census — the
+/// byte-identity oracle.
+fn store_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                let name = path.strip_prefix(root).unwrap().display().to_string();
+                files.push((name, bytes));
+            }
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
+}
+
+/// The (P3-L7) sustained-cadence observational measurement (the
+/// design's §4 workload 4, the debug-profile observational form the
+/// lane brief names): the commit path under sustained transition
+/// cadence — 24 stage→capture→commit cycles — with a concurrent
+/// observation stream (200 head rounds at ~2 ms cadence) competing
+/// on the one queue, exactly the demo's shape (transition-frame
+/// confirmations against snapshot-cadence reads). The ASSERTIONS
+/// are structural only (deterministic: every cycle confirms, the
+/// cadence and the probe stream are counted, the unused classes
+/// stay zero, the ring stays bounded); the MEASUREMENT is the
+/// printed diagnostic (run with `--nocapture`): the caller-side
+/// per-commit stall plus the per-class admission→dequeue vs
+/// dequeue→completion split — the data table the deferred-
+/// confirmation disposition is DRAFTED from. The release rig
+/// finalizes the disposition from the same surface in release
+/// mode; these debug numbers are observational, never the decision.
+#[test]
+fn sustained_commit_cadence_records_the_wait_service_split() {
+    let dir = TestDir::new("sustained-cadence");
+    let worker = found_worker(&dir.store(), false);
+    let medium = worker.source().unwrap().open_medium().unwrap();
+    let mut pipeline = CommitPipeline::open(medium, T1Journal::open(dir.journal()).unwrap())
+        .expect("the pipeline opens over the worker medium");
+    // The concurrent observation stream: exactly 200 head rounds at
+    // ~2 ms cadence (a FIXED count so the census stays
+    // deterministic while the interleaving is real).
+    let probe_source = worker.source().unwrap();
+    let probe = std::thread::spawn(move || {
+        let mut probe_medium = probe_source.open_medium().unwrap();
+        for _ in 0..200 {
+            probe_medium.head().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    });
+    // The sustained transition cadence: each cycle's
+    // `commit_canonical` measured caller-side (the stall the B13
+    // question decomposes).
+    const CYCLES: u64 = 24;
+    let mut stall_total_us: u64 = 0;
+    let mut stall_max_us: u64 = 0;
+    for cycle in 0..CYCLES {
+        pipeline
+            .stage(
+                ConsequenceEnvelope::capture(
+                    ConsequenceId::new(1, 1 + cycle, 7),
+                    vec![durable_span()],
+                    SignalLane::Captured,
+                    CounterValues::default(),
+                    SourceBaseline {
+                        counters: CounterValues::default(),
+                        award: AwardCheckpoint {
+                            durable: Coverage::new(),
+                            provisional: Coverage::new(),
+                        },
+                    },
+                    SourcePosition {
+                        head: None,
+                        tick: 400 + cycle,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        pipeline
+            .capture(
+                SourcePosition {
+                    head: None,
+                    tick: 400 + cycle,
+                },
+                DurabilityClass::DurableEligible,
+                Vec::new(),
+                vec![engine_persist::FrontierEntry {
+                    region: 1,
+                    episode: 1,
+                }],
+                Vec::new(),
+            )
+            .unwrap();
+        let started = std::time::Instant::now();
+        match pipeline.commit_canonical().unwrap() {
+            CommitOutcome::Confirmed(_) => {}
+            other => panic!("cycle {cycle} must confirm: {other:?}"),
+        }
+        let stall_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        stall_total_us = stall_total_us.saturating_add(stall_us);
+        stall_max_us = stall_max_us.max(stall_us);
+    }
+    probe.join().unwrap();
+    // The structural census (deterministic).
+    let stats = worker.worker_stats();
+    assert_eq!(stats.class(WorkerOpClass::Append).jobs, CYCLES);
+    assert!(stats.class(WorkerOpClass::Head).jobs >= 200);
+    assert!(stats.class(WorkerOpClass::Read).jobs > 0);
+    assert_eq!(stats.class(WorkerOpClass::Reclaim).jobs, 0);
+    assert_eq!(stats.class(WorkerOpClass::Barrier).jobs, 0);
+    assert_eq!(stats.class(WorkerOpClass::Validate).jobs, 0);
+    assert_eq!(stats.class(WorkerOpClass::Checkpoint).jobs, 0);
+    assert!(stats.recent.len() <= WORKER_STATS_SAMPLE_RING);
+    assert_eq!(
+        stats.totals().jobs,
+        stats.classes.iter().map(|class| class.jobs).sum::<u64>()
+    );
+    // The observational table (the draft disposition's data; the
+    // release rig re-captures this exact surface in release mode).
+    println!(
+        "sustained-cadence (debug observational): cycles={CYCLES} \
+         commit_stall_total_us={stall_total_us} \
+         commit_stall_mean_us={} commit_stall_max_us={stall_max_us}",
+        stall_total_us / CYCLES
+    );
+    println!("{stats}");
+    drop(pipeline);
+    worker.join().unwrap();
+}
+
+/// One deterministic classified span for the scripted fixtures (the
+/// child fixture's shape, factored for the two P3-L7 tests).
+fn durable_span() -> engine_persist::ClassifiedSpan {
+    engine_persist::ClassifiedSpan {
+        span: OccurrenceSpan::new(0, 3).unwrap(),
+        class: DurabilityClass::DurableEligible,
+    }
 }
