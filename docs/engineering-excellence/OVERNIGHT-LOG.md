@@ -612,3 +612,27 @@ and R6 (T39 timing-threshold discipline) queue next, then the D-EE-11
 approved development: T09-impl (the indexed lane), T13+T14 coordinated
 (the eviction + the cold path, provisional pod thresholds), the T08
 sustained/adversarial matrix.
+
+## R6 — the collective CI timing-threshold review (D-EE-11, T39 discipline)
+
+**The census of every wall-clock guard in the tree** (grep-verified): the
+combat diagonal (6 µs/record, recalibrated from three accumulated actuals),
+the player broad-phase (5 ms + 4 µs/record, never fired), the
+spatial-query allocation census (the same per-record form), the A09 witness
+bounds (ratio-based), the T09 census slope (4×/10× ratios). **The collective
+finding: every guard already pairs its timing row with deterministic teeth**
+— entries-touched = N exactly (T09), allocation-count pins
+(spatial_query_allocations, spine pins), census identities and frozen
+digests — the timing rows are observational confirmation, never the sole
+discriminator. **The recalibration history is the honest record the reviewer
+asked for**: each threshold movement cited its accumulated CI actuals with
+the discrimination argument restated (the combat 4→6 µs/record with the
+quadratic form still failing 3×+; the T09 8×→4× with ln 20 ≈ 3×
+discriminated); no threshold was relaxed without a mechanism argument, and
+the two shared-runner flakes (the journal concurrency timeout, the combat
+runner variance) are recorded with the third-occurrence protocol. **The
+improvement registered for a future narrow lane**: the combat/player/census
+guards could add deterministic cells-walked/entries-visited counters beside
+the timing bounds (the T09 pattern), making the algorithmic discrimination
+fully count-based; not urgent because the deterministic teeth already exist
+per-guard and the timing rows carry the runner-noise headroom explicitly.
