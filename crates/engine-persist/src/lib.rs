@@ -66,6 +66,7 @@ pub mod recovery_discovery;
 pub mod rotation;
 pub mod session_anchor;
 pub mod sqlite;
+pub mod worker_stats;
 
 #[cfg(test)]
 mod migrate_tests;
@@ -211,4 +212,8 @@ pub use rotation::{
 };
 pub use sqlite::{
     SqliteFaultAction, SqliteFaultControl, SqliteFaultPoint, SqliteMedium, SqliteMediumConfig,
+};
+pub use worker_stats::{
+    WORKER_OP_CLASS_COUNT, WORKER_STATS_SAMPLE_RING, WorkerClassStats, WorkerOpClass, WorkerSample,
+    WorkerStats, WorkerStatsCell,
 };

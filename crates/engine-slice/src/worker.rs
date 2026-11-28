@@ -27,16 +27,33 @@
 //!
 //! The queue capacity is a PROVISIONAL engineering default (64), not a
 //! ratified performance target.
+//!
+//! **(P3-L7, B13) The admission instrumentation:** every admitted
+//! job carries its admission instant and its frozen operation
+//! class; the loop's dequeue stamps the second boundary, and every
+//! terminal path (reply sent or deliberately dropped by a fault
+//! seam) records the queue-wait vs service-time split into the one
+//! per-session [`engine_persist::worker_stats::WorkerStatsCell`]
+//! BEFORE its reply action — so a caller that observed a reply
+//! always sees the job counted. The counters are observational
+//! only (never serialized, never a fingerprint input, no ordering
+//! decision consults them; a fresh worker resumes at defaults),
+//! and the panic/hard-exit arms record nothing (an unfinished job
+//! has no sample). The exposure is
+//! [`IoWorker::worker_stats`]/[`WorkerSource::worker_stats`] — the
+//! measurement surface the B13 deferred-confirmation question is
+//! answered from.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, RecvError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use engine_persist::{
     AppendOutcome, CanonicalMedium, ChainSummary, Hash, MediumError, ObjectClass, Reconciliation,
-    RevisionRecord, StoredObject, SyncTier, UnknownReason,
+    RevisionRecord, StoredObject, SyncTier, UnknownReason, WorkerOpClass, WorkerStats,
+    WorkerStatsCell,
 };
 
 use crate::store::{MediumSource, SessionStore, StoreLocation};
@@ -162,6 +179,16 @@ pub enum WorkerReply {
 /// one reply is deposited per slot (capacity 1 — the worker's send
 /// never blocks); an abandoned receiver makes that send fail, which
 /// the worker ignores.
+///
+/// (P3-L7, B13) The job additionally carries its admission
+/// instrumentation: the shared per-session stats cell, the
+/// admission-call instant, and the frozen operation class — the
+/// queue-wait vs service-time separation the deferred-confirmation
+/// question is answered from. All observational: nothing here is
+/// serialized, digested, or consulted by any ordering decision (the
+/// byte-identity proof in `pp_b4_worker` pins that the
+/// worker-mediated store and journal are identical to the direct
+/// provider's with the instrumentation live).
 struct Job {
     op: MediumOp,
     /// The optional-publication cancellation token (PP-B4 checkpoint 3):
@@ -170,6 +197,71 @@ struct Job {
     /// completion boundary regardless.
     cancel: Option<Arc<AtomicBool>>,
     reply: SyncSender<Result<WorkerReply, MediumError>>,
+    /// (P3-L7) The shared per-session stats cell (a clone — the
+    /// worker thread, the handle, and the sources all observe one
+    /// set of counters).
+    stats: WorkerStatsCell,
+    /// (P3-L7) The admission-call instant, stamped just before the
+    /// bounded send: under a saturated queue the recorded queue wait
+    /// therefore DELIBERATELY includes the bounded-send admission
+    /// backpressure, because that is the caller-experienced wait
+    /// the deferral question decomposes (the design's §4
+    /// "admission-wait"; the class doc in
+    /// `engine_persist::worker_stats` states the same boundary).
+    admitted_at: Instant,
+    /// (P3-L7) The operation's frozen stats class.
+    class: WorkerOpClass,
+}
+
+impl Job {
+    /// Admits one job: freezes the stats class and stamps the
+    /// admission instant (the send call follows immediately). The
+    /// ONLY construction path — every admission site (the proxy's
+    /// requests and the handle's probe/optional/required
+    /// submissions) routes through here, so no job can escape
+    /// instrumentation and no site can forget the stamp.
+    fn admit(
+        op: MediumOp,
+        cancel: Option<Arc<AtomicBool>>,
+        reply: SyncSender<Result<WorkerReply, MediumError>>,
+        stats: WorkerStatsCell,
+    ) -> Self {
+        let class = class_of(&op);
+        Job {
+            op,
+            cancel,
+            reply,
+            stats,
+            admitted_at: Instant::now(),
+            class,
+        }
+    }
+}
+
+/// (P3-L7) The transport's operation→stats-class mapping onto the
+/// frozen [`WorkerOpClass`] set. The transport owns this mapping
+/// because it owns the operation type; the class set itself is
+/// frozen in engine-persist so the rig's tables stay comparable
+/// across runs.
+fn class_of(op: &MediumOp) -> WorkerOpClass {
+    match op {
+        MediumOp::Head => WorkerOpClass::Head,
+        MediumOp::Append { .. } | MediumOp::AdmittedAppend { .. } => WorkerOpClass::Append,
+        MediumOp::ReadRecord { .. }
+        | MediumOp::ReadObject { .. }
+        | MediumOp::ClassifyObject { .. } => WorkerOpClass::Read,
+        MediumOp::Validate => WorkerOpClass::Validate,
+        MediumOp::ReconcileUnknown { .. } => WorkerOpClass::Reconcile,
+        MediumOp::Reclaim { .. }
+        | MediumOp::ReclaimPending { .. }
+        | MediumOp::BeginReclamation { .. }
+        | MediumOp::VerifyBeginAuthority { .. }
+        | MediumOp::BeginReclamationV2 { .. }
+        | MediumOp::VerifyBeginAuthorityV2 { .. }
+        | MediumOp::ObserveRangeTerminal { .. } => WorkerOpClass::Reclaim,
+        MediumOp::Checkpoint => WorkerOpClass::Checkpoint,
+        MediumOp::Barrier => WorkerOpClass::Barrier,
+    }
 }
 
 /// One job's reply channel (the bounded completion slot): the worker
@@ -397,6 +489,16 @@ fn worker_loop(
 ) {
     let _guard = DeathGuard(health.clone());
     for job in rx {
+        // (P3-L7, B13) The dequeue instant — the boundary between
+        // this job's queue wait and its service time. Every
+        // terminal path below (reply sent, or reply deliberately
+        // dropped by a fault seam) records the split IMMEDIATELY
+        // BEFORE its reply action, so a caller that observed the
+        // reply always sees the job counted; the panic and
+        // hard-exit arms record nothing — an unfinished job has no
+        // sample (the observational-honesty rule in
+        // `engine_persist::worker_stats`).
+        let dequeued_at = Instant::now();
         match fault.current() {
             WorkerFault::None
             | WorkerFault::PanicAfter(_)
@@ -428,6 +530,7 @@ fn worker_loop(
         // completes normally. The poisoned worker keeps draining — refuse
         // and reply — so stop/join remain clean.
         if !health.alive() {
+            job.stats.record(job.class, job.admitted_at, dequeued_at);
             let _ = job.reply.send(Err(MediumError::WorkerUnavailable {
                 detail:
                     "the I/O worker is poisoned — the job was refused at the execution boundary"
@@ -443,6 +546,7 @@ fn worker_loop(
         if let Some(cancel) = job.cancel.as_ref()
             && cancel.load(Ordering::Relaxed)
         {
+            job.stats.record(job.class, job.admitted_at, dequeued_at);
             let _ = job.reply.send(Ok(WorkerReply::Canceled));
             continue;
         }
@@ -455,6 +559,7 @@ fn worker_loop(
             // re-submission).
             fault.clear();
             let _ = execute(&mut store, job.op);
+            job.stats.record(job.class, job.admitted_at, dequeued_at);
             drop(job.reply);
             continue;
         }
@@ -462,6 +567,7 @@ fn worker_loop(
             match fault.current() {
                 WorkerFault::FailAppendPreCommit => {
                     fault.clear();
+                    job.stats.record(job.class, job.admitted_at, dequeued_at);
                     let _ = job.reply.send(Err(MediumError::Io {
                         op: "io-worker append (injected pre-commit fault)",
                         path: String::new(),
@@ -474,6 +580,7 @@ fn worker_loop(
                     // The append EXECUTES (it may commit); the reply is never
                     // sent — the caller must reconcile the uncertain class.
                     let _ = execute(&mut store, job.op);
+                    job.stats.record(job.class, job.admitted_at, dequeued_at);
                     drop(job.reply);
                     continue;
                 }
@@ -483,6 +590,7 @@ fn worker_loop(
                     // reply is dropped, the worker staying healthy — the
                     // caller must reconcile the uncertain class to the
                     // VERIFIED absence (C4-F2's regression D).
+                    job.stats.record(job.class, job.admitted_at, dequeued_at);
                     drop(job.reply);
                     continue;
                 }
@@ -496,6 +604,7 @@ fn worker_loop(
                     // and its reply is dropped, the worker staying healthy —
                     // the caller must reconcile the uncertain class to the
                     // VERIFIED absence (the count disarms at zero).
+                    job.stats.record(job.class, job.admitted_at, dequeued_at);
                     drop(job.reply);
                     continue;
                 }
@@ -522,6 +631,7 @@ fn worker_loop(
             && matches!(fault.current(), WorkerFault::UnverifiableNextReconcile)
         {
             fault.clear();
+            job.stats.record(job.class, job.admitted_at, dequeued_at);
             let _ = job
                 .reply
                 .send(Ok(WorkerReply::Reconcile(Reconciliation::Unverifiable {
@@ -531,6 +641,7 @@ fn worker_loop(
         }
         let executed_kind = job_kind(&job.op);
         let reply = execute(&mut store, job.op);
+        job.stats.record(job.class, job.admitted_at, dequeued_at);
         // An abandoned receiver fails this send; the worker ignores it and
         // never blocks (one reply per one-slot channel).
         let _ = job.reply.send(reply);
@@ -615,6 +726,7 @@ pub struct WorkerMedium {
     tx: SyncSender<Job>,
     tier: SyncTier,
     health: Health,
+    stats: WorkerStatsCell,
 }
 
 impl WorkerMedium {
@@ -632,11 +744,7 @@ impl WorkerMedium {
         let (reply, slot) = completion_slot();
         if self
             .tx
-            .send(Job {
-                op,
-                cancel: None,
-                reply,
-            })
+            .send(Job::admit(op, None, reply, self.stats.clone()))
             .is_err()
         {
             return Err(MediumError::WorkerUnavailable {
@@ -684,11 +792,7 @@ impl CanonicalMedium for WorkerMedium {
         let (reply, slot) = completion_slot();
         if self
             .tx
-            .send(Job {
-                op,
-                cancel: None,
-                reply,
-            })
+            .send(Job::admit(op, None, reply, self.stats.clone()))
             .is_err()
         {
             return Err(MediumError::WorkerUnavailable {
@@ -742,11 +846,7 @@ impl CanonicalMedium for WorkerMedium {
         let (reply, slot) = completion_slot();
         if self
             .tx
-            .send(Job {
-                op,
-                cancel: None,
-                reply,
-            })
+            .send(Job::admit(op, None, reply, self.stats.clone()))
             .is_err()
         {
             return Err(MediumError::WorkerUnavailable {
@@ -789,11 +889,7 @@ impl CanonicalMedium for WorkerMedium {
         let (reply, slot) = completion_slot();
         if self
             .tx
-            .send(Job {
-                op,
-                cancel: None,
-                reply,
-            })
+            .send(Job::admit(op, None, reply, self.stats.clone()))
             .is_err()
         {
             return Err(MediumError::WorkerUnavailable {
@@ -834,11 +930,7 @@ impl CanonicalMedium for WorkerMedium {
         let (reply, slot) = completion_slot();
         if self
             .tx
-            .send(Job {
-                op,
-                cancel: None,
-                reply,
-            })
+            .send(Job::admit(op, None, reply, self.stats.clone()))
             .is_err()
         {
             return Err(MediumError::WorkerUnavailable {
@@ -874,11 +966,7 @@ impl CanonicalMedium for WorkerMedium {
         let (reply, slot) = completion_slot();
         if self
             .tx
-            .send(Job {
-                op,
-                cancel: None,
-                reply,
-            })
+            .send(Job::admit(op, None, reply, self.stats.clone()))
             .is_err()
         {
             return Err(MediumError::WorkerUnavailable {
@@ -918,11 +1006,7 @@ impl CanonicalMedium for WorkerMedium {
         let (reply, slot) = completion_slot();
         if self
             .tx
-            .send(Job {
-                op,
-                cancel: None,
-                reply,
-            })
+            .send(Job::admit(op, None, reply, self.stats.clone()))
             .is_err()
         {
             return Err(MediumError::WorkerUnavailable {
@@ -1030,6 +1114,21 @@ pub struct WorkerSource {
     tx: SyncSender<Job>,
     tier: SyncTier,
     health: Health,
+    stats: WorkerStatsCell,
+}
+
+impl WorkerSource {
+    /// (P3-L7, B13) The worker transport's observability surface —
+    /// the queue-wait vs service-time split per job kind (see
+    /// [`engine_persist::worker_stats`]): read-only derived state,
+    /// never serialized, never a fingerprint input, session-scoped
+    /// (a fresh worker after recovery resumes at defaults). The
+    /// source-level accessor so the crossing/orchestration layer —
+    /// which holds the cloneable source, not the handle — can read
+    /// the same counters the rig's measurement captures.
+    pub fn worker_stats(&self) -> WorkerStats {
+        self.stats.snapshot()
+    }
 }
 
 impl MediumSource for WorkerSource {
@@ -1040,6 +1139,7 @@ impl MediumSource for WorkerSource {
             tx: self.tx.clone(),
             tier: self.tier,
             health: self.health.clone(),
+            stats: self.stats.clone(),
         })
     }
 
@@ -1060,6 +1160,7 @@ pub struct IoWorker {
     tier: SyncTier,
     fault: WorkerFaultControl,
     handle: Option<JoinHandle<()>>,
+    stats: WorkerStatsCell,
 }
 
 impl IoWorker {
@@ -1082,6 +1183,10 @@ impl IoWorker {
         let tier = store.durability_tier();
         let (tx, rx) = sync_channel(capacity);
         let cell = Arc::new(AtomicU8::new(HEALTH_ALIVE));
+        // (P3-L7) The one per-session stats cell — cloned into the
+        // sources, the proxies, and every admitted job (the worker
+        // thread is the only recorder).
+        let stats = WorkerStatsCell::new();
         let handle = thread::Builder::new()
             .name("canonical-io-worker".to_owned())
             .spawn({
@@ -1100,6 +1205,7 @@ impl IoWorker {
             tier,
             fault,
             handle: Some(handle),
+            stats,
         })
     }
 
@@ -1111,6 +1217,7 @@ impl IoWorker {
                 tx: tx.clone(),
                 tier: self.tier,
                 health: self.health.clone(),
+                stats: self.stats.clone(),
             }),
             None => Err(MediumError::WorkerUnavailable {
                 detail: "the I/O worker is stopped".to_owned(),
@@ -1129,6 +1236,20 @@ impl IoWorker {
     /// spawn (truthful; never a round trip).
     pub fn tier(&self) -> SyncTier {
         self.tier
+    }
+
+    /// (P3-L7, B13) The worker transport's observability surface —
+    /// the queue-wait vs service-time split per job kind (see
+    /// [`engine_persist::worker_stats`], the
+    /// `CommitPipeline::retention_stats` precedent for the class
+    /// discipline): read-only derived state, never serialized,
+    /// never a fingerprint input, and session-scoped — the counters
+    /// start at defaults at spawn, so a fresh worker opened after
+    /// recovery resumes at zeros (timings are never replayed). The
+    /// rig's §4-workload-4 capture reads the [`std::fmt::Display`]
+    /// form of this snapshot (the frozen `worker-transport/` lines).
+    pub fn worker_stats(&self) -> WorkerStats {
+        self.stats.snapshot()
     }
 
     /// POISON the session: mark the worker unusable for authoritative
@@ -1171,11 +1292,7 @@ impl IoWorker {
         let (reply, slot) = completion_slot();
         match &self.tx {
             Some(tx) => tx
-                .send(Job {
-                    op,
-                    cancel: None,
-                    reply,
-                })
+                .send(Job::admit(op, None, reply, self.stats.clone()))
                 .map(|()| slot)
                 .map_err(|_| MediumError::WorkerUnavailable {
                     detail: "the I/O worker's queue is closed (the worker exited)".to_owned(),
@@ -1200,7 +1317,7 @@ impl IoWorker {
             return Err(TrySubmitError::Unavailable);
         }
         let (reply, slot) = completion_slot();
-        let job = Job { op, cancel, reply };
+        let job = Job::admit(op, cancel, reply, self.stats.clone());
         match &self.tx {
             Some(tx) => match tx.try_send(job) {
                 Ok(()) => Ok(slot),
@@ -1231,11 +1348,7 @@ impl IoWorker {
             });
         }
         let (reply, slot) = completion_slot();
-        let job = Job {
-            op,
-            cancel: None,
-            reply,
-        };
+        let job = Job::admit(op, None, reply, self.stats.clone());
         match &self.tx {
             Some(tx) => tx
                 .send(job)
