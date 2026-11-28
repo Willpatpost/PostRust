@@ -164,6 +164,22 @@ pub(crate) struct LocomotionCrowd {
     /// AFTER `with_behavior()` exactly the way `run`'s
     /// behavior+weather arm does.
     pub(crate) rain: Option<crate::corner_weather::RainLayer>,
+    /// P5 §3.3 (A18/R2) — the crowd's dirty-generation counters (the
+    /// caller-owned half of the dirty-generation protocol): bumped
+    /// EXACTLY when the population inputs change — the instance
+    /// generation on every instance re-pack (a crowd tick's
+    /// `corner_instances_into`) AND every rain rebuild (the rain
+    /// kind rides the same instance population), the pose
+    /// generation on every pose re-evaluation (a tick's
+    /// `evaluate_population_poses_locomotion`). Between ticks (the
+    /// render-then-step shape at a presentation rate above the 60 Hz
+    /// sim clock — free-look's accumulator) neither moves, so the
+    /// submission declares byte-identical population halves and the
+    /// renderer's repack and mapped-write gates make those frames
+    /// free. Starts at 1: the constructor's own evaluation IS the
+    /// first generation.
+    pub(crate) instance_generation: u64,
+    pub(crate) pose_generation: u64,
     /// Fixed-timestep accumulator for the crowd's simulation steps.
     /// Accumulates presented-frame sim time and drives the world at
     /// exactly 1/60 per tick, with bounded catch-up and visible drop
@@ -207,6 +223,8 @@ impl LocomotionCrowd {
             vehicles,
             spine: None,
             rain: None,
+            instance_generation: 1,
+            pose_generation: 1,
             step_accumulator: FixedTimestepAccumulator::new(),
         }
     }
@@ -281,6 +299,8 @@ impl LocomotionCrowd {
             vehicles,
             spine: Some(spine),
             rain: None,
+            instance_generation: 1,
+            pose_generation: 1,
             step_accumulator: FixedTimestepAccumulator::new(),
         }
     }
@@ -323,6 +343,12 @@ impl LocomotionCrowd {
         );
         crate::corner_routes::corner_instances_into(&self.states, &self.tints, &mut self.instances);
         crate::corner_routes::evaluate_population_poses_locomotion(&self.states, &mut self.poses);
+        // P5 §3.3: the tick re-packed both halves — bump both
+        // generations (the between-tick submissions then declare
+        // byte-identical population halves and the renderer's gates
+        // make them free).
+        self.instance_generation += 1;
+        self.pose_generation += 1;
     }
 
     /// The composed step: spine.run_tick() then composed_tick() then
@@ -341,6 +367,9 @@ impl LocomotionCrowd {
             &mut self.instances,
         );
         crate::corner_routes::evaluate_population_poses_locomotion(&world.states, &mut self.poses);
+        // P5 §3.3: the tick re-packed both halves — bump both.
+        self.instance_generation += 1;
+        self.pose_generation += 1;
     }
 
     /// One step: plain or composed depending on behavior flag.
@@ -357,7 +386,10 @@ impl LocomotionCrowd {
     }
 
     /// `pub(crate)` (P5 R0): the census composition route submits
-    /// the crowd through the same population view `run` does.
+    /// the crowd through the same population view `run` does. Since
+    /// P5 §3.3 the view carries the crowd's dirty generations (the
+    /// render-then-step protocol: between ticks both stay put and
+    /// the renderer's repack/write gates make the frame free).
     pub(crate) fn population(&self) -> engine_renderer::ProxyPopulation<'_> {
         engine_renderer::ProxyPopulation {
             npc: &self.instances,
@@ -376,6 +408,8 @@ impl LocomotionCrowd {
                 .as_ref()
                 .map(|_| crate::corner_weather::RAIN_MATERIAL)
                 .unwrap_or(0),
+            instance_generation: self.instance_generation,
+            pose_generation: self.pose_generation,
         }
     }
 
@@ -394,6 +428,15 @@ impl LocomotionCrowd {
     ) {
         if let Some(rain) = &mut self.rain {
             let _report = rain.update_and_build(camera_position, camera_yaw, day_night, dt);
+            // P5 §3.3: the rain kind's instances were rebuilt from
+            // the CURRENT camera — the instance population changed,
+            // so the instance generation bumps (conservative and
+            // honest: a rebuild at an unchanged camera produces
+            // byte-identical bytes, and one redundant generation is
+            // never a stale one). The rain rides the crowd's ONE
+            // instance generation (npc + vehicle + rain are one
+            // packed population).
+            self.instance_generation += 1;
         }
     }
 

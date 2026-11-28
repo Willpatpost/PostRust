@@ -559,7 +559,12 @@ pub fn corner_population_locomotion() -> (Vec<Route>, Vec<NpcLocomotion>, Vec<bo
 /// bridge): `InstanceTransform { pos: [state.position[0], 0.02,
 /// state.position[1]], turn: state.facing, scale: 1.0 }` (the 0.02 feet
 /// seam, the table's convention), tint from the authored palette (the
-/// street palette is unchanged), pose_index i (sequential).
+/// street palette is unchanged), and the STANDER-DEDUP pose index
+/// (P5 §3.2(e)): standers (`speed == 0`) share palette block 0 (the
+/// cached rest), walker j carries `1 + j` — the same
+/// [`crate::corner_population::stander_dedup_block_indices`] rule
+/// `evaluate_population_poses_locomotion`'s palette emits, so the
+/// instance list and the block list agree by construction.
 pub fn corner_instances_into(
     states: &[NpcLocomotion],
     table_tints: &[[f32; 3]],
@@ -575,6 +580,12 @@ pub fn corner_instances_into(
         out.len(),
         "states and output instances are parallel"
     );
+    let mapping = crate::corner_population::stander_dedup_block_indices(
+        &states
+            .iter()
+            .map(|state| state.speed == 0.0)
+            .collect::<Vec<_>>(),
+    );
 
     for (i, state) in states.iter().enumerate() {
         out[i] = ProxyInstance {
@@ -585,7 +596,7 @@ pub fn corner_instances_into(
             },
             tint: table_tints[i],
             alpha: 1.0,
-            pose_index: i as u32,
+            pose_index: mapping[i],
         };
     }
 }
@@ -610,10 +621,17 @@ pub fn corner_instances(states: &[NpcLocomotion], table_tints: &[[f32; 3]]) -> V
     out
 }
 
-/// Evaluates the population's pose blocks IN PLACE (one block per NPC,
-/// pose-index order — entry i's block is block i, matching the table's
-/// sequential pose_index pin), reusing the buffer's capacity. Zero allocation
-/// after the first frame.
+/// Evaluates the population's pose PALETTE IN PLACE (P5 §3.2(e),
+/// the shared animation palette — was one block per NPC): the
+/// emitted blocks are `[rest] ∪ {walker blocks}` in entry order —
+/// block 0 the shared cached rest (IFF at least one npc stands),
+/// walker j's own block at `1 + j`, matching the pose indices
+/// [`corner_instances_into`] writes (the same
+/// [`crate::corner_population::stander_dedup_block_indices`] rule
+/// over `speed == 0`). Reuses the buffer's capacity: zero
+/// allocation after the first frame. The per-npc skin matrices are
+/// IDENTICAL to the pre-dedup evaluation (the identity proof's test
+/// below).
 pub fn evaluate_population_poses_locomotion(states: &[NpcLocomotion], out: &mut Vec<Block>) {
     use engine_renderer::animation::{
         SkinBind, compose_joint_matrices, humanoid_skeleton, rest_pose_block, sample_pose,
@@ -628,19 +646,20 @@ pub fn evaluate_population_poses_locomotion(states: &[NpcLocomotion], out: &mut 
 
     out.clear();
     out.reserve(states.len());
-
+    let any_stander = states.iter().any(|state| state.speed == 0.0);
+    // Block 0: the ONE shared rest block (the standers' own bytes,
+    // bit-exact by the rest-identity proof — deduplicated).
+    if any_stander {
+        out.push(rest_pose_block());
+    }
     for state in states {
-        let block = if state.speed == 0.0 {
-            // Standing: the rest pose.
-            rest_pose_block()
-        } else {
+        if state.speed != 0.0 {
             // Walking: sample the pose at (phase * stride), then skin.
             let t = state.stride_phase * WALK_STRIDE_SECONDS;
             let pose = sample_pose(&clip, t);
             let joint_worlds = compose_joint_matrices(&skeleton, &pose);
-            skin_matrices_bound(&joint_worlds, &bind)
-        };
-        out.push(block);
+            out.push(skin_matrices_bound(&joint_worlds, &bind));
+        }
     }
 }
 
@@ -1254,6 +1273,12 @@ mod tests {
 
         // Test the allocating form's fields
         assert_eq!(instances_allocating.len(), 24, "one instance per NPC");
+        let mapping = crate::corner_population::stander_dedup_block_indices(
+            &states
+                .iter()
+                .map(|state| state.speed == 0.0)
+                .collect::<Vec<_>>(),
+        );
         for (i, instance) in instances_allocating.iter().enumerate() {
             let state = &states[i];
             assert_eq!(
@@ -1270,7 +1295,12 @@ mod tests {
             );
             assert_eq!(instance.transform.turn, state.facing, "instance {i} turn");
             assert_eq!(instance.transform.scale, 1.0, "instance {i} scale");
-            assert_eq!(instance.pose_index, i as u32, "instance {i} pose_index");
+            // P5 §3.2(e): the stander-dedup mapping (was the
+            // identity `i` — the versioned claim's history).
+            assert_eq!(
+                instance.pose_index, mapping[i],
+                "instance {i} pose_index follows the dedup mapping"
+            );
             assert_eq!(instance.tint, tints[i], "instance {i} tint");
         }
 
@@ -1400,14 +1430,95 @@ mod tests {
         println!("POSE_FNV_33={frame33}");
         println!("POSE_FNV_300={frame300}");
 
-        // The measured-actual FNV-1a digests (the placeholder-pin discipline: measured at this tree)
-        const PINNED_0: u64 = 3836824830651730592;
-        const PINNED_33: u64 = 14640098374474969127;
-        const PINNED_300: u64 = 15375200366290321505;
+        // The measured-actual FNV-1a digests (the placeholder-pin
+        // discipline: measured at this tree). History: REPINNED in
+        // P5 R2 (A18, the §3.2(e) stander dedup) — the palette is
+        // `[rest] ∪ {walker blocks}` where the pre-dedup digest
+        // hashed one block per npc (the standers' redundant rest
+        // copies removed); the pin fired on the change exactly as
+        // designed, and the per-npc skin matrices are proven
+        // identical by `locomotion_dedup_preserves_every_npcs_skin_
+        /// matrices`.
+        const PINNED_0: u64 = 17_667_891_731_665_696_896; // R2 MEASURED (the dedup palette), frozen.
+        const PINNED_33: u64 = 6_063_901_512_547_130_183; // R2 MEASURED (the dedup palette), frozen.
+        const PINNED_300: u64 = 17_999_475_867_621_276_545; // R2 MEASURED (the dedup palette), frozen.
 
         assert_eq!(frame0, PINNED_0, "frame 0's pose-bytes digest moved");
         assert_eq!(frame33, PINNED_33, "frame 33's pose-bytes digest moved");
         assert_eq!(frame300, PINNED_300, "frame 300's pose-bytes digest moved");
+    }
+
+    /// P5 §3.2(e) — THE LOCOMOTION SKIN-MATRIX IDENTITY PROOF (the
+    /// dedup's pixel-compatibility witness, the phase-column twin of
+    /// corner_population's): for EVERY npc over an advancing
+    /// sequence, the palette block the instance list's dedup
+    /// `pose_index` selects is BIT-IDENTICAL to the block the
+    /// pre-dedup per-npc evaluation produced for that npc — same
+    /// skin matrices per npc ⟹ same pixels, so the ink gates hold
+    /// digit for digit through the dedup.
+    #[test]
+    fn locomotion_dedup_preserves_every_npcs_skin_matrices() {
+        use engine_renderer::animation::{
+            SkinBind, compose_joint_matrices, humanoid_skeleton, rest_pose_block, sample_pose,
+            skin_matrices_bound, walk_clip,
+        };
+
+        let (routes, mut states, present) = corner_population_locomotion();
+        let clip = walk_clip();
+        let skeleton = humanoid_skeleton();
+        let bind = SkinBind::from_skeleton(&skeleton);
+        let tints = crate::corner_population::corner_npc_tints();
+        let mut palette = Vec::new();
+        let mut instances = Vec::new();
+        instances.resize(
+            24,
+            ProxyInstance {
+                transform: InstanceTransform {
+                    pos: [0.0, 0.0, 0.0],
+                    turn: 0,
+                    scale: 0.0,
+                },
+                tint: [0.0, 0.0, 0.0],
+                alpha: 1.0,
+                pose_index: 0,
+            },
+        );
+        for step in 0..128_u64 {
+            evaluate_population_poses_locomotion(&states, &mut palette);
+            corner_instances_into(&states, &tints, &mut instances);
+            for (index, state) in states.iter().enumerate() {
+                // The pre-dedup per-npc evaluation (the reference
+                // oracle): the stander's rest copy, the walker's own
+                // sampled block at its CURRENT phase.
+                let own = if state.speed == 0.0 {
+                    rest_pose_block()
+                } else {
+                    let t = state.stride_phase * WALK_STRIDE_SECONDS;
+                    let pose = sample_pose(&clip, t);
+                    let joint_worlds = compose_joint_matrices(&skeleton, &pose);
+                    skin_matrices_bound(&joint_worlds, &bind)
+                };
+                let block_index = instances[index].pose_index as usize;
+                assert!(
+                    block_index < palette.len(),
+                    "step {step}, npc {index}: the index selects a supplied block"
+                );
+                assert_eq!(
+                    palette[block_index], own,
+                    "step {step}, npc {index}: the palette block is the npc's own \
+                     skin matrices (the dedup preserves the pixels)"
+                );
+            }
+            engine_core::npc_locomotion::advance_batch(
+                &routes,
+                &mut states,
+                &present,
+                1.0 / 60.0,
+                None,
+                0.3,
+                1.75,
+            );
+        }
     }
 
     // Import helpers from engine_core for advance_batch (used in pose_bytes_fnv_pins test)

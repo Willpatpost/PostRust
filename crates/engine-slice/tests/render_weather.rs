@@ -120,6 +120,8 @@ fn gate_matrix() -> ([[f32; 4]; 4], f32) {
 /// empty rain kind, byte-identical to the pre-package frames).
 fn rainless() -> ProxyPopulation<'static> {
     ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: &[],
         npc_poses: &[],
         npc_material: 1,
@@ -2084,6 +2086,8 @@ fn rain_warmed_allocation_constancy() {
         })
         .collect();
     let saturated = ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: &[],
         npc_poses: &[],
         npc_material: 0,
@@ -2274,6 +2278,8 @@ fn rain_n_vs_1_draw_mode_equivalence() {
         })
         .collect();
     let population = ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: &[],
         npc_poses: &[],
         npc_material: 1,
@@ -2379,6 +2385,8 @@ fn rain_diagonal_single_drop_footprint() {
         pose_index: 0,
     };
     let population = ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: &[],
         npc_poses: &[],
         npc_material: 1,

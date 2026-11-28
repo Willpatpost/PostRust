@@ -207,6 +207,8 @@ impl<'a> FixturePopulation<'a> {
             ]);
         FixturePopulation {
             population: ProxyPopulation {
+                instance_generation: 0,
+                pose_generation: 0,
                 npc,
                 npc_poses: poses,
                 npc_material,
@@ -231,6 +233,8 @@ impl<'a> FixturePopulation<'a> {
     ) -> Self {
         FixturePopulation {
             population: ProxyPopulation {
+                instance_generation: 0,
+                pose_generation: 0,
                 npc,
                 npc_poses: poses,
                 npc_material,
@@ -1237,6 +1241,8 @@ fn full_corner_population_matches_per_object_pixels() {
                 &mut blocks,
             );
             let animated = ProxyPopulation {
+                instance_generation: 0,
+                pose_generation: 0,
                 npc: &animated_instances,
                 npc_poses: &blocks,
                 npc_material: 1,
@@ -1314,6 +1320,8 @@ fn full_corner_population_matches_per_object_pixels() {
                 &mut blocks,
             );
             let animated = ProxyPopulation {
+                instance_generation: 0,
+                pose_generation: 0,
                 npc: &animated_instances,
                 npc_poses: &blocks,
                 npc_material: 1,
@@ -2667,6 +2675,8 @@ fn skinned_pose_matches_the_cpu_oracle() {
     // fixture discipline: the blocks outlive the population).
     let single = [instance];
     let population = ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: &single,
         npc_poses: &blocks,
         npc_material: 1,
@@ -2790,6 +2800,8 @@ fn skinned_pose_matches_the_cpu_oracle() {
     // the floor 1000 carries 50× of margin over that derivation).
     let rest_blocks = [rest_block];
     let rest_population = ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: &single,
         npc_poses: &rest_blocks,
         npc_material: 1,
@@ -2949,6 +2961,8 @@ fn animated_population_matches_per_object_pixels() {
         }
     }
     let walked = ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: &npc,
         npc_poses: &blocks,
         npc_material: 1,
@@ -3008,6 +3022,8 @@ fn animated_population_matches_per_object_pixels() {
         .map(|_| engine_renderer::animation::rest_pose_block())
         .collect();
     let at_rest = ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: &npc,
         npc_poses: &rest_blocks,
         npc_material: 1,
@@ -3299,6 +3315,8 @@ fn composed_population_matches_per_object_pixels() {
                 &mut composed_poses,
             );
             let animated = ProxyPopulation {
+                instance_generation: 0,
+                pose_generation: 0,
                 npc: &composed_instances,
                 npc_poses: &composed_poses,
                 npc_material: 1,
@@ -3397,6 +3415,8 @@ fn composed_population_matches_per_object_pixels() {
                 &mut composed_poses,
             );
             let animated = ProxyPopulation {
+                instance_generation: 0,
+                pose_generation: 0,
                 npc: &composed_instances,
                 npc_poses: &composed_poses,
                 npc_material: 1,
@@ -3487,6 +3507,8 @@ fn composed_population_matches_per_object_pixels() {
             .map(|_| engine_renderer::animation::rest_pose_block())
             .collect();
         let at_rest = ProxyPopulation {
+            instance_generation: 0,
+            pose_generation: 0,
             npc: &npc,
             npc_poses: &rest_blocks,
             npc_material: 1,
@@ -3813,6 +3835,8 @@ fn composed_wake_campaign_past_log_boundaries_allocates_nothing() {
             &mut composed_poses,
         );
         let animated = ProxyPopulation {
+            instance_generation: 0,
+            pose_generation: 0,
             npc: &composed_instances,
             npc_poses: &composed_poses,
             npc_material: 1,
@@ -3873,6 +3897,8 @@ fn composed_wake_campaign_past_log_boundaries_allocates_nothing() {
             &mut composed_poses,
         );
         let animated = ProxyPopulation {
+            instance_generation: 0,
+            pose_generation: 0,
             npc: &composed_instances,
             npc_poses: &composed_poses,
             npc_material: 1,

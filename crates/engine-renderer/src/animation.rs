@@ -57,7 +57,7 @@
 //! for the rest pose — NO special handling needed — the vertex shader
 //! will compute the same position as the unskinned path.
 
-use crate::proxy_instances::sin_cos_turn;
+use crate::proxy_instances::{GenerationDecision, sin_cos_turn};
 use std::sync::OnceLock;
 
 /// The number of joints in the v2 humanoid skeleton.
@@ -720,6 +720,70 @@ pub fn repack_poses_bounded(
         buffer.extend_from_slice(&bytes);
     }
 
+    Ok(())
+}
+
+/// The dirty-generation protocol's pose half (P5 §3.3, A18/R2 —
+/// [`crate::proxy_instances::repack_populations_generation`]'s
+/// mirror): the capacity bound ALWAYS runs (the typed refusal stays
+/// per-frame), and the byte regeneration is gated on the caller's
+/// declared `generation` — a pose advance bumps, a static pose set
+/// reuses (the garage's instance half and any between-tick frame's
+/// pose half). `buffer_generation` records which generation's bytes
+/// the retained `buffer` holds (0 = unknown; every generation-0
+/// submission resets it). The count guard
+/// (`buffer.len() == blocks.len() * POSE_STRIDE`) is the packed
+/// footprint. The full-repack fallback is [`repack_poses_bounded`],
+/// unchanged.
+pub fn repack_poses_generation(
+    buffer: &mut Vec<u8>,
+    blocks: &[[[[f32; 4]; 4]; HUMANOID_JOINTS]],
+    capacity: usize,
+    generation: u64,
+    buffer_generation: &mut u64,
+) -> Result<GenerationDecision, PosePackError> {
+    if blocks.len() > capacity {
+        return Err(PosePackError::Capacity {
+            capacity,
+            requested: blocks.len(),
+        });
+    }
+    if generation != 0
+        && *buffer_generation == generation
+        && buffer.len() == blocks.len() * POSE_STRIDE
+    {
+        return Ok(GenerationDecision::Reused);
+    }
+    buffer.clear();
+    buffer.reserve(blocks.len() * POSE_STRIDE);
+    for block in blocks.iter() {
+        let bytes = pack_pose_bytes(block);
+        buffer.extend_from_slice(&bytes);
+    }
+    *buffer_generation = generation;
+    Ok(GenerationDecision::Repacked)
+}
+
+/// THE MISSED-BUMP DEBUG VERIFY's pose half (P5 §3.3 — the
+/// independent reference path): re-packs `blocks` through the
+/// full-repack fallback and byte-compares against `buffer`,
+/// panicking loudly on divergence. The submission adapter invokes
+/// this on every pose-side reuse under `cfg(any(debug_assertions,
+/// test))`; always compiled so the red-then-green witness runs in
+/// every test profile.
+pub fn verify_pose_generation(
+    buffer: &[u8],
+    blocks: &[[[[f32; 4]; 4]; HUMANOID_JOINTS]],
+    capacity: usize,
+) -> Result<(), PosePackError> {
+    let mut reference = Vec::with_capacity(buffer.len());
+    repack_poses_bounded(&mut reference, blocks, capacity)?;
+    assert_eq!(
+        reference, buffer,
+        "MISSED BUMP (P5 §3.3): a pose set declared unchanged \
+         (generation reuse) repacked to different bytes — bump the \
+         pose generation when the evaluated blocks change"
+    );
     Ok(())
 }
 
@@ -2150,6 +2214,151 @@ mod tests {
         let mut constant = Vec::new();
         repack_poses(&mut constant, &blocks).unwrap();
         assert_eq!(bounded, constant);
+    }
+
+    /// P5 §3.3 (A18/R2) — the pose-side generation gate: the
+    /// decision sequence over a static pose set (the garage's
+    /// between-advance shape and any between-tick frame's pose
+    /// half). First submission repacks and records; same-generation
+    /// resubmissions reuse byte-identically; a bumped generation
+    /// (the pose advanced) repacks; generation 0 always repacks and
+    /// resets the record; the count guard repacks on a changed block
+    /// count at the same generation.
+    #[test]
+    fn pose_generation_gated_repack_decision_sequence() {
+        let skeleton = humanoid_skeleton();
+        let mut pose = rest_pose();
+        pose[7].delta_turns = [16384, 0, 0];
+        let joint_worlds = compose_joint_matrices(&skeleton, &pose);
+        let posed = skin_matrices(&joint_worlds, &skeleton);
+        let rest = rest_pose_block();
+        let static_set = [rest, posed, rest];
+        let mut buffer = Vec::new();
+        let mut buffer_generation = 0_u64;
+        assert_eq!(
+            repack_poses_generation(
+                &mut buffer,
+                &static_set,
+                MAX_POSE_BLOCKS,
+                4,
+                &mut buffer_generation
+            )
+            .unwrap(),
+            GenerationDecision::Repacked
+        );
+        let first = buffer.clone();
+        for _ in 0..3 {
+            assert_eq!(
+                repack_poses_generation(
+                    &mut buffer,
+                    &static_set,
+                    MAX_POSE_BLOCKS,
+                    4,
+                    &mut buffer_generation
+                )
+                .unwrap(),
+                GenerationDecision::Reused
+            );
+            assert_eq!(buffer, first);
+        }
+        assert_eq!(buffer_generation, 4);
+        // The pose advanced: bump and repack.
+        let mut pose2 = rest_pose();
+        pose2[8].delta_turns = [-8192, 0, 0];
+        let joint_worlds = compose_joint_matrices(&skeleton, &pose2);
+        let posed2 = skin_matrices(&joint_worlds, &skeleton);
+        let advanced = [rest, posed2, rest];
+        assert_eq!(
+            repack_poses_generation(
+                &mut buffer,
+                &advanced,
+                MAX_POSE_BLOCKS,
+                5,
+                &mut buffer_generation
+            )
+            .unwrap(),
+            GenerationDecision::Repacked
+        );
+        let mut expected = Vec::new();
+        repack_poses(&mut expected, &advanced).unwrap();
+        assert_eq!(buffer, expected, "the repacked bytes are the fallback's");
+        // The count guard: same generation, different block count.
+        assert_eq!(
+            repack_poses_generation(
+                &mut buffer,
+                &[rest],
+                MAX_POSE_BLOCKS,
+                5,
+                &mut buffer_generation
+            )
+            .unwrap(),
+            GenerationDecision::Repacked
+        );
+        // Generation 0: always repack, reset the record.
+        assert_eq!(
+            repack_poses_generation(
+                &mut buffer,
+                &static_set,
+                MAX_POSE_BLOCKS,
+                0,
+                &mut buffer_generation
+            )
+            .unwrap(),
+            GenerationDecision::Repacked
+        );
+        assert_eq!(buffer_generation, 0);
+        // The capacity refusal stays per-frame on the gated path and
+        // is atomic against the records.
+        let prior = buffer.clone();
+        let over: Vec<_> = vec![rest; MAX_POSE_BLOCKS + 1];
+        assert_eq!(
+            repack_poses_generation(
+                &mut buffer,
+                &over,
+                MAX_POSE_BLOCKS,
+                0,
+                &mut buffer_generation
+            ),
+            Err(PosePackError::Capacity {
+                capacity: MAX_POSE_BLOCKS,
+                requested: MAX_POSE_BLOCKS + 1
+            })
+        );
+        assert_eq!(buffer, prior);
+        assert_eq!(buffer_generation, 0);
+    }
+
+    /// P5 §3.3 — the pose-side missed-bump witnesses: the red half
+    /// panics the verify on a changed-but-not-bumped pose set; the
+    /// green half verifies an honestly-declared set clean.
+    #[test]
+    #[should_panic(expected = "MISSED BUMP")]
+    fn pose_missed_bump_panics_the_verify() {
+        let skeleton = humanoid_skeleton();
+        let mut pose = rest_pose();
+        pose[7].delta_turns = [16384, 0, 0];
+        let joint_worlds = compose_joint_matrices(&skeleton, &pose);
+        let posed = skin_matrices(&joint_worlds, &skeleton);
+        let rest = rest_pose_block();
+        let mut buffer = Vec::new();
+        repack_poses(&mut buffer, &[rest, posed]).unwrap();
+        // The walker advanced without a bump: the reference repack
+        // diverges and the verify fails loudly.
+        let mut pose2 = rest_pose();
+        pose2[7].delta_turns = [8192, 0, 0];
+        let joint_worlds = compose_joint_matrices(&skeleton, &pose2);
+        let posed2 = skin_matrices(&joint_worlds, &skeleton);
+        verify_pose_generation(&buffer, &[rest, posed2], MAX_POSE_BLOCKS).unwrap();
+    }
+
+    /// The verify's green half (see the red witness above).
+    #[test]
+    fn pose_verify_green() {
+        let rest = rest_pose_block();
+        let mut buffer = Vec::new();
+        repack_poses(&mut buffer, &[rest, rest]).unwrap();
+        verify_pose_generation(&buffer, &[rest, rest], MAX_POSE_BLOCKS)
+            .expect("an honestly-declared pose set verifies clean");
     }
 
     /// rest_pose_block: equals skin_matrices at the zero pose,

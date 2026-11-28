@@ -99,6 +99,52 @@ pub enum InstancePackError {
     Invalid { index: usize, field: &'static str },
 }
 
+/// The dirty-generation protocol's gate decision (P5 §3.3, A18/R2):
+/// whether a generation-gated repack REGENERATED the retained
+/// buffer's bytes or REUSED them because the caller declared the
+/// population byte-identical to the generation the buffer already
+/// holds. The write-side twin (the per-frame-slot stamp gate,
+/// [`generation_write_needed`]) consumes the same declared
+/// generation independently — the two levels never consult each
+/// other, which is exactly why both can be reasoned about (and
+/// tested) alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationDecision {
+    /// The gate missed (or the caller declared generation 0,
+    /// always-dirty): the full repack ran and the buffer now holds
+    /// the declared generation's bytes.
+    Repacked,
+    /// The gate hit: the caller's generation equals the buffer's
+    /// recorded generation at the same packed byte count, so the
+    /// retained bytes ARE the declared bytes — nothing was
+    /// regenerated. The debug verify mode
+    /// ([`verify_population_generation`]) re-packs and byte-compares
+    /// on this arm in debug/test builds, making a missed bump loud.
+    Reused,
+}
+
+/// The dirty-generation protocol's WRITE gate (P5 §3.3, A18/R2):
+/// whether a frame slot's mapped region must receive this frame's
+/// bytes. The slot's stamp records the generation whose bytes it
+/// last consumed — written ONLY together with those bytes — so a
+/// matching nonzero generation PROVES the region already holds
+/// byte-identical bytes (the ping-pong hazard is why the stamps are
+/// PER-SLOT: with FRAMES_IN_FLIGHT = 2 a stable population pays one
+/// write per slot per generation and then zero). Generation 0 is
+/// ALWAYS-DIRTY (today's behavior for every caller that has not
+/// opted in) and therefore always writes.
+///
+/// Pure — the frame flow's upload site and the census's write leg
+/// both consume this ONE decision function (the upload-policy unit
+/// class; the oracle harness in `vulkan/frame.rs` pins it against
+/// the always-write path).
+pub fn generation_write_needed(stamp: u64, generation: u64) -> bool {
+    // 0 = always-dirty: no stamp can vouch for it, and a generation-0
+    // write RESETS the stamp to 0 so a later opted-in generation can
+    // never skip against a slot holding some other caller's bytes.
+    generation == 0 || stamp != generation
+}
+
 /// The fixed half-turn constant (the nearest f32 to π/2 — a fixed
 /// bit pattern, identical on every platform).
 const FRAC_PI_2: f32 = core::f32::consts::FRAC_PI_2;
@@ -292,6 +338,29 @@ pub fn repack_populations_bounded(
     rain: &[ProxyInstance],
     capacity: usize,
 ) -> Result<(), InstancePackError> {
+    let total = validate_population(npc, vehicle, rain, capacity)?;
+    buffer.clear();
+    buffer.reserve(total * INSTANCE_STRIDE);
+    for instance in npc.iter().chain(vehicle).chain(rain) {
+        append_instance_bytes(buffer, instance);
+    }
+    Ok(())
+}
+
+/// The shared validation half (P5 §3.3, A18/R2): the capacity check
+/// plus the per-instance field validation, in the repack's own fixed
+/// chained order (npc then vehicle then rain — the refusal payloads'
+/// index arithmetic crosses the kind boundaries exactly the way the
+/// full repack's does). Extracted so the full repack and the
+/// generation-gated form validate through ONE implementation — the
+/// "byte layout exists exactly once" discipline applied to the
+/// refusal contract.
+fn validate_population(
+    npc: &[ProxyInstance],
+    vehicle: &[ProxyInstance],
+    rain: &[ProxyInstance],
+    capacity: usize,
+) -> Result<usize, InstancePackError> {
     let total = npc.len() + vehicle.len() + rain.len();
     if total > capacity {
         return Err(InstancePackError::Capacity {
@@ -304,11 +373,80 @@ pub fn repack_populations_bounded(
             return Err(InstancePackError::Invalid { index, field });
         }
     }
+    Ok(total)
+}
+
+/// The dirty-generation protocol's CPU half (P5 §3.3, A18/R2 — the
+/// design's caller-owned generation): the full validation ALWAYS
+/// runs (the typed refusals stay per-frame — a declared-identical
+/// population that no longer validates still refuses, fail-visible),
+/// and the byte REGENERATION is gated on the caller's declared
+/// `generation`. `buffer_generation` records which generation's
+/// bytes the retained `buffer` holds (0 = unknown — every
+/// generation-0 submission resets it, so an opted-in caller can
+/// never reuse a buffer holding some other population's bytes). The
+/// count guard (`buffer.len() == total * INSTANCE_STRIDE`) is the
+/// packed-byte footprint of the declared population — a same-count
+/// collision between two distinct opted-in populations remains the
+/// documented ownership hazard (the generation space belongs to the
+/// population source), caught in debug/test by
+/// [`verify_population_generation`].
+///
+/// THE FULL-REPACK FALLBACK is [`repack_populations_bounded`] —
+/// unchanged, byte-identical, and exactly what this function runs on
+/// every gate miss. Generation 0 delegates to it unconditionally
+/// (today's behavior).
+pub fn repack_populations_generation(
+    buffer: &mut Vec<u8>,
+    npc: &[ProxyInstance],
+    vehicle: &[ProxyInstance],
+    rain: &[ProxyInstance],
+    capacity: usize,
+    generation: u64,
+    buffer_generation: &mut u64,
+) -> Result<GenerationDecision, InstancePackError> {
+    let total = validate_population(npc, vehicle, rain, capacity)?;
+    if generation != 0
+        && *buffer_generation == generation
+        && buffer.len() == total * INSTANCE_STRIDE
+    {
+        return Ok(GenerationDecision::Reused);
+    }
     buffer.clear();
     buffer.reserve(total * INSTANCE_STRIDE);
     for instance in npc.iter().chain(vehicle).chain(rain) {
         append_instance_bytes(buffer, instance);
     }
+    *buffer_generation = generation;
+    Ok(GenerationDecision::Repacked)
+}
+
+/// THE MISSED-BUMP DEBUG VERIFY (P5 §3.3's mandated mitigation — the
+/// independent reference path): re-packs `npc`/`vehicle`/`rain`
+/// through the FULL-REPACK fallback and byte-compares against
+/// `buffer`, panicking loudly on divergence. This is the
+/// stale-generation hazard made audible: a caller that changed its
+/// population without bumping the generation renders the prior
+/// population in release — this function is what catches it in
+/// debug and test builds (the submission adapter invokes it on every
+/// reuse under `cfg(any(debug_assertions, test))`, never in a
+/// release production frame). Always compiled so the red-then-green
+/// witness can run in every test profile.
+pub fn verify_population_generation(
+    buffer: &[u8],
+    npc: &[ProxyInstance],
+    vehicle: &[ProxyInstance],
+    rain: &[ProxyInstance],
+    capacity: usize,
+) -> Result<(), InstancePackError> {
+    let mut reference = Vec::with_capacity(buffer.len());
+    repack_populations_bounded(&mut reference, npc, vehicle, rain, capacity)?;
+    assert_eq!(
+        reference, buffer,
+        "MISSED BUMP (P5 §3.3): a population declared unchanged \
+         (generation reuse) repacked to different bytes — bump the \
+         population's generation when its inputs change"
+    );
     Ok(())
 }
 
@@ -767,5 +905,249 @@ mod tests {
             "a smaller population keeps the capacity"
         );
         assert_eq!(buffer.len(), (npc.len() + vehicle.len()) * INSTANCE_STRIDE);
+    }
+
+    /// P5 §3.3 (A18/R2) — THE GATE DECISION TABLE: generation 0
+    /// always writes (today's behavior — no stamp can vouch for it);
+    /// a nonzero generation writes unless the stamp already records
+    /// exactly it; a stamp of 0 (unknown — the initial state, and
+    /// what every generation-0 write resets to) always writes. This
+    /// is the write-side half the frame flow's upload site and the
+    /// census's write leg consume.
+    #[test]
+    fn generation_write_gate_decision_table() {
+        use crate::proxy_instances::generation_write_needed;
+        assert!(generation_write_needed(0, 0), "generation 0 always writes");
+        assert!(
+            generation_write_needed(7, 0),
+            "generation 0 ignores the stamp"
+        );
+        assert!(generation_write_needed(0, 7), "an unknown stamp writes");
+        assert!(generation_write_needed(3, 7), "a different stamp writes");
+        assert!(
+            !generation_write_needed(7, 7),
+            "the stamp vouching for this generation skips"
+        );
+    }
+
+    /// P5 §3.3 (A18/R2) — THE GATED REPACK: the decision sequence
+    /// over a stable opted-in population. The first submission
+    /// repacks (unknown buffer generation) and records the
+    /// generation; same-generation resubmissions REUSE the retained
+    /// bytes byte-identically (the between-tick frame's shape — the
+    /// regeneration cost is gone, validation stays); a bumped
+    /// generation repacks the changed bytes; a generation-0
+    /// submission (an un-opted caller interleaved) always repacks
+    /// AND resets the buffer generation so the next opted-in
+    /// submission cannot reuse against it.
+    #[test]
+    fn generation_gated_repack_decision_sequence() {
+        let (npc, vehicle, rain) = fixture_populations();
+        let capacity = MAX_INSTANCES;
+        let mut buffer = Vec::new();
+        let mut buffer_generation = 0_u64;
+        // First opted-in submission: full repack, generation recorded.
+        assert_eq!(
+            repack_populations_generation(
+                &mut buffer,
+                &npc,
+                &vehicle,
+                &rain,
+                capacity,
+                5,
+                &mut buffer_generation
+            )
+            .unwrap(),
+            GenerationDecision::Repacked
+        );
+        let first = buffer.clone();
+        assert_eq!(buffer_generation, 5);
+        // Same generation, same population: REUSED, bytes untouched.
+        for _ in 0..3 {
+            assert_eq!(
+                repack_populations_generation(
+                    &mut buffer,
+                    &npc,
+                    &vehicle,
+                    &rain,
+                    capacity,
+                    5,
+                    &mut buffer_generation
+                )
+                .unwrap(),
+                GenerationDecision::Reused
+            );
+            assert_eq!(buffer, first, "the retained bytes are the declared bytes");
+        }
+        // A bumped generation with changed bytes: repacked.
+        let mut moved = npc.clone();
+        moved[0].transform.pos[0] += 3.0;
+        assert_eq!(
+            repack_populations_generation(
+                &mut buffer,
+                &moved,
+                &vehicle,
+                &rain,
+                capacity,
+                6,
+                &mut buffer_generation
+            )
+            .unwrap(),
+            GenerationDecision::Repacked
+        );
+        assert_eq!(buffer_generation, 6);
+        let mut expected = Vec::new();
+        repack_populations(&mut expected, &moved, &vehicle, &rain).unwrap();
+        assert_eq!(buffer, expected, "the repacked bytes are the fallback's");
+        // The count guard: the SAME generation with a different
+        // population SIZE repacks (the packed footprint no longer
+        // matches — two populations colliding at one generation is
+        // the ownership hazard, never a silent reuse).
+        assert_eq!(
+            repack_populations_generation(
+                &mut buffer,
+                &moved,
+                &vehicle,
+                &[],
+                capacity,
+                6,
+                &mut buffer_generation
+            )
+            .unwrap(),
+            GenerationDecision::Repacked
+        );
+        // Generation 0 (an un-opted caller): always repacks and
+        // resets the buffer generation to unknown.
+        assert_eq!(
+            repack_populations_generation(
+                &mut buffer,
+                &npc,
+                &vehicle,
+                &rain,
+                capacity,
+                0,
+                &mut buffer_generation
+            )
+            .unwrap(),
+            GenerationDecision::Repacked
+        );
+        assert_eq!(buffer_generation, 0, "generation 0 resets the record");
+        assert_eq!(
+            repack_populations_generation(
+                &mut buffer,
+                &npc,
+                &vehicle,
+                &rain,
+                capacity,
+                5,
+                &mut buffer_generation
+            )
+            .unwrap(),
+            GenerationDecision::Repacked,
+            "the re-opted submission cannot reuse the 0-caller's bytes"
+        );
+    }
+
+    /// P5 §3.3 — the gated path's refusals are the fallback's own
+    /// (validation always runs, atomically): an invalid instance and
+    /// an over-capacity population refuse with the exact typed
+    /// payloads, leaving the prior generation's bytes and the buffer
+    /// generation intact — a refused frame never corrupts the
+    /// protocol's records.
+    #[test]
+    fn generation_gated_repack_refusals_are_atomic() {
+        let (npc, vehicle, rain) = fixture_populations();
+        let mut buffer = Vec::new();
+        let mut buffer_generation = 0_u64;
+        repack_populations_generation(
+            &mut buffer,
+            &npc,
+            &vehicle,
+            &rain,
+            MAX_INSTANCES,
+            9,
+            &mut buffer_generation,
+        )
+        .unwrap();
+        let prior = buffer.clone();
+        let mut bad = npc.clone();
+        bad[1].tint = [1.5, 0.0, 0.0];
+        assert_eq!(
+            repack_populations_generation(
+                &mut buffer,
+                &bad,
+                &vehicle,
+                &rain,
+                MAX_INSTANCES,
+                9,
+                &mut buffer_generation
+            ),
+            Err(InstancePackError::Invalid {
+                index: 1,
+                field: "tint"
+            })
+        );
+        assert_eq!(buffer, prior, "the refusal left the prior bytes intact");
+        assert_eq!(buffer_generation, 9, "the refusal left the record intact");
+        assert_eq!(
+            repack_populations_generation(
+                &mut buffer,
+                &npc,
+                &vehicle,
+                &rain,
+                3,
+                9,
+                &mut buffer_generation
+            ),
+            Err(InstancePackError::Capacity {
+                capacity: 3,
+                requested: npc.len() + vehicle.len() + rain.len()
+            })
+        );
+        assert_eq!(buffer, prior);
+        assert_eq!(buffer_generation, 9);
+    }
+
+    /// P5 §3.3 — THE MISSED-BUMP RED WITNESS (the B04 pattern's
+    /// red half; the green half is every reuse above): a population
+    /// that CHANGED without a bump, verified against the retained
+    /// bytes, panics with the loud message — the stale-generation
+    /// hazard is audible in every test profile (the verify function
+    /// is always compiled; production release frames never call it).
+    #[test]
+    #[should_panic(expected = "MISSED BUMP")]
+    fn missed_bump_panics_the_verify() {
+        let (npc, vehicle, rain) = fixture_populations();
+        let mut buffer = Vec::new();
+        repack_populations(&mut buffer, &npc, &vehicle, &rain).unwrap();
+        let mut moved = npc.clone();
+        moved[0].transform.pos[2] -= 8.0;
+        // The declared-unchanged population is NOT what the buffer
+        // holds: the verify re-packs the reference and fails loudly.
+        verify_population_generation(&buffer, &moved, &vehicle, &rain, MAX_INSTANCES).unwrap();
+    }
+
+    /// P5 §3.3 — the verify's green half: an honestly-declared
+    /// population verifies clean, and a population that no longer
+    /// VALIDATES under a stale generation surfaces the typed refusal
+    /// through the same reference path (a missed bump that also
+    /// broke the input contract refuses instead of panicking).
+    #[test]
+    fn verify_green_and_invalid_refuses() {
+        let (npc, vehicle, rain) = fixture_populations();
+        let mut buffer = Vec::new();
+        repack_populations(&mut buffer, &npc, &vehicle, &rain).unwrap();
+        verify_population_generation(&buffer, &npc, &vehicle, &rain, MAX_INSTANCES)
+            .expect("an honestly-declared population verifies clean");
+        let mut invalid = npc.clone();
+        invalid[0].alpha = 2.0;
+        assert_eq!(
+            verify_population_generation(&buffer, &invalid, &vehicle, &rain, MAX_INSTANCES),
+            Err(InstancePackError::Invalid {
+                index: 0,
+                field: "alpha"
+            }),
+            "the missed bump that broke validation refuses loudly"
+        );
     }
 }

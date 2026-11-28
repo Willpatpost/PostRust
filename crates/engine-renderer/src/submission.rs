@@ -215,6 +215,28 @@ pub(crate) struct SubmissionPolicy {
     pub pose_capacity: usize,
 }
 
+/// The retained repack buffers' generation records (P5 §3.3,
+/// A18/R2): which generation's bytes `Renderer`'s `instance_bytes`
+/// and `pose_bytes` each hold. This is the CPU half of the
+/// dirty-generation protocol — the adapter's gate consults and
+/// updates it beside the buffers it describes, so the retained
+/// bytes and their record can never disagree. 0 = unknown (the
+/// initial state, and what every generation-0 — always-dirty —
+/// submission resets to). The per-frame-slot write half lives in
+/// `FrameState`'s stamps; the two levels are independent by design
+/// (the buffer always ends up holding the declared generation's
+/// bytes; the slot stamp decides only whether those bytes need
+/// copying into THIS slot's mapped region).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct PopulationGenerations {
+    /// The generation whose bytes the retained instance buffer
+    /// holds (the packed npc+vehicle+rain population).
+    pub instance: u64,
+    /// The generation whose bytes the retained pose buffer holds
+    /// (the packed pose-block palette).
+    pub pose: u64,
+}
+
 /// The input half of one `vulkan::render_frame` call, typed — the
 /// parameter set the S1 adapter builds from a validated submission.
 /// Field-for-field the existing per-feature entries' inline
@@ -263,6 +285,55 @@ pub(crate) struct FrameInputs<'x> {
     pub wet: Option<vulkan::reflection_draw::WetCamera>,
 }
 
+/// The missed-bump verify dispatch (P5 §3.3, A18/R2): on any reuse,
+/// debug and test builds re-pack through the FULL-REPACK FALLBACK
+/// and byte-compare (the independent reference path — a missed bump
+/// is loud); the release-production stub is empty (never a
+/// production frame's cost). Both arms share one signature so the
+/// adapter's call site is configuration-independent.
+#[cfg(any(debug_assertions, test))]
+fn verify_population_reuse(
+    population: &ProxyPopulation<'_>,
+    policy: SubmissionPolicy,
+    instance_bytes: &[u8],
+    pose_bytes: &[u8],
+    instance_decision: crate::proxy_instances::GenerationDecision,
+    pose_decision: crate::proxy_instances::GenerationDecision,
+) -> Result<(), RendererError> {
+    use crate::proxy_instances::GenerationDecision;
+    if instance_decision == GenerationDecision::Reused {
+        crate::proxy_instances::verify_population_generation(
+            instance_bytes,
+            population.npc,
+            population.vehicle,
+            population.rain,
+            policy.instance_capacity,
+        )
+        .map_err(RendererError::ProxyPack)?;
+    }
+    if pose_decision == GenerationDecision::Reused {
+        crate::animation::verify_pose_generation(
+            pose_bytes,
+            population.npc_poses,
+            policy.pose_capacity,
+        )
+        .map_err(RendererError::PosePack)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(debug_assertions, test)))]
+fn verify_population_reuse(
+    _population: &ProxyPopulation<'_>,
+    _policy: SubmissionPolicy,
+    _instance_bytes: &[u8],
+    _pose_bytes: &[u8],
+    _instance_decision: crate::proxy_instances::GenerationDecision,
+    _pose_decision: crate::proxy_instances::GenerationDecision,
+) -> Result<(), RendererError> {
+    Ok(())
+}
+
 /// Maps a submission onto the frame flow's input set — the
 /// submission adapter (device-free by construction: the repack
 /// buffers are caller-owned; [`crate::Renderer::submit_frame`]
@@ -282,9 +353,22 @@ pub(crate) struct FrameInputs<'x> {
 /// both repack buffers and all frame state untouched (an atomic
 /// repack, never a partial buffer).
 ///
+/// **P5 §3.3 (A18/R2) — the dirty-generation protocol's CPU half:**
+/// both repacks are GENERATION-GATED (see
+/// [`crate::proxy_instances::repack_populations_generation`]) —
+/// validation always runs (the typed refusals stay per-frame), the
+/// byte regeneration skips when the caller's declared generation
+/// matches the retained buffer's record at the same packed
+/// footprint. `generations` is the buffers' record, passed by the
+/// renderer beside the buffers. On a reuse, debug and test builds
+/// re-pack through the FULL-REPACK FALLBACK and byte-compare (the
+/// independent reference path — a missed bump is loud; never a
+/// release production frame's cost).
+///
 /// `material_table` is the attached scene's material count — the
 /// population validation's bound. `0` on the layers-only shape
 /// (unread there: no population path runs without a scene half).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn adapt_frame<'a, 'x>(
     policy: SubmissionPolicy,
     submission: &'x FrameSubmission<'a>,
@@ -292,6 +376,7 @@ pub(crate) fn adapt_frame<'a, 'x>(
     debug_overlay: &'x [OverlayVertex],
     instance_bytes: &'x mut Vec<u8>,
     pose_bytes: &'x mut Vec<u8>,
+    generations: &'x mut PopulationGenerations,
 ) -> Result<FrameInputs<'x>, RendererError> {
     let camera = submission.camera;
     let layers = &submission.layers;
@@ -318,8 +403,9 @@ pub(crate) fn adapt_frame<'a, 'x>(
     let eye = camera.eye;
     let view_proj = camera.view_proj;
     // The population: the populated entries' own validation +
-    // repack sequence, verbatim. `None` skips every check exactly
-    // like the unpopulated entries.
+    // repack sequence, verbatim, with the repacks generation-gated
+    // (P5 §3.3). `None` skips every check exactly like the
+    // unpopulated entries.
     let proxy = match &scene.population {
         Some(population) => {
             if population.npc_material >= material_table
@@ -335,18 +421,22 @@ pub(crate) fn adapt_frame<'a, 'x>(
                     population.rain_material
                 )));
             }
-            crate::proxy_instances::repack_populations_bounded(
+            let instance_decision = crate::proxy_instances::repack_populations_generation(
                 instance_bytes,
                 population.npc,
                 population.vehicle,
                 population.rain,
                 policy.instance_capacity,
+                population.instance_generation,
+                &mut generations.instance,
             )
             .map_err(RendererError::ProxyPack)?;
             // The pose contract (the capture-refusal discipline):
             // every POPULATED npc's pose index must select a supplied
             // block; the block-count bound is the repack's own typed
-            // refusal below.
+            // refusal below. The check runs on EVERY populated frame
+            // — generation-gated or not (a declared-identical
+            // population that outgrew its block list still refuses).
             if population
                 .npc
                 .iter()
@@ -364,12 +454,27 @@ pub(crate) fn adapt_frame<'a, 'x>(
                         .unwrap_or(0)
                 )));
             }
-            crate::animation::repack_poses_bounded(
+            let pose_decision = crate::animation::repack_poses_generation(
                 pose_bytes,
                 population.npc_poses,
                 policy.pose_capacity,
+                population.pose_generation,
+                &mut generations.pose,
             )
             .map_err(RendererError::PosePack)?;
+            // The missed-bump debug verify (P5 §3.3's mandated
+            // mitigation, dispatched above): on any reuse, debug and
+            // test builds re-pack through the full-repack fallback
+            // and byte-compare — the independent reference path,
+            // never a release production frame's cost.
+            verify_population_reuse(
+                population,
+                policy,
+                instance_bytes,
+                pose_bytes,
+                instance_decision,
+                pose_decision,
+            )?;
             Some(vulkan::proxy_draw::ProxyFrameUpload {
                 bytes: instance_bytes.as_slice(),
                 pose_bytes: pose_bytes.as_slice(),
@@ -380,6 +485,8 @@ pub(crate) fn adapt_frame<'a, 'x>(
                 vehicle_material: population.vehicle_material,
                 rain_material: population.rain_material,
                 mode: policy.proxy_draw_mode,
+                instance_generation: population.instance_generation,
+                pose_generation: population.pose_generation,
             })
         }
         None => None,
@@ -524,6 +631,10 @@ mod tests {
         };
         let mut instance_bytes = Vec::new();
         let mut pose_bytes = Vec::new();
+        // The adapter's generation records (P5 §3.3): fresh — every
+        // first submission repacks, exactly like the renderer's
+        // construction-time state.
+        let mut generations = PopulationGenerations::default();
         // The attached table's length (S2): the corner routes' own
         // bound — `lit_scene::materials().len()` (the former inline
         // read), pinned to the slice-side corner builder's table by
@@ -535,6 +646,7 @@ mod tests {
             &[],
             &mut instance_bytes,
             &mut pose_bytes,
+            &mut generations,
         )
         .expect("the plain corner submission validates");
         // The entry's own construction: the corner FrameParams,
@@ -590,6 +702,7 @@ mod tests {
         };
         let mut instance_bytes = Vec::new();
         let mut pose_bytes = Vec::new();
+        let mut generations = PopulationGenerations::default();
         let inputs = adapt_frame(
             policy,
             &submission,
@@ -597,6 +710,7 @@ mod tests {
             &[],
             &mut instance_bytes,
             &mut pose_bytes,
+            &mut generations,
         )
         .expect("the sticky-on submission validates");
         let expected = FrameInputs {
@@ -662,7 +776,8 @@ mod tests {
         // An empty-kind population carrying material index 3: no
         // repack work, no pose blocks — the validation is the only
         // code that runs (the index is checked regardless of kind
-        // population, exactly like the entries').
+        // population, exactly like the entries'). The generations
+        // default to 0 — the un-opted caller's always-dirty shape.
         let population = crate::renderer::ProxyPopulation {
             npc: &[],
             npc_poses: &[],
@@ -671,6 +786,8 @@ mod tests {
             vehicle_material: 0,
             rain: &[],
             rain_material: 0,
+            instance_generation: 0,
+            pose_generation: 0,
         };
         let submission = FrameSubmission {
             camera: FrameCamera {
@@ -694,6 +811,7 @@ mod tests {
         // typed refusal, the entries' own text.
         let mut instance_bytes = Vec::new();
         let mut pose_bytes = Vec::new();
+        let mut generations = PopulationGenerations::default();
         let error = adapt_frame(
             policy,
             &submission,
@@ -701,6 +819,7 @@ mod tests {
             &[],
             &mut instance_bytes,
             &mut pose_bytes,
+            &mut generations,
         )
         .expect_err("index 3 must refuse against the corner table");
         let RendererError::Vulkan(text) = &error else {
@@ -717,6 +836,7 @@ mod tests {
         // and the upload carries the (now in-table) indices.
         let mut instance_bytes = Vec::new();
         let mut pose_bytes = Vec::new();
+        let mut generations = PopulationGenerations::default();
         let inputs = adapt_frame(
             policy,
             &submission,
@@ -724,6 +844,7 @@ mod tests {
             &[],
             &mut instance_bytes,
             &mut pose_bytes,
+            &mut generations,
         )
         .expect("index 3 is inside a four-material table");
         let proxy = inputs.proxy.expect("the population maps to an upload");
@@ -750,5 +871,240 @@ mod tests {
             .expect("the fixture dt is finite and nonnegative");
         assert_eq!(report.active, 1);
         field
+    }
+
+    /// P5 §3.3 (A18/R2) — THE ADAPTER-LEVEL GENERATION EQUIVALENCE:
+    /// a fuzzed (generation, population) sequence maps through the
+    /// generation-gated adapter onto BYTE-IDENTICAL repack buffers
+    /// to the always-repack path — the same-generation submissions
+    /// reuse (nothing regenerated), the bumped submissions repack,
+    /// and the generation-0 submissions (today's behavior) repack
+    /// every frame regardless. The oracle runs the SAME sequence
+    /// through the generations zeroed (the un-opted shape — the
+    /// full-repack fallback), comparing both buffers after every
+    /// frame. This is the CPU half of the §3.5 oracle harness (the
+    /// write half lives in `vulkan::frame`'s stamp tests).
+    #[test]
+    fn generation_gated_adaptation_matches_the_always_repack_oracle() {
+        use crate::animation::{
+            HUMANOID_JOINTS, JointPose, compose_joint_matrices, humanoid_skeleton, rest_pose_block,
+            skin_matrices,
+        };
+        use crate::proxy_instances::{InstanceTransform, ProxyInstance};
+        let matrix = [
+            [0.9, 0.0, 0.0, 0.0],
+            [0.0, 0.9, 0.0, 0.0],
+            [0.0, 0.0, 0.9, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let light = crate::lit_scene::day_preset();
+        let policy = SubmissionPolicy {
+            proxy_draw_mode: ProxyDrawMode::default(),
+            ripple_debug: RippleDebugMode::default(),
+            instance_capacity: crate::proxy_instances::MAX_INSTANCES,
+            pose_capacity: crate::animation::MAX_POSE_BLOCKS,
+        };
+        // The population fixture: two npcs (one rest, one walking),
+        // advanced by a deterministic pseudo-random walk — the shape
+        // a render-then-step crowd drives (ticks bump, between-tick
+        // frames do not).
+        let rest = rest_pose_block();
+        let skeleton = humanoid_skeleton();
+        let walker_at = |turn: i16| {
+            let mut pose = [JointPose {
+                delta_pos: [0.0; 3],
+                delta_turns: [0; 3],
+            }; HUMANOID_JOINTS];
+            pose[7].delta_turns = [turn, 0, 0];
+            let joint_worlds = compose_joint_matrices(&skeleton, &pose);
+            skin_matrices(&joint_worlds, &skeleton)
+        };
+        let mut instances = vec![
+            ProxyInstance {
+                transform: InstanceTransform {
+                    pos: [1.0, 0.02, -2.0],
+                    turn: 1000,
+                    scale: 1.0,
+                },
+                tint: [0.9, 0.9, 0.9],
+                alpha: 1.0,
+                pose_index: 0,
+            },
+            ProxyInstance {
+                transform: InstanceTransform {
+                    pos: [-3.0, 0.02, 4.0],
+                    turn: 40000,
+                    scale: 1.0,
+                },
+                tint: [0.8, 0.6, 0.5],
+                alpha: 1.0,
+                pose_index: 1,
+            },
+        ];
+        let mut poses = vec![rest, walker_at(9000)];
+        // The gated state (what the renderer owns) and the oracle
+        // state (the same buffers driven always-dirty).
+        let mut gated_bytes = Vec::new();
+        let mut gated_poses = Vec::new();
+        let mut generations = PopulationGenerations::default();
+        let mut oracle_bytes = Vec::new();
+        let mut oracle_poses = Vec::new();
+        let mut oracle_generations = PopulationGenerations::default();
+        let mut rng: u64 = 0x243F_6A88_85A3_08D3;
+        let mut instance_generation = 1_u64;
+        let mut pose_generation = 1_u64;
+        // The submission builder: a local fn (a closure cannot
+        // express the shared parameter lifetime), taking the
+        // population slices as parameters so the same construction
+        // serves the gated path, the always-dirty oracle, and the
+        // same-generation resubmission after the sequence.
+        fn build<'a>(
+            instances: &'a [ProxyInstance],
+            poses: &'a [[[[f32; 4]; 4]; crate::animation::HUMANOID_JOINTS]],
+            instance_generation: u64,
+            pose_generation: u64,
+            matrix: [[f32; 4]; 4],
+            light: crate::lit_scene::LightParams,
+        ) -> FrameSubmission<'a> {
+            FrameSubmission {
+                camera: FrameCamera {
+                    view_proj: matrix,
+                    eye: [4.0, 1.7, 12.0],
+                },
+                output: OutputTarget {
+                    window_size: (1280, 720),
+                },
+                layers: DynamicLayers::default(),
+                scene: Some(SceneFrame {
+                    light,
+                    shadows: None,
+                    population: Some(crate::renderer::ProxyPopulation {
+                        npc: instances,
+                        npc_poses: poses,
+                        npc_material: 0,
+                        vehicle: &[],
+                        vehicle_material: 0,
+                        rain: &[],
+                        rain_material: 0,
+                        instance_generation,
+                        pose_generation,
+                    }),
+                    sky: None,
+                    post: false,
+                    wet: None,
+                }),
+            }
+        }
+        for frame in 0..16_u64 {
+            rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let bump_instances = frame % 3 == 0;
+            let bump_poses = frame % 2 == 0;
+            if bump_instances {
+                instance_generation += 1;
+                instances[0].transform.pos[0] += (rng % 100) as f32 * 0.01;
+            }
+            if bump_poses {
+                pose_generation += 1;
+                poses[1] = walker_at(((rng >> 16) % 16_384) as i16);
+            }
+            // The gated path (the renderer's own state threading).
+            let gated_submission = build(
+                &instances,
+                &poses,
+                instance_generation,
+                pose_generation,
+                matrix,
+                light,
+            );
+            let inputs = adapt_frame(
+                policy,
+                &gated_submission,
+                3,
+                &[],
+                &mut gated_bytes,
+                &mut gated_poses,
+                &mut generations,
+            )
+            .expect("the gated submission validates");
+            // The oracle path: the SAME population declared
+            // always-dirty (generation 0) — the full-repack
+            // fallback, today's behavior.
+            let oracle_submission = build(&instances, &poses, 0, 0, matrix, light);
+            let oracle = adapt_frame(
+                policy,
+                &oracle_submission,
+                3,
+                &[],
+                &mut oracle_bytes,
+                &mut oracle_poses,
+                &mut oracle_generations,
+            )
+            .expect("the oracle submission validates");
+            // The scalar facts first (the FrameInputs borrow the
+            // repack buffers — extracting the plain values ends
+            // those borrows before the buffer comparison).
+            let gated_facts = inputs.proxy.map(|upload| {
+                (
+                    upload.npc_count,
+                    upload.rain_count,
+                    upload.instance_generation,
+                    upload.pose_generation,
+                )
+            });
+            let oracle_facts = oracle
+                .proxy
+                .map(|upload| (upload.npc_count, upload.rain_count));
+            assert_eq!(
+                gated_bytes, oracle_bytes,
+                "frame {frame}: the instance bytes"
+            );
+            assert_eq!(gated_poses, oracle_poses, "frame {frame}: the pose bytes");
+            let (gated_npc, gated_rain, gated_instance_gen, gated_pose_gen) =
+                gated_facts.expect("the gated frame is populated");
+            let (oracle_npc, oracle_rain) = oracle_facts.expect("the oracle frame is populated");
+            assert_eq!(
+                (gated_npc, gated_rain),
+                (oracle_npc, oracle_rain),
+                "frame {frame}: the mapped counts agree"
+            );
+            assert_eq!(
+                gated_instance_gen, instance_generation,
+                "frame {frame}: the declared generation rides the upload"
+            );
+            assert_eq!(
+                gated_pose_gen, pose_generation,
+                "frame {frame}: the declared pose generation rides the upload"
+            );
+        }
+        // After the sequence the gated records hold the LAST
+        // declared generations, and a same-generation resubmission
+        // reuses (nothing regenerated — the between-tick shape).
+        let before = gated_bytes.clone();
+        let pose_before = gated_poses.clone();
+        let resubmission = build(
+            &instances,
+            &poses,
+            instance_generation,
+            pose_generation,
+            matrix,
+            light,
+        );
+        adapt_frame(
+            policy,
+            &resubmission,
+            3,
+            &[],
+            &mut gated_bytes,
+            &mut gated_poses,
+            &mut generations,
+        )
+        .expect("the same-generation resubmission validates");
+        assert_eq!(gated_bytes, before, "the reuse regenerated nothing");
+        assert_eq!(gated_poses, pose_before);
+        assert_eq!(
+            (generations.instance, generations.pose),
+            (instance_generation, pose_generation),
+            "the records hold the declared generations"
+        );
     }
 }

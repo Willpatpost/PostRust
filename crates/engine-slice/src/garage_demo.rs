@@ -135,6 +135,15 @@ pub fn run(
         // route's own render-then-step discipline at garage
         // scale — the placement is static, only the poses
         // advance).
+        // P5 §3.3 (A18/R2) — the dirty-generation adoption, the
+        // garage's own split: the INSTANCE population is the static
+        // authored table (never changes — generation 1, declared
+        // once, so after each frame slot is stamped the instance
+        // and indirect writes skip for the rest of the session);
+        // the POSE population re-evaluates every presented frame
+        // (generation = presented + 1, a fresh value per distinct
+        // pose set — the walk advances, so the pose half keeps
+        // repacking and writing, honestly).
         let camera: RouteWaypoint = garage_camera(presented);
         crate::corner_population::evaluate_population_poses(presented, &phases, &mut poses);
         let population = ProxyPopulation {
@@ -145,6 +154,8 @@ pub fn run(
             vehicle_material: GARAGE_VEHICLE_MATERIAL,
             rain: &[],
             rain_material: 0,
+            instance_generation: 1,
+            pose_generation: presented + 1,
         };
         let matrix = view_projection(camera, aspect);
         // THE SECOND SCENE'S PROOF, leg 2: the frame is ONE public

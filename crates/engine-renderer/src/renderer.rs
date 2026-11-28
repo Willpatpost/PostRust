@@ -14,7 +14,9 @@ use crate::config::{
 use crate::overlay::{AtlasText, OverlayVertex};
 use crate::scene::SceneVertex;
 use crate::scene_description::{SceneDescription, SceneHandle};
-use crate::submission::{FrameInputs, FrameSubmission, SubmissionPolicy, adapt_frame};
+use crate::submission::{
+    FrameInputs, FrameSubmission, PopulationGenerations, SubmissionPolicy, adapt_frame,
+};
 use crate::vulkan::{
     self, CapturedFrame, FrameState, InternalFrame, PipelineState, RendererError, SwapchainState,
     VulkanContext, drain_validation_messages, environment_pending, pick_depth_format,
@@ -86,6 +88,40 @@ pub struct ProxyPopulation<'a> {
     /// kind may carry any index (validated only when populated,
     /// exactly like the other kinds).
     pub rain_material: u32,
+    /// P5 §3.3 (A18/R2 — the dirty-generation protocol): the
+    /// INSTANCE population's generation — the caller-owned claim
+    /// that this submission's npc/vehicle/rain bytes are IDENTICAL
+    /// to every prior submission at the same nonzero value. **0 =
+    /// always-dirty** (today's behavior: the renderer validates and
+    /// repacks every populated frame, and every frame slot is
+    /// rewritten — the default every un-opted caller keeps). The
+    /// renderer tracks, per retained buffer and per frame slot,
+    /// which generation's bytes each holds and skips the
+    /// regeneration and the mapped write on a match.
+    ///
+    /// **The ownership contract** (the mutation invariant): bump
+    /// this EXACTLY when any instance input changes — a re-packed
+    /// crowd, a rebuilt rain pool, a retinted vehicle — and never
+    /// reuse a value after its population changed (the generation
+    /// space belongs to THIS population source; two interleaved
+    /// opted-in populations colliding at one generation is a caller
+    /// defect the debug verify mode catches). A missed bump renders
+    /// the prior population in release — the protocol's one real
+    /// hazard, made loud by [`crate::proxy_instances::
+    /// verify_population_generation`] in debug/test builds. The
+    /// indirect command block rides THIS generation (its bytes are a
+    /// pure function of the per-kind counts).
+    pub instance_generation: u64,
+    /// P5 §3.3: the POSE population's generation — the same
+    /// caller-owned claim for `npc_poses` (the garage's split: the
+    /// static placement never bumps the instance half, the advancing
+    /// walk cycle bumps this one every evaluated frame). **0 =
+    /// always-dirty.** Bump exactly when the evaluated blocks change
+    /// (a pose advance, a stander/walker transition); the
+    /// composition-side dedup (the shared rest block) changes the
+    /// BLOCK LIST and therefore bumps this generation once at the
+    /// adopting population's next change.
+    pub pose_generation: u64,
 }
 
 /// How proxy instances are submitted (the 6-E equivalence gate's
@@ -358,6 +394,13 @@ pub struct RenderStats {
     /// `device_wait_idle`, bounded by the pow2 quantum to at most
     /// `log2(cap / 64)` per session and carves never shrink).
     pub arena_growth_events: u64,
+    /// P5 §3.3 (A18/R2): monotonic count of population mapped-region
+    /// writes the dirty-generation protocol SKIPPED — instance,
+    /// pose, and indirect blocks whose per-slot stamp already
+    /// recorded the submission's generation (the between-tick and
+    /// static-placement frames' whole saving, made observable). Zero
+    /// for every un-opted (generation-0) caller.
+    pub population_writes_skipped: u64,
     gpu_timing: TimingSamples,
     /// The negotiated depth format (corrective finding 4, F):
     /// the renderer's chosen depth format, reported so tests can
@@ -431,6 +474,15 @@ pub struct Renderer {
     /// the pose blocks — repacked in place every populated frame,
     /// its capacity from the first frames reused forever).
     pose_bytes: Vec<u8>,
+    /// P5 §3.3 (A18/R2): the retained repack buffers' generation
+    /// records — which generation's bytes `instance_bytes` and
+    /// `pose_bytes` each hold (0 = unknown: the initial state, and
+    /// what every generation-0 submission resets to, so an opted-in
+    /// generation can never reuse against a buffer holding some
+    /// other population's bytes). The CPU half of the
+    /// dirty-generation protocol; the per-frame-slot write half
+    /// lives in the frame state's stamps.
+    population_generations: PopulationGenerations,
     proxy_draw_mode: ProxyDrawMode,
     /// The TEST-ONLY ripple debug mode (finding 15b's separation
     /// fixtures — see [`RippleDebugMode`]). The one retained
@@ -700,6 +752,7 @@ impl Renderer {
             pose_capacity: 0,
             pose_peak_used: 0,
             arena_growth_events: 0,
+            population_writes_skipped: 0,
             gpu_timing: TimingSamples::default(),
             depth_format: format!("{:?}", depth_format),
         };
@@ -717,6 +770,7 @@ impl Renderer {
             atlas_text,
             instance_bytes: Vec::new(),
             pose_bytes: Vec::new(),
+            population_generations: PopulationGenerations::default(),
             proxy_draw_mode: ProxyDrawMode::default(),
             ripple_debug: RippleDebugMode::Off,
             arena_budgets,
@@ -1054,6 +1108,7 @@ impl Renderer {
             &self.overlay_vertices,
             &mut self.instance_bytes,
             &mut self.pose_bytes,
+            &mut self.population_generations,
         )?;
         // The frame flow — the validated input set as ONE bundle
         // (A04, design §3.4): the same parameter set the former
@@ -1217,6 +1272,10 @@ impl Renderer {
         self.stats.pose_capacity = self.stats.pose_capacity.max(outcome.pose_capacity);
         self.stats.pose_peak_used = self.stats.pose_peak_used.max(outcome.pose_supplied);
         self.stats.arena_growth_events += u64::from(outcome.arena_growth_events);
+        // P5 §3.3 (A18/R2): the protocol's observable saving —
+        // gated-out mapped writes accumulate like the growth events
+        // (deferred and unpopulated frames carry zeros).
+        self.stats.population_writes_skipped += u64::from(outcome.population_writes_skipped);
         if outcome.presented {
             self.stats.frames_presented += 1;
         }

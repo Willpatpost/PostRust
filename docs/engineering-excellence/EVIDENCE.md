@@ -832,7 +832,212 @@ render_orientation, render_scene_separation, s6_evidence's device
 leg) remain the orchestrator's rig bar (this loader has no
 headless-surface Vulkan — the E-15 boundary, unchanged).
 
+## E-17 P5 R2 — A18 the dirty-generation protocol + the stander pose-dedup (2026-11-28, lane worktree branch `ee/p5-r2-dirty-generation`, base `30126fa`; CPU release on this machine, the E-12 §9.2 discipline)
+
+Owner-authorized per D-EE-10 item 1C (generation-aware preparation
+ACROSS ALL APPLICABLE ROUTES; the full-repack fallback + an
+independent reference path retained). Design §3 (P5-resource-
+residency.md), executed as specified: (c) the caller-owned
+generation + per-slot stamps as the protocol, (e) the stander
+pose-dedup in the same lane, (d) dirty-ranges deferred (the §9.3
+measured trigger — the matrix below is that measurement; the
+0%-row saving makes per-instance ranges the third-order refinement
+the design's own boundary states).
+
+**The protocol (engine-renderer):** `ProxyPopulation` grows
+`instance_generation`/`pose_generation` (u64; **0 = always-dirty**,
+today's exact behavior for every un-opted caller — the versioned
+public-API change; ~35 test literals mechanically updated to 0,
+disclosed below). TWO independent levels, each pure and unit-tested
+alone: (1) the CPU half — `repack_populations_generation` /
+`repack_poses_generation` validate ALWAYS (the typed refusals stay
+per-frame — the D2 discipline) and gate only the byte regeneration
+on the caller's declared generation against the retained buffers'
+records (`PopulationGenerations`, renderer-owned, reset to unknown
+by every generation-0 submission; the count guard is the packed
+footprint `buffer.len() == total × stride`); (2) the write half —
+`PopulationStamps` in `FrameState` (instance/pose/indirect per
+frame slot) gate the mapped writes in `upload_frame_data` through
+the ONE public decision function `generation_write_needed` (a slot's
+stamp records what it last consumed — the ping-pong correctness by
+construction; a generation-0 write resets the stamp so an opted-in
+generation can never skip against another caller's bytes). The
+indirect command block rides the INSTANCE generation (its bytes are
+a pure function of the per-kind counts — NEW-REND-08's
+cached-indirect observation closed). **Resource-replacement
+invalidation:** `recreate_swapchain` clears every stamp (the
+replacement pipeline state re-creates the instance/indirect buffers
+with no content copy) and the frame flow's arena-growth delta
+(the R1 `arena_growth_events` counter) clears them on any carve
+growth — no stamp can vouch for a replaced buffer's content.
+**The missed-bump debug verify mode** (§3.3's mandated mitigation,
+the independent reference path): `verify_population_generation` /
+`verify_pose_generation` re-pack through the FULL-REPACK FALLBACK
+and byte-compare, panicking "MISSED BUMP" on divergence — invoked
+by the submission adapter on every reuse under
+`cfg(any(debug_assertions, test))` (both arms behind one
+dispatcher signature so the release-production build compiles the
+call site with zero cost and zero warnings). **The full-repack
+fallback itself is unchanged** — `repack_populations_bounded` /
+`repack_poses_bounded` byte-identical, exactly what every gate miss
+and every generation-0 caller runs.
+
+**The all-routes adoption map (the owner's 1C ruling — every route
+that presents a population across frames):** the corner crowd's
+BOTH routes — scripted `run` and interactive free-look — through
+`LocomotionCrowd`'s counters (instance bumped on every crowd tick's
+re-pack AND every rain rebuild; pose bumped on every tick's
+re-evaluation; between ticks — free-look's accumulator shape at a
+presentation rate above the 60 Hz sim clock — neither moves and the
+frame is free); the garage route (the design's own split: instance
+generation constant 1 — the static placement never rewrites its
+half after both slots are stamped; pose generation = presented+1,
+bumping with every evaluated frame); the census composition route
+(through the same crowd machinery); the rain layer's standalone
+population (`RainLayer::instance_generation`, bumped per
+`update_and_build` — the weather gates' route). sim_demo presents
+NO population half (region-only rendering — verified: no
+`ProxyPopulation` anywhere in its path); every un-opted submission
+(the lavapipe ink gates' own constructions, generation 0) keeps
+today's always-repack/always-write behavior EXACTLY — the CI ink
+gates' submitted bytes are unchanged by construction.
+
+**The stander pose-dedup (§3.2(e), the shared animation palette):**
+`stander_dedup_block_indices` — ONE shared rule over stander flags
+(standers → palette block 0, the ONE cached rest block; walker j →
+1+j; no standers → the identity mapping, byte-identical submission
+for all-walking populations). Adopted by the phase-column evaluator
+(`evaluate_population_poses` — the garage and census path), the
+locomotion evaluator + instance bridge (`corner_routes`), and both
+population tables' constructors (`corner_population()` /
+`garage_population()` — the authored tables stay hand data, the
+remap is mechanical at construction). **The skin-matrix identity
+proof** (the pixel-compatibility witness): `stander_dedup_
+preserves_every_npcs_skin_matrices` (corner, 6 frames) and
+`locomotion_dedup_preserves_every_npcs_skin_matrices` (128
+advancing steps) assert, per npc, that the palette block its remapped
+index selects is BIT-IDENTICAL to the pre-dedup per-npc evaluation
+— same skin matrices per npc ⟹ same skinned vertices ⟹ identical
+PIXELS while the submitted bytes change (fewer blocks: corner 24→17,
+garage 6→5, any all-standing population →1). The ink gates
+(pixel-level, CI) hold digit-for-digit by this proof; the pod
+cannot run them (no Vulkan loader — E-15's standing note).
+
+**§9.2 — the repack matrix, BEFORE vs the protocol AFTER (CPU,
+release, this machine; 200 samples after 200 warmup; the same
+harness, matched cells; median µs/frame — repack / pose / write):
+BEFORE = the always-repack fallback; AFTER = the §3.3 gates:**
+
+| population | dirty | BEFORE rep/pose/wr | AFTER rep/pose/wr | skips |
+|---|---|---|---|---:|
+| garage (6+1) | 0% | 0.20 / 0.30 / 0.00 | 0.10 / 0.00 / 0.00 | 1992 |
+| garage (6+1) | mix (4/2) | 0.10 / 1.60 / 0.00 | 0.00 / 1.60 / 0.00 | 1195 |
+| garage (6+1) | 100% | 0.20 / 2.90 / 0.10 | 0.10 / 3.00 / 0.10 | 1195 |
+| corner (24+2) | 0% | 0.50 / 0.30 / 0.00 | 0.20 / 0.00 / 0.00 | 1992 |
+| corner (24+2) | mix (16/8) | 0.40 / 5.70 / 0.10 | 0.10 / 5.90 / 0.10 | 1195 |
+| corner (24+2) | 100% | 0.50 / 9.80 / 0.20 | 0.20 / 10.00 / 0.10 | 1195 |
+| 1k | 0% | 17.10 / 0.50 / 0.90 | 4.30 / 0.00 / 0.00 | 1992 |
+| 1k | mix (664/336) | 19.70 / 269.60 / 8.40 | 5.10 / 276.40 / 6.70 | 1195 |
+| 1k | 100% | 17.60 / 404.50 / 11.40 | 5.00 / 410.20 / 9.90 | 1195 |
+| 4k (at cap) | 0% | 55.60 / 1.30 / 5.20 | 16.50 / 0.00 / 0.00 | 1992 |
+| 4k (at cap) | mix (2728/1368) | 62.00 / 1120.90 / 77.20 | 20.10 / 1193.30 / 67.20 | 1195 |
+| 4k (at cap) | 100% | 77.50 / 1675.20 / 109.70 | 19.60 / 1796.20 / 101.50 | 1195 |
+
+The 0% row IS the between-tick unchanged-population frame (the
+render-then-step shape): its pose-evaluation and slot-write costs go
+to ZERO (nothing regenerated, nothing evaluated, nothing copied —
+the design's "~the submission-plumbing floor"), and the instance
+repack drops to the ALWAYS-RUN validation floor (~3.5× at 1k/4k —
+the D2 fail-visible discipline deliberately kept: a declared-
+identical population that no longer validates still refuses). The
+mix/100% rows keep their pose work (the walkers advance — the dirty
+axis is honest) while the instance repack and the instance/indirect
+writes skip (the static placement's own saving, the garage route's
+shape). The pose-bytes column shows the dedup palette (corner mix
+16,896→11,968 B; any 0% cell →704 B — one shared rest block). The
+AFTER pose medians at mix/full run ~2-6% above BEFORE (the
+generation record's bookkeeping on the always-miss path) — honest,
+measured, and second-order against the 0% row's elimination.
+Cross-run note: the BEFORE leg is the unchanged R0 code; its
+medians vary with machine state against E-12's archived row (this
+run's 0% cells: 0.20/0.50/17.10/55.60 vs E-12's 0.10/0.30/11.60/
+49.10 — same shape, same flat-across-dirty instance finding; the
+run-internal BEFORE/AFTER comparison is the row's point).
+`generation_skips` (the gated-out operations per cell: 5/frame at
+0% after both slots stamp, 3/frame at mix/full) is assertable in
+the harness's own lib test — the protocol's observable saving.
+
+**§3.5's mandatory tests, all green:** the equivalence — the
+adapter-level oracle (`generation_gated_adaptation_matches_the_
+always_repack_oracle`: a 16-frame fuzzed (generation, population)
+sequence, the gated path vs the always-dirty oracle, both buffers
+byte-identical every frame) and the write-half oracle
+(`population_generation_protocol_matches_the_always_write_oracle`
+in frame.rs's policy_tests class: 48 frames over the frame_slot
+ping-pong with an interleaved always-dirty caller, every slot's
+instance/pose/indirect regions equal the always-write bytes at
+every frame); the missed-bump red-then-green
+(`missed_bump_panics_the_verify` / `pose_missed_bump_panics_the_
+verify` — #[should_panic] "MISSED BUMP", running in BOTH debug and
+release test profiles since the verify functions are always
+compiled; the green halves verify honest declarations clean and
+stale-but-invalid inputs refuse loudly); the ping-pong shape
+(`stable_population_writes_each_slot_once_per_generation` — one
+write per slot per generation, the bump rewrites both, a
+generation-0 write breaks the stamp's vouching); the replacement
+invalidation (`stamp_clear_forces_rewrites_after_replacement` —
+the state contract both wiring sites rely on; the wiring itself is
+`recreate_swapchain`'s clear and the frame flow's growth-delta
+clear, exercised on device by the existing lifecycle/recreation
+batteries in CI); generation-0 byte-identity (the oracle's
+always-dirty arm, frame-by-frame). Double-run determinism: the
+pose/table FNV pins re-measured and frozen in one run, re-asserted
+green in the gate re-runs.
+
+**Conscious pin movements (all measured, all documented at the
+constant):** corner_population's packed-table FNV
+16_877_662_039_878_331_722 → **11_575_762_803_608_534_537** (the
+dedup's versioned claim on the params vec4's x — the pose_index
+remap); corner_population's pose-bytes FNV frames 0/33
+5_757_258_358_703_043_002 / 12_735_933_771_296_667_791 →
+**14_796_718_041_729_273_370 / 2_475_754_115_185_997_039** (the
+17-block palette); corner_routes' pose-bytes FNV frames 0/33/300
+3_836_824_830_651_730_592 / 14_640_098_374_474_969_127 /
+15_375_200_366_290_321_505 → **17_667_891_731_665_696_896 /
+6_063_901_512_547_130_183 / 17_999_475_867_621_276_545** (the
+locomotion palette). NO simulation-side digest moved (the rain/
+ripple fold states, the behavior stream, the locomotion campaign —
+untouched paths); no renderer-side digest moved (the proxy_instances
+fixture pin `9913137345556047595`, the animation pose-sequence
+digest `2_694_074_108_253_436_588` — the packing math is
+untouched). The census §9.2 byte columns move with the dedup
+palette (documented in the harness's own tests).
+
+**Lane gates (all exit 0):** `cargo fmt --all -- --check`;
+`cargo clippy -p engine-renderer -p engine-slice --all-targets --
+-D warnings`; `cargo test -p engine-renderer` **224 passed / 0
+failed, debug AND release** (= 212 at the lane base + 12 new: the
+gate decision table, the instance/pose decision sequences, the
+atomic refusals, the two missed-bump reds + two greens, the adapter
+oracle, the write-half oracle, the ping-pong shape, the stamp
+clear); `cargo test -p engine-slice --lib` **173 passed / 0
+failed** (= 169 at the lane base + 4 new: the two skin-matrix
+identity proofs, the mapping pins, the after-leg skip test);
+`cargo test -p engine-slice --test census_repack` (the battery's
+gate leg, debug) 2 passed / 1 ignored; the census_repack release
+measurement run `--ignored --nocapture --test-threads=1` 1 passed /
+0 failed (the archived table above); `cargo check --workspace
+--all-targets`. OBSERVED (pre-existing per E-15, NOT this lane):
+the census_repack smoke's `median_us > 0.0` assert flakes in
+RELEASE on this machine (timing granularity); the debug-profile
+gate run passes. CI count pins: engine-renderer moves 212→224
+(release battery pin at engine-ci.yml:883) and the main-shard
+expected count moves with the +16 lib tests — per D-EE-06 the
+orchestrator corrects the pins from these measured actuals at the
+integration point; this lane touches no workflow file.
+
 ## Measurement baselines
+
 
 Established: E-8 is the baseline battery (2026-11-26, tree `263532f` — the
 "before" numbers the P2/P3/P5 packages are judged against, with the B10/B11
