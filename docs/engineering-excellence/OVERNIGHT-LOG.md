@@ -198,3 +198,22 @@ edit, the a03f6fb commit having claimed the 1629→1633/1578→1582 movement in
 its message while the sed applied only the result-lines and renderer-release
 literals; the gate did exactly what it exists to do; the omission corrected
 at `089741d` with the history in the pin's comment).
+
+## T07 — the retention safe moving cut implemented (`c1d9b1a`, pins at `4d17f14`)
+
+The S0 headline finding closed at the mechanism level. The lane executed the
+approved design in two staged commits (`6a51ea0` the frontier, `25108d6` the
+logical head), spine.rs only. Orchestrator verification: gates re-run
+independently (every integration target unchanged, main-path allocation pins
+unmoved); both red witnesses captured pre-fix (the standing token cutting
+exactly the 30 records a would-be consumer still needed; the drain's memmove
+at physical index 100); the fresh ledger census re-derived (the lane catching
+its own stage-1 addition `retention_ordinal_of` as a must-switch site). The
+measurement obligations discharged: stride asserted **32 B** (the design's
+~40 estimate corrected by measurement), amortized bound witnessed across
+three retain/chunk regimes with pure zero-move firings proven by exact
+physical-index stability, sustained loop zero-allocation, pins
+(18,6880)/(9,3024) unmoved. Design reconciliations documented not silent
+(register signature, lag formula, zero-moves clause, stride). CI pins
+corrected from lane-measured actuals: main 1645/1594 passed (+12), lines 36,
+heavy/renderer unchanged; confirming run `46131503857` dispatched.
