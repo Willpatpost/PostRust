@@ -5,7 +5,10 @@
 
 use std::time::{Duration, Instant};
 
-use engine_core::{LodLevel, REGION_COUNT};
+// A05 (P2 L8): the region count is the demo's authored workload
+// value, not an engine-wide constant.
+use crate::npc::REGION_COUNT;
+use engine_core::LodLevel;
 use engine_renderer::{
     DemoScenePreference, DepthFormatPreference, PresentModePreference, RenderConfig, RenderStats,
     Renderer, ValidationPreference,

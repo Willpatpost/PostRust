@@ -15,14 +15,21 @@ use engine_core::{
     SaveError, SaveWorld, Schedule, Spine, Tick, World,
 };
 
-/// Eight logical region identifiers (Stage 3 metadata for later
-/// stages) — authoritative in engine-core (the shared wire-format
-/// constant; V2-W F4's authenticated retention).
-pub use engine_core::REGION_COUNT;
+/// The demo's authored region layout: eight logical regions (Stage 3
+/// metadata for later stages). A05, the world-configuration boundary
+/// (P2 L8): this is the DEMO'S OWN workload policy — no longer an
+/// engine-wide constant re-exported from engine-core. The value
+/// equals the v1 wire format's fixed interpretation
+/// (`engine_core::WorldConfig::V1_FORMAT`), so every historical save
+/// stays byte-compatible — the parity is pinned by
+/// `tests/world_config_boundary.rs`, and the engine's configured
+/// format (`npc-world-save/2`) accepts any authored value.
+pub const REGION_COUNT: usize = 8;
 
-/// The Stage 4 workload: 1,000 stable NPC identities — authoritative
-/// in engine-core (the shared wire-format bound).
-pub use engine_core::NPC_COUNT;
+/// The demo's authored workload: 1,000 stable NPC identities (Stage
+/// 4). The demo's own policy (A05 — see [`REGION_COUNT`]); equal to
+/// the v1 wire interpretation for byte-compatible saves.
+pub const NPC_COUNT: usize = 1000;
 
 /// Real-execution milestone period: every MILESTONE_PERIOD-th actual
 /// activity is an irreversible consequence. Milestones arise ONLY from
@@ -31,10 +38,12 @@ pub use engine_core::NPC_COUNT;
 /// consequences).
 pub const MILESTONE_PERIOD: u64 = 16;
 
-/// Side length of the per-NPC region-local position grid (bounds and
-/// travel-reachability invariants; derived render proxies) —
-/// authoritative in engine-core (the shared wire-format bound).
-pub use engine_core::REGION_GRID;
+/// The demo's authored side length of the per-NPC region-local
+/// position grid (bounds and travel-reachability invariants; derived
+/// render proxies). The demo's own policy (A05 — see
+/// [`REGION_COUNT`]); equal to the v1 wire interpretation for
+/// byte-compatible saves.
+pub const REGION_GRID: u8 = 16;
 
 /// How the workload handler chains activities (Stage 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,7 +182,11 @@ pub fn routine_payload_parts(payload: u64) -> Option<(usize, u64)> {
 /// and reconstruction restores it from the region checkpoint.
 pub const ROUTINE_CURSOR_DISCARDED: u64 = u64::MAX;
 
-/// Sentinel for a dormant NPC's discarded grid position.
+/// Sentinel for a dormant NPC's discarded grid position — wire-format
+/// DATA in both save versions (the one off-grid exemption every
+/// position-bounds gate sanctions), so it stays the engine-core value
+/// rather than a demo-authored one (A05 moves workload POLICY, not
+/// wire values).
 pub use engine_core::POSITION_DISCARDED;
 
 /// Sentinel for a dormant NPC's discarded represented-through boundary
