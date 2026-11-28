@@ -305,7 +305,7 @@ pub const DEMO_CLOCK_HZ: f32 = 60.0;
 /// (the FNV pins below). The per-npc skin matrices are IDENTICAL to
 /// the pre-dedup evaluation (the identity proof's test).
 pub fn evaluate_population_poses(k: u64, phases: &[Phase], out: &mut Vec<Block>) {
-    use engine_renderer::animation::{
+    use engine_animation::{
         SkinBind, compose_joint_matrices, humanoid_skeleton, rest_pose_block, sample_pose,
         skin_matrices_bound, walk_clip,
     };
@@ -349,7 +349,7 @@ pub fn evaluate_population_poses(k: u64, phases: &[Phase], out: &mut Vec<Block>)
 
 /// One pose block: 11 column-major skin matrices (the packed-pose
 /// stride's unit — the animation core's HUMANOID_JOINTS).
-pub type Block = [[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS];
+pub type Block = [[[f32; 4]; 4]; engine_animation::HUMANOID_JOINTS];
 
 #[cfg(test)]
 mod tests {
@@ -654,7 +654,7 @@ mod tests {
         assert_eq!(a.len(), 17, "the palette: one shared rest + 16 walkers");
 
         // Block 0: the shared rest (the waiters' own bytes).
-        let rest = engine_renderer::animation::rest_pose_block();
+        let rest = engine_animation::rest_pose_block();
         assert_eq!(a[0], rest, "block 0 is the shared cached rest");
 
         // The walkers move: at least one walker block differs from
@@ -693,7 +693,7 @@ mod tests {
     /// cannot.
     #[test]
     fn stander_dedup_preserves_every_npcs_skin_matrices() {
-        use engine_renderer::animation::{
+        use engine_animation::{
             SkinBind, compose_joint_matrices, humanoid_skeleton, rest_pose_block, sample_pose,
             skin_matrices_bound, walk_clip,
         };
@@ -779,7 +779,7 @@ mod tests {
             evaluate_population_poses(k, &phases, &mut blocks);
             let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
             for block in &blocks {
-                let bytes = engine_renderer::animation::pack_pose_bytes(block);
+                let bytes = engine_animation::pack_pose_bytes(block);
                 for &byte in bytes.iter() {
                     hash ^= u64::from(byte);
                     hash = hash.wrapping_mul(0x0000_0100_0000_01b3);

@@ -33,6 +33,13 @@ sqlite = ["engine-persist/sqlite"]
 crash-test-seams = ["engine-persist/crash-test-seams"]
 
 [dependencies]
+# A06 E-S2 (DECISION-A06 §4, owner-approved per D-EE-10 §2): the
+# pose-evaluation policy imports the animation core DIRECTLY from
+# engine-animation — the pure clip/skeleton/sampling/skinning crate
+# extracted at E-S1 — instead of reaching through engine-renderer's
+# animation shim. The GPU packing layer (repack_poses, MAX_POSE_BLOCKS,
+# PosePackError) stays renderer-side and keeps its renderer import.
+engine-animation = { path = "../engine-animation" }
 engine-core = { path = "../engine-core" }
 # default-features = false + the `sqlite` forwarding feature above
 # (D-EE-10 item 4): the default build resolves exactly today's

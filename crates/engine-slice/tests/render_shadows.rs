@@ -1018,7 +1018,7 @@ fn populated_shadow_map_matches_the_raycaster() {
         "the corner table's palette: one shared rest + the 16 walkers"
     );
     let rest_blocks: Vec<_> = (0..rest_palette_slots)
-        .map(|_| engine_renderer::animation::rest_pose_block())
+        .map(|_| engine_animation::rest_pose_block())
         .collect();
     let at_rest = ProxyPopulation {
         instance_generation: 0,

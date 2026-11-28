@@ -615,7 +615,7 @@ fn post_pixels_match_post_rs_and_the_disc_blooms() {
     // The Era-2 rest-pose blocks (the skinning input at rest —
     // bit-exact identity, so the composition's pixels are the
     // authored-silhouette equation).
-    let npc_poses = vec![engine_renderer::animation::rest_pose_block(); npc.len()];
+    let npc_poses = vec![engine_animation::rest_pose_block(); npc.len()];
     let population = engine_renderer::ProxyPopulation {
         instance_generation: 0,
         pose_generation: 0,
@@ -3031,7 +3031,7 @@ fn shadowed_populated_composes_through_the_hdr_chain() {
     //    three-way path.
     let (npc, vehicle) = engine_slice::corner_population::corner_population();
     let rest_blocks: Vec<_> = (0..npc.len())
-        .map(|_| engine_renderer::animation::rest_pose_block())
+        .map(|_| engine_animation::rest_pose_block())
         .collect();
     let population = engine_renderer::ProxyPopulation {
         instance_generation: 0,
@@ -3705,7 +3705,7 @@ fn check_torso_wall_through_the_chain(
         pose_index: 0,
     };
     let single = [instance];
-    let poses = [engine_renderer::animation::rest_pose_block()];
+    let poses = [engine_animation::rest_pose_block()];
     let population = engine_renderer::ProxyPopulation {
         instance_generation: 0,
         pose_generation: 0,

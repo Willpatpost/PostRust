@@ -267,7 +267,11 @@ fn vram_census_table() {
 // the design named): the residency scaling rows and the growth
 // gate boundary. Both rig-gated like the table above. ====
 
-use engine_renderer::animation::{MAX_POSE_BLOCKS, POSE_STRIDE, rest_pose_block};
+// A06 E-S2: POSE_STRIDE/rest_pose_block are engine-animation's
+// (moved at E-S1); MAX_POSE_BLOCKS is the renderer's capacity
+// mirror and keeps the renderer import.
+use engine_animation::{POSE_STRIDE, rest_pose_block};
+use engine_renderer::animation::MAX_POSE_BLOCKS;
 use engine_renderer::config::FRAMES_IN_FLIGHT;
 use engine_renderer::lit_scene::day_preset;
 use engine_renderer::proxy_instances::{INSTANCE_STRIDE, MAX_INSTANCES, ProxyInstance};
@@ -323,7 +327,7 @@ fn submit_population(
     renderer: &mut Renderer,
     matrix: &engine_slice::math::Mat4,
     instances: &[ProxyInstance],
-    blocks: &[[[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS]],
+    blocks: &[[[[f32; 4]; 4]; engine_animation::HUMANOID_JOINTS]],
     shadows: bool,
 ) -> engine_renderer::FrameResult {
     let population = ProxyPopulation {

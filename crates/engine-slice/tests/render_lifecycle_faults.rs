@@ -139,7 +139,7 @@ fn submit_population(
     renderer: &mut Renderer,
     matrix: &engine_slice::math::Mat4,
     instances: &[engine_renderer::proxy_instances::ProxyInstance],
-    blocks: &[[[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS]],
+    blocks: &[[[[f32; 4]; 4]; engine_animation::HUMANOID_JOINTS]],
     size: (u32, u32),
 ) -> engine_renderer::FrameResult {
     let population = ProxyPopulation {
@@ -475,7 +475,7 @@ fn growth_idle_failures_release_the_staged_carve() {
         attach_corner_scene(&mut renderer).expect("the scene attaches");
         let small = synthetic_population(100);
         let small_poses: Vec<_> = (0..100)
-            .map(|_| engine_renderer::animation::rest_pose_block())
+            .map(|_| engine_animation::rest_pose_block())
             .collect();
         for _ in 0..3 {
             let outcome = submit_population(&mut renderer, &matrix, &small, &small_poses, size);
@@ -491,7 +491,7 @@ fn growth_idle_failures_release_the_staged_carve() {
             instance.pose_index = (i % 300) as u32;
         }
         let grown_poses: Vec<_> = (0..300)
-            .map(|_| engine_renderer::animation::rest_pose_block())
+            .map(|_| engine_animation::rest_pose_block())
             .collect();
         // The instance growth's idle failure first: the INSTANCE
         // carve's ensure runs first in the populated ladder, so an
@@ -1021,7 +1021,7 @@ fn interrupted_growth_retry_rewrites_every_slot() {
     // A generation-carrying submit (the battery's own helper submits
     // at generation 0 — always-dirty, no skips to observe; the epoch
     // witness needs the opted-in protocol).
-    type PoseBlock = [[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS];
+    type PoseBlock = [[[f32; 4]; 4]; engine_animation::HUMANOID_JOINTS];
     let submit_at = |renderer: &mut Renderer,
                      instances: &[engine_renderer::proxy_instances::ProxyInstance],
                      blocks: &[PoseBlock],
@@ -1056,8 +1056,8 @@ fn interrupted_growth_retry_rewrites_every_slot() {
     // both slots stamped, the between-tick skips observed (the R2
     // win the epoch gate must preserve).
     let small = engine_slice::census::repack::synthetic_population(2);
-    let small_poses: Vec<[[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS]> =
-        vec![engine_renderer::animation::rest_pose_block(); 2];
+    let small_poses: Vec<[[[f32; 4]; 4]; engine_animation::HUMANOID_JOINTS]> =
+        vec![engine_animation::rest_pose_block(); 2];
     for _ in 0..4 {
         submit_at(&mut renderer, &small, &small_poses, 5);
     }
@@ -1075,8 +1075,8 @@ fn interrupted_growth_retry_rewrites_every_slot() {
     // phase precedes the acquire), the delta-clear belt exactly
     // what this failure swallows.
     let large = engine_slice::census::repack::synthetic_population(200);
-    let large_poses: Vec<[[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS]> =
-        vec![engine_renderer::animation::rest_pose_block(); 200];
+    let large_poses: Vec<[[[f32; 4]; 4]; engine_animation::HUMANOID_JOINTS]> =
+        vec![engine_animation::rest_pose_block(); 200];
     renderer.inject_lifecycle_fault(LifecycleFaultSite::PoseGrowthIdle, 1);
     let failed = renderer.submit_frame(corner_submission(
         &matrix,

@@ -61,7 +61,11 @@
 
 use std::time::{Duration, Instant};
 
-use engine_renderer::animation::{MAX_POSE_BLOCKS, POSE_STRIDE, repack_poses};
+// A06 E-S2: POSE_STRIDE is engine-animation's (moved at E-S1); the
+// repack family and its MAX_POSE_BLOCKS capacity mirror are the
+// renderer's GPU packing layer and keep the renderer import.
+use engine_animation::POSE_STRIDE;
+use engine_renderer::animation::{MAX_POSE_BLOCKS, repack_poses};
 use engine_renderer::proxy_indirect::INDIRECT_SLOT_BYTES;
 use engine_renderer::proxy_instances::{
     INSTANCE_STRIDE, InstanceTransform, MAX_INSTANCES, ProxyInstance, repack_populations,
@@ -77,7 +81,10 @@ use crate::corner_population::{Block, Phase, evaluate_population_poses};
 /// meshes are deterministic tables).
 fn proxy_mesh_vertex_counts() -> (u32, u32, u32) {
     (
-        engine_renderer::animation::skinned_humanoid_mesh().len() as u32,
+        // A06 E-S2: skinned_humanoid_mesh moved to populated_meshes
+        // at E-S1 (it derives from that module's unskinned mesh) —
+        // the direct path, beside its sibling mesh tables.
+        engine_renderer::populated_meshes::skinned_humanoid_mesh().len() as u32,
         engine_renderer::populated_meshes::sedan_mesh().len() as u32,
         engine_renderer::populated_meshes::rain_streak_mesh().len() as u32,
     )
@@ -691,7 +698,7 @@ mod tests {
             MAX_INSTANCES * INSTANCE_STRIDE,
             "the refusal left the previous frame's bytes intact (atomic repack)"
         );
-        let rest = engine_renderer::animation::rest_pose_block();
+        let rest = engine_animation::rest_pose_block();
         let blocks: Vec<Block> = (0..MAX_POSE_BLOCKS).map(|_| rest).collect();
         let mut pose_buffer = Vec::new();
         repack_poses(&mut pose_buffer, &blocks).expect("exactly the cap packs");
