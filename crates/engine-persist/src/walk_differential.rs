@@ -612,7 +612,18 @@ impl Drop for Case {
 /// mutated stores (the prior sub-case's mediums are dropped at its
 /// block's end, before this runs).
 fn opened_pair(case: &Case, steps: &[Step]) -> (LocalFileMedium, SqliteMedium) {
-    let _ = fs::remove_dir_all(&case.root);
+    // The wipe is LOUD on remnants (the Windows lesson, run
+    // 46155517625): a swallowed wipe failure surfaces later as a
+    // mystery unwrap in the clean open, far from its cause — fail
+    // HERE, naming the leftover, if anything survives removal.
+    if let Err(error) = fs::remove_dir_all(&case.root)
+        && case.root.exists()
+    {
+        panic!(
+            "the scratch wipe left remnants at {}: {error}",
+            case.root.display()
+        );
+    }
     fs::create_dir_all(&case.root).unwrap();
     let local_root = case.local_root();
     {
@@ -3757,6 +3768,17 @@ fn provider_read_failures_refuse_typed_fail_closed() {
         fs::create_dir(&path).unwrap();
         let local_observation =
             cold_outcome(local.walk_differential_cold(chain.head, &no_exclusion()));
+        // Windows delete semantics (2026-11-29, run 46155517625): the
+        // local medium's still-open handles let the scratch wipe
+        // (`let _ = remove_dir_all` in opened_pair) silently fail, so
+        // the injected object-directory survived into the SECOND
+        // opened_pair's clean open — the "read object"
+        // PermissionDenied surfacing as a mystery unwrap panic instead
+        // of the asserted typed refusal. Unix unlink semantics mask
+        // the divergence (handles never block removal). The medium is
+        // dropped BEFORE the scratch is reused; the observation was
+        // captured above (an owned outcome, not a borrow).
+        drop(local);
         // Sqlite: the objects table is dropped under the same walk.
         let (chain2, _object2) = plain_chain();
         let (_local2, sqlite2) = opened_pair(&case, &chain2.steps);

@@ -11644,7 +11644,18 @@ mod tests {
             }
             // The scan forms grow linearly with the unrelated
             // population (CA-08's factor-10 discipline over the
-            // 100× range; the 20k midpoint's 20× range gets 8×).
+            // 100× range; the 20k midpoint's 20× range gets 4×).
+            // The 20k threshold recalibrated from CI actuals
+            // (2026-11-29, runs 46155517625/46154762231): shared
+            // runners read a noisy-high 1k baseline (2.14 ms vs the
+            // pod's 0.94), compressing the measured ratio to 6.4×
+            // against the original 8× — 4× retains ~1.5× headroom
+            // under that noise while still discriminating a
+            // logarithmic form (ln 20 ≈ 3.0×) and a constant form
+            // (1×); the 100k row's 10× discriminates ln 100 ≈ 4.6×.
+            // The deterministic teeth (entries touched = N exactly,
+            // asserted above) carry the census; these rows are the
+            // observational confirmation.
             assert!(
                 scan[3] >= 10 * scan[0].max(1),
                 "{variant}: the scan form grows with the unrelated population (measured \
@@ -11653,7 +11664,7 @@ mod tests {
                 scan[3]
             );
             assert!(
-                scan[2] >= 8 * scan[0].max(1),
+                scan[2] >= 4 * scan[0].max(1),
                 "{variant}: the scan form grows into the 20k midpoint (measured {} → {} ns \
                  across 1k → 20k)",
                 scan[0],
@@ -11673,7 +11684,7 @@ mod tests {
                 indexed[3]
             );
             assert!(
-                indexed[2] >= 8 * indexed[0].max(1),
+                indexed[2] >= 4 * indexed[0].max(1),
                 "{variant}: the indexed residual grows into the 20k midpoint (measured \
                  {} → {} ns across 1k → 20k)",
                 indexed[0],
