@@ -42,25 +42,27 @@
 //! sqlite counts the post-invalidation cold walks into
 //! `last_append_walked`), each pinned by its own provider's tests.
 //!
-//! **The one documented pre-existing divergence** (the L5 precedent's
-//! "one deliberate divergence documented" shape, discovered by this
-//! battery on the untouched tree — the exact semantic risk the design
-//! §2.4.2 flagged): a suffix record whose first content reference is
-//! a `/2` composite root that FAILS closure verification. Local's
-//! suffix form recomputes the closure in `absorb_suffix` (AFTER the
-//! walk), so the failure escapes `validate_observed` directly and the
-//! trusted cursor SURVIVES; sqlite's R15 form verifies the closure
-//! DURING the walk, so the failure lands in the sound-invalidation
-//! arm (cursor discarded, cold walk re-derives the refusal). The
-//! errors are equal in value EXCEPT the chunk-envelope rule string —
-//! local says `composite-suffix-closure-verification`, sqlite says
-//! `composite-closure-verification` (the string both providers' cold
-//! walks and the reclaim execution walk use — local's suffix string
-//! is the odd one out of the five walk sites, an artifact of the
-//! uncoordinated R10/R15 correctives, and the ONE place the "Chain
-//! refusal rules are IDENTICAL in both" record is false today). The
-//! corner test asserts the divergence's exact shape so the
-//! unification's resolution of it is provable, never silent.
+//! **The suffix composite-closure corner — the divergence this
+//! battery DISCOVERED on the untouched tree and the unification
+//! RESOLVED (the proof, never silent):** pre-unification, a suffix
+//! record whose first content reference was a `/2` root failing
+//! closure verification behaved differently on the two providers —
+//! local's two-pass form (the closure recomputed in `absorb_suffix`
+//! after the walk) let the refusal escape directly with the trusted
+//! cursor SURVIVING and the rule string
+//! `composite-suffix-closure-verification`; sqlite's R15 one-pass
+//! form verified the closure during the walk, routing the failure
+//! into the sound-invalidation arm (cursor discarded, the cold walk
+//! re-deriving the refusal as `composite-closure-verification` — the
+//! string both cold walks already used; local's suffix string was
+//! the odd one out of the five walk sites, an artifact of the
+//! uncoordinated R10/R15 correctives, and the one place the
+//! "Chain refusal rules are IDENTICAL in both" record was false).
+//! The unified core takes the R15 discipline on both providers and
+//! the one rule string — the corner test now asserts STRICT
+//! byte-identity there (the errors equal in value, the cursors
+//! discarded on both, the rule the cold-walk string), pinning the
+//! resolution exactly where the divergence used to be.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -1794,32 +1796,28 @@ fn refusing_suffixes_agree_identically() {
     }
 }
 
-/// THE suffix composite-closure corner — the one documented
-/// pre-existing divergence between the two providers' current walk
-/// forms (the module doc's carve-out). The corpus: a suffix record
-/// whose first content reference is a `/2` root that FAILS closure
-/// verification in three ways — a malformed manifest body, a missing
-/// chunk, and a chunk failing its envelope verification. On the good
-/// path (the valid composite suffix) the providers agree exactly
-/// (proved by `valid_suffix_absorption_agrees_identically`).
+/// THE suffix composite-closure corner — the divergence this battery
+/// DISCOVERED on the untouched tree (the module doc's record) and the
+/// unification RESOLVED. The corpus: a suffix record whose first
+/// content reference is a `/2` root that FAILS closure verification
+/// in three ways — a malformed manifest body, a missing chunk, and a
+/// chunk failing its envelope verification. On the good path (the
+/// valid composite suffix) the providers agree exactly (proved by
+/// `valid_suffix_absorption_agrees_identically`).
 ///
-/// - **Errors:** equal in VALUE for the malformed manifest and the
-///   missing chunk (both providers derive them from the same bytes);
-///   for the envelope failure the RULE STRING differs — local's
-///   suffix absorption says `composite-suffix-closure-verification`,
-///   sqlite's in-walk verification (and both providers' cold walks)
-///   say `composite-closure-verification`.
-/// - **Cursors:** local's two-pass form (the closure recomputed in
-///   `absorb_suffix`, after the walk) lets the trusted cursor
-///   SURVIVE the refusal; sqlite's R15 one-pass form (the closure
-///   verified during the walk) routes the failure into the
-///   sound-invalidation arm — cursor discarded, cold walk re-derives
-///   the refusal.
-///
-/// The unification resolves this toward the R15/frozen-contract form
-/// (one closure verification during the walk, one rule string); this
-/// test pins the divergence's exact shape so that resolution is
-/// provable, never silent.
+/// Pre-unification the two providers disagreed here in the refusal
+/// STRING (local's `composite-suffix-closure-verification` vs
+/// sqlite's `composite-closure-verification`) and in the cursor
+/// disposition (local's post-walk closure recompute let the trusted
+/// cursor survive the refusal; sqlite's in-walk R15 verification
+/// routed the failure into the sound-invalidation arm — cursor
+/// discarded, cold walk re-deriving the refusal). The unified core
+/// takes the R15 discipline and the one cold-walk rule string on
+/// BOTH providers — this test now asserts STRICT byte-identity
+/// (compare_head) plus the specific rules, pinning the resolution
+/// exactly where the divergence used to be: the errors equal in
+/// value, the cursors discarded on both, the rule the
+/// cold-walk string both providers' cold walks always used.
 #[test]
 fn suffix_composite_closure_corner_is_the_documented_divergence() {
     let case = Case::new("closure-corner");
@@ -1841,31 +1839,15 @@ fn suffix_composite_closure_corner_is_the_documented_divergence() {
         ];
         run_local_steps(&local, &case.local_root(), &steps);
         run_sqlite_steps(&sqlite, &steps);
-        let local_observation = local_head_observation(&mut local);
-        let sqlite_observation = sqlite_head_observation(&mut sqlite);
-        // The refusal VALUE is identical (the same bytes, the same
-        // manifest decode failure).
+        // THE RESOLUTION: byte-identical observations — the same
+        // typed refusal (the manifest decode failure), the same
+        // sound-invalidation cursor disposition (discarded on both,
+        // the cold walk re-deriving the refusal).
+        let observation = compare_head("closure-malformed-manifest", &mut local, &mut sqlite);
+        head_refusal(&observation, "Format");
         assert_eq!(
-            local_observation.error, sqlite_observation.error,
-            "the malformed-manifest refusal value is identical"
-        );
-        assert!(
-            local_observation
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("Format"),
-            "the malformed manifest refuses typed: {:?}",
-            local_observation.error
-        );
-        // THE DOCUMENTED DIVERGENCE: the cursor disposition.
-        assert!(
-            local_observation.cursor.is_some(),
-            "local's post-walk closure recompute lets the trusted cursor survive"
-        );
-        assert_eq!(
-            sqlite_observation.cursor, None,
-            "sqlite's in-walk verification discards the cursor (the invalidation arm)"
+            observation.cursor, None,
+            "the in-walk closure failure discards the cursor on both (the invalidation arm)"
         );
     }
     // (b) The missing chunk: a valid manifest declaring a chunk the
@@ -1882,27 +1864,15 @@ fn suffix_composite_closure_corner_is_the_documented_divergence() {
         steps.push(Step::Head(record.id()));
         run_local_steps(&local, &case.local_root(), &steps);
         run_sqlite_steps(&sqlite, &steps);
-        let local_observation = local_head_observation(&mut local);
-        let sqlite_observation = sqlite_head_observation(&mut sqlite);
-        assert_eq!(
-            local_observation.error, sqlite_observation.error,
-            "the missing-chunk refusal value is identical"
-        );
-        assert!(
-            local_observation
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("MissingObject"),
-            "the missing chunk refuses typed: {:?}",
-            local_observation.error
-        );
-        assert!(local_observation.cursor.is_some());
-        assert_eq!(sqlite_observation.cursor, None);
+        let observation = compare_head("closure-missing-chunk", &mut local, &mut sqlite);
+        head_refusal(&observation, "MissingObject");
+        assert_eq!(observation.cursor, None);
     }
     // (c) The chunk failing its envelope verification: the manifest
     // declares TAG_HEADER but the chunk's envelope is tagged NEAR —
-    // the refusal RULE STRING is the divergence.
+    // the refusal rule string that used to diverge (local's
+    // `composite-suffix-closure-verification`), now the ONE
+    // cold-walk string on both.
     {
         let (chain, _object) = plain_chain();
         let (mut local, mut sqlite) = opened_pair(&case, &chain.steps);
@@ -1941,29 +1911,21 @@ fn suffix_composite_closure_corner_is_the_documented_divergence() {
         steps.push(Step::Head(record.id()));
         run_local_steps(&local, &case.local_root(), &steps);
         run_sqlite_steps(&sqlite, &steps);
-        let local_observation = local_head_observation(&mut local);
-        let sqlite_observation = sqlite_head_observation(&mut sqlite);
-        // Both refuse with a composite-closure rule; the STRINGS are
-        // the documented divergence.
+        // THE RESOLUTION: byte-identical observations with the ONE
+        // rule string — the cold-walk `composite-closure-verification`
+        // both providers' cold walks (and the reclaim execution walk)
+        // always used; local's odd suffix string is retired.
+        let observation = compare_head("closure-envelope-failure", &mut local, &mut sqlite);
+        head_refusal(&observation, "composite-closure-verification");
         assert!(
-            local_observation
+            !observation
                 .error
                 .as_deref()
                 .unwrap()
                 .contains("composite-suffix-closure-verification"),
-            "local's suffix absorption rule: {:?}",
-            local_observation.error
+            "the retired local-only suffix rule string must not appear: {:?}",
+            observation.error
         );
-        assert!(
-            sqlite_observation
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("composite-closure-verification"),
-            "sqlite's in-walk rule (the cold-walk string): {:?}",
-            sqlite_observation.error
-        );
-        assert!(local_observation.cursor.is_some());
-        assert_eq!(sqlite_observation.cursor, None);
+        assert_eq!(observation.cursor, None);
     }
 }

@@ -41,6 +41,7 @@ pub mod ancestry_accounting;
 pub mod ancestry_history;
 pub mod ancestry_witness;
 pub mod batch_completion;
+mod chain_walk;
 pub mod checkpoint;
 pub mod composite_append;
 pub mod composite_manifest;
