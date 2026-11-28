@@ -52,15 +52,47 @@
 //! population-linear (the T09 regional-locality finding is a
 //! different defect and stays open).
 //!
+//! **The ceiling's precise scope (R3, D-EE-11 — not a universal
+//! claim over the CURRENT configuration):** the closed form holds
+//! for work admitted under the caps in force at each obligation's
+//! admission. Two documented classes of already-admitted work can
+//! exceed the CURRENT config's caps, both bounded by the graph's
+//! own admitted shape — a finite, deterministic integer recorded in
+//! the graph, never an un-bound:
+//!
+//! 1. **Runtime tightening** ([`Spine::set_admission_bounds`]) binds
+//!    FUTURE admissions immediately but never re-bounds obligations
+//!    already admitted: their waiter release is bounded by the
+//!    admission-time fan-in (re-checking at the transition would
+//!    strand waiters — violating the E-10 all-or-nothing release —
+//!    or mutate canonical state; the same reasoning that rejects
+//!    restore-time enforcement). K tightens at every SUBSEQUENT
+//!    execution (follow-ups have no pre-admission).
+//! 2. **A restored legacy save** may carry a waiter list above the
+//!    restored spine's configured F: restore is fail-closed on
+//!    corruption, never on config, so the graph is admitted as-is
+//!    and its ONE-TIME legacy release is bounded by the saved
+//!    graph's own F-shape.
+//!
+//! The per-tick bound is therefore stated at the admission-epoch
+//! maximum (the loosest caps under which any live obligation was
+//! admitted, or the saved graph's own shape), never as a universal
+//! configured-work ceiling — "admitted existing graphs can exceed
+//! the current caps" is the honest sentence, and the divergence is
+//! observable (`dependency_registrations` against
+//! [`HousekeepingStats::waiter_visits`]) never silent.
+//!
 //! **External handler cost — NOT engine-bounded, stated plainly:**
 //! handler bodies (`World::execute` runs arbitrary user code inside
 //! `execute_now` — the engine bounds its own bookkeeping around the
 //! handler, never the handler); the follow-up count a handler
 //! ATTEMPTS beyond K (the engine admits ≤ K per execution and crops
-//! the rest fail-visibly — the emission effort is the handler's own
-//! cost); and driver-side costs (world fingerprinting, enabled
-//! diagnostics, the driver's own scheduling and retention-consumer
-//! policy).
+//! the rest fail-visibly — the typed `try_*` submission and the
+//! [`ExecCtx::follow_up_admissions_remaining`] reservation query
+//! make the refusal synchronous at the producer (R3), but the
+//! emission effort is the handler's own cost); and driver-side
+//! costs (world fingerprinting, enabled diagnostics, the driver's
+//! own scheduling and retention-consumer policy).
 //!
 //! # T08 measurement obligations (the next rig window)
 //!
@@ -122,6 +154,73 @@ pub trait World {
     fn fingerprint(&self, fp: &mut Fingerprinter);
 }
 
+/// The typed admission outcome of one follow-up submission (T08's K
+/// cap, the R3 contract): what the admission bound did with the
+/// handler's emission — the SYNCHRONOUS producer-facing signal that
+/// publishes at emission, inside `World::execute`, beside (never
+/// replacing) the after-the-drain telemetry
+/// ([`HousekeepingStats::follow_ups_cropped`] + the Error-level
+/// diagnostic, both published by `execute_now` after the handler
+/// returns).
+///
+/// [`Admitted`](Self::Admitted) — the submission is buffered and
+/// will be scheduled atomically with the executing event (the E-10
+/// discipline). [`BeyondAdmissionCap`](Self::BeyondAdmissionCap) —
+/// the submission lay beyond K: NOT buffered, NOT scheduled,
+/// counted and logged fail-visibly — and now ALSO refused typed at
+/// the producer, so a handler whose follow-ups are mandatory
+/// consequence-bearing gameplay events learns the refusal IN HAND
+/// and decides (retain the work in world state and re-emit from a
+/// later execution through the pump pattern, restructure the
+/// emission, or raise the cap through [`Spine::set_admission_bounds`]).
+/// A diagnostic counter is not a substitute for the producer
+/// knowing: the owner's rule — mandatory consequence-bearing
+/// gameplay events are never discarded for a performance budget —
+/// splits at the placement boundary the architecture draws (game
+/// policy stays outside engine mechanisms): the ENGINE's half is to
+/// never discard without telling the producer synchronously (this
+/// type) and to make the budget admission-time-known
+/// ([`ExecCtx::follow_up_admissions_remaining`]); what the handler
+/// then does with a refusal is game policy.
+///
+/// NOT `#[must_use]` deliberately: the legacy `()`-returning
+/// [`ExecCtx::follow_up`]/[`ExecCtx::schedule_at`]/
+/// [`ExecCtx::follow_up_in_field`] keep their exact T08 semantics
+/// for every existing caller (the crop still counted fail-visibly,
+/// the telemetry unchanged), and handlers opt into the typed
+/// contract through the `try_*` mirrors.
+///
+/// THE PARKED OWNER DECISION (recorded here, nothing decided per
+/// the standing rule): whether the ENGINE itself must preserve
+/// over-K mandatory emissions — **deterministic deferral**, the
+/// excess re-queued for a later tick with ordering guarantees.
+/// Rejected for this landing: the deferral queue is new canonical
+/// state (it must ride the wire, breaking save byte-identity — or
+/// the excess is scheduled immediately under a later due, which is
+/// admission, un-bounding the ≤ B·K per-tick ceiling), and it
+/// changes gameplay-visible consequence timing (a mandatory
+/// consequence landing ticks after its cause) — an owner-level
+/// gameplay semantics decision. RE-OPEN CONDITION: an owner ruling
+/// that engine-side preservation is required for a real handler
+/// class that cannot restructure under K; until then the
+/// transactional pattern (the reservation query + this typed
+/// refusal + world-state retention and re-emission) loses nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowUpAdmission {
+    /// The submission is buffered and will be scheduled atomically
+    /// with the executing event.
+    Admitted,
+    /// The submission lay beyond the K admission bound
+    /// ([`HousekeepingAdmission::max_follow_ups`]): not buffered,
+    /// not scheduled, counted in
+    /// [`HousekeepingStats::follow_ups_cropped`] and logged — and
+    /// refused typed here, at the producer, synchronously.
+    BeyondAdmissionCap {
+        /// The configured cap K the submission exceeded.
+        cap: u32,
+    },
+}
+
 /// Handler context: what an executing event may observe and enqueue.
 pub struct ExecCtx<'a> {
     executed_tick: Tick,
@@ -142,7 +241,15 @@ pub struct ExecCtx<'a> {
     /// [`HousekeepingAdmission::max_follow_ups`] at `ExecCtx`
     /// construction (the single construction site lives in
     /// `Spine::execute_now`), decremented per buffered follow-up.
+    /// The slots are reserved BEFORE the handler runs — the
+    /// transactional contract (R3) publishes them through
+    /// [`Self::follow_up_admissions_remaining`] so the handler's
+    /// admission budget is known before it mutates world state.
     admissions_remaining: u32,
+    /// The configured K this execution's admissions were budgeted
+    /// from (carried so the typed refusal can name its cap — see
+    /// [`FollowUpAdmission::BeyondAdmissionCap`]).
+    admission_cap: u32,
     /// Follow-up emissions cropped at emission by the K bound —
     /// beyond the cap the emission is not buffered, not scheduled,
     /// and counted; `execute_now` publishes the total into
@@ -163,20 +270,42 @@ impl<'a> ExecCtx<'a> {
         id.seq < self.next_seq && !self.unfinished.contains(&id.seq)
     }
 
-    /// The K admission gate (T08 §4.3): one slot per buffered
-    /// follow-up, the excess cropped at emission — not buffered, not
-    /// scheduled, counted — a config outcome deliberately distinct
-    /// from the dependency-shape refusals (`invalid_dropped`, a
-    /// fingerprinted Stats class): a crop is the admission policy
-    /// speaking, fail-visible through the counter and the
-    /// `Error`-level diagnostic.
-    fn admit(&mut self, spec: EventSpec) {
+    /// The transactional reservation query (R3, D-EE-11): the number
+    /// of further follow-up submissions THIS execution will admit
+    /// under the K bound — the per-execution slots, reserved at
+    /// `ExecCtx` construction before the handler runs, published
+    /// here so the handler's contract is admission-time-known: a
+    /// handler about to apply a world mutation with N mandatory
+    /// consequences can check the budget first, apply-and-emit what
+    /// fits, and retain the remainder in its own state for a later
+    /// execution's fresh budget (the pump pattern) — the engine
+    /// never discards a submission without telling the producer,
+    /// and the producer never mutates blind to its budget. Pure,
+    /// allocation-free, deterministic (a function of (K, emissions
+    /// so far) — never wall-clock).
+    pub fn follow_up_admissions_remaining(&self) -> u32 {
+        self.admissions_remaining
+    }
+
+    /// The K admission gate (T08 §4.3, the R3 typed form): one slot
+    /// per buffered follow-up; beyond the cap the submission is NOT
+    /// buffered, NOT scheduled, counted — and refused TYPED at the
+    /// producer, synchronously, at emission ([`FollowUpAdmission`])
+    /// — a config outcome deliberately distinct from the
+    /// dependency-shape refusals (`invalid_dropped`, a fingerprinted
+    /// Stats class): a crop is the admission policy speaking,
+    /// fail-visible through the typed refusal AND the counter AND
+    /// the `Error`-level diagnostic.
+    fn admit(&mut self, spec: EventSpec) -> FollowUpAdmission {
         if self.admissions_remaining == 0 {
             self.crops += 1;
-            return;
+            return FollowUpAdmission::BeyondAdmissionCap {
+                cap: self.admission_cap,
+            };
         }
         self.admissions_remaining -= 1;
         self.follow_ups.push(spec);
+        FollowUpAdmission::Admitted
     }
 
     /// Schedules an execution-relative follow-up: due = executed_tick +
@@ -193,6 +322,23 @@ impl<'a> ExecCtx<'a> {
         payload: u64,
         depends_on: Vec<EventId>,
     ) {
+        let _ = self.try_follow_up(delay, class, payload, depends_on);
+    }
+
+    /// The typed mirror of [`Self::follow_up`] (R3, D-EE-11): the
+    /// submission beyond K refuses typed at the producer —
+    /// [`FollowUpAdmission::BeyondAdmissionCap`] names the cap in
+    /// hand, inside the handler, at emission; the admitted
+    /// submission behaves exactly like the legacy form. See
+    /// [`FollowUpAdmission`] for the contract and the parked
+    /// owner decision.
+    pub fn try_follow_up(
+        &mut self,
+        delay: u64,
+        class: EventClass,
+        payload: u64,
+        depends_on: Vec<EventId>,
+    ) -> FollowUpAdmission {
         self.admit(EventSpec {
             class,
             schedule: Schedule::ExecutionRelative {
@@ -202,7 +348,7 @@ impl<'a> ExecCtx<'a> {
             payload,
             field: self.field,
             depends_on,
-        });
+        })
     }
 
     /// Schedules at a fixed logical time. `tick` may lie in the past — a
@@ -216,13 +362,26 @@ impl<'a> ExecCtx<'a> {
         payload: u64,
         depends_on: Vec<EventId>,
     ) {
+        let _ = self.try_schedule_at(tick, class, payload, depends_on);
+    }
+
+    /// The typed mirror of [`Self::schedule_at`] (R3, D-EE-11): the
+    /// submission beyond K refuses typed at the producer (see
+    /// [`Self::try_follow_up`] and [`FollowUpAdmission`]).
+    pub fn try_schedule_at(
+        &mut self,
+        tick: Tick,
+        class: EventClass,
+        payload: u64,
+        depends_on: Vec<EventId>,
+    ) -> FollowUpAdmission {
         self.admit(EventSpec {
             class,
             schedule: Schedule::AtLogicalTime { due: tick },
             payload,
             field: self.field,
             depends_on,
-        });
+        })
     }
 
     /// Schedules an execution-relative follow-up in an **explicit lane**
@@ -243,6 +402,21 @@ impl<'a> ExecCtx<'a> {
         payload: u64,
         depends_on: Vec<EventId>,
     ) {
+        let _ = self.try_follow_up_in_field(field, delay, class, payload, depends_on);
+    }
+
+    /// The typed mirror of [`Self::follow_up_in_field`] (R3,
+    /// D-EE-11): the submission beyond K refuses typed at the
+    /// producer (see [`Self::try_follow_up`] and
+    /// [`FollowUpAdmission`]).
+    pub fn try_follow_up_in_field(
+        &mut self,
+        field: Field,
+        delay: u64,
+        class: EventClass,
+        payload: u64,
+        depends_on: Vec<EventId>,
+    ) -> FollowUpAdmission {
         self.admit(EventSpec {
             class,
             schedule: Schedule::ExecutionRelative {
@@ -252,7 +426,7 @@ impl<'a> ExecCtx<'a> {
             payload,
             field,
             depends_on,
-        });
+        })
     }
 
     fn drain(&mut self) -> Vec<EventSpec> {
@@ -916,6 +1090,13 @@ pub struct Stats {
 ///   emission is not buffered, not scheduled, and counted in
 ///   [`HousekeepingStats::follow_ups_cropped`]) — never silent, and
 ///   bounding the scratch buffer's steady-state element capacity at K.
+///   The R3 contract on top of the crop: the typed `try_*` submission
+///   refuses beyond-K at the producer synchronously
+///   ([`FollowUpAdmission`]) and the reservation query
+///   ([`ExecCtx::follow_up_admissions_remaining`]) makes the budget
+///   admission-time-known — the engine never discards a submission
+///   without telling its producer; what the handler does with the
+///   refusal is game policy.
 ///
 /// CONFIGURATION, never logical state — the retention-policy tradition:
 /// set through the additive [`Spine::set_admission_bounds`] (no
@@ -926,6 +1107,16 @@ pub struct Stats {
 /// afterward; the divergence is observable in world content (which
 /// declarations get admitted), never in spine fingerprints, because
 /// config was never fingerprinted.
+///
+/// The ceiling this type buys is scoped, not universal (R3, D-EE-11 —
+/// see the module's cost-model section for the precise statement): it
+/// holds for work admitted under the caps in force at admission.
+/// Runtime tightening never re-bounds already-admitted obligations
+/// (their release bounded by the admission-time shape), and a restored
+/// legacy save may carry a waiter list above the restored config's F
+/// (its one-time release bounded by the saved graph's own F-shape). No
+/// universal configured-work ceiling is claimed while admitted existing
+/// graphs can exceed the current caps.
 ///
 /// Default justification (measured-actual discipline, T08 §4.1): every
 /// workspace fixture's observed maximum sits comfortably under each
@@ -2418,6 +2609,27 @@ impl<W: World> Spine<W> {
     /// defaults regardless of what the saving process had configured
     /// (the retention-policy precedent: the driver re-configures at
     /// its own configuration boundary after restore).
+    ///
+    /// THE RUNTIME-BOUND BOUNDARY (R3, D-EE-11): tightening the caps
+    /// here binds FUTURE work immediately — D and F at the next
+    /// [`Self::schedule`] call, K at every subsequent execution's
+    /// `ExecCtx` construction — but NEVER re-bounds obligations
+    /// already admitted: an admitted herd's waiter release walks its
+    /// admission-time fan-in even under a tighter current F. That is
+    /// the deliberate shape, not an oversight: re-checking admitted
+    /// graphs at the transition would either strand registered
+    /// waiters (violating the E-10 all-or-nothing release contract)
+    /// or mutate canonical state at a config boundary — the same
+    /// reasoning that rejects restore-time cap enforcement. The
+    /// already-admitted graph's work stays bounded by its own
+    /// admitted shape (a finite, deterministic integer in the graph,
+    /// observable through [`HousekeepingStats::waiter_visits`]);
+    /// nothing becomes unbounded. The consequence for the ceiling
+    /// claim: the per-tick closed form holds at the admission-epoch
+    /// maximum, not the current configuration — see the module's
+    /// cost-model section. Loosening is the driver's policy call:
+    /// future admissions bind at the new caps; admitted obligations
+    /// were admitted under caps at or below them.
     pub fn set_admission_bounds(&mut self, bounds: HousekeepingAdmission) {
         self.admission = bounds;
     }
@@ -4971,9 +5183,15 @@ impl<W: World> Spine<W> {
                 follow_ups: std::mem::take(&mut self.scratch_follow_ups),
                 // The K admission bound's per-execution budget (T08
                 // §4.3): the slots this execution may admit through
-                // `follow_up`/`schedule_at`/`follow_up_in_field`,
-                // cropped (counted, never silent) beyond it.
+                // `follow_up`/`schedule_at`/`follow_up_in_field`
+                // (and their typed `try_*` mirrors), cropped
+                // (counted, never silent) beyond it. The slots and
+                // the cap are reserved here, BEFORE the handler
+                // runs — the transactional contract (R3): the
+                // handler's admission budget is admission-time-known
+                // through `follow_up_admissions_remaining`.
                 admissions_remaining: self.admission.max_follow_ups.get(),
+                admission_cap: self.admission.max_follow_ups.get(),
                 crops: 0,
             };
             self.world.execute(&event, &mut ctx);
@@ -8381,6 +8599,387 @@ mod tests {
         assert_eq!(spine.stats().executed, 14);
         assert_eq!(spine.stats().invalid_dropped, 0);
         assert_release_charge_identity(&spine);
+    }
+
+    /// R3 (D-EE-11) part 1 — THE TYPED ADMISSION CONTRACT: the
+    /// handler's follow-up submission beyond K refuses TYPED at the
+    /// producer — synchronous, at emission — so a handler whose
+    /// follow-ups are mandatory consequence-bearing gameplay events
+    /// (the world mutation already applied, the consequence emitted)
+    /// learns the refusal IN HAND and decides, instead of the
+    /// T08 shape where the only signals (the crop counter + the
+    /// Error-level diagnostic) publish after the handler returns.
+    /// The legacy `follow_up` arm of the same battery documents the
+    /// defect it cannot fix: the ignoring handler's two excess
+    /// mandatory consequences vanish with only the after-the-fact
+    /// counter (byte-identical to the T08 landing — the compat bar).
+    #[test]
+    fn follow_up_submission_beyond_the_cap_refuses_typed_at_the_producer() {
+        /// The consequence-bearing world: a cause event whose
+        /// mandatory consequences are one damage event per target —
+        /// the world mutation (`applied`) and the emitted
+        /// consequence are the same gameplay fact, so a consequence
+        /// the engine refuses is a fact the handler MUST retain
+        /// (pending, in world state) rather than lose.
+        struct ConsequentialWorld {
+            /// Damage applied (the mutation), in apply order.
+            applied: Vec<u64>,
+            /// Damage consequence events the spine executed.
+            executed_consequences: Vec<u64>,
+            /// Mandatory consequences not yet admitted — retained
+            /// in WORLD state by the typed handler (the handler
+            /// decides; the engine told it, synchronously).
+            pending: Vec<u64>,
+            /// What each typed submission returned, in order (the
+            /// synchronous producer-facing signal under test).
+            observations: Vec<FollowUpAdmission>,
+            /// The reservation query at each execution's entry (the
+            /// transactional contract: the K slots are known BEFORE
+            /// the handler mutates).
+            capacity_at_entry: Vec<u32>,
+        }
+        impl World for ConsequentialWorld {
+            fn execute(&mut self, event: &Event, ctx: &mut ExecCtx) {
+                self.capacity_at_entry
+                    .push(ctx.follow_up_admissions_remaining());
+                match event.class {
+                    // The LEGACY cause (class 3): mutates for every
+                    // target, emits through the `()`-returning
+                    // `follow_up`, and cannot know which emissions
+                    // landed — the T08 defect, unchanged for compat.
+                    c if c == EventClass::new(3) => {
+                        for i in 0..event.payload {
+                            let target = 100 + i;
+                            self.applied.push(target);
+                            ctx.follow_up(1, EventClass::new(2), target, Vec::new());
+                        }
+                    }
+                    // The NON-reserving typed cause (class 5): emits
+                    // unconditionally through `try_follow_up` and
+                    // records the typed outcome — the refusal is
+                    // synchronous, and the refused targets are
+                    // retained, never lost.
+                    c if c == EventClass::new(5) => {
+                        for i in 0..event.payload {
+                            let target = 300 + i;
+                            let outcome =
+                                ctx.try_follow_up(1, EventClass::new(2), target, Vec::new());
+                            self.observations.push(outcome);
+                            match outcome {
+                                FollowUpAdmission::Admitted => self.applied.push(target),
+                                FollowUpAdmission::BeyondAdmissionCap { .. } => {
+                                    self.pending.push(target)
+                                }
+                            }
+                        }
+                    }
+                    // The damage consequence (class 2): executes,
+                    // records, and pumps the retained pending work
+                    // through THIS execution's fresh K budget — the
+                    // transactional pattern loses nothing.
+                    c if c == EventClass::new(2) => {
+                        self.executed_consequences.push(event.payload);
+                        while ctx.follow_up_admissions_remaining() > 0 && !self.pending.is_empty() {
+                            let target = self.pending.remove(0);
+                            let outcome =
+                                ctx.try_follow_up(1, EventClass::new(2), target, Vec::new());
+                            self.observations.push(outcome);
+                            match outcome {
+                                FollowUpAdmission::Admitted => self.applied.push(target),
+                                // Unreachable with the capacity
+                                // check (the reservation is exact).
+                                FollowUpAdmission::BeyondAdmissionCap { .. } => {
+                                    self.pending.insert(0, target);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            fn fingerprint(&self, fp: &mut Fingerprinter) {
+                fp.write_str("engine-core/spine/r3-followups/1");
+                for payload in &self.applied {
+                    fp.write_u64(*payload);
+                }
+                for payload in &self.executed_consequences {
+                    fp.write_u64(*payload);
+                }
+            }
+        }
+        let build = || {
+            let mut spine = Spine::new(
+                ConsequentialWorld {
+                    applied: Vec::new(),
+                    executed_consequences: Vec::new(),
+                    pending: Vec::new(),
+                    observations: Vec::new(),
+                    capacity_at_entry: Vec::new(),
+                },
+                100,
+            );
+            spine.set_admission_bounds(admission(64, 4096, 4));
+            spine
+                .schedule(spec(3, Field::Near, 1, 6))
+                .expect("the legacy cause schedules");
+            spine
+                .schedule(spec(5, Field::Near, 1, 6))
+                .expect("the typed cause schedules");
+            spine
+        };
+        let mut spine = build();
+        spine.run_to_completion(10);
+        // The reservation query: every execution entered with the
+        // full K budget (nothing else consumed slots).
+        assert!(!spine.world().capacity_at_entry.is_empty());
+        assert!(
+            spine.world().capacity_at_entry.iter().all(|&c| c == 4),
+            "the K slots are admission-time-known: every execution \
+             enters with the full per-execution budget"
+        );
+        // The typed signal discriminated, in emission order: the
+        // first four submissions admitted, the last two refused
+        // typed with the cap.
+        let typed: Vec<FollowUpAdmission> =
+            spine.world().observations.iter().take(6).copied().collect();
+        assert_eq!(
+            typed,
+            vec![
+                FollowUpAdmission::Admitted,
+                FollowUpAdmission::Admitted,
+                FollowUpAdmission::Admitted,
+                FollowUpAdmission::Admitted,
+                FollowUpAdmission::BeyondAdmissionCap { cap: 4 },
+                FollowUpAdmission::BeyondAdmissionCap { cap: 4 },
+            ],
+            "the submission beyond K refuses typed at the producer"
+        );
+        // The typed cause's six mandatory consequences ALL exist
+        // (four direct, two retained-then-pumped): the handler that
+        // reads its admissions loses nothing.
+        assert_eq!(
+            spine
+                .world()
+                .executed_consequences
+                .iter()
+                .filter(|&&p| (300..306).contains(&p))
+                .count(),
+            6,
+            "the typed handler's mandatory consequences all executed"
+        );
+        // The legacy cause's two excess consequences are GONE — the
+        // documented defect: the ignoring handler mutated for six
+        // targets, only four consequences ever existed, and the only
+        // signal published after the handler returned.
+        assert_eq!(
+            spine
+                .world()
+                .executed_consequences
+                .iter()
+                .filter(|&&p| (100..106).contains(&p))
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![100, 101, 102, 103],
+            "the legacy handler's two excess mandatory consequences \
+             vanished — the ()-returning form cannot tell it"
+        );
+        assert_eq!(spine.world().applied.len(), 12, "both causes mutated");
+        // The engine telemetry is UNCHANGED by the typed contract:
+        // two crops per cause (the legacy and the non-reserving
+        // typed), published after the drain — the counter is the
+        // driver's aggregate, never the producer's only signal.
+        assert_eq!(spine.housekeeping_stats().follow_ups_cropped, 4);
+        assert_eq!(spine.stats().invalid_dropped, 0);
+        assert!(spine.world().pending.is_empty());
+        assert_eq!(spine.pending_count(), 0);
+        assert_release_charge_identity(&spine);
+        declared_fan_in_matches_revalidation(&spine);
+        // Determinism: the identical scenario driven twice yields
+        // the identical world stream and engine fingerprint (the
+        // typed outcome is a pure function of (K, emission index),
+        // never wall-clock, never fingerprint state).
+        let mut twin = build();
+        twin.run_to_completion(10);
+        assert_eq!(
+            spine.world().executed_consequences,
+            twin.world().executed_consequences
+        );
+        assert_eq!(spine.world().applied, twin.world().applied);
+        assert_eq!(spine.engine_fingerprint(), twin.engine_fingerprint());
+    }
+
+    /// R3 (D-EE-11) part 2 — ARM 3, THE RUNTIME-BOUND BOUNDARY: a
+    /// graph admitted under looser caps, then a tighter runtime cap
+    /// at the next transition. The tightened F binds FUTURE
+    /// admissions (the ninth declarer refused at the new cap, the
+    /// observed count naming the admitted shape) but never re-bounds
+    /// the admitted herd: the prerequisite's release visits exactly
+    /// the admission-time fan-in (8, not the current F=2) — no
+    /// waiter stranded (the E-10 all-or-nothing release preserved),
+    /// nothing un-bounded (the release is a finite, deterministic
+    /// integer recorded in the graph). The claim correction, live:
+    /// the current-config ceiling B·F is exceeded by admitted
+    /// existing graphs; the per-tick bound is the admission-epoch
+    /// shape.
+    #[test]
+    fn runtime_admission_tightening_binds_future_admissions_never_stranding_admitted_work() {
+        let mut spine = Spine::new(
+            RecordingWorld {
+                executed: Vec::new(),
+            },
+            100,
+        );
+        spine.set_admission_bounds(admission(64, 8, 1024));
+        let prereq = spine.schedule(spec(0, Field::Near, 10, 9999)).unwrap();
+        for i in 0..8u64 {
+            assert!(
+                spine
+                    .schedule(dep_spec(1, Field::Near, 1, i, vec![prereq]))
+                    .is_ok()
+            );
+        }
+        spine.run_ticks(9);
+        assert_eq!(spine.blocked_count(), 8);
+        assert_eq!(spine.declared_fan_in.get(&prereq.seq), Some(&8));
+        declared_fan_in_matches_revalidation(&spine);
+        // The runtime tightening, mid-herd (the next transition).
+        spine.set_admission_bounds(admission(64, 2, 1024));
+        // FUTURE admissions bind at the new cap: the ninth declarer
+        // is refused with the ADMITTED shape named as the observed
+        // count — the typed refusal the tightened config surfaces.
+        assert_eq!(
+            spine.schedule(dep_spec(1, Field::Near, 1, 8, vec![prereq])),
+            Err(ScheduleError::PrerequisiteFanInExceeded {
+                prerequisite: prereq,
+                observed: 9,
+                cap: 2
+            })
+        );
+        // Configuration alone changed no logical state (the
+        // retention-policy class).
+        assert_eq!(spine.stats().scheduled, 9, "the refused never exist");
+        // Tick 10: the prerequisite executes. The release visits
+        // exactly the ADMISSION-TIME fan-in — 8, not the current
+        // F=2 — no waiter stranded, the E-10 all-or-nothing contract
+        // preserved; the work stays bounded by the admitted shape
+        // (finite, deterministic, observable), never un-bounded.
+        spine.run_tick();
+        let counters = spine.housekeeping_stats();
+        assert_eq!(
+            counters.waiter_visits, 8,
+            "the admitted herd releases at its admission-time shape, \
+             not the tightened current cap"
+        );
+        assert_eq!(counters.release_unblocks, 8);
+        assert_eq!(counters.release_decrements, 0);
+        assert_eq!(counters.release_not_blocked, 0);
+        assert_release_charge_identity(&spine);
+        assert_eq!(spine.blocked_count(), 0, "no waiter stranded");
+        assert_eq!(counters.worst_tick_housekeeping, 8);
+        // The whole admitted herd executed in canonical order — the
+        // tightened cap changed nothing for the admitted graph.
+        spine.run_to_completion(100);
+        let mut expected = vec![9999u64];
+        expected.extend(0..8);
+        assert_eq!(spine.world().executed, expected);
+        assert_eq!(spine.stats().executed, 9);
+        assert_eq!(spine.housekeeping_stats().follow_ups_cropped, 0);
+        declared_fan_in_matches_revalidation(&spine);
+    }
+
+    /// R3 (D-EE-11) part 3 — ARM 2, THE RESTORED LEGACY GRAPH
+    /// EXCEPTION: a save whose graph's fan-in (8) exceeds the
+    /// restored spine's re-configured F (4) restores byte-identically
+    /// (restore is fail-closed on corruption, never on config), and
+    /// its ONE-TIME legacy release performs bounded by the SAVED
+    /// graph's own F-shape — 8 visits, no waiter stranded — while
+    /// the tightened config refuses new declarations at 4. The
+    /// universal-ceiling claim corrected to the precise one: the
+    /// closed form holds at the admitted graph's own shape, and a
+    /// control twin at the defaults proves the tightened cap
+    /// changed nothing for the admitted graph.
+    #[test]
+    fn a_legacy_over_f_save_restores_and_releases_once_bounded_by_its_saved_fan_in() {
+        fn build() -> Spine<SaveableNoopWorld> {
+            let mut spine = Spine::new(SaveableNoopWorld, 100);
+            spine.set_admission_bounds(admission(64, 8, 1024));
+            let prereq = spine
+                .schedule(spec(0, Field::Near, 10, 0))
+                .expect("the prerequisite schedules");
+            for i in 0..8u64 {
+                spine
+                    .schedule(dep_spec(1, Field::Near, 1, i, vec![prereq]))
+                    .expect("the herd schedules");
+            }
+            spine
+        }
+        // The mid-herd boundary: eight declarers parked on the
+        // far-due prerequisite, admitted at F=8.
+        let mut spine = build();
+        spine.run_tick();
+        assert_eq!(spine.blocked_count(), 8);
+        declared_fan_in_matches_revalidation(&spine);
+        let maintained = spine.declared_fan_in.clone();
+        let bytes = spine.save_bytes();
+        // The restored spine, re-configured BELOW the saved graph's
+        // fan-in — the admitted-existing-graph-exceeds-the-current-
+        // caps shape (identical to a genuine pre-cap legacy save:
+        // the wire never records configuration).
+        let mut tightened: Spine<SaveableNoopWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+        assert_eq!(tightened.save_bytes(), bytes, "byte-identical round trip");
+        assert_eq!(tightened.declared_fan_in, maintained);
+        declared_fan_in_matches_revalidation(&tightened);
+        tightened.set_admission_bounds(admission(64, 4, 1024));
+        let prereq = EventId { seq: 0 };
+        // New declarations refuse at the tightened cap, the observed
+        // count naming the saved graph's shape.
+        assert_eq!(
+            tightened.schedule(dep_spec(2, Field::Near, 1, 8, vec![prereq])),
+            Err(ScheduleError::PrerequisiteFanInExceeded {
+                prerequisite: prereq,
+                observed: 9,
+                cap: 4
+            })
+        );
+        assert_eq!(tightened.stats().scheduled, 9, "the refused never exist");
+        // The control twin: the SAME bytes at the DEFAULTS.
+        let mut defaulted: Spine<SaveableNoopWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+        // Both drain the herd to completion: the tightened cap
+        // changed NOTHING for the admitted graph — same executions,
+        // same release, same fingerprint, same save bytes.
+        tightened.run_to_completion(100);
+        defaulted.run_to_completion(100);
+        assert_eq!(tightened.stats().executed, 9);
+        assert_eq!(defaulted.stats().executed, 9);
+        assert_eq!(tightened.blocked_count(), 0);
+        assert_eq!(defaulted.blocked_count(), 0);
+        // THE ONE-TIME LEGACY RELEASE, bounded by the saved graph's
+        // own F-shape: 8 visits under a current config of F=4 —
+        // exceeding the current-config ceiling B·F, bounded by the
+        // saved shape, never un-bounded, never stranding.
+        let counters = tightened.housekeeping_stats();
+        assert_eq!(
+            counters.waiter_visits, 8,
+            "the legacy release is bounded by the saved graph's F-shape"
+        );
+        assert_eq!(counters.release_unblocks, 8);
+        assert_release_charge_identity(&tightened);
+        assert_eq!(
+            defaulted.housekeeping_stats().waiter_visits,
+            8,
+            "the defaults twin releases identically — the tightened cap \
+             changed nothing for the admitted graph"
+        );
+        assert_eq!(
+            tightened.engine_fingerprint(),
+            defaulted.engine_fingerprint()
+        );
+        assert_eq!(tightened.save_bytes(), defaulted.save_bytes());
+        assert_eq!(spine.stats().executed, 0, "the saving spine stays mid-herd");
+        declared_fan_in_matches_revalidation(&tightened);
     }
 
     /// §7.9 — THE STORMS RE-PINNED AT A CONFIGURED FAN-IN: the
