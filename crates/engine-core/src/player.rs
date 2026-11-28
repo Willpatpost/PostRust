@@ -4053,7 +4053,10 @@ mod tests {
                     }
                 }
                 for (index, col) in world.rotated().iter().enumerate().step_by(2) {
-                    let (min, max) = player_box(col.center, &config);
+                    // CA-05 consumer adaptation: the geometry read goes
+                    // through the accessor (the field is private since
+                    // the stale-cached-bounds fix).
+                    let (min, max) = player_box(col.center(), &config);
                     assert!(
                         same_option_vec3(
                             grid.depenetration(min, max),

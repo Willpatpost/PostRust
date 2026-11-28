@@ -49,21 +49,47 @@ use crate::player::{SKIN, StaticCollider};
 /// `R_y(yaw)` as `look_direction`/`step_player`: at `yaw = 0` the box
 /// is axis-aligned with its local +X toward world +X; a positive yaw
 /// rotates local +X toward world −Z... consistent with the player's
-/// facing math — see `to_world`). The frame (`cos_yaw`, `sin_yaw`) is
-/// derived once at construction and cached; construct only through
-/// [`RotatedCollider::new`] or [`RotatedCollider::from_base_yaw`],
-/// which validate and refuse degenerate/non-finite inputs.
+/// facing math — see `to_world`).
+///
+/// **The geometry fields are PRIVATE (F05, the stale-cached-bounds
+/// correctness fix):** the rotation frame (`cos_yaw`, `sin_yaw`) and
+/// the world AABB (`aabb_min`, `aabb_max`) are DERIVED values cached
+/// at construction so every query is pure arithmetic. When the
+/// geometry fields were public and writable, a legal field edit —
+/// `collider.center[0] = 10.0` — left those caches derived from the
+/// OLD geometry: `overlaps_box`'s broad phase rejected against the
+/// stale bounds (a translated collider reported a miss where its
+/// reconstruction reported a hit — the reproduced witness), and a
+/// broad-phase grid built from `world_aabb()` carried the stale
+/// volume. The caches can no longer disagree with the geometry
+/// because the geometry can no longer be edited in place: reads go
+/// through [`RotatedCollider::center`], [`RotatedCollider::half`],
+/// and [`RotatedCollider::yaw`], and movement/resizing/re-rotation
+/// go through the VALIDATED whole-value replacements
+/// [`RotatedCollider::moved_to`], [`RotatedCollider::resized`], and
+/// [`RotatedCollider::with_yaw`] (or reconstruction through
+/// [`RotatedCollider::new`] or [`RotatedCollider::from_base_yaw`]),
+/// which re-derive every cached value and refuse degenerate,
+/// non-finite, or derived-unrepresentable inputs — the shape is
+/// always internally consistent by construction.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RotatedCollider {
-    /// The box center in world coordinates.
-    pub center: [f32; 3],
+    /// The box center in world coordinates (private — see the type
+    /// docs; read through [`RotatedCollider::center`], replace
+    /// through [`RotatedCollider::moved_to`]).
+    center: [f32; 3],
     /// The half-extents in the LOCAL frame (`half[axis] > 0` on every
-    /// axis — degenerate extents are refused at construction).
-    pub half: [f32; 3],
+    /// axis — degenerate extents are refused at construction;
+    /// private — see the type docs; read through
+    /// [`RotatedCollider::half`], replace through
+    /// [`RotatedCollider::resized`]).
+    half: [f32; 3],
     /// The rotation about the world Y axis (radians). Any finite value
     /// is accepted; the frame is cached, so normalization is never
-    /// needed (the trigonometry is periodic).
-    pub yaw: f32,
+    /// needed (the trigonometry is periodic). Private — see the type
+    /// docs; read through [`RotatedCollider::yaw`], replace through
+    /// [`RotatedCollider::with_yaw`].
+    yaw: f32,
     /// The cached rotation frame — derived in the constructors, never
     /// recomputed per query.
     cos_yaw: f32,
@@ -82,7 +108,14 @@ impl RotatedCollider {
     /// component is non-finite, or any half-extent is non-positive
     /// (a degenerate box: the GO §4 adversarial "degenerate" class is
     /// refused at the representation boundary, exactly like the
-    /// player config's validation discipline).
+    /// player config's validation discipline), or when the DERIVED
+    /// bounds are unrepresentable (F05: the corner transform and the
+    /// Y extents are arithmetic on the inputs — finite inputs near
+    /// `f32::MAX` can overflow them to ±infinity or NaN, and a
+    /// collider whose cached world AABB carries a non-finite face
+    /// would never reject in the broad phase — an infinite bound
+    /// admits everything — so the unrepresentable shape is refused
+    /// at construction instead of cached).
     pub fn new(center: [f32; 3], half: [f32; 3], yaw: f32) -> Option<RotatedCollider> {
         let valid = center.iter().all(|v| v.is_finite())
             && half.iter().all(|v| v.is_finite() && *v > 0.0)
@@ -106,6 +139,17 @@ impl RotatedCollider {
         }
         aabb_min[1] = center[1] - half[1];
         aabb_max[1] = center[1] + half[1];
+        // The derived-bounds representability gate (F05): every
+        // cached face must be finite — the input validation above
+        // does NOT imply this (a diagonal yaw sums two near-`f32::MAX`
+        // corner terms past the finite range; a low center minus a
+        // huge half-extent underflows the Y face), and a non-finite
+        // cached bound silently disables the broad-phase rejection.
+        let representable =
+            aabb_min.iter().all(|v| v.is_finite()) && aabb_max.iter().all(|v| v.is_finite());
+        if !representable {
+            return None;
+        }
         Some(RotatedCollider {
             center,
             half,
@@ -135,6 +179,56 @@ impl RotatedCollider {
             [footprint_x / 2.0, height / 2.0, footprint_z / 2.0],
             yaw,
         )
+    }
+
+    /// The box center in world coordinates (the read accessor for the
+    /// private geometry field — see the type docs for why the field
+    /// itself is private).
+    pub fn center(&self) -> [f32; 3] {
+        self.center
+    }
+
+    /// The half-extents in the LOCAL frame (the read accessor for the
+    /// private geometry field — see the type docs for why the field
+    /// itself is private).
+    pub fn half(&self) -> [f32; 3] {
+        self.half
+    }
+
+    /// The rotation about the world Y axis in radians (the read
+    /// accessor for the private geometry field — see the type docs
+    /// for why the field itself is private).
+    pub fn yaw(&self) -> f32 {
+        self.yaw
+    }
+
+    /// Whole-value replacement for MOVEMENT: a new collider with the
+    /// given center, this collider's half-extents and yaw, every
+    /// cached value (frame, world AABB) re-derived — the validated
+    /// replacement for the field edit the pre-F05 public API allowed
+    /// (`collider.center = …` left the caches stale; this cannot).
+    /// `None` under exactly [`RotatedCollider::new`]'s refusal rules
+    /// (non-finite center, or the moved shape's derived bounds
+    /// overflowing the finite range).
+    pub fn moved_to(&self, center: [f32; 3]) -> Option<RotatedCollider> {
+        RotatedCollider::new(center, self.half, self.yaw)
+    }
+
+    /// Whole-value replacement for RESIZING: a new collider with the
+    /// given half-extents, this collider's center and yaw, every
+    /// cached value re-derived. `None` under exactly
+    /// [`RotatedCollider::new`]'s refusal rules (non-finite or
+    /// non-positive extents, or unrepresentable derived bounds).
+    pub fn resized(&self, half: [f32; 3]) -> Option<RotatedCollider> {
+        RotatedCollider::new(self.center, half, self.yaw)
+    }
+
+    /// Whole-value replacement for RE-ROTATION: a new collider with
+    /// the given yaw, this collider's center and half-extents, the
+    /// rotation frame and world AABB re-derived. `None` under exactly
+    /// [`RotatedCollider::new`]'s refusal rules.
+    pub fn with_yaw(&self, yaw: f32) -> Option<RotatedCollider> {
+        RotatedCollider::new(self.center, self.half, yaw)
     }
 
     /// The cached rotation frame `(cos(yaw), sin(yaw))`.
@@ -1657,5 +1751,243 @@ mod tests {
             "the camera pulls in behind the margin-expanded cover: {drawn_length} vs {desired_length}"
         );
         assert!(drawn_length > config.tp_min_distance, "above the floor");
+    }
+
+    /// **F05 regression — the stale-cached-bounds witness as the
+    /// crate's own battery.** Pre-fix, the public mutable `center`
+    /// field left the cached world AABB at the construction geometry
+    /// while the center moved: a unit box translated to x = 10 kept
+    /// bounds [-1, 1] and reported a MISS where the same collider
+    /// RECONSTRUCTED at x = 10 reported a hit (the reproduced
+    /// external witness, exit 101 — both programs used only safe
+    /// public operations). The field edit is now unrepresentable
+    /// (private geometry, validated whole-value replacement), and
+    /// this test pins the equivalence the replacement API owes: the
+    /// translated collider answers EVERY query exactly as its
+    /// reconstruction does.
+    #[test]
+    fn a_translated_collider_answers_with_current_geometry() {
+        let origin = RotatedCollider::new([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], 0.0).unwrap();
+        let moved = origin.moved_to([10.0, 0.0, 0.0]).unwrap();
+        let rebuilt = RotatedCollider::new(moved.center(), moved.half(), moved.yaw()).unwrap();
+        // The witness's own readout: the translated collider's cached
+        // world AABB sits at the translated position (pre-fix it
+        // stayed [-1, 1] on every axis).
+        assert_eq!(moved.world_aabb(), rebuilt.world_aabb());
+        assert_eq!(moved.world_aabb().min, [9.0, -1.0, -1.0]);
+        assert_eq!(moved.world_aabb().max, [11.0, 1.0, 1.0]);
+        // The witness's query: a box at the translated position.
+        let min = [9.5, -0.5, -0.5];
+        let max = [10.5, 0.5, 0.5];
+        assert!(moved.overlaps_box(min, max));
+        assert_eq!(
+            moved.overlaps_box(min, max),
+            rebuilt.overlaps_box(min, max),
+            "the translated and rebuilt colliders agree on the witness query"
+        );
+        // The full query surface agrees too: the segment through the
+        // translated position, the sweep toward it, and the
+        // depenetration out of it.
+        let (from, to) = ([5.0, 0.0, 0.0], [15.0, 0.0, 0.0]);
+        assert_eq!(
+            segment_rotated_hit(from, to, &moved, 0.0).map(|(t, _)| t),
+            segment_rotated_hit(from, to, &rebuilt, 0.0).map(|(t, _)| t)
+        );
+        assert_eq!(
+            moved.sweep_axis_box(min, max, 0, -10.0),
+            rebuilt.sweep_axis_box(min, max, 0, -10.0)
+        );
+        assert_eq!(
+            moved.push_out_box(min, max, 0.0),
+            rebuilt.push_out_box(min, max, 0.0)
+        );
+        // The old position is clear: the collider is GONE from where
+        // it was built (the mirror of the stale-bounds defect, which
+        // kept answering there).
+        assert!(!moved.overlaps_box([-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]));
+    }
+
+    /// **F05:** each whole-value replacement is EXACTLY the
+    /// reconstruction at the replaced geometry — the cached frame and
+    /// world bounds re-derived, equal over the whole struct (the
+    /// derived fields included, so a stale cache is detectable as
+    /// inequality) — and each inherits [`RotatedCollider::new`]'s
+    /// refusal rules verbatim (the degenerate and non-finite input
+    /// classes, plus the derived-bounds representability gate below).
+    #[test]
+    fn whole_value_replacements_equal_reconstruction() {
+        let base = RotatedCollider::new([3.0, 1.0, -4.0], [1.5, 2.0, 0.75], 0.6).unwrap();
+        let center = [10.0, 5.0, 7.0];
+        let half = [0.5, 3.0, 2.0];
+        let yaw = -1.2;
+        assert_eq!(
+            base.moved_to(center).unwrap(),
+            RotatedCollider::new(center, base.half(), base.yaw()).unwrap()
+        );
+        assert_eq!(
+            base.resized(half).unwrap(),
+            RotatedCollider::new(base.center(), half, base.yaw()).unwrap()
+        );
+        assert_eq!(
+            base.with_yaw(yaw).unwrap(),
+            RotatedCollider::new(base.center(), base.half(), yaw).unwrap()
+        );
+        // The refusals inherit `new`'s rules exactly.
+        assert!(base.moved_to([f32::NAN, 0.0, 0.0]).is_none());
+        assert!(base.moved_to([f32::INFINITY, 0.0, 0.0]).is_none());
+        assert!(base.resized([1.0, 0.0, 1.0]).is_none());
+        assert!(base.resized([1.0, -2.0, 1.0]).is_none());
+        assert!(base.resized([1.0, f32::INFINITY, 1.0]).is_none());
+        assert!(base.with_yaw(f32::NAN).is_none());
+    }
+
+    /// **F05 — the audit's constructor note (the derived-bounds
+    /// computation at the old :86–109):** the input validation
+    /// checks finiteness and positivity, THEN the corner transform
+    /// and Y extents run — finite inputs can still overflow that
+    /// arithmetic. A collider whose cached world AABB would carry a
+    /// non-finite face never rejects in the broad phase (an infinite
+    /// bound admits every query), so the unrepresentable shape is
+    /// refused at construction. The horizontal class: two
+    /// near-`f32::MAX` corner terms summed at a diagonal yaw; the
+    /// vertical class: a low center minus a huge half-extent. The
+    /// huge-but-REPRESENTABLE control still constructs (the gate
+    /// refuses unrepresentable results, never mere magnitude).
+    #[test]
+    fn construction_refuses_unrepresentable_derived_bounds() {
+        // Horizontal: half-extents at f32::MAX and a 45° yaw — the
+        // corner transform sums ±MAX·(cos45° + sin45°) ≈ 4.8e38 on a
+        // world axis, past the f32 finite range (±inf, or NaN where
+        // +inf and −inf corners meet in the min/max).
+        assert!(
+            RotatedCollider::new(
+                [0.0, 0.0, 0.0],
+                [f32::MAX, 1.0, f32::MAX],
+                std::f32::consts::FRAC_PI_4
+            )
+            .is_none()
+        );
+        // Vertical: every input finite, but center[1] − half[1]
+        // underflows to −inf (−3e38 − 3e38 is past the range).
+        assert!(
+            RotatedCollider::new([0.0, -3.0e38, 0.0], [1.0, 3.0e38, 1.0], 0.0).is_none(),
+            "the Y-extent underflow is refused"
+        );
+        // The representable control: the same magnitudes at yaw 0
+        // (each corner term stands alone — no sum), so the huge AABB
+        // is finite and the collider constructs.
+        let huge = RotatedCollider::new([0.0, 0.0, 0.0], [f32::MAX, 1.0, f32::MAX], 0.0)
+            .expect("huge but representable at yaw 0");
+        assert!(huge.world_aabb().min.iter().all(|v| v.is_finite()));
+        assert!(huge.world_aabb().max.iter().all(|v| v.is_finite()));
+        // The replacement APIs inherit the same gate: moving the
+        // representable huge collider is fine, re-rotating it to the
+        // diagonal-unrepresentable shape is refused.
+        assert!(huge.moved_to([1.0e10, 0.0, 0.0]).is_some());
+        assert!(huge.with_yaw(std::f32::consts::FRAC_PI_4).is_none());
+    }
+
+    /// **F05 — the static-grid build path (player.rs's
+    /// `grid_after_push`/`build_static_grid`, the old :679–703):**
+    /// a collider translated through the whole-value replacement
+    /// BEFORE insertion is found at its NEW position by BOTH
+    /// broad-phase regimes — the below-gate linear world and the
+    /// above-gate gridded world answer identically, at queries
+    /// placed where only the translated collider sits (the fillers
+    /// line a distant band). Pre-fix, a grid built from stale bounds
+    /// carried the OLD volume: the query at the new position missed
+    /// in the gridded world while the linear world hit — the exact
+    /// disagreement this test would catch. With the geometry
+    /// uneditable in place, the grid reads fresh bounds by
+    /// construction; this pins it for any future mutation surface.
+    #[test]
+    fn translated_colliders_are_found_below_and_above_the_grid_gate() {
+        use crate::player::{CollisionWorld, GRID_COLLIDER_GATE, StaticCollider};
+        // The translated cover: a 0.6-rad rotated box moved to
+        // x = 200 — far from every filler box.
+        let cover = RotatedCollider::new([0.0, 1.0, 0.0], [1.0, 1.0, 1.0], 0.6)
+            .unwrap()
+            .moved_to([200.0, 1.0, 0.0])
+            .unwrap();
+        // The below-gate world: 120 fillers + the cover = 121
+        // colliders — under the 128 gate, permanently linear.
+        let mut linear = CollisionWorld::new(0.0);
+        for index in 0..120 {
+            let x = (index % 40) as f32 * 2.5;
+            let z = (index / 40) as f32 * 2.5 - 40.0;
+            linear = linear.with_collider(StaticCollider {
+                min: [x, 0.0, z],
+                max: [x + 1.0, 2.0, z + 1.0],
+            });
+        }
+        linear = linear.with_rotated_collider(Some(cover));
+        // The above-gate world: 127 fillers + the cover = 128 — the
+        // gate crosses exactly at the rotated push, so the full grid
+        // builds over both lists from their CURRENT bounds.
+        let mut gridded = CollisionWorld::new(0.0);
+        for index in 0..127 {
+            let x = (index % 42) as f32 * 2.4;
+            let z = (index / 42) as f32 * 2.4 - 40.0;
+            gridded = gridded.with_collider(StaticCollider {
+                min: [x, 0.0, z],
+                max: [x + 1.0, 2.0, z + 1.0],
+            });
+        }
+        gridded = gridded.with_rotated_collider(Some(cover));
+        let linear_total = linear.colliders().len() + linear.rotated().len();
+        let gridded_total = gridded.colliders().len() + gridded.rotated().len();
+        assert!(
+            linear_total < GRID_COLLIDER_GATE,
+            "the linear regime ({linear_total} colliders)"
+        );
+        assert!(
+            gridded_total >= GRID_COLLIDER_GATE,
+            "the grid regime ({gridded_total} colliders)"
+        );
+
+        // The translated position (cover center x = 200, horizontal
+        // reach |cos 0.6| + |sin 0.6| ≈ 1.39): a player-sized box
+        // there overlaps ONLY the cover — both regimes must find it.
+        let (min, max) = ([199.5, 0.5, -0.5], [200.5, 1.5, 0.5]);
+        assert_eq!(
+            linear.box_overlaps(min, max),
+            gridded.box_overlaps(min, max)
+        );
+        assert!(
+            gridded.box_overlaps(min, max),
+            "the gridded regime finds the translated cover at its new position"
+        );
+        // A segment across the translated position: blocked, equally.
+        let (from, to) = ([195.0, 1.0, 0.0], [205.0, 1.0, 0.0]);
+        assert_eq!(
+            linear.segment_hit(from, to, 0.0),
+            gridded.segment_hit(from, to, 0.0)
+        );
+        assert!(
+            gridded.segment_hit(from, to, 0.0).is_some(),
+            "the segment through the translated position is blocked"
+        );
+        // A sweep toward the translated face contacts it, equally.
+        let (sweep_min, sweep_max) = ([190.0, 0.5, -0.5], [191.0, 1.5, 0.5]);
+        assert_eq!(
+            linear.sweep_axis(sweep_min, sweep_max, 0, 12.0),
+            gridded.sweep_axis(sweep_min, sweep_max, 0, 12.0)
+        );
+        let (_, contacted) = gridded.sweep_axis(sweep_min, sweep_max, 0, 12.0);
+        assert!(
+            contacted,
+            "the sweep toward the translated cover contacts it"
+        );
+        // Depenetration out of the translated cover: the same push.
+        assert_eq!(
+            linear.depenetration(min, max),
+            gridded.depenetration(min, max)
+        );
+        assert!(linear.depenetration(min, max).is_some());
+        // The OLD position (the origin, where the cover was built
+        // before translation): clear in both regimes — the translated
+        // collider no longer answers where it no longer is.
+        assert!(!linear.box_overlaps([-0.5, 0.5, -0.5], [0.5, 1.5, 0.5]));
+        assert!(!gridded.box_overlaps([-0.5, 0.5, -0.5], [0.5, 1.5, 0.5]));
     }
 }
