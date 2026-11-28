@@ -29,6 +29,7 @@
 //!     --ignored --nocapture
 //! ```
 
+use engine_renderer::WetFrame;
 use engine_renderer::lit_scene::{
     GROUND_Y, LightParams, RouteWaypoint, SCENE_EXTENT, day_preset, intersection_boxes,
     lit_surface_color, materials,
@@ -44,7 +45,9 @@ use engine_renderer::{
     ValidationPreference,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
+use engine_slice::corner_demo::corner_submission;
 use engine_slice::corner_demo::view_projection;
+use engine_slice::corner_scene::corner_bounds;
 use engine_slice::corner_weather::{RAIN_ALPHA, RAIN_MATERIAL, yaw_to_turn};
 use engine_slice::math::{camera_forward, camera_right};
 
@@ -236,7 +239,7 @@ fn wet_ground_gate_at(preference: DepthFormatPreference, label: &str) {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             replace_pipelines: true,
             depth_format: preference,
@@ -244,6 +247,16 @@ fn wet_ground_gate_at(preference: DepthFormatPreference, label: &str) {
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
+    // The per-frame sky/post/wet declarations (the deleted sticky
+    // setters' state, carried by each submission below): the
+    // all-off initial state is the dry baseline's own.
+    let mut sky_frame: Option<SkyFrame> = None;
+    let mut post_on = false;
+    let mut wet_on = false;
+
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
@@ -308,18 +321,40 @@ fn wet_ground_gate_at(preference: DepthFormatPreference, label: &str) {
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, eye, light, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                None,
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                size
+            ))
             .unwrap()
             .presented
     );
     let dry = renderer.take_frame_capture().unwrap().unwrap();
 
     // THE WET FRAME.
-    renderer.set_wet(true);
+    wet_on = true;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, eye, light, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                None,
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -610,20 +645,42 @@ fn wet_ground_gate_at(preference: DepthFormatPreference, label: &str) {
         },
         1.0,
     );
-    renderer.set_wet(false);
+    wet_on = false;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&high_matrix, high_eye, light, size)
+            .submit_frame(corner_submission(
+                &high_matrix,
+                high_eye,
+                light,
+                None,
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                size
+            ))
             .unwrap()
             .presented
     );
     let high_dry = renderer.take_frame_capture().unwrap().unwrap();
-    renderer.set_wet(true);
+    wet_on = true;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&high_matrix, high_eye, light, size)
+            .submit_frame(corner_submission(
+                &high_matrix,
+                high_eye,
+                light,
+                None,
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -692,11 +749,22 @@ fn wet_ground_gate_at(preference: DepthFormatPreference, label: &str) {
     );
 
     // THE DRY PATH RESTORED: byte-identical to the grazing baseline.
-    renderer.set_wet(false);
+    wet_on = false;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, eye, light, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                None,
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -739,12 +807,23 @@ fn wet_ground_gate_at(preference: DepthFormatPreference, label: &str) {
 
     // WARMED CONSTANCY: two more wet frames — the allocation set
     // constant, byte-identical captures.
-    renderer.set_wet(true);
+    wet_on = true;
     for _ in 0..2 {
         renderer.request_frame_capture().unwrap();
         assert!(
             renderer
-                .render_corner(&matrix, eye, light, size)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    eye,
+                    light,
+                    None,
+                    corner_bounds(),
+                    None,
+                    sky_frame,
+                    post_on,
+                    wet_on.then_some(WetFrame { ripple: None }),
+                    size
+                ))
                 .unwrap()
                 .presented
         );
@@ -759,43 +838,70 @@ fn wet_ground_gate_at(preference: DepthFormatPreference, label: &str) {
 
     // THE COMPOSITION SMOKES (one clean presented frame each):
     // wet + post (the reflection through the ACES tonemap);
-    renderer.set_post(true);
+    post_on = true;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, eye, light, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                None,
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                size
+            ))
             .unwrap()
             .presented
     );
     let _ = renderer.take_frame_capture().unwrap().unwrap();
     // wet + post + sky (the full Era-1 stack);
     let day = engine_renderer::sky::atmosphere_at(0.0);
-    renderer.set_sky(Some(engine_renderer::SkyFrame {
+    sky_frame = Some(engine_renderer::SkyFrame {
         palette: day.sky,
         disc_dir: day.disc_dir,
-    }));
+    });
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, eye, light, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                None,
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                size
+            ))
             .unwrap()
             .presented
     );
     let _ = renderer.take_frame_capture().unwrap().unwrap();
     // wet + shadows (the depth pass + the shadowed ground + the
     // reflection over it);
-    renderer.set_sky(None);
-    renderer.set_post(false);
+    sky_frame = None;
+    post_on = false;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(
+            .submit_frame(corner_submission(
                 &matrix,
                 eye,
                 light,
-                engine_slice::corner_demo::demo_bias(),
+                Some(engine_slice::corner_demo::demo_bias()),
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
                 size
-            )
+            ))
             .unwrap()
             .presented
     );
@@ -818,7 +924,18 @@ fn wet_ground_gate_at(preference: DepthFormatPreference, label: &str) {
     };
     renderer.request_frame_capture().unwrap();
     let populated = renderer
-        .render_corner_populated(&matrix, eye, light, &population, size)
+        .submit_frame(corner_submission(
+            &matrix,
+            eye,
+            light,
+            None,
+            corner_bounds(),
+            Some(population),
+            sky_frame,
+            post_on,
+            wet_on.then_some(WetFrame { ripple: None }),
+            size,
+        ))
         .unwrap();
     assert!(populated.presented);
     assert!(populated.geometry.proxy_draw_calls > 0);
@@ -1061,12 +1178,21 @@ fn the_grazing_specular_eye_swing_discriminates_beyond_tolerance_or_pins_the_bou
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
+    // The per-frame wet declaration (the deleted sticky setter's
+    // state, carried by each submission below; this test never
+    // toggles sky or post - the constant tails below): the dry
+    // baseline reads the all-off state first.
+    let mut wet_on = false;
+
     let size_in_pixels = app.window().size_in_pixels();
     assert_eq!(
         size_in_pixels, size,
@@ -1085,16 +1211,38 @@ fn the_grazing_specular_eye_swing_discriminates_beyond_tolerance_or_pins_the_bou
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, best_eye, best_light, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                best_eye,
+                best_light,
+                None,
+                corner_bounds(),
+                None,
+                None,
+                false,
+                wet_on.then_some(WetFrame { ripple: None }),
+                size
+            ))
             .unwrap()
             .presented
     );
     let dry = renderer.take_frame_capture().unwrap().unwrap();
-    renderer.set_wet(true);
+    wet_on = true;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, best_eye, best_light, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                best_eye,
+                best_light,
+                None,
+                corner_bounds(),
+                None,
+                None,
+                false,
+                wet_on.then_some(WetFrame { ripple: None }),
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1191,13 +1339,22 @@ fn first_frame_after_replacement_keeps_every_layer() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             replace_pipelines: true,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
+    // The per-frame sky/post/wet declarations (the deleted sticky
+    // setters' state, carried by each submission below).
+    let mut sky_frame: Option<SkyFrame>;
+    let mut post_on: bool;
+    let mut wet_on: bool;
+
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
@@ -1217,16 +1374,27 @@ fn first_frame_after_replacement_keeps_every_layer() {
     );
 
     let day = atmosphere_at(0.0);
-    renderer.set_sky(Some(SkyFrame {
+    sky_frame = Some(SkyFrame {
         palette: day.sky,
         disc_dir: day.disc_dir,
-    }));
-    renderer.set_post(true);
-    renderer.set_wet(true);
+    });
+    post_on = true;
+    wet_on = true;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&matrix, eye, light, BIAS, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1236,7 +1404,18 @@ fn first_frame_after_replacement_keeps_every_layer() {
     // The first frame on the replacement generation carries sky + wet +
     // post + shadowed (finding 6).
     let replacement = renderer
-        .render_corner_shadowed(&matrix, eye, light, BIAS, (size.0 + 8, size.1 + 8))
+        .submit_frame(corner_submission(
+            &matrix,
+            eye,
+            light,
+            Some(BIAS),
+            corner_bounds(),
+            None,
+            sky_frame,
+            post_on,
+            wet_on.then_some(WetFrame { ripple: None }),
+            (size.0 + 8, size.1 + 8),
+        ))
         .unwrap();
     assert!(replacement.recreated, "the resize forced a recreation");
     println!("first frame after replacement: recreated = true");
@@ -1244,7 +1423,18 @@ fn first_frame_after_replacement_keeps_every_layer() {
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&matrix, eye, light, BIAS, (size.0 + 8, size.1 + 8))
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                (size.0 + 8, size.1 + 8)
+            ))
             .unwrap()
             .presented
     );
@@ -1305,11 +1495,22 @@ fn first_frame_after_replacement_keeps_every_layer() {
 
     // SKY: the same pose with the sky layer OFF — the background
     // probe must change (sky equation vs the tonemapped clear).
-    renderer.set_sky(None);
+    sky_frame = None;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&matrix, eye, light, BIAS, new_size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                new_size
+            ))
             .unwrap()
             .presented
     );
@@ -1324,18 +1525,29 @@ fn first_frame_after_replacement_keeps_every_layer() {
         sky_probe_on, sky_probe_off,
         "the sky layer drew on the first frame after the replacement"
     );
-    renderer.set_sky(Some(SkyFrame {
+    sky_frame = Some(SkyFrame {
         palette: day.sky,
         disc_dir: day.disc_dir,
-    }));
+    });
 
     // WET: the same pose with the ground re-draw OFF — the lower
     // frame (where this pose's ground quad lives) must change.
-    renderer.set_wet(false);
+    wet_on = false;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&matrix, eye, light, BIAS, new_size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                new_size
+            ))
             .unwrap()
             .presented
     );
@@ -1369,15 +1581,26 @@ fn first_frame_after_replacement_keeps_every_layer() {
         "the wet ground re-draw changed the first frame after the replacement \
          ({bottom_differ} lower-half pixels)"
     );
-    renderer.set_wet(true);
+    wet_on = true;
 
     // POST: the same pose with the chain OFF — the tonemap and bloom
     // must change the frame (the composite's own signature).
-    renderer.set_post(false);
+    post_on = false;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&matrix, eye, light, BIAS, new_size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                new_size
+            ))
             .unwrap()
             .presented
     );
@@ -1403,7 +1626,7 @@ fn first_frame_after_replacement_keeps_every_layer() {
         "the post chain ran on the first frame after the replacement \
          ({post_differ} pixels differ from the postless frame)"
     );
-    renderer.set_post(true);
+    post_on = true;
 
     // Byte-identical repeat: request again, render the same pose at the
     // same new size, take, and assert byte-identical. The second frame
@@ -1411,7 +1634,18 @@ fn first_frame_after_replacement_keeps_every_layer() {
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&matrix, eye, light, BIAS, (size.0 + 8, size.1 + 8))
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                (size.0 + 8, size.1 + 8)
+            ))
             .unwrap()
             .presented
     );
@@ -1463,13 +1697,22 @@ fn first_frame_after_out_of_date_recreation_keeps_every_layer() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             replace_pipelines: true,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
+    // The per-frame sky/post/wet declarations (the deleted sticky
+    // setters' state, carried by each submission below).
+    let mut sky_frame: Option<SkyFrame>;
+    let mut post_on: bool;
+    let mut wet_on: bool;
+
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
@@ -1489,16 +1732,27 @@ fn first_frame_after_out_of_date_recreation_keeps_every_layer() {
     );
 
     let day = atmosphere_at(0.0);
-    renderer.set_sky(Some(SkyFrame {
+    sky_frame = Some(SkyFrame {
         palette: day.sky,
         disc_dir: day.disc_dir,
-    }));
-    renderer.set_post(true);
-    renderer.set_wet(true);
+    });
+    post_on = true;
+    wet_on = true;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&matrix, eye, light, BIAS, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1511,7 +1765,18 @@ fn first_frame_after_out_of_date_recreation_keeps_every_layer() {
     renderer.inject_acquire_out_of_date();
     renderer.request_frame_capture().unwrap();
     let out_of_date = renderer
-        .render_corner_shadowed(&matrix, eye, light, BIAS, size)
+        .submit_frame(corner_submission(
+            &matrix,
+            eye,
+            light,
+            Some(BIAS),
+            corner_bounds(),
+            None,
+            sky_frame,
+            post_on,
+            wet_on.then_some(WetFrame { ripple: None }),
+            size,
+        ))
         .unwrap();
     assert!(out_of_date.recreated, "the injection forced a recreation");
     assert!(out_of_date.presented, "the injection frame was presented");
@@ -1577,11 +1842,22 @@ fn first_frame_after_out_of_date_recreation_keeps_every_layer() {
 
     // SKY: the same pose with the sky layer OFF — the background
     // probe must change (sky equation vs the tonemapped clear).
-    renderer.set_sky(None);
+    sky_frame = None;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&matrix, eye, light, BIAS, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1596,18 +1872,29 @@ fn first_frame_after_out_of_date_recreation_keeps_every_layer() {
         sky_probe_on, sky_probe_off,
         "the sky layer drew on the first frame after the out-of-date recreation"
     );
-    renderer.set_sky(Some(SkyFrame {
+    sky_frame = Some(SkyFrame {
         palette: day.sky,
         disc_dir: day.disc_dir,
-    }));
+    });
 
     // WET: the same pose with the ground re-draw OFF — the lower
     // frame (where this pose's ground quad lives) must change.
-    renderer.set_wet(false);
+    wet_on = false;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&matrix, eye, light, BIAS, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1641,15 +1928,26 @@ fn first_frame_after_out_of_date_recreation_keeps_every_layer() {
         "the wet ground re-draw changed the first frame after the out-of-date recreation \
          ({bottom_differ} lower-half pixels)"
     );
-    renderer.set_wet(true);
+    wet_on = true;
 
     // POST: the same pose with the chain OFF — the tonemap and bloom
     // must change the frame (the composite's own signature).
-    renderer.set_post(false);
+    post_on = false;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&matrix, eye, light, BIAS, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1675,7 +1973,7 @@ fn first_frame_after_out_of_date_recreation_keeps_every_layer() {
         "the post chain ran on the first frame after the out-of-date recreation \
          ({post_differ} pixels differ from the postless frame)"
     );
-    renderer.set_post(true);
+    post_on = true;
 
     // Byte-identical repeat: request again, render the same pose at the
     // same size, take, and assert byte-identical. The second frame
@@ -1683,7 +1981,18 @@ fn first_frame_after_out_of_date_recreation_keeps_every_layer() {
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&matrix, eye, light, BIAS, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1705,7 +2014,18 @@ fn first_frame_after_out_of_date_recreation_keeps_every_layer() {
     // arming anything and assert `.recreated` is FALSE (the plan was
     // consumed exactly once; no lingering recreation intent).
     let no_injection = renderer
-        .render_corner_shadowed(&matrix, eye, light, BIAS, size)
+        .submit_frame(corner_submission(
+            &matrix,
+            eye,
+            light,
+            Some(BIAS),
+            corner_bounds(),
+            None,
+            sky_frame,
+            post_on,
+            wet_on.then_some(WetFrame { ripple: None }),
+            size,
+        ))
         .unwrap();
     assert!(
         !no_injection.recreated,
@@ -1765,7 +2085,7 @@ fn wet_targets_honor_the_negotiated_depth_format() {
         let mut renderer = Renderer::new(
             app.window(),
             RenderConfig {
-                demo_scene: DemoScenePreference::Corner,
+                demo_scene: DemoScenePreference::Omitted,
                 validation: ValidationPreference::On,
                 replace_pipelines: true,
                 depth_format: preference,
@@ -1773,6 +2093,15 @@ fn wet_targets_honor_the_negotiated_depth_format() {
             },
         )
         .unwrap();
+        // P4 S6: the corner content is ATTACHED (the Corner construction
+        // preference is deleted) - the same public attach every consumer uses.
+        engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
+        // The per-frame sky/post/wet declarations (the deleted sticky
+        // setters' state, carried by each submission below).
+        let sky_frame: Option<SkyFrame> = None;
+        let mut post_on: bool;
+        let mut wet_on: bool;
+
         let reported = renderer.stats().depth_format.clone();
         assert!(
             renderer.stats().validation_active,
@@ -1795,8 +2124,8 @@ fn wet_targets_honor_the_negotiated_depth_format() {
             let size = app.window().size_in_pixels();
             assert_eq!(size, (256, 256));
 
-            renderer.set_post(false);
-            renderer.set_wet(true);
+            post_on = false;
+            wet_on = true;
             let matrix = view_projection(
                 RouteWaypoint {
                     position: eye,
@@ -1807,7 +2136,18 @@ fn wet_targets_honor_the_negotiated_depth_format() {
             renderer.request_frame_capture().unwrap();
             assert!(
                 renderer
-                    .render_corner_shadowed(&matrix, eye, light, BIAS, size)
+                    .submit_frame(corner_submission(
+                        &matrix,
+                        eye,
+                        light,
+                        Some(BIAS),
+                        corner_bounds(),
+                        None,
+                        sky_frame,
+                        post_on,
+                        wet_on.then_some(WetFrame { ripple: None }),
+                        size
+                    ))
                     .unwrap()
                     .presented
             );
@@ -1853,7 +2193,18 @@ fn wet_targets_honor_the_negotiated_depth_format() {
             );
             // Render at the new size (this forces recreation)
             let outcome = renderer
-                .render_corner_shadowed(&matrix, eye, light, BIAS, new_size)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    eye,
+                    light,
+                    Some(BIAS),
+                    corner_bounds(),
+                    None,
+                    sky_frame,
+                    post_on,
+                    wet_on.then_some(WetFrame { ripple: None }),
+                    new_size,
+                ))
                 .unwrap();
             assert!(outcome.recreated, "the resize forced a recreation");
             println!("wet fallback {forced_name} at 264: recreated = true");
@@ -1869,7 +2220,18 @@ fn wet_targets_honor_the_negotiated_depth_format() {
             renderer.request_frame_capture().unwrap();
             assert!(
                 renderer
-                    .render_corner_shadowed(&matrix, eye, light, BIAS, new_size)
+                    .submit_frame(corner_submission(
+                        &matrix,
+                        eye,
+                        light,
+                        Some(BIAS),
+                        corner_bounds(),
+                        None,
+                        sky_frame,
+                        post_on,
+                        wet_on.then_some(WetFrame { ripple: None }),
+                        new_size
+                    ))
                     .unwrap()
                     .presented
             );
@@ -1897,16 +2259,27 @@ fn wet_targets_honor_the_negotiated_depth_format() {
             // Prove the wet layer actually redrew on the replacement
             // generation: toggle wet OFF, render same pose+size, toggle ON
             // and assert lower half differs by more than measured floor
-            renderer.set_wet(false);
+            wet_on = false;
             renderer.request_frame_capture().unwrap();
             assert!(
                 renderer
-                    .render_corner_shadowed(&matrix, eye, light, BIAS, new_size)
+                    .submit_frame(corner_submission(
+                        &matrix,
+                        eye,
+                        light,
+                        Some(BIAS),
+                        corner_bounds(),
+                        None,
+                        sky_frame,
+                        post_on,
+                        wet_on.then_some(WetFrame { ripple: None }),
+                        new_size
+                    ))
                     .unwrap()
                     .presented
             );
             let wet_off = renderer.take_frame_capture().unwrap().unwrap();
-            renderer.set_wet(true);
+            wet_on = true;
 
             // MEASURED: on the 2026-11-24 lavapipe run, wet_differ =
             // 34848 of 34848 lower-half pixels (264x132 - the wet
@@ -1954,7 +2327,18 @@ fn wet_targets_honor_the_negotiated_depth_format() {
             renderer.request_frame_capture().unwrap();
             assert!(
                 renderer
-                    .render_corner_shadowed(&matrix, eye, light, BIAS, new_size)
+                    .submit_frame(corner_submission(
+                        &matrix,
+                        eye,
+                        light,
+                        Some(BIAS),
+                        corner_bounds(),
+                        None,
+                        sky_frame,
+                        post_on,
+                        wet_on.then_some(WetFrame { ripple: None }),
+                        new_size
+                    ))
                     .unwrap()
                     .presented
             );
@@ -1962,7 +2346,18 @@ fn wet_targets_honor_the_negotiated_depth_format() {
             renderer.request_frame_capture().unwrap();
             assert!(
                 renderer
-                    .render_corner_shadowed(&matrix, eye, light, BIAS, new_size)
+                    .submit_frame(corner_submission(
+                        &matrix,
+                        eye,
+                        light,
+                        Some(BIAS),
+                        corner_bounds(),
+                        None,
+                        sky_frame,
+                        post_on,
+                        wet_on.then_some(WetFrame { ripple: None }),
+                        new_size
+                    ))
                     .unwrap()
                     .presented
             );
@@ -1991,11 +2386,22 @@ fn wet_targets_honor_the_negotiated_depth_format() {
             );
 
             // Set post ON (wet stays on from step 2)
-            renderer.set_post(true);
+            post_on = true;
             renderer.request_frame_capture().unwrap();
             assert!(
                 renderer
-                    .render_corner_shadowed(&matrix, eye, light, BIAS, new_size)
+                    .submit_frame(corner_submission(
+                        &matrix,
+                        eye,
+                        light,
+                        Some(BIAS),
+                        corner_bounds(),
+                        None,
+                        sky_frame,
+                        post_on,
+                        wet_on.then_some(WetFrame { ripple: None }),
+                        new_size
+                    ))
                     .unwrap()
                     .presented
             );
@@ -2023,7 +2429,18 @@ fn wet_targets_honor_the_negotiated_depth_format() {
             // Resize AGAIN to 272×272
             let larger_size = (256 + 16, 256 + 16);
             let outcome = renderer
-                .render_corner_shadowed(&matrix, eye, light, BIAS, larger_size)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    eye,
+                    light,
+                    Some(BIAS),
+                    corner_bounds(),
+                    None,
+                    sky_frame,
+                    post_on,
+                    wet_on.then_some(WetFrame { ripple: None }),
+                    larger_size,
+                ))
                 .unwrap();
             assert!(outcome.recreated, "the second resize forced a recreation");
             println!("wet fallback {forced_name} combined at 272: recreated = true");
@@ -2041,7 +2458,18 @@ fn wet_targets_honor_the_negotiated_depth_format() {
             renderer.request_frame_capture().unwrap();
             assert!(
                 renderer
-                    .render_corner_shadowed(&matrix, eye, light, BIAS, larger_size)
+                    .submit_frame(corner_submission(
+                        &matrix,
+                        eye,
+                        light,
+                        Some(BIAS),
+                        corner_bounds(),
+                        None,
+                        sky_frame,
+                        post_on,
+                        wet_on.then_some(WetFrame { ripple: None }),
+                        larger_size
+                    ))
                     .unwrap()
                     .presented
             );
@@ -2068,16 +2496,27 @@ fn wet_targets_honor_the_negotiated_depth_format() {
 
             // Prove both layers with differentials at the final extent
             // (a) post differential — set_post(false), render+capture, set_post(true)
-            renderer.set_post(false);
+            post_on = false;
             renderer.request_frame_capture().unwrap();
             assert!(
                 renderer
-                    .render_corner_shadowed(&matrix, eye, light, BIAS, larger_size)
+                    .submit_frame(corner_submission(
+                        &matrix,
+                        eye,
+                        light,
+                        Some(BIAS),
+                        corner_bounds(),
+                        None,
+                        sky_frame,
+                        post_on,
+                        wet_on.then_some(WetFrame { ripple: None }),
+                        larger_size
+                    ))
                     .unwrap()
                     .presented
             );
             let no_post = renderer.take_frame_capture().unwrap().unwrap();
-            renderer.set_post(true);
+            post_on = true;
 
             // MEASURED: on the 2026-11-24 lavapipe run, post_differ =
             // 73984 of 73984 pixels (272x272 - the ACES tonemap +
@@ -2103,16 +2542,26 @@ fn wet_targets_honor_the_negotiated_depth_format() {
             );
 
             // (b) wet differential — set_wet(false), render+capture, set_wet(true)
-            renderer.set_wet(false);
+            wet_on = false;
             renderer.request_frame_capture().unwrap();
             assert!(
                 renderer
-                    .render_corner_shadowed(&matrix, eye, light, BIAS, larger_size)
+                    .submit_frame(corner_submission(
+                        &matrix,
+                        eye,
+                        light,
+                        Some(BIAS),
+                        corner_bounds(),
+                        None,
+                        sky_frame,
+                        post_on,
+                        wet_on.then_some(WetFrame { ripple: None }),
+                        larger_size
+                    ))
                     .unwrap()
                     .presented
             );
             let no_wet = renderer.take_frame_capture().unwrap().unwrap();
-            renderer.set_wet(true);
 
             // MEASURED: on the 2026-11-24 lavapipe run, wet_differ =
             // 36251 of 36960 lower-half pixels (the 709 unchanged are
@@ -2188,13 +2637,22 @@ fn shadowed_wet_ground_reads_the_current_camera() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             replace_pipelines: true,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
+    // The per-frame sky/post/wet declarations (the deleted sticky
+    // setters' state, carried by each submission below).
+
+    let mut post_on: bool;
+    let mut wet_on: bool;
+
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
@@ -2233,9 +2691,9 @@ fn shadowed_wet_ground_reads_the_current_camera() {
     // Wet ON, post OFF, sky OFF — the finding's scope. The FIRST
     // corner frame this renderer draws is SHADOWED+wet: the corner
     // region's uninitialized-camera window.
-    renderer.set_wet(true);
-    renderer.set_post(false);
-    renderer.set_sky(None);
+    wet_on = true;
+    post_on = false;
+    let sky_frame: Option<SkyFrame> = None;
 
     // Four wet captures alternating the poses across both frame
     // slots (A, B, A, B — the capture-only renders alternate slots
@@ -2248,7 +2706,18 @@ fn shadowed_wet_ground_reads_the_current_camera() {
             renderer.request_frame_capture().unwrap();
             assert!(
                 renderer
-                    .render_corner_shadowed(&matrices[index], eye, light, BIAS, size)
+                    .submit_frame(corner_submission(
+                        &matrices[index],
+                        eye,
+                        light,
+                        Some(BIAS),
+                        corner_bounds(),
+                        None,
+                        sky_frame,
+                        post_on,
+                        wet_on.then_some(WetFrame { ripple: None }),
+                        size
+                    ))
                     .unwrap()
                     .presented
             );
@@ -2260,7 +2729,7 @@ fn shadowed_wet_ground_reads_the_current_camera() {
     // ground re-draw OFF (the blend's matte term is whatever the
     // shadowed scene pass rendered there — lit or shadowed ground,
     // the captured term keeps the model valid either way).
-    renderer.set_wet(false);
+    wet_on = false;
     let dry_captures: Vec<_> = poses
         .iter()
         .map(|(eye, _aim, _)| {
@@ -2268,7 +2737,18 @@ fn shadowed_wet_ground_reads_the_current_camera() {
             renderer.request_frame_capture().unwrap();
             assert!(
                 renderer
-                    .render_corner_shadowed(&matrices[index], *eye, light, BIAS, size)
+                    .submit_frame(corner_submission(
+                        &matrices[index],
+                        *eye,
+                        light,
+                        Some(BIAS),
+                        corner_bounds(),
+                        None,
+                        sky_frame,
+                        post_on,
+                        wet_on.then_some(WetFrame { ripple: None }),
+                        size
+                    ))
                     .unwrap()
                     .presented
             );
@@ -2366,21 +2846,43 @@ fn shadowed_wet_ground_reads_the_current_camera() {
     // patch (through the ACES tonemap the blend is not directly
     // oracle-comparable, but a stale camera would reject the
     // EQUAL-depth ground redraw entirely and the two would match).
-    renderer.set_post(true);
-    renderer.set_wet(true);
+    post_on = true;
+    wet_on = true;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&matrices[0], poses[0].0, light, BIAS, size)
+            .submit_frame(corner_submission(
+                &matrices[0],
+                poses[0].0,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                size
+            ))
             .unwrap()
             .presented
     );
     let hdr_wet = renderer.take_frame_capture().unwrap().unwrap();
-    renderer.set_wet(false);
+    wet_on = false;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&matrices[0], poses[0].0, light, BIAS, size)
+            .submit_frame(corner_submission(
+                &matrices[0],
+                poses[0].0,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_on.then_some(WetFrame { ripple: None }),
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -2455,12 +2957,21 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
+    // The per-frame sky/post declarations (the deleted sticky
+    // setters' state; constant across this test's captures - the
+    // wet axis rides the capture arguments below).
+    let sky_frame: Option<SkyFrame> = None;
+    let post_on = false;
+
     let size = app.window().size_in_pixels();
     assert_eq!(size, (512, 512));
     assert!(renderer.stats().validation_active);
@@ -2482,14 +2993,30 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
     let light = day_preset();
     let empty = rainless_population();
 
-    // One render + capture at the current sticky wet state.
+    // One render + capture at the given per-frame state (the deleted
+    // sticky setters' state, now the caller's arguments - the
+    // closure must not borrow the locals across the toggles).
     let capture = |renderer: &mut Renderer,
-                   population: &ProxyPopulation<'_>|
+                   population: &ProxyPopulation<'_>,
+                   sky: Option<SkyFrame>,
+                   post: bool,
+                   wet: bool|
      -> engine_renderer::CapturedFrame {
         renderer.request_frame_capture().unwrap();
         assert!(
             renderer
-                .render_corner_populated(&matrix, eye, light, population, size)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    eye,
+                    light,
+                    None,
+                    corner_bounds(),
+                    Some(*population),
+                    sky,
+                    post,
+                    wet.then_some(WetFrame { ripple: None }),
+                    size
+                ))
                 .unwrap()
                 .presented
         );
@@ -2497,10 +3024,8 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
     };
 
     // D and W: the dry ground and the wet ground (no rain).
-    renderer.set_wet(false);
-    let dry = capture(&mut renderer, &empty);
-    renderer.set_wet(true);
-    let wet = capture(&mut renderer, &empty);
+    let dry = capture(&mut renderer, &empty, sky_frame, post_on, false);
+    let wet = capture(&mut renderer, &empty, sky_frame, post_on, true);
 
     // The placement pixel P0: the most CONTRASTIVE reflective ground
     // pixel in the lower frame (W - D maximal, W bright) whose CPU
@@ -2626,10 +3151,8 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
 
     // R_DRY (the streak's presence witness over the dry ground)
     // and R (the ordered blend over the wet ground).
-    renderer.set_wet(false);
-    let streak_dry = capture(&mut renderer, &streak_population);
-    renderer.set_wet(true);
-    let streak_wet = capture(&mut renderer, &streak_population);
+    let streak_dry = capture(&mut renderer, &streak_population, sky_frame, post_on, false);
+    let streak_wet = capture(&mut renderer, &streak_population, sky_frame, post_on, true);
 
     // The streak's CPU-projected footprint (the weather gate's own
     // projector: the mesh corners through the packed instance
@@ -2866,7 +3389,7 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
         rain_material: RAIN_MATERIAL,
     };
     let behind_footprint = streak_footprint(&behind_streak, &matrix, size);
-    let behind_wet = capture(&mut renderer, &behind_population);
+    let behind_wet = capture(&mut renderer, &behind_population, sky_frame, post_on, true);
     for y in behind_footprint.min_y..=behind_footprint.max_y {
         for x in behind_footprint.min_x..=behind_footprint.max_x {
             assert_eq!(
@@ -2883,9 +3406,8 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
     // must still move the witness pixel wet-vs-rain (the defect
     // erasure would leave the HDR pair identical at high
     // reflectivity).
-    renderer.set_post(true);
-    let wet_post = capture(&mut renderer, &empty);
-    let streak_post = capture(&mut renderer, &streak_population);
+    let wet_post = capture(&mut renderer, &empty, sky_frame, true, true);
+    let streak_post = capture(&mut renderer, &streak_population, sky_frame, true, true);
     let post_delta = (wet_post.pixel_rgba(w_x, w_y)[w_channel] as i32
         - streak_post.pixel_rgba(w_x, w_y)[w_channel] as i32)
         .abs();

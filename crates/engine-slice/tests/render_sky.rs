@@ -25,7 +25,8 @@ use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 
 use engine_renderer::lit_scene::RouteWaypoint;
 use engine_renderer::lit_scene::{day_preset, night_preset};
-use engine_slice::corner_demo::view_projection;
+use engine_slice::corner_demo::{corner_submission, view_projection};
+use engine_slice::corner_scene::{attach_corner_scene, corner_bounds};
 use engine_slice::math::{camera_forward, camera_right};
 
 /// One aimed camera: the corner route's own projection (65°, near
@@ -111,17 +112,26 @@ fn sky_pixels_match_sky_color_and_never_touch_covered_geometry() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             replace_pipelines: true,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner
+    // construction preference is deleted).
+    attach_corner_scene(&mut renderer).unwrap();
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
     let _ = app.frame();
+
+    // THE PER-FRAME SKY DECLARATION (P4 S6: the deleted set_sky
+    // sticky's state, carried by each submission — the same
+    // discipline the corner demo's route carries): the known-answer
+    // poses below assign the palette before the first submission.
+    let mut sky: Option<SkyFrame>;
 
     // THE LAZY PROOF: the skyless corner's allocation pins hold
     // BEFORE the first sky frame (the skyless path pays nothing).
@@ -154,10 +164,10 @@ fn sky_pixels_match_sky_color_and_never_touch_covered_geometry() {
     // OPEN road axes and stay at the street-level eye.
     let day = atmosphere_at(0.0);
     let sun_dir = day.disc_dir;
-    renderer.set_sky(Some(SkyFrame {
+    sky = Some(SkyFrame {
         palette: day.sky,
         disc_dir: sun_dir,
-    }));
+    });
     let eye = [0.0, 1.7, 0.0];
     let high_eye = [0.0, 25.0, 0.0];
     let poses = [
@@ -180,7 +190,18 @@ fn sky_pixels_match_sky_color_and_never_touch_covered_geometry() {
         renderer.request_frame_capture().unwrap();
         assert!(
             renderer
-                .render_corner(&matrix, position, day_preset(), size)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    position,
+                    day_preset(),
+                    None,
+                    corner_bounds(),
+                    None,
+                    sky,
+                    false,
+                    None,
+                    size
+                ))
                 .unwrap()
                 .presented
         );
@@ -218,16 +239,27 @@ fn sky_pixels_match_sky_color_and_never_touch_covered_geometry() {
     // the street-level origin, so the check rides the above-mass
     // eye like the sun pose).
     let night = atmosphere_at(1.0);
-    renderer.set_sky(Some(SkyFrame {
+    sky = Some(SkyFrame {
         palette: night.sky,
         disc_dir: night.disc_dir,
-    }));
+    });
     let toward = std::array::from_fn(|i| high_eye[i] + night.disc_dir[i]);
     let matrix = aimed(high_eye, toward);
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, high_eye, night_preset(), size)
+            .submit_frame(corner_submission(
+                &matrix,
+                high_eye,
+                night_preset(),
+                None,
+                corner_bounds(),
+                None,
+                sky,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -259,23 +291,44 @@ fn sky_pixels_match_sky_color_and_never_touch_covered_geometry() {
         [0.0, -1.0, 0.0, 0.0],
         [0.0, 0.0, 0.5, 1.0],
     ];
-    renderer.set_sky(None);
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&ground_matrix, [0.0, 1.7, 0.0], day_preset(), size)
+            .submit_frame(corner_submission(
+                &ground_matrix,
+                [0.0, 1.7, 0.0],
+                day_preset(),
+                None,
+                corner_bounds(),
+                None,
+                sky,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
     let without_sky = renderer.take_frame_capture().unwrap().unwrap();
-    renderer.set_sky(Some(SkyFrame {
+    sky = Some(SkyFrame {
         palette: day.sky,
         disc_dir: sun_dir,
-    }));
+    });
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&ground_matrix, [0.0, 1.7, 0.0], day_preset(), size)
+            .submit_frame(corner_submission(
+                &ground_matrix,
+                [0.0, 1.7, 0.0],
+                day_preset(),
+                None,
+                corner_bounds(),
+                None,
+                sky,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -293,16 +346,38 @@ fn sky_pixels_match_sky_color_and_never_touch_covered_geometry() {
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, pose.position, day_preset(), size)
+            .submit_frame(corner_submission(
+                &matrix,
+                pose.position,
+                day_preset(),
+                None,
+                corner_bounds(),
+                None,
+                sky,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
     let sky_visible = renderer.take_frame_capture().unwrap().unwrap();
-    renderer.set_sky(None);
+    sky = None;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, pose.position, day_preset(), size)
+            .submit_frame(corner_submission(
+                &matrix,
+                pose.position,
+                day_preset(),
+                None,
+                corner_bounds(),
+                None,
+                sky,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -344,15 +419,26 @@ fn sky_pixels_match_sky_color_and_never_touch_covered_geometry() {
         (2, 1, 1, 0, 0),
         "the sky state's and the capture buffer's one-time allocation deltas"
     );
-    renderer.set_sky(Some(SkyFrame {
+    sky = Some(SkyFrame {
         palette: day.sky,
         disc_dir: sun_dir,
-    }));
+    });
     for _ in 0..2 {
         renderer.request_frame_capture().unwrap();
         assert!(
             renderer
-                .render_corner(&matrix, pose.position, day_preset(), size)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    pose.position,
+                    day_preset(),
+                    None,
+                    corner_bounds(),
+                    None,
+                    sky,
+                    false,
+                    None,
+                    size
+                ))
                 .unwrap()
                 .presented
         );
@@ -374,13 +460,18 @@ fn sky_pixels_match_sky_color_and_never_touch_covered_geometry() {
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(
+            .submit_frame(corner_submission(
                 &matrix,
                 pose.position,
                 day_preset(),
-                engine_slice::corner_demo::demo_bias(),
+                Some(engine_slice::corner_demo::demo_bias()),
+                corner_bounds(),
+                None,
+                sky,
+                false,
+                None,
                 size
-            )
+            ))
             .unwrap()
             .presented
     );
@@ -422,12 +513,13 @@ fn sky_pixels_match_sky_color_and_never_touch_covered_geometry() {
         let mut renderer2 = Renderer::new(
             app2.window(),
             RenderConfig {
-                demo_scene: DemoScenePreference::Corner,
+                demo_scene: DemoScenePreference::Omitted,
                 validation: ValidationPreference::On,
                 ..Default::default()
             },
         )
         .unwrap();
+        attach_corner_scene(&mut renderer2).unwrap();
         let size2 = app2.window().size_in_pixels();
         assert_eq!(size2, (264, 200));
         // The aim: the sun direction perturbed ~8° toward a
@@ -467,14 +559,25 @@ fn sky_pixels_match_sky_color_and_never_touch_covered_geometry() {
             },
             size2.0 as f32 / size2.1 as f32,
         );
-        renderer2.set_sky(Some(SkyFrame {
+        let sky2 = Some(SkyFrame {
             palette: day.sky,
             disc_dir: sun,
-        }));
+        });
         renderer2.request_frame_capture().unwrap();
         assert!(
             renderer2
-                .render_corner(&matrix2, eye2, day_preset(), size2)
+                .submit_frame(corner_submission(
+                    &matrix2,
+                    eye2,
+                    day_preset(),
+                    None,
+                    corner_bounds(),
+                    None,
+                    sky2,
+                    false,
+                    None,
+                    size2
+                ))
                 .unwrap()
                 .presented
         );

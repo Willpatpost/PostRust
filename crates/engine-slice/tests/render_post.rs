@@ -33,11 +33,12 @@ use engine_renderer::post::{
 use engine_renderer::shadows::ShadowBias;
 use engine_renderer::sky::{atmosphere_at, sky_color};
 use engine_renderer::{
-    DemoScenePreference, DepthFormatPreference, DynamicLayers, FrameCamera, FrameSubmission,
-    OutputTarget, RenderConfig, Renderer, SceneFrame, SkyFrame, TargetFaultSite, TargetFaultStage,
-    ValidationPreference, WetFrame,
+    DemoScenePreference, DepthFormatPreference, RenderConfig, Renderer, SkyFrame, TargetFaultSite,
+    TargetFaultStage, ValidationPreference, WetFrame,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
+use engine_slice::corner_demo::corner_submission;
+use engine_slice::corner_scene::corner_bounds;
 
 use engine_renderer::lit_scene::day_preset;
 use engine_renderer::lit_scene::{LightParams, RouteWaypoint, lit_surface_color, materials};
@@ -192,13 +193,21 @@ fn post_pixels_match_post_rs_and_the_disc_blooms() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             replace_pipelines: true,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
+    // The per-frame sky/post/wet declarations (the deleted sticky
+    // setters' state, carried by each submission below).
+    let mut sky_frame: Option<SkyFrame> = None;
+    let mut post_on = false;
+
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
@@ -229,7 +238,18 @@ fn post_pixels_match_post_rs_and_the_disc_blooms() {
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, high_eye, day_preset(), size)
+            .submit_frame(corner_submission(
+                &matrix,
+                high_eye,
+                day_preset(),
+                None,
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -237,15 +257,26 @@ fn post_pixels_match_post_rs_and_the_disc_blooms() {
 
     // THE POST FRAMES: the sky + the chain (the disc is the bloom
     // feeder the gate pins).
-    renderer.set_sky(Some(SkyFrame {
+    sky_frame = Some(SkyFrame {
         palette: day.sky,
         disc_dir: sun_dir,
-    }));
-    renderer.set_post(true);
+    });
+    post_on = true;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, high_eye, day_preset(), size)
+            .submit_frame(corner_submission(
+                &matrix,
+                high_eye,
+                day_preset(),
+                None,
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -423,12 +454,23 @@ fn post_pixels_match_post_rs_and_the_disc_blooms() {
     // THE POSTLESS PATH RESTORED: post off and skyless again — the
     // frame is BYTE-IDENTICAL to the baseline (the post state
     // exists and stays allocated; the postless path ignores it).
-    renderer.set_post(false);
-    renderer.set_sky(None);
+    post_on = false;
+    sky_frame = None;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, high_eye, day_preset(), size)
+            .submit_frame(corner_submission(
+                &matrix,
+                high_eye,
+                day_preset(),
+                None,
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -457,16 +499,27 @@ fn post_pixels_match_post_rs_and_the_disc_blooms() {
 
     // WARMED CONSTANCY: two more post frames — the allocation set
     // constant, byte-identical captures.
-    renderer.set_post(true);
-    renderer.set_sky(Some(SkyFrame {
+    post_on = true;
+    sky_frame = Some(SkyFrame {
         palette: day.sky,
         disc_dir: sun_dir,
-    }));
+    });
     for _ in 0..2 {
         renderer.request_frame_capture().unwrap();
         assert!(
             renderer
-                .render_corner(&matrix, high_eye, day_preset(), size)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    high_eye,
+                    day_preset(),
+                    None,
+                    corner_bounds(),
+                    None,
+                    sky_frame,
+                    post_on,
+                    None,
+                    size
+                ))
                 .unwrap()
                 .presented
         );
@@ -484,52 +537,74 @@ fn post_pixels_match_post_rs_and_the_disc_blooms() {
     // full batteries are their packages' own):
     // - the plain HDR path (post, no sky — the background is the
     //   clear color through the tonemap);
-    renderer.set_sky(None);
+    sky_frame = None;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, high_eye, day_preset(), size)
+            .submit_frame(corner_submission(
+                &matrix,
+                high_eye,
+                day_preset(),
+                None,
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
     let _ = renderer.take_frame_capture().unwrap().unwrap();
     // - the night moon through the chain;
     let night = atmosphere_at(1.0);
-    renderer.set_sky(Some(SkyFrame {
+    sky_frame = Some(SkyFrame {
         palette: night.sky,
         disc_dir: night.disc_dir,
-    }));
+    });
     let toward_moon = std::array::from_fn(|i| high_eye[i] + night.disc_dir[i]);
     let night_matrix = aimed(high_eye, toward_moon);
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(
+            .submit_frame(corner_submission(
                 &night_matrix,
                 high_eye,
                 engine_renderer::lit_scene::night_preset(),
+                None,
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                None,
                 size
-            )
+            ))
             .unwrap()
             .presented
     );
     let _ = renderer.take_frame_capture().unwrap().unwrap();
     // - the shadowed path through the chain (the depth pass + the
     //   shadowed HDR pipeline + the composite);
-    renderer.set_sky(Some(SkyFrame {
+    sky_frame = Some(SkyFrame {
         palette: day.sky,
         disc_dir: sun_dir,
-    }));
+    });
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(
+            .submit_frame(corner_submission(
                 &matrix,
                 high_eye,
                 day_preset(),
-                engine_slice::corner_demo::demo_bias(),
+                Some(engine_slice::corner_demo::demo_bias()),
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                None,
                 size
-            )
+            ))
             .unwrap()
             .presented
     );
@@ -552,7 +627,18 @@ fn post_pixels_match_post_rs_and_the_disc_blooms() {
     };
     renderer.request_frame_capture().unwrap();
     let populated_frame = renderer
-        .render_corner_populated(&matrix, high_eye, day_preset(), &population, size)
+        .submit_frame(corner_submission(
+            &matrix,
+            high_eye,
+            day_preset(),
+            None,
+            corner_bounds(),
+            Some(population),
+            None,
+            true,
+            None,
+            size,
+        ))
         .unwrap();
     assert!(populated_frame.presented);
     assert!(populated_frame.geometry.proxy_draw_calls > 0);
@@ -652,12 +738,18 @@ fn post_discriminator_asymmetric_disc_and_bloom_lift() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
+    // The per-frame sky/post/wet declarations (the deleted sticky
+    // setters' state, carried by each submission below).
+
     let size = app.window().size_in_pixels();
     assert_eq!(size, (121, 75));
     assert!(renderer.stats().validation_active);
@@ -720,15 +812,26 @@ fn post_discriminator_asymmetric_disc_and_bloom_lift() {
     let toward = std::array::from_fn(|i| high_eye[i] + aim_dir[i]);
     let matrix = aimed_at_aspect(high_eye, toward, aspect);
 
-    renderer.set_sky(Some(SkyFrame {
+    let sky_frame: Option<SkyFrame> = Some(SkyFrame {
         palette: day.sky,
         disc_dir: sun_dir,
-    }));
-    renderer.set_post(true);
+    });
+    let post_on: bool = true;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, high_eye, day_preset(), size)
+            .submit_frame(corner_submission(
+                &matrix,
+                high_eye,
+                day_preset(),
+                None,
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1075,12 +1178,18 @@ fn post_edge_cases_tiny_extents_and_ambient_feed() {
         let mut renderer = Renderer::new(
             app.window(),
             RenderConfig {
-                demo_scene: DemoScenePreference::Corner,
+                demo_scene: DemoScenePreference::Omitted,
                 validation: ValidationPreference::On,
                 ..Default::default()
             },
         )
         .unwrap();
+        // P4 S6: the corner content is ATTACHED (the Corner construction
+        // preference is deleted) - the same public attach every consumer uses.
+        engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
+        // The per-frame sky/post/wet declarations (the deleted sticky
+        // setters' state, carried by each submission below).
+
         let size = app.window().size_in_pixels();
         assert_eq!(
             size,
@@ -1090,11 +1199,11 @@ fn post_edge_cases_tiny_extents_and_ambient_feed() {
         assert!(renderer.stats().validation_active);
         let _ = app.frame();
 
-        renderer.set_sky(Some(SkyFrame {
+        let sky_frame: Option<SkyFrame> = Some(SkyFrame {
             palette: day.sky,
             disc_dir: sun_dir,
-        }));
-        renderer.set_post(true);
+        });
+        let post_on: bool = true;
         // The TRUE aspect into the projection (aimed_at_aspect): at
         // width 2 the columns sit ±0.28° of azimuth from the view axis
         // — both INSIDE the disc's ~2° angular radius, so the disc band
@@ -1107,7 +1216,18 @@ fn post_edge_cases_tiny_extents_and_ambient_feed() {
         renderer.request_frame_capture().unwrap();
         assert!(
             renderer
-                .render_corner(&matrix, high_eye, day_preset(), size)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    high_eye,
+                    day_preset(),
+                    None,
+                    corner_bounds(),
+                    None,
+                    sky_frame,
+                    post_on,
+                    None,
+                    size
+                ))
                 .unwrap()
                 .presented
         );
@@ -1199,12 +1319,18 @@ fn post_edge_cases_tiny_extents_and_ambient_feed() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
+    // The per-frame sky/post/wet declarations (the deleted sticky
+    // setters' state, carried by each submission below).
+
     let size = app.window().size_in_pixels();
     assert_eq!(size, (89, 55));
     assert!(renderer.stats().validation_active);
@@ -1255,12 +1381,23 @@ fn post_edge_cases_tiny_extents_and_ambient_feed() {
         ambient: [-0.5, 0.0, 0.18],
         ..day_preset()
     };
-    renderer.set_sky(None);
-    renderer.set_post(true);
+    let sky_frame: Option<SkyFrame> = None;
+    let post_on: bool = true;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, high_eye, light_neg, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                high_eye,
+                light_neg,
+                None,
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1305,7 +1442,18 @@ fn post_edge_cases_tiny_extents_and_ambient_feed() {
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, high_eye, light_over, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                high_eye,
+                light_over,
+                None,
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1455,13 +1603,19 @@ fn depth_fallbacks_and_the_post_lifecycle() {
         let mut renderer = Renderer::new(
             app.window(),
             RenderConfig {
-                demo_scene: DemoScenePreference::Corner,
+                demo_scene: DemoScenePreference::Omitted,
                 validation: ValidationPreference::On,
                 depth_format: preference,
                 ..Default::default()
             },
         )
         .unwrap();
+        // P4 S6: the corner content is ATTACHED (the Corner construction
+        // preference is deleted) - the same public attach every consumer uses.
+        engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
+        // The per-frame sky/post/wet declarations (the deleted sticky
+        // setters' state, carried by each submission below).
+
         let reported = renderer.stats().depth_format.clone();
         if reported != forced_name {
             println!(
@@ -1473,18 +1627,29 @@ fn depth_fallbacks_and_the_post_lifecycle() {
             continue;
         }
         println!("post fallback: forced {forced_name} honored");
-        renderer.set_sky(Some(SkyFrame {
+        let sky_frame: Option<SkyFrame> = Some(SkyFrame {
             palette: day.sky,
             disc_dir: sun_dir,
-        }));
-        renderer.set_post(true);
+        });
+        let post_on: bool = true;
 
         // Create, render, capture — the oracle at the original size.
         let size = app.window().size_in_pixels();
         renderer.request_frame_capture().unwrap();
         assert!(
             renderer
-                .render_corner(&matrix, high_eye, day_preset(), size)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    high_eye,
+                    day_preset(),
+                    None,
+                    corner_bounds(),
+                    None,
+                    sky_frame,
+                    post_on,
+                    None,
+                    size
+                ))
                 .unwrap()
                 .presented
         );
@@ -1520,7 +1685,18 @@ fn depth_fallbacks_and_the_post_lifecycle() {
         renderer.request_frame_capture().unwrap();
         assert!(
             renderer
-                .render_corner(&matrix, high_eye, day_preset(), resized)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    high_eye,
+                    day_preset(),
+                    None,
+                    corner_bounds(),
+                    None,
+                    sky_frame,
+                    post_on,
+                    None,
+                    resized
+                ))
                 .unwrap()
                 .presented
         );
@@ -1555,7 +1731,18 @@ fn depth_fallbacks_and_the_post_lifecycle() {
         renderer.request_frame_capture().unwrap();
         assert!(
             renderer
-                .render_corner(&matrix, high_eye, day_preset(), resized)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    high_eye,
+                    day_preset(),
+                    None,
+                    corner_bounds(),
+                    None,
+                    sky_frame,
+                    post_on,
+                    None,
+                    resized
+                ))
                 .unwrap()
                 .presented
         );
@@ -1595,22 +1782,41 @@ fn depth_fallbacks_and_the_post_lifecycle() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
+    // The per-frame sky/post/wet declarations (the deleted sticky
+    // setters' state, carried by each submission below).
+
+    let mut post_on: bool;
+
     let size = app.window().size_in_pixels();
-    renderer.set_sky(Some(SkyFrame {
+    let sky_frame: Option<SkyFrame> = Some(SkyFrame {
         palette: day.sky,
         disc_dir: sun_dir,
-    }));
-    renderer.set_post(true);
+    });
+    post_on = true;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, high_eye, day_preset(), size)
+            .submit_frame(corner_submission(
+                &matrix,
+                high_eye,
+                day_preset(),
+                None,
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1649,10 +1855,21 @@ fn depth_fallbacks_and_the_post_lifecycle() {
     // `== warm` across the two recreations — unpassable by design, and
     // masked behind the stencil-load validation failure until that was
     // fixed; see the branch's finding-4 corrective.)
-    renderer.set_post(false);
+    post_on = false;
     renderer.request_frame_capture().unwrap();
     let postless = renderer
-        .render_corner(&matrix, high_eye, day_preset(), size)
+        .submit_frame(corner_submission(
+            &matrix,
+            high_eye,
+            day_preset(),
+            None,
+            corner_bounds(),
+            None,
+            sky_frame,
+            post_on,
+            None,
+            size,
+        ))
         .unwrap();
     // THE COORDINATOR FLAG CONTRACT (the finding-20 phase-A seam's
     // own gate — the extraction once dropped exactly these flags,
@@ -1666,7 +1883,18 @@ fn depth_fallbacks_and_the_post_lifecycle() {
     let _ = renderer.take_frame_capture().unwrap().unwrap();
     renderer.request_frame_capture().unwrap();
     let minimized = renderer
-        .render_corner(&matrix, high_eye, day_preset(), (0, 0))
+        .submit_frame(corner_submission(
+            &matrix,
+            high_eye,
+            day_preset(),
+            None,
+            corner_bounds(),
+            None,
+            sky_frame,
+            post_on,
+            None,
+            (0, 0),
+        ))
         .unwrap();
     assert!(
         !minimized.presented && minimized.deferred && !minimized.recreated,
@@ -1684,7 +1912,18 @@ fn depth_fallbacks_and_the_post_lifecycle() {
     // itself the proof the first is still pending.
     let _ = renderer.request_frame_capture().unwrap_err();
     let recovered = renderer
-        .render_corner(&matrix, high_eye, day_preset(), size)
+        .submit_frame(corner_submission(
+            &matrix,
+            high_eye,
+            day_preset(),
+            None,
+            corner_bounds(),
+            None,
+            sky_frame,
+            post_on,
+            None,
+            size,
+        ))
         .unwrap();
     assert!(
         recovered.presented && !recovered.deferred,
@@ -1707,7 +1946,18 @@ fn depth_fallbacks_and_the_post_lifecycle() {
     let away = (size.0 + 8, size.1 + 8);
     renderer.request_frame_capture().unwrap();
     let awayed = renderer
-        .render_corner(&matrix, high_eye, day_preset(), away)
+        .submit_frame(corner_submission(
+            &matrix,
+            high_eye,
+            day_preset(),
+            None,
+            corner_bounds(),
+            None,
+            sky_frame,
+            post_on,
+            None,
+            away,
+        ))
         .unwrap();
     assert!(
         awayed.presented && awayed.recreated && !awayed.deferred,
@@ -1733,11 +1983,22 @@ fn depth_fallbacks_and_the_post_lifecycle() {
         (warm.descriptor_pools, warm.descriptor_sets),
         "post OFF: the away recreation must not rebuild the post bundle"
     );
-    renderer.set_post(true);
+    post_on = true;
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, high_eye, day_preset(), size)
+            .submit_frame(corner_submission(
+                &matrix,
+                high_eye,
+                day_preset(),
+                None,
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1754,7 +2015,18 @@ fn depth_fallbacks_and_the_post_lifecycle() {
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, high_eye, day_preset(), size)
+            .submit_frame(corner_submission(
+                &matrix,
+                high_eye,
+                day_preset(),
+                None,
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1842,15 +2114,18 @@ fn injected_target_failures_unwind_every_handle_and_never_strand_a_slot() {
             driver: DriverPreference::Real,
         })
         .unwrap();
-        let renderer = engine_renderer::Renderer::new(
+        let mut renderer = engine_renderer::Renderer::new(
             app.window(),
             RenderConfig {
-                demo_scene: DemoScenePreference::Corner,
+                // P4 S6: the corner content is ATTACHED (the Corner
+                // construction preference is deleted).
+                demo_scene: DemoScenePreference::Omitted,
                 validation: ValidationPreference::On,
                 ..Default::default()
             },
         )
         .unwrap();
+        engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
         (app, renderer)
     }
 
@@ -1867,6 +2142,12 @@ fn injected_target_failures_unwind_every_handle_and_never_strand_a_slot() {
     let toward_sun = std::array::from_fn(|i| high_eye[i] + sun_dir[i]);
     let matrix = aimed(high_eye, toward_sun);
     let size = (256, 256);
+    // The per-frame sky/post/wet declarations (the deleted sticky
+    // setters' state, carried by each submission below; the fault
+    // cells assign them per phase).
+    let mut sky_frame: Option<SkyFrame>;
+    let mut post_on: bool;
+    let mut wet_frame: Option<WetFrame> = None;
 
     // PHASE 1: finding 3 (slot-stranding check)
     // "Inject an allocation or framebuffer failure on the first post or
@@ -1880,10 +2161,10 @@ fn injected_target_failures_unwind_every_handle_and_never_strand_a_slot() {
     // the renderer's surface belongs to its window, so the app must
     // outlive the renderer (drop order: renderer, then app).
     let (_app, mut renderer) = new_renderer();
-    renderer.set_sky(Some(SkyFrame {
+    sky_frame = Some(SkyFrame {
         palette: day.sky,
         disc_dir: sun_dir,
-    }));
+    });
     let pre = renderer.allocations();
     assert_eq!(
         (
@@ -1898,8 +2179,19 @@ fn injected_target_failures_unwind_every_handle_and_never_strand_a_slot() {
 
     // 2. Inject Memory fault on first post frame.
     renderer.inject_target_fault(TargetFaultSite::Post, TargetFaultStage::Memory, 1);
-    renderer.set_post(true);
-    let result = renderer.render_corner(&matrix, high_eye, day_preset(), size);
+    post_on = true;
+    let result = renderer.submit_frame(corner_submission(
+        &matrix,
+        high_eye,
+        day_preset(),
+        None,
+        corner_bounds(),
+        None,
+        sky_frame,
+        post_on,
+        wet_frame,
+        size,
+    ));
     assert!(
         matches!(result, Err(RendererError::InjectedFault(_))),
         "first fault should be InjectedFault, got {:?}",
@@ -1918,11 +2210,33 @@ fn injected_target_failures_unwind_every_handle_and_never_strand_a_slot() {
     }
 
     // 4. Two ORDINARY frames: both slots should remain usable.
-    renderer.set_post(false);
+    post_on = false;
     let before_frames = renderer.stats().frames_presented;
-    let r1 = renderer.render_corner(&matrix, high_eye, day_preset(), size);
+    let r1 = renderer.submit_frame(corner_submission(
+        &matrix,
+        high_eye,
+        day_preset(),
+        None,
+        corner_bounds(),
+        None,
+        sky_frame,
+        post_on,
+        wet_frame,
+        size,
+    ));
     assert!(r1.unwrap().presented, "first ordinary frame should succeed");
-    let r2 = renderer.render_corner(&matrix, high_eye, day_preset(), size);
+    let r2 = renderer.submit_frame(corner_submission(
+        &matrix,
+        high_eye,
+        day_preset(),
+        None,
+        corner_bounds(),
+        None,
+        sky_frame,
+        post_on,
+        wet_frame,
+        size,
+    ));
     assert!(
         r2.unwrap().presented,
         "second ordinary frame should succeed"
@@ -1935,9 +2249,20 @@ fn injected_target_failures_unwind_every_handle_and_never_strand_a_slot() {
     );
 
     // 5. Recovery: post back on, should work and build targets.
-    renderer.set_post(true);
+    post_on = true;
     renderer.request_frame_capture().unwrap();
-    let r3 = renderer.render_corner(&matrix, high_eye, day_preset(), size);
+    let r3 = renderer.submit_frame(corner_submission(
+        &matrix,
+        high_eye,
+        day_preset(),
+        None,
+        corner_bounds(),
+        None,
+        sky_frame,
+        post_on,
+        wet_frame,
+        size,
+    ));
     let presented = r3.unwrap().presented;
     assert!(presented, "post recovery frame should succeed");
     let capture = renderer.take_frame_capture().unwrap();
@@ -1968,8 +2293,19 @@ fn injected_target_failures_unwind_every_handle_and_never_strand_a_slot() {
     // in its phase-2 form).
     let wet_baseline = renderer.allocations();
     renderer.inject_target_fault(TargetFaultSite::Wet, TargetFaultStage::Framebuffer, 1);
-    renderer.set_wet(true);
-    let result = renderer.render_corner(&matrix, high_eye, day_preset(), size);
+    wet_frame = Some(WetFrame { ripple: None });
+    let result = renderer.submit_frame(corner_submission(
+        &matrix,
+        high_eye,
+        day_preset(),
+        None,
+        corner_bounds(),
+        None,
+        sky_frame,
+        post_on,
+        wet_frame,
+        size,
+    ));
     assert!(
         matches!(result, Err(RendererError::InjectedFault(_))),
         "wet fault should be InjectedFault, got {:?}",
@@ -1988,11 +2324,33 @@ fn injected_target_failures_unwind_every_handle_and_never_strand_a_slot() {
     }
 
     // Two ordinary frames again (post may stay on).
-    renderer.set_wet(false);
+    wet_frame = None;
     let before_frames = renderer.stats().frames_presented;
-    let r1 = renderer.render_corner(&matrix, high_eye, day_preset(), size);
+    let r1 = renderer.submit_frame(corner_submission(
+        &matrix,
+        high_eye,
+        day_preset(),
+        None,
+        corner_bounds(),
+        None,
+        sky_frame,
+        post_on,
+        wet_frame,
+        size,
+    ));
     assert!(r1.unwrap().presented, "wet recovery frame 1 should succeed");
-    let r2 = renderer.render_corner(&matrix, high_eye, day_preset(), size);
+    let r2 = renderer.submit_frame(corner_submission(
+        &matrix,
+        high_eye,
+        day_preset(),
+        None,
+        corner_bounds(),
+        None,
+        sky_frame,
+        post_on,
+        wet_frame,
+        size,
+    ));
     assert!(r2.unwrap().presented, "wet recovery frame 2 should succeed");
     let after_frames = renderer.stats().frames_presented;
     assert_eq!(
@@ -2002,9 +2360,20 @@ fn injected_target_failures_unwind_every_handle_and_never_strand_a_slot() {
     );
 
     // Recovery wet frame.
-    renderer.set_wet(true);
+    wet_frame = Some(WetFrame { ripple: None });
     renderer.request_frame_capture().unwrap();
-    let r3 = renderer.render_corner(&matrix, high_eye, day_preset(), size);
+    let r3 = renderer.submit_frame(corner_submission(
+        &matrix,
+        high_eye,
+        day_preset(),
+        None,
+        corner_bounds(),
+        None,
+        sky_frame,
+        post_on,
+        wet_frame,
+        size,
+    ));
     assert!(r3.unwrap().presented, "wet recovery frame should succeed");
     let capture = renderer.take_frame_capture().unwrap();
     assert!(capture.is_some(), "wet capture should be available");
@@ -2062,15 +2431,15 @@ fn injected_target_failures_unwind_every_handle_and_never_strand_a_slot() {
             // the drop order at scope end is renderer, then app).
             // (the underscore app still owns the window — see phase 1)
             let (_app, mut renderer) = new_renderer();
-            renderer.set_sky(Some(SkyFrame {
+            sky_frame = Some(SkyFrame {
                 palette: day.sky,
                 disc_dir: sun_dir,
-            }));
+            });
 
             // Set up the appropriate state for the site.
             match site {
                 TargetFaultSite::Post => {
-                    renderer.set_post(true);
+                    post_on = true;
                 }
                 TargetFaultSite::Wet => {
                     // The wet-reflection target build runs AFTER the
@@ -2079,13 +2448,24 @@ fn injected_target_failures_unwind_every_handle_and_never_strand_a_slot() {
                     // bundle live. Render one post-only frame first:
                     // the census it leaves is the baseline the wet
                     // partial must unwind back to.
-                    renderer.set_post(true);
-                    let warm = renderer.render_corner(&matrix, high_eye, day_preset(), size);
+                    post_on = true;
+                    let warm = renderer.submit_frame(corner_submission(
+                        &matrix,
+                        high_eye,
+                        day_preset(),
+                        None,
+                        corner_bounds(),
+                        None,
+                        sky_frame,
+                        post_on,
+                        wet_frame,
+                        size,
+                    ));
                     assert!(
                         warm.unwrap().presented,
                         "the wet cell's post-only warm frame"
                     );
-                    renderer.set_wet(true);
+                    wet_frame = Some(WetFrame { ripple: None });
                 }
                 TargetFaultSite::Shadow => {
                     // The shadow state builds lazily on the FIRST
@@ -2126,11 +2506,31 @@ fn injected_target_failures_unwind_every_handle_and_never_strand_a_slot() {
             // state; a plain corner frame would never fire the plan).
             renderer.inject_target_fault(site, *stage, 1);
             let result = match site {
-                TargetFaultSite::Shadow => {
-                    renderer.render_corner_shadowed(&matrix, high_eye, day_preset(), BIAS, size)
-                }
+                TargetFaultSite::Shadow => renderer.submit_frame(corner_submission(
+                    &matrix,
+                    high_eye,
+                    day_preset(),
+                    Some(BIAS),
+                    corner_bounds(),
+                    None,
+                    sky_frame,
+                    post_on,
+                    wet_frame,
+                    size,
+                )),
                 TargetFaultSite::Post | TargetFaultSite::Wet => {
-                    renderer.render_corner(&matrix, high_eye, day_preset(), size)
+                    renderer.submit_frame(corner_submission(
+                        &matrix,
+                        high_eye,
+                        day_preset(),
+                        None,
+                        corner_bounds(),
+                        None,
+                        sky_frame,
+                        post_on,
+                        wet_frame,
+                        size,
+                    ))
                 }
             };
 
@@ -2161,11 +2561,31 @@ fn injected_target_failures_unwind_every_handle_and_never_strand_a_slot() {
 
             // Recovery render (same path, no plan armed).
             let result = match site {
-                TargetFaultSite::Shadow => {
-                    renderer.render_corner_shadowed(&matrix, high_eye, day_preset(), BIAS, size)
-                }
+                TargetFaultSite::Shadow => renderer.submit_frame(corner_submission(
+                    &matrix,
+                    high_eye,
+                    day_preset(),
+                    Some(BIAS),
+                    corner_bounds(),
+                    None,
+                    sky_frame,
+                    post_on,
+                    wet_frame,
+                    size,
+                )),
                 TargetFaultSite::Post | TargetFaultSite::Wet => {
-                    renderer.render_corner(&matrix, high_eye, day_preset(), size)
+                    renderer.submit_frame(corner_submission(
+                        &matrix,
+                        high_eye,
+                        day_preset(),
+                        None,
+                        corner_bounds(),
+                        None,
+                        sky_frame,
+                        post_on,
+                        wet_frame,
+                        size,
+                    ))
                 }
             };
             assert!(
@@ -2235,23 +2655,34 @@ fn injected_target_failures_unwind_every_handle_and_never_strand_a_slot() {
     for (site, stage, ordinal) in late_cells {
         // (the underscore app still owns the window — see phase 1)
         let (_app, mut renderer) = new_renderer();
-        renderer.set_sky(Some(SkyFrame {
+        sky_frame = Some(SkyFrame {
             palette: day.sky,
             disc_dir: sun_dir,
-        }));
+        });
 
         match site {
             TargetFaultSite::Post => {
-                renderer.set_post(true);
+                post_on = true;
             }
             TargetFaultSite::Wet => {
-                renderer.set_post(true);
-                let warm = renderer.render_corner(&matrix, high_eye, day_preset(), size);
+                post_on = true;
+                let warm = renderer.submit_frame(corner_submission(
+                    &matrix,
+                    high_eye,
+                    day_preset(),
+                    None,
+                    corner_bounds(),
+                    None,
+                    sky_frame,
+                    post_on,
+                    wet_frame,
+                    size,
+                ));
                 assert!(
                     warm.unwrap().presented,
                     "the late wet cell's post-only warm frame"
                 );
-                renderer.set_wet(true);
+                wet_frame = Some(WetFrame { ripple: None });
             }
             TargetFaultSite::Shadow => {
                 // Shadowed renders below build the shadow state.
@@ -2290,11 +2721,31 @@ fn injected_target_failures_unwind_every_handle_and_never_strand_a_slot() {
         // Inject fault with higher ordinal (several successful slots before fault).
         renderer.inject_target_fault(site, stage, ordinal);
         let result = match site {
-            TargetFaultSite::Shadow => {
-                renderer.render_corner_shadowed(&matrix, high_eye, day_preset(), BIAS, size)
-            }
+            TargetFaultSite::Shadow => renderer.submit_frame(corner_submission(
+                &matrix,
+                high_eye,
+                day_preset(),
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_frame,
+                size,
+            )),
             TargetFaultSite::Post | TargetFaultSite::Wet => {
-                renderer.render_corner(&matrix, high_eye, day_preset(), size)
+                renderer.submit_frame(corner_submission(
+                    &matrix,
+                    high_eye,
+                    day_preset(),
+                    None,
+                    corner_bounds(),
+                    None,
+                    sky_frame,
+                    post_on,
+                    wet_frame,
+                    size,
+                ))
             }
         };
 
@@ -2326,11 +2777,31 @@ fn injected_target_failures_unwind_every_handle_and_never_strand_a_slot() {
 
         // Recovery.
         let result = match site {
-            TargetFaultSite::Shadow => {
-                renderer.render_corner_shadowed(&matrix, high_eye, day_preset(), BIAS, size)
-            }
+            TargetFaultSite::Shadow => renderer.submit_frame(corner_submission(
+                &matrix,
+                high_eye,
+                day_preset(),
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                sky_frame,
+                post_on,
+                wet_frame,
+                size,
+            )),
             TargetFaultSite::Post | TargetFaultSite::Wet => {
-                renderer.render_corner(&matrix, high_eye, day_preset(), size)
+                renderer.submit_frame(corner_submission(
+                    &matrix,
+                    high_eye,
+                    day_preset(),
+                    None,
+                    corner_bounds(),
+                    None,
+                    sky_frame,
+                    post_on,
+                    wet_frame,
+                    size,
+                ))
             }
         };
         assert!(
@@ -2475,18 +2946,25 @@ fn shadowed_populated_composes_through_the_hdr_chain() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
+    // The per-frame sky/post/wet declarations (the deleted sticky
+    // setters' state, carried by each submission below).
+    let sky_frame: Option<SkyFrame> = None;
+
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
     let _ = app.frame();
 
-    renderer.set_post(true);
+    let post_on: bool = true;
     let light = day_preset();
     // The demo's own bias — one source for both sides (render_shadows'
     // discipline; a hand-rolled copy here would drift when the demo's
@@ -2511,7 +2989,18 @@ fn shadowed_populated_composes_through_the_hdr_chain() {
     // populated families' alone).
     renderer.request_frame_capture().unwrap();
     let unpopulated = renderer
-        .render_corner_shadowed(&matrix, eye, light, bias, size)
+        .submit_frame(corner_submission(
+            &matrix,
+            eye,
+            light,
+            Some(bias),
+            corner_bounds(),
+            None,
+            sky_frame,
+            post_on,
+            None,
+            size,
+        ))
         .unwrap();
     assert!(unpopulated.presented, "the unpopulated baseline presents");
     let unpopulated_image = renderer.take_frame_capture().unwrap().unwrap();
@@ -2536,7 +3025,18 @@ fn shadowed_populated_composes_through_the_hdr_chain() {
     };
     renderer.request_frame_capture().unwrap();
     let composed = renderer
-        .render_corner_populated_shadowed(&matrix, eye, light, bias, &population, size)
+        .submit_frame(corner_submission(
+            &matrix,
+            eye,
+            light,
+            Some(bias),
+            corner_bounds(),
+            Some(population),
+            None,
+            true,
+            None,
+            size,
+        ))
         .unwrap();
     assert!(composed.presented, "the three-way composition presents");
     assert_eq!(
@@ -2589,7 +3089,18 @@ fn shadowed_populated_composes_through_the_hdr_chain() {
     );
     renderer.request_frame_capture().unwrap();
     let repeat = renderer
-        .render_corner_populated_shadowed(&matrix, eye, light, bias, &population, size)
+        .submit_frame(corner_submission(
+            &matrix,
+            eye,
+            light,
+            Some(bias),
+            corner_bounds(),
+            Some(population),
+            None,
+            true,
+            None,
+            size,
+        ))
         .unwrap();
     assert!(repeat.presented);
     assert_eq!(
@@ -2645,18 +3156,27 @@ fn shadowed_populated_composes_through_the_hdr_chain() {
     );
 }
 
-/// THE P4 S1 FOLLOW-UP GATE — the GPU-level `submit_frame`
-/// equivalence proof. The submission module's unit test pins the
-/// mapping at the TYPE level (a [`FrameSubmission`] shaped like
-/// `render_corner`'s argument list produces, through the adapter,
-/// the identical frame-flow parameter set — for the plain all-off
-/// configuration AND the sticky-on sky+post+wet one); this gate is
-/// the presented-bytes half of the same proof: the SAME renderer,
-/// the SAME fixed camera/scene state, the frame rendered through
-/// the EXISTING route (`render_corner` reading its sticky
-/// sky/post/wet fields) and through the NEW route
-/// (`Renderer::submit_frame` carrying the same state per frame) —
-/// the two captures must be BYTE-IDENTICAL.
+/// THE P4 S1 GATE, EVOLVED AT S6 — the corner route's submit-frame
+/// battery on the FINAL API. The S1 form proved the submission route
+/// byte-identical to the `render_corner` entries (the sticky-reading
+/// old route) plain and composed; S6 deleted those entries, so the
+/// byte-equality-vs-old-route leg is HISTORICAL — proven once at S1,
+/// recorded in the submission module's type-level proof (the
+/// hand-built expectation the adapter must reproduce), and the rig
+/// log. What this gate pins on the FINAL API — the legs that keep
+/// the corner route honest per frame:
+/// 1. DOUBLE-RUN BYTE-EQUALITY (the A24 pattern): the SAME
+///    submission, rendered twice, presents byte-identical captures —
+///    plain and composed (sky + post + wet with a live ripple field;
+///    the deleted stickies' state, per-frame fields since S3).
+/// 2. THE ALLOCATION CONSTANCY: the submission route's frames
+///    allocate nothing over a warmed renderer (the adapter is stack
+///    assembly — the contract's zero-cost statement, witnessed on
+///    the device) — both plain and composed.
+/// 3. THE INK FLOOR: the composed capture visibly differs from the
+///    plain one (the byte-equality legs compared living composed
+///    content, not two accidentally-identical plain frames).
+/// 4. Validation drains clean.
 ///
 /// THE CAMERA: the weather gates' road-cross vantage (the eye the
 /// ripple reflection gate pins its ink at — 1.7 m at [0, 0, 15]
@@ -2665,33 +3185,10 @@ fn shadowed_populated_composes_through_the_hdr_chain() {
 /// sky all in view, so the composed variant's three passes all
 /// contribute pixels.
 ///
-/// THE TWO PROOFS:
-/// 1. THE PLAIN FRAME — `render_corner` with every sticky at its
-///    construction default (no sky, post off, dry ground) vs the
-///    submission with `scene.sky: None`, `post: false`, `wet: None`
-///    (the type-level proof's Configuration 1): byte-equal captures.
-/// 2. THE COMPOSED FRAME — the stickies ON (`set_sky` + `set_post` +
-///    `set_wet` + `set_ripple_field`, with the submission module
-///    test's own one-live-ring ripple fixture) vs the submission
-///    carrying `scene.sky: Some(_)`, `post: true`,
-///    `wet: Some(WetFrame { ripple: Some(&field) })` (the
-///    type-level proof's Configuration 2 — sky + post + wet, the
-///    sticky-on state it pinned): byte-equal captures. The stickies
-///    stay SET while the submission renders — the strongest form:
-///    the submission's per-frame fields alone must reproduce the
-///    frame the stickies feed `render_corner` (the adapter reads
-///    only the proxy mode and the TEST-ONLY ripple debug lane from
-///    the renderer).
-///
 /// THE DISCIPLINE (the neighboring gates' own): each compared
 /// capture follows a warm frame (the composed state's one-time lazy
 /// targets — post HDR + bloom, sky, wet reflection — build in the
-/// warm frame, never inside a compared capture); the ink floor
-/// proves the composed capture is living composed content, not two
-/// accidentally-identical plain frames; the Vulkan allocation set
-/// is constant across every submission-route frame (the adapter is
-/// stack assembly — the contract's zero-cost statement, witnessed on
-/// the device); validation drains clean.
+/// warm frame, never inside a compared capture).
 ///
 /// `#[ignore]`d like the binary's other lavapipe gates: it requires
 /// `SDL_VIDEODRIVER=offscreen` plus a software Vulkan ICD
@@ -2705,10 +3202,10 @@ fn shadowed_populated_composes_through_the_hdr_chain() {
 /// ```
 #[test]
 #[ignore = "requires SDL_VIDEODRIVER=offscreen and a software Vulkan ICD (lavapipe); the dev pod needs the user-local ICD setup (see render_overflow)"]
-fn submit_frame_matches_render_corner_bytes_plain_and_composed() {
+fn submit_frame_corner_frames_double_run_deterministic_plain_and_composed() {
     let _guard = sdl_lock();
     let mut app = ShellApp::new(ShellConfig {
-        title: "S1 submit-frame equivalence".into(),
+        title: "S6 submit-frame corner battery".into(),
         width: 256,
         height: 256,
         target_fps: 60,
@@ -2718,49 +3215,23 @@ fn submit_frame_matches_render_corner_bytes_plain_and_composed() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer
+    // uses; the submissions below ride the corner route's own
+    // corner_submission builder (engine_slice::corner_demo's - one
+    // tested place where the route's frame shape lives).
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
+
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
     let _ = app.frame();
-
-    /// The submission carrying one corner frame's state — the exact
-    /// mapping the submission module's type-level proof pins: the
-    /// same camera/light/output `render_corner` consumes, empty
-    /// dynamic layers (the entry's own `&[]` arguments), and the
-    /// scene half's per-frame sky/post/wet fields standing in for
-    /// the stickies the entry reads.
-    fn corner_submission<'a>(
-        matrix: [[f32; 4]; 4],
-        eye: [f32; 3],
-        light: LightParams,
-        size: (u32, u32),
-        sky: Option<SkyFrame>,
-        post: bool,
-        wet: Option<WetFrame<'a>>,
-    ) -> FrameSubmission<'a> {
-        FrameSubmission {
-            camera: FrameCamera {
-                view_proj: matrix,
-                eye,
-            },
-            output: OutputTarget { window_size: size },
-            layers: DynamicLayers::default(),
-            scene: Some(SceneFrame {
-                light,
-                shadows: None,
-                population: None,
-                sky,
-                post,
-                wet,
-            }),
-        }
-    }
 
     /// The ripple fixture (the submission module test's own,
     /// verbatim): one observed kill death at a known position, one
@@ -2790,107 +3261,154 @@ fn submit_frame_matches_render_corner_bytes_plain_and_composed() {
     let light = day_preset();
     let day = atmosphere_at(0.0);
 
-    // ---- PROOF 1: the plain all-off corner frame ----
+    // ---- LEG 1: the plain all-off corner frame, double-run ----
     // One warm frame first (the compared captures then sit on a
-    // fully-warmed renderer, symmetrically for both routes).
+    // fully-warmed renderer).
     assert!(
         renderer
-            .render_corner(&matrix, eye, light, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                None,
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size,
+            ))
             .unwrap()
             .presented,
         "the plain warm frame"
     );
-    renderer.request_frame_capture().unwrap();
-    assert!(
-        renderer
-            .render_corner(&matrix, eye, light, size)
-            .unwrap()
-            .presented
-    );
-    let plain_route = renderer.take_frame_capture().unwrap().unwrap();
     let plain_allocations = renderer.allocations();
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
             .submit_frame(corner_submission(
-                matrix, eye, light, size, None, false, None
+                &matrix,
+                eye,
+                light,
+                None,
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size,
             ))
             .unwrap()
             .presented
     );
-    let plain_submission = renderer.take_frame_capture().unwrap().unwrap();
-    assert_eq!(
-        plain_submission.bytes, plain_route.bytes,
-        "PROOF 1 (the plain corner frame): submit_frame's presented bytes must equal \
-         render_corner's"
-    );
-    assert_eq!(
-        renderer.allocations(),
-        plain_allocations,
-        "the submission route's plain frame allocates nothing (stack assembly over a \
-         warmed renderer)"
-    );
-
-    // ---- PROOF 2: the sticky-on composed frame (sky + post + wet) ----
-    let field = ripple_field();
-    renderer.set_sky(Some(SkyFrame {
-        palette: day.sky,
-        disc_dir: day.disc_dir,
-    }));
-    renderer.set_post(true);
-    renderer.set_wet(true);
-    renderer.set_ripple_field(Some(&field));
-    // One warm composed frame: the one-time post/sky/wet lazy
-    // targets build HERE, never inside a compared capture.
-    assert!(
-        renderer
-            .render_corner(&matrix, eye, light, size)
-            .unwrap()
-            .presented,
-        "the composed warm frame"
-    );
-    renderer.request_frame_capture().unwrap();
-    assert!(
-        renderer
-            .render_corner(&matrix, eye, light, size)
-            .unwrap()
-            .presented
-    );
-    let composed_route = renderer.take_frame_capture().unwrap().unwrap();
-    let composed_allocations = renderer.allocations();
-    // The stickies stay SET while the submission renders (see the
-    // doc comment): the per-frame fields alone must reproduce the
-    // frame they feed render_corner.
+    let plain_a = renderer.take_frame_capture().unwrap().unwrap();
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
             .submit_frame(corner_submission(
-                matrix,
+                &matrix,
                 eye,
                 light,
+                None,
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
                 size,
-                Some(SkyFrame {
-                    palette: day.sky,
-                    disc_dir: day.disc_dir,
-                }),
-                true,
-                Some(WetFrame {
-                    ripple: Some(&field),
-                }),
             ))
             .unwrap()
             .presented
     );
-    let composed_submission = renderer.take_frame_capture().unwrap().unwrap();
+    let plain_b = renderer.take_frame_capture().unwrap().unwrap();
     assert_eq!(
-        composed_submission.bytes, composed_route.bytes,
-        "PROOF 2 (the sky+post+wet corner frame): submit_frame's presented bytes must \
-         equal render_corner's"
+        plain_a.bytes, plain_b.bytes,
+        "LEG 1 (the plain corner frame): the same submission double-runs byte-identical"
+    );
+    assert_eq!(
+        renderer.allocations(),
+        plain_allocations,
+        "the submission route's plain frames allocate nothing (stack assembly over a
+         warmed renderer)"
+    );
+
+    // ---- LEG 2: the composed frame (sky + post + wet), double-run ----
+    let field = ripple_field();
+    let sky = Some(SkyFrame {
+        palette: day.sky,
+        disc_dir: day.disc_dir,
+    });
+    let wet = Some(WetFrame {
+        ripple: Some(&field),
+    });
+    // One warm composed frame: the one-time post/sky/wet lazy
+    // targets build HERE, never inside a compared capture.
+    assert!(
+        renderer
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                None,
+                corner_bounds(),
+                None,
+                sky,
+                true,
+                wet,
+                size,
+            ))
+            .unwrap()
+            .presented,
+        "the composed warm frame"
+    );
+    let composed_allocations = renderer.allocations();
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                None,
+                corner_bounds(),
+                None,
+                sky,
+                true,
+                wet,
+                size,
+            ))
+            .unwrap()
+            .presented
+    );
+    let composed_a = renderer.take_frame_capture().unwrap().unwrap();
+    renderer.request_frame_capture().unwrap();
+    assert!(
+        renderer
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                None,
+                corner_bounds(),
+                None,
+                sky,
+                true,
+                wet,
+                size,
+            ))
+            .unwrap()
+            .presented
+    );
+    let composed_b = renderer.take_frame_capture().unwrap().unwrap();
+    assert_eq!(
+        composed_a.bytes, composed_b.bytes,
+        "LEG 2 (the sky+post+wet corner frame): the same submission double-runs
+         byte-identical"
     );
     assert_eq!(
         renderer.allocations(),
         composed_allocations,
-        "the submission route's composed frame allocates nothing (the adapter introduces \
+        "the submission route's composed frames allocate nothing (the adapter introduces
          no per-frame device allocation)"
     );
 
@@ -2898,12 +3416,12 @@ fn submit_frame_matches_render_corner_bytes_plain_and_composed() {
     // extent): the composed capture visibly differs from the plain
     // one — the sky fills the background, the post chain tonemaps
     // the frame, the wet reflection re-draws the ground — so the
-    // byte-equality proofs above compared living composed content.
-    let ink = count_differing_pixels(&plain_route.bytes, &composed_route.bytes, size);
+    // byte-equality legs above compared living composed content.
+    let ink = count_differing_pixels(&plain_a.bytes, &composed_a.bytes, size);
     assert!(
         ink > 10_000,
-        "the sky+post+wet frame visibly differs from the plain frame ({ink} differing \
-         bytes) — the byte-equality proofs compared living composed content"
+        "the sky+post+wet frame visibly differs from the plain frame ({ink} differing
+         bytes) — the byte-equality legs compared living composed content"
     );
 
     assert_eq!(
@@ -2913,12 +3431,12 @@ fn submit_frame_matches_render_corner_bytes_plain_and_composed() {
         renderer.stats().recent_validation
     );
     println!(
-        "S1 submit_frame equivalence: the plain and sky+post+wet corner frames \
-         byte-identical through render_corner and submit_frame ({}- and {}-byte \
-         captures), the composed frame {ink} differing bytes from the plain one, \
-         allocations constant across the submission frames",
-        plain_route.bytes.len(),
-        composed_route.bytes.len()
+        "S6 submit-frame corner battery: the plain and sky+post+wet corner frames
+         double-run byte-identical through submit_frame ({}- and {}-byte captures),
+         the composed frame {ink} differing bytes from the plain one, allocations
+         constant across the submission frames",
+        plain_a.bytes.len(),
+        composed_a.bytes.len()
     );
 }
 
@@ -3150,7 +3668,18 @@ fn check_torso_wall_through_the_chain(
     };
     renderer.request_frame_capture().unwrap();
     let frame = renderer
-        .render_corner_populated_shadowed(&matrix, fixture_eye, light, bias, &population, size)
+        .submit_frame(corner_submission(
+            &matrix,
+            fixture_eye,
+            light,
+            Some(bias),
+            corner_bounds(),
+            Some(population),
+            None,
+            true,
+            None,
+            size,
+        ))
         .unwrap();
     assert!(frame.presented);
     assert_eq!(

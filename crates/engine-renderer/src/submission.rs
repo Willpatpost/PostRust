@@ -25,23 +25,25 @@
 //! ([`adapt_frame`]) is stack assembly the compiler can elide
 //! entirely; it introduces no per-frame heap allocation anywhere.
 //!
-//! **Stage S1 scope (additive):** the four `render_corner*` methods
-//! and `render_layers` keep their routes UNCHANGED —
-//! [`crate::Renderer::submit_frame`] is a new route that maps the
-//! submission onto the SAME internals through [`adapt_frame`]. The
-//! sky/post/wet state is PER FRAME here (the contract's shape) while
-//! the old routes keep their sticky setters; S3 migrates the
-//! stickies into per-frame fields and S6 removes the old routes. The
-//! two renderer-level policies the adapter still reads — the proxy
-//! submission mode and the TEST-ONLY ripple debug lane — ride
+//! **Stage S1 scope (additive, completed at S6):** the four
+//! `render_corner*` methods and `render_layers` kept their routes
+//! while [`crate::Renderer::submit_frame`] was proven against
+//! them — the S1 gate's byte-equality and the type-level proof
+//! below. S6 then deleted the four corner entries and the sticky
+//! sky/post/wet setters: `submit_frame` is THE scene-backed
+//! production route, and the sky/post/wet state is PER FRAME
+//! here (the contract's shape — the submission is the one
+//! declaration of the frame's passes). The two renderer-level
+//! policies the adapter still reads — the proxy submission mode
+//! and the TEST-ONLY ripple debug lane — ride
 //! [`SubmissionPolicy`] until their own migration steps.
 //!
 //! **Stage S2 extension:** the population validation's
-//! material-table bound moved behind the attach-time scene handle —
-//! [`adapt_frame`] now takes the ATTACHED table's length (the
-//! S1-era read of `lit_scene::materials().len()`; the corner's
-//! value is pinned to the reference table by the
-//! `corner_content` shim-equality gate) instead of reading a
+//! material-table bound moved behind the attach-time scene
+//! handle — [`adapt_frame`] now takes the ATTACHED table's
+//! length (the S1-era read of `lit_scene::materials().len()`;
+//! the corner's value is pinned to the reference table by the
+//! slice-side `corner_scene` equality gate) instead of reading a
 //! renderer-internal constant.
 
 use engine_core::ripple::RippleField;
@@ -124,8 +126,8 @@ pub struct SceneFrame<'a> {
     /// the cascade is computed over — AUTHORED content, supplied
     /// with the attached scene's description (the corner route's
     /// value — `shadows::scene_bounds(lit_scene::intersection_boxes())`
-    /// — since S2 lives in the description the `Corner` preference
-    /// attaches; a `submit_frame` caller authors their own).
+    /// — is authored in engine-slice's `corner_scene` since S6; a
+    /// `submit_frame` caller authors their own).
     pub shadows: Option<ShadowFrame>,
     /// The proxy population (the existing typed struct, verbatim:
     /// npc/vehicle/rain kinds, the npc pose blocks, per-kind material
@@ -155,8 +157,9 @@ pub struct ShadowFrame {
 /// A scene's world axis-aligned bounding box — the shadow cascade's
 /// projection domain. Plain data: the scene author supplies it (the
 /// corner route's value folds `lit_scene::intersection_boxes()`
-/// through `shadows::scene_bounds`); S2's `SceneDescription` carries
-/// it at attach time.
+/// through `shadows::scene_bounds`); the `SceneDescription` carries
+/// it at attach time and the caller echoes it into the submission's
+/// [`SceneFrame`] on shadowed frames.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SceneBounds {
     pub min: [f32; 3],
@@ -242,13 +245,15 @@ pub(crate) struct FrameInputs<'x> {
     pub wet: Option<vulkan::reflection_draw::WetCamera>,
 }
 
-/// Maps a submission onto the frame flow's input set — THE S1
-/// ADAPTER. Device-free by construction (the repack buffers are
-/// caller-owned; [`crate::Renderer::submit_frame`] passes its
-/// retained F-05 buffers), so the mapping is unit-testable without a
-/// GPU: the module test builds `render_corner`'s argument shape and
-/// asserts the produced [`FrameInputs`] equals the parameter set that
-/// entry constructs inline.
+/// Maps a submission onto the frame flow's input set — the
+/// submission adapter (device-free by construction: the repack
+/// buffers are caller-owned; [`crate::Renderer::submit_frame`]
+/// passes its retained F-05 buffers), so the mapping is
+/// unit-testable without a GPU: the module test builds the
+/// former `render_corner` entry's argument shape and asserts the
+/// produced [`FrameInputs`] equals the parameter set that entry
+/// constructed inline (the expectation is hand-built in the
+/// test, so the proof survives the entry's S6 deletion).
 ///
 /// Validation order — the populated entries' own sequence, preserved
 /// exactly: material indices vs the ATTACHED scene's table (the
@@ -438,23 +443,26 @@ mod tests {
     use super::*;
     use crate::renderer::pack_ripple_field;
 
-    /// THE S1 EQUIVALENCE PROOF (device-free, the type-level bar): a
-    /// [`FrameSubmission`] shaped exactly like `render_corner`'s
-    /// argument list — camera, light, window size, no population, no
-    /// shadows, no dynamic layers — maps through [`adapt_frame`]
-    /// onto the IDENTICAL parameter set `render_corner` constructs
-    /// inline and hands `vulkan::render_frame`. Every expected value
-    /// below is built from the SAME expressions that entry contains
-    /// (cited per field); if either side drifts, this fails. Two
-    /// configurations are proven: the all-off plain frame, and the
-    /// sticky-on frame (sky + post + wet with a live ripple field —
-    /// the settings the demo sets through `set_sky`/`set_post`/
-    /// `set_wet`/`set_ripple_field`, which the entry reads from its
-    /// sticky members and the submission carries per frame).
+    /// THE S1 EQUIVALENCE PROOF (device-free, the type-level bar):
+    /// a [`FrameSubmission`] shaped exactly like the former
+    /// `render_corner` entry's argument list — camera, light,
+    /// window size, no population, no shadows, no dynamic layers —
+    /// maps through [`adapt_frame`] onto the IDENTICAL parameter
+    /// set that entry constructed inline and handed
+    /// `vulkan::render_frame` (the expectation below is built from
+    /// the SAME expressions the entry contained, cited per field —
+    /// the proof survives the entry's S6 deletion because the
+    /// expectation is hand-built here). If either side drifts,
+    /// this fails. Two configurations are proven: the all-off
+    /// plain frame, and the effects-on frame (sky + post + wet
+    /// with a live ripple field — the state the demo carried per
+    /// frame through the submission's fields where the deleted
+    /// sticky setters once fed the old route).
     #[test]
     fn plain_corner_submission_maps_to_render_corner_parameter_set() {
-        // render_corner's argument shape (renderer.rs:621–627): a
-        // view-projection, an eye, the day preset, a window size.
+        // The former render_corner entry's argument shape
+        // (renderer.rs at its S1-era lines): a view-projection, an
+        // eye, the day preset, a window size.
         let matrix = [
             [0.9, 0.0, 0.0, 0.0],
             [0.0, 0.9, 0.0, 0.0],
@@ -491,9 +499,9 @@ mod tests {
         let mut instance_bytes = Vec::new();
         let mut pose_bytes = Vec::new();
         // The attached table's length (S2): the corner routes' own
-        // bound — `lit_scene::materials().len()` (renderer.rs's
-        // former inline read), pinned to the shim's table by the
-        // corner_content equality gate.
+        // bound — `lit_scene::materials().len()` (the former inline
+        // read), pinned to the slice-side corner builder's table by
+        // the corner_scene equality gate.
         let inputs = adapt_frame(
             policy,
             &submission,
@@ -503,9 +511,9 @@ mod tests {
             &mut pose_bytes,
         )
         .expect("the plain corner submission validates");
-        // render_corner's own construction (renderer.rs:633–656): the
-        // corner FrameParams, empty dynamic layers, and — every
-        // sticky off — no sky, no post, no wet camera.
+        // The entry's own construction: the corner FrameParams,
+        // empty dynamic layers, and — every effect off — no sky, no
+        // post, no wet camera.
         let expected = FrameInputs {
             window_size: size,
             view_proj: matrix,
@@ -526,10 +534,9 @@ mod tests {
         );
 
         // ---- Configuration 2: sky + post + wet on ----
-        // The sticky-on frame: the entry's sky_params (renderer.rs
-        // :1114–1122) and wet_camera (:1096–1108) read the sticky
-        // members set through set_sky/set_post/set_wet/
-        // set_ripple_field; the submission carries the same state per
+        // The effects-on frame: the entry's former sky_params and
+        // wet_camera bodies read the sticky members set through the
+        // deleted setters; the submission carries the same state per
         // frame. The expected values below replicate those bodies —
         // the same expressions, the same pure functions.
         let field = ripple_field();
@@ -576,7 +583,7 @@ mod tests {
             corner_params: Some(vulkan::corner::FrameParams::new(matrix, eye, light)),
             proxy: None,
             shadowed: None,
-            // sky_params' body: SkyFrameParams::new over the
+            // sky_params' former body: SkyFrameParams::new over the
             // CPU-computed inverse, the palette, the disc direction.
             sky: Some(vulkan::sky_draw::SkyFrameParams::new(
                 crate::sky::mat4_inverse(&matrix),
@@ -584,9 +591,9 @@ mod tests {
                 sky.disc_dir,
             )),
             post: true,
-            // wet_camera's body: the true camera and light plus the
-            // ripple uniform packed exactly as set_ripple_field packs
-            // it (renderer.rs:1077's own expression).
+            // wet_camera's former body: the true camera and light
+            // plus the ripple uniform packed exactly as the wet
+            // submission path packs it (the same pure function).
             wet: Some(vulkan::reflection_draw::WetCamera {
                 view_proj: matrix,
                 eye,
@@ -604,13 +611,13 @@ mod tests {
     /// bar): the population material validation reads the ATTACHED
     /// scene's table length — the parameter the renderer fills from
     /// the [`crate::SceneHandle`] — not a renderer-internal
-    /// constant. The corner's attached value (3, the shim's table,
-    /// pinned to `lit_scene::materials()` by the corner_content
-    /// gate) refuses index 3 with EXACTLY the populated entries'
-    /// own refusal text (modulo the S2 wording — "scene" for
-    /// "corner", matched in the entries themselves); a LARGER
-    /// attached table accepts the same index — the boundary is the
-    /// attachment's, proving the validation follows the handle.
+    /// constant. The corner's attached value (3, pinned to
+    /// `lit_scene::materials()` by the slice-side `corner_scene`
+    /// equality gate) refuses index 3 with EXACTLY the populated
+    /// entries' own refusal text (the S2 wording — "scene" for
+    /// "corner"); a LARGER attached table accepts the same index —
+    /// the boundary is the attachment's, proving the validation
+    /// follows the handle.
     #[test]
     fn population_material_validation_reads_the_attached_table() {
         let matrix = [

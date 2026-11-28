@@ -111,6 +111,15 @@ Interactive modes
                                     scene's world AABB; R/F vertical, Shift
                                     sprint, Esc quit; --frames <count> is the
                                     smoke's bounded auto-quit)
+  --scene garage [--wet]             The Garage (P4's second scene): an authored
+                                     workshop interior — 3 own materials, own
+                                     bounds and wet roles, 6 mechanics + a van —
+                                     rendered ENTIRELY through the public
+                                     attach_scene + submit_frame contract (the
+                                     renderer-internals-free proof); shadows,
+                                     sky and post always on; --wet adds the
+                                     oiled floor's reflection; --frames <count>
+                                     bounds the sweep for smokes
   --player | --playable              Movement and gatehouse demos
   --combat | --encounter             Combat and courtyard demos
   --demo-persist <campaign-dir>      Persistent campaign
@@ -596,6 +605,78 @@ fn main() {
             }
         } else if let Err(message) = engine_slice::persist_demo::run_persist_demo(options) {
             eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // THE P4 SECOND SCENE'S CLI ROUTE (the design's §7, open
+    // question 1's shape — one more early-return arm in the
+    // current cascade style; P6's cli.rs split absorbs it): the
+    // garage route with its own small flag set (--wet, --frames)
+    // and the shared graphics options.
+    if args.iter().any(|arg| arg == "--scene") {
+        let run = || -> Result<(), String> {
+            let mut garage = false;
+            let mut wet = false;
+            let mut frames: Option<u64> = None;
+            let mut present = engine_renderer::PresentModePreference::Auto;
+            let mut validation = engine_renderer::ValidationPreference::Auto;
+            let mut options = args.iter().skip(1);
+            while let Some(arg) = options.next() {
+                match arg.as_str() {
+                    "--scene" => {
+                        let scene = options.next().ok_or(
+                            "--scene requires a value (the one authored scene is 'garage')",
+                        )?;
+                        if scene != "garage" {
+                            return Err(format!(
+                                "--scene {scene} is not supported (the one authored scene is \
+                                 'garage')"
+                            ));
+                        }
+                        garage = true;
+                    }
+                    // The oiled floor's reflection (the scene's own
+                    // ground roles — the receiver is the floor quad,
+                    // the walls and crates reflect).
+                    "--wet" => wet = true,
+                    // The smoke's bounded exit (the free-look
+                    // precedent: never a silent truncation of a
+                    // measurement — this route is presentation-only,
+                    // and the full sweep is 240 frames).
+                    "--frames" => {
+                        frames = Some(
+                            options
+                                .next()
+                                .ok_or("--frames requires a value")?
+                                .parse::<u64>()
+                                .map_err(|_| "--frames requires an integer count")?
+                                .clamp(1, 1_000_000),
+                        );
+                    }
+                    "--present" => {
+                        present = options
+                            .next()
+                            .and_then(|v| engine_renderer::PresentModePreference::parse(v))
+                            .ok_or("--present requires auto, fifo, mailbox or immediate")?;
+                    }
+                    "--validation" => {
+                        validation = options
+                            .next()
+                            .and_then(|v| engine_renderer::ValidationPreference::parse(v))
+                            .ok_or("--validation requires auto, on or off")?;
+                    }
+                    _ => return Err(format!("unrecognized scene option {arg}")),
+                }
+            }
+            if !garage {
+                return Err("--scene requires a value (the one authored scene is 'garage')".into());
+            }
+            engine_slice::garage_demo::run(frames, wet, present, validation)
+        };
+        if let Err(e) = run() {
+            eprintln!("error: {e}");
             std::process::exit(1);
         }
         return;

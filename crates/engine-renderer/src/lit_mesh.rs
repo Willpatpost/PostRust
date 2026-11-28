@@ -31,7 +31,12 @@ fn quad(vertices: &mut Vec<LitVertex>, corners: [[f32; 3]; 4], normal: [f32; 3],
 /// parameterization of the former `corner_mesh()` — the emission
 /// is pure MECHANISM shared by the attach path and the CPU
 /// oracle; the boxes, the ground plate's extent and height, and
-/// the material count are the caller's AUTHORED content).
+/// the material count are the caller's AUTHORED content). PUBLIC
+/// since S6: the scene descriptions consumers attach
+/// ([`crate::Renderer::attach_scene`]) are caller-built, and this
+/// builder is the shared emission every box-authored scene
+/// (engine-slice's corner AND the second scene) builds its mesh
+/// with.
 ///
 /// ONE draw range per material, in material order: material 0's
 /// range starts with the ground quad (a `ground_extent` square at
@@ -41,7 +46,7 @@ fn quad(vertices: &mut Vec<LitVertex>, corners: [[f32; 3]; 4], normal: [f32; 3],
 /// ranges are contiguous and cover the whole vertex buffer — the
 /// shape [`crate::scene_description::SceneDescription::validate`]
 /// requires and the shadow depth pass's whole-mesh draw assumes.
-pub(crate) fn mesh_from_boxes(
+pub fn mesh_from_boxes(
     boxes: &[SceneBox],
     ground_extent: f32,
     ground_y: f32,

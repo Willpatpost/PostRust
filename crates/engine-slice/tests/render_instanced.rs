@@ -63,6 +63,8 @@ use engine_renderer::{
     ValidationPreference,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
+use engine_slice::corner_demo::corner_submission;
+use engine_slice::corner_scene::corner_bounds;
 
 // The host allocation counter test-support module (finding 10's
 // missing gate; tests/common/ — not a standalone test target).
@@ -275,7 +277,18 @@ fn capture_populated(
     renderer.set_proxy_draw_mode(mode);
     renderer.request_frame_capture().unwrap();
     let frame = renderer
-        .render_corner_populated(matrix, eye, light, population, size)
+        .submit_frame(corner_submission(
+            matrix,
+            eye,
+            light,
+            None,
+            corner_bounds(),
+            Some(*population),
+            None,
+            false,
+            None,
+            size,
+        ))
         .unwrap();
     assert!(frame.presented, "the populated frame presented");
     let image = renderer.take_frame_capture().unwrap().unwrap();
@@ -295,7 +308,18 @@ fn capture_base(
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(matrix, eye, light, size)
+            .submit_frame(corner_submission(
+                matrix,
+                eye,
+                light,
+                None,
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -365,7 +389,18 @@ fn check_single_instance_oracle(
     ];
     renderer.request_frame_capture().unwrap();
     let frame = renderer
-        .render_corner_populated(&matrix, wall.eye, day_preset(), population, size)
+        .submit_frame(corner_submission(
+            &matrix,
+            wall.eye,
+            day_preset(),
+            None,
+            corner_bounds(),
+            Some(*population),
+            None,
+            false,
+            None,
+            size,
+        ))
         .unwrap();
     assert!(frame.presented);
     assert_eq!(
@@ -498,13 +533,18 @@ fn check_rotated_instance_oracle(
     let single = [*instance];
     renderer.request_frame_capture().unwrap();
     let frame = renderer
-        .render_corner_populated(
+        .submit_frame(corner_submission(
             &matrix,
             eye,
             day_preset(),
-            &populated(&single, &[], 1, 0).population,
+            None,
+            corner_bounds(),
+            Some(populated(&single, &[], 1, 0).population),
+            None,
+            false,
+            None,
             size,
-        )
+        ))
         .unwrap();
     assert!(frame.presented);
     assert_eq!(
@@ -584,13 +624,16 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             replace_pipelines: true,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
@@ -710,13 +753,18 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
     // two mesh memories, their staged uploads' staging memories, and
     // the instance memory; cumulative counters never decrement).
     let replacement = renderer
-        .render_corner_populated(
+        .submit_frame(corner_submission(
             &matrix,
             eye,
             light,
-            &population.population,
+            None,
+            corner_bounds(),
+            Some(population.population),
+            None,
+            false,
+            None,
             (size.0 + 8, size.1 + 8),
-        )
+        ))
         .unwrap();
     assert!(replacement.recreated, "the resize forced a recreation");
     let (after, calls) = capture_populated(
@@ -830,26 +878,36 @@ fn instanced_draws_match_per_object_pixels_and_pin_counts() {
     // out-of-table material.
     let over: Vec<_> = vec![single_npc[0]; 4096];
     let refused = renderer
-        .render_corner_populated(
+        .submit_frame(corner_submission(
             &matrix,
             eye,
             light,
-            &populated(&over, &single_vehicle, 1, 2).population,
+            None,
+            corner_bounds(),
+            Some(populated(&over, &single_vehicle, 1, 2).population),
+            None,
+            false,
+            None,
             size,
-        )
+        ))
         .unwrap_err();
     assert!(matches!(
         refused,
         engine_renderer::RendererError::ProxyPack(_)
     ));
     let bad_material = renderer
-        .render_corner_populated(
+        .submit_frame(corner_submission(
             &matrix,
             eye,
             light,
-            &populated(&single_npc, &[], 3, 0).population,
+            None,
+            corner_bounds(),
+            Some(populated(&single_npc, &[], 3, 0).population),
+            None,
+            false,
+            None,
             size,
-        )
+        ))
         .unwrap_err();
     assert!(bad_material.to_string().contains("material table"));
     // A subsequent healthy frame still presents (no poisoned state).
@@ -995,12 +1053,15 @@ fn full_corner_population_matches_per_object_pixels() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
@@ -1186,7 +1247,18 @@ fn full_corner_population_matches_per_object_pixels() {
             };
             assert!(
                 renderer
-                    .render_corner_populated(&matrix, eye, light, &animated, size)
+                    .submit_frame(corner_submission(
+                        &matrix,
+                        eye,
+                        light,
+                        None,
+                        corner_bounds(),
+                        Some(animated),
+                        None,
+                        false,
+                        None,
+                        size
+                    ))
                     .unwrap()
                     .presented
             );
@@ -1251,7 +1323,18 @@ fn full_corner_population_matches_per_object_pixels() {
                 rain_material: 0,
             };
             let outcome = renderer
-                .render_corner_populated(&matrix, eye, light, &animated, size)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    eye,
+                    light,
+                    None,
+                    corner_bounds(),
+                    Some(animated),
+                    None,
+                    false,
+                    None,
+                    size,
+                ))
                 .unwrap();
             let allocs = scope.count();
             drop(scope);
@@ -1336,13 +1419,16 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             replace_pipelines: true,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
@@ -1525,7 +1611,18 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
         renderer.set_proxy_draw_mode(mode);
         let scope = common::HostAllocScope::new();
         let outcome = renderer
-            .render_corner_populated(&matrix, eye, light, &population.population, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                None,
+                corner_bounds(),
+                Some(population.population),
+                None,
+                false,
+                None,
+                size,
+            ))
             .unwrap();
         let allocs = scope.count();
         drop(scope);
@@ -1547,13 +1644,18 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
     // allocations survive; the counters resume constant.
     renderer.set_proxy_draw_mode(ProxyDrawMode::Indirect);
     let replacement = renderer
-        .render_corner_populated(
+        .submit_frame(corner_submission(
             &matrix,
             eye,
             light,
-            &population.population,
+            None,
+            corner_bounds(),
+            Some(population.population),
+            None,
+            false,
+            None,
             (size.0 + 8, size.1 + 8),
-        )
+        ))
         .unwrap();
     assert!(replacement.recreated, "the resize forced a recreation");
     let (after, calls) = capture_populated(
@@ -1651,13 +1753,18 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
     // one past MAX_INSTANCES (the TOTAL-population bound).
     let over: Vec<_> = vec![single_npc[0]; 4097];
     let refused = renderer
-        .render_corner_populated(
+        .submit_frame(corner_submission(
             &matrix,
             eye,
             light,
-            &populated(&over, &[], 1, 0).population,
+            None,
+            corner_bounds(),
+            Some(populated(&over, &[], 1, 0).population),
+            None,
+            false,
+            None,
             size,
-        )
+        ))
         .unwrap_err();
     assert!(matches!(
         refused,
@@ -1723,7 +1830,18 @@ fn indirect_draws_match_direct_and_per_object_pixels() {
         renderer.set_proxy_draw_mode(mode);
         renderer.request_frame_capture().unwrap();
         let frame = renderer
-            .render_corner_populated(&matrix, eye, light, &population.population, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                None,
+                corner_bounds(),
+                Some(population.population),
+                None,
+                false,
+                None,
+                size,
+            ))
             .unwrap();
         assert!(frame.presented);
         assert_eq!(
@@ -1857,12 +1975,15 @@ fn oblique_wheel_views_expose_the_outside_tire_and_both_cap_orientations() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
@@ -1952,7 +2073,18 @@ fn oblique_wheel_views_expose_the_outside_tire_and_both_cap_orientations() {
     );
     renderer.request_frame_capture().unwrap();
     let frame = renderer
-        .render_corner_populated(&matrix, eye, light, &population.population, size)
+        .submit_frame(corner_submission(
+            &matrix,
+            eye,
+            light,
+            None,
+            corner_bounds(),
+            Some(population.population),
+            None,
+            false,
+            None,
+            size,
+        ))
         .unwrap();
     assert!(frame.presented && frame.geometry.proxy_draw_calls == 1);
     let image = renderer.take_frame_capture().unwrap().unwrap();
@@ -2029,7 +2161,18 @@ fn oblique_wheel_views_expose_the_outside_tire_and_both_cap_orientations() {
     );
     renderer.request_frame_capture().unwrap();
     let frame = renderer
-        .render_corner_populated(&matrix, eye, light, &population.population, size)
+        .submit_frame(corner_submission(
+            &matrix,
+            eye,
+            light,
+            None,
+            corner_bounds(),
+            Some(population.population),
+            None,
+            false,
+            None,
+            size,
+        ))
         .unwrap();
     assert!(frame.presented && frame.geometry.proxy_draw_calls == 1);
     let image = renderer.take_frame_capture().unwrap().unwrap();
@@ -2115,7 +2258,18 @@ fn oblique_wheel_views_expose_the_outside_tire_and_both_cap_orientations() {
     );
     renderer.request_frame_capture().unwrap();
     let frame = renderer
-        .render_corner_populated(&matrix, eye, light, &population.population, size)
+        .submit_frame(corner_submission(
+            &matrix,
+            eye,
+            light,
+            None,
+            corner_bounds(),
+            Some(population.population),
+            None,
+            false,
+            None,
+            size,
+        ))
         .unwrap();
     assert!(frame.presented && frame.geometry.proxy_draw_calls == 1);
     let image = renderer.take_frame_capture().unwrap().unwrap();
@@ -2277,13 +2431,16 @@ fn skinned_pose_matches_the_cpu_oracle() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             replace_pipelines: true,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
@@ -2520,7 +2677,18 @@ fn skinned_pose_matches_the_cpu_oracle() {
     };
     renderer.request_frame_capture().unwrap();
     let frame = renderer
-        .render_corner_populated(&matrix, eye, day_preset(), &population, size)
+        .submit_frame(corner_submission(
+            &matrix,
+            eye,
+            day_preset(),
+            None,
+            corner_bounds(),
+            Some(population),
+            None,
+            false,
+            None,
+            size,
+        ))
         .unwrap();
     assert!(frame.presented);
     assert_eq!(
@@ -2598,7 +2766,18 @@ fn skinned_pose_matches_the_cpu_oracle() {
     // identical bytes).
     renderer.request_frame_capture().unwrap();
     let repeat_frame = renderer
-        .render_corner_populated(&matrix, eye, day_preset(), &population, size)
+        .submit_frame(corner_submission(
+            &matrix,
+            eye,
+            day_preset(),
+            None,
+            corner_bounds(),
+            Some(population),
+            None,
+            false,
+            None,
+            size,
+        ))
         .unwrap();
     assert!(repeat_frame.presented);
     let repeat = renderer.take_frame_capture().unwrap().unwrap();
@@ -2621,7 +2800,18 @@ fn skinned_pose_matches_the_cpu_oracle() {
     };
     renderer.request_frame_capture().unwrap();
     let rest_frame = renderer
-        .render_corner_populated(&matrix, eye, day_preset(), &rest_population, size)
+        .submit_frame(corner_submission(
+            &matrix,
+            eye,
+            day_preset(),
+            None,
+            corner_bounds(),
+            Some(rest_population),
+            None,
+            false,
+            None,
+            size,
+        ))
         .unwrap();
     assert!(rest_frame.presented);
     let rest_image = renderer.take_frame_capture().unwrap().unwrap();
@@ -2691,13 +2881,16 @@ fn animated_population_matches_per_object_pixels() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             replace_pipelines: true,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
@@ -2825,7 +3018,18 @@ fn animated_population_matches_per_object_pixels() {
     };
     renderer.request_frame_capture().unwrap();
     let rest_frame = renderer
-        .render_corner_populated(&matrix, eye, light, &at_rest, size)
+        .submit_frame(corner_submission(
+            &matrix,
+            eye,
+            light,
+            None,
+            corner_bounds(),
+            Some(at_rest),
+            None,
+            false,
+            None,
+            size,
+        ))
         .unwrap();
     assert!(rest_frame.presented);
     let rest_image = renderer.take_frame_capture().unwrap().unwrap();
@@ -2896,12 +3100,15 @@ fn composed_population_matches_per_object_pixels() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
@@ -3102,7 +3309,18 @@ fn composed_population_matches_per_object_pixels() {
             };
             assert!(
                 renderer
-                    .render_corner_populated(&matrix, eye, light, &animated, size)
+                    .submit_frame(corner_submission(
+                        &matrix,
+                        eye,
+                        light,
+                        None,
+                        corner_bounds(),
+                        Some(animated),
+                        None,
+                        false,
+                        None,
+                        size
+                    ))
                     .unwrap()
                     .presented
             );
@@ -3188,7 +3406,18 @@ fn composed_population_matches_per_object_pixels() {
                 rain_material: 0,
             };
             let outcome = renderer
-                .render_corner_populated(&matrix, eye, light, &animated, size)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    eye,
+                    light,
+                    None,
+                    corner_bounds(),
+                    Some(animated),
+                    None,
+                    false,
+                    None,
+                    size,
+                ))
                 .unwrap();
             let allocs = scope.count();
             drop(scope);
@@ -3268,7 +3497,18 @@ fn composed_population_matches_per_object_pixels() {
         };
         renderer.request_frame_capture().unwrap();
         let rest_frame = renderer
-            .render_corner_populated(&matrix, eye, light, &at_rest, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                None,
+                corner_bounds(),
+                Some(at_rest),
+                None,
+                false,
+                None,
+                size,
+            ))
             .unwrap();
         assert!(rest_frame.presented);
         let rest_image = renderer.take_frame_capture().unwrap().unwrap();
@@ -3435,12 +3675,15 @@ fn composed_wake_campaign_past_log_boundaries_allocates_nothing() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
@@ -3579,7 +3822,18 @@ fn composed_wake_campaign_past_log_boundaries_allocates_nothing() {
             rain_material: 0,
         };
         let outcome = renderer
-            .render_corner_populated(&matrix, eye, light, &animated, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                None,
+                corner_bounds(),
+                Some(animated),
+                None,
+                false,
+                None,
+                size,
+            ))
             .unwrap();
         assert!(outcome.presented);
     }
@@ -3628,7 +3882,18 @@ fn composed_wake_campaign_past_log_boundaries_allocates_nothing() {
             rain_material: 0,
         };
         let outcome = renderer
-            .render_corner_populated(&matrix, eye, light, &animated, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                None,
+                corner_bounds(),
+                Some(animated),
+                None,
+                false,
+                None,
+                size,
+            ))
             .unwrap();
         let allocs = scope.count();
         drop(scope);

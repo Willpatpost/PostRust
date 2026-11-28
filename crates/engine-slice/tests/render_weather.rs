@@ -45,9 +45,11 @@ use engine_renderer::planar::{projected_uv_offset, reflection_blend, ripple_pert
 use engine_renderer::proxy_instances::{InstanceTransform, ProxyInstance};
 use engine_renderer::{
     DemoScenePreference, ProxyDrawMode, ProxyPopulation, RIPPLE_ROUGHEN_GAIN, RIPPLE_UV_GAIN,
-    RenderConfig, Renderer, RippleDebugMode, ValidationPreference,
+    RenderConfig, Renderer, RippleDebugMode, ValidationPreference, WetFrame,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
+use engine_slice::corner_demo::corner_submission;
+use engine_slice::corner_scene::corner_bounds;
 use engine_slice::corner_weather::{
     RAIN_ALPHA, RAIN_MATERIAL, RIPPLE_POLICY, RainLayer, yaw_to_turn,
 };
@@ -84,15 +86,19 @@ fn app_and_renderer(title: &str) -> (ShellApp, Renderer) {
         driver: DriverPreference::Real,
     })
     .unwrap();
-    let renderer = Renderer::new(
+    let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            // P4 S6: the corner content is ATTACHED (the Corner
+            // construction preference is deleted) — the same public
+            // attach every consumer uses.
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             ..Default::default()
         },
     )
     .unwrap();
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
     (app, renderer)
 }
 
@@ -141,14 +147,36 @@ fn raining_capture(
         layer.update_and_build(GATE_EYE, yaw, 0.0, demo_clock_dt().as_secs_f32());
         let population = layer.population();
         renderer
-            .render_corner_populated(matrix, GATE_EYE, light, &population, SIZE)
+            .submit_frame(corner_submission(
+                matrix,
+                GATE_EYE,
+                light,
+                None,
+                corner_bounds(),
+                Some(population),
+                None,
+                false,
+                None,
+                SIZE,
+            ))
             .unwrap();
     }
     renderer.request_frame_capture().unwrap();
     let population = layer.population();
     assert!(
         renderer
-            .render_corner_populated(matrix, GATE_EYE, light, &population, SIZE)
+            .submit_frame(corner_submission(
+                matrix,
+                GATE_EYE,
+                light,
+                None,
+                corner_bounds(),
+                Some(population),
+                None,
+                false,
+                None,
+                SIZE,
+            ))
             .unwrap()
             .presented
     );
@@ -178,7 +206,18 @@ fn rain_ink_count_gate() {
     let baseline_pop = rainless();
     assert!(
         renderer
-            .render_corner_populated(&matrix, GATE_EYE, light, &baseline_pop, SIZE)
+            .submit_frame(corner_submission(
+                &matrix,
+                GATE_EYE,
+                light,
+                None,
+                corner_bounds(),
+                Some(baseline_pop),
+                None,
+                false,
+                None,
+                SIZE
+            ))
             .unwrap()
             .presented
     );
@@ -246,13 +285,35 @@ fn rain_ink_broadside_at_presentation_extent() {
         let pop = rainless();
         for _ in 0..60 {
             renderer
-                .render_corner_populated(&matrix, GATE_EYE, light, &pop, SIZE)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    GATE_EYE,
+                    light,
+                    None,
+                    corner_bounds(),
+                    Some(pop),
+                    None,
+                    false,
+                    None,
+                    SIZE,
+                ))
                 .unwrap();
         }
         renderer.request_frame_capture().unwrap();
         assert!(
             renderer
-                .render_corner_populated(&matrix, GATE_EYE, light, &pop, SIZE)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    GATE_EYE,
+                    light,
+                    None,
+                    corner_bounds(),
+                    Some(pop),
+                    None,
+                    false,
+                    None,
+                    SIZE,
+                ))
                 .unwrap()
                 .presented
         );
@@ -262,13 +323,35 @@ fn rain_ink_broadside_at_presentation_extent() {
         let pop = rainless();
         for _ in 0..60 {
             renderer
-                .render_corner_populated(&matrix, GATE_EYE, light, &pop, SIZE)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    GATE_EYE,
+                    light,
+                    None,
+                    corner_bounds(),
+                    Some(pop),
+                    None,
+                    false,
+                    None,
+                    SIZE,
+                ))
                 .unwrap();
         }
         renderer.request_frame_capture().unwrap();
         assert!(
             renderer
-                .render_corner_populated(&matrix, GATE_EYE, light, &pop, SIZE)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    GATE_EYE,
+                    light,
+                    None,
+                    corner_bounds(),
+                    Some(pop),
+                    None,
+                    false,
+                    None,
+                    SIZE,
+                ))
                 .unwrap()
                 .presented
         );
@@ -358,10 +441,11 @@ fn rain_ink_broadside_at_presentation_extent() {
 
 /// One raining WET campaign at the gate camera with the ripple
 /// uniform pinned per frame (the `raining_capture` shape plus the
-/// sticky setter — the presentation bridge: the field state itself
-/// is deterministic sim state (the campaign digest pins it), the
-/// setter only copies it into the frame's uniform). `frames` warm
-/// frames, then the captured presentation frame.
+/// per-frame wet declaration — the presentation bridge: the field
+/// state itself is deterministic sim state (the campaign digest
+/// pins it), the submission only packs it into the frame's
+/// uniform). `frames` warm frames, then the captured presentation
+/// frame.
 fn ripple_campaign(
     renderer: &mut Renderer,
     matrix: &[[f32; 4]; 4],
@@ -370,21 +454,42 @@ fn ripple_campaign(
     ripple: Option<&RippleField>,
     frames: usize,
 ) -> engine_renderer::CapturedFrame {
+    let wet = Some(WetFrame { ripple });
     let mut layer = RainLayer::new(GATE_EYE);
     for _ in 0..frames {
         layer.update_and_build(GATE_EYE, yaw, 0.0, demo_clock_dt().as_secs_f32());
         let population = layer.population();
-        renderer.set_ripple_field(ripple);
         renderer
-            .render_corner_populated(matrix, GATE_EYE, light, &population, SIZE)
+            .submit_frame(corner_submission(
+                matrix,
+                GATE_EYE,
+                light,
+                None,
+                corner_bounds(),
+                Some(population),
+                None,
+                false,
+                wet,
+                SIZE,
+            ))
             .unwrap();
     }
     renderer.request_frame_capture().unwrap();
     let population = layer.population();
-    renderer.set_ripple_field(ripple);
     assert!(
         renderer
-            .render_corner_populated(matrix, GATE_EYE, light, &population, SIZE)
+            .submit_frame(corner_submission(
+                matrix,
+                GATE_EYE,
+                light,
+                None,
+                corner_bounds(),
+                Some(population),
+                None,
+                false,
+                wet,
+                SIZE,
+            ))
             .unwrap()
             .presented
     );
@@ -422,8 +527,8 @@ fn ripple_reflection_gate() {
     // The wet path must be ON for both captures — the ripple
     // uniform rides the wet ground re-draw (a dry frame never
     // samples it; without this the gate would measure wet-vs-dry,
-    // not ripple-vs-none).
-    renderer.set_wet(true);
+    // not ripple-vs-none). The campaigns below carry the wet
+    // declaration on every submission (the helper builds it).
     renderer.set_proxy_draw_mode(ProxyDrawMode::Instanced);
 
     // The forced field: the DEMO's policy with eight hand-authored
@@ -723,24 +828,37 @@ fn oracle_rows(rings: &[RippleRing]) -> [[f32; 4]; 2 + engine_core::ripple::RIPP
 }
 
 /// One wet capture at the gate camera with the ripple uniform and
-/// the TEST-ONLY debug mode pinned (the sticky setters — the
-/// presentation bridge; single frames, the static rainless
+/// the TEST-ONLY debug mode pinned (the per-frame wet declaration —
+/// the presentation bridge; single frames, the static rainless
 /// population: the diff between two such captures isolates exactly
-/// the ripple terms the modes leave active).
+/// the ripple terms the modes leave active). `wet` is the caller's
+/// declaration (the dry capture is the signed-movement gate's own
+/// control arm).
 fn ripple_mode_capture(
     renderer: &mut Renderer,
     matrix: &[[f32; 4]; 4],
     light: LightParams,
     ripple: Option<&RippleField>,
+    wet: bool,
     mode: RippleDebugMode,
 ) -> engine_renderer::CapturedFrame {
     renderer.set_ripple_debug_mode(mode);
-    renderer.set_ripple_field(ripple);
     let empty = rainless();
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_populated(matrix, GATE_EYE, light, &empty, SIZE)
+            .submit_frame(corner_submission(
+                matrix,
+                GATE_EYE,
+                light,
+                None,
+                corner_bounds(),
+                Some(empty),
+                None,
+                false,
+                wet.then_some(WetFrame { ripple }),
+                SIZE,
+            ))
             .unwrap()
             .presented
     );
@@ -768,7 +886,6 @@ fn ripple_term_separation_gate() {
 
     let (matrix, _yaw) = gate_matrix();
     let light = day_preset();
-    renderer.set_wet(true);
     renderer.set_proxy_draw_mode(ProxyDrawMode::Instanced);
 
     let forced = forced_eight_ring_field();
@@ -776,12 +893,20 @@ fn ripple_term_separation_gate() {
     // The three captures: the empty baseline, blend-only, and
     // displacement-only (single frames — the field is static and
     // authored; the population is the rainless baseline).
-    let baseline = ripple_mode_capture(&mut renderer, &matrix, light, None, RippleDebugMode::Off);
+    let baseline = ripple_mode_capture(
+        &mut renderer,
+        &matrix,
+        light,
+        None,
+        true,
+        RippleDebugMode::Off,
+    );
     let blend_only = ripple_mode_capture(
         &mut renderer,
         &matrix,
         light,
         Some(&forced),
+        true,
         RippleDebugMode::BlendOnly,
     );
     let displacement_only = ripple_mode_capture(
@@ -789,6 +914,7 @@ fn ripple_term_separation_gate() {
         &matrix,
         light,
         Some(&forced),
+        true,
         RippleDebugMode::DisplacementOnly,
     );
 
@@ -901,13 +1027,19 @@ fn ripple_signed_movement_gate() {
 
     let (matrix, _yaw) = gate_matrix();
     let light = day_preset();
-    renderer.set_wet(true);
     renderer.set_proxy_draw_mode(ProxyDrawMode::Instanced);
     let (forward, right, up) = gate_basis();
     let (width, height) = (SIZE.0 as usize, SIZE.1 as usize);
 
     // The baseline (the empty field — the identity no-op).
-    let baseline = ripple_mode_capture(&mut renderer, &matrix, light, None, RippleDebugMode::Off);
+    let baseline = ripple_mode_capture(
+        &mut renderer,
+        &matrix,
+        light,
+        None,
+        true,
+        RippleDebugMode::Off,
+    );
 
     // THE DRY CAPTURE (the round-7 corrective — the receiver-blend
     // gate's own qualification discipline): the round-6 Ubuntu run
@@ -929,9 +1061,14 @@ fn ripple_signed_movement_gate() {
     // byte-identical wet and dry (the receiver redraw is depth-EQUAL
     // on the ground only), so the receiver-response floor excludes
     // it before the content math runs.
-    renderer.set_wet(false);
-    let dry = ripple_mode_capture(&mut renderer, &matrix, light, None, RippleDebugMode::Off);
-    renderer.set_wet(true);
+    let dry = ripple_mode_capture(
+        &mut renderer,
+        &matrix,
+        light,
+        None,
+        false,
+        RippleDebugMode::Off,
+    );
 
     // THE MEASURED ASYMMETRIC MIRROR FEATURE: the strongest
     // reflection-CONTENT transition (the sweep magnitude s above)
@@ -1081,6 +1218,7 @@ fn ripple_signed_movement_gate() {
         &matrix,
         light,
         Some(&young),
+        true,
         RippleDebugMode::DisplacementOnly,
     );
     let blend = ripple_mode_capture(
@@ -1088,6 +1226,7 @@ fn ripple_signed_movement_gate() {
         &matrix,
         light,
         Some(&young),
+        true,
         RippleDebugMode::BlendOnly,
     );
 
@@ -1270,6 +1409,7 @@ fn ripple_signed_movement_gate() {
         &matrix,
         light,
         Some(&mature),
+        true,
         RippleDebugMode::DisplacementOnly,
     );
     // The projected support geometry (the world annulus's screen
@@ -1408,7 +1548,6 @@ fn ripple_natural_sequence_gate() {
 
     let (matrix, yaw) = gate_matrix();
     let light = day_preset();
-    renderer.set_wet(true);
     renderer.set_proxy_draw_mode(ProxyDrawMode::Instanced);
 
     let dt = 1.0f32 / 60.0f32;
@@ -1431,16 +1570,28 @@ fn ripple_natural_sequence_gate() {
         let before_spawned = layer.ripple_field().spawned();
         layer.update_and_build(GATE_EYE, yaw, 0.0, demo_clock_dt().as_secs_f32());
         // THE LIVE FIELD FORWARDED (the finding-15d corrective: the
-        // campaign's own field, packed every frame exactly as the
-        // demo's bridge does).
-        renderer.set_ripple_field(Some(layer.ripple_field()));
+        // campaign's own field, declared on every submission below
+        // exactly as the demo's route does).
         let population = layer.population();
         let field = layer.ripple_field();
         let new_count = field.spawned() - before_spawned;
         if new_count == 0 {
             assert!(
                 renderer
-                    .render_corner_populated(&matrix, GATE_EYE, light, &population, SIZE)
+                    .submit_frame(corner_submission(
+                        &matrix,
+                        GATE_EYE,
+                        light,
+                        None,
+                        corner_bounds(),
+                        Some(population),
+                        None,
+                        false,
+                        Some(WetFrame {
+                            ripple: Some(layer.ripple_field())
+                        }),
+                        SIZE,
+                    ))
                     .unwrap()
                     .presented
             );
@@ -1516,7 +1667,20 @@ fn ripple_natural_sequence_gate() {
             );
             assert!(
                 renderer
-                    .render_corner_populated(&matrix, GATE_EYE, light, &population, SIZE)
+                    .submit_frame(corner_submission(
+                        &matrix,
+                        GATE_EYE,
+                        light,
+                        None,
+                        corner_bounds(),
+                        Some(population),
+                        None,
+                        false,
+                        Some(WetFrame {
+                            ripple: Some(layer.ripple_field())
+                        }),
+                        SIZE,
+                    ))
                     .unwrap()
                     .presented
             );
@@ -1528,7 +1692,20 @@ fn ripple_natural_sequence_gate() {
         if max_x < 0.0 || min_x >= SIZE.0 as f32 || max_y < 0.0 || min_y >= SIZE.1 as f32 {
             assert!(
                 renderer
-                    .render_corner_populated(&matrix, GATE_EYE, light, &population, SIZE)
+                    .submit_frame(corner_submission(
+                        &matrix,
+                        GATE_EYE,
+                        light,
+                        None,
+                        corner_bounds(),
+                        Some(population),
+                        None,
+                        false,
+                        Some(WetFrame {
+                            ripple: Some(layer.ripple_field())
+                        }),
+                        SIZE,
+                    ))
                     .unwrap()
                     .presented
             );
@@ -1540,7 +1717,20 @@ fn ripple_natural_sequence_gate() {
         renderer.request_frame_capture().unwrap();
         assert!(
             renderer
-                .render_corner_populated(&matrix, GATE_EYE, light, &population, SIZE)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    GATE_EYE,
+                    light,
+                    None,
+                    corner_bounds(),
+                    Some(population),
+                    None,
+                    false,
+                    Some(WetFrame {
+                        ripple: Some(layer.ripple_field())
+                    }),
+                    SIZE,
+                ))
                 .unwrap()
                 .presented
         );
@@ -1561,11 +1751,25 @@ fn ripple_natural_sequence_gate() {
             }
             field
         };
-        renderer.set_ripple_field(Some(&before_field));
+        // The before-field rides THIS submission alone (the deleted
+        // sticky setter's per-frame call site).
         renderer.request_frame_capture().unwrap();
         assert!(
             renderer
-                .render_corner_populated(&matrix, GATE_EYE, light, &population, SIZE)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    GATE_EYE,
+                    light,
+                    None,
+                    corner_bounds(),
+                    Some(population),
+                    None,
+                    false,
+                    Some(WetFrame {
+                        ripple: Some(&before_field)
+                    }),
+                    SIZE,
+                ))
                 .unwrap()
                 .presented
         );
@@ -1651,6 +1855,7 @@ fn ripple_natural_sequence_gate() {
                 &matrix,
                 light,
                 Some(layer.ripple_field()),
+                true,
                 RippleDebugMode::DisplacementOnly,
             );
             let disp_without = ripple_mode_capture(
@@ -1658,6 +1863,7 @@ fn ripple_natural_sequence_gate() {
                 &matrix,
                 light,
                 Some(&before_field),
+                true,
                 RippleDebugMode::DisplacementOnly,
             );
             let mut disp_ink = 0usize;
@@ -1697,6 +1903,7 @@ fn ripple_natural_sequence_gate() {
                 &matrix,
                 light,
                 Some(layer.ripple_field()),
+                true,
                 RippleDebugMode::BlendOnly,
             );
             let blend_without = ripple_mode_capture(
@@ -1704,6 +1911,7 @@ fn ripple_natural_sequence_gate() {
                 &matrix,
                 light,
                 Some(&before_field),
+                true,
                 RippleDebugMode::BlendOnly,
             );
             let mut blend_ink = 0usize;
@@ -1740,16 +1948,27 @@ fn ripple_natural_sequence_gate() {
             sequence = Some(new_rings.clone());
             break;
         }
-        renderer.set_wet(false);
+        // The dry control arm: THIS submission alone declares no
+        // wet (the deleted set_wet toggle's per-frame form).
         renderer.request_frame_capture().unwrap();
         assert!(
             renderer
-                .render_corner_populated(&matrix, GATE_EYE, light, &population, SIZE)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    GATE_EYE,
+                    light,
+                    None,
+                    corner_bounds(),
+                    Some(population),
+                    None,
+                    false,
+                    None,
+                    SIZE,
+                ))
                 .unwrap()
                 .presented
         );
         let dry = renderer.take_frame_capture().unwrap().unwrap();
-        renderer.set_wet(true);
         let mut contribution = 0i32;
         for y in inflated_min_y.max(0)..=(inflated_max_y.min(height_cap())) {
             for x in inflated_min_x.max(0)..=(inflated_max_x.min(width_cap())) {
@@ -1834,7 +2053,18 @@ fn rain_warmed_allocation_constancy() {
         renderer.request_frame_capture().unwrap();
         assert!(
             renderer
-                .render_corner_populated(&matrix, GATE_EYE, light, &population, SIZE)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    GATE_EYE,
+                    light,
+                    None,
+                    corner_bounds(),
+                    Some(population),
+                    None,
+                    false,
+                    None,
+                    SIZE,
+                ))
                 .unwrap()
                 .presented
         );
@@ -1852,7 +2082,18 @@ fn rain_warmed_allocation_constancy() {
             layer.update_and_build(GATE_EYE, yaw, 0.0, demo_clock_dt().as_secs_f32());
             let population = layer.population();
             let outcome = renderer
-                .render_corner_populated(&matrix, GATE_EYE, light, &population, SIZE)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    GATE_EYE,
+                    light,
+                    None,
+                    corner_bounds(),
+                    Some(population),
+                    None,
+                    false,
+                    None,
+                    SIZE,
+                ))
                 .unwrap();
             let host = scope.count();
             assert!(outcome.presented);
@@ -1904,7 +2145,18 @@ fn rain_double_run_byte_equality() {
             renderer.request_frame_capture().unwrap();
             assert!(
                 renderer
-                    .render_corner_populated(&matrix, GATE_EYE, light, &population, SIZE)
+                    .submit_frame(corner_submission(
+                        &matrix,
+                        GATE_EYE,
+                        light,
+                        None,
+                        corner_bounds(),
+                        Some(population),
+                        None,
+                        false,
+                        None,
+                        SIZE,
+                    ))
                     .unwrap()
                     .presented
             );
@@ -1970,7 +2222,18 @@ fn rain_n_vs_1_draw_mode_equivalence() {
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_populated(&matrix, GATE_EYE, light, &population, SIZE)
+            .submit_frame(corner_submission(
+                &matrix,
+                GATE_EYE,
+                light,
+                None,
+                corner_bounds(),
+                Some(population),
+                None,
+                false,
+                None,
+                SIZE,
+            ))
             .unwrap()
             .presented
     );
@@ -1980,7 +2243,18 @@ fn rain_n_vs_1_draw_mode_equivalence() {
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_populated(&matrix, GATE_EYE, light, &population, SIZE)
+            .submit_frame(corner_submission(
+                &matrix,
+                GATE_EYE,
+                light,
+                None,
+                corner_bounds(),
+                Some(population),
+                None,
+                false,
+                None,
+                SIZE,
+            ))
             .unwrap()
             .presented
     );
@@ -2132,7 +2406,18 @@ fn rain_diagonal_single_drop_footprint() {
     let baseline_pop = rainless();
     assert!(
         renderer
-            .render_corner_populated(&matrix, GATE_EYE, light, &baseline_pop, SIZE)
+            .submit_frame(corner_submission(
+                &matrix,
+                GATE_EYE,
+                light,
+                None,
+                corner_bounds(),
+                Some(baseline_pop),
+                None,
+                false,
+                None,
+                SIZE,
+            ))
             .unwrap()
             .presented
     );
@@ -2140,7 +2425,18 @@ fn rain_diagonal_single_drop_footprint() {
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_populated(&matrix, GATE_EYE, light, &population, SIZE)
+            .submit_frame(corner_submission(
+                &matrix,
+                GATE_EYE,
+                light,
+                None,
+                corner_bounds(),
+                Some(population),
+                None,
+                false,
+                None,
+                SIZE,
+            ))
             .unwrap()
             .presented
     );
@@ -2222,14 +2518,36 @@ fn rain_composition_smoke() {
         layer.update_and_build(GATE_EYE, yaw, 0.35, demo_clock_dt().as_secs_f32());
         let population = layer.population();
         renderer
-            .render_corner_populated_shadowed(&matrix, GATE_EYE, light, BIAS, &population, SIZE)
+            .submit_frame(corner_submission(
+                &matrix,
+                GATE_EYE,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                Some(population),
+                None,
+                false,
+                None,
+                SIZE,
+            ))
             .unwrap();
     }
     // The raining composed capture.
     renderer.request_frame_capture().unwrap();
     let population = layer.population();
     let frame = renderer
-        .render_corner_populated_shadowed(&matrix, GATE_EYE, light, BIAS, &population, SIZE)
+        .submit_frame(corner_submission(
+            &matrix,
+            GATE_EYE,
+            light,
+            Some(BIAS),
+            corner_bounds(),
+            Some(population),
+            None,
+            false,
+            None,
+            SIZE,
+        ))
         .unwrap();
     assert!(frame.presented, "the composed frame presented");
     let raining = renderer.take_frame_capture().unwrap().unwrap();
@@ -2238,7 +2556,18 @@ fn rain_composition_smoke() {
     renderer.request_frame_capture().unwrap();
     let baseline_pop = rainless();
     let baseline_frame = renderer
-        .render_corner_populated_shadowed(&matrix, GATE_EYE, light, BIAS, &baseline_pop, SIZE)
+        .submit_frame(corner_submission(
+            &matrix,
+            GATE_EYE,
+            light,
+            Some(BIAS),
+            corner_bounds(),
+            Some(baseline_pop),
+            None,
+            false,
+            None,
+            SIZE,
+        ))
         .unwrap();
     assert!(baseline_frame.presented);
     let baseline = renderer.take_frame_capture().unwrap().unwrap();

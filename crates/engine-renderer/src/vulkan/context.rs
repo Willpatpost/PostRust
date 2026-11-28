@@ -482,13 +482,13 @@ impl VulkanContext {
             context.destroy();
             return Err(e);
         }
-        // The corner content NO LONGER uploads here (P4 S2): the
-        // `Corner` preference's construction-time upload moved to the
-        // attach API (`Renderer::new`'s preference adapter attaches the
-        // migration shim's description through
-        // `VulkanContext::attach_scene_resources` — the same ladder
-        // position, the same allocation order, now behind the
-        // `SceneDescription` handle every future consumer uses).
+        // The corner content NO LONGER uploads here (P4 S2, completed
+        // at S6): construction builds NO scene resources — every
+        // description (the corner's included) reaches the context
+        // through `VulkanContext::attach_scene_resources` behind the
+        // `SceneDescription` handle, called by
+        // `Renderer::attach_scene` on the consumer's side of the
+        // boundary.
         Ok((context, validation_active, sync_validation))
     }
 

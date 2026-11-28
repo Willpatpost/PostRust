@@ -481,6 +481,53 @@ pub fn view_projection(pose: RouteWaypoint, aspect: f32) -> Mat4 {
     )
 }
 
+/// One corner frame's submission — THE corner route's frame
+/// declaration since P4 S6 (the four former `render_corner*`
+/// entries' argument lists folded into the public contract's one
+/// per-frame type: the shadows/population presence that used to
+/// select the entry now selects the `SceneFrame`'s fields, and the
+/// sky/post/wet state the deleted sticky setters fed rides the
+/// same declaration). The corner batteries reuse this builder for
+/// the same reason they reuse [`view_projection`] — one tested
+/// place where the corner route's frame shape lives.
+// The argument count is the four-way union's own axis set (the
+// run() precedent: one parameter per demo-mode flag the callers
+// already hold flat); grouping them would restructure every call
+// site inside what is already a mechanical migration.
+#[allow(clippy::too_many_arguments)]
+pub fn corner_submission<'a>(
+    matrix: &Mat4,
+    eye: [f32; 3],
+    light: LightParams,
+    shadows: Option<engine_renderer::shadows::ShadowBias>,
+    corner_bounds: engine_renderer::SceneBounds,
+    population: Option<engine_renderer::ProxyPopulation<'a>>,
+    sky: Option<engine_renderer::SkyFrame>,
+    post: bool,
+    wet: Option<engine_renderer::WetFrame<'a>>,
+    size: (u32, u32),
+) -> engine_renderer::FrameSubmission<'a> {
+    engine_renderer::FrameSubmission {
+        camera: engine_renderer::FrameCamera {
+            view_proj: *matrix,
+            eye,
+        },
+        output: engine_renderer::OutputTarget { window_size: size },
+        layers: engine_renderer::DynamicLayers::default(),
+        scene: Some(engine_renderer::SceneFrame {
+            light,
+            shadows: shadows.map(|bias| engine_renderer::ShadowFrame {
+                bias,
+                bounds: corner_bounds,
+            }),
+            population,
+            sky,
+            post,
+            wet,
+        }),
+    }
+}
+
 /// The free-look mode's options; `None` in [`run`] keeps the
 /// scripted measurement route, `Some` replaces the route's pose
 /// with the interactive camera (presentation only).
@@ -727,11 +774,22 @@ pub fn run(
         RenderConfig {
             present_mode: present,
             validation,
-            demo_scene: DemoScenePreference::Corner,
+            // P4 S6: the corner content is ATTACHED, not constructed
+            // (the Corner preference is deleted) — the demo authors
+            // its own description through the same public
+            // attach_scene every consumer uses.
+            demo_scene: DemoScenePreference::Omitted,
             ..Default::default()
         },
     )
     .map_err(|e| e.to_string())?;
+    let scene =
+        crate::corner_scene::attach_corner_scene(&mut renderer).map_err(|e| e.to_string())?;
+    let corner_bounds = crate::corner_scene::corner_bounds();
+    debug_assert_eq!(
+        scene.material_count, 3,
+        "the corner table's three materials"
+    );
     // THE RENDERING BRIDGE (Era 2 package A part 4): the populated
     // route's crowd is BEHAVIOR STATE — the locomotion population
     // (routes, states, mask) stepped per presented frame at the
@@ -807,19 +865,16 @@ pub fn run(
         ProxyDrawMode::Indirect
     };
     renderer.set_proxy_draw_mode(proxy_mode);
-    // Era 1 package 6: the post chain (the sticky renderer setting
-    // — the HDR render-target chain + the bloom mips + the ACES
-    // composite, post.rs's equations through the real render path).
-    // Composes with EVERY corner flag (the sky's disc is the bloom
-    // feeder the gate pins); the region path stays postless (the
-    // setting's documented scope).
-    renderer.set_post(post);
-    // Era 1 package 7: the wet-ground reflection (the sticky
-    // renderer setting — the mirrored scene into the offscreen
-    // target, the ground re-drawn Schlick-blended). Composes with
-    // every corner flag; the mirrored scene is the building masses
-    // (the sky and the proxies are the documented follow-ups).
-    renderer.set_wet(wet);
+    // Era 1 packages 6/7/3 — THE PER-FRAME SUBMISSION STATE (P4 S6:
+    // the sticky setters are deleted; the submission's scene half
+    // carries the post/wet/sky declaration on every frame, the S1g
+    // gate's byte-equality proof applied to the demo route). The
+    // flags below are the demo's own mode state, read at each
+    // submission exactly where the stickies used to sit.
+    // Era 1 package 6: the post chain (the HDR render-target chain
+    // + the bloom mips + the ACES composite, post.rs's equations
+    // through the real render path). Composes with EVERY corner
+    // flag (the sky's disc is the bloom feeder the gate pins).
     if wet {
         println!(
             "wet ground: the planar reflection (the mirrored scene about y={}, the ground \
@@ -841,12 +896,15 @@ pub fn run(
     // presets — the pinned special case; the day/night cycle
     // package advances t continuously). The disc rides the SAME
     // direction as the light (the sun by day, the moon by night).
+    // `sky_frame` is the per-frame declaration the submissions
+    // carry (None keeps the skyless byte-identical path).
+    let mut sky_frame: Option<engine_renderer::SkyFrame> = None;
     if sky {
         let atmosphere = engine_renderer::sky::atmosphere_at(if night { 1.0 } else { 0.0 });
-        renderer.set_sky(Some(engine_renderer::SkyFrame {
+        sky_frame = Some(engine_renderer::SkyFrame {
             palette: atmosphere.sky,
             disc_dir: atmosphere.disc_dir,
-        }));
+        });
         println!(
             "sky: the atmosphere_at {} palette behind the scene (horizon {:?}, zenith {:?}, the disc at {:?})",
             if night { "night" } else { "day" },
@@ -949,8 +1007,12 @@ pub fn run(
             shadows,
             light,
             bias,
+            corner_bounds,
             day_night,
             night,
+            sky_frame,
+            post,
+            wet,
             options,
             pace,
             audio,
@@ -985,10 +1047,10 @@ pub fn run(
                 engine_renderer::sky::cycle_position(i as f32 / 60.0, period),
             );
             light = atmosphere.light;
-            renderer.set_sky(Some(engine_renderer::SkyFrame {
+            sky_frame = Some(engine_renderer::SkyFrame {
                 palette: atmosphere.sky,
                 disc_dir: atmosphere.disc_dir,
-            }));
+            });
         }
         // THE RAIN UPDATE PRECEDES THE SUBMISSION (the audit's
         // finding 18 corrective — rain and rings present from ONE
@@ -1017,22 +1079,21 @@ pub fn run(
             crowd.update_rain(pose.position, yaw, rain_t, DEMO_CLOCK_DT_F32);
         }
         // The rain-ripple field (Era-2 package C recursive item 1):
-        // packed into the renderer's sticky wet state BEFORE the
-        // submission, from the JUST-COMPLETED tick above — frame i
-        // renders the ripple field and the rain instances of the
-        // SAME tick (the finding-18 corrective; a dry session
-        // clears it — the empty uniform, the wet path's Era-1
-        // byte-identity). The sticky setter is the presentation
-        // bridge: the field state itself is deterministic sim state
-        // (the campaign digest pins it) — the setter only copies it
-        // into the frame's uniform.
-        if wet {
-            renderer.set_ripple_field(
-                crowd
-                    .as_ref()
-                    .and_then(|c| c.rain.as_ref().map(|r| r.ripple_field())),
-            );
-        }
+        // the JUST-COMPLETED tick's field rides THIS frame's wet
+        // declaration — frame i renders the ripple field and the
+        // rain instances of the SAME tick (the finding-18
+        // corrective; a dry session declares wet with no ripple —
+        // the empty uniform, the wet path's Era-1 byte-identity).
+        // The field state itself is deterministic sim state (the
+        // campaign digest pins it) — the submission only packs it
+        // into the frame's uniform (P4 S6: the deleted
+        // set_ripple_field sticky's per-frame call site, now the
+        // WetFrame's field exactly where the frame is declared).
+        let wet_frame = wet.then(|| engine_renderer::WetFrame {
+            ripple: crowd
+                .as_ref()
+                .and_then(|c| c.rain.as_ref().map(|r| r.ripple_field())),
+        });
         // The per-frame population: the crowd's CURRENT state (frame i
         // shows the crowd after i ticks — the render-then-step
         // discipline for the NPCs; the rain instances inside are the
@@ -1040,24 +1101,25 @@ pub fn run(
         let frame_population = crowd.as_ref().map(|crowd| crowd.population());
         let matrix = view_projection(pose, aspect);
         // Submission selection: the four-way union
-        // (--populated --shadows together is the Era-2 stage 4b path).
-        let frame = if shadows && let Some(population) = frame_population.as_ref() {
-            renderer.render_corner_populated_shadowed(
+        // (--populated --shadows together is the Era-2 stage 4b path)
+        // — ONE entry point since P4 S6 (the four former
+        // render_corner* routes are this submission's
+        // shadows/population fields; the S1g gate proved the
+        // mapping byte-identical before the routes were deleted).
+        let frame = renderer
+            .submit_frame(corner_submission(
                 &matrix,
                 pose.position,
                 light,
-                bias,
-                population,
+                shadows.then_some(bias),
+                corner_bounds,
+                frame_population,
+                sky_frame,
+                post,
+                wet_frame,
                 size,
-            )
-        } else if shadows {
-            renderer.render_corner_shadowed(&matrix, pose.position, light, bias, size)
-        } else if let Some(population) = frame_population.as_ref() {
-            renderer.render_corner_populated(&matrix, pose.position, light, population, size)
-        } else {
-            renderer.render_corner(&matrix, pose.position, light, size)
-        }
-        .map_err(|e| e.to_string())?;
+            ))
+            .map_err(|e| e.to_string())?;
         let end = Instant::now();
         if !frame.presented || frame.recreated || frame.suboptimal {
             return Err(format!(
@@ -1173,8 +1235,12 @@ fn run_free_look(
     shadows: bool,
     mut light: LightParams,
     bias: engine_renderer::shadows::ShadowBias,
+    corner_bounds: engine_renderer::SceneBounds,
     day_night: Option<f32>,
     night: bool,
+    mut sky_frame: Option<engine_renderer::SkyFrame>,
+    post: bool,
+    wet: bool,
     options: FreeLookOptions,
     pace: Option<Duration>,
     audio: bool,
@@ -1297,10 +1363,10 @@ fn run_free_look(
         if let Some(t) = cycle_t {
             let atmosphere = engine_renderer::sky::atmosphere_at(t);
             light = atmosphere.light;
-            renderer.set_sky(Some(engine_renderer::SkyFrame {
+            sky_frame = Some(engine_renderer::SkyFrame {
                 palette: atmosphere.sky,
                 disc_dir: atmosphere.disc_dir,
-            }));
+            });
         }
         // THE RAIN UPDATE PRECEDES THE SUBMISSION (the audit's
         // finding 18 corrective — rain and rings present from ONE
@@ -1337,19 +1403,18 @@ fn run_free_look(
         };
         // The rain update ran ABOVE (per-tick, before the submission)
         // — the frame renders the ripple field and the rain instances
-        // of the SAME tick. free-look does not carry the `wet` flag —
-        // the renderer's own sticky setting IS the state (set at
-        // startup from the flag; reading it back is exact). The
-        // sticky setter is the presentation bridge: the field state
-        // itself is deterministic sim state (the campaign digest pins
-        // it) — the setter only copies it into the frame's uniform.
-        if renderer.wet() {
-            renderer.set_ripple_field(
-                crowd
-                    .as_ref()
-                    .and_then(|c| c.rain.as_ref().map(|r| r.ripple_field())),
-            );
-        }
+        // of the SAME tick. free-look does not carry the `wet` flag
+        // through the loop — the demo's own mode flag IS the state
+        // (passed in from run(), where the CLI set it; reading it is
+        // exact). The field state itself is deterministic sim state
+        // (the campaign digest pins it) — the submission only packs
+        // it into the frame's uniform (P4 S6: the deleted
+        // set_ripple_field sticky's per-frame call site).
+        let wet_frame = wet.then(|| engine_renderer::WetFrame {
+            ripple: crowd
+                .as_ref()
+                .and_then(|c| c.rain.as_ref().map(|r| r.ripple_field())),
+        });
         // The crowd's CURRENT state (presentation-only determinism:
         // presented frame k shows the crowd after k ticks — the
         // render-then-step discipline for the NPCs; the rain
@@ -1357,23 +1422,22 @@ fn run_free_look(
         // the update above).
         let frame_population = crowd.as_ref().map(|crowd| crowd.population());
         let matrix = camera.view_projection(aspect);
-        let frame = if shadows && let Some(population) = &frame_population {
-            renderer.render_corner_populated_shadowed(
+        // The scripted route's own submission selection (the four-way
+        // union through ONE entry point since P4 S6).
+        let frame = renderer
+            .submit_frame(corner_submission(
                 &matrix,
                 camera.position,
                 light,
-                bias,
-                population,
+                shadows.then_some(bias),
+                corner_bounds,
+                frame_population,
+                sky_frame,
+                post,
+                wet_frame,
                 size,
-            )
-        } else if shadows {
-            renderer.render_corner_shadowed(&matrix, camera.position, light, bias, size)
-        } else if let Some(population) = frame_population.as_ref() {
-            renderer.render_corner_populated(&matrix, camera.position, light, population, size)
-        } else {
-            renderer.render_corner(&matrix, camera.position, light, size)
-        }
-        .map_err(|e| e.to_string())?;
+            ))
+            .map_err(|e| e.to_string())?;
         if frame.deferred {
             // The drawable is temporarily unavailable (mid-transition):
             // poll quietly, present nothing, retry — no recreation storm.
