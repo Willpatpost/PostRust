@@ -102,6 +102,57 @@ audit-claimed with verification-first mandated in each fix lane's brief.
 | CA-21 | SHELL | **FIXED-AWAITING-RE-AUDIT** | integrated `42ff2a1` (lane `ce2dab5`) | the producer lock bounded (the A25 mirror; red demonstrated); the admitted set, FIFO, pairing, refused total provably identical |
 | CA-22 | SHELL | **FIXED-AWAITING-RE-AUDIT** | integrated `42ff2a1` (lane `ce2dab5`) | the cue backpressure (the explicit budget + refusal telemetry; the mixer-voice routing left as the owner NEW-SHELL-3 consolidation); the 800-push burst refusing 687 fail-visibly |
 | CA-23 | SHELL | **FIXED-AWAITING-RE-AUDIT** | integrated `42ff2a1` (lane `ce2dab5`) | repeats a mapped-key count (the intent contract); red demonstrated |
+### The Strict Audit IV (2026-11-28, at `096f8d9` — `audits/strict-audit-IV-096f8d9.md`, the owner-delivered comprehensive report)
+
+40 numbered findings with corrective designs, closure matrices for every prior register, the mandatory
+acceptance-measurement matrix (§7), the source-coverage ledger (§8), the five-wave execution plan (§9),
+and the final acceptance criteria (§10 — the hard-blocker list governs P7). Register intake only —
+every T-row awaits the morning's independent verification-before-acceptance per the owner directive.
+Classes: CONFIRMED (source-derived), HYPOTHESIS (reproduce-or-refute mandated), OBLIGATION
+(architectural), INVESTIGATION (measurement-gated), REPORTED (integrated, needs exact-head evidence).
+
+| ID | Class | Cross-links | Note (one line) |
+|---|---|---|---|
+| T01 | CONFIRMED (remote) | F04/CA04 | no exact-head remote CI verification — the control plane itself untrusted |
+| T02 | HYPOTHESIS (strong) | CA11/A18 | generation-stamp invalidation too late on interrupted preparation |
+| T03 | CONFIRMED ordering + HYPOTHESIS error | Q10/CA01 | attach publishes before deferred upload readiness; error outcome unresolved |
+| T04 | CONFIRMED (S0, owner contract) | A11/CA15 | dynamic geometry violates complete-primitive admission |
+| T05 | CONFIRMED + strong hypothesis | Q02-analog/A18 | raw caller generations not robust identity/shape contracts |
+| T06 | CONFIRMED latch gap | CA10/CA13 | error disposition can lose terminal device state, unusable slots |
+| T07 | CONFIRMED (S0 for consequences) | Q05/CA07 | retention acknowledgment a permanent assertion, not a safe moving cut |
+| T08 | CONFIRMED | B01/Q03/CA03 | housekeeping observation does not bound scheduler work |
+| T09 | CONFIRMED | A08/CA08 | queued ops still traverse unrelated heap elements |
+| T10 | CONFIRMED | Q01/A10/CA05 | oversized lane bounded per object, not localized over many |
+| T11 | CONFIRMED | Q04/CA09/B06 | spatial adoption conditional; large live composition unproven |
+| T12 | CONFIRMED (deferred stages) | R06/Q06/CA14 | scene generalization — CA14's stages 2-4 |
+| T13 | CONFIRMED | Q08/CA17/A22/R07 | historical persistence residency linear |
+| T14 | CONFIRMED code + integrity hypotheses | CA14-adjacent | cold lookup work/trust boundary not scalable |
+| T15 | CONFIRMED | A20 | staging budget a fixed append frontier, not pressure-aware streaming |
+| T16 | CONFIRMED (S0 with T06) | CA13 | staging error classification/polling can mask device loss |
+| T17 | CONFIRMED growth waits | A11/A23/CA12 | arena growth waits whole device; residency high-water |
+| T18 | CONFIRMED | A18 | whole-set generation only coarse dirty tracking |
+| T19 | CONFIRMED | A06 | animation renderer-bound — the extraction IN FLIGHT |
+| T20 | CONFIRMED direct paths | R02/A19 | numerical admission inconsistent frame/asset boundaries |
+| T21 | CONFIRMED | Q07/CA02 | decode bounds exclude transients; defaults wire max |
+| T22 | OBLIGATION (open) | A14 | distributed fallible bare-handle ownership ladders |
+| T23 | CONFIRMED-REPORTED | A20/B14/B15 | pool net residency + measurement narrative |
+| T24 | CONFIRMED | A19 | ripple one global circle, not per-region culling |
+| T25 | REPORTED | B14 | target sharing needs workload-specific matched proof |
+| T26 | OBLIGATION (open) | A26-class | CPU whole-scene/proxy capacity architecture |
+| T27 | INVESTIGATION | A21/R05 | frame stats/timestamp bounded meaningful semantics |
+| T28 | CONFIRMED | B13 | worker measurement does not resolve authority-thread blocking |
+| T29 | CONFIRMED structure | B02/B03 | chain walker bounded startup/suffix residency proof |
+| T30 | REPORTED/DESIGN | R07/B04 | transaction state-machine consolidation staged |
+| T31 | CONFIRMED improvements + proof needed | CA18-20 | backup/restore durability + path portability cross-provider |
+| T32 | CONFIRMED | B15/A06/F03 | animation/render contract footprint outstanding |
+| T33 | IMPLEMENTED (evidence due) | NEW-REND-11/F02 | SDL pin + sqlite follow-through — exact-head evidence |
+| T34 | REPORTED | B08/A25/CA21-23 | input/audio sustained burst/latency review |
+| T35 | SOURCE-HISTORY | R03/R04 | free-look timestep extreme + composition order |
+| T36 | CONFIRMED | A01/A02/A13 | large files/change responsibilities remain |
+| T37 | INVESTIGATION | Q09/A10/B06 | spatial foundation vs avoidable duplication |
+| T38 | CONFIRMED (recurred) | Q11/B16 | docs control plane stale again |
+| T39 | CONFIRMED (S0-gating) | B10 | exact-tree workload-matched measurement methodology |
+| T40 | OBLIGATION (open) | B16 | whole-source coverage + threat/usage ledger |
 ## The Sol re-audit (2026-11-27, the continuation mandate at `8d34771`)
 
 **NOT complete — final integration NOT authorized.** Scores: cleanliness 7.4,
