@@ -832,6 +832,214 @@ render_orientation, render_scene_separation, s6_evidence's device
 leg) remain the orchestrator's rig bar (this loader has no
 headless-surface Vulkan — the E-15 boundary, unchanged).
 
+## E-17 P5 R5 — B14 the render-target census analysis + the aliasing decision (2026-11-28, lane worktree tree at this lane's commit, branch `ee/p5-r5-target-aliasing`, base `d739c2b`; rig GPU RTX 5070 Ti + the AMD Radeon iGPU, release, real windows, the E-7/E-12 discipline)
+
+The B14 lane (the design §6's measure-first package, executed under
+the D-EE-10 item 1A authorization): the census analysis over E-12's
+§9.1 rows re-run fresh on this tree, the aliasing DECISION RECORD per
+the authorization's six evaluation axes, and the decision's
+implementation. All commands below exit 0 unless noted; the archived
+logs at `Temp\opencode\ee\r5-logs\{before-batteries,after-batteries,
+after-composition-amd}.log` (the E-14 before/after same-session
+discipline — the base tree `d739c2b` ran the BEFORE battery set
+before any edit).
+
+**THE CENSUS (the re-run + the analysis inputs):** the §9.1 table
+(24 cells) re-run BEFORE the change reproduces E-12/E-16's rows
+exactly (dry 17 dev-mem/0 targets; +shadows 21/2-2-2-2; +post
+26/8-8-9-8; +wet 23/4-4-2-4; +wet+post 31/12-12-11-12; maximal
+36/14-14-13-14; the computed §6.1 columns: reflection
+22,118,400→199,065,600 B and post 23,961,600→215,654,400 B across
+720p→4K, shadow 4,194,304 fixed; D32_SFLOAT at every extent). The
+INTEGRATED-GPU run — the authorization's "integrated GPUs IN SCOPE"
+clause made measured, not assumed: with `VK_DRIVER_FILES` restricted
+to the AMD ICD (`DriverStore\FileRepository\u0200157...amd-vulkan64.
+json`), the FULL 24-cell census constructs, presents, and validates
+0/0 on "AMD Radeon(TM) Graphics (integrated)" with counters
+byte-identical to the discrete run — the allocation shape is
+device-independent, so on shared-memory hardware the renderer's
+whole target residency is direct system memory.
+
+**THE EVALUATION RECORD (each D-EE-10 item 1A axis, the census
+numbers):**
+
+1. **Absolute savings** — the depth pair (reflection depth ↔ HDR
+   depth, both full-extent, both written-only inside their own
+   passes): 2×extent-px×4 B = **7,372,800 / 16,588,800 / 29,491,200
+   / 66,355,200 B** at 720p/1080p/1440p/4K (both slots, D32). The
+   color pair (reflection color ↔ bloom_a/b): the bloom pair's bytes
+   = **1,843,200 / 4,147,200 / 7,372,800 / 16,588,800 B** — exactly
+   1/4 the depth pair's prize at every extent.
+2. **Peak residency before/after** — the maximal composition's
+   target residency 50,274,304 / 107,874,304 / 188,514,304 /
+   418,914,304 B → **42,901,504 / 91,285,504 / 159,023,104 /
+   352,559,104 B** (−14.7% / −15.4% / −15.6% / −15.8%; the
+   measured after-rows' aliased-total column). The renderer's other
+   device residency (textures 794,624 + the staging pool 1,048,576 +
+   the demand carves 102,400 at the census population + the small
+   uniform/mesh buffers) is extent-independent ≈ 2 MB — the target
+   residency dominates, so the pair shares are the composition's
+   shares.
+3. **Resolution scaling** — linear in pixels (4K exactly 9× 720p,
+   pinned by test); the saving's SHARE rises with extent (the fixed
+   4 MB shadow cascade dilutes less: 14.7%→15.8%).
+4. **Sync cost** — the depth pair needs ONE WAW barrier between the
+   two passes (the pass object's own in-dependency carries an EMPTY
+   src access mask — finding 9's form — so the reflection pass's
+   depth writes need an explicit availability scope before the scene
+   pass's depth clear): one extra `cmd_pipeline_barrier` call per
+   wet+post frame, EARLY|LATE_FRAGMENT_TESTS both directions,
+   DEPTH_STENCIL_ATTACHMENT_WRITE availability+visibility, no layout
+   transition (both passes leave the image in
+   DEPTH_STENCIL_ATTACHMENT_OPTIMAL). Zero new render passes,
+   submits, or CPU allocations. The color pair's sync was never the
+   cost — the bloom pass's existing `write_dependency` (prior
+   fragment reads → this pass's color writes, post_draw.rs's blur_v
+   shape) already provides the read→write separation it would need.
+5. **GPU overlap** — the "disjoint" lifetimes do NOT overlap today:
+   one command buffer, the cascade's fixed pass order (the
+   reflection pass ends before the scene pass begins; the ground
+   re-draw's reads end inside the scene pass). The WAW orders writes
+   the render-pass sequence already orders — the only serialization
+   it adds is the scene pass's depth clear waiting for the
+   reflection pass's depth-write tail, bounded by the
+   mirrored-buildings-only draw. Measured: the §9.6 maximal
+   composition re-run AFTER (validation 0/0 at all four extents, GPU
+   median 0.079/0.130/0.181/0.364 ms at 720p/1080p/1440p/4K) —
+   within noise of E-15's 0.065/0.115/0.184/0.365: NO REGRESSION.
+6. **Shared-memory hardware** — measured (the AMD iGPU runs above).
+   On UMA the 7.4–66.4 MB saving is a direct system-memory
+   reduction; on the 16 GB discrete card the same saving is
+   0.046–0.41% of VRAM — negligible THERE. This is exactly the
+   asymmetry the owner's ruling names: the 10% threshold demoted to
+   a heuristic, integrated hardware brought in scope.
+
+**THE DECISION — split, on the evidence:**
+
+- **The DEPTH PAIR: ALIASED** (the authorization's conditional
+  approval exercised). It clears every axis: ~15% of the target
+  residency at every extent (above even the demoted heuristic), the
+  mechanism is the simplest legal form (spare-image reuse — ONE
+  image object bound by both passes' framebuffers; no ALIAS_BIT, no
+  second image), the sync cost is one barrier batch entry, the
+  fidelity is untouched (both passes CLEAR the attachment at begin —
+  the image contents are identical), and the single-family
+  compositions' allocation pins hold EXACTLY (the shared pair
+  replaces a family's own one-for-one).
+- **The COLOR PAIR (reflection color ↔ bloom_a/b): NO-CHANGE with
+  evidence.** (1) The prize is 1/4 the depth pair's — 3.7–4.0% of
+  the maximal composition's target residency at every extent, below
+  even the heuristic. (2) The extent mismatch (full vs 1/4) forecloses
+  spare-image reuse — one image object cannot serve both extents
+  without shader/UV changes (a fidelity change, barred). (3) The
+  ALIAS_BIT route is spec-LEGAL (the memory-aliasing chapter:
+  different-creation-parameter aliases are legal with poison
+  semantics — safe here since every use overwrites before reading —
+  and the bloom pass's existing write_dependency provides the
+  separation) but requires a cross-family shared COLOR allocation:
+  sized at the reflection color's 7.37 MB/slot it regresses the
+  post-only composition 8× (14.7 MB for bloom's 1.8 MB need); sized
+  at the bloom pair it cannot host the reflection; growing at
+  composition boundaries is a new rebuild subsystem. (4) The ensure
+  ladder builds post targets FIRST (the fault battery's documented
+  order) — the design's named +wet+post composition would build the
+  bloom images before any reflection color exists to host them, so
+  the aliasing would not even engage without reordering the ladder.
+  **Trigger recorded:** revisit when an integrated 4K deployment is
+  the target with composition-conditional residency accepted, or the
+  bloom chain moves to full-extent mips (a 4× prize), or the owner
+  pulls the half-res reflection lever (§10.6 — the owner's, never
+  P5's). The half-res lever itself stays untouched (default NO).
+
+**THE MECHANISM (the depth pair, as landed):** `SharedDepthTargets`
+(post_draw.rs — the HDR pass's module, where the depth attachment
+contract lives): the per-slot full-extent depth images + memories,
+keyed (extent, swapchain generation). Whichever extent-bound family
+builds FIRST creates the pair — registered to its OWN partial for
+the fault-injection unwind (a fault anywhere in that build releases
+it) and MOVED to the shared bundle at the build's COMMIT (after
+every fallible step); the second family creates only its OWN views
+(`create_shared_depth_view`, fault-checked at the creating family's
+site so the late-ordinal injection cells keep firing). The
+COORDINATED STALE RELEASE (frame_prepare::ensure_extent_targets):
+post bundle → reflection bundle → shared images — every family
+framebuffer and depth view dies before the images it views (the
+object-lifetime rule the sharing makes load-bearing); the families'
+`ensure_targets` lost their unilateral stale release (a
+Some-but-stale bundle past the coordinated release fails visibly).
+The WAW barrier: `record_read_barrier`'s depth entry, gated by
+`FramePlan::depth_pair_waw()` (= wet ∧ post — pinned by a unit test
+over the plan's four configurations), takes this slot's shared image
+from the frame flow. `PipelineState` owns the bundle, destroyed
+after both families.
+
+**THE LIFETIME/OWNERSHIP PROOFS:** the frame-slot rule is the
+targets' own ping-pong extended to both writers — slot S's image is
+written by slot S's reflection pass and slot S's scene pass, inside
+the frame that first waited slot S's fence (the whole-submission
+fence covers both passes' writes before the slot's reuse two frames
+later); the pass-order disjointness is the cascade's fixed order
+with the explicit WAW between the two writers, and single-family
+frames have a single writer by construction. The EXECUTABLE proofs:
+sync validation 0/0 at every census cell (24 cells, discrete AND
+integrated) and every battery leg; the fault-injection matrix re-run
+green (every Wet/Post site × stage × the late ordinals — the
+partials now unwind the depth registration on the creating path and
+touch nothing shared on the reusing path); the allocation-constancy
+legs; the census's new per-row after-shape pins.
+
+**THE INK GATES (BEFORE `d739c2b` → AFTER, same session/hardware,
+both exit 0):** `render_post --ignored` 7/7 BOTH runs digit-for-digit
+— composed ink 34171; the one-time delta (11,3,9,1,0) and the
+shadowed-populated (5,4,16,0) UNCHANGED; fixtures 57,600 px max
+1/255; the postless path byte-identical; the D24/D16 fallback and
+recreation lifecycle green (the exact rebuild budget `warm +
+2·depth_per_chain + 8` holds — the post build still allocates its 8
+memories). `render_reflection --ignored` 7/7 BOTH — the wet
+allocation delta (7,2,8,2) UNCHANGED (wet-first creates the shared
+pair as its own 4 images); the known-answer patches 60/1653/2619/
+5551 max 1/255; the dry path byte-identical; the W-D contrast 24;
+the POST-ENABLED witness delta 34 (the wet+post pixel witness — the
+aliased-depth composition's own gate) IDENTICAL.
+`render_weather --ignored` 11/11 BOTH — E-7's pinned ink values
+reproduced digit-for-digit: rain ink 17041; broadside 3482/2162;
+the ripple reflection ink 236114/98131/10187; the sweep 22/255 at
+[-1.929102, 0.0, -2.6461658]; the young-field census 22/22, best
+(577, 350, 22); the measured sweep left 22 / right −21 / plateau
+−1; the term separations 96548/67535/7625 blend-only and
+27149/27149/2538 displacement-only. The S6 submit-frame composed
+(sky+post+wet) frames double-run deterministic.
+
+**THE CONSCIOUS PIN MOVEMENTS (D-EE-06, each measured on the rig):**
+(1) census_vram's +wet+post row (12,12,11,12)→**(10,12,11,10)** and
+the maximal row (14,14,13,14)→**(12,14,13,12)** target counters,
+dev-mem 31→29 / 36→34 — the lane's OWN battery re-based in-lane
+(the after-shape pins above); every single-family row UNCHANGED.
+(2) render_post's (11,3,9,1,0) and render_reflection's (7,2,8,2)
+NOT moved (measured identical — the design's one-for-one
+replacement held them). (3) The renderer test count 216→**220**
+(+4: the frame-plan depth-pair WAW rule, the depth-pair allocation
+table, the depth-pair savings arithmetic, the rejected color pair's
+record). (4) census_vram's ignored count unchanged (3i; the table
+leg extended, not added). No CI pin edited in-lane (the
+orchestrator's batched `ci:` commit at integration; the renderer
+release pin moves 216→220, the main shard +4 with it).
+
+**Lane gates (this lane's tree):** `cargo fmt --all -- --check`
+exit 0; `cargo clippy -p engine-renderer --all-targets --
+-D warnings` exit 0 (and `-p engine-slice --all-targets` exit 0 —
+the census battery edit); `cargo test -p engine-renderer` **220
+passed / 0 failed debug AND release** (= the 216 pin + 4 new);
+`cargo test -p engine-slice --lib` **169 passed / 0 failed** (the
+base tree's own count — this lane adds no slice lib test);
+`census_vram --release --ignored` 3 passed / 0 failed (the after-
+rows); `census_composition --release --ignored` 1 passed / 0 failed
+(validation 0/0 at all four extents, the curves within noise);
+`cargo check --workspace --all-targets` exit 0. The four
+offscreen-gated smokes (render_overflow, render_orientation,
+render_scene_separation, s6_evidence's device leg) remain the
+orchestrator's rig bar (the E-15/E-16 boundary, unchanged).
+
 ## Measurement baselines
 
 Established: E-8 is the baseline battery (2026-11-26, tree `263532f` — the

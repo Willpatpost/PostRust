@@ -259,6 +259,19 @@ impl FramePlan {
             pose_demand_blocks,
         }
     }
+
+    /// THE B14/R5 DEPTH-PAIR HANDOFF RULE: does this frame write the
+    /// SHARED depth image twice — the wet reflection pass before the
+    /// scene pass, then the scene pass itself? Exactly the frames
+    /// with both the wet and post bits on: the reflection pass runs
+    /// only on wet frames, and the scene pass binds the shared depth
+    /// only when it is the HDR one (the post chain's scene pass; a
+    /// wet-postless frame's main pass uses the swapchain's own depth
+    /// attachment). The record cascade's read barrier keys its depth
+    /// WAW entry on this fact (the aliasing's one new barrier).
+    pub(crate) fn depth_pair_waw(&self) -> bool {
+        self.uses.wet && self.uses.post
+    }
 }
 
 #[cfg(test)]
@@ -617,6 +630,71 @@ mod tests {
             instanced.uses.populated && !instanced.uses.indirect,
             "the instanced-mode populated frame declares population without the indirect path"
         );
+    }
+
+    /// THE B14/R5 DEPTH-PAIR HANDOFF RULE (the aliasing's one new
+    /// barrier's firing condition): the shared depth image is
+    /// written twice — reflection pass then HDR scene pass — exactly
+    /// on the frames with BOTH the wet and post bits on. The four
+    /// configurations the equivalence test above proves, reduced to
+    /// this one fact: the everything-on frame (wet through the post
+    /// chain's HDR scene pass) is the ONLY one that arms the depth
+    /// WAW; the wet-without-post frame's main pass uses the
+    /// swapchain's own depth (no second writer), and the dry and
+    /// layers-only frames never touch the shared image at all.
+    #[test]
+    fn the_depth_pair_waw_follows_the_wet_and_post_bits() {
+        let matrix = [
+            [0.9, 0.0, 0.0, 0.0],
+            [0.0, 0.9, 0.0, 0.0],
+            [0.0, 0.0, 0.9, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let policy = SubmissionPolicy {
+            proxy_draw_mode: ProxyDrawMode::default(),
+            ripple_debug: RippleDebugMode::default(),
+            instance_capacity: crate::proxy_instances::MAX_INSTANCES,
+            pose_capacity: crate::animation::MAX_POSE_BLOCKS,
+        };
+        let plan_for = |post: bool, wet: Option<WetFrame>| {
+            let submission = FrameSubmission {
+                camera: FrameCamera {
+                    view_proj: matrix,
+                    eye: [4.0, 1.7, 12.0],
+                },
+                output: OutputTarget {
+                    window_size: (1280, 720),
+                },
+                layers: DynamicLayers::default(),
+                scene: Some(SceneFrame {
+                    light: crate::lit_scene::day_preset(),
+                    shadows: None,
+                    population: None,
+                    sky: None,
+                    post,
+                    wet,
+                }),
+            };
+            derive_plan(policy, &submission)
+        };
+        // The everything-on frame: wet through the HDR scene pass.
+        assert!(
+            plan_for(true, Some(WetFrame { ripple: None })).depth_pair_waw(),
+            "the wet+post frame writes the shared depth twice"
+        );
+        // Wet without post: the main pass's depth is the
+        // swapchain's own attachment — no second shared writer.
+        assert!(
+            !plan_for(false, Some(WetFrame { ripple: None })).depth_pair_waw(),
+            "the wet-postless frame arms no depth WAW"
+        );
+        // Post without wet: the scene pass is the only writer.
+        assert!(
+            !plan_for(true, None).depth_pair_waw(),
+            "the post frame arms no depth WAW (no reflection pass ran)"
+        );
+        // The all-off frame.
+        assert!(!plan_for(false, None).depth_pair_waw());
     }
 
     /// The production derivation path, factored over the test's

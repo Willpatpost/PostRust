@@ -30,6 +30,30 @@ use engine_slice::census::carve::{
 use engine_slice::census::composition::{CENSUS_FAMILIES, corner_renderer_at, warm_family};
 use engine_slice::census::repack::synthetic_population;
 
+/// THE B14/R5 ALIASED TARGET BYTES (the after-columns): the depth
+/// pair's duplicate removed — one per-slot full-extent depth pair
+/// per composition that runs BOTH the wet and post families (the
+/// shared image the two passes alias; a family running alone keeps
+/// exactly its own pair, so its row is unchanged). Pure arithmetic
+/// beside `computed_targets` — the counters check it on the rig.
+fn aliased_targets(
+    targets: ComputedTargets,
+    family: &engine_slice::census::composition::FamilySpec,
+    depth_bpp: u64,
+    extent: (u32, u32),
+) -> u64 {
+    let duplicate_depth_pair = engine_renderer::config::FRAMES_IN_FLIGHT as u64
+        * extent.0 as u64
+        * extent.1 as u64
+        * depth_bpp;
+    let total = targets.total_bytes;
+    if family.wet && family.post {
+        total - duplicate_depth_pair
+    } else {
+        total
+    }
+}
+
 fn sdl_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
@@ -39,11 +63,15 @@ fn sdl_lock() -> std::sync::MutexGuard<'static, ()> {
 
 /// The computed columns for every cell of the table (the §6.1
 /// prediction at the negotiated 4 B/px depth — the battery prints
-/// the device's actual depth format alongside its measured rows).
+/// the device's actual depth format alongside its measured rows),
+/// and the B14/R5 AFTER columns (the depth-pair aliasing's
+/// per-family arithmetic — the duplicate pair removed only from the
+/// both-family compositions).
 #[test]
 fn computed_columns_match_the_design() {
     let carves: MappedCarves = mapped_carves();
     assert_eq!(carves.total_bytes, 8_320_000);
+    let family_axis: Vec<_> = CENSUS_FAMILIES.to_vec();
     for extent in CENSUS_EXTENTS {
         let targets: ComputedTargets = computed_targets(extent, 4);
         assert!(targets.reflection_bytes > 0 && targets.post_bytes > 0);
@@ -54,11 +82,39 @@ fn computed_columns_match_the_design() {
             targets.reflection_bytes + targets.post_bytes + targets.shadow_bytes
         );
         assert_eq!(targets.shadow_bytes, 4_194_304);
+        // The B14/R5 after-columns: the aliasing touches ONLY the
+        // compositions running both target families — the single
+        // families keep their exact before-bytes (their allocation
+        // pins' arithmetic), and the both-family rows drop exactly
+        // the duplicate depth pair (2 × px × 4 at D32).
+        for family in &family_axis {
+            let after = aliased_targets(targets, family, 4, extent);
+            if family.wet && family.post {
+                assert_eq!(
+                    after,
+                    targets.total_bytes
+                        - engine_renderer::config::FRAMES_IN_FLIGHT as u64
+                            * extent.0 as u64
+                            * extent.1 as u64
+                            * 4,
+                    "the both-family row at {extent:?} drops the duplicate depth pair"
+                );
+            } else {
+                assert_eq!(
+                    after, targets.total_bytes,
+                    "the single-family row at {extent:?} is unchanged by the aliasing"
+                );
+            }
+        }
     }
     assert_eq!(depth_bytes_per_pixel("D32_SFLOAT"), 4);
 }
 
 /// THE CENSUS (the rig leg): 6 families × 4 extents, one table.
+/// Since B14/R5 the table also prints the MEASURING DEVICE (the
+/// gpu_name/device_type stats — the integrated-GPU run's evidence
+/// column) and the AFTER column (the aliased target bytes — the
+/// depth pair's duplicate removed from the both-family rows).
 #[test]
 #[ignore = "requires a real Vulkan device and windows (the rig run: release, serial, archived per E-8)"]
 fn vram_census_table() {
@@ -76,7 +132,7 @@ fn vram_census_table() {
     println!(
         "  row: family | extent | dev-mem tex-mem tex-bytes pools sets samplers | targets \
          img/view/fb/mem (frees) | uploads submits/wait-ms/staged/tail-B | computed \
-         shadow/reflection/post B | depth-format"
+         shadow/reflection/post B | depth-format | device (type) | aliased-total B"
     );
     for family in CENSUS_FAMILIES {
         for extent in CENSUS_EXTENTS {
@@ -94,9 +150,10 @@ fn vram_census_table() {
             let a = renderer.allocations();
             let depth_bpp = depth_bytes_per_pixel(&stats.depth_format);
             let targets = computed_targets(extent, depth_bpp);
+            let aliased = aliased_targets(targets, &family, depth_bpp, extent);
             println!(
                 "  {} | {}x{} | {} {} {} {} {} {} | {} {} {} {} ({} {} {} {}) | {} \
-                 {:.2} {} {} | {} {} {} | {}",
+                 {:.2} {} {} | {} {} {} | {} | {} ({}) | {}",
                 family.name,
                 extent.0,
                 extent.1,
@@ -129,7 +186,10 @@ fn vram_census_table() {
                     0
                 },
                 if family.post { targets.post_bytes } else { 0 },
-                stats.depth_format
+                stats.depth_format,
+                stats.gpu_name,
+                stats.device_type,
+                aliased
             );
             // The family's chains are observable in the target
             // counters: a family without a chain builds none of its
@@ -137,6 +197,64 @@ fn vram_census_table() {
             // census's own consistency check, not a pixel gate).
             if !family.wet && !family.post && !family.shadows {
                 assert_eq!(a.target_images, 0, "the dry family builds no targets");
+            }
+            // THE B14/R5 AFTER-SHAPE PINS (the aliasing's own
+            // counter evidence): the single families keep their
+            // exact before-counts (the shared pair replaces their
+            // own one-for-one — the (7,2,8,2)/(11,3,9,1,0) pins'
+            // arithmetic); the both-family compositions carry ONE
+            // depth pair, not two — two fewer images and memories
+            // than the before-table at every extent.
+            let counters = (
+                a.target_images,
+                a.target_image_views,
+                a.target_framebuffers,
+                a.target_memories,
+            );
+            match (family.wet, family.post, family.shadows) {
+                (false, false, false) => {
+                    assert_eq!(counters, (0, 0, 0, 0), "the dry row {extent:?}");
+                }
+                (false, false, true) => {
+                    assert_eq!(
+                        counters,
+                        (2, 2, 2, 2),
+                        "the +shadows row {extent:?} — untouched by the target aliasing"
+                    );
+                }
+                (false, true, false) => {
+                    assert_eq!(
+                        counters,
+                        (8, 8, 9, 8),
+                        "the +post row {extent:?} — unchanged by the aliasing"
+                    );
+                }
+                (true, false, false) => {
+                    assert_eq!(
+                        counters,
+                        (4, 4, 2, 4),
+                        "the +wet row {extent:?} — unchanged by the aliasing"
+                    );
+                }
+                (true, true, false) => {
+                    assert_eq!(
+                        counters,
+                        (10, 12, 11, 10),
+                        "the +wet+post row {extent:?} — one depth pair, not two \
+                         (was (12, 12, 11, 12) before B14/R5)"
+                    );
+                }
+                (true, true, true) => {
+                    assert_eq!(
+                        counters,
+                        (12, 14, 13, 12),
+                        "the maximal row {extent:?} — one depth pair, not two \
+                         (was (14, 14, 13, 14) before B14/R5)"
+                    );
+                }
+                // The census axis is closed (six families, the arms
+                // above cover all six bit combinations it contains).
+                _ => unreachable!("the census family axis is closed"),
             }
             drop(renderer);
             drop(app);

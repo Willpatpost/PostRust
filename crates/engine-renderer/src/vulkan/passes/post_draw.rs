@@ -156,6 +156,14 @@ struct PostTargets {
     hdr_images: Vec<vk::Image>,
     hdr_memories: Vec<vk::DeviceMemory>,
     hdr_views: Vec<vk::ImageView>,
+    /// THE B14/R5 TWO-PHASE DEPTH OWNERSHIP: on a CREATING build
+    /// (no matching shared bundle) these hold the registered handles
+    /// for the fault-injection unwind — a fault anywhere later in
+    /// the build releases them via this bundle's `release` — until
+    /// the build's COMMIT moves them into the shared bundle, leaving
+    /// both vectors EMPTY in a committed bundle (the release drains
+    /// are then no-ops). On a REUSING build (the wet-first order)
+    /// they stay empty throughout.
     hdr_depth_images: Vec<vk::Image>,
     hdr_depth_memories: Vec<vk::DeviceMemory>,
     hdr_depth_views: Vec<vk::ImageView>,
@@ -184,6 +192,156 @@ struct PostTargets {
     /// view, the linear sampler, the PostParams uniform).
     post_pool: vk::DescriptorPool,
     post_sets: [vk::DescriptorSet; 2],
+}
+
+/// THE B14/R5 SHARED DEPTH ATTACHMENTS (P5's aliasing decision —
+/// the DEPTH PAIR): the per-slot full-extent depth images the HDR
+/// scene pass and the wet reflection pass ALIAS. One image object
+/// serves both passes' framebuffers (the "spare-image reuse" form —
+/// no `VK_IMAGE_CREATE_ALIAS_BIT`, no second image: the pair's
+/// lifetimes are disjoint within the frame by the cascade's fixed
+/// pass order — the reflection pass ends before the scene pass
+/// begins — and the two passes' depth writes are separated by the
+/// explicit WAW barrier the reflection state records between them,
+/// `ReflectionResources::record_read_barrier`).
+///
+/// OWNERSHIP: whichever extent-bound family built FIRST created the
+/// images (registered to its own partial for the fault-injection
+/// unwind — a fault anywhere in that build releases them — and
+/// MOVED here at that build's commit, after every fallible step
+/// succeeded); the second family creates only its OWN views over
+/// them. The census consequence: a family that builds alone
+/// (post-only or wet-only) allocates exactly the images it always
+/// did (the shared pair replaces its own one-for-one); only the
+/// compositions that run BOTH families drop the duplicate — the
+/// measured prize (E-17): 2 × extent-px × depth-bytes per slot
+/// pair, 7,372,800 B at 720p/D32 through 66,355,200 B at 4K.
+///
+/// FRAME-SLOT OWNERSHIP (the ping-pong proof, extended to both
+/// passes): slot S's image is written by slot S's reflection pass
+/// and slot S's HDR scene pass, inside the frame that first waited
+/// slot S's fence — the whole-submission fence covers both passes'
+/// writes before the slot's next reuse two frames later.
+///
+/// RELEASE ORDER (load-bearing): both families' framebuffers bind
+/// views of these images, so every family framebuffer and depth
+/// view dies BEFORE the images — the coordinated stale release in
+/// `frame_prepare::ensure_extent_targets` (post bundle, reflection
+/// bundle, then this) and `PipelineState::destroy`'s order
+/// (post, reflection, then this) maintain it.
+pub(crate) struct SharedDepthTargets {
+    extent: (u32, u32),
+    /// The swapchain generation when this bundle was created — the
+    /// same key domain the post and reflection bundles key on (only
+    /// a recreation, already device-idle, can change it).
+    swapchain_generation: u64,
+    images: Vec<vk::Image>,
+    memories: Vec<vk::DeviceMemory>,
+}
+
+impl SharedDepthTargets {
+    /// The creating family's commit form: takes ownership of the
+    /// images + memories that family's partial registered (the
+    /// commit point — after every fallible step of that build
+    /// succeeded).
+    pub(super) fn new(
+        extent: (u32, u32),
+        swapchain_generation: u64,
+        images: Vec<vk::Image>,
+        memories: Vec<vk::DeviceMemory>,
+    ) -> Self {
+        Self {
+            extent,
+            swapchain_generation,
+            images,
+            memories,
+        }
+    }
+
+    /// The extent-bound cache key: this bundle serves a family's
+    /// build only when both the extent and the swapchain generation
+    /// match (the same test the families' own bundles run).
+    pub(super) fn matches(&self, extent: (u32, u32), swapchain_generation: u64) -> bool {
+        self.extent == extent && self.swapchain_generation == swapchain_generation
+    }
+
+    /// The per-slot images — the second family's view creation and
+    /// the reflection state's WAW barrier consume these handles.
+    pub(super) fn images(&self) -> &[vk::Image] {
+        &self.images
+    }
+
+    /// Releases every handle exactly once; valid only while the
+    /// device is idle AND after every family framebuffer that binds
+    /// a view of these images has been destroyed (the coordinated
+    /// release order — see the struct doc).
+    pub(super) fn release(&mut self, ctx: &VulkanContext) {
+        // SAFETY: owned by this bundle; the callers maintain the
+        // idle-device and framebuffer-first ordering proofs.
+        unsafe {
+            for memory in self.memories.drain(..) {
+                ctx.free_target_memory(memory);
+            }
+            for image in self.images.drain(..) {
+                ctx.destroy_target_image(image);
+            }
+        }
+    }
+
+    /// The coordinated stale release's shared half: release when
+    /// the key no longer matches. Called only AFTER the families'
+    /// own stale bundles released theirs (their framebuffers and
+    /// views first) — `frame_prepare::ensure_extent_targets`'s
+    /// order.
+    pub(super) fn release_if_stale(
+        &mut self,
+        ctx: &VulkanContext,
+        extent: (u32, u32),
+        swapchain_generation: u64,
+    ) {
+        if !self.matches(extent, swapchain_generation) {
+            self.release(ctx);
+        }
+    }
+}
+
+/// Creates ONE depth view over an EXISTING shared image (the B14/R5
+/// depth pair's second-family arm: the wet-first order's post build,
+/// the post-first order's reflection build). Fault-checked at the
+/// CREATING family's site so the injection cells keep firing on the
+/// reuse path (the late-ordinal Wet View cell counts these).
+///
+/// # Safety
+/// `image` must belong to a live `SharedDepthTargets` that outlives
+/// the view being created (the owner's release runs after this
+/// family's bundle).
+pub(super) fn create_shared_depth_view(
+    ctx: &VulkanContext,
+    site: TargetFaultSite,
+    image: vk::Image,
+    format: vk::Format,
+    views: &mut Vec<vk::ImageView>,
+    what: &str,
+) -> Result<(), RendererError> {
+    let subresource = vk::ImageSubresourceRange {
+        aspect_mask: super::depth_aspect(format),
+        level_count: 1,
+        layer_count: 1,
+        ..Default::default()
+    };
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .subresource_range(subresource);
+    // SAFETY: pushed immediately after creation; the caller's
+    // partial-bundle release unwinds it on a later fault (the
+    // finding-8 immediate-registration discipline).
+    // Fault check before view creation (the caller family's site).
+    ctx.check_target_fault(site, TargetFaultStage::View)?;
+    let view = unsafe { ctx.create_target_image_view(&view_info, what) }?;
+    views.push(view);
+    Ok(())
 }
 
 /// The lazily-created post state, owned by [`super::PipelineState`]
@@ -1194,16 +1352,22 @@ impl PostResources {
     /// still be reading or writing its images. The FIRST build has
     /// nothing in flight by definition (the state itself was just
     /// created). Called outside command recording.
-    /// Ensures the extent-bound post targets exist and matches the
-    /// swapchain generation. Rebuilds on extent change or swapchain
-    /// recreation (the generation changes, never a view handle
-    /// reuse).
+    ///
+    /// THE B14/R5 STALE-PATH CONTRACT: the coordinated stale release
+    /// in `frame_prepare::ensure_extent_targets` — which runs before
+    /// this with the same key — owns releasing a STALE bundle (both
+    /// families' framebuffers must die before the shared depth
+    /// images they view, so no family may release its own stale
+    /// bundle unilaterally); a Some-but-stale bundle here is an
+    /// internal ordering defect and fails visibly rather than
+    /// risking the cross-family view lifetime.
     pub(super) fn ensure_targets(
         &mut self,
         ctx: &VulkanContext,
         extent: vk::Extent2D,
         swapchain_views: &[vk::ImageView],
         swapchain_generation: u64,
+        shared_depth: &mut Option<SharedDepthTargets>,
     ) -> Result<(), RendererError> {
         if swapchain_views.is_empty() {
             return Err(RendererError::Vulkan(
@@ -1216,9 +1380,10 @@ impl PostResources {
         {
             return Ok(());
         }
-        let mut old = self.targets.take();
-        if let Some(old) = &mut old {
-            old.release(ctx);
+        if self.targets.is_some() {
+            return Err(RendererError::Vulkan(
+                "the post targets are stale past the coordinated extent release".into(),
+            ));
         }
         self.targets = Some(PostTargets::build(
             ctx,
@@ -1234,8 +1399,36 @@ impl PostResources {
             self.params_buffer,
             self.params_mapped,
             swapchain_generation,
+            shared_depth,
         )?);
         Ok(())
+    }
+
+    /// The coordinated stale release's post half (B14/R5): release
+    /// this state's extent-bound bundle when its key no longer
+    /// matches — BEFORE the shared depth images (the framebuffers
+    /// inside bind views of them). `frame_prepare` calls this, then
+    /// the reflection state's twin, then the shared bundle's own
+    /// `release_if_stale`.
+    pub(super) fn release_stale_targets(
+        &mut self,
+        ctx: &VulkanContext,
+        extent: vk::Extent2D,
+        swapchain_generation: u64,
+    ) {
+        let stale = self.targets.as_ref().is_some_and(|targets| {
+            targets.extent != (extent.width, extent.height)
+                || targets.swapchain_generation != swapchain_generation
+        });
+        if stale {
+            // SAFETY: the coordinated release runs only on the
+            // stale key (a recreation path — already device-idle);
+            // this family's framebuffers die before the shared
+            // images it views (the caller's order).
+            if let Some(mut targets) = self.targets.take() {
+                targets.release(ctx);
+            }
+        }
     }
 
     /// Records the whole post chain for this frame — the five
@@ -1559,6 +1752,7 @@ impl PostTargets {
         params_buffer: vk::Buffer,
         params_mapped: *mut core::ffi::c_void,
         swapchain_generation: u64,
+        shared_depth: &mut Option<SharedDepthTargets>,
     ) -> Result<PostTargets, RendererError> {
         let mut partial = PostTargets {
             extent: (extent.width, extent.height),
@@ -1600,9 +1794,33 @@ impl PostTargets {
             params_buffer,
             params_mapped,
             swapchain_generation,
+            shared_depth,
         ) {
             partial.release(ctx);
             return Err(error);
+        }
+        // THE B14/R5 COMMIT (the depth pair's creating arm): every
+        // fallible step succeeded, so the depth images and memories
+        // this build registered become the SHARED bundle — the
+        // reflection state's next build (and this one's own
+        // framebuffers) bind views of them. The vectors empty here,
+        // making this bundle's own release a no-op for them; the
+        // fault path above already released whatever existed. A
+        // reusing build (the wet-first order) created none — the
+        // vectors are empty and nothing commits.
+        if !partial.hdr_depth_images.is_empty() {
+            let shared = SharedDepthTargets::new(
+                (extent.width, extent.height),
+                swapchain_generation,
+                std::mem::take(&mut partial.hdr_depth_images),
+                std::mem::take(&mut partial.hdr_depth_memories),
+            );
+            // The coordinated stale release in `frame_prepare` owns
+            // a prior bundle's death; this belt covers an impossible
+            // stale survivor without leaking it.
+            if let Some(mut old) = shared_depth.replace(shared) {
+                old.release(ctx);
+            }
         }
         Ok(partial)
     }
@@ -1622,7 +1840,8 @@ impl PostTargets {
         depth_format: vk::Format,
         params_buffer: vk::Buffer,
         params_mapped: *mut core::ffi::c_void,
-        _swapchain_generation: u64,
+        swapchain_generation: u64,
+        shared_depth: &Option<SharedDepthTargets>,
     ) -> Result<(), RendererError> {
         let slots = FRAMES_IN_FLIGHT as usize;
         let scene_extent = (extent.width, extent.height);
@@ -1770,17 +1989,47 @@ impl PostTargets {
         // after the pass). Use the negotiated depth format's aspect
         // flags (corrective finding 4: D32/D16 → DEPTH, D24_S8 →
         // DEPTH | STENCIL).
-        for _slot in 0..slots {
-            create_image(
-                depth_format,
-                scene_extent,
-                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-                super::depth_aspect(depth_format),
-                &mut self.hdr_depth_images,
-                &mut self.hdr_depth_memories,
-                &mut self.hdr_depth_views,
-                "post HDR depth image",
-            )?;
+        //
+        // THE B14/R5 DEPTH PAIR (the shared images): when the shared
+        // bundle already matches this extent and generation (the
+        // WET-FIRST order — the reflection state's build created the
+        // images), this family creates only its OWN views over them
+        // (the reuse arm; the framebuffers below bind those views);
+        // otherwise (the POST-FIRST order, or the first build after
+        // the coordinated stale release of a recreation) this build
+        // creates the images + memories into its own partial — the
+        // fault-injection registration — which the build's COMMIT
+        // moves into the shared bundle. Either way this family's
+        // `hdr_depth_views` are its own, released with its bundle.
+        if let Some(shared) = shared_depth
+            && shared.matches(scene_extent, swapchain_generation)
+        {
+            for &image in shared.images() {
+                // SAFETY: the shared bundle outlives this bundle
+                // (the release order); the view is registered to
+                // this partial immediately.
+                create_shared_depth_view(
+                    ctx,
+                    TargetFaultSite::Post,
+                    image,
+                    depth_format,
+                    &mut self.hdr_depth_views,
+                    "post HDR depth view (shared image)",
+                )?;
+            }
+        } else {
+            for _slot in 0..slots {
+                create_image(
+                    depth_format,
+                    scene_extent,
+                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                    super::depth_aspect(depth_format),
+                    &mut self.hdr_depth_images,
+                    &mut self.hdr_depth_memories,
+                    &mut self.hdr_depth_views,
+                    "post HDR depth image",
+                )?;
+            }
         }
         // The HDR scene framebuffers: color + depth per slot.
         for slot in 0..slots {
@@ -2018,5 +2267,124 @@ impl PostTargets {
                 ctx.destroy_target_image_view(view);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::FRAMES_IN_FLIGHT;
+
+    /// THE B14/R5 ALIASING DECISION TABLE (device-free — the
+    /// ownership rule the rig census verifies with live counters):
+    /// the per-slot full-extent depth images are created exactly
+    /// ONCE per extent generation, by whichever extent-bound family
+    /// built first (the ensure ladder's order makes that the post
+    /// chain on a frame that runs both); the second family creates
+    /// only its own views. A family that runs ALONE therefore
+    /// allocates exactly the target images it always did — the
+    /// shared pair replaces its own one-for-one, holding every
+    /// single-family allocation pin (render_post's (11,3,9,1,0),
+    /// render_reflection's (7,2,8,2)) — and only the compositions
+    /// running BOTH families drop the duplicate pair.
+    #[test]
+    fn the_depth_pair_allocation_table() {
+        let slots = FRAMES_IN_FLIGHT;
+        // Each family's OWN target-image count: the post chain's
+        // six color/bloom images (HDR + bloom_a + bloom_b per slot)
+        // plus the depth pair when it is the creator; the
+        // reflection's color images plus the depth pair when it is.
+        let post_images = |creates_depth: bool| 2 + 4 + u32::from(creates_depth) * slots;
+        let wet_images = |creates_depth: bool| 2 + u32::from(creates_depth) * slots;
+        // Post alone: the post build creates the shared pair (the
+        // census +post row's 8 images, unchanged by the aliasing).
+        assert_eq!(post_images(true), 8);
+        // Wet alone (the post state exists for its HDR render pass,
+        // but no post targets were built): the reflection build
+        // creates the shared pair (the census +wet row's 4 images,
+        // unchanged).
+        assert_eq!(wet_images(true), 4);
+        // Wet+post — the ensure ladder builds the post targets
+        // first, so the post build creates the shared pair and the
+        // reflection reuses: 10 images where the unaliased renderer
+        // carried 12 (the census +wet+post row's after-shape).
+        assert_eq!(post_images(true) + wet_images(false), 10);
+        // The wet-first order composes to the same total (the
+        // reflection creates, the post reuses) — the counts are
+        // order-independent even though the creating family differs.
+        assert_eq!(wet_images(true) + post_images(false), 10);
+        // The saving is exactly ONE duplicate depth pair per
+        // composition — never more: the pair is shared, not
+        // per-family.
+        assert_eq!(
+            post_images(true) + wet_images(true) - (post_images(true) + wet_images(false)),
+            slots,
+            "one depth image per frame slot saved per both-family composition"
+        );
+    }
+
+    /// THE MEASURED PRIZE (the census arithmetic this lane's
+    /// decision rests on): the duplicate depth pair's bytes at the
+    /// census extents — `FRAMES_IN_FLIGHT × extent-pixels × depth
+    /// bytes` (the rig's negotiated D32_SFLOAT: 4 B/px). This is
+    /// the absolute saving per composition that runs both families,
+    /// linear in extent (the 4K cell is exactly 9× the 720p cell).
+    #[test]
+    fn the_depth_pair_savings_at_the_census_extents() {
+        let cases: [((u32, u32), u64); 4] = [
+            ((1280, 720), 7_372_800),
+            ((1920, 1080), 16_588_800),
+            ((2560, 1440), 29_491_200),
+            ((3840, 2160), 66_355_200),
+        ];
+        for (extent, expected) in cases {
+            let pixels = u64::from(extent.0) * u64::from(extent.1);
+            assert_eq!(
+                FRAMES_IN_FLIGHT as u64 * pixels * 4,
+                expected,
+                "the duplicate D32 depth pair at {extent:?}"
+            );
+        }
+        let (base, uhd) = (cases[0].1, cases[3].1);
+        assert_eq!(
+            uhd,
+            9 * base,
+            "linear in extent — the §6.1 scaling property"
+        );
+    }
+
+    /// The REJECTED color pair, for the record (the decision's other
+    /// half): the bloom mips' whole residency is 1/8 of ONE
+    /// reflection color image — the pair rides at the 1/4 extent —
+    /// so aliasing reflection color ↔ bloom saves the bloom pair's
+    /// bytes only (4 × quarter-extent pixels × 8 B), 3.7–4.0% of the
+    /// maximal composition's target residency at every census
+    /// extent: below the heuristic the owner demoted to a
+    /// non-gate, and behind a mechanism the extent mismatch (full
+    /// vs 1/4) forces into ALIAS_BIT + a cross-family shared
+    /// allocation the lazy family order cannot size without either
+    /// regressing the post-only composition 8× or growing at
+    /// composition boundaries. NO-CHANGE, trigger recorded in
+    /// E-17.
+    #[test]
+    fn the_rejected_color_pair_savings_at_the_census_extents() {
+        let cases: [((u32, u32), u64); 4] = [
+            ((1280, 720), 1_843_200),
+            ((1920, 1080), 4_147_200),
+            ((2560, 1440), 7_372_800),
+            ((3840, 2160), 16_588_800),
+        ];
+        for (extent, expected) in cases {
+            let quarter = (extent.0 / 4) as u64 * (extent.1 / 4) as u64;
+            assert_eq!(
+                2 * FRAMES_IN_FLIGHT as u64 * quarter * 8,
+                expected,
+                "both slots' bloom mip pairs at {extent:?}"
+            );
+        }
+        // The depth pair's prize is 4× the color pair's at every
+        // extent (the full-extent depth vs the quarter-extent color
+        // mips, both 4 B/px vs 8 B/px) — the split decision's
+        // arithmetic.
+        assert_eq!(66_355_200 / 16_588_800, 4);
     }
 }

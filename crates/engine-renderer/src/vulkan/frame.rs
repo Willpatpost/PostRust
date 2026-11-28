@@ -1525,7 +1525,27 @@ fn record_command_buffer(
                 clear_color,
                 &corner.reflected_ranges(),
             );
-            reflection_state.record_read_barrier(ctx, command, slot);
+            // THE B14/R5 DEPTH-PAIR WAW: the barrier's depth entry
+            // rides exactly the frames whose scene pass is the HDR
+            // one (this wet frame renders through the post chain) —
+            // this slot's shared depth image, the same image the
+            // reflection pass above just wrote and the HDR scene
+            // pass below clears and writes. The ensure ladder above
+            // built (or matched) both families' extent targets with
+            // the shared bundle on this plan, so the expect is the
+            // ensure discipline's own invariant.
+            reflection_state.record_read_barrier(
+                ctx,
+                command,
+                slot,
+                plan.depth_pair_waw().then(|| {
+                    pipes
+                        .shared_depth
+                        .as_ref()
+                        .expect("a wet+post frame's ensures created the shared depth bundle")
+                        .images()[slot]
+                }),
+            );
         }
 
         // The Era-1 post chain (package 6): a post frame REPLACES
