@@ -3,8 +3,42 @@
 //! present-wait semaphores, timestamps, overlay slots — the frame
 //! outcome, and the full wait -> acquire -> (recreate) -> record ->
 //! submit -> present flow (`render_frame`, the coordinator's host
-//! half). Pure move from vulkan.rs (stage S4); no logic changed —
-//! only location and visibility.
+//! half). The S4 split was a pure move from vulkan.rs; A04 (design
+//! §3.4 + §5.4) then collapsed the flow's parameter set and named
+//! its phases — no behavior change in either step:
+//!
+//! **The §3.4 collapse (19 → 6):** the four owning states stay four
+//! explicit `&mut` parameters (the ownership argument the original
+//! parameter-list comment defended — the design agrees with it and
+//! disagrees only about the input half); the fifteen input/policy
+//! parameters collapsed into TWO values: [`FramePolicy`]
+//! (construction-time config, `Copy`) and [`InternalFrame`] (the
+//! validated, repacked submission one level down, plus the [`FramePlan`]
+//! derived from it — a borrow bundle). The same Options and slices
+//! flow through, named by one struct instead of positional
+//! parameters; the preparation pair and `recreate_swapchain` take
+//! the same two values (the policy one level down each time).
+//!
+//! **The §5.4 phases:** `render_frame` is now the phase ladder in
+//! call order — `validate_proxy_materials` → `prepare_frame` (the
+//! S4-extracted preparation pair) → `wait_slot_fence` →
+//! `acquire_with_retry` → `reset_and_timestamps` →
+//! `upload_frame_data` → `record_command_buffer` →
+//! `submit_command_buffer` → `present_image`. Each phase is a
+//! private function of this module — not a phase trait, not
+//! extensible at runtime; the ordering is the code. Where S3/S4 had
+//! already landed a piece of a phase (the preparation pair, the
+//! per-family record functions, the plan), the phase below is the
+//! remaining wiring only — each phase's doc names the overlap.
+//!
+//! **Zero-cost statement (§3.4):** [`FramePolicy`] and
+//! [`InternalFrame`] are `Copy` borrow bundles — no `Vec`, no `Box`,
+//! no trait objects; construction is stack assembly the compiler
+//! elides. No per-frame heap allocation and no dyn dispatch were
+//! introduced anywhere in the flow. The behavioral half of the proof
+//! is the batteries' identical `FrameOutcome`s and allocation
+//! counters (the A04 gate set); the type-level half is
+//! `policy_tests::the_collapsed_frame_parameters_are_copy_stack_data`.
 
 use ash::vk;
 
@@ -18,11 +52,10 @@ use super::pipelines::PipelineState;
 use super::resources::create_mapped_buffer;
 use super::swapchain::{SwapchainState, mark_suboptimal};
 use super::uploads::{LayerPriority, upload_layers};
-use super::{corner, post_draw, proxy_draw, reflection_draw, scene_record, shadow_draw, sky_draw};
-use crate::SceneLayer;
+use super::{corner, post_draw, proxy_draw, scene_record};
 use crate::config::{DemoScenePreference, DynamicClamp, FRAMES_IN_FLIGHT, PresentModePreference};
 use crate::overlay::OverlayVertex;
-use crate::scene::SceneVertex;
+use crate::submission::FrameInputs;
 
 /// A single frame slot owns this mapping. The slot fence must have
 /// signaled before growing or writing it.
@@ -299,38 +332,150 @@ pub(crate) struct FrameOutcome {
     pub indirect_draws_issued: u32,
 }
 
+/// Construction-time frame policy (P4 D2 §3.4, stage A04): the
+/// `RenderConfig` values the frame flow reads per call, collapsed
+/// from three positional parameters into one `Copy` value — the
+/// policy half of the 19 → 6 parameter collapse. The four owning
+/// states stay four explicit `&mut` parameters through every
+/// internal function (the design's §5.2 anti-god-object rule); this
+/// struct carries ONLY configuration, never state.
+///
+/// **The design's `scene_attached` adaptation (documented):** §3.4
+/// sketched the third field as `scene_attached: bool`, written when
+/// the `Corner` construction preference was the scene-carrying arm.
+/// S6 deleted that arm — authored scene content now reaches the
+/// renderer only through `attach_scene`, and the attached handle's
+/// state IS `ctx.corner` (read directly by the flow; §3.4's own
+/// "the attached handle's state (was ctx.corner)" note). The
+/// preference that remains is the static Stage-2 demonstration
+/// scene's `Included` opt-in (design §3.2 keeps it), and the
+/// pipeline-replacement path consumes it
+/// (`recreate_swapchain` → `PipelineState::new`) — so the policy
+/// carries the preference itself, verbatim, and the attached-scene
+/// fact needs no boolean mirror.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FramePolicy {
+    /// The present-mode preference a recreation re-resolves against
+    /// (`RenderConfig::present_mode`).
+    pub present_preference: PresentModePreference,
+    /// The verification seam that forces pipeline replacement on
+    /// every recreation (`RenderConfig::replace_pipelines`,
+    /// `--replace-pipelines`).
+    pub replace_pipelines: bool,
+    /// The static demonstration scene's opt-in (P3,
+    /// `RenderConfig::demo_scene`) — the LIVE preference every
+    /// replacement pipeline is built with.
+    pub demo_scene: DemoScenePreference,
+}
+
+/// One validated frame, one level down (P4 D2 §3.4, stage A04): the
+/// input half of a `render_frame` call as ONE value — the
+/// [`FrameInputs`] the safe layer's adapter built from a validated
+/// `FrameSubmission` (S1's equivalence target), plus the
+/// [`FramePlan`] derived from it ONCE (S3's single derivation, now
+/// at this bundle's construction). This is the frame half of the
+/// 19 → 6 collapse: the same Options and slices that flowed through
+/// fifteen positional parameters, named by one struct.
+///
+/// **Zero-cost statement (§3.4):** a borrow bundle — `Copy`, no
+/// `Vec`, no `Box`, no trait objects; construction is stack assembly
+/// the compiler elides. The batteries' identical `FrameOutcome`s and
+/// allocation counters are the behavioral half of the proof.
+///
+/// **The design's field-list adaptation (documented):** §3.4 sketched
+/// `{ submission, scene, ripple_debug }` — pre-S1 text, written
+/// before the submission contract landed. The landed shape: the
+/// SUBMISSION arrives already validated and repacked (the adapter
+/// runs in the safe layer, device-free, per the §3.3
+/// validate-whole-before-any-frame-state invariant — `FrameInputs`
+/// is "the validated submission, one level down"); the SCENE stays
+/// `ctx.corner` — a reference carved out of the context cannot
+/// coexist with the `&mut ctx` the four-state ownership rule
+/// requires, and post-S6 `ctx.corner` IS the attached handle's
+/// state; and `ripple_debug` is folded at adaptation time into the
+/// wet camera's packed ripple uniform (the retained test-only
+/// sticky's only consumer, through `adapt_frame`'s policy
+/// parameter).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InternalFrame<'a> {
+    /// The validated, repacked input set (the safe layer adapter's
+    /// output — `adapt_frame`, or the layers-only literal).
+    pub inputs: FrameInputs<'a>,
+    /// The frame's explicit pass-uses declaration, derived once at
+    /// construction (S3's `FramePlan`, consumed by the preparation
+    /// pair and the record cascade).
+    pub plan: FramePlan,
+}
+
+impl<'a> InternalFrame<'a> {
+    /// Builds the flow's frame bundle from the adapter's output,
+    /// deriving the [`FramePlan`] ONCE — the S3 single derivation,
+    /// performed at exactly the same point relative to the flow as
+    /// when it sat inline at the top of `render_frame`'s body
+    /// (before any synchronization state is touched, on the same
+    /// flat facts every route hands the frame flow).
+    pub(crate) fn new(inputs: FrameInputs<'a>) -> Self {
+        // THE FRAME PLAN (P4 D2 §4.2, stage S3): the explicit pass-uses
+        // declaration, derived ONCE here from the input set — the same
+        // flat facts every route hands the frame flow. The THREE
+        // preparation sites below (the pre-recreation ensure, the
+        // Recreated arm's re-run, and the out-of-date path's
+        // re-preparation) and the record cascade's pass-variant decisions
+        // (the post/main branch, the wet ground's placement, the overlay
+        // upload gate) consume it instead of re-deriving the uses from
+        // the positional Options — the preparation triplication the
+        // design's §1.4 finding named. The equivalence to the implicit
+        // derivation this flow previously performed at each site is
+        // pinned by `frame_plan`'s unit test (the S1/S2 pattern).
+        let foreground_vertices = inputs.foreground.map_or(&[][..], |layer| layer.vertices);
+        let plan = FramePlan::derive(
+            inputs.region_vertices,
+            foreground_vertices,
+            inputs.hud,
+            inputs.debug_overlay,
+            inputs.proxy.as_ref(),
+            inputs.shadowed.as_ref(),
+            inputs.sky.as_ref(),
+            inputs.post,
+            inputs.wet.as_ref(),
+        );
+        Self { inputs, plan }
+    }
+}
+
+/// The acquire phase's result (§5.4): an acquired image, or the
+/// deferral signal (every deferred arm inside `acquire_with_retry`
+/// already latched what it owes — the recreation intent in
+/// `frames.needs_recreate` — exactly as the inline arms did).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Acquisition {
+    Acquired {
+        image_index: u32,
+        suboptimal: bool,
+        /// The out-of-date arm performed the inline recreation (the
+        /// public `recreated` contract: callers learn the generation
+        /// changed).
+        recreated: bool,
+    },
+    Deferred,
+}
+
 /// The full frame flow: wait → acquire → (recreate if needed) → record →
 /// submit → present. Called by the safe [`crate::Renderer`] wrapper.
-// Private frame orchestration: the four owning states plus the per-frame
-// inputs are exactly the parameters the record/submit/present sequence
-// needs; bundling them would hide the ownership story for no gain.
-// The Era-1 sky pass rides the same flat list (the one-Option-per-layer
-// shape; the sky is a layer like the shadowed one, drawn first when
-// present). The Era-1 post chain rides it as ONE bool (the chain has no
-// per-frame data at all — its only uniform is extent-static), and the
-// wet reflection as ONE Option (the camera description its mirrored
-// math consumes; None keeps the dry path).
-#[allow(clippy::too_many_arguments)]
+// Private frame orchestration (P4 D2 §3.4, stage A04): the four owning
+// states stay four explicit `&mut` parameters — the ownership argument
+// this list always defended — and the fifteen input/policy parameters
+// collapsed into the `Copy` policy and the borrow-only frame bundle
+// (see [`FramePolicy`] and [`InternalFrame`]). The body below is the
+// §5.4 phase ladder in call order; each phase function carries its own
+// verbatim-moved comments and safety arguments.
 pub(crate) fn render_frame(
     ctx: &mut VulkanContext,
     swapchain: &mut SwapchainState,
     pipes: &mut PipelineState,
     frames: &mut FrameState,
-    window_size: (u32, u32),
-    present_preference: PresentModePreference,
-    replace_pipelines: bool,
-    demo_scene: DemoScenePreference,
-    view_proj: &[[f32; 4]; 4],
-    region_vertices: &[SceneVertex],
-    foreground: Option<SceneLayer<'_>>,
-    hud: &[OverlayVertex],
-    debug_overlay: &[OverlayVertex],
-    corner_params: Option<&corner::FrameParams>,
-    proxy: Option<&proxy_draw::ProxyFrameUpload<'_>>,
-    shadowed: Option<&shadow_draw::ShadowFrameParams>,
-    sky: Option<&sky_draw::SkyFrameParams>,
-    post: bool,
-    wet: Option<&reflection_draw::WetCamera>,
+    policy: FramePolicy,
+    frame: &InternalFrame<'_>,
 ) -> Result<FrameOutcome, RendererError> {
     let mut outcome = FrameOutcome::default();
     let slot = frames.frame_slot;
@@ -341,14 +486,129 @@ pub(crate) fn render_frame(
     // refused frames record nothing, so their delta is zero.
     let indirect_issued_before = ctx.indirect_draws_issued.get();
 
-    // The proxy materials are validated before ANY synchronization
-    // state is touched (the capture-refusal discipline: a refusal
-    // here can never leave a fence reset-but-unsignaled or an
-    // acquired image's semaphore unconsumed). A populated kind whose
-    // material index falls outside the corner table is a typed error;
-    // an EMPTY kind may carry any index (it draws nothing). The
-    // Era-2 package C rain kind joins the validation exactly like
-    // the other kinds.
+    // Phase 1 — validate_inputs: the proxy material validation,
+    // before ANY synchronization state is touched.
+    let proxy_sets = validate_proxy_materials(ctx, frame.inputs.proxy.as_ref())?;
+
+    // Phase 2 — prepare: swapchain checks, lazy state, and target
+    // creation before acquire (finding 20, Phase A; findings 3-8).
+    // The coordinator owns the outcome flags: the preparation pair
+    // reports Deferred/Recreated/Proceeded and this match sets
+    // FrameOutcome::{deferred, recreated} from those arms.
+    match prepare_frame(ctx, swapchain, pipes, frames, policy, frame)? {
+        FramePreparationResult::Deferred => {
+            outcome.deferred = true;
+            return Ok(outcome);
+        }
+        FramePreparationResult::Recreated => {
+            outcome.recreated = true;
+            // Re-run preparation against the new generation.
+            match prepare_frame(ctx, swapchain, pipes, frames, policy, frame)? {
+                FramePreparationResult::Deferred => {
+                    outcome.deferred = true;
+                    return Ok(outcome);
+                }
+                FramePreparationResult::Recreated => {
+                    // This should never happen - recreate once per frame.
+                    // If it does, we'll retry in the acquire loop.
+                    frames.needs_recreate = true;
+                    outcome.deferred = true;
+                    return Ok(outcome);
+                }
+                FramePreparationResult::Proceeded => {}
+            }
+        }
+        FramePreparationResult::Proceeded => {}
+    }
+
+    // Phase 3 — wait_slot_fence (plus this slot's overlay growth,
+    // which the design's §1.2 inventory grouped with the wait).
+    wait_slot_fence(ctx, frames, frame, slot)?;
+
+    // Phase 4 — acquire_with_retry: the out-of-date inline recreation
+    // and the retry acquire live inside.
+    let acquisition = acquire_with_retry(ctx, swapchain, pipes, frames, policy, frame, slot)?;
+    let (image_index, suboptimal) = match acquisition {
+        Acquisition::Acquired {
+            image_index,
+            suboptimal,
+            recreated,
+        } => {
+            outcome.recreated |= recreated;
+            (image_index, suboptimal)
+        }
+        Acquisition::Deferred => {
+            outcome.deferred = true;
+            return Ok(outcome);
+        }
+    };
+    outcome.suboptimal = suboptimal;
+    frames.image_index = image_index;
+
+    // Phase 5 — reset_and_timestamps: the per-image guard, the slot
+    // fence reset, and the previous use's timestamp read.
+    let gpu_render_ms = reset_and_timestamps(ctx, frames, slot, image_index)?;
+
+    // Phase 6 — upload_frame_data: the mapped-slot writes this slot's
+    // fence wait now owns.
+    let world_drawn = upload_frame_data(ctx, pipes, frames, frame, &mut outcome, slot)?;
+
+    // The present-wait semaphore is owned by the acquired image
+    // (corrective finding C). Grown BEFORE recording begins (the
+    // fail-fast discipline: a creation failure must not leave a
+    // recorded-but-unsubmitted command buffer against a reset fence
+    // and an acquired image).
+    let present_semaphore = frames.present_semaphore_for(ctx, image_index)?;
+
+    // Phase 7 — record: the pass cascade into this slot's command
+    // buffer.
+    record_command_buffer(
+        ctx,
+        swapchain,
+        pipes,
+        frames,
+        frame,
+        proxy_sets,
+        slot,
+        image_index,
+        world_drawn,
+        &mut outcome,
+    )?;
+
+    // Phase 8 — submit.
+    submit_command_buffer(ctx, frames, present_semaphore, slot)?;
+
+    // Phase 9 — present.
+    present_image(
+        ctx,
+        swapchain,
+        frames,
+        image_index,
+        present_semaphore,
+        &mut outcome,
+    )?;
+
+    outcome.gpu_render_ms = gpu_render_ms;
+    outcome.indirect_draws_issued =
+        (ctx.indirect_draws_issued.get() - indirect_issued_before) as u32;
+    frames.frame_slot = (slot + 1) % FRAMES_IN_FLIGHT as usize;
+    Ok(outcome)
+}
+
+/// Phase 1 — `validate_inputs` (§5.4): the proxy materials are
+/// validated before ANY synchronization state is touched (the
+/// capture-refusal discipline: a refusal here can never leave a fence
+/// reset-but-unsignaled or an acquired image's semaphore unconsumed).
+/// A populated kind whose material index falls outside the attached
+/// scene's table is a typed error; an EMPTY kind may carry any index
+/// (it draws nothing). The Era-2 package C rain kind joins the
+/// validation exactly like the other kinds. Extracted verbatim from
+/// `render_frame`'s body at A04; `ctx` is an immutable reborrow — the
+/// validation only reads the attached scene's material table.
+fn validate_proxy_materials(
+    ctx: &VulkanContext,
+    proxy: Option<&proxy_draw::ProxyFrameUpload<'_>>,
+) -> Result<Option<[vk::DescriptorSet; 3]>, RendererError> {
     let proxy_sets = match (ctx.corner.as_ref(), proxy) {
         (Some(corner), Some(upload)) => {
             let npc_set = corner.material_set(upload.npc_material);
@@ -377,81 +637,21 @@ pub(crate) fn render_frame(
         // unpopulated frame rather than an error.
         (None, Some(_)) | (None, None) | (Some(_), None) => None,
     };
+    Ok(proxy_sets)
+}
 
-    // Frame preparation: swapchain checks, lazy state, and target creation
-    // before acquire (finding 20, Phase A; findings 3-8).
-    let foreground_vertices = foreground.map_or(&[][..], |layer| layer.vertices);
-    // THE FRAME PLAN (P4 D2 §4.2, stage S3): the explicit pass-uses
-    // declaration, derived ONCE here from the input set — the same
-    // flat facts every route hands the frame flow. The THREE
-    // preparation sites below (the pre-recreation ensure, the
-    // Recreated arm's re-run, and the out-of-date path's
-    // re-preparation) and the record cascade's pass-variant decisions
-    // (the post/main branch, the wet ground's placement, the overlay
-    // upload gate) consume it instead of re-deriving the uses from
-    // the positional Options — the preparation triplication the
-    // design's §1.4 finding named. The equivalence to the implicit
-    // derivation this flow previously performed at each site is
-    // pinned by `frame_plan`'s unit test (the S1/S2 pattern).
-    let plan = FramePlan::derive(
-        region_vertices,
-        foreground_vertices,
-        hud,
-        debug_overlay,
-        proxy,
-        shadowed,
-        sky,
-        post,
-        wet,
-    );
-    match prepare_frame(
-        ctx,
-        swapchain,
-        pipes,
-        frames,
-        window_size,
-        present_preference,
-        replace_pipelines,
-        demo_scene,
-        &plan,
-        frames.capture.pending,
-    )? {
-        FramePreparationResult::Deferred => {
-            outcome.deferred = true;
-            return Ok(outcome);
-        }
-        FramePreparationResult::Recreated => {
-            outcome.recreated = true;
-            // Re-run preparation against the new generation.
-            match prepare_frame(
-                ctx,
-                swapchain,
-                pipes,
-                frames,
-                window_size,
-                present_preference,
-                replace_pipelines,
-                demo_scene,
-                &plan,
-                frames.capture.pending,
-            )? {
-                FramePreparationResult::Deferred => {
-                    outcome.deferred = true;
-                    return Ok(outcome);
-                }
-                FramePreparationResult::Recreated => {
-                    // This should never happen - recreate once per frame.
-                    // If it does, we'll retry in the acquire loop.
-                    frames.needs_recreate = true;
-                    outcome.deferred = true;
-                    return Ok(outcome);
-                }
-                FramePreparationResult::Proceeded => {}
-            }
-        }
-        FramePreparationResult::Proceeded => {}
-    }
-
+/// Phase 3 — `wait_slot_fence` (§5.4, the slot-fence wait plus the
+/// overlay slot growth the design's §1.2 inventory grouped with it
+/// at the wait's line range): waits for this slot's previous
+/// submission, then grows only the fenced slot's overlay buffer —
+/// before acquire, so a failure leaves the image-available semaphore
+/// and fence reusable.
+fn wait_slot_fence(
+    ctx: &VulkanContext,
+    frames: &mut FrameState,
+    frame: &InternalFrame<'_>,
+    slot: usize,
+) -> Result<(), RendererError> {
     // Wait for this slot's previous submission. The fence is reset only
     // AFTER the per-image guard below: under present backpressure the
     // driver can hand a slot the image that slot last rendered, and
@@ -466,10 +666,31 @@ pub(crate) fn render_frame(
 
     // Allocation can fail. Grow only the fenced slot, before acquire, so
     // a failure leaves the image-available semaphore and fence reusable.
-    frames.overlay_slots[slot].reserve(ctx, hud.len().saturating_add(debug_overlay.len()))?;
+    frames.overlay_slots[slot].reserve(
+        ctx,
+        frame
+            .inputs
+            .hud
+            .len()
+            .saturating_add(frame.inputs.debug_overlay.len()),
+    )?;
+    Ok(())
+}
 
-    // OUT_OF_DATE retries once. The fence stays signaled until an image
-    // has actually been acquired, including when both attempts defer.
+/// Phase 4 — `acquire_with_retry` (§5.4): the first acquire, the
+/// injected-out-of-date simulation, the out-of-date inline recreation
+/// (through `prepare_after_recreation`), and the retry acquire.
+/// OUT_OF_DATE retries once. The fence stays signaled until an image
+/// has actually been acquired, including when both attempts defer.
+fn acquire_with_retry(
+    ctx: &mut VulkanContext,
+    swapchain: &mut SwapchainState,
+    pipes: &mut PipelineState,
+    frames: &mut FrameState,
+    policy: FramePolicy,
+    frame: &InternalFrame<'_>,
+    slot: usize,
+) -> Result<Acquisition, RendererError> {
     // If the acquire-out-of-date plan is armed, inject the error at the
     // FIRST acquire site only (the retry acquire inside the out-of-date
     // arm is NEVER injected — the plan is consumed at the first site
@@ -490,38 +711,26 @@ pub(crate) fn render_frame(
             )
         }
     };
+    let mut recreated = false;
     if let Err(vk::Result::ERROR_OUT_OF_DATE_KHR) = acquire_result {
         // The out-of-date inline recreation uses prepare_after_recreation
         // to handle probe, recreate, state-ensure, target-ensure, capture-ensure,
         // and retry acquire (finding 20, Phase A; findings 3-8).
-        match prepare_after_recreation(
-            ctx,
-            swapchain,
-            pipes,
-            frames,
-            window_size,
-            present_preference,
-            replace_pipelines,
-            demo_scene,
-            &plan,
-            frames.capture.pending,
-        )? {
+        match prepare_after_recreation(ctx, swapchain, pipes, frames, policy, frame)? {
             FramePreparationResult::Deferred => {
-                outcome.deferred = true;
-                return Ok(outcome);
+                return Ok(Acquisition::Deferred);
             }
             FramePreparationResult::Recreated => {
                 // This should never happen - prepare_after_recreation already
                 // retried acquire. If it returns Recreated, something went wrong.
                 frames.needs_recreate = true;
-                outcome.deferred = true;
-                return Ok(outcome);
+                return Ok(Acquisition::Deferred);
             }
             FramePreparationResult::Proceeded => {
                 // The inline recreation happened inside the helper — the
                 // original arm reported it on the outcome (the public
                 // recreated contract: callers learn the generation changed).
-                outcome.recreated = true;
+                recreated = true;
                 // Retry acquire after preparation.
                 acquire_result = unsafe {
                     ctx.swapchain_ext.acquire_next_image(
@@ -534,24 +743,37 @@ pub(crate) fn render_frame(
             }
         }
     }
-    let (image_index, suboptimal) = match acquire_result {
-        Ok((index, suboptimal)) => (index, suboptimal),
+    match acquire_result {
+        Ok((image_index, suboptimal)) => Ok(Acquisition::Acquired {
+            image_index,
+            suboptimal,
+            recreated,
+        }),
         Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
             frames.needs_recreate = true;
-            outcome.deferred = true;
-            return Ok(outcome);
+            Ok(Acquisition::Deferred)
         }
-        Err(vk::Result::TIMEOUT) => {
-            return Err(RendererError::Vulkan(
-                "acquire_next_image timed out: no swapchain image became available in 100 ms \
-                 (present mode not draining — vsync-locked FIFO paced beyond the display rate?)"
-                    .into(),
-            ));
-        }
-        Err(error) => return Err(RendererError::vk(error, "acquire_next_image")),
-    };
-    outcome.suboptimal = suboptimal;
-    frames.image_index = image_index;
+        Err(vk::Result::TIMEOUT) => Err(RendererError::Vulkan(
+            "acquire_next_image timed out: no swapchain image became available in 100 ms \
+             (present mode not draining — vsync-locked FIFO paced beyond the display rate?)"
+                .into(),
+        )),
+        Err(error) => Err(RendererError::vk(error, "acquire_next_image")),
+    }
+}
+
+/// Phase 5 — `reset_and_timestamps` (§5.4; the per-image guard wait
+/// is folded in as the reset's own prelude — the original comment
+/// below calls it "the last wait that can reference this slot's
+/// previous signal"): guards against acquiring an image another
+/// in-flight submission still reads, resets the slot fence, and
+/// reads the previous use's timestamps.
+fn reset_and_timestamps(
+    ctx: &VulkanContext,
+    frames: &mut FrameState,
+    slot: usize,
+    image_index: u32,
+) -> Result<Option<f64>, RendererError> {
     if let Some(image_fence) = mut_at(&mut frames.images_in_flight, image_index as usize) {
         if *image_fence != vk::Fence::null() {
             unsafe {
@@ -586,31 +808,29 @@ pub(crate) fn render_frame(
         } else {
             None
         };
+    Ok(gpu_render_ms)
+}
 
-    // Record.
-    let command = frames.command_buffers[slot];
-    let framebuffer = swapchain.framebuffers[image_index as usize];
-    let extent = swapchain.extent;
-    // The clear color (hoisted: the Era-1 post chain's HDR scene
-    // pass clears the SAME color the main pass would — the value
-    // is identical, only the attachment's format differs).
-    let clear_color = corner_params.map_or_else(
-        || shadowed.map_or([0.02, 0.02, 0.04, 1.0], |params| params.clear_color()),
-        corner::FrameParams::clear_color,
-    );
-    let clear_values = [
-        vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: clear_color,
-            },
-        },
-        vk::ClearValue {
-            depth_stencil: vk::ClearDepthStencilValue {
-                depth: 1.0,
-                stencil: 0,
-            },
-        },
-    ];
+/// Phase 6 — `upload_frame_data` (§5.1's uploads row, §5.4's phase):
+/// the mapped per-slot writes this slot's fence wait now owns — the
+/// region/foreground layers, the overlay vertices, and the proxy
+/// instance/pose/indirect blocks. Returns the world batch's drawn
+/// count (the record phase's foreground first-instance offset).
+fn upload_frame_data(
+    ctx: &VulkanContext,
+    pipes: &PipelineState,
+    frames: &mut FrameState,
+    frame: &InternalFrame<'_>,
+    outcome: &mut FrameOutcome,
+    slot: usize,
+) -> Result<u32, RendererError> {
+    let inputs = &frame.inputs;
+    let region_vertices = inputs.region_vertices;
+    let foreground = inputs.foreground;
+    let foreground_vertices = foreground.map_or(&[][..], |layer| layer.vertices);
+    let hud = inputs.hud;
+    let debug_overlay = inputs.debug_overlay;
+    let proxy = inputs.proxy.as_ref();
     // Both scene layers fit in the existing mapped slot. Copy directly from
     // their retained application buffers without concatenating CPU geometry.
     let mut world_drawn = 0;
@@ -632,7 +852,7 @@ pub(crate) fn render_frame(
     // The overlay upload's gate is the plan's overlay bit (the
     // frame's explicit declaration — the same emptiness check the
     // plan derived once at the top).
-    if plan.uses.overlay {
+    if frame.plan.uses.overlay {
         (outcome.overlay, _) = unsafe {
             upload_layers(
                 overlay.mapped,
@@ -687,6 +907,70 @@ pub(crate) fn render_frame(
             );
         }
     }
+    Ok(world_drawn)
+}
+
+/// Phase 7 — `record` (§4.2(2), the cascade): the pass recording
+/// into this slot's command buffer, in the fixed order the module
+/// manifest documents — shadow depth → wet mirrored-scene (+barrier)
+/// → the scene pass (the post chain's HDR passes or the main pass
+/// with the corner scene recorder / region layers) → the shadow
+/// readback → timestamps → the capture readback. The per-family
+/// record functions (`record_depth_pass`, `record_reflection_pass`,
+/// `post_state.record`, `record_corner_scene`) were already
+/// extracted (finding 20 Phase B / S2-S4); this phase is the WIRING
+/// the design's §5.4 named — the ladder that sequences them and owns
+/// the pass-variant branch (the plan's `post` bit) and the overlay
+/// draw. `ctx`, `pipes`, and `swapchain` are immutable here: the
+/// cascade records through the states; only the frame state's
+/// readback handshake bits mutate.
+#[allow(clippy::too_many_arguments)]
+fn record_command_buffer(
+    ctx: &VulkanContext,
+    swapchain: &SwapchainState,
+    pipes: &PipelineState,
+    frames: &mut FrameState,
+    frame: &InternalFrame<'_>,
+    proxy_sets: Option<[vk::DescriptorSet; 3]>,
+    slot: usize,
+    image_index: u32,
+    world_drawn: u32,
+    outcome: &mut FrameOutcome,
+) -> Result<(), RendererError> {
+    let frame_inputs = &frame.inputs;
+    let plan = &frame.plan;
+    let corner_params = frame_inputs.corner_params.as_ref();
+    let proxy = frame_inputs.proxy.as_ref();
+    let shadowed = frame_inputs.shadowed.as_ref();
+    let sky = frame_inputs.sky.as_ref();
+    let wet = frame_inputs.wet.as_ref();
+    let view_proj = &frame_inputs.view_proj;
+    let foreground = frame_inputs.foreground;
+
+    // Record.
+    let command = frames.command_buffers[slot];
+    let framebuffer = swapchain.framebuffers[image_index as usize];
+    let extent = swapchain.extent;
+    // The clear color (hoisted: the Era-1 post chain's HDR scene
+    // pass clears the SAME color the main pass would — the value
+    // is identical, only the attachment's format differs).
+    let clear_color = corner_params.map_or_else(
+        || shadowed.map_or([0.02, 0.02, 0.04, 1.0], |params| params.clear_color()),
+        corner::FrameParams::clear_color,
+    );
+    let clear_values = [
+        vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: clear_color,
+            },
+        },
+        vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
+            },
+        },
+    ];
 
     // Disjoint window-depth intervals allow self-occlusion in both layers
     // using one depth attachment, without a clear, barrier or extra pass.
@@ -711,10 +995,6 @@ pub(crate) fn render_frame(
         extent,
         offset: vk::Offset2D { x: 0, y: 0 },
     };
-
-    // The present-wait semaphore is owned by the acquired image
-    // (corrective finding C).
-    let present_semaphore = frames.present_semaphore_for(ctx, image_index)?;
 
     // The targets were ensured pre-acquire — finding 3's stranded-frame
     // corrective. This comment marks the original call sites (removed).
@@ -1178,28 +1458,55 @@ pub(crate) fn render_frame(
         ctx.device
             .end_command_buffer(command)
             .map_err(|error| RendererError::vk(error, "end_command_buffer"))?;
+    }
+    Ok(())
+}
 
-        // Submit: wait for the acquire semaphore, signal the image's
-        // present-wait semaphore (corrective finding C) and the slot
-        // fence.
-        let wait_stage = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-        let wait_semaphores = [frames.image_available[slot]];
-        let signal_semaphores = [present_semaphore];
-        let commands = [command];
-        let submit_info = vk::SubmitInfo::default()
-            .wait_semaphores(&wait_semaphores)
-            .wait_dst_stage_mask(&wait_stage)
-            .command_buffers(&commands)
-            .signal_semaphores(&signal_semaphores);
+/// Phase 8 — `submit` (§5.4): queue the recorded buffer — waiting
+/// the acquire semaphore, signaling the image's present-wait
+/// semaphore (corrective finding C) and the slot fence.
+fn submit_command_buffer(
+    ctx: &VulkanContext,
+    frames: &mut FrameState,
+    present_semaphore: vk::Semaphore,
+    slot: usize,
+) -> Result<(), RendererError> {
+    let command = frames.command_buffers[slot];
+    let wait_stage = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+    let wait_semaphores = [frames.image_available[slot]];
+    let signal_semaphores = [present_semaphore];
+    let commands = [command];
+    let submit_info = vk::SubmitInfo::default()
+        .wait_semaphores(&wait_semaphores)
+        .wait_dst_stage_mask(&wait_stage)
+        .command_buffers(&commands)
+        .signal_semaphores(&signal_semaphores);
+    unsafe {
         ctx.device
             .queue_submit(ctx.graphics_queue, &[submit_info], frames.in_flight[slot])
             .map_err(|error| RendererError::vk(error, "queue_submit"))?;
-        if frames.timestamps_supported {
-            frames.timestamps_written[slot] = true;
-        }
     }
+    if frames.timestamps_supported {
+        frames.timestamps_written[slot] = true;
+    }
+    Ok(())
+}
 
-    // Present.
+/// Phase 9 — `present` (§5.4): hand the acquired image to the
+/// presentation engine, waiting the image's present semaphore. An
+/// out-of-date present is DEFERRED, not inline (the batch-3 review's
+/// lifecycle finding: every recreation entry point honors surface
+/// availability) — the presentation is gone; the recreation intent
+/// and the deferral hint latch, and this frame's submission fence
+/// still signals normally.
+fn present_image(
+    ctx: &VulkanContext,
+    swapchain: &SwapchainState,
+    frames: &mut FrameState,
+    image_index: u32,
+    present_semaphore: vk::Semaphore,
+    outcome: &mut FrameOutcome,
+) -> Result<(), RendererError> {
     let present_wait_semaphores = [present_semaphore];
     let present_swapchains = [swapchain.swapchain];
     let present_image_indices = [image_index];
@@ -1232,12 +1539,7 @@ pub(crate) fn render_frame(
         }
         Err(error) => return Err(RendererError::vk(error, "queue_present")),
     }
-
-    outcome.gpu_render_ms = gpu_render_ms;
-    outcome.indirect_draws_issued =
-        (ctx.indirect_draws_issued.get() - indirect_issued_before) as u32;
-    frames.frame_slot = (slot + 1) % FRAMES_IN_FLIGHT as usize;
-    Ok(outcome)
+    Ok(())
 }
 
 fn mut_at<T>(slice: &mut [T], index: usize) -> Option<&mut T> {
@@ -1287,6 +1589,24 @@ pub(crate) fn present_semaphore_len_for(current_len: usize, required: usize) -> 
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+
+    /// THE A04 ZERO-COST STATEMENT (design §3.4, the type-level
+    /// half): the collapsed parameter set is plain stack data —
+    /// [`FramePolicy`] and [`InternalFrame`] are `Copy` borrow
+    /// bundles (no `Vec`, no `Box`, no trait objects), so the 19→6
+    /// collapse introduced no per-frame heap allocation and no
+    /// clone. The behavioral half of the proof is the batteries'
+    /// identical `FrameOutcome`s and allocation counters (S1's
+    /// byte-equality gates and the allocation-constancy tuples,
+    /// which run unchanged against the collapsed flow).
+    #[test]
+    fn the_collapsed_frame_parameters_are_copy_stack_data() {
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<FramePolicy>();
+        assert_copy::<InternalFrame<'static>>();
+        assert_copy::<FramePlan>();
+        assert_copy::<FrameOutcome>();
+    }
 
     #[test]
     fn timestamp_gate_requires_support_and_a_resolved_sample() {

@@ -21,8 +21,12 @@
 //! because they could drift).
 //!
 //! This module is that declaration. [`FramePlan::derive`] is called
-//! ONCE per frame at the top of `vulkan::render_frame` — the single
-//! derivation — and the three preparation sites plus the record
+//! ONCE per frame, at the [`InternalFrame`](crate::vulkan::frame::
+//! InternalFrame) construction that precedes `vulkan::render_frame`
+//! (A04 moved the call from the top of `render_frame`'s body to the
+//! entry bundle's constructor — the same single derivation, the same
+//! point relative to the flow: before any synchronization state is
+//! touched) — and the three preparation sites plus the record
 //! cascade's pass-variant decisions consume the resulting
 //! [`FramePlan`] instead of re-deriving. It is a thin coordinator,
 //! exactly the design's §4.1 negative justification made positive:
@@ -150,8 +154,9 @@ pub(crate) struct FramePlan {
 
 impl FramePlan {
     /// Derives the frame plan from the frame flow's input set — THE
-    /// ONE DERIVATION (P4 D2 §4.2, stage S3). Called once at the top
-    /// of `vulkan::render_frame`, on the same flat facts every route
+    /// ONE DERIVATION (P4 D2 §4.2, stage S3; since A04 it lives at
+    /// the `InternalFrame` construction that precedes
+    /// `vulkan::render_frame`), on the same flat facts every route
     /// (the per-feature entries and the `submit_frame` adapter)
     /// already hands the frame flow: the layer batches, the
     /// population/shadowed/sky/post/wet `Option`s. Each field's
@@ -537,10 +542,12 @@ mod tests {
 
     /// The production derivation path, factored over the test's
     /// configurations: the submission validates and maps through the
-    /// S1 adapter onto the frame flow's input set, then the plan
-    /// derives from that set exactly as `vulkan::render_frame` does
-    /// (the same `FramePlan::derive` call, the same
-    /// `foreground_vertices` computation the frame flow performs).
+    /// S1 adapter onto the frame flow's input set, then the frame
+    /// bundle's own constructor derives the plan — the exact
+    /// production path `Renderer::submit_frame` performs
+    /// (`InternalFrame::new`: the same `FramePlan::derive` call and
+    /// the same `foreground_vertices` computation the frame flow
+    /// performed inline before A04).
     fn derive_plan(policy: SubmissionPolicy, submission: &FrameSubmission<'_>) -> FramePlan {
         let mut instance_bytes = Vec::new();
         let mut pose_bytes = Vec::new();
@@ -553,17 +560,6 @@ mod tests {
             &mut pose_bytes,
         )
         .expect("the test submissions validate");
-        let foreground_vertices = inputs.foreground.map_or(&[][..], |layer| layer.vertices);
-        FramePlan::derive(
-            inputs.region_vertices,
-            foreground_vertices,
-            inputs.hud,
-            inputs.debug_overlay,
-            inputs.proxy.as_ref(),
-            inputs.shadowed.as_ref(),
-            inputs.sky.as_ref(),
-            inputs.post,
-            inputs.wet.as_ref(),
-        )
+        crate::vulkan::frame::InternalFrame::new(inputs).plan
     }
 }

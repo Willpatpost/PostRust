@@ -161,7 +161,7 @@ pub(crate) use capture::{
     request_shadow_readback, take_capture, take_shadow_readback,
 };
 pub(crate) use context::{VulkanContext, device_idle, pick_depth_format, pick_surface_format};
-pub(crate) use frame::{FrameOutcome, FrameState, render_frame};
+pub(crate) use frame::{FrameOutcome, FramePolicy, FrameState, InternalFrame, render_frame};
 pub(crate) use pipelines::PipelineState;
 pub(crate) use swapchain::{
     SurfaceProbeDecision, SwapchainState, consume_recreate, mark_suboptimal, surface_probe_decision,
