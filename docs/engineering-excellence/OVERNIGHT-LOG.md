@@ -164,3 +164,22 @@ to measure the pin movements (renderer-release 232→211, main result lines +2
 expected); pins will be corrected ONLY from its measured actuals. E-S2 (slice
 rewire to `engine_animation::`), E-S3 (shim deletion decision), E-S4 (B15
 re-measure) queued.
+
+## T04 — the complete-primitive admission landed (`1e998d4`)
+
+The lane (`ee/overnight-t04-primitives`, red witness `482d469` + fix `15c5307` +
+re-pin `9c304cb`) delivered the D-EE-10 §1E owner contract for dynamic geometry:
+whole-triangle admission units (no semantic boundaries inferred from vertex
+counts), the triangle-floor draw bound (`capacity − capacity mod 3`), malformed-tail
+rejection with largest-complete-prefix admission, `admit_layers` as the one pure
+admission plan before any upload byte moves, per-layer `LayerShare` records, the
+deterministic foreground-then-world complete-unit partition, and the typed
+unit+vertex reporting with the exact decomposition. The red witness recorded the
+audit's defect verbatim (six failing assertions at the pre-fix tree). The
+render_overflow smoke's execution is environment-blocked locally (no Vulkan
+loader — evidenced; CI-Linux mesa remains the authority); its new pins derive
+from the pinned pure function. CI pins corrected from measured actuals at
+`a03f6fb` (main lines 36 both platforms — CI-measured by run `46129087795`;
+renderer-release 215 — measured on the combined tree; main passed 1633/1582 —
+lane-measured +4 with candidate confirmation). The confirming run `46129831117`
+dispatched at `a03f6fb`.
