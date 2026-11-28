@@ -55,6 +55,9 @@ sources (`.wgsl`/`.glsl`).
 `cargo metadata --no-deps`: 5 workspace members, DAG
 core → {persist? no} (actual dependency edges to be mapped by P0 auditors:
 slice depends on all; renderer/shell/persist on core per manifests).
+*(Superseded for current-tree dependency data by E-11's B15 closure matrix —
+core 0 external, persist 19, renderer 15, shell 5, slice 35 unique normal
+deps; the manifest edges above verified current at `1d4ecc9`.)*
 
 ## E-3 Model fleet (2026-11-26; labels corrected 2026-11-27 per the audit's IA-14)
 
@@ -489,6 +492,10 @@ lock untouched, dependency closure shape unchanged.
 
 ## Measurement baselines
 
-(To be established in P0: first full build of the integration tree, then the
-workload matrix per charter §8.2. Rig GPU numbers remain the owner's;
-lavapipe = correctness only. No invented metrics.)
+Established: E-8 is the baseline battery (2026-11-26, tree `263532f` — the
+"before" numbers the P2/P3/P5 packages are judged against, with the B10/B11
+methodology corrections at E-8's tail), E-9 the owner's maximal-composition
+walk, E-12 the P5 R0 census rows. The workload matrix continues per charter
+§8.2 (the E-8 extension rows named in the P5 design; the maximal-composition
+frame curves re-run after every P5 lane). Rig GPU numbers remain the owner's;
+lavapipe = correctness only. No invented metrics.
