@@ -18,6 +18,14 @@
 //! SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_overflow -- \
 //!     --ignored --nocapture
 //! ```
+//!
+//! T04 (strict-audit-IV, D-EE-10 §1E) re-pinned this smoke to the
+//! complete-primitive admission contract: the region's 36,800 cap is
+//! NOT triangle-aligned (≡ 2 mod 3), so the oversize 37,800 supply
+//! now admits the 36,798 floor and omits 1,002 per frame — 334 whole
+//! triangles, never a partial primitive (the pre-T04 pins of
+//! 1,000/2,000 drew two vertices into the 12,267th triangle). The
+//! overlay boundary (300,000) IS aligned, so its pins are unchanged.
 
 use engine_renderer::scene::{SceneVertex, push_box};
 use engine_renderer::{
@@ -39,11 +47,16 @@ const IDENTITY_VIEW_PROJ: [[f32; 4]; 4] = [
 ];
 
 /// The oversize region scene: 1,050 `push_box` boxes × 36 verts =
-/// 37,800 supplied vs the 36,800 per-slot capacity → exactly 1,000
-/// omitted per frame. The mod-36 derivation is auditable (the P1
-/// challenge F-1): `push_box` emits 36 verts per call and 36,800 ≡ 8
-/// (mod 36), so every box-built supply omits ≡ 28 (mod 36) — 1,050
-/// boxes is the round 37,800 that omits the round 1,000.
+/// 37,800 supplied vs the 36,800 per-slot capacity. T04's
+/// complete-primitive admission: the capacity's TRIANGLE FLOOR is
+/// 36,800 − 36,800 mod 3 = 36,798 (36,800 ≡ 2 mod 3), so the
+/// well-formed 37,800 supply (12,600 triangles) admits 36,798
+/// (12,266 triangles) and omits exactly 1,002 per frame — 334
+/// complete triangles, never a partial primitive. The pre-T04 clamp
+/// omitted 1,000, drawing 36,800 — two vertices INTO the 12,267th
+/// triangle (the mid-primitive cut this smoke now refuses); the
+/// mod-36 note stands as the audit trail: `push_box` emits 36
+/// verts/call and 36,800 ≡ 8 (mod 36).
 fn oversize_region_scene() -> Vec<SceneVertex> {
     let mut vertices = Vec::new();
     for index in 0..1_050_u32 {
@@ -94,8 +107,9 @@ fn oversized_region_and_overlay_report_exact_truncation() {
         // for checkability — the region budget IS this smoke's
         // 36,800-per-slot boundary (the closed form's per-slot
         // share, now the configured cap the demand-sized carve grows
-        // toward; the oversize 37,800 supply still truncates exactly
-        // 1,000, the pin below).
+        // toward; the oversize 37,800 supply admits the cap's
+        // triangle floor 36,798 and omits exactly 1,002, the pins
+        // below — T04's complete-primitive contract).
         instance_capacity: InstanceCapacity::default(),
         pose_capacity: PoseCapacity::default(),
         region_capacity: RegionCapacity::default(),
@@ -150,20 +164,29 @@ fn oversized_region_and_overlay_report_exact_truncation() {
          (lazy buffer unallocated) overlay_truncated=0"
     );
 
-    // Frame 2: the oversize region — exactly 1,000 omitted after ONE
-    // frame. The double-count guard: one physical truncation must read
-    // 1,000, NOT 2,000 (the two historical min() clamps now consume
-    // one decision).
+    // Frame 2: the oversize region — exactly 1,002 omitted after ONE
+    // frame (334 complete triangles refused at the 36,798 floor —
+    // T04: the omission itself is whole-triangle; the pre-T04
+    // behavior omitted 1,000 and drew two vertices into the next
+    // triangle). The double-count guard: one physical truncation must
+    // read 1,002, NOT 2,004 (the two historical min() clamps now
+    // consume one decision).
     let oversize = oversize_region_scene();
     frame(&mut renderer, &oversize, &[], Some(short_text));
     let stats = renderer.stats();
-    assert_eq!(stats.region_truncated_vertices, 1_000);
+    assert_eq!(stats.region_truncated_vertices, 1_002);
+    assert_eq!(
+        stats.region_truncated_vertices % 3,
+        0,
+        "T04: a well-formed supply's omission is whole-triangle"
+    );
     assert_eq!(stats.region_supplied_peak_vertices, 37_800);
     assert_eq!(stats.region_capacity_vertices, 36_800);
     assert_eq!(stats.overlay_truncated_vertices, 0, "overlay untouched");
     println!(
         "[overflow-smoke] stage 2 region oversize (ONE frame): \
-         region_truncated={} (double-count guard: exactly 1000, not 2000) \
+         region_truncated={} (double-count guard: exactly 1002, not 2004; \
+         whole-triangle omission at the 36798 floor) \
          region_peak={} region_capacity={} overlay_truncated=0",
         stats.region_truncated_vertices,
         stats.region_supplied_peak_vertices,
@@ -174,7 +197,7 @@ fn oversized_region_and_overlay_report_exact_truncation() {
     // counters accumulate per recorded frame.
     frame(&mut renderer, &oversize, &[], Some(short_text));
     let stats = renderer.stats();
-    assert_eq!(stats.region_truncated_vertices, 2_000);
+    assert_eq!(stats.region_truncated_vertices, 2_004);
     println!(
         "[overflow-smoke] stage 3 second oversize frame (second slot): \
          region_truncated={} (per-frame accumulation)",
@@ -184,7 +207,11 @@ fn oversized_region_and_overlay_report_exact_truncation() {
     // Frame 4: 48,000 solid rectangles (288,000 vertices), 4,000 HUD
     // glyphs (24,000) and 4,000 diagnostic glyphs (24,000). The HUD
     // fills the slot first, truncating 12,000 HUD + 24,000 diagnostic
-    // vertices. Keep the original 336,000 / 300,000 / 36,000 pins.
+    // vertices. The overlay pins are UNCHANGED under T04's
+    // complete-primitive admission: the 300,000 overlay capacity is
+    // triangle-aligned (300,000 ≡ 0 mod 3), so its floor equals the
+    // capacity and the admitted counts were already whole-triangle.
+    // Keep the original 336,000 / 300,000 / 36,000 pins.
     let big_text = "A".repeat(4_000);
     let mut hud = Vec::with_capacity(312_000);
     for _ in 0..48_000 {
@@ -206,7 +233,7 @@ fn oversized_region_and_overlay_report_exact_truncation() {
     assert_eq!(stats.overlay_supplied_peak_vertices, 336_000);
     assert_eq!(stats.overlay_capacity_vertices, 300_000);
     assert_eq!(
-        stats.region_truncated_vertices, 2_000,
+        stats.region_truncated_vertices, 2_004,
         "region untouched (cross-contamination guard)"
     );
     println!(
@@ -223,7 +250,7 @@ fn oversized_region_and_overlay_report_exact_truncation() {
     // not move (in-capacity geometry is never counted).
     frame(&mut renderer, &in_capacity, &[], Some(short_text));
     let stats = renderer.stats();
-    assert_eq!(stats.region_truncated_vertices, 2_000);
+    assert_eq!(stats.region_truncated_vertices, 2_004);
     assert_eq!(stats.overlay_truncated_vertices, 36_000);
     println!(
         "[overflow-smoke] stage 5 in-capacity control: counters unchanged \
@@ -236,7 +263,7 @@ fn oversized_region_and_overlay_report_exact_truncation() {
     let report = TruncationReport::from_stats(renderer.stats());
     let lines = truncation_report_lines(&report);
     assert!(lines.contains(
-        &"REGION TRUNCATION: 2000 vertices omitted (peak 37800 / capacity 36800)".to_string()
+        &"REGION TRUNCATION: 2004 vertices omitted (peak 37800 / capacity 36800)".to_string()
     ));
     assert!(lines.contains(
         &"OVERLAY TRUNCATION: 36000 vertices omitted (peak 336000 / capacity 300000)".to_string()

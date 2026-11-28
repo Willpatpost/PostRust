@@ -410,44 +410,121 @@ pub(crate) fn present_mode_str(mode: vk::PresentModeKHR) -> &'static str {
     }
 }
 
-/// The single capacity decision for one dynamic-geometry upload+draw
-/// pair (F-03 Step 1, fail-visible over fail-silent): what the frame
-/// supplied, the frame slot's vertex capacity, the vertex count
-/// actually copied and drawn, and the count omitted.
+/// The single admission decision for one dynamic-geometry upload+draw
+/// pair (F-03 Step 1, fail-visible over fail-silent; T04/D-EE-10 §1E,
+/// complete-primitive admission): what the frame supplied (requested
+/// vertices), the frame slot's vertex capacity, the vertex count
+/// actually copied and drawn (admitted), the count omitted, and —
+/// since T04 — the SAME facts counted in admission UNITS (whole
+/// triangles), the incomplete-triangle tail a malformed supply
+/// carried, the triangle floor the capacity admits to, and the typed
+/// omission reason.
 ///
-/// Computed ONCE per frame per buffer at the record step — both the
-/// upload byte bound (`drawn` × vertex size) and the draw count consume
-/// `drawn`, so one physical truncation is counted exactly once (never
-/// once per historical clamp site) and the copy can never disagree
-/// with the draw: no out-of-bounds copy, no inflated draw count. The
-/// omitted count is reported upstream, never fatal — the
-/// capacity/refusal policy is Step 2, separately authorized.
+/// Computed ONCE per frame per buffer before the upload — both the
+/// upload byte bound (`drawn` × vertex size) and the draw count
+/// consume `drawn`, so one physical truncation is counted exactly
+/// once (never once per historical clamp site) and the copy can
+/// never disagree with the draw: no out-of-bounds copy, no inflated
+/// draw count. The omitted count is reported upstream, never fatal —
+/// the capacity/refusal policy is Step 2, separately authorized.
+///
+/// **The complete-primitive contract (T04):** the admission unit is
+/// the WHOLE TRIANGLE — the smallest unit a flat triangle-list slice
+/// can name. `drawn` is always a multiple of 3 (the pre-T04 clamp
+/// could cut a 36-vertex proxy box mid-primitive: a supply of 36,801
+/// against the 36,800 region cap drew 36,800, two vertices into the
+/// 12,267th triangle). Two invariants follow:
+///
+/// - the capacity bound is the TRIANGLE FLOOR `capacity − capacity
+///   mod 3` (a 64-vertex capacity admits 63, never 64), and the
+///   two-layer partition in `vulkan::uploads` lands the residual
+///   layer's admission boundary between triangles;
+/// - a malformed length (not a multiple of 3 — an authored triangle
+///   list cannot end mid-primitive) is REJECTED at its tail: the
+///   largest complete-triangle prefix is admitted, the incomplete
+///   remainder is omitted and counted in `malformed_tail`, never
+///   drawn.
+///
+/// Semantic boundaries (a 36-vertex box, an authored mesh group) are
+/// NOT inferred from vertex counts — a flat slice carries no such
+/// metadata; callers needing whole-object admission must author
+/// whole-object batches (each an exact multiple of their unit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct DynamicClamp {
-    /// Vertices the caller supplied this frame.
+    /// Vertices the caller supplied this frame (requested).
     pub supplied: u32,
-    /// The frame slot's vertex capacity.
+    /// The frame slot's raw vertex capacity (the carve's, pre-floor).
     pub capacity: u32,
-    /// Vertices actually copied and drawn (`<= capacity` and
-    /// `<= supplied`).
+    /// Vertices actually copied and drawn (admitted; `<= capacity`,
+    /// `<= supplied`, and always a whole number of triangles).
     pub drawn: u32,
-    /// Vertices omitted (`supplied − drawn`; 0 in capacity). Raw
-    /// vertex counts — an overflow can cut a 36-vertex proxy box
-    /// mid-primitive, and the count says so.
+    /// Vertices omitted (`supplied − drawn`; 0 in capacity) — the
+    /// capacity cut plus any malformed tail. Raw vertex counts,
+    /// reported typed and loud, never silently dropped.
     pub truncated: u32,
+    /// Complete triangles requested (`(supplied − malformed_tail) / 3`
+    /// — the well-formed prefix of the supply).
+    pub requested_units: u32,
+    /// Complete triangles admitted (`drawn / 3`).
+    pub admitted_units: u32,
+    /// Complete triangles omitted (`requested_units − admitted_units`).
+    pub omitted_units: u32,
+    /// The incomplete-triangle vertices a malformed supply carried —
+    /// rejected whole, never admitted, counted here.
+    pub malformed_tail: u32,
+    /// The capacity's triangle floor (`capacity − capacity mod 3`) —
+    /// the largest whole-triangle count the slot admits.
+    pub capacity_floor: u32,
+    /// Why vertices were omitted (typed, never a silent zero).
+    pub reason: AdmissionReason,
+}
+
+/// The typed omission reason accompanying [`DynamicClamp`]: nothing
+/// omitted (the exact fast path), the triangle floor refused supply,
+/// a malformed tail was rejected, or both in one frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AdmissionReason {
+    /// Everything requested was admitted (zero omission).
+    #[default]
+    Fits,
+    /// The triangle floor refused complete triangles (the capacity
+    /// cut — the Step-2 growth/refusal policy's input).
+    Capacity,
+    /// A malformed tail (a length not a multiple of 3) was rejected.
+    MalformedTail,
+    /// Both a capacity cut and a malformed tail in one decision.
+    CapacityAndMalformedTail,
 }
 
 /// The decision is pure and central: `supplied` arrives as the
 /// caller's slice length and converts saturating, so a supply beyond
 /// `u32::MAX` (unreachable at 24 B/vertex) degrades instead of
-/// wrapping — the bound is structural rather than memory luck.
+/// wrapping — the bound is structural rather than memory luck. The
+/// admission arithmetic is the complete-primitive contract above:
+/// the triangle floor bounds the draw, the malformed tail is refused
+/// whole, and every omitted vertex is counted with its typed reason.
 pub(crate) fn dynamic_geometry_clamp(supplied: usize, capacity: u32) -> DynamicClamp {
     let supplied = supplied.min(u32::MAX as usize) as u32;
+    let capacity_floor = capacity - capacity % 3;
+    let malformed_tail = supplied % 3;
+    let complete = supplied - malformed_tail;
+    let drawn = complete.min(capacity_floor);
     DynamicClamp {
         supplied,
         capacity,
-        drawn: supplied.min(capacity),
-        truncated: supplied.saturating_sub(capacity),
+        drawn,
+        truncated: supplied - drawn,
+        requested_units: complete / 3,
+        admitted_units: drawn / 3,
+        omitted_units: (complete - drawn) / 3,
+        malformed_tail,
+        capacity_floor,
+        reason: match (complete > capacity_floor, malformed_tail > 0) {
+            (true, true) => AdmissionReason::CapacityAndMalformedTail,
+            (true, false) => AdmissionReason::Capacity,
+            (false, true) => AdmissionReason::MalformedTail,
+            (false, false) => AdmissionReason::Fits,
+        },
     }
 }
 
@@ -715,45 +792,90 @@ mod tests {
     }
 
     #[test]
-    fn clamp_decision_in_capacity_supplies_every_vertex() {
-        // In-capacity geometry is copied and drawn whole — the decision
-        // reproduces today's min() values exactly.
+    fn clamp_decision_in_capacity_supplies_every_whole_triangle() {
+        // T04 (D-EE-10 §1E): in-capacity WELL-FORMED geometry (a whole
+        // number of triangles) is copied and drawn whole — the exact
+        // fast path, byte-identical to the pre-contract min() values.
         for (supplied, capacity) in [
             (0_usize, 36_800_u32),
-            (1, 36_800),
+            (3, 36_800),
             (36_288, 36_800),
-            (299_999, 300_000),
+            (299_997, 300_000),
         ] {
             let clamp = dynamic_geometry_clamp(supplied, capacity);
             assert_eq!(clamp.drawn, supplied as u32, "everything fits");
+            assert_eq!(clamp.drawn % 3, 0, "admission is whole-triangle");
             assert_eq!(clamp.truncated, 0, "nothing omitted");
             assert_eq!(clamp.capacity, capacity);
+        }
+        // A MALFORMED in-capacity supply (a length that is not a
+        // multiple of 3 — an authored triangle list cannot end
+        // mid-primitive) is refused at its incomplete tail: the
+        // complete-triangle prefix is admitted, the tail vertices are
+        // omitted and counted, never drawn. The pre-T04 clamp drew
+        // them (a 1-vertex "triangle" rasterized as a degenerate) —
+        // the admission contract's malformed rejection.
+        for (supplied, capacity, drawn, omitted) in [
+            (1_usize, 36_800_u32, 0_u32, 1_u32),
+            (2, 36_800, 0, 2),
+            (299_999, 300_000, 299_997, 2),
+            (36_802, 36_800, 36_798, 4),
+        ] {
+            let clamp = dynamic_geometry_clamp(supplied, capacity);
+            assert_eq!(
+                clamp.drawn, drawn,
+                "the incomplete tail is never admitted (supply {supplied})"
+            );
+            assert_eq!(clamp.drawn % 3, 0, "admission is whole-triangle");
+            assert_eq!(clamp.truncated, omitted, "the tail is omitted and counted");
         }
     }
 
     #[test]
-    fn clamp_decision_at_capacity_boundary_omits_nothing() {
-        let clamp = dynamic_geometry_clamp(36_800, 36_800);
-        assert_eq!(clamp.drawn, 36_800);
-        assert_eq!(clamp.truncated, 0);
+    fn clamp_decision_at_capacity_boundary_admits_the_triangle_floor() {
+        // A triangle-aligned boundary admits everything (the exact
+        // fast path). The region's own cap 36_800 ≡ 2 (mod 3) is NOT
+        // aligned: the last admission seat is the triangle floor
+        // 36_798 — the pre-T04 clamp drew all 36_800, splitting the
+        // 12,267th triangle two vertices in.
+        let aligned = dynamic_geometry_clamp(300_000, 300_000);
+        assert_eq!(aligned.drawn, 300_000);
+        assert_eq!(aligned.truncated, 0);
+        let region_cap = dynamic_geometry_clamp(36_800, 36_800);
+        assert_eq!(
+            region_cap.drawn, 36_798,
+            "the floor is capacity − capacity mod 3"
+        );
+        assert_eq!(region_cap.drawn % 3, 0);
+        assert_eq!(
+            region_cap.truncated, 2,
+            "the non-aligned remainder is omitted"
+        );
     }
 
     #[test]
-    fn clamp_decision_oversize_omits_exact_delta() {
-        // The capacity-decision logic with oversized synthetic input —
-        // exact deltas, including the smoke's mod-36 derivation
-        // (push_box emits 36 verts/call; the region capacity 36,800 is
-        // ≡ 8 mod 36, so a 1,050-box supply of 37,800 omits exactly
-        // 1,000) and the overlay case (2,000 'A' glyphs × 168 verts =
-        // 336,000 vs 300,000 → 36,000).
-        for (supplied, capacity, omitted) in [
-            (36_801_usize, 36_800_u32, 1_u32),
-            (36_836, 36_800, 36),
-            (37_800, 36_800, 1_000),
-            (336_000, 300_000, 36_000),
+    fn clamp_decision_oversize_omits_whole_triangles_only() {
+        // The capacity decision with oversized synthetic input under
+        // the complete-primitive contract: the omitted delta is
+        // measured from the TRIANGLE FLOOR, never from the raw
+        // capacity. The mod-36 derivation (push_box emits 36
+        // verts/call; the region capacity 36,800 ≡ 8 mod 36): a
+        // 1,050-box supply of 37,800 omits 1,002 — the pre-T04 1,000
+        // cut the last admitted box mid-triangle. The overlay case
+        // (336,000 vs the aligned 300,000) is unchanged at 36,000.
+        for (supplied, capacity, drawn, omitted) in [
+            (36_801_usize, 36_800_u32, 36_798_u32, 3_u32),
+            (36_836, 36_800, 36_798, 38),
+            (37_800, 36_800, 36_798, 1_002),
+            (336_000, 300_000, 300_000, 36_000),
         ] {
             let clamp = dynamic_geometry_clamp(supplied, capacity);
-            assert_eq!(clamp.drawn, capacity, "the draw never exceeds capacity");
+            assert_eq!(clamp.drawn, drawn, "the triangle floor is the draw bound");
+            assert_eq!(
+                clamp.drawn % 3,
+                0,
+                "the draw is a whole number of triangles"
+            );
             assert_eq!(clamp.truncated, omitted, "the exact omitted delta");
             assert_eq!(
                 clamp.supplied,
@@ -765,10 +887,134 @@ mod tests {
             );
         }
         // A supply beyond u32::MAX (unreachable at 24 B/vertex)
-        // saturates instead of wrapping.
+        // saturates instead of wrapping — and still admits only the
+        // floor.
         let huge = dynamic_geometry_clamp(usize::MAX, 36_800);
         assert_eq!(huge.supplied, u32::MAX);
-        assert_eq!(huge.drawn, 36_800);
+        assert_eq!(huge.drawn, 36_798);
+        assert_eq!(huge.drawn % 3, 0);
+    }
+
+    #[test]
+    fn clamp_admits_whole_triangles_at_nonmultiple_capacities() {
+        // T04's own capacity table: nonmultiple caps 1, 2, 4, 64, 65
+        // against a well-formed 300-vertex supply (100 triangles) and
+        // the audit's 36-vertex proxy-box shapes. The admission unit
+        // is the TRIANGLE (a flat triangle-list slice carries no
+        // object metadata — D-EE-10 §1E forbids inferring semantic
+        // boundaries from arbitrary vertex counts), so a cap below 3
+        // refuses the whole batch (nothing fits whole) and every
+        // larger cap admits its floor.
+        for (supplied, capacity, drawn) in [
+            (300_usize, 1_u32, 0_u32),
+            (300, 2, 0),
+            (300, 4, 3),
+            (300, 64, 63),
+            (300, 65, 63),
+            (36, 64, 36),
+            (72, 64, 63),
+            (72, 108, 72),
+        ] {
+            let clamp = dynamic_geometry_clamp(supplied, capacity);
+            assert_eq!(
+                clamp.drawn, drawn,
+                "supply {supplied} vs capacity {capacity}: whole-triangle admission"
+            );
+            assert_eq!(clamp.drawn % 3, 0, "never a partial primitive");
+            assert_eq!(
+                clamp.supplied,
+                clamp.drawn + clamp.truncated,
+                "the omission is counted, never silent"
+            );
+        }
+        // Two whole 36-vertex boxes against the audit's 64-vertex
+        // capacity: 63 vertices admit (21 complete triangles — box
+        // one whole, box two cut BETWEEN triangles at 27/36), 9 are
+        // omitted and reported. The pre-T04 clamp drew 64 — one
+        // vertex into box two's tenth triangle.
+        let two_boxes = dynamic_geometry_clamp(72, 64);
+        assert_eq!(two_boxes.drawn, 63);
+        assert_eq!(two_boxes.truncated, 9);
+    }
+
+    #[test]
+    fn clamp_reports_units_malformed_tail_floor_and_reason() {
+        // T04's reported-metrics shape: requested/admitted/omitted
+        // counted in VERTICES (the F-03 fields) AND in UNITS (whole
+        // triangles), the malformed tail counted separately from the
+        // capacity cut, and the typed reason naming which happened.
+        for (supplied, capacity, units, malformed_tail, floor, reason) in [
+            // The mid-primitive cut case, whole-triangle accounting:
+            // 36,801 = 12,267 triangles; the floor admits 12,266.
+            (
+                36_801_usize,
+                36_800_u32,
+                (12_267_u32, 12_266, 1),
+                0_u32,
+                36_798_u32,
+                AdmissionReason::Capacity,
+            ),
+            // Capacity cut AND a malformed tail in one decision.
+            (
+                36_836,
+                36_800,
+                (12_278, 12_266, 12),
+                2,
+                36_798,
+                AdmissionReason::CapacityAndMalformedTail,
+            ),
+            // The smoke's oversize region: 1,002 vertices = 334
+            // complete triangles omitted.
+            (
+                37_800,
+                36_800,
+                (12_600, 12_266, 334),
+                0,
+                36_798,
+                AdmissionReason::Capacity,
+            ),
+            // A malformed lone vertex: refused whole, no unit ever
+            // requested.
+            (
+                1,
+                36_800,
+                (0, 0, 0),
+                1,
+                36_798,
+                AdmissionReason::MalformedTail,
+            ),
+            // The exact fast path: everything admitted, reason Fits.
+            (
+                300_000,
+                300_000,
+                (100_000, 100_000, 0),
+                0,
+                300_000,
+                AdmissionReason::Fits,
+            ),
+            // A capacity below one triangle refuses the whole batch.
+            (300, 2, (100, 0, 100), 0, 0, AdmissionReason::Capacity),
+        ] {
+            let clamp = dynamic_geometry_clamp(supplied, capacity);
+            assert_eq!(
+                (
+                    clamp.requested_units,
+                    clamp.admitted_units,
+                    clamp.omitted_units
+                ),
+                units,
+                "supply {supplied} vs capacity {capacity}: the unit accounting"
+            );
+            assert_eq!(clamp.malformed_tail, malformed_tail);
+            assert_eq!(clamp.capacity_floor, floor);
+            assert_eq!(clamp.reason, reason);
+            assert_eq!(clamp.admitted_units * 3, clamp.drawn);
+            assert_eq!(
+                clamp.omitted_units * 3 + clamp.malformed_tail,
+                clamp.truncated,
+                "omitted vertices decompose into refused units + the tail"
+            );
+        }
     }
 
     #[test]
