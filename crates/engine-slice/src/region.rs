@@ -962,6 +962,22 @@ impl RegionDirector {
         // the director's own transition (the pipeline-free path, and
         // the orchestrated tick's live↔live reclassifies), timed
         // individually, never a tick aggregate, never fingerprinted.
+        //
+        // CA-08 CONSUMER SEAM (the production adoption): every
+        // director transition is a KNOWN region-keyed move — the
+        // class tag the spine treats as opaque is this lane's region
+        // identity — so the transitions below ride the spine's
+        // class-locality index (`suspend_class`/`resume_class`/
+        // `reclassify_class`/`held_class_view`), whose answers are
+        // bit-identical to the predicate forms (the engine-core
+        // equivalence battery) while touching only the region's own
+        // membership instead of sorting and scanning the entire
+        // queue. The six-phase crossing (crossing.rs) deliberately
+        // keeps `collect_matching` + `suspend_ids`: its read phase
+        // is a read-only preparation and its commit is ID-EXACT by
+        // the staged-commit protocol — the class-indexed forms serve
+        // the director's whole-region transitions, not the
+        // per-obligation staged plan.
         let transition_start = Instant::now();
         match (from, to) {
             (_, LodLevel::Dormant) => self.deactivate(spine, region, from, now),
@@ -972,7 +988,7 @@ impl RegionDirector {
             _ => {
                 let class = EventClass::new(region as u16);
                 let field = spine.world().config().lod_field(to);
-                spine.reclassify_matching(|view| view.class == class, field);
+                spine.reclassify_class(class, field);
                 spine.world_mut().set_region_lod(region, to);
                 self.states[region].level = to;
             }
@@ -1016,7 +1032,9 @@ impl RegionDirector {
     ) {
         let deactivation_start = Instant::now();
         let class = EventClass::new(region as u16);
-        spine.suspend_matching(|view| view.class == class);
+        // CA-08: the indexed suspend — the region's own membership
+        // moves, never a whole-queue sort+scan (see `transition`).
+        spine.suspend_class(class);
         spine.world_mut().set_region_lod(region, LodLevel::Dormant);
         // Gather the region's held references (the spine owns the
         // obligations) through the SHARED gathering — the same
@@ -1024,11 +1042,9 @@ impl RegionDirector {
         // performs from the collected views (Batch 4: identical
         // entries and captures, identical order — the helper's
         // ascending-seq normalization is a no-op on the held view).
-        let held: Vec<ObligationView<'_>> = spine
-            .held_view()
-            .into_iter()
-            .filter(|view| view.class == class)
-            .collect();
+        // CA-08: `held_class_view` is the indexed form of the held
+        // scan+filter — flat in the unrelated held population.
+        let held: Vec<ObligationView<'_>> = spine.held_class_view(class);
         let episode = self.states[region].episode + 1;
         let (entries, captures) = gather_region_entries(spine.world(), region, &held);
         // Capture BEFORE discard: every uncommitted consequential signal
@@ -1197,10 +1213,11 @@ impl RegionDirector {
         }
         // Phase 3 — resume with original identity, reclassify to the
         // activation's lane (the reservation protects the region
-        // immediately), and promote.
-        spine.resume_matching(|view| view.class == class);
+        // immediately), and promote. CA-08: both moves ride the
+        // class-locality index (see `transition`).
+        spine.resume_class(class);
         let field = spine.world().config().lod_field(to);
-        spine.reclassify_matching(|view| view.class == class, field);
+        spine.reclassify_class(class, field);
         spine.world_mut().set_region_lod(region, to);
         self.states[region] = RegionState {
             level: to,
