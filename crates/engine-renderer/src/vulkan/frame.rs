@@ -22,9 +22,15 @@
 //! **The §5.4 phases:** `render_frame` is now the phase ladder in
 //! call order — `validate_proxy_materials` → `prepare_frame` (the
 //! S4-extracted preparation pair) → `wait_slot_fence` →
-//! `acquire_with_retry` → `reset_and_timestamps` →
-//! `upload_frame_data` → `record_command_buffer` →
-//! `submit_command_buffer` → `present_image`. Each phase is a
+//! `acquire_with_retry` → `guard_image_and_read_timestamps` →
+//! `upload_frame_data` → `present_semaphore_for` →
+//! `record_command_buffer` → `commit_slot_fence` →
+//! `submit_command_buffer` → `present_image`, with phases 5-8
+//! grouped in [`acquire_to_submit`] and every error inside them
+//! routed through [`dispose_failed_acquisition`] (CA-10's
+//! acquisition disposition — the slot fence's reset is DEFERRED to
+//! the commit between record and submit, so no post-acquire failure
+//! can strand the slot). Each phase is a
 //! private function of this module — not a phase trait, not
 //! extensible at runtime; the ordering is the code. Where S3/S4 had
 //! already landed a piece of a phase (the preparation pair, the
@@ -255,6 +261,12 @@ impl FrameState {
         ctx: &VulkanContext,
         image_index: u32,
     ) -> Result<vk::Semaphore, RendererError> {
+        // CA-10 fault knob: the PRESENT-SEMAPHORE boundary (Phase
+        // 6.5, post-acquire) — a plan armed here fires before the
+        // creation, with the slot fence still signaled and nothing
+        // recorded (the fail-fast position this growth already
+        // holds).
+        ctx.check_lifecycle_fault(crate::LifecycleFaultSite::FramePresentSemaphore)?;
         self.sync_present_semaphores(ctx, image_index + 1)?;
         Ok(self.present_semaphores[image_index as usize])
     }
@@ -593,38 +605,39 @@ pub(crate) fn render_frame(
     outcome.suboptimal = suboptimal;
     frames.image_index = image_index;
 
-    // Phase 5 — reset_and_timestamps: the per-image guard, the slot
-    // fence reset, and the previous use's timestamp read.
-    let gpu_render_ms = reset_and_timestamps(ctx, frames, slot, image_index)?;
-
-    // Phase 6 — upload_frame_data: the mapped-slot writes this slot's
-    // fence wait now owns.
-    let world_drawn = upload_frame_data(ctx, pipes, frames, frame, &mut outcome, slot)?;
-
-    // The present-wait semaphore is owned by the acquired image
-    // (corrective finding C). Grown BEFORE recording begins (the
-    // fail-fast discipline: a creation failure must not leave a
-    // recorded-but-unsubmitted command buffer against a reset fence
-    // and an acquired image).
-    let present_semaphore = frames.present_semaphore_for(ctx, image_index)?;
-
-    // Phase 7 — record: the pass cascade into this slot's command
-    // buffer.
-    record_command_buffer(
+    // Phases 5-8 — `acquire_to_submit`: everything between the
+    // acquisition and the submission. CA-10 (the stranded slot): the
+    // slot fence's RESET and the per-image ownership PUBLISH are
+    // DEFERRED to the commit step between record and submit (see
+    // [`commit_slot_fence`]), so every fallible step below runs with
+    // the fence still carrying its previous signal — a failure at
+    // ANY of them cannot strand the slot. Any error inside gets the
+    // acquisition's disposition (the release in
+    // [`dispose_failed_acquisition`]) instead of propagating raw.
+    let submitted = acquire_to_submit(
         ctx,
         swapchain,
         pipes,
         frames,
         frame,
         proxy_sets,
+        &mut outcome,
         slot,
         image_index,
-        world_drawn,
-        &mut outcome,
-    )?;
-
-    // Phase 8 — submit.
-    submit_command_buffer(ctx, frames, present_semaphore, slot)?;
+    );
+    let (gpu_render_ms, _world_drawn, present_semaphore) = match submitted {
+        Ok(triple) => triple,
+        Err(error) => {
+            return Err(dispose_failed_acquisition(
+                ctx,
+                swapchain,
+                frames,
+                slot,
+                image_index,
+                error,
+            ));
+        }
+    };
 
     // Phase 9 — present.
     present_image(
@@ -642,6 +655,74 @@ pub(crate) fn render_frame(
     outcome.arena_growth_events = (ctx.arena_growth_events.get() - arena_growth_before) as u32;
     frames.frame_slot = (slot + 1) % FRAMES_IN_FLIGHT as usize;
     Ok(outcome)
+}
+
+/// Phases 5-8 (§5.4, CA-10's restructure): the per-image guard wait
+/// and timestamp read, the frame's uploads, the present-wait
+/// semaphore, the command-buffer recording, the slot-fence COMMIT
+/// (the deferred reset + per-image ownership publish), and the
+/// submission. The slot fence stays SIGNALLED through everything
+/// before the commit — the property that makes every error below
+/// strand-free — and the commit is the last fallible step before
+/// the submit (the reset itself is the one CA-10 boundary whose
+/// failure leaves the fence state indeterminate; its disposition is
+/// the fence-state discriminator in [`dispose_failed_acquisition`]).
+#[allow(clippy::too_many_arguments)]
+fn acquire_to_submit(
+    ctx: &VulkanContext,
+    swapchain: &SwapchainState,
+    pipes: &PipelineState,
+    frames: &mut FrameState,
+    frame: &InternalFrame<'_>,
+    proxy_sets: Option<[vk::DescriptorSet; 3]>,
+    outcome: &mut FrameOutcome,
+    slot: usize,
+    image_index: u32,
+) -> Result<(Option<f64>, u32, vk::Semaphore), RendererError> {
+    // Phase 5 — guard_and_timestamps: the per-image guard wait (the
+    // LAST wait that can reference this slot's previous signal —
+    // the reset is still deferred) and the previous use's timestamp
+    // read (Phase 3's slot-fence wait proved them resolved).
+    let gpu_render_ms = guard_image_and_read_timestamps(ctx, frames, slot, image_index)?;
+
+    // Phase 6 — upload_frame_data: the mapped-slot writes this
+    // slot's fence wait now owns (infallible today — the Result is
+    // the boundary contract; the CA-10 fault knob sits at its top).
+    let world_drawn = upload_frame_data(ctx, pipes, frames, frame, outcome, slot)?;
+
+    // The present-wait semaphore is owned by the acquired image
+    // (corrective finding C). Grown BEFORE recording begins (the
+    // fail-fast discipline: a creation failure must not leave a
+    // recorded-but-unsubmitted command buffer against a reset fence
+    // and an acquired image) — and since CA-10, BEFORE the fence
+    // commit as well, so the failure stays strand-free by
+    // construction.
+    let present_semaphore = frames.present_semaphore_for(ctx, image_index)?;
+
+    // Phase 7 — record: the pass cascade into this slot's command
+    // buffer.
+    record_command_buffer(
+        ctx,
+        swapchain,
+        pipes,
+        frames,
+        frame,
+        proxy_sets,
+        slot,
+        image_index,
+        world_drawn,
+        outcome,
+    )?;
+
+    // Phase 7.5 — the slot-fence COMMIT (CA-10): the reset and the
+    // per-image ownership publish, deferred until every fallible
+    // step before the submission has succeeded.
+    commit_slot_fence(ctx, frames, slot)?;
+
+    // Phase 8 — submit.
+    submit_command_buffer(ctx, frames, present_semaphore, slot)?;
+
+    Ok((gpu_render_ms, world_drawn, present_semaphore))
 }
 
 /// Phase 1 — `validate_inputs` (§5.4): the proxy materials are
@@ -811,13 +892,20 @@ fn acquire_with_retry(
     }
 }
 
-/// Phase 5 — `reset_and_timestamps` (§5.4; the per-image guard wait
-/// is folded in as the reset's own prelude — the original comment
-/// below calls it "the last wait that can reference this slot's
-/// previous signal"): guards against acquiring an image another
-/// in-flight submission still reads, resets the slot fence, and
-/// reads the previous use's timestamps.
-fn reset_and_timestamps(
+/// Phase 5 — `guard_image_and_read_timestamps` (§5.4; the per-image
+/// guard wait, CA-10's restructure of the old
+/// `reset_and_timestamps`): guards against acquiring an image
+/// another in-flight submission still reads, then reads the previous
+/// use's timestamps. THE WAIT DISCIPLINE IS UNCHANGED from the
+/// pre-CA-10 code — this is still "the last wait that can reference
+/// this slot's previous signal" — but the RESET that used to follow
+/// it here is DEFERRED to [`commit_slot_fence`] between record and
+/// submit: every fallible step between this guard and the commit
+/// (the uploads, the present semaphore, the recording) now runs with
+/// the slot fence still carrying its previous signal, so a failure
+/// at any of them leaves the fence waitable and the slot reusable
+/// (the stranded-slot fix — see [`dispose_failed_acquisition`]).
+fn guard_image_and_read_timestamps(
     ctx: &VulkanContext,
     frames: &mut FrameState,
     slot: usize,
@@ -836,21 +924,23 @@ fn reset_and_timestamps(
                     })?;
             }
         }
+        // The per-image ownership STAGING (CA-10): the slot fence is
+        // recorded as the image's owner BEFORE the fence is reset —
+        // publishing here is safe because the slot fence is still
+        // SIGNALED (a future guard waiting on it passes immediately)
+        // and the PUBLISHING slot is the one this frame is about to
+        // reset-and-submit; if anything below fails before the
+        // commit, `dispose_failed_acquisition` restores the previous
+        // owner or nulls the entry (the frame that would have
+        // signaled it never ran).
         *image_fence = frames.in_flight[slot];
     }
 
-    // Safe to reset only now: the image guard above is the last wait
-    // that can reference this slot's previous signal.
-    unsafe {
-        ctx.device
-            .reset_fences(&[frames.in_flight[slot]])
-            .map_err(|error| RendererError::vk(error, "reset_fences"))?;
-    }
-
-    // Timestamps from this slot's previous use are resolved now (the
-    // fence above proves it). The first use of a slot has no samples
-    // yet, and unsupported timestamps are never queried (corrective
-    // finding E).
+    // Timestamps from this slot's previous use are resolved now —
+    // Phase 3's slot-fence wait proved the submission complete (the
+    // fence is still signaled; the read does not consume it). The
+    // first use of a slot has no samples yet, and unsupported
+    // timestamps are never queried (corrective finding E).
     let gpu_render_ms =
         if timestamp_sample_ready(frames.timestamps_supported, frames.timestamps_written[slot]) {
             read_timestamps(ctx, frames, slot)
@@ -858,6 +948,229 @@ fn reset_and_timestamps(
             None
         };
     Ok(gpu_render_ms)
+}
+
+/// Phase 7.5 — `commit_slot_fence` (CA-10's deferred reset): resets
+/// this slot's fence at the LAST fallible boundary before the
+/// submit, completing the per-image ownership publication the guard
+/// phase staged (the slot fence it recorded there becomes the image's
+/// real owner the moment this frame's submission signals it). The
+/// reset must precede the submission (a submit signals the fence; it
+/// must be unsignaled), and every wait that can reference the slot's
+/// PREVIOUS signal (Phase 3's slot wait, the per-image guard) has
+/// completed by construction — the pre-CA-10 proof, preserved with
+/// the reset simply moved later in the same frame.
+fn commit_slot_fence(
+    ctx: &VulkanContext,
+    frames: &mut FrameState,
+    slot: usize,
+) -> Result<(), RendererError> {
+    // Safe to reset only now: every wait that can reference this
+    // slot's previous signal has run (Phase 3's wait; the image
+    // guard in Phase 5 — the last one).
+    unsafe {
+        ctx.device
+            .reset_fences(&[frames.in_flight[slot]])
+            .map_err(|error| RendererError::vk(error, "reset_fences"))?;
+    }
+    Ok(())
+}
+
+/// The acquisition's disposition (CA-10): EVERY error after a
+/// successful acquire gets an explicit release instead of
+/// propagating raw. The pre-CA-10 code reset the slot fence before
+/// the fallible upload/semaphore/record/submit chain, so any error
+/// in that chain left the fence reset-but-never-signaled — the next
+/// frame on the slot blocked the full 2 s
+/// [`WAIT_TIMEOUT_NS`][super::WAIT_TIMEOUT_NS] and failed with the
+/// slot-fence timeout, and the acquired image's
+/// `image_available` signal stayed pending for the slot's next
+/// acquire (signaling an already-signaled binary semaphore). This
+/// release defines the disposition for each piece:
+///
+/// **The acquired image + the acquire semaphore** — RETURNED
+/// together: the WSI-canonical release presents the image WAITING
+/// `image_available[slot]`, so the presentation is ordered against
+/// the acquire's implicit layout transition (the sync-validation
+/// WRITE_AFTER_READ the rig caught when an earlier draft presented
+/// with no waits) and the wait consumes the signal at the
+/// presentation — one operation returning the image to the pool and
+/// retiring the semaphore's signal. The content is whatever the
+/// image last held (the failed frame drew nothing into it — a
+/// visible one-frame staleness on an already-reported error path).
+/// An out-of-date refusal is the normal path's own deferred-
+/// recreation arm (latch the intent, probe next frame); because a
+/// REJECTED present may not have consumed the wait, the semaphore
+/// is then REPLACED (below) rather than trusted. A HARD present
+/// failure holds the image (the pool shrinks by one, fail-visible
+/// as the typed acquire timeout once failures exhaust it) and the
+/// semaphore is replaced the same way.
+///
+/// **The slot fence** — healed when the fence-state discriminator
+/// (`get_fence_status`) finds it unsignaled: the fence is SIGNALED
+/// for every failure before the commit (never reset this frame),
+/// and NOT_READY after a committed reset whose submission failed or
+/// never ran (including a reset that itself failed indeterminately
+/// — the status reports the actual state). The heal is ONE empty
+/// submission (no command buffers, no waits) carrying the fence —
+/// the canonical signal-a-fence idiom — and a status error (device
+/// lost) takes the heal arm as the conservative direction.
+///
+/// **The drain proof** — after the release operations, ONE
+/// `queue_wait_idle` proves the presentation's semaphore wait (and
+/// the heal submission) COMPLETED before this function returns:
+/// the next frame's acquire requires the semaphore with NO pending
+/// operations, and a queue-asynchronous consume would race the
+/// reuse (the rig's second catch — the pending-operations
+/// validation error). The idle is bounded by the presentation
+/// engine's drain (a FIFO present processes within a vblank or
+/// two) — tens of milliseconds against the strand's 2 seconds.
+///
+/// **The per-image ownership** — nulled when the discriminator
+/// found the fence reset (the publishing frame never submitted, so
+/// no work references the image; the image's previous real owner
+/// completed — the guard waited on it — so the null costs a future
+/// acquirer nothing but a skipped wait). Left UNTOUCHED when the
+/// fence is still signaled (the previous owner's entry may still be
+/// legitimately waited on; the guard's own wait failure returned
+/// before the publication).
+///
+/// **The recorded command buffer** — reset (best-effort): a
+/// mid-recording failure leaves the buffer in the recording state,
+/// which the next frame's `begin_command_buffer` would refuse; the
+/// pool's `RESET_COMMAND_BUFFER` flag makes the reset legal at any
+/// time after the slot's previous submission completed (Phase 3's
+/// wait proved it). A failed reset surfaces at the next frame's
+/// begin as a typed error — fail-visible, never a silent strand.
+///
+/// **Escalation** — if the heal submission, the drain, or the
+/// rejected-present semaphore replacement fails, the slot's
+/// synchronization state is unrecoverable: the ORIGINAL error is
+/// wrapped in [`RendererError::FrameSlotUnrecoverable`], the typed
+/// terminal refusal — the caller must treat this renderer as
+/// failed and construct a fresh one. Never a silent strand.
+fn dispose_failed_acquisition(
+    ctx: &VulkanContext,
+    swapchain: &SwapchainState,
+    frames: &mut FrameState,
+    slot: usize,
+    image_index: u32,
+    error: RendererError,
+) -> RendererError {
+    // Best-effort command-buffer reset (a recording-state buffer
+    // would refuse the next frame's begin; a clean buffer resets
+    // harmlessly — see the doc above).
+    unsafe {
+        let _ = ctx.device.reset_command_buffer(
+            frames.command_buffers[slot],
+            vk::CommandBufferResetFlags::empty(),
+        );
+    }
+    // The fence-state discriminator (see the doc above).
+    let fence_signaled =
+        unsafe { ctx.device.get_fence_status(frames.in_flight[slot]) }.unwrap_or(false);
+    let heal_fence = !fence_signaled;
+    if heal_fence {
+        // The ownership published at the guard must not survive a
+        // frame that never submitted: null it.
+        if let Some(image_fence) = mut_at(&mut frames.images_in_flight, image_index as usize) {
+            *image_fence = vk::Fence::null();
+        }
+    }
+    // The image return + the acquire semaphore's consume: the
+    // WSI-canonical release present (see the doc above).
+    let present_wait_semaphores = [frames.image_available[slot]];
+    let present_swapchains = [swapchain.swapchain];
+    let present_image_indices = [image_index];
+    let present_info = vk::PresentInfoKHR::default()
+        .wait_semaphores(&present_wait_semaphores)
+        .swapchains(&present_swapchains)
+        .image_indices(&present_image_indices);
+    let semaphore_trusted = match unsafe {
+        ctx.swapchain_ext
+            .queue_present(ctx.graphics_queue, &present_info)
+    } {
+        Ok(suboptimal) => {
+            if suboptimal {
+                mark_suboptimal(&mut frames.needs_recreate);
+            }
+            // A processed present consumed the wait: the semaphore
+            // is trusted idle once the drain below completes.
+            true
+        }
+        Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+            // The normal present path's own deferred arm: the
+            // presentation is gone, the recreation intent and the
+            // deferral hint latch. A rejected present may not have
+            // consumed the wait — the semaphore is replaced below.
+            mark_suboptimal(&mut frames.needs_recreate);
+            frames.surface_probe_pending = true;
+            false
+        }
+        Err(_present_error) => {
+            // The image stays held (pool shrinkage, fail-visible as
+            // the typed acquire timeout once failures exhaust it);
+            // the semaphore may hold its signal — replaced below.
+            false
+        }
+    };
+    // The fence heal (see the doc above): one empty submission
+    // carrying the slot fence, only when the discriminator found it
+    // unsignaled.
+    if heal_fence {
+        let fence = frames.in_flight[slot];
+        // SAFETY: an empty-batch submission with the fence — the
+        // signal-a-fence idiom; no command buffers, no waits.
+        if let Err(release_error) =
+            unsafe { ctx.device.queue_submit(ctx.graphics_queue, &[], fence) }
+                .map_err(|error| RendererError::vk(error, "release submit (fence heal)"))
+        {
+            return RendererError::FrameSlotUnrecoverable {
+                source: Box::new(error),
+                release: Box::new(release_error),
+            };
+        }
+    }
+    // The drain proof (see the doc above): the presentation's
+    // semaphore wait and the heal submission are complete when this
+    // returns — the slot's next acquire finds no pending operation.
+    if let Err(release_error) = super::device_idle(ctx) {
+        return RendererError::FrameSlotUnrecoverable {
+            source: Box::new(error),
+            release: Box::new(release_error),
+        };
+    }
+    if !semaphore_trusted {
+        // The release present was rejected or failed: the acquire
+        // semaphore's signal may still be pending, and a pending
+        // signal poisons the slot's next acquire (signaling an
+        // already-signaled binary semaphore). REPLACE it — the
+        // drain above proved no queued operation refers to it, so
+        // the destroy is legal whatever its signal state, and the
+        // fresh semaphore gives the slot a clean acquire.
+        let stale = frames.image_available[slot];
+        if stale != vk::Semaphore::null() {
+            unsafe {
+                ctx.device.destroy_semaphore(stale, None);
+            }
+        }
+        let fresh = match unsafe {
+            ctx.device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+        }
+        .map_err(|error| RendererError::vk(error, "release (acquire semaphore replacement)"))
+        {
+            Ok(fresh) => fresh,
+            Err(release_error) => {
+                return RendererError::FrameSlotUnrecoverable {
+                    source: Box::new(error),
+                    release: Box::new(release_error),
+                };
+            }
+        };
+        frames.image_available[slot] = fresh;
+    }
+    error
 }
 
 /// Phase 6 — `upload_frame_data` (§5.1's uploads row, §5.4's phase):
@@ -873,6 +1186,13 @@ fn upload_frame_data(
     outcome: &mut FrameOutcome,
     slot: usize,
 ) -> Result<u32, RendererError> {
+    // CA-10 fault knob: the UPLOAD boundary (Phase 6, post-acquire).
+    // The mapped writes below are infallible today — the Result this
+    // function returns is the boundary contract, and the knob keeps
+    // the boundary's disposition testable (a plan armed here fires
+    // after the acquire, before any write, with the slot fence still
+    // signaled — the release must leave the slot reusable).
+    ctx.check_lifecycle_fault(crate::LifecycleFaultSite::FrameUpload)?;
     let inputs = &frame.inputs;
     let region_vertices = inputs.region_vertices;
     let foreground = inputs.foreground;
@@ -1001,6 +1321,12 @@ fn record_command_buffer(
 ) -> Result<(), RendererError> {
     let frame_inputs = &frame.inputs;
     let plan = &frame.plan;
+    // CA-10 fault knob: the RECORD boundary (Phase 7, post-acquire,
+    // after the semaphore growth) — a plan armed here fires with
+    // nothing recorded and the slot fence still signaled; the
+    // release's command-buffer reset covers the mid-recording shape
+    // (a failure later in this cascade) identically.
+    ctx.check_lifecycle_fault(crate::LifecycleFaultSite::FrameRecord)?;
     let corner_params = frame_inputs.corner_params.as_ref();
     let proxy = frame_inputs.proxy.as_ref();
     let shadowed = frame_inputs.shadowed.as_ref();
@@ -1533,6 +1859,14 @@ fn submit_command_buffer(
     present_semaphore: vk::Semaphore,
     slot: usize,
 ) -> Result<(), RendererError> {
+    // CA-10 fault knob: the SUBMIT boundary (Phase 8) — the one
+    // post-acquire failure that lands AFTER the fence commit (the
+    // reset ran, the ownership published): a plan armed here fires
+    // with the fence reset-but-unsignaled, exercising the release's
+    // heal arm (the discriminator finds NOT_READY; the empty
+    // release submission re-signals the fence while consuming the
+    // acquire semaphore).
+    ctx.check_lifecycle_fault(crate::LifecycleFaultSite::FrameSubmit)?;
     let command = frames.command_buffers[slot];
     let wait_stage = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
     let wait_semaphores = [frames.image_available[slot]];

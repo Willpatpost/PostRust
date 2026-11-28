@@ -218,6 +218,40 @@ pub struct AllocationStats {
     /// its per-texture totals, so this field is the attribution
     /// slice, not an additional sum.
     pub texture_staging_tail_bytes: u64,
+    /// CA-01 (the attach-atomicity census): monotonic creation count
+    /// of the corner pipeline group's Vulkan objects (the lit,
+    /// proxy, and rain pipelines plus the lit and proxy layouts —
+    /// the five handles the group stages before publishing into the
+    /// pipeline state). The paired frees counter below counts the
+    /// group's scoped-owner releases; a FAILED attach that rolled
+    /// back leaves the pair equal (created then released), which is
+    /// the no-leak proof the attach battery asserts per injected
+    /// fault site.
+    pub corner_pipeline_objects: u64,
+    /// CA-01: monotonic destruction count of those same corner
+    /// pipeline group objects through the group's scoped owner (a
+    /// failed or replaced build's partial release). Objects that
+    /// COMMIT into the live pipeline state are freed later by the
+    /// state's own `destroy` — outside this counter — so the pair
+    /// reads equal exactly when every staged object was released.
+    pub corner_pipeline_object_frees: u64,
+    /// CA-11 (the growth-handle-loss census): monotonic count of
+    /// arena-carve replacements STAGED through the scoped mapped-
+    /// buffer owner (the region, instance, and pose growth paths'
+    /// new buffer+memory pair, created before the old carve dies).
+    /// The paired frees counter below counts the owner's releases; a
+    /// growth whose fallible idle wait failed leaves the pair equal
+    /// (staged then released — the new objects cleaned up, the old
+    /// bindings intact), which is the no-leak proof the growth
+    /// battery asserts per injected fault site.
+    pub arena_replacements: u64,
+    /// CA-11: monotonic destruction count of those same staged
+    /// replacement pairs through the scoped owner's Drop. A
+    /// replacement that COMMIT (retiring the old carve) is freed
+    /// later by the owning state's destroy — outside this counter —
+    /// so the pair reads equal exactly when every staged replacement
+    /// was released.
+    pub arena_replacement_frees: u64,
 }
 
 /// Long-lived renderer statistics (Stage 2 authorization, item 4).
@@ -475,7 +509,12 @@ struct AttachedScene {
 /// device-free (a refusal builds nothing and leaves the context
 /// untouched), then upload through the context's scene-resource
 /// machinery (partial-failure-safe — on error the context is
-/// unchanged), then distill the retained facts. ONE scene per
+/// unchanged), then distill the retained facts. The INSTALL the
+/// machinery performs is STAGING: the caller completes the
+/// transaction by building the corner pipeline group and publishes
+/// the handle only on full success, rolling the install back
+/// through [`VulkanContext::release_staged_scene_resources`]
+/// otherwise (CA-01 — see the public method's doc). ONE scene per
 /// renderer lifetime (the context's attach refuses a second; the
 /// device-lifetime pass families bind the attached buffers).
 fn attach_description(
@@ -717,6 +756,14 @@ impl Renderer {
     /// scene-backed frame ([`Self::submit_frame`]'s `scene` half)
     /// draws it.
     ///
+    /// ALL-OR-NOTHING (CA-01, the attach-atomicity contract): the
+    /// resource upload and the dependent corner-pipeline group are
+    /// one STAGED transaction — a failure at ANY creation step
+    /// rolls the whole attach back (the staged resources released,
+    /// no partial pipeline group, no handle published), so the
+    /// renderer is exactly as it was and a RETRY of the same
+    /// description is as clean as a first attach.
+    ///
     /// ONE scene per renderer lifetime: the device-lifetime pass
     /// families (the retained skinned state, the shadow/reflection
     /// per-material sets) bind the attached mesh/material buffers,
@@ -728,6 +775,21 @@ impl Renderer {
     /// their own description through this call, and the second
     /// scene (engine-slice's garage) proves the boundary.
     pub fn attach_scene(&mut self, scene: SceneDescription) -> Result<SceneHandle, RendererError> {
+        // CA-01 (attach atomicity): the attach is a STAGED
+        // transaction. The resources install FIRST (the pipeline
+        // group binds their descriptor layout), but until the group
+        // commits they are STAGING — and if the group's assembly
+        // fails, the guard below releases them, leaving the
+        // renderer exactly as it was: no installed resources (the
+        // context's one-scene budget unconsumed), no partial
+        // pipeline group (the assembly stages in a scoped owner and
+        // adopts only on full success), no published handle — and
+        // the RETRY of the same description is as clean as a first
+        // attach. Before this guard, a pipeline failure left the
+        // resources installed behind a `None` scene: the retry was
+        // refused ("a scene is already attached") and the renderer
+        // was unusable for scene-backed frames — the stranded
+        // no-scene state the audit's CA-01 named.
         let attached = attach_description(&mut self.ctx, scene)?;
         // The corner-family pipelines (P4 S6): the scene attaches
         // AFTER construction, so the lit/proxy/rain objects — which
@@ -741,7 +803,17 @@ impl Renderer {
         // pre-S6 path (the Corner preference attached before
         // construction; the Omitted path never drew the scene
         // family).
-        self.pipes.ensure_corner_pipelines(&self.ctx)?;
+        if let Err(error) = self.pipes.ensure_corner_pipelines(&self.ctx) {
+            // The rollback guard: the staged resources die here, the
+            // pipeline state was never written (the group staging),
+            // and the error propagates — the retry re-runs the whole
+            // attach from a clean context.
+            self.ctx.release_staged_scene_resources();
+            return Err(error);
+        }
+        // Full success — publish the retained facts and the handle
+        // together (the one place the attach becomes visible to
+        // frames).
         let handle = attached.handle;
         self.scene = Some(attached);
         Ok(handle)
@@ -1051,6 +1123,23 @@ impl Renderer {
         ordinal: u32,
     ) {
         self.ctx.set_target_fault(site, stage, ordinal);
+    }
+
+    /// Arms a one-shot LIFECYCLE fault (the CA-01/CA-10/CA-11
+    /// verification knobs — the target-fault seam's own discipline
+    /// on the lifecycle site enum): the ordinal-th matching
+    /// fallible step named by [`site`](crate::LifecycleFaultSite)
+    /// returns [`RendererError::InjectedFault`] instead of its real
+    /// device call — a scene-attach creation step, a post-acquire
+    /// frame boundary, or an arena growth's idle window. The
+    /// ordinal is 1-based and decrements per MATCHING check across
+    /// the renderer's lifetime; the plan is consumed when the
+    /// ordinal reaches 0. Diagnostic-only, test-only: never
+    /// produced by real device calls. The `&mut self` is
+    /// intentional (the one-shot intent encoded in the type, the
+    /// target seam's own rule).
+    pub fn inject_lifecycle_fault(&mut self, site: crate::LifecycleFaultSite, ordinal: u32) {
+        self.ctx.set_lifecycle_fault(site, ordinal);
     }
 
     /// Arms a one-shot acquire-out-of-date injection (finding 6's

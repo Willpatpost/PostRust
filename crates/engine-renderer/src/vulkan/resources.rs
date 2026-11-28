@@ -319,6 +319,125 @@ pub(super) fn advance_target_fault_plan(
     }
 }
 
+/// The LIFECYCLE fault plan's advance logic (CA-01/CA-10/CA-11's
+/// seam — the target plan's own discipline on the flat lifecycle
+/// site enum): extracted pure so the seam is unit-testable without
+/// a Vulkan device, exactly as [`advance_target_fault_plan`] is.
+///
+/// A plan matches only when the site equals the check's; a match
+/// decrements the ordinal, and the fault fires when it reaches zero
+/// (consuming the plan). Non-matching checks leave the plan
+/// untouched. The ordinal is 1-based; `set_lifecycle_fault` clamps
+/// it to at least 1.
+pub(super) fn advance_lifecycle_fault_plan(
+    plan: &mut Option<(crate::LifecycleFaultSite, u32)>,
+    site: crate::LifecycleFaultSite,
+) -> Option<RendererError> {
+    let (plan_site, ordinal) = (*plan)?;
+    if plan_site != site {
+        return None;
+    }
+    let remaining = ordinal - 1;
+    if remaining == 0 {
+        *plan = None;
+        Some(RendererError::InjectedFault(format!("{site:?}")))
+    } else {
+        *plan = Some((plan_site, remaining));
+        None
+    }
+}
+
+/// A mapped buffer held by a SCOPED OWNER while unpublished (CA-11
+/// — the growth-handle-loss fix): [`create_mapped_buffer`] returns
+/// a bare `(buffer, memory, mapped)` tuple with no destructor, so
+/// any fallible step between the allocation and the replacement
+/// point (the arena growth paths' `device_idle`) propagated the
+/// error while DROPPING the new handles on the floor — the old
+/// bindings stayed intact but the new buffer and its memory leaked
+/// for the device's remaining lifetime.
+///
+/// This guard closes the window: it owns the triple from creation,
+/// [`Drop`] destroys exactly what exists (so every `?` between
+/// [`Self::create`] and [`Self::commit`] is leak-free by
+/// construction), and `commit` disarms it at the replacement point
+/// — the one place the caller installs the pieces into live state
+/// and retirement of the old carve begins. The design alternative —
+/// reordering so the fallible idle wait PRECEDES the allocation —
+/// was considered and rejected: it would pin the discipline to
+/// today's single fallible step, while the guard covers any future
+/// fallible step in the window (the audit's stated shape), at an
+/// identical stall profile (one `device_wait_idle` per growth
+/// event either way).
+///
+/// The staging/release events are counted on the context's census
+/// pair (`arena_replacements` / `arena_replacement_frees`) so the
+/// growth battery can prove the release ran — the
+/// target-images/target-frees counters' own discipline.
+pub(super) struct ScopedMappedBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    mapped: *mut core::ffi::c_void,
+    ctx: *const VulkanContext,
+}
+
+impl ScopedMappedBuffer {
+    /// Creates the replacement pair through the existing
+    /// partial-failure-safe helper and takes ownership of it (the
+    /// census pair's staging half counted here). The caller must
+    /// keep `ctx` alive and the device valid for the guard's
+    /// lifetime (the renderer's single-threaded frame flow owns
+    /// both).
+    pub(super) fn create(
+        ctx: &VulkanContext,
+        usage: vk::BufferUsageFlags,
+        size: vk::DeviceSize,
+    ) -> Result<Self, RendererError> {
+        let (buffer, memory, mapped) = create_mapped_buffer(ctx, usage, size)?;
+        ctx.record_arena_replacement_staged();
+        Ok(Self {
+            buffer,
+            memory,
+            mapped,
+            ctx,
+        })
+    }
+
+    /// Disarms the guard and hands the pieces to the caller at the
+    /// replacement point — the caller installs them into live
+    /// state immediately (the steps below the commit are
+    /// commit-only). After this call the guard's `Drop` is a no-op.
+    pub(super) fn commit(mut self) -> (vk::Buffer, vk::DeviceMemory, *mut core::ffi::c_void) {
+        let pieces = (self.buffer, self.memory, self.mapped);
+        self.buffer = vk::Buffer::null();
+        self.memory = vk::DeviceMemory::null();
+        self.mapped = core::ptr::null_mut();
+        pieces
+    }
+}
+
+impl Drop for ScopedMappedBuffer {
+    fn drop(&mut self) {
+        if self.buffer != vk::Buffer::null() {
+            let ctx = unsafe { &*self.ctx };
+            unsafe {
+                if !self.mapped.is_null() {
+                    ctx.device.unmap_memory(self.memory);
+                }
+                ctx.device.destroy_buffer(self.buffer, None);
+                ctx.device.free_memory(self.memory, None);
+            }
+            ctx.record_arena_replacement_released();
+        }
+    }
+}
+
+// SAFETY (the raw pointers): `ctx` and `mapped` are confined to the
+// renderer's single owning thread exactly like the live states' own
+// mapped pointers — the guard exists only inside one frame-flow or
+// ensure call, dropped or committed before that call returns (and
+// raw pointers already make the type !Send/!Sync, so it cannot
+// silently cross threads).
+
 #[cfg(test)]
 mod target_fault_seam_tests {
     use super::advance_target_fault_plan;
@@ -416,6 +535,103 @@ mod target_fault_seam_tests {
             ] {
                 assert!(advance_target_fault_plan(&mut plan, site, stage).is_none());
             }
+        }
+        assert_eq!(plan, None);
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_fault_seam_tests {
+    use super::advance_lifecycle_fault_plan;
+    use crate::LifecycleFaultSite;
+    use crate::RendererError;
+
+    /// A fired plan is consumed: the second matching check passes
+    /// (the target seam's own first rule, on the lifecycle enum).
+    #[test]
+    fn plan_fires_once_then_stays_consumed() {
+        let mut plan = Some((LifecycleFaultSite::LitPipeline, 1));
+        assert!(advance_lifecycle_fault_plan(&mut plan, LifecycleFaultSite::LitPipeline).is_some());
+        assert_eq!(plan, None);
+        assert!(advance_lifecycle_fault_plan(&mut plan, LifecycleFaultSite::LitPipeline).is_none());
+        assert_eq!(plan, None);
+    }
+
+    /// Only the MATCHING site decrements the ordinal; every other
+    /// site's check leaves the plan untouched — the property that
+    /// lets one renderer walk an attach retry through several
+    /// injections without cross-talk between the clusters.
+    #[test]
+    fn ordinal_decrements_only_on_the_matching_site() {
+        let mut plan = Some((LifecycleFaultSite::PoseGrowthIdle, 3));
+        for site in [
+            LifecycleFaultSite::RegionGrowthIdle,
+            LifecycleFaultSite::InstanceGrowthIdle,
+            LifecycleFaultSite::SceneVertices,
+            LifecycleFaultSite::FrameSubmit,
+            LifecycleFaultSite::ProxyPipeline,
+        ] {
+            assert!(advance_lifecycle_fault_plan(&mut plan, site).is_none());
+            assert_eq!(plan, Some((LifecycleFaultSite::PoseGrowthIdle, 3)));
+        }
+        // Three matching checks: the first two decrement, the third
+        // fires and consumes the plan.
+        assert!(
+            advance_lifecycle_fault_plan(&mut plan, LifecycleFaultSite::PoseGrowthIdle).is_none()
+        );
+        assert_eq!(plan, Some((LifecycleFaultSite::PoseGrowthIdle, 2)));
+        assert!(
+            advance_lifecycle_fault_plan(&mut plan, LifecycleFaultSite::PoseGrowthIdle).is_none()
+        );
+        assert_eq!(plan, Some((LifecycleFaultSite::PoseGrowthIdle, 1)));
+        assert!(
+            advance_lifecycle_fault_plan(&mut plan, LifecycleFaultSite::PoseGrowthIdle).is_some()
+        );
+        assert_eq!(plan, None);
+    }
+
+    /// The fired error is the InjectedFault variant naming the site
+    /// (the batteries assert the variant; the message carries the
+    /// step for diagnostics).
+    #[test]
+    fn the_fired_fault_is_the_injected_variant_naming_its_step() {
+        let mut plan = Some((LifecycleFaultSite::FrameSubmit, 1));
+        match advance_lifecycle_fault_plan(&mut plan, LifecycleFaultSite::FrameSubmit) {
+            Some(RendererError::InjectedFault(message)) => {
+                assert!(message.contains("FrameSubmit"), "message: {message}");
+            }
+            other => panic!("expected InjectedFault, got {other:?}"),
+        }
+    }
+
+    /// An unarmed plan (None) never fires and stays None, for every
+    /// lifecycle site.
+    #[test]
+    fn an_unarmed_plan_never_fires() {
+        let mut plan = None;
+        for site in [
+            LifecycleFaultSite::SceneVertices,
+            LifecycleFaultSite::SceneTexture,
+            LifecycleFaultSite::SceneSampler,
+            LifecycleFaultSite::SceneUniforms,
+            LifecycleFaultSite::SceneDescriptors,
+            LifecycleFaultSite::LitModule,
+            LifecycleFaultSite::LitLayout,
+            LifecycleFaultSite::LitPipeline,
+            LifecycleFaultSite::ProxyModule,
+            LifecycleFaultSite::ProxyLayout,
+            LifecycleFaultSite::ProxyPipeline,
+            LifecycleFaultSite::RainModule,
+            LifecycleFaultSite::RainPipeline,
+            LifecycleFaultSite::FrameUpload,
+            LifecycleFaultSite::FramePresentSemaphore,
+            LifecycleFaultSite::FrameRecord,
+            LifecycleFaultSite::FrameSubmit,
+            LifecycleFaultSite::RegionGrowthIdle,
+            LifecycleFaultSite::InstanceGrowthIdle,
+            LifecycleFaultSite::PoseGrowthIdle,
+        ] {
+            assert!(advance_lifecycle_fault_plan(&mut plan, site).is_none());
         }
         assert_eq!(plan, None);
     }

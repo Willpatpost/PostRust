@@ -72,7 +72,8 @@
 //! lit pipeline (the 6-B foundation; no new bindings).
 
 use super::{
-    RendererError, VulkanContext, create_device_local_buffer_with_data, create_mapped_buffer,
+    RendererError, ScopedMappedBuffer, VulkanContext, create_device_local_buffer_with_data,
+    create_mapped_buffer,
 };
 use crate::ProxyDrawMode;
 use crate::config::FRAMES_IN_FLIGHT;
@@ -503,7 +504,15 @@ impl ProxyResources {
             return Ok(());
         }
         let slot_bytes = u64::from(target) * INSTANCE_STRIDE as u64;
-        let (instances, instances_memory, instances_mapped) = create_mapped_buffer(
+        // CA-11 (the growth-handle-loss fix): the replacement pair
+        // lives in a SCOPED OWNER from creation to commit — a
+        // failure at the fallible idle wait below drops the guard,
+        // which destroys the NEW buffer and memory (the old
+        // bindings intact), instead of dropping the bare handles on
+        // the floor as the pre-fix tuple did. The staging/release
+        // events land on the census pair
+        // (`arena_replacements`/`arena_replacement_frees`).
+        let replacement = ScopedMappedBuffer::create(
             ctx,
             vk::BufferUsageFlags::VERTEX_BUFFER,
             // One disjoint region per frame slot, each holding a
@@ -516,8 +525,13 @@ impl ProxyResources {
         // leaves the prior state fully intact — the finding-G
         // discipline), and the event is counted. The stall is the
         // renderer's own ordered-teardown helper (device_wait_idle,
-        // typed).
+        // typed). The CA-11 fault knob sits immediately before the
+        // wait: a plan armed here fires with the replacement
+        // allocated and the old carve still live — the exact leak
+        // window the guard closes.
+        ctx.check_lifecycle_fault(crate::LifecycleFaultSite::InstanceGrowthIdle)?;
         super::device_idle(ctx)?;
+        let (instances, instances_memory, instances_mapped) = replacement.commit();
         unsafe {
             if !self.instances_mapped.is_null() {
                 ctx.device.unmap_memory(self.instances_memory);

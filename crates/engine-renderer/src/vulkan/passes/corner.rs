@@ -135,6 +135,10 @@ impl CornerResources {
             vk::BufferUsageFlags::VERTEX_BUFFER,
             bytemuck::cast_slice(&description.mesh.vertices),
         )?;
+        // CA-01 fault knob: the vertex pair exists — a plan armed
+        // here fires with it created, exercising this build's own
+        // partial-failure release below.
+        ctx.check_lifecycle_fault(crate::LifecycleFaultSite::SceneVertices)?;
         for bytes in &description.textures.textures {
             self.textures.push(Texture::upload(
                 ctx,
@@ -145,8 +149,13 @@ impl CornerResources {
                 },
                 bytes,
             )?);
+            // CA-01 fault knob: the just-pushed texture exists (the
+            // ordinal selects which of the table's textures).
+            ctx.check_lifecycle_fault(crate::LifecycleFaultSite::SceneTexture)?;
         }
         self.sampler = SamplerPool::with_address_mode(ctx, vk::SamplerAddressMode::REPEAT)?;
+        // CA-01 fault knob: the sampler pool exists.
+        ctx.check_lifecycle_fault(crate::LifecycleFaultSite::SceneSampler)?;
 
         // SAFETY: query the same live device that owns the mapped UBO.
         let limits = unsafe {
@@ -163,6 +172,8 @@ impl CornerResources {
             vk::BufferUsageFlags::UNIFORM_BUFFER,
             stride * (u64::from(FRAMES_IN_FLIGHT) + materials.len() as u64),
         )?;
+        // CA-01 fault knob: the mapped uniform pair exists.
+        ctx.check_lifecycle_fault(crate::LifecycleFaultSite::SceneUniforms)?;
         let combined = vk::DescriptorType::COMBINED_IMAGE_SAMPLER;
         let dynamic = vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC;
         let uniform = vk::DescriptorType::UNIFORM_BUFFER;
@@ -186,9 +197,17 @@ impl CornerResources {
             descriptor_count: count,
         });
         let (pool, layout, sets) = create_sets_sized(ctx, &bindings, &sizes, count)?;
+        // The registration MUST precede the fault knob: the check
+        // fires with the set group created, and the rollback
+        // (this build's own partial-failure destroy) can only
+        // release what `self` owns — the battery's validator
+        // caught exactly this ordering (the set group leaked when
+        // the knob sat between the creation and the assignment).
         self.pool = pool;
         self.layout = layout;
         self.sets = sets;
+        // CA-01 fault knob: the descriptor set group exists.
+        ctx.check_lifecycle_fault(crate::LifecycleFaultSite::SceneDescriptors)?;
         for (i, mat) in materials.iter().enumerate() {
             let offset = (u64::from(FRAMES_IN_FLIGHT) + i as u64) * stride;
             let [r, g, b] = mat.specular;
