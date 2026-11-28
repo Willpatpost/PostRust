@@ -77,6 +77,18 @@ mod reclaim_exec;
 mod timings;
 mod walks;
 
+// (F16 corrective, the codex full-audit at `95408c9`) The L9 split
+// moved the two crash-seam arming statics into `reclaim_exec` and
+// dropped the facade path `engine_persist::local::{...}` that
+// engine-slice's pp_b3_reclaim battery imports — the exact CI heavy
+// command failed E0432 at compile, before any test ran (the main
+// shard never sees it: a different feature; the lane's own feature
+// run covered engine-persist's own tests, not slice's crash-seam
+// suite). The names restored at the facade under the same feature
+// gate, the pre-split reachability exactly.
+#[cfg(feature = "crash-test-seams")]
+pub use reclaim_exec::{ARM_RECLAIM_LAST_UNIT, ARM_RECLAIM_MID_UNIT};
+
 use timings::elapsed_nanos;
 pub use timings::{AppendTimings, WalkStats};
 

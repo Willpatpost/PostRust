@@ -752,7 +752,7 @@ jobs:
           echo "main shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 2 / 33)"
           [ "$passed" -eq "$expected" ] || { echo "MAIN SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           [ "$ignored" -eq 2 ] || { echo "MAIN SHARD IGNORED MISMATCH: $ignored != 2"; exit 1; }
-          [ "$results" -eq 33 ] || { echo "MAIN SHARD RESULT-LINE MISMATCH: $results != 33"; exit 1; }
+          [ "$results" -eq 34 ] || { echo "MAIN SHARD RESULT-LINE MISMATCH: $results != 34"; exit 1; }
       # (The batch-3 review's corrective item 4) The ISOLATED RELEASE
       # engine-renderer battery — the configuration the orientation
       # pin's representation-sensitive former matcher failed in while
@@ -2092,7 +2092,8 @@ jobs:
           # the isolated rerun and the full protocol rerun both
           # green — the SECOND recorded occurrence, a third
           # makes it a register investigation; the weather rig
-          # battery 11/11 in the same first run).          expected=674
+# battery 11/11 in the same first run).
+          expected=674
           if [ "$(uname -s)" != "Linux" ]; then expected=673; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
