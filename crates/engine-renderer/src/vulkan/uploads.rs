@@ -61,6 +61,19 @@ pub(super) struct LayerAdmission {
 /// Computes the plan. Pure and unit-testable without a device; the
 /// exact fast path (both layers well-formed and inside the floor)
 /// reproduces the pre-T04 copy counts exactly.
+///
+/// **The whole-object composition (R4, 2026-11-29):** with a
+/// UNIT-ALIGNED capacity (a multiple of every layer's authored
+/// unit) and unit-multiple supplies, this partition admits whole
+/// objects in BOTH layers even at overflow — the priority layer's
+/// admitted count is unit-multiple, so the residual seat
+/// `floor − priority_admitted` stays unit-aligned; a priority layer
+/// that alone exceeds the floor refuses the residual layer WHOLE
+/// (layer-level atomicity). Parked for the first caller needing it
+/// (see [`DynamicClamp`]'s whole-object contract): per-layer
+/// authored-unit descriptors partitioning THIS plan by complete
+/// units — the wiring seam is the `upload_layers` call sites in
+/// `vulkan/frame.rs`.
 pub(super) fn admit_layers(
     first_len: usize,
     second_len: usize,
@@ -328,6 +341,61 @@ mod policy_tests {
         assert_eq!(decision.drawn % 3, 0);
         assert_eq!(decision.truncated, 12);
         assert_eq!(decision.supplied, 18);
+    }
+
+    #[test]
+    fn unit_aligned_capacity_partitions_whole_objects_across_layers() {
+        // R4 (2026-11-29) — the two-layer composition under the
+        // whole-object contract: with a UNIT-ALIGNED capacity (a
+        // multiple of both layers' authored units — here 6-vert
+        // quads, the overlay's real units) and unit-multiple
+        // supplies, the deterministic partition admits whole quads
+        // in BOTH layers at overflow, and a priority layer that
+        // alone exceeds the floor refuses the residual layer WHOLE.
+        // The region shape (`Second`: foreground priority) stands in
+        // for both priorities' arithmetic.
+        //
+        // 5 world quads (30) + 2 foreground quads (12) vs the
+        // aligned capacity 24: the foreground admits its 2 quads
+        // whole, the world takes the residual seat's 2 of its 5
+        // quads — every share a quad multiple, every omission whole
+        // quads.
+        let plan = admit_layers(30, 12, 24, LayerPriority::Second);
+        assert_eq!(plan.second.admitted, 12, "the foreground's 2 quads whole");
+        assert_eq!(
+            plan.first.admitted, 12,
+            "the world's residual seat: 2 whole quads"
+        );
+        assert_eq!(plan.first.admitted % 6, 0, "never a partial unit");
+        assert_eq!(plan.first.omitted, 18, "3 whole quads omitted");
+        assert_eq!(plan.first.omitted % 6, 0);
+        assert_eq!(plan.second.omitted, 0);
+        assert_eq!(plan.record.drawn, 24);
+        // The priority layer alone exceeds the floor: the residual
+        // layer is refused WHOLE (layer-level atomicity — the seat
+        // is zero, never a partial unit).
+        let plan = admit_layers(30, 30, 24, LayerPriority::Second);
+        assert_eq!(plan.second.admitted, 24, "4 whole quads");
+        assert_eq!(plan.second.admitted % 6, 0);
+        assert_eq!(plan.first.admitted, 0, "the world refused whole");
+        assert_eq!(plan.first.omitted, 30);
+        // A NON-aligned capacity (22 → floor 21, 21 ≡ 3 mod 6): the
+        // residual seat 21 − 12 = 9 lands MID-QUAD — the documented
+        // boundary over the floor (no authoring rule moves it; the
+        // caller-side lever is the unit-aligned budget — see
+        // DynamicClamp's whole-object contract).
+        let plan = admit_layers(30, 12, 22, LayerPriority::Second);
+        assert_eq!(plan.second.admitted, 12);
+        assert_eq!(
+            plan.first.admitted, 9,
+            "the mid-quad cut: one and a half quads"
+        );
+        assert_eq!(
+            plan.first.admitted % 6,
+            3,
+            "the boundary a unit-aligned budget removes"
+        );
+        assert_eq!(plan.first.omitted, 21);
     }
 
     #[test]

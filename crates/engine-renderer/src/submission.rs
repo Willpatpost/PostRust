@@ -103,6 +103,17 @@ pub struct OutputTarget {
 /// overlay slot (HUD first). At capacity, foreground takes precedence
 /// over world geometry and HUD over diagnostics — `render_layers`'s
 /// documented policy, unchanged.
+///
+/// **R4 (2026-11-29) — the whole-object authoring rule:** callers
+/// whose authored objects (36-vert boxes, 6-vert quads) must
+/// render whole author each layer as an exact multiple of its unit
+/// and stay under the layer's floor — sufficient by the lattice
+/// argument on [`crate::config::DynamicClamp`] (an under-cap
+/// unit-multiple supply is always admitted whole). At overflow the
+/// engine's cut is the triangle floor, generically mid-unit; the
+/// caller-side lever is a unit-aligned `RegionCapacity` (see its
+/// docs). The engine-owned per-layer unit descriptors remain parked
+/// for the first caller needing whole objects AT overflow.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DynamicLayers<'a> {
     /// The world batch (the `render_layers` path's region geometry;

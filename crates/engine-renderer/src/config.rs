@@ -297,6 +297,17 @@ impl Default for PoseCapacity {
 /// closed form, not the demo arithmetic welded into the carve site
 /// — no engine-core constant ties the simulation's shape to the
 /// renderer's residency after this.
+///
+/// R4 (2026-11-29): a caller whose authored units must survive an
+/// over-capacity cut WHOLE configures this budget UNIT-ALIGNED — a
+/// multiple of the authored unit (36 × 1022 = 36,792 for `push_box`
+/// boxes): the admission floor then lands on unit boundaries and
+/// every unit-multiple supply admits whole objects, omitting whole
+/// objects, at any overflow (see [`DynamicClamp`]'s whole-object
+/// contract). The DEFAULT 36,800 is NOT box-aligned (≡ 8 mod 36) —
+/// an over-cap box supply cuts mid-box by design (the census found
+/// no production caller there; the over-cap authors are the
+/// deliberate oversize harnesses).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegionCapacity(pub u32);
 
@@ -457,10 +468,65 @@ pub(crate) fn present_mode_str(mode: vk::PresentModeKHR) -> &'static str {
 ///   remainder is omitted and counted in `malformed_tail`, never
 ///   drawn.
 ///
-/// Semantic boundaries (a 36-vertex box, an authored mesh group) are
-/// NOT inferred from vertex counts — a flat slice carries no such
-/// metadata; callers needing whole-object admission must author
-/// whole-object batches (each an exact multiple of their unit).
+/// **The whole-object contract (T04, completed by the R4 census
+/// 2026-11-29):** semantic boundaries (a 36-vertex box, an authored
+/// mesh group) are NOT inferred from vertex counts — a flat slice
+/// carries no such metadata. The honest whole-object statement has
+/// two halves:
+///
+/// - **Under the floor, unit-multiple authoring is SUFFICIENT —
+///   proven.** Every authored unit in the tree is a triangle
+///   multiple (6-vert quads, 36-vert boxes), so a unit-multiple
+///   supply is triangle-well-formed, and the triangle floor is the
+///   LARGEST triangle multiple ≤ the capacity: any unit-multiple
+///   supply that fits the capacity is admitted whole IN UNITS (the
+///   unit-multiple lattice is coarser than the triangle lattice, so
+///   the unit floor sits at or below the triangle floor — pinned by
+///   the census battery below). The demand-sized carves make this
+///   the only state a production caller is ever in: an under-cap
+///   supply never meets the cut at all.
+/// - **Over the floor, the cut is the triangle floor — generically
+///   MID-UNIT, and no authoring rule can move it.** The default
+///   region budget 36,800 ≡ 8 (mod 36): an over-cap `push_box`
+///   supply is cut 6 vertices into a box (one triangle of one
+///   face). The caller-side lever that restores whole-object
+///   admission at overflow is a UNIT-ALIGNED capacity —
+///   `RegionCapacity(36_792)` (= 36 × 1022) makes the floor itself
+///   box-aligned, and every box-multiple supply then admits whole
+///   boxes, omitting whole boxes, at ANY overflow; the two-layer
+///   partition composes (the priority layer's admitted count is
+///   unit-multiple, so the residual seat stays unit-aligned — see
+///   `vulkan::uploads::admit_layers`).
+///
+/// The R4 census (2026-11-29) mapped every dynamic-geometry author
+/// in the tree against its floor at its real capacity: NO
+/// production caller can be split mid-object. The region scene's
+/// 36,288-vertex worst case (8 plates + 1000 proxy boxes) is the
+/// closed form the 36,800 budget DERIVES from (+512 margin, 510
+/// under the floor); every other scene-vertex author is under by
+/// orders of magnitude; the overlay limit 300,000 is quad-aligned
+/// (6 × 50,000), so rect- and glyph-unit authors cut on unit
+/// boundaries even at overflow. The only over-cap authors in the
+/// tree are the deliberate oversize harnesses (`render_overflow`'s
+/// 37,800-vs-36,800; the rig-run growth harnesses' 612-vs-500),
+/// which exist to pin clamp arithmetic, not visual integrity.
+///
+/// **The parked engine-owned design (R4, for the first caller that
+/// needs it):** the submission carrying per-layer authored-unit
+/// descriptors (offset + unit count, validated once — extents
+/// within the slice, each unit a triangle multiple) so
+/// `admit_layers` partitions by COMPLETE AUTHORED UNITS with
+/// whole-object admitted/refused/reported semantics, this record
+/// growing the unit-level counts (a unit tail SUBSUMES the triangle
+/// tail: a unit-malformed-but-triangle-well-formed remainder is
+/// refused whole), the flat path byte-identical when no descriptors
+/// are supplied. Re-open condition: a caller whose authored units
+/// must stay whole AT overflow rather than by staying under the
+/// floor or aligning the budget. The wiring seam (a `DynamicLayers`
+/// field → `FrameInputs` → `upload_frame_data` → `upload_layers`)
+/// lives in `vulkan/frame.rs` and `renderer.rs` — outside the R4
+/// lane's edit scope, which is why the design is parked rather than
+/// landed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct DynamicClamp {
     /// Vertices the caller supplied this frame (requested).
@@ -1025,6 +1091,114 @@ mod tests {
                 clamp.omitted_units * 3 + clamp.malformed_tail,
                 clamp.truncated,
                 "omitted vertices decompose into refused units + the tail"
+            );
+        }
+    }
+
+    /// R4 (2026-11-29) — the lattice theorem under the whole-object
+    /// contract: every authored unit in the tree is a triangle
+    /// multiple (6-vert quads, 36-vert boxes), and the triangle
+    /// floor is the LARGEST triangle multiple ≤ the capacity — so
+    /// any UNIT-MULTIPLE supply that fits the capacity is admitted
+    /// whole IN UNITS (drawn == supplied, drawn a unit multiple,
+    /// nothing omitted). This is the only state a production caller
+    /// is ever in: the demand-sized carves keep every under-cap
+    /// supply away from the cut entirely.
+    #[test]
+    fn unit_multiple_supplies_admit_whole_in_units_under_any_capacity() {
+        // Exhaustive over the small capacities (every unit step at
+        // and below the capacity), covering the pow2 carve shapes,
+        // the non-aligned edges, and the rig harness's configured
+        // 500.
+        for unit in [6_u32, 36_u32] {
+            for capacity in [63_u32, 64, 65, 128, 500] {
+                let mut supply = 0_u32;
+                while supply <= capacity {
+                    let clamp = dynamic_geometry_clamp(supply as usize, capacity);
+                    assert_eq!(
+                        clamp.drawn, supply,
+                        "unit {unit} supply {supply} vs capacity {capacity}: whole in units"
+                    );
+                    assert_eq!(clamp.drawn % unit, 0, "never a partial unit");
+                    assert_eq!(clamp.truncated, 0, "nothing omitted under the floor");
+                    supply += unit;
+                }
+            }
+        }
+        // The production caps' census rows, exact: the region's
+        // 36,288-vertex worst case (8 plates + 1000 proxy boxes —
+        // the closed form the 36,800 budget derives from) sits 510
+        // under the 36,798 floor (the +512 hand margin minus the
+        // floor's 2); the overlay's 36,000-vertex worst debug text
+        // (6,000 glyph quads) sits 264,000 under its 300,000 floor.
+        let region = dynamic_geometry_clamp(36_288, 36_800);
+        assert_eq!(region.drawn, 36_288);
+        assert_eq!(region.drawn % 36, 0, "1008 whole boxes");
+        assert_eq!(region.truncated, 0);
+        assert_eq!(region.capacity_floor - region.drawn, 510);
+        assert_eq!(
+            crate::scene::region_scene_capacity_vertices() / FRAMES_IN_FLIGHT - 36_288,
+            512,
+            "the closed form's hand margin over the worst production supply"
+        );
+        let overlay = dynamic_geometry_clamp(36_000, 300_000);
+        assert_eq!(overlay.drawn, 36_000);
+        assert_eq!(overlay.drawn % 6, 0, "6000 whole glyph quads");
+        assert_eq!(overlay.truncated, 0);
+    }
+
+    /// R4 — the overflow half of the whole-object contract: over the
+    /// floor the cut is the TRIANGLE floor, generically MID-UNIT (no
+    /// authoring rule can move it); a UNIT-ALIGNED capacity restores
+    /// whole-object admission at any overflow. The mid-unit rows are
+    /// the documented boundary — the census found no production
+    /// caller there (only the deliberate oversize harnesses).
+    #[test]
+    fn unit_aligned_capacity_admits_whole_objects_at_overflow() {
+        for (capacity, supply, unit, drawn, omitted, into_next) in [
+            // The DEFAULT region budget (36,800 ≡ 8 mod 36): the
+            // render_overflow smoke's own arithmetic — the cut lands
+            // 6 vertices into box 1023 (one triangle of one face).
+            (
+                36_800_u32,
+                37_800_usize,
+                36_u32,
+                36_798_u32,
+                1_002_u32,
+                6_u32,
+            ),
+            // The rig harness's configured 500 (≡ 32 mod 36): 17
+            // boxes of 612 admit 498 — 13 whole boxes plus 30 of
+            // box 14 (5 of 6 faces). NOTE: census_vram's leg-3 pin
+            // reads 112 (the pre-T04 612−500 arithmetic); the T04
+            // value is this 114 — a latent rig-run red outside the
+            // R4 lane's edit scope, reported to the orchestrator.
+            (500, 612, 36, 498, 114, 30),
+            // UNIT-ALIGNED budgets: 36,792 = 36 × 1022 and 504 =
+            // 36 × 14 — the floor itself is box-aligned, so the
+            // same over-cap supplies cut on BOX boundaries: whole
+            // boxes admitted, whole boxes omitted.
+            (36_792, 37_800, 36, 36_792, 1_008, 0),
+            (504, 612, 36, 504, 108, 0),
+            // The overlay limit is quad-aligned (300,000 = 6 ×
+            // 50,000): the smoke's 336,000 supply cuts on rect
+            // boundaries — 50,000 whole quads.
+            (300_000, 336_000, 6, 300_000, 36_000, 0),
+        ] {
+            let clamp = dynamic_geometry_clamp(supply, capacity);
+            assert_eq!(clamp.drawn, drawn, "capacity {capacity} supply {supply}");
+            assert_eq!(clamp.truncated, omitted);
+            assert_eq!(clamp.drawn % 3, 0, "never a partial primitive");
+            assert_eq!(
+                clamp.drawn % unit,
+                into_next,
+                "capacity {capacity}: the cut's position inside the next {unit}-vert unit \
+                 (0 = on a unit boundary)"
+            );
+            assert_eq!(
+                clamp.truncated % unit,
+                (unit - into_next) % unit,
+                "the omission completes the partially-admitted unit and refuses whole ones"
             );
         }
     }
