@@ -133,8 +133,9 @@ pub use npc_world_save::{
     NpcWorldSection, NpcWorldSectionV2,
 };
 pub use spine::{
-    CompactionError, ExecCtx, HistoryKind, LaneReport, LaneTotals, ObligationLocation,
-    ObligationView, ReconstructionError, ScheduleError, Spine, Stats, SuspensionStats, World,
+    CompactionError, ExecCtx, HistoryKind, HousekeepingAdmission, LaneReport, LaneTotals,
+    ObligationLocation, ObligationView, ReconstructionError, ScheduleError, Spine, Stats,
+    SuspensionStats, World,
 };
 pub use weapons::{
     Arsenal, FireContext, FireOutcome, FireRefusal, FiringPattern, MAX_SPREAD_RAYS, Shot,
