@@ -201,9 +201,10 @@ pub(crate) fn run_family_frames(
     let mut gpu_times: Vec<Duration> = Vec::with_capacity(measured);
     let mut presented: u64 = 0;
 
+    let mut input = engine_shell::InputSnapshot::default();
     for i in 0..total + lag {
         let frame_start = Instant::now();
-        let input = app.frame();
+        app.frame_into(&mut input);
         if input.quit_requested || input.minimized || app.window().size_in_pixels() != size {
             return Err("route interrupted by close, minimize or resize".into());
         }

@@ -7,6 +7,8 @@
 //! (see docs/TECH-ARCHITECTURE §6, Stage 1 record).
 
 mod common;
+#[path = "common/host_alloc.rs"]
+mod host_alloc;
 
 use std::time::Duration;
 
@@ -343,4 +345,122 @@ fn focus_transitions_are_recorded_in_diagnostics() {
     assert_eq!(records.len(), 2);
     assert!(records[0].message.contains("focus lost"));
     assert!(records[1].message.contains("focus regained"));
+}
+
+/// Counts only Rust allocations inside the frame pump. SDL event injection,
+/// snapshot checks and reporting all run outside the measuring window.
+#[test]
+fn warmed_input_frame_allocation_census() {
+    let _guard = lock();
+    let mut app = common::dummy_app("input allocation census");
+    let mut snapshot = InputSnapshot::default();
+    for (key_edge, cycles) in [(false, 0), (true, 0), (false, 1), (false, 32)] {
+        let mut totals = (0, 0);
+        // A press/release pair warms held-key membership and both edge directions.
+        for frame in 0..34 {
+            if key_edge {
+                let event = if frame % 2 == 0 {
+                    key_down(Keycode::W, false)
+                } else {
+                    key_up(Keycode::W)
+                };
+                app.push_event(event).unwrap();
+            }
+            for _ in 0..cycles {
+                for event in [
+                    key_down(Keycode::W, false),
+                    button_down(MouseButton::Left),
+                    key_up(Keycode::W),
+                    button_up(MouseButton::Left),
+                ] {
+                    app.push_event(event).unwrap();
+                }
+            }
+            let scope = host_alloc::HostAllocScope::new();
+            app.frame_into(&mut snapshot);
+            let (count, bytes) = scope.totals();
+            drop(scope);
+            if frame >= 2 {
+                totals.0 += count;
+                totals.1 += bytes;
+            }
+            let pressed = usize::from(key_edge && frame % 2 == 0);
+            let released = usize::from(key_edge && frame % 2 == 1);
+            assert_eq!(snapshot.keys_pressed.len(), cycles + pressed);
+            assert_eq!(snapshot.keys_released.len(), cycles + released);
+            assert_eq!(snapshot.mouse_pressed.len(), cycles);
+            assert_eq!(snapshot.mouse_released.len(), cycles);
+        }
+        eprintln!(
+            "single key edge={key_edge}, mixed cycles={cycles}: 32 frames, {totals:?} (allocations, requested bytes)"
+        );
+        assert_eq!(totals, (0, 0));
+    }
+}
+
+#[test]
+fn reusing_an_edited_snapshot_preserves_event_order_and_frame_boundaries() {
+    let _guard = lock();
+    let mut app = common::dummy_app("reusable input");
+    app.frame();
+    app.set_relative_mouse(true);
+    app.push_event(key_down(Keycode::W, false)).unwrap();
+    let retained = app.frame();
+    let mut snapshot = retained.clone();
+
+    // Application mappers can change any public field between polls.
+    snapshot.keys_pressed.push(Keycode::Escape);
+    snapshot.mouse_released.push(MouseButton::Right);
+    snapshot.quit_requested = true;
+    for event in [
+        key_down(Keycode::D, false),
+        key_down(Keycode::A, false),
+        key_down(Keycode::A, true),
+        key_up(Keycode::D),
+        key_up(Keycode::W),
+        button_down(MouseButton::Right),
+        button_down(MouseButton::Left),
+        button_up(MouseButton::Left),
+        button_up(MouseButton::Right),
+        motion(5.0, -1.0),
+        window_event(WindowEvent::FocusLost),
+        window_event(WindowEvent::FocusGained),
+        window_event(WindowEvent::Minimized),
+        window_event(WindowEvent::Restored),
+        window_event(WindowEvent::Resized(321, 123)),
+        motion(2.0, -3.0),
+    ] {
+        app.push_event(event).unwrap();
+    }
+    app.frame_into(&mut snapshot);
+    assert_eq!(
+        snapshot,
+        InputSnapshot {
+            keys_pressed: vec![Keycode::D, Keycode::A],
+            keys_released: vec![Keycode::D, Keycode::W],
+            key_repeats: 1,
+            mouse_pressed: vec![MouseButton::Right, MouseButton::Left],
+            mouse_released: vec![MouseButton::Left, MouseButton::Right],
+            look_delta: (2.0, -3.0),
+            resized: Some((321, 123)),
+            focus_lost: true,
+            focus_gained: true,
+            minimized: true,
+            restored: true,
+            ..InputSnapshot::default()
+        }
+    );
+    app.push_event(Event::Quit { timestamp: 0 }).unwrap();
+    for _ in 0..2 {
+        app.frame_into(&mut snapshot);
+        assert_eq!(
+            snapshot,
+            InputSnapshot {
+                quit_requested: true,
+                ..InputSnapshot::default()
+            }
+        );
+    }
+    assert_eq!(retained.keys_pressed, [Keycode::W]);
+    assert_eq!(retained.move_forward, 1);
 }

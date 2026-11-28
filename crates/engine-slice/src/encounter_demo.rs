@@ -2282,9 +2282,10 @@ pub fn run_encounter_demo_with_hud_scale(
     let mut timing = FrameTiming::new();
     let mut diagnostic = String::new();
     let mut diagnostic_at = None;
+    let mut snapshot = InputSnapshot::default();
     loop {
         let frame_start = std::time::Instant::now();
-        let mut snapshot = app.frame();
+        app.frame_into(&mut snapshot);
         let sprint_held = controls.map_frame(&mut snapshot, |key| app.is_held(key));
         if snapshot.focus_lost || snapshot.minimized {
             demo.driver.clear_pending_input();

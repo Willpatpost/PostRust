@@ -192,6 +192,21 @@ impl InputState {
         }
     }
 
+    /// The shell calls this between polls, before dispatching the next batch.
+    /// Each drained edge list can then grow directly in the caller's storage.
+    pub(crate) fn reuse_edge_buffers(&mut self, previous: &mut InputSnapshot) {
+        fn reuse<T>(drained: &mut Vec<T>, previous: &mut Vec<T>) {
+            debug_assert!(drained.is_empty());
+            previous.clear();
+            std::mem::swap(drained, previous);
+        }
+
+        reuse(&mut self.keys_pressed, &mut previous.keys_pressed);
+        reuse(&mut self.keys_released, &mut previous.keys_released);
+        reuse(&mut self.mouse_pressed, &mut previous.mouse_pressed);
+        reuse(&mut self.mouse_released, &mut previous.mouse_released);
+    }
+
     /// Drains the accumulators into a snapshot for this frame.
     pub fn poll(&mut self) -> InputSnapshot {
         let move_forward = i8::from(self.keys_held.contains(&Keycode::W))

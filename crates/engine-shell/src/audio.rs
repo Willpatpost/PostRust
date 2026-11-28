@@ -1273,107 +1273,9 @@ impl AudioDevice {
     }
 }
 
-/// The host-allocation counting seam for the in-file device tests
-/// (finding 11a's measurement): a `#[global_allocator]` wrapper
-/// around `std::alloc::System` that counts `alloc`/`alloc_zeroed`
-/// calls on the CURRENT THREAD while a [`HostAllocScope`] guard is
-/// alive. This is the same pattern — and the same SAFETY argument —
-/// as `engine-slice`'s `tests/common/mod.rs` host counter, placed
-/// here (inside `#[cfg(test)]`) so the callback body's allocation
-/// law can be measured through the identical code without SDL and
-/// without a new test binary.
-///
-/// SAFETY (the `unsafe impl GlobalAlloc`): every method delegates
-/// to `std::alloc::System` unchanged, inheriting its guarantees;
-/// the counting state is `thread_local!` `Cell`s incremented with
-/// no allocation inside the allocator path (no reentrancy hazard);
-/// `thread_local!` access inside `alloc` is sound for the
-/// pre-initialized non-const thread-local form used here (the
-/// fast-path check reads a `Cell<bool>` without destructors, so no
-/// registration/alloc can occur on first access). The workspace
-/// denies `unsafe_code`; this test-support module needs the one
-/// `unsafe impl GlobalAlloc` a counting allocator IS — the scoped
-/// allow keeps the deny everywhere else (the shipped library code
-/// carries none).
 #[cfg(test)]
-mod host_alloc_seam {
-    #![allow(unsafe_code)]
-
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::cell::Cell;
-
-    thread_local! {
-        static MEASURING: Cell<bool> = const { Cell::new(false) };
-        static ALLOC_COUNT: Cell<u64> = const { Cell::new(0) };
-    }
-
-    #[global_allocator]
-    static HOST_ALLOC_COUNTER: HostAllocCounter = HostAllocCounter;
-
-    /// Enables allocation counting for the current thread until
-    /// dropped. The count starts at zero on creation; `count()` reads
-    /// it at any point inside the scope.
-    pub struct HostAllocScope;
-
-    impl HostAllocScope {
-        pub fn new() -> Self {
-            ALLOC_COUNT.with(|c| c.set(0));
-            MEASURING.with(|m| m.set(true));
-            HostAllocScope
-        }
-
-        /// The allocations counted so far in this scope.
-        pub fn count(&self) -> u64 {
-            ALLOC_COUNT.with(|c| c.get())
-        }
-    }
-
-    impl Drop for HostAllocScope {
-        fn drop(&mut self) {
-            MEASURING.with(|m| m.set(false));
-        }
-    }
-
-    struct HostAllocCounter;
-
-    unsafe impl GlobalAlloc for HostAllocCounter {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            MEASURING.with(|m| {
-                if m.get() {
-                    ALLOC_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
-                }
-            });
-            unsafe { System.alloc(layout) }
-        }
-
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            unsafe { System.dealloc(ptr, layout) }
-        }
-
-        unsafe fn realloc(&self, ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
-            // THE REALLOC COUNT (the sign-off review's finding 22
-            // corrective — the identical gap the slice seam carried):
-            // a warmed buffer growing inside the callback body is
-            // allocation churn the pre-corrective counter never saw.
-            // Every realloc while measuring counts as one event.
-            MEASURING.with(|m| {
-                if m.get() {
-                    ALLOC_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
-                }
-            });
-            unsafe { System.realloc(ptr, old_layout, new_size) }
-        }
-
-        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            MEASURING.with(|m| {
-                if m.get() {
-                    ALLOC_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
-                }
-            });
-            unsafe { System.alloc_zeroed(layout) }
-        }
-    }
-}
+#[path = "../tests/common/host_alloc.rs"]
+mod host_alloc_seam;
 
 #[cfg(test)]
 mod device_tests {
@@ -1454,15 +1356,15 @@ mod device_tests {
     #[test]
     fn the_seam_counts_realloc_growth() {
         let scope = HostAllocScope::new();
-        let before = scope.count();
+        let before = scope.totals().0;
         let mut grown: Vec<u8> = Vec::with_capacity(8);
         grown.push(0);
-        let after_alloc = scope.count();
+        let after_alloc = scope.totals().0;
         // Grow far past the capacity: at least one realloc fires.
         for i in 0..4096 {
             grown.push(i as u8);
         }
-        let after_grow = scope.count();
+        let after_grow = scope.totals().0;
         assert!(
             after_grow > after_alloc,
             "the growth's reallocations are counted (alloc {after_alloc}, grown {after_grow})"
@@ -1860,7 +1762,7 @@ mod device_tests {
         // below vacuously).
         let scope = HostAllocScope::new();
         let probe: Vec<u8> = Vec::with_capacity(1024);
-        let probe_count = scope.count();
+        let probe_count = scope.totals().0;
         drop(probe);
         assert!(
             probe_count >= 1,
@@ -1873,11 +1775,11 @@ mod device_tests {
         for _ in 0..64 {
             mixer.run_callback((MIX_CHUNK_FRAMES as i32) * 5 + 7, &mut accepting);
         }
-        let success_allocations = scope.count();
+        let success_allocations = scope.totals().0;
         // The rejected-write path: our side of the failure boundary.
         let scope = HostAllocScope::new();
         mixer.run_callback((MIX_CHUNK_FRAMES as i32) * 3, &mut |_: &[i16]| false);
-        let rejection_allocations = scope.count();
+        let rejection_allocations = scope.totals().0;
         stop.store(true, Ordering::Relaxed);
         contender.join().expect("the contender finishes");
         assert_eq!(

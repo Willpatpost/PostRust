@@ -1101,9 +1101,10 @@ pub fn run_playable_demo(options: PlayableOptions) -> Result<(), String> {
     let mut timing = FrameTiming::new();
     let mut scene_vertices: Vec<SceneVertex> = Vec::new();
 
+    let mut snapshot = InputSnapshot::default();
     loop {
         let frame_start = Instant::now();
-        let mut snapshot = app.frame();
+        app.frame_into(&mut snapshot);
         let sprint_held = controls.map_frame(&mut snapshot, |key| app.is_held(key));
         if snapshot.focus_lost || snapshot.minimized {
             demo.driver.clear_pending_input();
