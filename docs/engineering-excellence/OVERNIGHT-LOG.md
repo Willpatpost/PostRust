@@ -347,3 +347,8 @@ accumulated actuals in the test comment (39.5/38.2 at 8192, 51.3 at 32768),
 by 3×+. The siblings untouched (their own actuals, not yet fired). The
 covering run `46142938607` dispatched at `ba0a089` (E-S2 + the guard + the
 design docs).
+
+**E-S2 + the guard correction verified green:** run `46142938607` at
+`ba0a089` — all five jobs success. The A06 extraction now stands at
+E-S1+E-S2 landed; the combat guard's recalibrated bound held on all
+platforms.
