@@ -426,3 +426,6 @@ recorded** (≥5k unrelated queued at transition in a production/rig workload
 — the landed batteries are the ready-made slope evidence for the designed
 stage 2). CI pins corrected (`ff99da7`: main 1676/1625, lines 38). Run
 `46152480236` dispatched.
+
+**T09 stage-1 verified green:** run `46152480236` at `ff99da7` — all five
+jobs; the +3/+1-line pin arithmetic confirmed on both platforms.
