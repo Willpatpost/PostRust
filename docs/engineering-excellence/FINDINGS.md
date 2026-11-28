@@ -80,12 +80,12 @@ audit-claimed with verification-first mandated in each fix lane's brief.
 | ID | Area | State | Note |
 |---|---|---|---|
 | CA-01 (F01) | REND | REGISTERED (audit-claimed) | scene-attach failure atomicity — resources installed before pipelines, handle published after, a pipeline error leaves no-scene + retry-refused (Q10's precise shape) |
-| CA-02 (F02) | CORE | REGISTERED (audit-claimed) | npc-world decode resource admission — valid wire ranges vs affordable decoder work are different contracts; caller-configurable limits + checked reservation (Q07's precise shape) |
-| CA-03 (F03) | CORE | REGISTERED (audit-claimed) | scheduler housekeeping — a blocked move charging one while registering multiple dependency edges; the bounded-work contract (Q03/B01's precise shape) |
+| CA-02 | CORE | **FIXED-AWAITING-RE-AUDIT** | integrated `b9709c6` (lane `9dce696`) | the decode admission: SectionDecodeLimits + the four pre-reservation gates + fallible try_reserve (the typed Overflow where the process aborted); the ~62x precision recorded; the counting-allocator census the documented follow-up |
+| CA-03 | CORE | **FIXED-AWAITING-RE-AUDIT** | integrated `b9709c6` (lane `9dce696`) | the HousekeepingStats observability + the atomic release/order contract documented before any cursor; the no-partial-release proof surface; the backlog slope published |
 | CA-04 (F04) | CI | **FIXED (verified before fix, `3311fd9`)** | the main result-line check 33 vs the tree's 34 + the heavy expected=674 glued into a comment (Linux comparing 674 actual against the stale 549) — both corrected |
 | CA-05 (F05) | CORE | **CONFIRMED (witness reproduced, exit 101)** | RotatedCollider's public mutable fields vs private cached bounds — a legal field edit leaves the cached frame/world AABB stale; the translated box misses what the rebuilt box hits |
 | CA-06 (F06) | CORE | **CONFIRMED (witness reproduced, exit 101)** | the v2 section's in-memory validate() never inspects active positions while restore does — (4,0) passes validation and fails its own round-trip |
-| CA-07 (F07) | CORE | REGISTERED (audit-claimed) | compaction's consequence eligibility is caller-established only; the retained-tail copy cost during compaction unmeasured (Q05's precise shape) |
+| CA-07 | CORE | **FIXED-AWAITING-RE-AUDIT** | integrated `b9709c6` (lane `9dce696`) | the ConsequenceEligibility token + the refusal arm with lag; the equivalence pinned with unresolved consequences; the in-place drain (zero-allocation sustained loop); the per-firing operation-count table |
 | CA-08 (F08) | CORE | REGISTERED (audit-claimed) | regional transitions still scan the whole queue (A08's precise shape) |
 | CA-09 (F09) | CORE/SLICE | REGISTERED (audit-claimed) | the indexed query APIs' production adoption boundary (Q04's precise shape — the combat_demo linear caller named) |
 | CA-10 (F10) | REND | REGISTERED (audit-claimed) | post-acquire errors can strand a frame slot — the fence reset before the fallible upload/record/submit chain |
