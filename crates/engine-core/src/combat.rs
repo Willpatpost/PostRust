@@ -2890,10 +2890,18 @@ mod tests {
             for (arm, value) in linear_times.iter().enumerate() {
                 linear_series[arm].push((size, *value));
             }
-            // Sanity bounds only (characterization, not a gate).
+            // Sanity bounds only (characterization, not a gate). The
+            // per-record form (the 877590f/3e0c729 precedent): the
+            // diagonal grid arm walks cells proportionally to the
+            // population, so a fixed bound trips on its own scaling
+            // under a slow/shared runner (the CI measured 51.3 ms
+            // at 32,768 against the old fixed 50 ms — the local rig
+            // reads ~13.7 ms); 5 ms + 4 µs/record gives ~2.6x
+            // headroom over the CI actual while a quadratic blowup
+            // (seconds at 32k) still fails by an order of magnitude.
             for ns in grid_times.iter().chain(linear_times.iter()) {
                 assert!(
-                    ns.is_finite() && *ns < 50_000_000.0,
+                    ns.is_finite() && *ns < 5_000_000.0 + size as f64 * 4_000.0,
                     "pop {size}: a probe is absurdly slow: {ns} ns"
                 );
             }

@@ -619,8 +619,11 @@ fn spatial_query_allocation_census() {
                 row
             );
             assert!(
-                row.ns_per_query.is_finite() && row.ns_per_query < 50_000_000.0,
-                "{:?} — an absurdly slow query (sanity bound)",
+                row.ns_per_query.is_finite()
+                    && row.ns_per_query < 5_000_000.0 + row.population as f64 * 4_000.0,
+                "{:?} - an absurdly slow query (sanity bound; the per-record form — the \
+                 diagonal arms scale with the population and a fixed 50 ms trips on a \
+                 shared runner)",
                 row
             );
         }

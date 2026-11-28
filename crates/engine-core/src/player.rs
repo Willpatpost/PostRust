@@ -4834,10 +4834,16 @@ mod tests {
             }
             linear_box_series.push((size, linear_times[0]));
             linear_diag_series.push((size, linear_times[5]));
-            // Sanity bounds only (characterization, not a gate).
+            // Sanity bounds only (characterization, not a gate). The
+            // per-record form (the 877590f/3e0c729 precedent): the
+            // diagonal grid arm walks cells proportionally to the
+            // population (the same class the CI runner fired on the
+            // combat twin — 51.3 ms at 32,768 vs the fixed 50 ms);
+            // corrected here in the same pass so the slower-runner
+            // arithmetic cannot fire this file next.
             for ns in grid_times.iter().chain(linear_times.iter()) {
                 assert!(
-                    ns.is_finite() && *ns < 50_000_000.0,
+                    ns.is_finite() && *ns < 5_000_000.0 + size as f64 * 4_000.0,
                     "pop {size}: a query arm is absurdly slow: {ns} ns"
                 );
             }
