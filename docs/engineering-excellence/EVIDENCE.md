@@ -219,6 +219,40 @@ extent assertion is fail-visible in the gate. Log:
 clause is discharged: the oracle was always right; the capture extent was
 wrong.
 
+## E-11 B15 workspace footprint measurement (2026-11-27, rig CPU 9800X3D, worktree tree `72c91d3`, branch `ee/b15-workspace-footprint`)
+
+The B15 lane's full record: `docs/engineering-excellence/FOOTPRINT.md`
+(every table's command, method, and finding lives there; raw trees/logs at
+`Temp\opencode\ee\b15-artifacts\` — scratch by the E-manifest convention).
+All commands below exit 0 unless stated.
+
+- Closure matrix (`cargo tree -p <crate> --edges {normal | normal,build |
+  normal,build,dev} --prefix none`, markers stripped, unique counted):
+  core 1/1/1 (zero deps), persist 20/25/25, renderer 16/53/57, shell
+  6/14/14, slice 36/70/70 unique incl. self. Plain `cargo tree -p
+  engine-renderer` (no `--edges`) = 57 — the default includes dev+build.
+- Binaries: `cargo build -p engine-slice` → debug exe 16,371,200 B;
+  `cargo build -p engine-slice --release` (cold release dir, timed
+  48.0 s) → release exe 10,509,824 B. Release rlibs: core 3,543,938 ·
+  persist 10,454,706 · renderer 2,829,696 · shell 508,042 · slice
+  12,298,198 B. Stripped sizes NOT measured — no strip binary in the
+  pinned `minimal` toolchain profile (recorded, not worked around).
+- Minimal consumers (throwaway projects outside the repo, fresh locks,
+  own target dirs, `Measure-Command` around `cargo build` after an
+  untimed `cargo fetch`; all `cargo run` green): core 2.9 s / closure 2;
+  persist 9.0 s / 26 (SQLite C compile isolated at 3.5 s via
+  `cargo clean -p libsqlite3-sys` + rebuild); shell 44.5 s / 15 (SDL
+  static isolated at 38.4 s via `cargo clean -p sdl3-sys` + rebuild);
+  renderer 41.9 s / 54; slice 52.6 s / 71.
+- Key outcomes registered: B15 → MEASURED (the rend-half note's
+  "nalgebra" corrected — no nalgebra in any closure); NEW-REND-11 (the
+  sdl3-sys caret drift: fresh consumers resolve SDL 3.4.20 vs the
+  workspace's pinned 3.4.18); dev-dep isolation verified closure-neutral;
+  rusqlite-unconditional and the renderer's absent types-only surface
+  recorded as the two owner-decision levers (FOOTPRINT.md §8).
+- Lane gates (untouched tree): `cargo fmt --all -- --check` exit 0;
+  `cargo check --workspace --all-targets` exit 0.
+
 ## Measurement baselines
 
 (To be established in P0: first full build of the integration tree, then the
