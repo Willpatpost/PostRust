@@ -28,15 +28,19 @@ use std::collections::BTreeSet;
 use rusqlite::Connection;
 
 use crate::chain_walk::{
-    ChainReads, ValidationOutcome, WalkCursor, WalkedChain, advance_cursor as core_advance_cursor,
-    validate_observed as core_validate_observed, walk_chain_excluding as core_walk_chain_excluding,
+    ChainReads, STREAM_CHUNK_BYTES, ValidationOutcome, VerifiedPrefix, WalkCursor, WalkedChain,
+    advance_cursor as core_advance_cursor, validate_observed as core_validate_observed,
+    verify_streamed_object, walk_chain_excluding as core_walk_chain_excluding,
 };
 use crate::hash::Hash;
 use crate::local::WalkStats;
 use crate::medium::MediumError;
 use crate::record::RevisionRecord;
 
-use super::rows::{load_referenced_object, load_referenced_record, record_exists};
+use super::rows::{
+    load_referenced_object, load_referenced_record, object_length, read_object_prefix,
+    read_object_window, record_exists,
+};
 
 /// The session-scoped trusted cursor (the §5.3.2 model — identical
 /// semantics to the file medium's): the shared walk core's
@@ -65,6 +69,41 @@ impl ChainReads for SqliteChainReads<'_> {
 
     fn record_present(&mut self, id: &Hash) -> Result<bool, MediumError> {
         record_exists(self.conn, id)
+    }
+
+    // (T29) The unverified bounded prefix read: the streaming
+    // verify's leading window (verification is the streaming op's
+    // business, never this one's).
+    fn read_object_prefix(&mut self, hash: &Hash, len: usize) -> Result<Vec<u8>, MediumError> {
+        read_object_prefix(self.conn, hash, len)
+    }
+
+    // (T29) The streaming verified read over the sqlite medium: the
+    // leading window through the prefix op, the positioned
+    // continuation through `substr` windows bounded by the row's
+    // known length (the pinned rusqlite's incremental blob I/O is
+    // feature-gated off — the design's sanctioned substrate fallback)
+    // — the SHA-256 folds every window, the identity mismatch
+    // refusing as the referenced corruption the whole-row load always
+    // refused. Every statement runs inside the caller's coordination
+    // scope (the walk's transaction), the whole-row read's own
+    // discipline.
+    fn verify_object_streaming(&mut self, hash: &Hash) -> Result<VerifiedPrefix, MediumError> {
+        // The leading window through the seam's own prefix op — the
+        // unverified bounded read the streaming verify then folds
+        // into the full-object hash.
+        let leading = self.read_object_prefix(hash, STREAM_CHUNK_BYTES)?;
+        let total = object_length(self.conn, hash)?;
+        let mut offset = leading.len() as u64;
+        let conn = self.conn;
+        verify_streamed_object(hash, leading, |buf| {
+            if offset >= total {
+                return Ok(0);
+            }
+            let read = read_object_window(conn, hash, offset, buf)?;
+            offset += read as u64;
+            Ok(read)
+        })
     }
 }
 

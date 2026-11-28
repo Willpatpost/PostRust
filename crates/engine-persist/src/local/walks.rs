@@ -19,17 +19,21 @@
 //! timing and the refusal rules are the core's.
 
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::Path;
 
 use crate::chain_walk::{
-    ChainReads, ValidationOutcome, WalkCursor, advance_cursor as core_advance_cursor,
-    validate_observed as core_validate_observed, walk_chain_excluding as core_walk_chain_excluding,
+    ChainReads, STREAM_CHUNK_BYTES, ValidationOutcome, VerifiedPrefix, WalkCursor,
+    advance_cursor as core_advance_cursor, validate_observed as core_validate_observed,
+    verify_streamed_object, walk_chain_excluding as core_walk_chain_excluding,
 };
 use crate::hash::Hash;
 use crate::medium::{ChainSummary, MediumError};
 use crate::record::RevisionRecord;
 
-use super::layout::{load_referenced_at, object_path_at};
+use super::layout::{
+    load_referenced_at, object_path_at, open_object_window_at, read_object_prefix_at,
+};
 use super::{Cursor, LocalFileMedium};
 
 /// (P3-L9b) The local adapter over the shared walk core's reader
@@ -57,6 +61,51 @@ impl ChainReads for LocalChainReads<'_> {
 
     fn record_present(&mut self, id: &Hash) -> Result<bool, MediumError> {
         Ok(object_path_at(self.root, id).is_file())
+    }
+
+    // (T29) The unverified bounded prefix read: the streaming
+    // verify's leading window (verification is the streaming op's
+    // business, never this one's).
+    fn read_object_prefix(&mut self, hash: &Hash, len: usize) -> Result<Vec<u8>, MediumError> {
+        read_object_prefix_at(self.root, hash, len)
+    }
+
+    // (T29) The streaming verified read over the file medium: the
+    // leading window through the prefix op, the positioned
+    // continuation through ONE held file handle — the SHA-256 folds
+    // every window (every byte read, never every byte held; the L5
+    // discipline at this seam), the identity mismatch refusing as the
+    // referenced corruption the whole-bytes load always refused.
+    fn verify_object_streaming(&mut self, hash: &Hash) -> Result<VerifiedPrefix, MediumError> {
+        // The leading window through the seam's own prefix op — the
+        // unverified bounded read the streaming verify then folds
+        // into the full-object hash.
+        let leading = self.read_object_prefix(hash, STREAM_CHUNK_BYTES)?;
+        let (mut file, path) = open_object_window_at(self.root, hash, leading.len() as u64)?;
+        verify_streamed_object(hash, leading, |buf| {
+            let mut read = 0usize;
+            while read < buf.len() {
+                let n = file
+                    .read(&mut buf[read..])
+                    .map_err(|e| io_err_read("read object", &path, e))?;
+                if n == 0 {
+                    break;
+                }
+                read += n;
+            }
+            Ok(read)
+        })
+    }
+}
+
+/// The reads' Io form over the window path (the layout's `io_err`
+/// shape, kept identical so a window read failure classifies exactly
+/// as the whole read's).
+fn io_err_read(op: &'static str, path: &Path, source: std::io::Error) -> MediumError {
+    MediumError::Io {
+        op,
+        path: path.display().to_string(),
+        source,
     }
 }
 

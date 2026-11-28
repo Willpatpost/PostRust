@@ -4,6 +4,7 @@
 //! unreferenced-object sweep. These change when the evidence
 //! preservation rules change.
 
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 
@@ -85,12 +86,17 @@ impl LocalFileMedium {
     /// The session-open sweep: under the lock, every `objects/` entry
     /// not reachable from HEAD is quarantined (junk names included);
     /// reachable objects were hash-verified during the cold walk.
+    /// (T29, commit 2) BORROW, not clone: the directory iteration
+    /// queries `cursor.reachable.contains` per entry under a shared
+    /// borrow — the whole-set deep copy per open is deleted (zero
+    /// observables moved; the empty fallback preserves the
+    /// no-cursor shape exactly).
     pub(super) fn sweep_unreferenced(&mut self) -> Result<u64, MediumError> {
-        let reachable = self
-            .cursor
-            .as_ref()
-            .map(|cursor| cursor.reachable.clone())
-            .unwrap_or_default();
+        let empty = BTreeSet::new();
+        let reachable = match self.cursor.as_ref() {
+            Some(cursor) => &cursor.reachable,
+            None => &empty,
+        };
         let mut quarantined = 0u64;
         let dir = self.root.join(OBJECTS_DIR);
         for entry in fs::read_dir(&dir).map_err(|e| io_err("read objects dir", &dir, e))? {

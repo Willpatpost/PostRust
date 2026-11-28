@@ -7,8 +7,8 @@
 //! constants stay re-exported at the module root (the shared contract
 //! surface, the S4 WAIT_TIMEOUT_NS precedent).
 
-use std::fs::{self, OpenOptions};
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::fault::FaultControl;
@@ -201,6 +201,66 @@ pub(super) fn load_referenced_at(root: &Path, hash: &Hash) -> Result<Vec<u8>, Me
         MediumError::HashMismatch { .. } => MediumError::ReferencedObjectCorrupt { hash: *hash },
         other => other,
     })
+}
+
+// ------------------------------------------------- (T29) the streaming reads
+
+/// (T29) Reads a bounded prefix of an object's bytes under a store
+/// root — the UNVERIFIED prefix op (the streaming verify's leading
+/// window; hash verification NOT implied, never a substitute for it).
+/// The layout's own load semantics govern the failure classes:
+/// NotFound → `MissingObject`, over-limit → `Format`, read failure →
+/// the typed `Io`; a shorter-than-requested result means the object
+/// itself is shorter (EOF is data here, never an error).
+pub(super) fn read_object_prefix_at(
+    root: &Path,
+    hash: &Hash,
+    len: usize,
+) -> Result<Vec<u8>, MediumError> {
+    let path = object_path_at(root, hash);
+    let metadata = fs::metadata(&path).map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => MediumError::MissingObject { hash: *hash },
+        _ => io_err("stat object", &path, e),
+    })?;
+    if metadata.len() > MAX_OBJECT_BYTES {
+        return Err(MediumError::Format(engine_core::SaveError::Limit {
+            section: "object-store",
+            kind: "byte-length",
+            value: metadata.len(),
+            max: MAX_OBJECT_BYTES,
+        }));
+    }
+    let mut file = File::open(&path).map_err(|e| io_err("read object", &path, e))?;
+    let want = len.min(usize::try_from(metadata.len()).unwrap_or(len));
+    let mut buffer = vec![0u8; want];
+    let mut read = 0usize;
+    while read < buffer.len() {
+        let n = file
+            .read(&mut buffer[read..])
+            .map_err(|e| io_err("read object", &path, e))?;
+        if n == 0 {
+            buffer.truncate(read);
+            break;
+        }
+        read += n;
+    }
+    Ok(buffer)
+}
+
+/// (T29) Opens an object for positioned continuation reads at
+/// `offset` — the streaming verify's window source after the leading
+/// prefix window (sequential reads from the seek position; the medium
+/// is immutable within the walk's single coordination scope).
+pub(super) fn open_object_window_at(
+    root: &Path,
+    hash: &Hash,
+    offset: u64,
+) -> Result<(File, PathBuf), MediumError> {
+    let path = object_path_at(root, hash);
+    let mut file = File::open(&path).map_err(|e| io_err("read object", &path, e))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| io_err("seek object", &path, e))?;
+    Ok((file, path))
 }
 
 fn platform_tier() -> SyncTier {

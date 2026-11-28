@@ -77,13 +77,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use sha2::{Digest, Sha256};
+
 use crate::checkpoint::{
     CHECKPOINT_METADATA_DOMAIN, CheckpointMetadata, ReclaimedIndexEntry, peek_object_domain,
 };
-use crate::composite_manifest;
+use crate::composite_manifest::{self, ManifestEntry};
 use crate::hash::Hash;
 use crate::medium::{ChainSummary, MediumError};
 use crate::record::{AuthorityMode, RecordKind, RevisionRecord};
+use engine_core::wire::MAX_TAG_LEN;
 
 // ----------------------------------------------------------- the reader seam
 
@@ -97,6 +100,17 @@ use crate::record::{AuthorityMode, RecordKind, RevisionRecord};
 /// hash-verify: the bytes returned for an identity are the stored
 /// bytes AT that identity (a mismatch is the referenced-corruption
 /// refusal, never silently passed through).
+///
+/// (T29, commit 2) The two narrow LOADING operations the bounded
+/// residency design adds — still loading operations, still the
+/// `BeginReads` narrowness, never a provider hierarchy: the
+/// unverified bounded prefix read (the streaming verify's leading
+/// window) and the streaming verified read (the SHA-256 folded over
+/// bounded windows — every byte READ, never every byte HELD, the L5
+/// `FrameReader` discipline at this seam). The whole-bytes form
+/// remains for the callers that genuinely need the payload (the
+/// composite root, the checkpoint metadata — the legitimate whole
+/// reads).
 pub(crate) trait ChainReads {
     /// Reads and hash-verifies a revision record's canonical bytes.
     fn read_record_bytes(&mut self, id: &Hash) -> Result<Vec<u8>, MediumError>;
@@ -106,6 +120,179 @@ pub(crate) trait ChainReads {
     /// detection — an absent parent is a gap, legitimate only under
     /// the covering skip table).
     fn record_present(&mut self, id: &Hash) -> Result<bool, MediumError>;
+    /// (T29) Reads a bounded prefix of a content object's bytes —
+    /// hash verification NOT implied; prefix-only consumers must not
+    /// treat this as verification (the streaming op is the verified
+    /// form). The streaming verify's leading window.
+    fn read_object_prefix(&mut self, hash: &Hash, len: usize) -> Result<Vec<u8>, MediumError>;
+    /// (T29) Fully hash-verifies a content object WITHOUT
+    /// materializing it: streams the bytes in bounded chunks, returns
+    /// the verified prefix (the leading bytes through the
+    /// chunk-envelope header's end — every prefix consumer decodes
+    /// from it exactly as it would from the whole bytes) plus the
+    /// object's total byte count (the declared-length accounting). A
+    /// hash mismatch is the referenced-corruption refusal, exactly as
+    /// the whole-bytes form's.
+    fn verify_object_streaming(&mut self, hash: &Hash) -> Result<VerifiedPrefix, MediumError>;
+}
+
+// ------------------------------------------------- the streaming verification
+
+/// The streaming read chunk — the design §4.1's labeled stream-buffer
+/// bound: the ONE window the streaming reads hold, reused per object
+/// (a stack array in the driver, the journal hash path's own shape).
+pub(crate) const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
+/// The absolute prefix-capture bound: the chunk-envelope header's
+/// worst case under the wire maxima (8 + MAX_TAG_LEN domain,
+/// 8 + MAX_TAG_LEN tag, 8 payload length). Real objects' headers are
+/// ~60-100 B; the bound exists so a pathological long-tag object
+/// decodes from the captured prefix exactly as it would from whole
+/// bytes.
+pub(crate) const ENVELOPE_HEADER_BOUND_BYTES: usize = 24 + 2 * MAX_TAG_LEN as usize;
+
+/// One streaming verification's outcome: the verified leading bytes
+/// plus the object's total streamed byte count.
+pub(crate) struct VerifiedPrefix {
+    /// The leading bytes through the envelope header's end (or the
+    /// whole object when shorter, or the capture up to a wire bound
+    /// the consumer's bounded read refuses identically on).
+    pub(crate) bytes: Vec<u8>,
+    /// The object's full streamed byte count — the declared-length
+    /// accounting input (the envelope's header + declared payload
+    /// must equal it: no trailing, no short).
+    pub(crate) total_len: u64,
+}
+
+/// How the adaptive prefix capture reads the bytes captured so far.
+enum CaptureTarget {
+    /// The capture is complete through this offset.
+    Complete(usize),
+    /// A declared string length exceeded the wire maximum — the
+    /// capture stops here (the consumer's bounded read refuses on
+    /// the length prefix alone, exactly as the whole read's would).
+    OverBound(usize),
+    /// The capture genuinely needs more bytes.
+    NeedsMore,
+}
+
+/// Resolves the prefix-capture target for the bytes captured so far:
+/// EVERY object's domain peek (the u64-LE length-prefixed domain —
+/// the same grammar `Decoder` reads, bounds checked identically),
+/// plus the chunk envelope header (the tag and the payload length)
+/// when the domain is the session-chunk domain — the ONE
+/// prefix-decodable payload grammar the walks consume (every other
+/// payload structure — the manifest, the checkpoint metadata — is
+/// served by its object's legitimate whole read). A non-chunk
+/// object's capture therefore ends at its domain: the peek decodes
+/// from the prefix exactly as it would from the whole bytes.
+fn capture_target(prefix: &[u8]) -> CaptureTarget {
+    if prefix.len() < 8 {
+        return CaptureTarget::NeedsMore;
+    }
+    let domain_len = u64::from_le_bytes(prefix[0..8].try_into().unwrap()) as usize;
+    if domain_len > MAX_TAG_LEN as usize {
+        return CaptureTarget::OverBound(8);
+    }
+    let domain_end = 8 + domain_len;
+    if prefix.len() < domain_end {
+        return CaptureTarget::NeedsMore;
+    }
+    if &prefix[8..domain_end] == composite_manifest::SESSION_CHUNK_DOMAIN.as_bytes() {
+        if prefix.len() < domain_end + 8 {
+            return CaptureTarget::NeedsMore;
+        }
+        let tag_len =
+            u64::from_le_bytes(prefix[domain_end..domain_end + 8].try_into().unwrap()) as usize;
+        if tag_len > MAX_TAG_LEN as usize {
+            return CaptureTarget::OverBound(domain_end + 8);
+        }
+        let header_end = domain_end + 8 + tag_len + 8;
+        if prefix.len() < header_end {
+            return CaptureTarget::NeedsMore;
+        }
+        return CaptureTarget::Complete(header_end);
+    }
+    CaptureTarget::Complete(domain_end)
+}
+
+/// (T29) The streaming verification driver — core mechanics, provider
+/// policy-free: folds the adapter-supplied byte windows through
+/// SHA-256 (every byte read, never every byte held) while capturing
+/// the leading bytes through the envelope header's end. The capture
+/// extends only while the header is genuinely undecodable and within
+/// the wire maxima — a bound-exceeding or truncated object leaves the
+/// consumer refusing exactly as the whole-read form would. The
+/// adapters provide the transport: the leading window (through
+/// [`ChainReads::read_object_prefix`]) and the continuation reads
+/// into the reused window buffer (zero at the object's end).
+///
+/// The identity mismatch is the referenced-corruption refusal — the
+/// streaming op is the walks' referenced load, the whole-bytes
+/// `load_referenced` form's exact twin (this op's only production
+/// consumers are reference-reached loads).
+pub(crate) fn verify_streamed_object(
+    hash: &Hash,
+    leading: Vec<u8>,
+    mut read_window: impl FnMut(&mut [u8]) -> Result<usize, MediumError>,
+) -> Result<VerifiedPrefix, MediumError> {
+    // The adaptive prefix capture over the leading window and the
+    // continuation windows, until the capture target resolves (the
+    // domain peek's need, plus the chunk envelope header's for
+    // chunk-domain objects), a wire bound is exceeded, or the object
+    // ends.
+    fn resolve_capture(captured: &mut Vec<u8>, capture_open: &mut bool) {
+        if !*capture_open {
+            return;
+        }
+        match capture_target(captured) {
+            CaptureTarget::Complete(target) => {
+                captured.truncate(target);
+                *capture_open = false;
+            }
+            CaptureTarget::OverBound(target) => {
+                captured.truncate(target);
+                *capture_open = false;
+            }
+            CaptureTarget::NeedsMore => {
+                if captured.len() >= ENVELOPE_HEADER_BOUND_BYTES {
+                    captured.truncate(ENVELOPE_HEADER_BOUND_BYTES);
+                    *capture_open = false;
+                }
+            }
+        }
+    }
+    let mut hasher = Sha256::new();
+    let mut total: u64 = 0;
+    let mut captured = leading;
+    hasher.update(&captured);
+    total += captured.len() as u64;
+    let mut capture_open = true;
+    resolve_capture(&mut captured, &mut capture_open);
+    let mut window = [0u8; STREAM_CHUNK_BYTES];
+    loop {
+        let read = read_window(&mut window)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&window[..read]);
+        total += read as u64;
+        if capture_open {
+            captured.extend_from_slice(&window[..read]);
+            resolve_capture(&mut captured, &mut capture_open);
+        }
+    }
+    let finalized: [u8; 32] = hasher.finalize().into();
+    let observed = Hash::from_bytes(&finalized).ok_or(MediumError::Chain {
+        rule: "streaming-hash-width",
+    })?;
+    if observed != *hash {
+        return Err(MediumError::ReferencedObjectCorrupt { hash: *hash });
+    }
+    Ok(VerifiedPrefix {
+        bytes: captured,
+        total_len: total,
+    })
 }
 
 // ---------------------------------------------------------------- the cursor
@@ -281,11 +468,18 @@ pub(crate) fn walk_chain_excluding<R: ChainReads>(
                 rule: "duplicate-idempotency-key",
             });
         }
-        let mut first_object: Option<Vec<u8>> = None;
+        // (T29) The streaming verified read: every content reference
+        // hash-verifies WITHOUT materializing (the SHA-256 folded
+        // over bounded windows — every byte read, never every byte
+        // held), the FIRST reference's verified prefix kept for
+        // the recognition peek below. The refs loop's error order is
+        // the whole-read form's exact order (each reference verified
+        // in position order; the peek still runs AFTER the loop).
+        let mut first_prefix: Option<VerifiedPrefix> = None;
         for (position, reference) in record.content_refs.iter().enumerate() {
-            let bytes = reads.read_object_bytes(reference)?;
+            let verified = reads.verify_object_streaming(reference)?;
             if position == 0 {
-                first_object = Some(bytes);
+                first_prefix = Some(verified);
             }
             if reachable.insert(*reference) {
                 content_objects += 1;
@@ -295,34 +489,35 @@ pub(crate) fn walk_chain_excluding<R: ChainReads>(
         // carries the checkpoint-metadata domain — its index joins the
         // membership universe (staged for the post-walk merge) and its
         // skip table becomes the gap cover for everything below it.
-        if let Some(bytes) = first_object {
-            let domain = peek_object_domain(&bytes).map_err(MediumError::Format)?;
+        // (T29) The peek runs on the verified prefix — the same point
+        // in the check sequence the whole-read form peeked, over
+        // exactly the bytes the whole read would have peeked; a
+        // root/metadata domain then takes its ONE legitimate whole
+        // read (the medium is immutable within the walk's single
+        // coordination scope — the S6-C4 discipline — so the second
+        // read serves the same bytes the stream verified).
+        if let Some(verified) = first_prefix {
+            let domain = peek_object_domain(&verified.bytes).map_err(MediumError::Format)?;
             // The VERIFIED composite-closure reachability (the K2-C1
             // corrective): a /2 root's chunks are transitively
             // referenced through its manifest — the walk proves EVERY
-            // dependency (the hash-verified read, the full envelope
-            // verification against the manifest entry) before it joins
-            // the reachable set. A missing, corrupt, or malformed
-            // chunk fails the walk closed; nothing is silently
-            // ignored.
+            // dependency (the streaming hash verification, the full
+            // envelope verification against the manifest entry)
+            // before it joins the reachable set. A missing, corrupt,
+            // or malformed chunk fails the walk closed; nothing is
+            // silently ignored.
             if domain == composite_manifest::SESSION_SNAPSHOT_V2_DOMAIN {
+                let bytes = reads.read_object_bytes(&record.content_refs[0])?;
                 let manifest = composite_manifest::decode(&bytes).map_err(MediumError::Format)?;
                 for entry in &manifest.entries {
-                    let chunk_bytes = reads.read_object_bytes(&entry.identity)?;
-                    crate::composite_append::verify_chunk_dependency(
-                        &chunk_bytes,
-                        &entry.identity,
-                        &manifest,
-                    )
-                    .map_err(|_error| MediumError::Chain {
-                        rule: "composite-closure-verification",
-                    })?;
+                    verify_composite_chunk_streaming(reads, entry)?;
                     if reachable.insert(entry.identity) {
                         content_objects += 1;
                     }
                 }
             }
             if domain == CHECKPOINT_METADATA_DOMAIN {
+                let bytes = reads.read_object_bytes(&record.content_refs[0])?;
                 let metadata = CheckpointMetadata::decode(&bytes).map_err(MediumError::Format)?;
                 staged_indexes.extend(metadata.index.iter().cloned());
                 checkpoints.push(current);
@@ -489,14 +684,19 @@ pub(crate) fn walk_chain<R: ChainReads>(
 /// already-closed handle). R15: each returned entry carries its
 /// walk-verified composite closure (the established verifier runs
 /// during the walk — see [`VerifiedSuffixEntry`]).
+///
+/// (T29, commit 2) The trusted sets arrive BY BORROW — the dispatch's
+/// three cursor-set deep clones are deleted (the consumer only reads
+/// them; zero observables moved, the census's churn row pinned to
+/// zero).
 pub(crate) fn walk_suffix<R: ChainReads>(
     reads: &mut R,
     target: Hash,
     until: Hash,
     trusted_epoch: u64,
-    trusted_keys: BTreeSet<Vec<u8>>,
-    trusted_record_ids: BTreeSet<Hash>,
-    reclaimed: BTreeMap<Hash, u64>,
+    trusted_keys: &BTreeSet<Vec<u8>>,
+    trusted_record_ids: &BTreeSet<Hash>,
+    reclaimed: &BTreeMap<Hash, u64>,
 ) -> Result<Vec<VerifiedSuffixEntry>, MediumError> {
     let mut suffix: Vec<VerifiedSuffixEntry> = Vec::new();
     let mut current = target;
@@ -565,24 +765,37 @@ pub(crate) fn walk_suffix<R: ChainReads>(
                 rule: "duplicate-idempotency-key",
             });
         }
-        // R15: every content reference loads hash-verified; the FIRST
-        // reference's domain determines the entry's composite closure
-        // — the cold walk's exact discipline — and the established
-        // verifier runs HERE, during the walk: a /2 root's full
-        // closure is verified exactly once (no re-extraction, no
+        // R15: every content reference verifies hash-complete (the
+        // T29 streaming form — never materialized); the FIRST
+        // reference's verified prefix determines the entry's composite
+        // closure — the cold walk's exact discipline — and the
+        // established verifier runs HERE, during the walk: a /2 root's
+        // full closure is verified exactly once (no re-extraction, no
         // duplicate hash-verifying reads), a malformed root domain
         // refuses (the peek propagates), and a missing,
         // hash-mismatched, or malformed chunk refuses — a failure is
-        // never converted into an absent closure.
-        let mut first_object: Option<Vec<u8>> = None;
+        // never converted into an absent closure. The peek runs AFTER
+        // the refs loop, the whole-read form's exact point; a /2 root
+        // then takes its ONE legitimate whole read (the manifest
+        // decode needs it; the medium is immutable within the walk's
+        // coordination scope).
+        let mut first_prefix: Option<VerifiedPrefix> = None;
         for (position, reference) in record.content_refs.iter().enumerate() {
-            let bytes = reads.read_object_bytes(reference)?;
+            let verified = reads.verify_object_streaming(reference)?;
             if position == 0 {
-                first_object = Some(bytes);
+                first_prefix = Some(verified);
             }
         }
-        let composite_closure = match first_object {
-            Some(bytes) => verified_composite_closure(reads, &bytes)?,
+        let composite_closure = match first_prefix {
+            Some(verified) => {
+                let domain = peek_object_domain(&verified.bytes).map_err(MediumError::Format)?;
+                if domain != composite_manifest::SESSION_SNAPSHOT_V2_DOMAIN {
+                    None
+                } else {
+                    let root_bytes = reads.read_object_bytes(&record.content_refs[0])?;
+                    verified_composite_closure(reads, &root_bytes)?
+                }
+            }
             None => None,
         };
         newer_epoch = Some(record.epoch);
@@ -599,14 +812,66 @@ pub(crate) fn walk_suffix<R: ChainReads>(
     }
 }
 
+/// (T29) The streaming composite-chunk verification — the R12/R15
+/// envelope discipline without the whole materialization: the
+/// streaming op hash-verifies the chunk's identity (the whole-bytes
+/// `verify_chunk_dependency` remains, the cfg(test) reference walk's
+/// oracle), the envelope header (domain, tag, payload length) decodes
+/// from the verified prefix, and the declared-length accounting
+/// closes the envelope: the header plus the declared payload must
+/// equal the streamed total (no trailing, no short), under the
+/// schema's per-chunk bound and the manifest's declared length. Every
+/// failure class refuses with the ONE rule string the whole-bytes
+/// form maps every failure to; the missing/corrupt propagations are
+/// the streaming op's own (the whole read's exact twins).
+fn verify_composite_chunk_streaming<R: ChainReads>(
+    reads: &mut R,
+    entry: &ManifestEntry,
+) -> Result<(), MediumError> {
+    let refuse = || MediumError::Chain {
+        rule: "composite-closure-verification",
+    };
+    let verified = reads.verify_object_streaming(&entry.identity)?;
+    let mut decoder = engine_core::Decoder::new(&verified.bytes);
+    let domain = decoder
+        .read_str(MAX_TAG_LEN, "k2c1-chunk")
+        .map_err(|_error| refuse())?;
+    if domain != composite_manifest::SESSION_CHUNK_DOMAIN {
+        return Err(refuse());
+    }
+    let tag = decoder
+        .read_str(MAX_TAG_LEN, "k2c1-chunk")
+        .map_err(|_error| refuse())?;
+    if tag != entry.tag {
+        return Err(refuse());
+    }
+    let payload_len = decoder.read_u64().map_err(|_error| refuse())?;
+    if payload_len > composite_manifest::MAX_CHUNK_BYTES {
+        return Err(refuse());
+    }
+    if payload_len != entry.payload_length {
+        return Err(refuse());
+    }
+    // The declared-length accounting: the envelope header plus the
+    // declared payload is the complete object — no trailing data, no
+    // short payload (the whole form's `read_bytes` truncation and
+    // `finish` trailing refusals).
+    let consumed = (verified.bytes.len() - decoder.remaining()) as u64;
+    if consumed + payload_len != verified.total_len {
+        return Err(refuse());
+    }
+    Ok(())
+}
+
 /// The VERIFIED composite closure over the reader (the R12
 /// corrective): for a /2 root, strictly decode the manifest and
-/// verify every declared chunk (the hash-verified load + the full
-/// envelope check) — returning the closure identities for the trusted
-/// reachability set. Every failure propagates typed; `Ok(None)` is
-/// ONLY the positively established non-composite case (the peeked
+/// verify every declared chunk (the streaming hash verification + the
+/// envelope accounting) — returning the closure identities for the
+/// trusted reachability set. Every failure propagates typed; `Ok(None)`
+/// is ONLY the positively established non-composite case (the peeked
 /// domain is not the /2 root) — never a suppressed verification
-/// failure.
+/// failure. (T29) The root arrives as the caller's ONE legitimate
+/// whole read (the manifest decode needs it); every CHUNK streams.
 pub(crate) fn verified_composite_closure<R: ChainReads>(
     reads: &mut R,
     root_bytes: &[u8],
@@ -618,11 +883,7 @@ pub(crate) fn verified_composite_closure<R: ChainReads>(
     let manifest = composite_manifest::decode(root_bytes).map_err(MediumError::Format)?;
     let mut identities = Vec::with_capacity(manifest.entries.len());
     for entry in &manifest.entries {
-        let chunk_bytes = reads.read_object_bytes(&entry.identity)?;
-        crate::composite_append::verify_chunk_dependency(&chunk_bytes, &entry.identity, &manifest)
-            .map_err(|_error| MediumError::Chain {
-                rule: "composite-closure-verification",
-            })?;
+        verify_composite_chunk_streaming(reads, entry)?;
         identities.push(entry.identity);
     }
     Ok(Some(identities))
@@ -692,16 +953,20 @@ pub(crate) fn validate_observed<R: ChainReads>(
             Ok(ValidationOutcome::VerifiedHead)
         }
         (Some(id), Some((trusted_head, trusted_epoch))) => {
-            let (trusted_keys, trusted_record_ids, reclaimed) = cursor
-                .as_ref()
-                .map(|cursor| {
-                    (
-                        cursor.seen_keys.clone(),
-                        cursor.record_ids.clone(),
-                        cursor.reclaimed.clone(),
-                    )
-                })
-                .unwrap_or_default();
+            // (T29, commit 2) BORROW, not clone: the consumer only
+            // reads the three sets — the whole-read form's three
+            // cursor-set deep copies per divergent-head validation are
+            // deleted (zero observables moved; the census's churn row
+            // pins zero). The empty fallbacks preserve the defensive
+            // None-cursor shape exactly (no allocation — an empty
+            // BTreeSet/Map allocates nothing).
+            let empty_keys = BTreeSet::new();
+            let empty_ids = BTreeSet::new();
+            let empty_reclaimed = BTreeMap::new();
+            let (trusted_keys, trusted_record_ids, reclaimed) = match cursor.as_ref() {
+                Some(cursor) => (&cursor.seen_keys, &cursor.record_ids, &cursor.reclaimed),
+                None => (&empty_keys, &empty_ids, &empty_reclaimed),
+            };
             match walk_suffix(
                 reads,
                 id,
@@ -819,6 +1084,520 @@ pub(crate) fn advance_cursor(
                         cursor.content_objects += 1;
                     }
                 }
+            }
+        }
+    }
+}
+
+// ============================================================== the census
+// (T29, commit 1) The walker residency census — the R07-§7-shape
+// read-only ESTIMATOR over a walked chain (the design §2's three
+// lifetime classes as documented fields over MEASURED populations),
+// test-only: never serialized, never a fingerprint input, never a
+// production surface. The populations are the walked chain's own
+// (records, content objects, key lengths, reclaimed entries) plus
+// two caller-measured inputs (the store's largest content object;
+// the walked records' total depends_on edges) — the estimator never
+// guesses a population. The per-element constants are the R07 §2 /
+// CA-17 conventions the design inherits and labels as estimates:
+// std's exact B-tree node occupancy is its own business, so the node
+// share is taken at ≈48 B amortized per element; `Hash` is a fixed
+// 32 B; the Vec header at 24 B; Vec capacity slack up to 2× length
+// is a documented upper bound the rows report WITHOUT (the rows are
+// the convention-constant term, never the slack).
+//
+// Gated with the differential battery that consumes it (the
+// both-providers census requires the sqlite twin; a local-only test
+// build compiles neither).
+#[cfg(all(test, feature = "sqlite"))]
+pub(crate) mod walk_census {
+    use super::WalkedChain;
+
+    /// 32 B hash + the ≈48 B amortized B-tree node share per element.
+    pub(crate) const HASH_SET_ELEMENT_BYTES: u64 = 32 + 48;
+    /// The per-key overhead: 24 B Vec header + the node share; the
+    /// key's own bytes are measured per key.
+    pub(crate) const KEY_OVERHEAD_BYTES: u64 = 24 + 48;
+    /// 32 B hash + 8 B epoch + the node share per reclaimed entry.
+    pub(crate) const RECLAIMED_ELEMENT_BYTES: u64 = 32 + 8 + 48;
+    /// The walked triple `(Hash, u64, Vec<Hash>)`: 40 B tuple + 24 B
+    /// Vec header, plus 32 B per depends_on edge (measured).
+    pub(crate) const WALKED_TUPLE_BYTES: u64 = 40 + 24;
+    /// The deferred ancestry index entry: 32 B hash + 8 B position +
+    /// the node share.
+    pub(crate) const POSITIONS_ELEMENT_BYTES: u64 = 32 + 8 + 48;
+    /// (T29, commit 2 — the cause of this row's movement) The
+    /// object-buffer term under the STREAMING mechanics: ONE reused
+    /// stream window (the design §4.1's labeled ~64 KiB bound, the
+    /// same figure the journal hash path's own stack window carries)
+    /// plus the largest object the walk holds WHOLE — composite roots
+    /// and checkpoint metadata ONLY, the legitimate whole reads
+    /// (zero on plain shapes). The whole-read form's 2·o_max
+    /// concurrent holds (the commit-1 row, 11,010,048 B measured at
+    /// the L5-max shape) are gone: every plain content reference
+    /// verifies without materializing.
+    pub(crate) const STREAM_WINDOW_BYTES: u64 = 64 * 1024;
+
+    /// One census row set. Every byte field is an estimator row over
+    /// measured populations (labeled conventions, never byte-level
+    /// measurements); every population field is measured.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct WalkCensus {
+        // measured populations
+        /// Retained records walked (the summary's own count).
+        pub(crate) records: u64,
+        /// Distinct reachable content objects (the summary's own).
+        pub(crate) content_objects: u64,
+        /// Distinct idempotency keys seen (on-chain plus the
+        /// reclaimed-index merge).
+        pub(crate) keys: u64,
+        /// The reclaimed-index entries merged into the universe.
+        pub(crate) reclaimed_entries: u64,
+        /// The caller-measured total depends_on edges walked.
+        pub(crate) dependency_edges: u64,
+        // class 1 — cursor-resident (session lifetime; O(chain) BY
+        // DESIGN and load-bearing: the substrate of the O(1)
+        // per-commit key/dependency membership checks — never shrunk)
+        /// `reachable` (record ids + content hashes).
+        pub(crate) reachable_bytes: u64,
+        /// `record_ids` (the revision-id subset).
+        pub(crate) record_ids_bytes: u64,
+        /// `seen_keys` (per-key measured lengths).
+        pub(crate) seen_keys_bytes: u64,
+        /// `reclaimed` (identity → epoch).
+        pub(crate) reclaimed_index_bytes: u64,
+        /// The four fields' total (the O(100) fixed fields omitted as
+        /// noise, per the design §2.1).
+        pub(crate) cursor_resident_bytes: u64,
+        // class 2 — walk-transient (peak concurrent with the cursor
+        // being built)
+        /// The `walked` triples.
+        pub(crate) walked_bytes: u64,
+        /// The deferred ancestry `positions` map.
+        pub(crate) positions_bytes: u64,
+        /// The object-buffer term under the STREAMING mechanics (T29
+        /// commit 2 — the cause of this row's movement): one reused
+        /// ~64 KiB stream window plus the largest WHOLE-HELD object
+        /// (composite roots and checkpoint metadata only, the
+        /// legitimate whole reads; zero on plain shapes). The
+        /// commit-1 row was 2·o_max under the whole-read mechanics
+        /// (11,010,048 B measured at the L5-max shape).
+        pub(crate) object_buffer_peak_bytes: u64,
+        /// The walk-transient total (walked + positions + the object
+        /// buffers; the staged MK indexes join the reclaimed row at
+        /// the merge, per the design §2.2's accounting).
+        pub(crate) walk_transient_peak_bytes: u64,
+        // class 3 — the per-validation churn
+        /// (T29, commit 2 — the cause of this row's movement: ZERO)
+        /// The dispatch's per-validation churn. The whole-read form
+        /// deep-cloned the three cursor sets before EVERY
+        /// divergent-head suffix walk (the commit-1 rows: 61,641 /
+        /// 247,253 / 990,677 B, linear in N); the borrow fix deleted
+        /// the clones — the sets pass by reference into the read-only
+        /// consumer, zero cursor-set copies per validation.
+        pub(crate) validation_churn_bytes: u64,
+    }
+
+    /// Computes the census over one walked chain.
+    /// `largest_whole_read_object_bytes` is the CALLER-MEASURED
+    /// largest object the walk holds whole under the streaming
+    /// mechanics (roots/metadata only; zero on plain shapes).
+    pub(crate) fn census(
+        walked: &WalkedChain,
+        largest_whole_read_object_bytes: u64,
+        dependency_edges: u64,
+    ) -> WalkCensus {
+        let cursor = &walked.cursor;
+        let records = walked.summary.records;
+        let content_objects = walked.summary.content_objects;
+        let keys = cursor.seen_keys.len() as u64;
+        let reclaimed_entries = cursor.reclaimed.len() as u64;
+        let reachable_bytes = HASH_SET_ELEMENT_BYTES * cursor.reachable.len() as u64;
+        let record_ids_bytes = HASH_SET_ELEMENT_BYTES * cursor.record_ids.len() as u64;
+        let seen_keys_bytes = cursor
+            .seen_keys
+            .iter()
+            .map(|key| KEY_OVERHEAD_BYTES + key.len() as u64)
+            .sum();
+        let reclaimed_index_bytes = RECLAIMED_ELEMENT_BYTES * reclaimed_entries;
+        let walked_bytes = WALKED_TUPLE_BYTES * records + 32 * dependency_edges;
+        let positions_bytes = POSITIONS_ELEMENT_BYTES * records;
+        // (T29, commit 2) The streaming mechanics' object-buffer peak:
+        // one reused window + the largest legitimate whole hold. The
+        // churn row: ZERO (the clones deleted).
+        let object_buffer_peak_bytes = STREAM_WINDOW_BYTES + largest_whole_read_object_bytes;
+        let cursor_resident_bytes =
+            reachable_bytes + record_ids_bytes + seen_keys_bytes + reclaimed_index_bytes;
+        WalkCensus {
+            records,
+            content_objects,
+            keys,
+            reclaimed_entries,
+            dependency_edges,
+            reachable_bytes,
+            record_ids_bytes,
+            seen_keys_bytes,
+            reclaimed_index_bytes,
+            cursor_resident_bytes,
+            walked_bytes,
+            positions_bytes,
+            object_buffer_peak_bytes,
+            walk_transient_peak_bytes: walked_bytes + positions_bytes + object_buffer_peak_bytes,
+            validation_churn_bytes: 0,
+        }
+    }
+}
+
+// ==================================================== the whole-read reference
+// (T29, commit 2) THE L5 ORACLE DISCIPLINE (`79b2fde`, the journal
+// streaming differential's own shape): the production walks stream
+// (every byte read, never every byte held); these cfg(test)
+// reference walks are the PRE-STREAMING whole-read forms, preserved
+// verbatim as the differential oracle the equivalence proof compares
+// against — states by equality, errors by their complete Debug and
+// Display surfaces. Gated with the battery that drives them (the
+// both-providers proof requires the sqlite twin). FROZEN: these
+// bodies never change again — that is the point of an oracle.
+#[cfg(all(test, feature = "sqlite"))]
+pub(crate) mod whole_read_reference {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::checkpoint::{
+        CHECKPOINT_METADATA_DOMAIN, CheckpointMetadata, ReclaimedIndexEntry, peek_object_domain,
+    };
+    use crate::composite_manifest;
+    use crate::hash::Hash;
+    use crate::medium::MediumError;
+    use crate::record::{RecordKind, RevisionRecord};
+
+    use super::{ChainReads, VerifiedSuffixEntry, WalkCursor, WalkedChain};
+
+    /// The whole-read cold walk (the pre-streaming form, verbatim):
+    /// every referenced object loaded and hash-verified whole, the
+    /// composite chunks loaded whole AND verified through
+    /// `verify_chunk_dependency` (whose `bytes.to_vec()` copy is part
+    /// of the form this reference documents).
+    pub(crate) fn walk_chain_excluding_reference<R: ChainReads>(
+        reads: &mut R,
+        head: Hash,
+        exclude: &BTreeSet<Hash>,
+    ) -> Result<WalkedChain, MediumError> {
+        let mut seen_ids = BTreeSet::new();
+        let mut seen_keys = BTreeSet::new();
+        let mut reachable = BTreeSet::new();
+        let mut records = 0u64;
+        let mut content_objects = 0u64;
+        let mut current = head;
+        let mut newer_epoch: Option<u64> = None;
+        let mut head_epoch = 0u64;
+        let mut walked: Vec<(Hash, u64, Vec<Hash>)> = Vec::new();
+        let mut staged_indexes: Vec<ReclaimedIndexEntry> = Vec::new();
+        let mut checkpoints: Vec<Hash> = Vec::new();
+        let mut skip_table: Option<(Hash, CheckpointMetadata)> = None;
+        let mut gap_pending = false;
+        let (founding_id, authority, campaign_id) = loop {
+            if !seen_ids.insert(current) {
+                return Err(MediumError::Chain { rule: "cycle" });
+            }
+            let bytes = reads.read_record_bytes(&current)?;
+            let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
+            if records == 0 {
+                head_epoch = record.epoch;
+            }
+            if let Some(epoch) = newer_epoch {
+                if gap_pending {
+                    if record.epoch >= epoch {
+                        return Err(MediumError::Chain {
+                            rule: "epoch-regression",
+                        });
+                    }
+                    gap_pending = false;
+                } else if record.epoch.checked_add(1) != Some(epoch) {
+                    return Err(MediumError::Chain {
+                        rule: "epoch-regression",
+                    });
+                }
+            }
+            if let Some(key) = &record.idempotency_key
+                && !seen_keys.insert(key.clone())
+            {
+                return Err(MediumError::Chain {
+                    rule: "duplicate-idempotency-key",
+                });
+            }
+            let mut first_object: Option<Vec<u8>> = None;
+            for (position, reference) in record.content_refs.iter().enumerate() {
+                let bytes = reads.read_object_bytes(reference)?;
+                if position == 0 {
+                    first_object = Some(bytes);
+                }
+                if reachable.insert(*reference) {
+                    content_objects += 1;
+                }
+            }
+            if let Some(bytes) = first_object {
+                let domain = peek_object_domain(&bytes).map_err(MediumError::Format)?;
+                if domain == composite_manifest::SESSION_SNAPSHOT_V2_DOMAIN {
+                    let manifest =
+                        composite_manifest::decode(&bytes).map_err(MediumError::Format)?;
+                    for entry in &manifest.entries {
+                        let chunk_bytes = reads.read_object_bytes(&entry.identity)?;
+                        crate::composite_append::verify_chunk_dependency(
+                            &chunk_bytes,
+                            &entry.identity,
+                            &manifest,
+                        )
+                        .map_err(|_error| MediumError::Chain {
+                            rule: "composite-closure-verification",
+                        })?;
+                        if reachable.insert(entry.identity) {
+                            content_objects += 1;
+                        }
+                    }
+                }
+                if domain == CHECKPOINT_METADATA_DOMAIN {
+                    let metadata =
+                        CheckpointMetadata::decode(&bytes).map_err(MediumError::Format)?;
+                    staged_indexes.extend(metadata.index.iter().cloned());
+                    checkpoints.push(current);
+                    skip_table = Some((current, metadata));
+                }
+            }
+            reachable.insert(current);
+            walked.push((current, record.epoch, record.depends_on.clone()));
+            records += 1;
+            newer_epoch = Some(record.epoch);
+            match record.parent {
+                Some(parent) => {
+                    if reads.record_present(&parent)? && !exclude.contains(&parent) {
+                        current = parent;
+                    } else {
+                        let Some((owner, table)) = skip_table.as_ref() else {
+                            return Err(MediumError::MissingObject { hash: parent });
+                        };
+                        let target = if current == *owner {
+                            table
+                                .self_skip()
+                                .map(|entry| entry.nearest_retained_ancestor)
+                        } else {
+                            table
+                                .skip_for(&current)
+                                .map(|entry| entry.nearest_retained_ancestor)
+                        };
+                        let Some(target) = target else {
+                            return Err(MediumError::MissingObject { hash: parent });
+                        };
+                        gap_pending = true;
+                        current = target;
+                    }
+                }
+                None => match record.kind {
+                    RecordKind::Founding {
+                        authority,
+                        campaign_id,
+                    } => {
+                        if record.epoch != 0 {
+                            return Err(MediumError::Chain {
+                                rule: "kind-incoherent",
+                            });
+                        }
+                        break (current, authority, campaign_id);
+                    }
+                    RecordKind::Regular => {
+                        return Err(MediumError::Chain {
+                            rule: "founding-missing",
+                        });
+                    }
+                },
+            }
+        };
+        let mut reclaimed: BTreeMap<Hash, u64> = BTreeMap::new();
+        let mut reclaimed_records = 0u64;
+        let mut reclaimed_keys = 0u64;
+        for entry in staged_indexes {
+            if seen_ids.contains(&entry.hash) {
+                continue;
+            }
+            if reclaimed.insert(entry.hash, entry.epoch).is_some() {
+                return Err(MediumError::Chain {
+                    rule: "checkpoint-index-incoherent",
+                });
+            }
+            if let Some(key) = &entry.key
+                && !seen_keys.insert(key.clone())
+            {
+                return Err(MediumError::Chain {
+                    rule: "duplicate-idempotency-key",
+                });
+            }
+            if entry.key.is_some() {
+                reclaimed_keys += 1;
+            }
+            reclaimed_records += 1;
+        }
+        let mut positions: BTreeMap<Hash, usize> = BTreeMap::new();
+        for (index, (id, _, _)) in walked.iter().enumerate() {
+            positions.insert(*id, index);
+        }
+        for (index, (_, record_epoch, dependencies)) in walked.iter().enumerate() {
+            for dependency in dependencies {
+                let resolves = positions
+                    .get(dependency)
+                    .is_some_and(|position| *position > index)
+                    || reclaimed
+                        .get(dependency)
+                        .is_some_and(|&dep_epoch| dep_epoch < *record_epoch);
+                if !resolves {
+                    return Err(MediumError::Chain {
+                        rule: "depends-on-unresolvable",
+                    });
+                }
+            }
+        }
+        Ok(WalkedChain {
+            summary: crate::medium::ChainSummary {
+                head,
+                height: head_epoch,
+                founding: founding_id,
+                authority,
+                campaign_id: campaign_id.clone(),
+                records,
+                content_objects,
+                checkpoints,
+                reclaimed_records,
+                reclaimed_keys,
+            },
+            cursor: WalkCursor {
+                head,
+                epoch: head_epoch,
+                seen_keys,
+                reachable,
+                record_ids: seen_ids,
+                reclaimed,
+                founding: founding_id,
+                authority,
+                campaign_id,
+                content_objects,
+            },
+        })
+    }
+
+    /// The whole-read composite closure (the pre-streaming form,
+    /// verbatim — every chunk loaded whole and verified through
+    /// `verify_chunk_dependency`).
+    pub(crate) fn verified_composite_closure_reference<R: ChainReads>(
+        reads: &mut R,
+        root_bytes: &[u8],
+    ) -> Result<Option<Vec<Hash>>, MediumError> {
+        let domain = peek_object_domain(root_bytes).map_err(MediumError::Format)?;
+        if domain != composite_manifest::SESSION_SNAPSHOT_V2_DOMAIN {
+            return Ok(None);
+        }
+        let manifest = composite_manifest::decode(root_bytes).map_err(MediumError::Format)?;
+        let mut identities = Vec::with_capacity(manifest.entries.len());
+        for entry in &manifest.entries {
+            let chunk_bytes = reads.read_object_bytes(&entry.identity)?;
+            crate::composite_append::verify_chunk_dependency(
+                &chunk_bytes,
+                &entry.identity,
+                &manifest,
+            )
+            .map_err(|_error| MediumError::Chain {
+                rule: "composite-closure-verification",
+            })?;
+            identities.push(entry.identity);
+        }
+        Ok(Some(identities))
+    }
+
+    /// The whole-read suffix walk (the pre-streaming form, verbatim —
+    /// the trusted sets still arrive BY VALUE, the clones' shape).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn walk_suffix_reference<R: ChainReads>(
+        reads: &mut R,
+        target: Hash,
+        until: Hash,
+        trusted_epoch: u64,
+        trusted_keys: BTreeSet<Vec<u8>>,
+        trusted_record_ids: BTreeSet<Hash>,
+        reclaimed: BTreeMap<Hash, u64>,
+    ) -> Result<Vec<VerifiedSuffixEntry>, MediumError> {
+        let mut suffix: Vec<VerifiedSuffixEntry> = Vec::new();
+        let mut current = target;
+        let mut newer_epoch: Option<u64> = None;
+        let mut visited = BTreeSet::new();
+        let mut suffix_keys = BTreeSet::new();
+        loop {
+            if current == until {
+                if let Some(boundary) = suffix.last()
+                    && trusted_epoch.checked_add(1) != Some(boundary.record.epoch)
+                {
+                    return Err(MediumError::Chain {
+                        rule: "epoch-regression",
+                    });
+                }
+                let mut positions: BTreeMap<Hash, usize> = BTreeMap::new();
+                for (index, entry) in suffix.iter().enumerate() {
+                    positions.insert(entry.id, index);
+                }
+                for (index, entry) in suffix.iter().enumerate() {
+                    for dependency in &entry.record.depends_on {
+                        let resolves = trusted_record_ids.contains(dependency)
+                            || positions
+                                .get(dependency)
+                                .is_some_and(|position| *position > index)
+                            || reclaimed
+                                .get(dependency)
+                                .is_some_and(|&dep_epoch| dep_epoch < entry.record.epoch);
+                        if !resolves {
+                            return Err(MediumError::Chain {
+                                rule: "depends-on-unresolvable",
+                            });
+                        }
+                    }
+                }
+                return Ok(suffix);
+            }
+            if !visited.insert(current) {
+                return Err(MediumError::Chain { rule: "cycle" });
+            }
+            let bytes = reads.read_record_bytes(&current)?;
+            let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
+            if let Some(epoch) = newer_epoch
+                && record.epoch.checked_add(1) != Some(epoch)
+            {
+                return Err(MediumError::Chain {
+                    rule: "epoch-regression",
+                });
+            }
+            if let Some(key) = &record.idempotency_key
+                && (trusted_keys.contains(key) || !suffix_keys.insert(key.clone()))
+            {
+                return Err(MediumError::Chain {
+                    rule: "duplicate-idempotency-key",
+                });
+            }
+            let mut first_object: Option<Vec<u8>> = None;
+            for (position, reference) in record.content_refs.iter().enumerate() {
+                let bytes = reads.read_object_bytes(reference)?;
+                if position == 0 {
+                    first_object = Some(bytes);
+                }
+            }
+            let composite_closure = match first_object {
+                Some(bytes) => verified_composite_closure_reference(reads, &bytes)?,
+                None => None,
+            };
+            newer_epoch = Some(record.epoch);
+            let parent = record.parent;
+            suffix.push(VerifiedSuffixEntry {
+                id: current,
+                record,
+                composite_closure,
+            });
+            match parent {
+                Some(parent) => current = parent,
+                None => return Err(MediumError::Chain { rule: "divergence" }),
             }
         }
     }
