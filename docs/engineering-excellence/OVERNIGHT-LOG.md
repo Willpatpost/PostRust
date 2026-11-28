@@ -183,3 +183,18 @@ from the pinned pure function. CI pins corrected from measured actuals at
 renderer-release 215 — measured on the combined tree; main passed 1633/1582 —
 lane-measured +4 with candidate confirmation). The confirming run `46129831117`
 dispatched at `a03f6fb`.
+
+## The T19+T04 candidate verified green (2026-11-28)
+
+**Run `46130487361` at exact head `089741d`: conclusion SUCCESS — all five
+jobs green.** The A06 E-S1 extraction and the T04 complete-primitive admission
+are CI-verified together: heavy 720/60/72 (unchanged), main 1633 Linux /
+1582 Windows / 2 ignored / 36 result lines, renderer-release 215/2, macOS
+ARM64, and the count-gate self-test on every main job. The interim runs are
+recorded honestly: `46129087795` (the T19-isolated measurement — heavy+macOS
+green, the main jobs red only at the correctly-stale pins) and `46129831117`
+(the first confirming run — caught the orchestrator's own missed passed-pin
+edit, the a03f6fb commit having claimed the 1629→1633/1578→1582 movement in
+its message while the sed applied only the result-lines and renderer-release
+literals; the gate did exactly what it exists to do; the omission corrected
+at `089741d` with the history in the pin's comment).
