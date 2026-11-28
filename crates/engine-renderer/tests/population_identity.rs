@@ -25,10 +25,19 @@
 //! population source; a collision there is a caller defect the
 //! RENDERER-side identity layer must defend against, which is what
 //! T05 landed; see `submission.rs`'s identity records).
+//!
+//! R1 (D-EE-11) extends the same shape to the token's own documented
+//! residual — allocator address recycling: the last two tests pin
+//! the public surface of the lifetime scope that closes it (the
+//! content digest beside the token, taken through the packing's own
+//! emission order), while the renderer-level witnesses (the
+//! recycling harness itself, the missed-bump re-admissions, both
+//! halves) live in-crate in `submission.rs`'s tests because
+//! `adapt_frame` and `PopulationGenerations` are `pub(crate)`.
 
 use engine_renderer::proxy_instances::{
-    GenerationDecision, INSTANCE_STRIDE, InstanceTransform, MAX_INSTANCES, ProxyInstance,
-    repack_populations, repack_populations_generation,
+    GenerationDecision, INSTANCE_STRIDE, InstanceSourceToken, InstanceTransform, MAX_INSTANCES,
+    ProxyInstance, population_digest, repack_populations, repack_populations_generation,
 };
 
 /// Two fixture populations from two DIFFERENT sources (their own
@@ -191,4 +200,81 @@ fn core_gate_reuses_an_identical_byte_payload_across_a_different_partition() {
     // block and the per-kind draws must follow the NEW counts; the
     // stamp-level defense is proven in `vulkan/frame.rs`'s tests.
     assert_eq!(buffer, a_bytes);
+}
+
+/// R1 (D-EE-11, Arm A) — THE RECYCLED-ADDRESS TOKEN COLLISION, at
+/// the public token surface: source A's Vec is DROPPED and source
+/// B's same-layout Vec is allocated immediately after — on this
+/// platform's allocator the immediate same-size realloc lands at A's
+/// exact addresses (observed deterministically; the lane's pre-fix
+/// red run proved it: the renderer-level witness's missed-bump
+/// verify panicked, which is only reachable when the recycled token
+/// matched). WHEN that recycling happens, B's token EQUALS A's —
+/// the pointer-derived token alone cannot distinguish the sources
+/// (the residual T05 documented honestly). The composed identity
+/// must still discriminate: the CONTENT DIGEST of different content
+/// differs, so the renderer-side gate (`submission.rs`'s records)
+/// re-admits B instead of letting it inherit A's validated
+/// generation. This test pins the composed discriminability
+/// unconditionally (green on any allocator; on a recycling
+/// allocator it exercises the exact documented hazard).
+#[test]
+fn recycled_address_token_collision_is_content_separable() {
+    let a = source_a();
+    let a_token = InstanceSourceToken::of(&a[..2], &a[2..], &[]);
+    let a_digest = population_digest(&a[..2], &a[2..], &[]);
+    drop(a);
+    let b = source_b();
+    let b_token = InstanceSourceToken::of(&b[..2], &b[2..], &[]);
+    let b_digest = population_digest(&b[..2], &b[2..], &[]);
+    // The composed contract: WHEN the allocator recycles A's exact
+    // addresses (the token collides), the digest MUST separate the
+    // different content — the renderer's would-reuse gate compares
+    // both, so the collision cannot inherit A's generation.
+    assert!(
+        a_token != b_token || a_digest != b_digest,
+        "a recycled-address token collision with different content \
+         must remain discriminable by the composed identity"
+    );
+    assert_ne!(
+        a_digest, b_digest,
+        "different content must digest differently — the lifetime \
+         scope's truth bearer"
+    );
+    // And the digest is stable for the same content (the between-tick
+    // reuse's foundation).
+    assert_eq!(b_digest, population_digest(&b[..2], &b[2..], &[]));
+}
+
+/// R1 — THE DIGEST-STREAM DRIFT PIN: `population_digest` is defined
+/// through the packing's own emission order, so it MUST equal the
+/// FNV-1a of the population's packed bytes. If the packing ever
+/// gains a field (a versioned layout claim) and the digest is not
+/// taken through the same emission, this pin fires — the content
+/// identity can never silently cover less than the packed bytes.
+#[test]
+fn population_digest_is_the_packed_bytes_fnv() {
+    let cases: Vec<Vec<ProxyInstance>> = vec![source_a(), source_b(), vec![]];
+    for instances in cases {
+        let (npc, vehicle): (&[ProxyInstance], &[ProxyInstance]) = if instances.is_empty() {
+            (&[], &[])
+        } else {
+            (&instances[..2], &instances[2..])
+        };
+        let mut packed = Vec::new();
+        repack_populations(&mut packed, npc, vehicle, &[]).unwrap();
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for &byte in &packed {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        assert_eq!(
+            population_digest(npc, vehicle, &[]),
+            hash,
+            "the content digest must equal the FNV of the packed bytes"
+        );
+    }
+    // The empty population's digest is the FNV offset basis (the
+    // record's 0 stays a distinct unknown sentinel).
+    assert_eq!(population_digest(&[], &[], &[]), 0xcbf2_9ce4_8422_2325);
 }
