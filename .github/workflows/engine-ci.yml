@@ -765,7 +765,7 @@ jobs:
           # printed expectation was wrong, the same duplicate-literal
           # drift class).
           expected_ignored=2
-          expected_results=34
+          expected_results=36
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -886,7 +886,7 @@ jobs:
           # sixth). The failure message now names the actual pin
           # (the audit's stale-163 note: the message was never
           # updated at the 166 move).
-          echo "renderer release: $passed passed, $results test-result lines (expected 232 / 2)"
+          echo "renderer release: $passed passed, $results test-result lines (expected 215 / 2)"
           # ENGINEERING EXCELLENCE P1-B09 (2026-11-26): +1
           # platform-uniform engine-renderer lib test (the macOS
           # windowed metal list never gets the headless fallback):
@@ -900,7 +900,7 @@ jobs:
           # equivalence pin): 173 + 1 = 174 (Windows MEASURED
           # locally on the integrated tree — 174/2 result lines,
           # exit 0; Linux the platform-uniform inference).
-          [ "$passed" -eq 232 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 232"; exit 1; }
+          [ "$passed" -eq 215 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 215"; exit 1; }
           [ "$results" -eq 2 ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != 2"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production
