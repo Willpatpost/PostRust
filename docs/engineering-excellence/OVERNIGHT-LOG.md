@@ -502,3 +502,16 @@ narrow follow-up), T39/T40 throughout, P7 only at the bar.
 **Recovery:** `~/postrust-logs/overnight-state/` (STATE.md, events.jsonl,
 per-lane notes); the register (FINDINGS.md) current per landing; this log.
 The self-resume message is saved alongside the checkpoint.
+
+## The directive's §1 discharge + R2 landed (`1dcc3cb`)
+
+Exact-head CI confirmed: run `46163200811` at `2639ec2` — all five jobs green
+(the three commits past the last verified candidate confirmed docs/test-only).
+D-EE-11 registered with the four rulings; R1–R6 registered.
+
+R2 (the frontier authority): arm 1 confirmed+fixed (the typed beyond-history
+refusal, clamping rejected); arm 2 confirmed+fixed shape (a) (the ordinary
+compact consulting the frontier; the explicit administrative override as a
+distinct greppable authorization); arm 3 refuted; arm 4 documented with the
+option recorded. Pins corrected (main 1686/1635). Run `46164606020` dispatched.
+R1 running.
