@@ -53,8 +53,19 @@ var<uniform> frame: FrameParams;
 // LAYOUT (must match the CPU packer in reflection_draw.rs
 // term-for-term): params0 = (live count, expansion speed m/s,
 // band width m, tangent-displacement gain m); params1 = (roughen
-// gain, TEST-ONLY debug mode, 0, 0); rings[i] = (center_x,
-// center_z, age s, current amplitude).
+// gain, TEST-ONLY debug mode, 0, 0); bound = (center_x, center_z,
+// radius m, 0); rings[i] = (center_x, center_z, age s, current
+// amplitude). The bound row is the A19 localization's VERSIONED
+// CLAIM (the params vec4s' reserved-lane discipline, the
+// pose_index/alpha precedents in proxy_instances.rs): the field's
+// active extent as ONE conservative bounding circle over the live
+// rings, packed by the CPU (the live prefix's bounding-box center;
+// the radius is max over the live rings of |center_i − bc| +
+// radius_i + width, padded by the packer's documented ULP travel
+// budget). The ring rows shifted rows[2 + i] → rows[3 + i] and
+// RIPPLE_UNIFORM_ROWS went 34 → 35 in the SAME versioned change
+// (packer + this struct + the stride arithmetic are ONE contract;
+// the planar-side layout test pins the agreement).
 // THE EMPTY FIELD IS A NO-OP BY IEEE IDENTITY (the identity gate's
 // proof): count 0 skips the loop AND the projection, uv_offset
 // stays (0,0) and screen_uv + (0,0) is bit-identical for the
@@ -65,9 +76,36 @@ var<uniform> frame: FrameParams;
 // zero world_offset projects to a (0, -0.0) uv difference and
 // screen_uv + (0, -0.0) == screen_uv in IEEE arithmetic (x + (-0.0)
 // is x for every finite x, +0.0 included).
+//
+// THE A19 LOCALIZATION (P5 — the loop bounded by the field's
+// active extent): the fragment shader below gates the whole ring
+// loop on the packed bound circle — a fragment OUTSIDE the bound
+// takes the identity path directly (uv_offset stays (0,0), roughen
+// stays 0.0), which is bit-identical to what the loop would have
+// produced for it (every band gate is false by the bound's
+// conservativeness, so the identity contract above applies — the
+// sampled uv and the blend land on the same values); a fragment
+// INSIDE runs the loop verbatim. NO in-band fragment's arithmetic
+// changes at all — the ink gates reproduce digit-for-digit.
+// THE HONEST BOUNDARY (the design's §5.2(a) statement, recorded
+// here): the ungated loop is NOT a measured hotspot at any shipped
+// workload — the measured steady state is ~3.7 live rings against
+// the 32 bound, and even the saturation case (32 rings over a
+// full-screen 4K ground) is ~4 G flop, well under 1 ms on the
+// reference GPU. The early-out is the finding's named localization
+// at the SMALLEST possible surface — no tiling, no compute passes,
+// no per-ring datastructure — bought for the (typical) majority of
+// ground fragments that sit far from the ~3.7-ring field.
+// TILE/EMITTER-LOCALIZED PROCESSING (compute-pass ripple
+// accumulation) stays DEFERRED with a recorded trigger: it earns
+// building only when a measured wet-route GPU-ms row shows the
+// ground re-draw dominating at saturation WITH this early-out
+// already landed (the dense-field-over-small-receiver shape the
+// census rows would name) — the P5 §9.5 rows are the instrument.
 struct RippleField {
     params0: vec4<f32>,
     params1: vec4<f32>,
+    bound: vec4<f32>,
     rings: array<vec4<f32>, 32>,
 };
 @group(0) @binding(4)
@@ -127,78 +165,105 @@ fn fs_main(@location(0) world_normal: vec3<f32>,
     var roughen = 0.0f;
     let ripple_count = i32(ripple_field.params0.x);
     if (ripple_count > 0) {
-        // THE TEST-ONLY DEBUG MODE (params1.y — renderer.rs's
-        // RippleDebugMode, the Era-2 audit finding 15b separation
-        // fixtures): 0 = the shipped path (the production packing
-        // always writes 0), 1 = the UV/displacement term suppressed
-        // (blend only), 2 = the blend/roughen term suppressed
-        // (displacement only). The knobs exist so the ink gate can
-        // isolate each term's visible contribution; they NEVER
-        // appear in a production frame.
-        let debug_mode = i32(ripple_field.params1.y);
-        // THE WORLD TANGENT DISPLACEMENT (finding 19's corrective):
-        // the gradient's push stays in WORLD meters — a radial
-        // tangent vector at this ground point — NEVER in screen
-        // units. The projection below converts it.
-        var world_offset = vec2<f32>(0.0, 0.0);
-        for (var i = 0; i < ripple_count; i = i + 1) {
-            let ring = ripple_field.rings[i];
-            let delta = vec2<f32>(world_pos.x - ring.x, world_pos.z - ring.y);
-            let dist = sqrt(dot(delta, delta));
-            let radius = ripple_field.params0.y * ring.z;
-            let band = abs(dist - radius);
-            let width = ripple_field.params0.z;
-            if (band < width) {
-                // the signed slope: +amp/width inside the ring line,
-                // - outside (one subtraction and a sign — fixed order)
-                let slope = ring.w / width;
-                let signed = select(slope, -slope, dist > radius);
-                // the radial direction (dist == 0 has none: zero
-                // contribution — the exact center of a ring)
-                let dir = select(vec2<f32>(0.0, 0.0), delta / dist, dist > 0.0);
-                if (debug_mode != 1) {
-                    world_offset = world_offset + dir * (signed * ripple_field.params0.w);
-                }
-                if (debug_mode != 2) {
-                    roughen = roughen + ring.w * (1.0 - band / width);
+        // THE FIELD-EXTENT EARLY-OUT (A19): the packed bound circle
+        // conservatively covers every live ring's band (the CPU's
+        // max over the live prefix of |center_i − bc| + radius_i +
+        // width, padded by its ULP travel budget), so a fragment
+        // OUTSIDE the bound is outside every ring's band gate BY
+        // CONSTRUCTION — it takes the identity path directly
+        // (uv_offset stays (0,0), roughen stays 0.0): bit-identical
+        // to what the loop below would have produced for it (the
+        // header's identity note — the zero world_offset projects
+        // to a sampled-uv-identical (0, -0.0) and the zero roughen
+        // leaves the blend exactly untouched), at the cost of one
+        // sqrt instead of the whole ring loop. The comparison is
+        // <= (inside-or-on runs the loop): the conservative side —
+        // the bound NEVER culls a fragment a ring's band contains
+        // (the no-false-negative bar the property test pins).
+        // Fragments INSIDE the bound run the loop and the projection
+        // below VERBATIM — no in-band arithmetic changes at all.
+        let bound_delta = vec2<f32>(
+            world_pos.x - ripple_field.bound.x,
+            world_pos.z - ripple_field.bound.y,
+        );
+        let bound_dist = sqrt(dot(bound_delta, bound_delta));
+        if (bound_dist <= ripple_field.bound.z) {
+            // THE TEST-ONLY DEBUG MODE (params1.y — renderer.rs's
+            // RippleDebugMode, the Era-2 audit finding 15b separation
+            // fixtures): 0 = the shipped path (the production packing
+            // always writes 0), 1 = the UV/displacement term suppressed
+            // (blend only), 2 = the blend/roughen term suppressed
+            // (displacement only). The knobs exist so the ink gate can
+            // isolate each term's visible contribution; they NEVER
+            // appear in a production frame. The early-out above is
+            // mode-independent: an out-of-bound fragment's loop
+            // contribution is zero in EVERY mode, so skipping it is
+            // exact for the suppressors too.
+            let debug_mode = i32(ripple_field.params1.y);
+            // THE WORLD TANGENT DISPLACEMENT (finding 19's corrective):
+            // the gradient's push stays in WORLD meters — a radial
+            // tangent vector at this ground point — NEVER in screen
+            // units. The projection below converts it.
+            var world_offset = vec2<f32>(0.0, 0.0);
+            for (var i = 0; i < ripple_count; i = i + 1) {
+                let ring = ripple_field.rings[i];
+                let delta = vec2<f32>(world_pos.x - ring.x, world_pos.z - ring.y);
+                let dist = sqrt(dot(delta, delta));
+                let radius = ripple_field.params0.y * ring.z;
+                let band = abs(dist - radius);
+                let width = ripple_field.params0.z;
+                if (band < width) {
+                    // the signed slope: +amp/width inside the ring line,
+                    // - outside (one subtraction and a sign — fixed order)
+                    let slope = ring.w / width;
+                    let signed = select(slope, -slope, dist > radius);
+                    // the radial direction (dist == 0 has none: zero
+                    // contribution — the exact center of a ring)
+                    let dir = select(vec2<f32>(0.0, 0.0), delta / dist, dist > 0.0);
+                    if (debug_mode != 1) {
+                        world_offset = world_offset + dir * (signed * ripple_field.params0.w);
+                    }
+                    if (debug_mode != 2) {
+                        roughen = roughen + ring.w * (1.0 - band / width);
+                    }
                 }
             }
+            // THE PROJECTION INTO SCREEN UV (finding 19's corrective):
+            // the ground point P and the displaced point P + d (d stays
+            // in the ground plane — a tangent displacement, world_pos.y
+            // untouched) both project through the frame's TRUE
+            // view-projection, the w-divide lands them in authored NDC,
+            // and the difference — with the established Y convention
+            // (authored NDC +y is screen-UP; screen_uv's frag.xy is
+            // framebuffer y-DOWN, the vertex-boundary epilogue's flip
+            // replayed here: u = (ndc_x + 1)/2, v = (1 - ndc_y)/2) — is
+            // the sample offset in the SAME units screen_uv lives in.
+            // This is the camera-correctness: turning the camera 180°
+            // flips the screen direction of the same world push, pitch
+            // foreshortens it, and perspective scales it by distance.
+            // WHY THE TRUE VP IS "THE SAME VP THE REFLECTION TARGET WAS
+            // RENDERED WITH": the target renders through the mirrored
+            // view-projection (view_proj × M), and the mirror fixes the
+            // ground plane — every point ON the plane (P and P + d both,
+            // d being tangent) maps to BIT-IDENTICAL clip positions
+            // under either matrix (planar.rs's
+            // mirrored_view_projection_fixes_the_ground_plane pins it),
+            // so the frame block's true view_proj (binding 3, the same
+            // uniform the vertex stage already reads) needs NO new
+            // uniform lane. The zero world_offset projects to exactly
+            // (0, -0.0) — value-identical sampling (the header's
+            // identity note).
+            let clip_p = frame.view_proj * vec4<f32>(world_pos, 1.0);
+            let clip_q = frame.view_proj * vec4<f32>(
+                world_pos.x + world_offset.x,
+                world_pos.y,
+                world_pos.z + world_offset.y,
+                1.0,
+            );
+            let ndc_p = clip_p.xy / clip_p.w;
+            let ndc_q = clip_q.xy / clip_q.w;
+            uv_offset = vec2<f32>(0.5, -0.5) * (ndc_q - ndc_p);
         }
-        // THE PROJECTION INTO SCREEN UV (finding 19's corrective):
-        // the ground point P and the displaced point P + d (d stays
-        // in the ground plane — a tangent displacement, world_pos.y
-        // untouched) both project through the frame's TRUE
-        // view-projection, the w-divide lands them in authored NDC,
-        // and the difference — with the established Y convention
-        // (authored NDC +y is screen-UP; screen_uv's frag.xy is
-        // framebuffer y-DOWN, the vertex-boundary epilogue's flip
-        // replayed here: u = (ndc_x + 1)/2, v = (1 - ndc_y)/2) — is
-        // the sample offset in the SAME units screen_uv lives in.
-        // This is the camera-correctness: turning the camera 180°
-        // flips the screen direction of the same world push, pitch
-        // foreshortens it, and perspective scales it by distance.
-        // WHY THE TRUE VP IS "THE SAME VP THE REFLECTION TARGET WAS
-        // RENDERED WITH": the target renders through the mirrored
-        // view-projection (view_proj × M), and the mirror fixes the
-        // ground plane — every point ON the plane (P and P + d both,
-        // d being tangent) maps to BIT-IDENTICAL clip positions
-        // under either matrix (planar.rs's
-        // mirrored_view_projection_fixes_the_ground_plane pins it),
-        // so the frame block's true view_proj (binding 3, the same
-        // uniform the vertex stage already reads) needs NO new
-        // uniform lane. The zero world_offset projects to exactly
-        // (0, -0.0) — value-identical sampling (the header's
-        // identity note).
-        let clip_p = frame.view_proj * vec4<f32>(world_pos, 1.0);
-        let clip_q = frame.view_proj * vec4<f32>(
-            world_pos.x + world_offset.x,
-            world_pos.y,
-            world_pos.z + world_offset.y,
-            1.0,
-        );
-        let ndc_p = clip_p.xy / clip_p.w;
-        let ndc_q = clip_q.xy / clip_q.w;
-        uv_offset = vec2<f32>(0.5, -0.5) * (ndc_q - ndc_p);
     }
     let reflection = textureSample(
         reflection_tex,

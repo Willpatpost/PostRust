@@ -1094,12 +1094,33 @@ impl Drop for Renderer {
 /// (active count — exact for ≤ 32, the pool's bound, policy speed,
 /// policy width, [`RIPPLE_UV_GAIN`]); rows[1] =
 /// ([`RIPPLE_ROUGHEN_GAIN`], the [`RippleDebugMode`] uniform lane,
-/// 0, 0); rows[2 + i] = (center_x, center_z, age, amplitude *
+/// 0, 0); rows[2] = the A19 field-extent bound
+/// `(center_x, center_z, radius, 0)` — the conservative bounding
+/// circle over the LIVE prefix, [`crate::planar::ripple_field_bound`]'s
+/// one shared implementation (the shader's early-out gate; the
+/// empty prefix packs zeros, moot under the count gate);
+/// rows[3 + i] = (center_x, center_z, age, amplitude *
 /// (1.0 - age / lifetime) — the fade at read time, the core's
 /// pinned order). `None` packs the EMPTY uniform (all zeros — the
 /// shader's identity no-op, the rainless wet path's byte-identity;
 /// the debug lane reads 0 there too, but the count gate makes the
 /// question moot).
+///
+/// THE (b) TAIL — CPU-SIDE RECEIVER-RECT RING CULLING — DEFERRED,
+/// NOT FOLDED (the design §5.3(3)'s optional-tail provision): the
+/// cull's plumbing is not cheap where it matters — the packer↔
+/// oracle↔shader term-for-term mirror would ALL need the receiver
+/// rect (the oracle's gate-side row builders construct rows
+/// independently of this packer, so the mirror contract widens
+/// with every consumer), and the cull drops NOTHING on every
+/// shipped workload: the corner and garage receivers are the full
+/// ~80 m ground plate, and every demo, gate, and census ring lands
+/// on it. TRIGGER to fold it: a scene whose receiver is a strict
+/// subset of the ripple spawn area (the small-puddle shape) — then
+/// [`crate::scene_description::GroundRoles`]'s receiver range
+/// becomes the world rect at attach (pure description data), one
+/// more packer parameter, with the oracle/helper mirrors moved in
+/// the same versioned change.
 pub(crate) fn pack_ripple_field(
     field: Option<&engine_core::ripple::RippleField>,
     debug: RippleDebugMode,
@@ -1116,8 +1137,16 @@ pub(crate) fn pack_ripple_field(
         RIPPLE_UV_GAIN,
     ];
     rows[1] = [RIPPLE_ROUGHEN_GAIN, debug.uniform_lane(), 0.0, 0.0];
+    // The A19 bound row (the versioned rows[2] claim): the
+    // conservative circle over the LIVE prefix only — the shader's
+    // loop reads rings[0..count], so the bound covers exactly the
+    // rings the loop visits (dead pool slots never widen it).
+    let live = &field.rings()[..field.active_count()];
+    let (bound_center, bound_radius) =
+        crate::planar::ripple_field_bound(live, policy.speed, policy.width);
+    rows[2] = [bound_center[0], bound_center[1], bound_radius, 0.0];
     for (i, ring) in field.rings().iter().enumerate() {
-        rows[2 + i] = [
+        rows[3 + i] = [
             ring.center[0],
             ring.center[1],
             ring.age,
@@ -1197,15 +1226,27 @@ mod tests {
             "DisplacementOnly packs lane 2.0 (the blend term suppressed)"
         );
         let age = 0.0f32 + dt;
+        // THE A19 BOUND ROW (the versioned rows[2] claim): the single
+        // live ring's own outer reach around its center (the bbox
+        // center of one ring IS its center), padded by the ULP travel
+        // budget — the same f32 expressions the packing performs.
+        let bound_radius =
+            (0.0f32 + 0.8f32 * age + 0.35f32) * crate::planar::RIPPLE_BOUND_ULP_TRAVEL;
         assert_eq!(
             packed.rows[2],
+            [-3.5, 8.25, bound_radius, 0.0],
+            "rows[2]: the field-extent bound — the live prefix's bbox center and \
+             the padded conservative radius"
+        );
+        assert_eq!(
+            packed.rows[3],
             [-3.5, 8.25, age, 1.0f32 * (1.0f32 - age / 2.5f32)],
-            "rows[2]: the landing column, the accumulated age, the faded amplitude"
+            "rows[3]: the landing column, the accumulated age, the faded amplitude"
         );
         // The unused ring rows stay zero (the shader reads only
         // rings[0..count] — the tail is never observed, but the
         // packing's full-row initialization keeps it exact zeros).
-        for row in &packed.rows[3..] {
+        for row in &packed.rows[4..] {
             assert_eq!(*row, [0.0; 4], "the unused ring rows are zero");
         }
 
@@ -1235,8 +1276,29 @@ mod tests {
         assert_eq!(packed.rows[0][1], 0.8);
         assert_eq!(packed.rows[0][2], 0.35);
         assert_eq!(packed.rows[0][3], RIPPLE_UV_GAIN);
+        // The three-ring bound: the centers' bbox center, the max
+        // over the live rings of the padded per-ring reach — the
+        // same f32 expressions the packing performs (the offsets in
+        // the shader's own sqrt-of-dot form).
+        let bc = [(-3.5f32 + 2.5f32) * 0.5, (-2.0f32 + 8.25f32) * 0.5];
+        let reach = |center: [f32; 2], ring_age: f32| {
+            let dx = center[0] - bc[0];
+            let dz = center[1] - bc[1];
+            (dx * dx + dz * dz).sqrt() + 0.8f32 * ring_age + 0.35f32
+        };
+        let bound_radius = 0.0f32
+            .max(reach([-3.5, 8.25], age_first))
+            .max(reach([1.0, -2.0], age_rest))
+            .max(reach([2.5, 4.0], age_rest))
+            * crate::planar::RIPPLE_BOUND_ULP_TRAVEL;
         assert_eq!(
             packed.rows[2],
+            [bc[0], bc[1], bound_radius, 0.0],
+            "rows[2]: the three-ring field-extent bound (the bbox center, the \
+             padded max reach)"
+        );
+        assert_eq!(
+            packed.rows[3],
             [
                 -3.5,
                 8.25,
@@ -1246,18 +1308,27 @@ mod tests {
             "ring 0: three accumulated ticks"
         );
         assert_eq!(
-            packed.rows[3],
+            packed.rows[4],
             [1.0, -2.0, age_rest, 1.0f32 * (1.0f32 - age_rest / 2.5f32)],
             "ring 1: two accumulated ticks"
         );
         assert_eq!(
-            packed.rows[4],
+            packed.rows[5],
             [2.5, 4.0, age_rest, 1.0f32 * (1.0f32 - age_rest / 2.5f32)],
             "ring 2: two accumulated ticks"
         );
-        for row in &packed.rows[5..] {
+        for row in &packed.rows[6..] {
             assert_eq!(*row, [0.0; 4]);
         }
+        // Double-run determinism (the rig gates' byte-equality's CPU
+        // half): the packing is a pure function of the field and the
+        // debug mode — packing the same field again yields the
+        // identical rows, the bound row included.
+        assert_eq!(
+            pack_ripple_field(Some(&field), RippleDebugMode::Off),
+            packed,
+            "packing the same field twice is byte-identical"
+        );
 
         // The rainless wet path — the exact branch it runs — packs
         // the EMPTY uniform (all zeros; the shader's count gate

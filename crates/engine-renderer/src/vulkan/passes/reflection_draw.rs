@@ -95,17 +95,36 @@ use std::ops::Range;
 /// compatibility with the post state's HDR pass rests on it).
 const REFLECTION_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
-/// The ripple uniform's row count: params0, params1, then
-/// RIPPLE_POOL_BOUND rings (engine-core's bound — the shader's
-/// array size and this layout are ONE contract).
-pub(crate) const RIPPLE_UNIFORM_ROWS: usize = 2 + engine_core::ripple::RIPPLE_POOL_BOUND;
+/// The ripple uniform's row count: params0, params1, the A19
+/// field-extent bound row, then RIPPLE_POOL_BOUND rings
+/// (engine-core's bound — the shader's array size and this layout
+/// are ONE contract).
+///
+/// THE A19 VERSIONED CLAIM (P5 — the reserved-row discipline, the
+/// pose_index/alpha precedents): rows[2] is the field-extent bound
+/// `(bound_center_x, bound_center_z, bound_radius, 0)` — the
+/// conservative bounding circle over the live rings the fragment
+/// shader's early-out gate reads. The ring rows shifted
+/// `rows[2 + i]` → `rows[3 + i]` and this count went 34 → 35 in
+/// the same versioned change; the stride/base arithmetic below
+/// derives from this constant and follows; the WGSL struct mirrors
+/// it (`ground_reflect.wgsl`'s RippleField). No S5 layout pin
+/// covers the ripple block (the pins cover FrameParams/
+/// MaterialParams/LightMatrix of the composed variants only), so
+/// the contract is the packer↔shader term-for-term mirror plus the
+/// identity/ink gates — the planar-side layout test pins the
+/// cross-side agreement.
+pub(crate) const RIPPLE_UNIFORM_ROWS: usize = 3 + engine_core::ripple::RIPPLE_POOL_BOUND;
 
 /// The packed ripple uniform (the GPU view of engine-core's
 /// RippleField): rows[0] = (live count, speed, width,
 /// tangent-displacement gain m), rows[1] = (roughen gain, the
 /// TEST-ONLY RippleDebugMode lane — renderer.rs's separation knobs,
-/// 0.0 in every production frame, 0, 0), rows[2 + i] = (center_x,
-/// center_z, age, current amplitude). Copy-sized, zero-allocation.
+/// 0.0 in every production frame, 0, 0), rows[2] = the A19
+/// field-extent bound (center_x, center_z, radius, 0 — the
+/// conservative bounding circle over the live prefix, packed by the
+/// same pure packer), rows[3 + i] = (center_x, center_z, age,
+/// current amplitude). Copy-sized, zero-allocation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct RippleUniformData {
     pub rows: [[f32; 4]; RIPPLE_UNIFORM_ROWS],
@@ -1375,8 +1394,8 @@ impl ReflectionTargets {
             // contract the record-time dynamic offset and the
             // construction-time zeroing both rely on: at least the
             // packed uniform's size, a multiple of 16 (the align
-            // discipline's power-of-two align over the 544-byte
-            // block).
+            // discipline's power-of-two align over the 560-byte
+            // block — 35 rows, the A19 bound row included).
             debug_assert!(ripple_stride >= (RIPPLE_UNIFORM_ROWS * 16) as u32);
             debug_assert!(ripple_stride.is_multiple_of(16));
             let ripple = [vk::DescriptorBufferInfo::default()

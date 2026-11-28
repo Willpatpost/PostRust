@@ -489,6 +489,101 @@ passed / 0 failed / 1 ignored**; `cargo clippy -p engine-shell -p
 engine-renderer --all-targets -- -D warnings` (the D-EE-03
 touched-crates discipline). No behavior change: no `.rs` file touched,
 lock untouched, dependency closure shape unchanged.
+## E-14 P5 R4 — A19 the ripple ring loop localized by the field's active extent (2026-11-27, lane worktree tree at commit, branch `ee/p5-r4-ring-localization`, rig GPU)
+
+The A19 implementation lane (the design §5.3's recommendation (c)):
+the versioned rows[2] bound claim — the conservative bounding circle
+over the live rings, `max_i(|center_i − bc| + radius_i + width)`
+padded by the ULP travel budget (a relative 2⁻¹⁹) — packed by
+`pack_ripple_field` through the ONE shared `planar::
+ripple_field_bound`, read by the fragment shader's early-out gate
+(`bound_dist <= bound.z` runs the loop verbatim; outside takes the
+identity path directly — bit-identical by the shader's own
+documented identity contract). RIPPLE_UNIFORM_ROWS 34 → 35; the ring
+rows shifted rows[2 + i] → rows[3 + i] in the same versioned change
+(packer + WGSL struct + stride arithmetic + the planar oracle + the
+gate-side `oracle_rows` layout companion in engine-slice's
+render_weather — no gate value or assertion changed, only the row
+encoding). (b) the CPU-side receiver-rect culling: DEFERRED per the
+design's optional-tail provision (the packer↔oracle↔shader mirror
+would all need the rect, and every shipped receiver is the full ~80 m
+ground plate — the cull drops nothing; trigger recorded at the
+packer). (d) tile/emitter-localized processing: deferred with
+trigger in the shader header.
+
+**§9.5 — the ripple rows (AFTER R4, rig GPU, release, the same
+battery/command as E-12):** `cargo test -p engine-slice --test
+census_ripple --release -- --ignored --nocapture --test-threads=1`
+→ 1 passed / 0 failed. BEFORE (this lane's own base run, same
+session/hardware) → AFTER:
+
+| state | extent | gpu-ms p50 BEFORE | p50 AFTER | p95 BEFORE | p95 AFTER |
+|---|---|---:|---:|---:|---:|
+| empty | 1280×720 | 0.033 | 0.029 | 0.036 | 0.036 |
+| steady | 1280×720 | 0.033 | 0.031 | 0.036 | 0.036 |
+| saturated | 1280×720 | 0.043 | 0.034 | 0.047 | 0.042 |
+| empty | 2560×1440 | 0.072 | 0.076 | 0.242 | 0.093 |
+| steady | 2560×1440 | 0.070 | 0.075 | 0.075 | 0.085 |
+| saturated | 2560×1440 | 0.104 | 0.077 | 0.114 | 0.082 |
+
+The saturation overhead over empty (p50, the stable metric — the
+session-to-session empty row itself moves ±0.004 ms): 720p
++0.010 → +0.005 ms (halved; E-12's +31% → ~+17%); 1440p +0.032 →
++0.001 ms (E-12's +48% → ~+1% — eliminated: the saturated field's
+~13.4 m bound circle leaves most of the visible ground plate
+outside, and those fragments now pay one sqrt instead of the
+32-ring loop). The steady rows are unchanged within rig noise
+(the ~3.7-ring field was never the cost). Full p99/max columns in
+the archived logs (`Temp\opencode\ee\r4-logs\{before,after}-census.log`)
+— the tails are rig-noisy and carry no signal.
+
+**The ink gates (the acceptance bar, BEFORE → AFTER, same
+session/hardware, exit 0 both):**
+`cargo test -p engine-slice --test render_weather -- --ignored
+--nocapture --test-threads=1` → 11 passed / 0 failed BOTH runs,
+digit-for-digit: rain ink 17041 differing bytes; broadside ink
+3482 px / 2162 upper-third; the AllocationStats tuple
+(19/4/1589248/3/7/2); the ripple reflection ink 236114 differing
+bytes / 98131 differing pixels / 10187 displayed-RGB-qualified;
+the ripple sweep 22/255 at ground center [-1.929102, 0.0,
+-2.6461658]; the young-field ink census 22/22, best (577, 350,
+22); the measured sweep left 22 / right −21 / plateau −1; the
+natural sequence's landings and term counts; the term separations
+**96548/67535/7625 blend-only and 27149/27149/2538
+displacement-only — E-7's pinned values, reproduced exactly**.
+`cargo test -p engine-slice --test render_reflection -- --ignored
+--nocapture --test-threads=1` → 7 passed / 0 failed AFTER (the
+BEFORE run was killed mid-battery by a session timeout after 5/7
+legs ok — every leg carries `WetFrame { ripple: None }`, the
+rainless wet path, so the battery is structurally invisible to the
+A19 change: the empty uniform's count gate skips the early-out;
+the (7, 2, 8, 2) allocation delta and the 60/1653/2619/5551
+known-answer patches reproduced identically in both runs).
+
+**The new unit battery (engine-renderer, runs in the standard
+gates):** `the_field_extent_bound_never_culls_a_banded_fragment`
+(the no-false-negative property — adversarial layouts: the newborn
+disk, near-lifetime rings, the bbox-diagonal pair, the four-corner
+square, 32 coincident centers, the axis-aligned
+triangle-equality pair, the 10⁴-scale ULP-travel field, and seeded
+random fields at 1/5/32 rings × three policies; every probe where
+the verbatim loop yields a non-identity contribution must sit
+inside the bound, measured through the shader's own dist form);
+`the_early_out_is_value_transparent_against_the_verbatim_loop`
+(the honest-bound oracle equals the infinite-bound verbatim-loop
+oracle at every probe, bit-for-bit — the identity contract made
+executable); `the_ripple_uniform_layout_agrees_with_the_shader_struct`
+(the versioned-row claim's cross-side agreement — the WGSL struct's
+member order and the 3 + RIPPLE_POOL_BOUND row count).
+
+**Lane gates (this lane's tree):** `cargo fmt --all -- --check`
+exit 0; `cargo clippy -p engine-renderer --all-targets --
+-D warnings` exit 0; `cargo test -p engine-renderer` **193
+passed / 0 failed (debug AND release** = the 190-pin + the three
+A19 tests); `cargo test -p engine-slice --lib` **157 passed / 0
+failed** (the lane's base count — untouched); the batteries'
+non-ignored portions: census_ripple 1/1i, render_weather 1/11i,
+render_reflection 0/7i — all ok.
 
 ## Measurement baselines
 
