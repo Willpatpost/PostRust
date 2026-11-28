@@ -190,6 +190,92 @@ crossover, E-08 skip decomposition, per-NPC memory, CPU render path) are
 carried there — the E-8 register cites the artifact rather than duplicating
 every line.
 
+**B10/B11 slice-measurement methodology corrections (2026-11-27, lane
+`ee/slice-b10-b11-methodology`, base `72d636b`):**
+
+- **B10 decision — option (a), the audit's own disposition, with the audit's
+  premises adjudicated by direct read first.** The audit's core premise (the
+  `synthesis_once` arm "uses `NpcWorld::restore`, reconstructing state from
+  save bytes" while "replay replays from the last checkpoint") is FALSE for
+  this harness: no restore/save/checkpoint call exists in
+  `behavior_measurement.rs` (the dormancy span is quiet — nothing armed, no
+  held events; the replay arm re-executes the missed occurrences through the
+  real queue, the synthesis arm runs the REAL `evaluate_wake`/`next_occurrence`
+  per NPC on freshly constructed routines and arms the live chains on a
+  pre-constructed spine). The arms' different work IS the measured quantity —
+  which reactivation policy is cheaper at which miss count — so the correction
+  is labeling, not re-timing: the activation section now prints a methodology
+  block naming each arm's timed window (replay = arm 250·k past-due events +
+  the queue drain; synthesis = one evaluate_wake per NPC + the re-arm jumps +
+  arming the 250 live chains; no restore-from-save in EITHER arm), beside the
+  existing outcome-divergence and post-activation-queue reports.
+- **The cadence_hz=0 question: the shipped E-08 skip decomposition was NOT
+  produced under irregular cadence.** `--benchmark-behavior` is
+  argument-free; the skip-cost cells arm events at authored dues and drain by
+  logical `run_ticks` — no frame cadence exists in the harness (the section's
+  output now says so). The `cadence_hz=0` irregular pattern (including the
+  2 s stall exceeding the 8-tick per-frame catch-up bound) is the `--sim`
+  route's driver pattern (`sim_demo::irregular_frame`), whose determinism
+  `tests/regions.rs` covers. The audit's genuine residual — no measurement of
+  the worst-case pending accumulation under that stall shape — is closed by a
+  NEW behavior-measurement section (the stall worst case) driving the real
+  SimDriver + NpcWorld Legacy workload (1,000 NPCs, period 6 + seeded jitter,
+  budget 200 / near reserve 60, 10 Hz, catch-up bound 8) through a 120-tick
+  headless warm plus 12 cycles of the demo's own irregular pattern, with the
+  no-discard invariant (clock + outstanding == ticks due) and the spine
+  conservation asserted at every frame and the full per-frame census
+  double-run-identical. Measured (release, this lane's tree): **worst-case
+  retained tick obligation 12** (every cycle's stall: the 2 s stall's 20 due
+  ticks minus the 8-tick per-frame bound), draining to 0 inside every cycle
+  (no cross-cycle accumulation); **worst-case queue pending 1,000 — exactly
+  the pre-stall steady armed population** (one pending follow-up per NPC; the
+  stall does not grow the queue: arrivals come only from budget-bounded
+  executions, so unbounded accumulation requires demand > budget — the
+  sustained matrix's overload class, measured separately);
+  cumulative-from-construction late arrivals 0 / late executions 169 /
+  budget-exhausted ticks 6, ALL from the headless warm ramp (the initial
+  1,000-event schedule spread's synchrony) — the 144 irregular-cadence frames
+  add ZERO budget exhaustion (asserted); per-frame cost p50/p99/max
+  0.000/0.174/0.278 ms (the max is the 8-tick catch-up batch). Lib-side
+  guard: `stall_worst_case_double_run_and_pin` (pins 12 / 1,000 / (0, 169, 6)
+  plus the empty-increment attribution law).
+- **B11 — the ripple diagnostic's census relabeled; one genuinely-wrong
+  counter corrected.** The module doc's "admitted/visible ring centers" and
+  "the frames whose displacement moves displayed rgb near a live ring (the
+  term-separation census)" conflated field-level counts with rendered-pixel
+  claims (the term-separation census belongs to the render_weather gates,
+  E-7 — the phrase was a phantom in this diagnostic). The output now defines
+  its terms before the arms: contacts = kill-plane ground landings; admitted
+  = rings GENERATED into the field (at the shipped 320:1 the other ~319/320
+  landings are NEVER GENERATED — decimated before admission, not occluded);
+  live / frames-with-a-live-ring = FIELD censuses (a frame counts EXISTENCE
+  — whether the displacement pass actually moved displayed rgb is not
+  measured here). **The genuinely-wrong counter:** "contacts" summed the
+  particle report's all-cause `deaths` (kill-plane landings AND midair
+  lifetime expiries) while labeled "the physical ground contacts" — the
+  layer's own census comment separates the two classes, and ripple.rs's
+  measured demo-campaign context is 18 kill deaths vs 5,286 lifetime deaths.
+  It now reads the layer's public kill-plane census (`kill_deaths()` delta,
+  the same delta discipline as the neighboring counters). At this harness's
+  fixed-camera volume the two counts coincide numerically (pre- and post-edit
+  runs both print contacts 4,809; the three-arm arithmetic floor(4809/320)=15,
+  /160=30, /80=60 matches the admitted counts exactly), so the shipped
+  numbers' values are unchanged and their meaning is now correct;
+  admitted/refused/live counts are untouched (counting logic otherwise
+  identical, per the audit's labeling-only scope).
+- Gates (this lane's tree): `cargo fmt --all -- --check` exit 0;
+  `cargo clippy -p engine-slice --all-targets -- -D warnings` exit 0;
+  `cargo test -p engine-slice --lib` **144 passed / 0 failed** (baseline 143
+  — one NEW test, no existing test touched, no pin weakened); `--test
+  regions` 18/0 and `--test sim_determinism` 8/0 (the SimDriver machinery
+  the new section exercises); `--benchmark-behavior` and
+  `--benchmark-ripple-visibility` both exit 0 (logs at
+  `Temp\opencode\ee\b10b11-artifacts\`).
+- Provenance note: the raw `baseline-battery.log` this record cites is no
+  longer present at `Temp\opencode\ee\artifacts\` (only the later gate logs
+  survive). The stall-section and ripple numbers above were measured on
+  this lane's tree (the logs just cited).
+
 ## E-9 The owner's maximal-composition walk (2026-11-27, rig, tree `85a83b2`)
 
 The owner ran the maximal composition route (`--corner --populated --behavior

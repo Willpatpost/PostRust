@@ -3,7 +3,11 @@
 //! machinery): the behavior-workload sustained matrix, the witness
 //! enumeration cost per significant event, activation latency with
 //! schedule catch-up (E-09's crossover on the real machinery), the
-//! skip-cost curves (E-08's shape on the real queue), and
+//! skip-cost curves (E-08's shape on the real queue — logical-tick
+//! cells, no frame cadence), the stall worst case (B10's added
+//! case: the worst-case pending accumulation under a stall that
+//! exceeds the per-frame catch-up bound, through the real
+//! SimDriver machinery the `--sim` irregular route drives), and
 //! memory-per-NPC by tier. ALL pod-observational benchmark work
 //! (never CI thresholds, never physical-rig claims) with the
 //! double-run determinism proof asserted in every section — the
@@ -28,6 +32,10 @@ use engine_core::npc_perception::{
 };
 use engine_core::npc_schedule::{ActivityDescriptor, Cadence, Commitment, NpcSchedule, Target};
 use engine_core::spine::{ExecCtx, Spine, World};
+
+use crate::npc::NpcConfig;
+use crate::sim::{SimConfig, SimDriver};
+use crate::sim_demo::irregular_frame;
 
 /// The bench's wake class (0xC6 — deployment-local policy; the corner's
 /// composed demo uses 0xC5, the engine-core fixture 0xC4).
@@ -619,6 +627,40 @@ fn run_activation_crossover() {
     println!("  pod results, observational (never CI thresholds, never physical-rig claims)");
     println!();
 
+    // THE B10 ADJUDICATION (the slice audit's replay-vs-synthesis
+    // claim, verified by direct read): the audit's premise — that
+    // the synthesis arm "uses `NpcWorld::restore`, reconstructing
+    // state from save bytes" while "replay replays from the last
+    // checkpoint" — is FALSE for this harness. Neither arm touches
+    // save bytes, restore, or checkpoints (no such call exists in
+    // this module; the dormancy span is QUIET — nothing armed, so
+    // there is no checkpoint to replay from, and no held events
+    // exist on this queue). What the arms genuinely differ in IS
+    // the measured quantity — WHICH reactivation policy's work is
+    // cheaper at which miss count: the replay policy re-executes
+    // every missed occurrence through the real queue; the synthesis
+    // policy performs ONE evaluation per NPC (the lazy-decay jump)
+    // and re-arms the live chains directly. The methodology block
+    // below labels each arm's timed window so the comparison cannot
+    // be overread as like-for-like work; the outcome divergence is
+    // reported beside the costs (finding 8's correction), never
+    // equated.
+    println!("  methodology (B10's labeling corrective — what each arm's timed window IS):");
+    println!(
+        "    replay arm: arm 250·k past-due events onto the live spine, then drain \
+         them through the real queue — every missed occurrence re-executes \
+         (budget-bounded, ceil(250k/{BUDGET})+2 drain ticks; the honest re-arms stay \
+         pending beyond the window)"
+    );
+    println!(
+        "    synthesis arm: the per-NPC loop (ONE evaluate_wake per NPC — the \
+         lazy-decay jump over the whole dormancy span — plus each entry's \
+         next_occurrence re-arm jump), then arm the 250 live chains on a \
+         pre-constructed spine — NO queue drain, and NO restore-from-save-bytes \
+         in EITHER arm: the arms' different work IS the measured policy choice"
+    );
+    println!();
+
     // THE k SEMANTICS (finding 8's correction, documented and
     // asserted): k is the missed occurrences PER ENTRY over the
     // dormancy span (0, k·600] — 2k per NPC at this factory's two
@@ -1158,6 +1200,22 @@ fn run_skip_cost_curves() {
     println!("  pod results, observational (never CI thresholds, never physical-rig claims)");
     println!();
 
+    // B10's cadence clarification: these cells are LOGICAL-TICK
+    // queue measurements — events armed at authored dues, drained
+    // by `run_ticks`; no frame cadence exists anywhere in this
+    // harness (the shipped E-08 decomposition therefore carries no
+    // `cadence_hz` — the audit's `cadence_hz = 0` premise names the
+    // `--sim` route's driver pattern, not this section). The
+    // frame-cadence stall shape — a stall exceeding the per-frame
+    // catch-up bound — is the next section's measurement.
+    println!(
+        "  methodology (B10's cadence clarification): logical-tick cells — events \
+         armed at authored dues, drained by run_ticks; no frame cadence exists in \
+         this harness. The frame-cadence stall shape (a stall exceeding the \
+         per-frame catch-up bound) is the NEXT section's measurement."
+    );
+    println!();
+
     // The E-08 cell set: the (duration, events) pairs where events
     // vary at FIXED duration (rows 1-2, 3-4, 5-6) and duration varies
     // at FIXED events (E=3_000 at 10^4 vs 10^5; E=30_000 at 10^5 vs
@@ -1402,6 +1460,250 @@ fn crossover_schedules_dormant(population: usize) -> Vec<NpcSchedule> {
     schedules
 }
 
+// --------------------------------- SECTION 4b — stall worst case (B10's added case)
+
+/// One frame's census — logical quantities only (no timing), so the
+/// double-run equality is exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StallFrame {
+    frame: u64,
+    /// The driver's retained tick obligation AFTER the frame: due
+    /// ticks accrued but not executed (the per-frame catch-up
+    /// bound's remainder — the no-discard invariant's
+    /// "outstanding" term).
+    outstanding: u32,
+    /// The spine queue's armed population after the frame (events
+    /// scheduled, not yet executed).
+    pending: usize,
+    /// Cumulative late arrivals (events armed with a due already
+    /// behind the clock).
+    late_arrivals: u64,
+    /// Cumulative late executions (executions past their due).
+    late_executions: u64,
+    /// Cumulative budget-exhausted ticks (ticks that ended with the
+    /// budget consumed and due work still queued).
+    budget_exhausted_ticks: u64,
+}
+
+/// Runs the B10 stall script once: a 120-tick headless warm (the
+/// queue's steady armed shape), then `cycles` repetitions of the
+/// demo's own irregular cadence — `sim_demo::irregular_frame`, the
+/// `--sim` route's `cadence_hz = 0` pattern (five 60 Hz frames, ONE
+/// 2 s stall = 20 due ticks at the 10 Hz rate against the 8-tick
+/// per-frame catch-up bound, five 240 Hz frames, one 120 Hz frame;
+/// computed durations only, never real sleeping — the sim_demo
+/// determinism precedent). The no-discard invariant and the spine
+/// conservation are asserted AT every frame, inside the run (both
+/// runs of a double-run re-assert them); the per-frame census is
+/// the double-run comparison's subject. Returns the driver (for
+/// the final-state equality), the census, and the observational
+/// per-frame cost samples.
+fn run_stall_script(
+    cycles: u64,
+) -> (
+    SimDriver,
+    Vec<StallFrame>,
+    engine_core::timing::TimingSamples,
+) {
+    let mut driver = SimDriver::new(NpcConfig::default(), SimConfig::default());
+    driver.run_headless(120);
+    let mut census: Vec<StallFrame> = Vec::new();
+    let mut samples = engine_core::timing::TimingSamples::default();
+    for frame in 0..cycles * 12 {
+        let started = std::time::Instant::now();
+        driver.advance(irregular_frame(frame));
+        samples.record(started.elapsed());
+        let spine = driver.spine();
+        let stats = spine.stats();
+        let outstanding = driver.outstanding_ticks();
+        let pending = spine.pending_count();
+        // THE NO-DISCARD INVARIANT (sim.rs's own accounting law):
+        // every tick ever due is executed or outstanding — the
+        // stall may DEFER work, never drop it.
+        assert_eq!(
+            driver.ticks_due_total(),
+            spine.clock().as_u64() + u64::from(outstanding),
+            "no-discard: clock + outstanding == ticks due, at frame {frame}"
+        );
+        // The spine conservation (this harness's wide law).
+        assert_eq!(
+            stats.scheduled,
+            stats.executed
+                + pending as u64
+                + spine.blocked_count() as u64
+                + spine.held_count() as u64,
+            "spine conservation at frame {frame}"
+        );
+        census.push(StallFrame {
+            frame,
+            outstanding,
+            pending,
+            late_arrivals: stats.late_arrivals,
+            late_executions: stats.late_executions,
+            budget_exhausted_ticks: stats.budget_exhausted_ticks,
+        });
+    }
+    (driver, census, samples)
+}
+
+/// The B10 stall measurement: the worst-case pending accumulation
+/// under a stall that exceeds the per-frame catch-up bound — the
+/// queue/accumulator shape the E-08 skip cells (logical ticks) and
+/// the E-09 crossover arms (the reactivation drain vs the synthesis
+/// jump) do not measure, driven through the REAL catch-up machinery
+/// (SimDriver, the same driver the `--sim` irregular route drives)
+/// over the real NpcWorld Legacy workload.
+fn run_stall_worst_case() {
+    println!(
+        "Stall worst case — the pending accumulation under a stall exceeding the \
+         per-frame catch-up bound (B10's added case)"
+    );
+    println!("  pod results, observational (never CI thresholds, never physical-rig claims)");
+    println!();
+    const CYCLES: u64 = 12;
+    let config = SimConfig::default();
+    println!(
+        "  the machinery: SimDriver (the --sim route's own driver) over the real \
+         NpcWorld Legacy workload — 1,000 NPCs, period 6 + seeded jitter, budget {} \
+         (near reserve {}), {} Hz tick rate, per-frame catch-up bound {} ticks",
+        config.budget,
+        config.effective_near_reserve(),
+        config.tick_rate_hz,
+        config.max_catchup_per_frame
+    );
+    println!(
+        "  the script: a 120-tick headless warm (the steady queue shape), then {} \
+         cycles of the demo's irregular cadence (the cadence_hz=0 pattern: five 60 Hz \
+         frames, ONE 2 s stall = 20 due ticks vs the 8-tick bound, five 240 Hz \
+         frames, one 120 Hz frame — computed durations only, never real sleeping)",
+        CYCLES
+    );
+    println!();
+
+    // DOUBLE-RUN (fresh construction, no shared state): the whole
+    // script again, then the equality asserts — printed claims come
+    // AFTER verification, never before.
+    let (driver_a, census_a, samples_a) = run_stall_script(CYCLES);
+    let (driver_b, census_b, _) = run_stall_script(CYCLES);
+    assert_eq!(census_a, census_b, "the stall census double-run identical");
+    {
+        let spine_a = driver_a.spine();
+        let spine_b = driver_b.spine();
+        assert_eq!(
+            spine_a.clock(),
+            spine_b.clock(),
+            "final campaign tick identical"
+        );
+        assert_eq!(spine_a.stats(), spine_b.stats(), "final stats identical");
+        assert_eq!(
+            spine_a.lane_fingerprint_hex(),
+            spine_b.lane_fingerprint_hex(),
+            "final lane fingerprint identical"
+        );
+        assert_eq!(
+            spine_a.lane_state_fingerprint_hex(),
+            spine_b.lane_state_fingerprint_hex(),
+            "final lane state fingerprint identical"
+        );
+    }
+
+    // The worst case, from the census: the retained tick obligation
+    // and the queue's armed population — each with the frame it
+    // occurred at.
+    let worst_outstanding_frame = census_a
+        .iter()
+        .max_by_key(|f| f.outstanding)
+        .expect("the census is nonempty");
+    let worst_pending_frame = census_a
+        .iter()
+        .max_by_key(|f| f.pending)
+        .expect("the census is nonempty");
+    // The pre-stall reference: the last short frame before the
+    // first stall (the pattern's stall lands at index 5).
+    let pre_stall = census_a
+        .iter()
+        .find(|f| f.frame == 4)
+        .expect("frame 4 is in the census");
+    // The retained obligation drains fully inside EVERY cycle: the
+    // catch-up bound defers the stall's dues across frames, never
+    // accumulates them across cycles.
+    for cycle in 0..CYCLES {
+        assert!(
+            census_a[cycle as usize * 12..cycle as usize * 12 + 12]
+                .iter()
+                .any(|f| f.outstanding == 0),
+            "cycle {cycle} contains a fully-drained frame (no cross-cycle accumulation)"
+        );
+    }
+    let last = *census_a.last().expect("the census is nonempty");
+    // WHERE the budget exhausted (the lateness attribution): the
+    // frames whose cumulative budget-exhausted count advanced. The
+    // measured truth: the list is EMPTY — every budget-exhausted
+    // tick and late execution belongs to the headless warm ramp
+    // (the initial 1,000-event schedule spread's synchrony, before
+    // the first census frame); the irregular-cadence script itself
+    // adds NO lateness at this workload.
+    let exhaustion_frames: Vec<u64> = census_a
+        .windows(2)
+        .filter_map(|w| {
+            (w[1].budget_exhausted_ticks > w[0].budget_exhausted_ticks).then_some(w[1].frame)
+        })
+        .collect();
+    assert!(
+        exhaustion_frames.is_empty(),
+        "the irregular-cadence frames add no budget exhaustion (the lateness is the \
+         warm ramp's, measured in the cumulative counters)"
+    );
+
+    println!(
+        "stall cell: {} cycles × 12 frames of the irregular cadence",
+        CYCLES
+    );
+    println!(
+        "  worst-case retained tick obligation: {} ticks (frame {} — the LAST stall \
+         frame; every cycle's stall retains the same amount: the 2 s stall's ~20 due \
+         ticks against the 8-tick per-frame bound)",
+        worst_outstanding_frame.outstanding, worst_outstanding_frame.frame
+    );
+    println!(
+        "  worst-case queue pending: {} events (frame {}) vs the pre-stall steady \
+         armed population {} (frame 4) — the stall does not grow the queue at this \
+         workload: arrivals come only from budget-bounded executions, so unbounded \
+         accumulation requires demand > budget (the sustained matrix's overload \
+         class, measured separately)",
+        worst_pending_frame.pending, worst_pending_frame.frame, pre_stall.pending
+    );
+    println!(
+        "  drain: the retained obligation returns to 0 inside every cycle (asserted, \
+         {} cycles); cumulative-from-construction late arrivals {} / late executions \
+         {} / budget-exhausted ticks {} — ALL from the headless warm ramp (the \
+         initial 1,000-event schedule spread's synchrony): the 144 irregular-cadence \
+         frames add ZERO (asserted — the stall script itself creates no lateness at \
+         this workload)",
+        CYCLES, last.late_arrivals, last.late_executions, last.budget_exhausted_ticks
+    );
+    println!(
+        "  budget-exhaustion attribution: the census frames' increments are {:?} — \
+         empty (the lateness is the warm ramp's, carried in the cumulative counters \
+         from before the first census frame)",
+        exhaustion_frames
+    );
+    println!(
+        "  per-frame cost p50/p99/max {:.3}/{:.3}/{:.3} ms ({} frames; the max is \
+         the catch-up batch — up to 8 budgeted ticks in one frame)",
+        samples_a.percentile_ms(0.50),
+        samples_a.percentile_ms(0.99),
+        samples_a.max_ms(),
+        samples_a.sample_count()
+    );
+    println!(
+        "  determinism: the FULL per-frame census DOUBLE-RUN IDENTICAL (asserted \
+         above); the no-discard invariant and spine conservation asserted at every \
+         frame of both runs"
+    );
+    println!();
+}
+
 // ------------------------------------------------------- SECTION 5 — memory per NPC
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1584,6 +1886,8 @@ pub fn run_behavior_measurements() {
     run_activation_crossover();
     println!();
     run_skip_cost_curves();
+    println!();
+    run_stall_worst_case();
     println!();
     run_memory_per_npc();
 }
@@ -1889,6 +2193,117 @@ mod tests {
         let mut fp = Fingerprinter::new();
         world.fingerprint(&mut fp);
         assert_eq!(fp.finish(), fp2.finish(), "world fingerprint identical");
+    }
+
+    /// The B10 stall worst-case pins (MEASURED on this module's
+    /// first complete run, stable across independent runs — the
+    /// frozen-pin discipline: a divergence is an investigation,
+    /// never a silent re-pin). All three are logical censuses of
+    /// the scripted irregular cadence (computed durations only),
+    /// so they are deterministic everywhere. The lateness triple
+    /// is cumulative-from-construction and belongs ENTIRELY to
+    /// the headless warm ramp (the initial 1,000-event schedule
+    /// spread's synchrony): the 144 irregular-cadence frames add
+    /// zero budget exhaustion (asserted below) — the stall script
+    /// itself creates no lateness at this workload.
+    const PINNED_STALL_OUTSTANDING: u32 = 12;
+    const PINNED_STALL_PENDING: usize = 1000;
+    const PINNED_STALL_LATENESS: (u64, u64, u64) = (0, 169, 6);
+
+    #[test]
+    fn stall_worst_case_double_run_and_pin() {
+        // The B10 stall worst case (the added section's lib-side
+        // guard): the 12-cycle irregular-cadence script on the real
+        // SimDriver + NpcWorld machinery. The structural laws — the
+        // no-discard invariant and the spine conservation — are
+        // asserted INSIDE run_stall_script at every frame of BOTH
+        // runs; this guard adds the double-run census equality, the
+        // catch-up-bound arithmetic, the per-cycle drain law, and
+        // the frozen extrema pins.
+        let (driver_a, census_a, _) = run_stall_script(12);
+        let (driver_b, census_b, _) = run_stall_script(12);
+        assert_eq!(census_a, census_b, "the stall census double-run identical");
+        assert_eq!(
+            driver_a.spine().clock(),
+            driver_b.spine().clock(),
+            "final campaign tick identical"
+        );
+        assert_eq!(
+            driver_a.spine().stats(),
+            driver_b.spine().stats(),
+            "final stats identical"
+        );
+
+        let worst_outstanding = census_a
+            .iter()
+            .map(|f| f.outstanding)
+            .max()
+            .expect("the census is nonempty");
+        let worst_pending = census_a
+            .iter()
+            .map(|f| f.pending)
+            .max()
+            .expect("the census is nonempty");
+        let last = *census_a.last().expect("the census is nonempty");
+        println!(
+            "stall census: worst outstanding {worst_outstanding}, worst pending \
+             {worst_pending}, final lateness ({}, {}, {})",
+            last.late_arrivals, last.late_executions, last.budget_exhausted_ticks
+        );
+
+        // The structural law (exact arithmetic, not a measurement):
+        // the pattern's 2 s stall accrues >= 20 due ticks at the
+        // 10 Hz rate; the 8-tick per-frame catch-up bound retains
+        // >= 12 of them.
+        let config = SimConfig::default();
+        let stall_due_ticks = 2_000_000_000u64 / (1_000_000_000 / u64::from(config.tick_rate_hz));
+        assert!(
+            u64::from(worst_outstanding)
+                >= stall_due_ticks - u64::from(config.max_catchup_per_frame),
+            "the stall's retained obligation is at least its due ticks minus the bound"
+        );
+        // The drain completes inside every cycle (no cross-cycle
+        // accumulation of the retained obligation).
+        for cycle in 0..12u64 {
+            assert!(
+                census_a[cycle as usize * 12..cycle as usize * 12 + 12]
+                    .iter()
+                    .any(|f| f.outstanding == 0),
+                "cycle {cycle} drains fully"
+            );
+        }
+
+        assert_eq!(
+            worst_outstanding, PINNED_STALL_OUTSTANDING,
+            "retained-obligation worst-case pin"
+        );
+        assert_eq!(
+            worst_pending, PINNED_STALL_PENDING,
+            "queue-pending worst-case pin"
+        );
+        assert_eq!(
+            (
+                last.late_arrivals,
+                last.late_executions,
+                last.budget_exhausted_ticks
+            ),
+            PINNED_STALL_LATENESS,
+            "the stall script's cumulative lateness pin (the warm ramp's initial \
+             spread, measured and frozen)"
+        );
+        // The attribution law (measured, frozen): the census frames
+        // themselves add NO budget exhaustion — the lateness is the
+        // warm ramp's, carried in the cumulative counters.
+        let exhaustion_frames: Vec<u64> = census_a
+            .windows(2)
+            .filter_map(|w| {
+                (w[1].budget_exhausted_ticks > w[0].budget_exhausted_ticks).then_some(w[1].frame)
+            })
+            .collect();
+        assert!(
+            exhaustion_frames.is_empty(),
+            "the irregular-cadence frames add no budget exhaustion (got {exhaustion_frames:?})"
+        );
     }
 
     #[test]
