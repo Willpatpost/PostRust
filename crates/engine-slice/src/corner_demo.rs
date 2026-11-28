@@ -140,19 +140,30 @@ fn project_footstep_observations(
 ///
 /// When rain is enabled, the crowd also owns the `RainLayer` that
 /// drives the rain particles and builds the instance buffer per frame.
-struct LocomotionCrowd {
+///
+/// `pub(crate)` (P5 R0): the census harness (`crate::census`) drives
+/// THIS crowd — not a near-copy — so the maximal-composition route
+/// the §9.6 row measures is the demo's own machinery, byte for
+/// byte. Crate-private: no public-API change.
+pub(crate) struct LocomotionCrowd {
     routes: Vec<engine_core::npc_locomotion::Route>,
     states: Vec<engine_core::npc_locomotion::NpcLocomotion>,
     present: Vec<bool>,
-    instances: Vec<engine_renderer::proxy_instances::ProxyInstance>,
+    /// `pub(crate)` (P5 R0): the census composition route prints the
+    /// population line from the live buffers, exactly like `run`.
+    pub(crate) instances: Vec<engine_renderer::proxy_instances::ProxyInstance>,
     tints: [[f32; 3]; 24],
     poses: Vec<Block>,
-    vehicles: Vec<engine_renderer::proxy_instances::ProxyInstance>,
+    /// `pub(crate)` (P5 R0): same census line — the vehicle count.
+    pub(crate) vehicles: Vec<engine_renderer::proxy_instances::ProxyInstance>,
     /// When behavior is on, the behavior spine and world.
     spine: Option<engine_core::spine::Spine<crate::corner_behavior::CornerCrowdWorld>>,
     /// When rain is enabled, the rain layer that owns the emitter
-    /// and builds instances per frame.
-    rain: Option<crate::corner_weather::RainLayer>,
+    /// and builds instances per frame. `pub(crate)` (P5 R0): the
+    /// census composition route assigns the warm-started layer
+    /// AFTER `with_behavior()` exactly the way `run`'s
+    /// behavior+weather arm does.
+    pub(crate) rain: Option<crate::corner_weather::RainLayer>,
     /// Fixed-timestep accumulator for the crowd's simulation steps.
     /// Accumulates presented-frame sim time and drives the world at
     /// exactly 1/60 per tick, with bounded catch-up and visible drop
@@ -162,8 +173,10 @@ struct LocomotionCrowd {
 }
 
 impl LocomotionCrowd {
-    /// The plain (non-behavior) constructor.
-    fn new() -> Self {
+    /// The plain (non-behavior) constructor. `pub(crate)` (P5 R0):
+    /// the census harness builds crowds through the same
+    /// constructors `run` selects.
+    pub(crate) fn new() -> Self {
         let (routes, states, present) = crate::corner_routes::corner_population_locomotion();
         let tints = crate::corner_population::corner_npc_tints();
         let mut instances = Vec::with_capacity(24);
@@ -201,8 +214,9 @@ impl LocomotionCrowd {
     /// The behavior spine constructor: the 24 schedules/routines/rngs,
     /// the locomotion states and present mask from part 4's constructor,
     /// and the routes (cloned once at construction). The 40 initial wake
-    /// events are armed at construction.
-    fn with_behavior() -> Self {
+    /// events are armed at construction. `pub(crate)` (P5 R0): the
+    /// census composition route's maximal arm.
+    pub(crate) fn with_behavior() -> Self {
         let (routes, states, present) = crate::corner_routes::corner_population_locomotion();
         let tints = crate::corner_population::corner_npc_tints();
         let mut instances = Vec::with_capacity(24);
@@ -277,8 +291,9 @@ impl LocomotionCrowd {
     /// knob (the ripple-visibility diagnostic's own ladder: None =
     /// the shipped 320:1 policy and its exact pins; a value swaps
     /// ONLY the admission rate — the owner's future-walk decision
-    /// tool, never a silent production change).
-    fn with_rain(ripple_decimation: Option<u32>) -> Self {
+    /// tool, never a silent production change). `pub(crate)` (P5
+    /// R0): the census composition route's weather arm.
+    pub(crate) fn with_rain(ripple_decimation: Option<u32>) -> Self {
         let mut crowd = Self::new();
         crowd.rain = Some(match ripple_decimation {
             None => crate::corner_weather::RainLayer::new([-5.0, 1.7, 13.0]),
@@ -331,7 +346,9 @@ impl LocomotionCrowd {
     /// One step: plain or composed depending on behavior flag.
     /// Uses the fixed-timestep accumulator to determine how many
     /// ticks to advance based on accumulated wall time.
-    fn step(&mut self, dt: f32) {
+    /// `pub(crate)` (P5 R0): the census composition route's
+    /// render-then-step tick, the same call `run` makes.
+    pub(crate) fn step(&mut self, dt: f32) {
         if self.spine.is_some() {
             self.step_composed(dt);
         } else {
@@ -339,7 +356,9 @@ impl LocomotionCrowd {
         }
     }
 
-    fn population(&self) -> engine_renderer::ProxyPopulation<'_> {
+    /// `pub(crate)` (P5 R0): the census composition route submits
+    /// the crowd through the same population view `run` does.
+    pub(crate) fn population(&self) -> engine_renderer::ProxyPopulation<'_> {
         engine_renderer::ProxyPopulation {
             npc: &self.instances,
             npc_poses: &self.poses,
@@ -364,7 +383,15 @@ impl LocomotionCrowd {
     /// ticking the emitter. `camera_position` and `camera_yaw` are
     /// from the current frame's view. `day_night` is the cycle position.
     /// `dt` is the fixed-timestep delta (typically DEMO_CLOCK_DT = 1/60).
-    fn update_rain(&mut self, camera_position: [f32; 3], camera_yaw: f32, day_night: f32, dt: f32) {
+    /// `pub(crate)` (P5 R0): the census composition route's
+    /// pre-submission rain tick, the same call `run` makes.
+    pub(crate) fn update_rain(
+        &mut self,
+        camera_position: [f32; 3],
+        camera_yaw: f32,
+        day_night: f32,
+        dt: f32,
+    ) {
         if let Some(rain) = &mut self.rain {
             let _report = rain.update_and_build(camera_position, camera_yaw, day_night, dt);
         }
@@ -397,7 +424,9 @@ impl LocomotionCrowd {
     /// the local table in the plain mode, the spine world's in the
     /// composed mode (the states live IN the world when behavior is
     /// on; borrow them out the same way `step_composed` does).
-    fn states(&self) -> &[engine_core::npc_locomotion::NpcLocomotion] {
+    /// `pub(crate)` (P5 R0): the census composition route prints the
+    /// walking/standing line from the same states.
+    pub(crate) fn states(&self) -> &[engine_core::npc_locomotion::NpcLocomotion] {
         match &self.spine {
             Some(spine) => &spine.world().states,
             None => &self.states,

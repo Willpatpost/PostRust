@@ -339,6 +339,96 @@ All commands below exit 0 unless stated.
 - Lane gates (untouched tree): `cargo fmt --all -- --check` exit 0;
   `cargo check --workspace --all-targets` exit 0.
 
+## E-12 P5 R0 — the census harness rows actually run (2026-11-27, lane worktree tree `b229e7f`, branch `ee/p5-r0-census-harness`)
+
+The R0 lane's three runnable rows (the §9.2 CPU matrix pod-valid by
+design; the §9.4/§9.5 rows run on the rig's own hardware — the RTX
+5070 Ti box, release, real windows, the E-7 discipline). All
+commands below exit 0. The §9.1 VRAM census and the §9.6
+composition curves are the remaining rig rows (24 + 4 windows
+including 4K — the serial archived runs; the batteries are
+`tests/census_vram.rs` / `tests/census_composition.rs`, run the
+same way).
+
+**§9.2 — the repack matrix (BEFORE R2, CPU, release, 9800X3D):**
+`cargo test -p engine-slice --test census_repack --release --
+--ignored --nocapture --test-threads=1` → 1 passed / 0 failed.
+Per-cell median µs/frame (instance-repack / pose-eval / slot-write;
+p99 in the battery's printed row; 200 samples after 200 warmup;
+the 0%-dirty instance and write columns are also the between-tick
+unchanged-population cost — render-then-step's before-R2 shape):
+
+| population | dirty | repack | pose | write | inst B | pose B |
+|---|---|---:|---:|---:|---:|---:|
+| garage (6+1) | 0% | 0.10 | 0.30 | 0.00 | 672 | 4,224 |
+| garage (6+1) | mix (4/2) | 0.10 | 1.60 | 0.10 | 672 | 4,224 |
+| garage (6+1) | 100% | 0.10 | 2.30 | 0.00 | 672 | 4,224 |
+| corner (24+2) | 0% | 0.30 | 0.50 | 0.10 | 2,496 | 16,896 |
+| corner (24+2) | mix (16/8) | 0.30 | 5.70 | 0.20 | 2,496 | 16,896 |
+| corner (24+2) | 100% | 0.30 | 8.20 | 0.10 | 2,496 | 16,896 |
+| 1k | 0% | 11.60 | 10.00 | 10.80 | 96,000 | 704,000 |
+| 1k | mix (664/336) | 11.60 | 228.30 | 11.00 | 96,000 | 704,000 |
+| 1k | 100% | 12.10 | 353.30 | 11.70 | 96,000 | 704,000 |
+| 4k (at cap) | 0% | 49.10 | 39.90 | 110.00 | 393,216 | 2,883,584 |
+| 4k (at cap) | mix (2728/1368) | 48.70 | 946.10 | 107.60 | 393,216 | 2,883,584 |
+| 4k (at cap) | 100% | 47.40 | 1,373.00 | 100.30 | 393,216 | 2,883,584 |
+
+Shape findings (the row's purpose): the instance repack and slot
+write are FLAT across the dirty axis (the whole-set before-R2
+cost); the pose evaluation scales with walkers (~0.34 µs/walker;
+standing NPCs ~10 ns/block through the A17 cache); the §9.3 carve
+context prints demand-independent 8,320,000 B. Boundary leg: 4k
+packs, 4k+1 refuses (both kinds, typed).
+
+**§9.4 — the attach/upload census (BEFORE R3, rig GPU, release):**
+`cargo test -p engine-slice --test census_attach --release --
+--ignored --nocapture --test-threads=1` → 1 passed / 0 failed
+(twice-reproduced; counters identical across runs, wall time
+varies 6.9–47 ms with first-run driver caching):
+
+| scene | attach-wall-ms | submits (attach/construction) | blocking-wait-ms | staged-pairs | tail-B | tex-mem | tex-bytes | dev-mem |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| corner | 6.92 | 5 (4/1) | 0.65 | 1 | 794,624 | 4 | 1,589,248 | 10 |
+| garage | 7.28 | 5 (4/1) | 1.24 | 1 | 794,624 | 4 | 1,589,248 | 10 |
+
+The `texture_bytes` 1,589,248 cross-checks E-7's tuple exactly; the
+NEW `texture_staging_tail_bytes` shows the permanent tails are
+794,624 B = 50.0% of the texture residency (the R3 retirement's
+whole prize). The frame-path freeze assertion passed: the four
+staging counters do not move across warmed dry frames.
+
+**§9.5 — the ripple rows (BEFORE R4, rig GPU, release):**
+`cargo test -p engine-slice --test census_ripple --release --
+--ignored --nocapture --test-threads=1` → 1 passed / 0 failed
+(120 samples per cell after 4 warm; the field state is the only
+variable — no rain instances):
+
+| state | extent | gpu-ms p50/p95/p99/max | live rings |
+|---|---|---|---:|
+| empty | 1280×720 | 0.032/0.036/0.037/0.070 | 0 |
+| steady | 1280×720 | 0.031/0.037/0.042/0.044 | 1 |
+| saturated | 1280×720 | 0.042/0.047/0.048/0.053 | 32 |
+| empty | 2560×1440 | 0.073/0.082/0.086/0.089 | 0 |
+| steady | 2560×1440 | 0.071/0.078/0.085/0.086 | 1 |
+| saturated | 2560×1440 | 0.108/0.118/0.275/0.293 | 32 |
+
+Saturation costs +31% (720p) / +48% (1440p) over empty on p50 —
+the honest before-R4 magnitude (the finding's named worst case is
+real but small at these extents, consistent with the design's
+§5.2(a) boundary). The steady cell's instantaneous live count read
+1 at the measured window (the ~3.7 is the time average; the count
+oscillates 0–8 with the 1.5 rings/s admission and 2.5 s lifetime).
+
+**Lane gates (the tree above):** `cargo fmt --all -- --check`
+exit 0; `cargo clippy -p engine-renderer -p engine-slice
+--all-targets -- -D warnings` exit 0; `cargo test -p
+engine-renderer` 190 passed / 0 failed (debug AND release — the
+pin unchanged, correct for a counter-only lane); `cargo test -p
+engine-slice --lib` 156 passed / 0 failed (= 143 baseline + 13
+census); the batteries' non-ignored portions: census_repack 2/1i,
+census_vram 1/1i, census_ripple 1/1i, census_attach 0/1i,
+census_composition 0/1i — all ok.
+
 ## Measurement baselines
 
 (To be established in P0: first full build of the integration tree, then the

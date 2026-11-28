@@ -50,12 +50,23 @@ pub(super) fn create_shader_module(
 
 /// Records an init-time transfer on the graphics queue. The staging resources
 /// may be released or reused only after the fence signals.
+///
+/// P5 R0 (§9.4, the attach/upload census): every COMPLETED call
+/// records one one-shot staging submission plus its blocking-wait
+/// duration through [`VulkanContext::record_upload_submit`] — the
+/// helper's whole per-object machinery (fresh pool, command
+/// buffer, fence, submit, blocking wait, destruction) is exactly
+/// what the census row counts, and exactly what A20/R3's pool
+/// replaces. A call that fails before the wait counts nothing
+/// (never overcounted); the timing is two `Instant::now()` reads
+/// on an attach-only path, never the frame path.
 pub(super) fn with_upload_commands(
     ctx: &VulkanContext,
     record: impl FnOnce(vk::CommandBuffer),
 ) -> Result<(), RendererError> {
     let mut pool = vk::CommandPool::null();
     let mut fence = vk::Fence::null();
+    let mut blocking_wait = std::time::Duration::ZERO;
     let result = (|| {
         let pool_info =
             vk::CommandPoolCreateInfo::default().queue_family_index(ctx.graphics_family);
@@ -88,12 +99,17 @@ pub(super) fn with_upload_commands(
             ctx.device
                 .queue_submit(ctx.graphics_queue, &[submit_info], fence)
                 .map_err(|error| RendererError::vk(error, "staging submit"))?;
+            let wait_started = std::time::Instant::now();
             ctx.device
                 .wait_for_fences(&[fence], true, u64::MAX)
                 .map_err(|error| RendererError::vk(error, "staging wait"))?;
+            blocking_wait = wait_started.elapsed();
         }
         Ok(())
     })();
+    if result.is_ok() {
+        ctx.record_upload_submit(blocking_wait);
+    }
     // SAFETY: a successful submit was waited above (or the device was lost).
     // Destroying the pool also releases its single primary command buffer.
     unsafe {
@@ -194,7 +210,14 @@ pub(super) fn create_device_local_buffer_with_data(
         Ok(())
     })();
     match result {
-        Ok(()) => Ok((buffer, memory)),
+        Ok(()) => {
+            // P5 R0 (§9.4): one completed device-local buffer upload
+            // through a throwaway HOST_VISIBLE staging pair (created
+            // and destroyed inside the closure above) — the census
+            // row's buffer-half staging object count.
+            ctx.record_staged_buffer_upload();
+            Ok((buffer, memory))
+        }
         Err(error) => {
             unsafe {
                 if staging != vk::Buffer::null() {
