@@ -66,6 +66,18 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # T01 (2026-11-28): the count-gate control-plane regression
+      # fixture — deterministic, cargo-free (bash/awk/grep only), runs
+      # in seconds. Guards the exact defect class repaired at the
+      # same date: the heavy shard's echo printed 74 while its gate
+      # enforced 64 against an actual of 72 (three literals for one
+      # quantity, drifting independently). The script exercises the
+      # gate parse/assert semantics on synthetic logs AND verifies
+      # this workflow's shard echoes and assertions derive from the
+      # same centralized expectation variables.
+      - name: CI count-gate self-test (the T01 control-plane fixture)
+        shell: bash
+        run: bash scripts/ci-count-gate-selftest.sh
       - name: Build
         run: cargo build --workspace
       # R16 (the K2-C1 final-review activation-isolation check): the
@@ -746,13 +758,21 @@ jobs:
           # run).
           expected=1629
           if [ "$(uname -s)" != "Linux" ]; then expected=1578; fi
+          # T01 (2026-11-28): the main-shard pins centralized the same
+          # way as the heavy shard's — the sibling defect here was the
+          # echo printing a stale 33 while the gate enforced 34 (green
+          # in run 46125284171 only because the actual IS 34; the
+          # printed expectation was wrong, the same duplicate-literal
+          # drift class).
+          expected_ignored=2
+          expected_results=34
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
-          echo "main shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 2 / 33)"
+          echo "main shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / $expected_ignored / $expected_results)"
           [ "$passed" -eq "$expected" ] || { echo "MAIN SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
-          [ "$ignored" -eq 2 ] || { echo "MAIN SHARD IGNORED MISMATCH: $ignored != 2"; exit 1; }
-          [ "$results" -eq 34 ] || { echo "MAIN SHARD RESULT-LINE MISMATCH: $results != 34"; exit 1; }
+          [ "$ignored" -eq "$expected_ignored" ] || { echo "MAIN SHARD IGNORED MISMATCH: $ignored != $expected_ignored"; exit 1; }
+          [ "$results" -eq "$expected_results" ] || { echo "MAIN SHARD RESULT-LINE MISMATCH: $results != $expected_results"; exit 1; }
       # (The batch-3 review's corrective item 4) The ISOLATED RELEASE
       # engine-renderer battery — the configuration the orientation
       # pin's representation-sensitive former matcher failed in while
@@ -2148,6 +2168,17 @@ jobs:
           # battery 11/11 in the same first run).
           expected=720
           if [ "$(uname -s)" != "Linux" ]; then expected=720; fi
+          # T01 (2026-11-28): the three heavy-shard pins centralized as
+          # ONE authoritative variable set — the echo, the assertions and
+          # the failure messages all derive from these, so they can no
+          # longer drift apart (the defect this repairs: the 057e72f
+          # correction updated ignored 59 -> 60 but typo'd the echo's
+          # result-line literal to 74 while leaving the result-line gate
+          # at the era-8128ae2 64; the dual-platform CI actual at the
+          # exact head a2e6e86 — run 46125284171, both heavy jobs —
+          # measured 720 / 60 / 72 IDENTICAL on ubuntu and windows).
+          expected_ignored=60
+          expected_results=72
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
@@ -2161,7 +2192,7 @@ jobs:
           # are engine-renderer lib tests — the main shard's).
           # Linux 582/14/59 MEASURED locally with this step's own
           # awk; Windows 581/14/59 platform-uniform.
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 60 / 74)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / $expected_ignored / $expected_results)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           # Era 1 package 3 (the sky, 2026-11-23): the NEW
           # tests/render_sky.rs binary carries ONE #[ignore]d
@@ -2341,7 +2372,7 @@ jobs:
           # allocations constant): ignored 46 -> 47 (measured on
           # the lane tree with this step's own parse — 664/47/64
           # Windows, passed and result lines unchanged).
-          [ "$ignored" -eq 60 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 60"; exit 1; }
+          [ "$ignored" -eq "$expected_ignored" ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != $expected_ignored"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
@@ -2383,7 +2414,14 @@ jobs:
           # ERA 2 PACKAGE C stage 4+5 (2026-11-25, this commit): the
           # NEW tests/render_weather.rs binary adds the 64th result
           # line. MEASURED with this step's own awk on this tree.
-          [ "$results" -eq 64 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 64"; exit 1; }
+          # T01 (2026-11-28): this gate reads the centralized pin above —
+          # 72 at this tree (the 8 result lines added since the 64 era:
+          # mapped by the dual-platform run 46125284171 and the local
+          # reproduction; the census: the slice lib + bin + the
+          # integration binaries incl. the crash-seams children + the
+          # doctest). The echo and this assertion now share
+          # $expected_results by construction.
+          [ "$results" -eq "$expected_results" ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != $expected_results"; exit 1; }
       # (F-06, the 2026-11-12 quality audit — Agent C) The release-mode
       # render-path CPU canary: the comparative microbenchmark in
       # release mode on the llvipe runner — NO timing thresholds (the
