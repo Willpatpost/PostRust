@@ -924,6 +924,22 @@ fn shadow_map_depths_match_the_raycaster_and_pixels_gate() {
 ///   few texels), and the rest-vs-walked EXPECTATION maps differ at
 ///   73 texels — the shadows move with the crowd.
 ///
+/// THE R2 PALETTE SEMANTICS (P5 §3.2(e), the stander pose-dedup —
+/// the re-basing this gate carries): `corner_population`'s npc
+/// instances carry the DEDUP pose indices (the 8 waiters share
+/// palette block 0, walker j its own block at 1 + j) and the
+/// evaluators emit the PALETTE — one shared rest block + one block
+/// per walker, 17 at this table's 8-stander/16-walker disposition —
+/// never one block per npc. The rest regime's supply and the walk
+/// regime's count expectation below were re-based onto those
+/// semantics; the occluders already select through each instance's
+/// remapped `pose_index` (`NpcOccluder::new` reads
+/// `blocks[pose_index]`), so the oracle reads exactly the blocks
+/// the renderer drew from and the census/differential numbers above
+/// are UNCHANGED (the per-npc skin matrices are bit-identical by
+/// the lane's identity proof — re-verified on this rig: the rest
+/// census re-matches the documented measured numbers exactly).
+///
 /// THE NPC CLASS'S DENSITY LESSON (measured, recorded — the
 /// stage-4a census's own tradition): the cascade's texel is
 /// 0.110 m over the ~80 m span, so a 0.42 m-wide figure spans
@@ -987,8 +1003,21 @@ fn populated_shadow_map_matches_the_raycaster() {
     // light's, not the camera's) — the 6-F gate's own ground probe.
     let (matrix, eye) = ground_camera([0.0, 0.0], 1.0);
 
-    // ================= THE REST-POSE MAP.
-    let rest_blocks: Vec<_> = (0..npc.len())
+    // ================= THE REST-POSE MAP. The rest regime's supply
+    // is PALETTE-SHAPED (the R2 §3.2(e) semantics): the population's
+    // instances carry the dedup pose indices (the 8 waiters share
+    // block 0, walker j at 1 + j), so ONE rest block per PALETTE
+    // SLOT — their max pose_index + 1, 17 at this table's
+    // 8-stander/16-walker disposition — puts every npc at the
+    // bit-exact rest; the pre-dedup fixture supplied one rest copy
+    // per npc (24). Every selected block is the rest either way, so
+    // the rest map's bytes and census are unchanged.
+    let rest_palette_slots = npc.iter().map(|i| i.pose_index).max().unwrap() as usize + 1;
+    assert_eq!(
+        rest_palette_slots, 17,
+        "the corner table's palette: one shared rest + the 16 walkers"
+    );
+    let rest_blocks: Vec<_> = (0..rest_palette_slots)
         .map(|_| engine_renderer::animation::rest_pose_block())
         .collect();
     let at_rest = ProxyPopulation {
@@ -1058,13 +1087,30 @@ fn populated_shadow_map_matches_the_raycaster() {
     assert_census(&rest_census, "rest");
 
     // ================= THE ANIMATED MAP (frame 33 — the population's
-    // own phases; the oracle reads the SAME walked blocks).
+    // own phases; the oracle reads the SAME walked palette). THE
+    // PALETTE-COUNT EXPECTATION (the R2 §3.2(e) stander dedup): the
+    // table's 8 waiters stand and 16 walk, so the evaluated palette
+    // is ONE shared rest block + the 16 walkers' own blocks = 17 —
+    // the pre-dedup fixture pinned one block per npc (24) under the
+    // parallel-vector shape; the occluders below select through
+    // each instance's remapped `pose_index`, so the oracle reads
+    // exactly the blocks the renderer drew from.
     let phases = engine_slice::corner_population::corner_population_phases();
+    let walkers = phases
+        .iter()
+        .filter(|p| matches!(p, engine_slice::corner_population::Phase::Walk(_)))
+        .count();
+    assert_eq!(walkers, 16, "the table's crossers and strollers walk");
     let mut walked_blocks = Vec::new();
     engine_slice::corner_population::evaluate_population_poses(33, &phases, &mut walked_blocks);
-    assert_eq!(walked_blocks.len(), npc.len());
-    // The walk is real: the 16 walkers are off rest (MEASURED: 16 of
-    // 24 blocks differ from the rest block).
+    assert_eq!(
+        walked_blocks.len(),
+        1 + walkers,
+        "the pose palette: one shared rest block + one block per walker"
+    );
+    // The walk is real: the walkers are off rest (MEASURED: 16 of
+    // the 17 palette blocks differ from the shared rest — block 0
+    // is the rest, blocks 1..=16 the walkers').
     assert!(
         walked_blocks
             .iter()
