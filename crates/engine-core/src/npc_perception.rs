@@ -1689,13 +1689,24 @@ mod tests {
             indexed_series.push((size, indexed_ns));
             linear_series.push((size, linear_ns));
             rebuild_series.push((size, rebuild_ns));
-            // Sanity bounds only (characterization, not a gate).
-            for ns in [indexed_ns, linear_ns, rebuild_ns] {
+            // Sanity bounds only (characterization, not a gate). The
+            // query arms are flat and keep the absolute bound; the
+            // rebuild arm is linear in population (measured ~230 ns
+            // per record serial, ~520 ns under concurrent load on
+            // the rig, 2026-11-27), so its bound carries a per-record
+            // term: a fixed bound trips on the arm's own scaling
+            // (68 ms at 131,072 under load) while a quadratic blowup
+            // would still clear it by orders of magnitude.
+            for ns in [indexed_ns, linear_ns] {
                 assert!(
                     ns.is_finite() && ns < 50_000_000.0,
-                    "size {size}: an arm is absurdly slow: {ns} ns"
+                    "size {size}: a query arm is absurdly slow: {ns} ns"
                 );
             }
+            assert!(
+                rebuild_ns.is_finite() && rebuild_ns < 5_000_000.0 + size as f64 * 2_000.0,
+                "size {size}: the rebuild arm is absurdly slow: {rebuild_ns} ns"
+            );
         }
 
         let indexed_slope = slope(&indexed_series);
