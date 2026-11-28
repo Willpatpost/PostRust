@@ -29,7 +29,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::hash::{BuildHasher, Hasher};
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 
 use crate::clock::Tick;
 use crate::diag::{Diagnostics, Level};
@@ -74,6 +74,20 @@ pub struct ExecCtx<'a> {
     /// exists).
     field: Field,
     follow_ups: Vec<EventSpec>,
+    /// The K admission bound's remaining slots for this execution
+    /// (T08 §4.3): initialized to
+    /// [`HousekeepingAdmission::max_follow_ups`] at `ExecCtx`
+    /// construction (the single construction site lives in
+    /// `Spine::execute_now`), decremented per buffered follow-up.
+    admissions_remaining: u32,
+    /// Follow-up emissions cropped at emission by the K bound —
+    /// beyond the cap the emission is not buffered, not scheduled,
+    /// and counted; `execute_now` publishes the total into
+    /// [`HousekeepingStats::follow_ups_cropped`] after the drain
+    /// (never silent: the counter plus an `Error`-level diagnostic
+    /// line). Cropping at EMISSION also bounds the scratch buffer's
+    /// steady-state element capacity at K.
+    crops: u32,
 }
 
 impl<'a> ExecCtx<'a> {
@@ -86,10 +100,29 @@ impl<'a> ExecCtx<'a> {
         id.seq < self.next_seq && !self.unfinished.contains(&id.seq)
     }
 
+    /// The K admission gate (T08 §4.3): one slot per buffered
+    /// follow-up, the excess cropped at emission — not buffered, not
+    /// scheduled, counted — a config outcome deliberately distinct
+    /// from the dependency-shape refusals (`invalid_dropped`, a
+    /// fingerprinted Stats class): a crop is the admission policy
+    /// speaking, fail-visible through the counter and the
+    /// `Error`-level diagnostic.
+    fn admit(&mut self, spec: EventSpec) {
+        if self.admissions_remaining == 0 {
+            self.crops += 1;
+            return;
+        }
+        self.admissions_remaining -= 1;
+        self.follow_ups.push(spec);
+    }
+
     /// Schedules an execution-relative follow-up: due = executed_tick +
     /// `delay`. Anchors to *actual* execution, not to the event's intended
     /// time — an overdue cause shifts its effects honestly instead of
     /// stacking impossible deadlines (`docs/TECH-ARCHITECTURE.md` §3.2).
+    /// Beyond the K admission bound
+    /// ([`HousekeepingAdmission::max_follow_ups`]) the emission is
+    /// cropped at emission — never silently (see [`Self::admit`]).
     pub fn follow_up(
         &mut self,
         delay: u64,
@@ -97,7 +130,7 @@ impl<'a> ExecCtx<'a> {
         payload: u64,
         depends_on: Vec<EventId>,
     ) {
-        self.follow_ups.push(EventSpec {
+        self.admit(EventSpec {
             class,
             schedule: Schedule::ExecutionRelative {
                 origin: self.executed_tick,
@@ -111,7 +144,8 @@ impl<'a> ExecCtx<'a> {
 
     /// Schedules at a fixed logical time. `tick` may lie in the past — a
     /// late arrival; the spine records it and the safe watermark can
-    /// retreat.
+    /// retreat. Beyond the K admission bound the emission is cropped
+    /// at emission (see [`Self::admit`]).
     pub fn schedule_at(
         &mut self,
         tick: Tick,
@@ -119,7 +153,7 @@ impl<'a> ExecCtx<'a> {
         payload: u64,
         depends_on: Vec<EventId>,
     ) {
-        self.follow_ups.push(EventSpec {
+        self.admit(EventSpec {
             class,
             schedule: Schedule::AtLogicalTime { due: tick },
             payload,
@@ -136,6 +170,8 @@ impl<'a> ExecCtx<'a> {
     /// lane (reclassified only through the explicit transition
     /// operation, [`Spine::reclassify_matching`]). Identity,
     /// dependencies, and accounting are identical to [`Self::follow_up`].
+    /// Beyond the K admission bound the emission is cropped at
+    /// emission (see [`Self::admit`]).
     pub fn follow_up_in_field(
         &mut self,
         field: Field,
@@ -144,7 +180,7 @@ impl<'a> ExecCtx<'a> {
         payload: u64,
         depends_on: Vec<EventId>,
     ) {
-        self.follow_ups.push(EventSpec {
+        self.admit(EventSpec {
             class,
             schedule: Schedule::ExecutionRelative {
                 origin: self.executed_tick,
@@ -163,7 +199,11 @@ impl<'a> ExecCtx<'a> {
 
 /// Rejection reasons for a scheduling request. Rejections are returned to
 /// the caller (or, for handler follow-ups, reported through diagnostics and
-/// stats) — never silently dropped (E-10 discipline).
+/// stats) — never silently dropped (E-10 discipline). The two admission
+/// refusals (T08) are CONFIG outcomes, surfaced typed at the producer so
+/// the driver can raise the cap ([`Spine::set_admission_bounds`]) or
+/// restructure its graph instead of the engine silently absorbing
+/// unbounded housekeeping work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduleError {
     /// A dependency references an event that was never scheduled. Because
@@ -171,6 +211,42 @@ pub enum ScheduleError {
     /// events, this rule also makes dependency cycles structurally
     /// impossible (review correction 2).
     UnknownDependency(EventId),
+    /// The event's dependency-declaration length exceeds the admission
+    /// bound D ([`HousekeepingAdmission::max_dependencies`]) — the raw
+    /// `depends_on` length, checked before the identity is allocated so a
+    /// refused spec leaves zero trace (no seq consumed, no queue push, no
+    /// counter moves). The raw length bounds the unique fan-out (the
+    /// registration pass dedups repeated ids later), so one park's
+    /// registration work is bounded `O(D·log n)` — a closed form, never a
+    /// hope (T08 §3.1).
+    DependencyFanOutExceeded {
+        /// The raw declaration length the schedule call observed.
+        observed: usize,
+        /// The configured cap D.
+        cap: u32,
+    },
+    /// Scheduling this event would push a prerequisite's declared-dependent
+    /// count above the admission bound F
+    /// ([`HousekeepingAdmission::max_declared_dependents`]). The count is
+    /// the number of UNFINISHED events declaring the prerequisite —
+    /// declarations on executed prerequisites are free (the declarer
+    /// executes directly and never parks) — maintained through the
+    /// derived, wire-invisible `declared_fan_in` map, so the atomic
+    /// waiter release an execution performs is bounded by exactly this
+    /// count (registered waiters ⊆ declared dependents, T08 §3.1's
+    /// load-bearing proof: the E-10 all-or-nothing release stays atomic,
+    /// bounded rather than suspended). Checked before the identity is
+    /// allocated; a refused spec leaves zero trace.
+    PrerequisiteFanInExceeded {
+        /// The prerequisite whose declared-dependent count would exceed
+        /// the cap.
+        prerequisite: EventId,
+        /// The count the schedule call would have produced
+        /// (`declared + 1`).
+        observed: u32,
+        /// The configured cap F.
+        cap: u32,
+    },
 }
 
 /// The spine's execution-history representation (PP-B2, the ratified
@@ -650,6 +726,76 @@ pub struct Stats {
     pub budget_exhausted_ticks: u64,
 }
 
+/// The scheduler-housekeeping admission bounds (T08 — Option A, bound
+/// admission before mutations): three caps, every check BEFORE any graph
+/// mutation, giving the whole tick a closed-form engine-work ceiling
+/// `O(B·(F + K·(D + log n)) + hk·D·log n)` with `hk ≤ 4.5·B + 4F`.
+///
+/// * **D** ([`Self::max_dependencies`]) — the per-event RAW
+///   dependency-declaration length, refused in [`Spine::schedule`] beside
+///   the unknown-dependency validation, before the seq is allocated. The
+///   raw length bounds the unique fan-out (registration dedups repeated
+///   ids), so one park's registration work is `O(D·log n)`.
+/// * **F** ([`Self::max_declared_dependents`]) — the per-prerequisite
+///   count of UNFINISHED declarers, refused through the derived
+///   wire-invisible `declared_fan_in` map. The load-bearing consequence:
+///   registered waiters ⊆ declared dependents ≤ F at every stable
+///   boundary, so the E-10 all-or-nothing release an execution performs
+///   is **bounded, not suspended** (the CA-03 recorded contract,
+///   preserved verbatim).
+/// * **K** ([`Self::max_follow_ups`]) — the per-execution follow-up
+///   admission count, cropped at `ExecCtx` EMISSION (beyond the cap the
+///   emission is not buffered, not scheduled, and counted in
+///   [`HousekeepingStats::follow_ups_cropped`]) — never silent, and
+///   bounding the scratch buffer's steady-state element capacity at K.
+///
+/// CONFIGURATION, never logical state — the retention-policy tradition:
+/// set through the additive [`Spine::set_admission_bounds`] (no
+/// constructor churn), never fingerprinted, never serialized. A restored
+/// spine resumes at the DEFAULTS and the driver re-configures — the
+/// documented retention-policy precedent: a world saved under non-default
+/// bounds and restored without re-configuring behaves under the defaults
+/// afterward; the divergence is observable in world content (which
+/// declarations get admitted), never in spine fingerprints, because
+/// config was never fingerprinted.
+///
+/// Default justification (measured-actual discipline, T08 §4.1): every
+/// workspace fixture's observed maximum sits comfortably under each
+/// default — the largest declared fan-in is 2048 (the lanes.rs
+/// 2100/2050 herd), the largest dependency list 3 raw entries, the
+/// largest per-execution follow-up count 3 — so D=64/F=4096/K=1024 leave
+/// 2-500× headroom over every battery while keeping the ceiling
+/// closed-form. Within-cap graphs behave bit-for-bit as before: the caps
+/// are refusals at admission, not deferrals in the drain, so no
+/// canonical order, no event id, no held/blocked/unfinished semantic, no
+/// wire byte, and no allocation pin moves. The defaults are judgment,
+/// not measurement: whether production worlds fit under them — or prefer
+/// tighter caps with visible refusals — is driver policy the
+/// observability (refusal counts, crop counts, backlog slope) makes
+/// conscious.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HousekeepingAdmission {
+    /// The per-event dependency-declaration cap D (raw `depends_on`
+    /// length).
+    pub max_dependencies: NonZeroU32,
+    /// The per-prerequisite declared-dependent cap F.
+    pub max_declared_dependents: NonZeroU32,
+    /// The per-execution follow-up admission cap K.
+    pub max_follow_ups: NonZeroU32,
+}
+
+impl Default for HousekeepingAdmission {
+    /// D = 64, F = 4096, K = 1024 (see the type doc's default
+    /// justification).
+    fn default() -> Self {
+        HousekeepingAdmission {
+            max_dependencies: NonZeroU32::new(64).expect("64 is non-zero"),
+            max_declared_dependents: NonZeroU32::new(4096).expect("4096 is non-zero"),
+            max_follow_ups: NonZeroU32::new(1024).expect("1024 is non-zero"),
+        }
+    }
+}
+
 /// Observational per-tick near/far lane report (Stage 3). Not part of the
 /// Stage 0 fingerprint schema and not authoritative state — the ledger
 /// and queues already represent executions deterministically; this is
@@ -792,6 +938,16 @@ pub struct HousekeepingStats {
     /// through [`Spine::near_pending_count`] /
     /// [`Spine::far_pending_count`] yields the backlog slope).
     pub exhaustion_backlog_peak: u64,
+    /// Handler follow-up emissions cropped at `ExecCtx` emission by the
+    /// K admission bound ([`HousekeepingAdmission::max_follow_ups`],
+    /// T08 §4.3): beyond the cap the emission is not buffered, not
+    /// scheduled, and counted here. A CONFIG outcome, deliberately a
+    /// distinct class from fingerprinted `Stats::invalid_dropped` (the
+    /// dependency-shape refusals a handler could have fixed): a crop
+    /// is the admission policy speaking, never silently — this counter
+    /// plus the `Error`-level diagnostic line under the `would_log`
+    /// guard make it fail-visible.
+    pub follow_ups_cropped: u64,
 }
 
 /// Observational suspension and reclassification counters (Stage 4
@@ -1113,6 +1269,51 @@ pub struct Spine<W: World> {
     /// class-keyed transitions that touch only their own members;
     /// entries vanish when a class's last member leaves.
     class_index: Option<ClassIndex>,
+    /// The derived declared-fan-in counts (T08 §4.2): prerequisite
+    /// seq → the number of UNFINISHED events whose `depends_on`
+    /// declares it. INVARIANT at every stable boundary:
+    /// `declared_fan_in[P]` equals that count for every unfinished
+    /// P; entries for executed P do not exist (removed at P's
+    /// execution); a prerequisite with zero unfinished declarers has
+    /// no entry. The F admission check consults it (point lookup
+    /// only) and the four maintenance sites keep it:
+    /// `schedule`/`schedule_held` (+1 per unique dep whose target is
+    /// unfinished — the held arm is REQUIRED by the
+    /// registered-⊆-declared proof, since a held declarer is
+    /// unfinished and parks on resume), `execute_now` (remove the
+    /// executed event's OWN entry, beside the `unfinished.remove`
+    /// and before the handler runs so follow-ups declaring their
+    /// just-executing producer skip the check), the held
+    /// reconstruction's recount, and `restore`'s rebuild pass.
+    ///
+    /// THE UPKEEP PROOF (why no decrement site exists): a declarer W
+    /// of P can leave `unfinished` only by executing, and W executes
+    /// only when every dependency is met — P included — so P's entry
+    /// was already removed at P's execution; while P's entry exists,
+    /// the count of its declarers never changes. Suspension is
+    /// invariant by construction (a held declarer stays unfinished;
+    /// resume re-parks through the normal path) — fewer maintenance
+    /// sites than `waiting_on` itself.
+    ///
+    /// DERIVED, never serialized, never fingerprinted, rebuilt at
+    /// restore through the canonical-spec pass (the
+    /// `remaining_deps` precedent — wire-invisible by construction);
+    /// never iterated for any decision (point lookups, inserts, and
+    /// removes only — so no deterministic-iteration requirement).
+    /// REPRESENTATION: a lookup-only `HashMap` over the
+    /// `RemainingDepsHasherBuilder`, PRE-RESERVED at construction
+    /// (`DECLARED_FAN_IN_RESERVE`) — the allocation-pin discipline:
+    /// the reservation moves the structural cost outside every
+    /// measured window and the steady-state ops are
+    /// allocation-free within reserve.
+    declared_fan_in: HashMap<u64, u32, RemainingDepsHasherBuilder>,
+    /// The scheduler-housekeeping admission bounds (T08 — see
+    /// [`HousekeepingAdmission`]). Configuration, never logical
+    /// state: not fingerprinted, not serialized — a restored spine
+    /// resumes at the defaults and the driver re-configures through
+    /// [`Spine::set_admission_bounds`] (the retention-policy
+    /// precedent).
+    admission: HousekeepingAdmission,
 }
 
 /// Registers a freshly blocked event on every unmet dependency and
@@ -1165,6 +1366,50 @@ fn has_unmet_dependencies_with(unfinished: &BTreeSet<u64>, next_seq: u64, event:
         .depends_on
         .iter()
         .any(|id| !is_executed_seq_with(unfinished, next_seq, id.seq))
+}
+
+/// Visits each UNIQUE dependency id in `deps` exactly once, in
+/// first-occurrence order — the in-place O(len²) dedup scan the
+/// admission checks use (T08 §3.1): bounded by the D cap itself
+/// (raw length ≤ D), allocation-free by construction, so the
+/// checks run inside the allocation-pinned scheduling path without
+/// moving a pin. Repeated ids encounter the earlier occurrence's
+/// scan and are skipped — the same consecutively-deduplicated
+/// declaration order the registration pass and the canonical
+/// release order rest on.
+fn for_each_unique_dep(deps: &[EventId], visit: impl FnMut(EventId)) {
+    let mut visit = visit;
+    for (index, dep) in deps.iter().enumerate() {
+        if deps[..index].contains(dep) {
+            continue;
+        }
+        visit(*dep);
+    }
+}
+
+/// Rebuilds the derived declared-fan-in counts from canonical state
+/// (T08 §4.2 — the `remaining_deps` rebuild's shape, over EVERY
+/// unfinished obligation's spec this time: the count spans queued,
+/// blocked, AND held declarers): for each unique dependency whose
+/// target is unfinished, one count. The maintained map equals this
+/// pure function at every stable boundary (the
+/// rebuild-equals-maintained invariant the revalidation helper
+/// pins); the held reconstruction's replacement path and `restore`
+/// both refresh through this pass.
+fn rebuild_declared_fan_in<'a>(
+    map: &mut HashMap<u64, u32, RemainingDepsHasherBuilder>,
+    events: impl Iterator<Item = &'a Event>,
+    unfinished: &BTreeSet<u64>,
+    next_seq: u64,
+) {
+    map.clear();
+    for event in events {
+        for_each_unique_dep(&event.depends_on, |dep| {
+            if !is_executed_seq_with(unfinished, next_seq, dep.seq) {
+                *map.entry(dep.seq).or_insert(0) += 1;
+            }
+        });
+    }
 }
 
 // -- the class-locality index's maintenance helpers (CA-08) ----------
@@ -1274,6 +1519,18 @@ fn class_drop_held(index: &mut ClassIndex, class: EventClass, seq: u64) {
 /// blocked-set sizes; beyond the reservation the map simply grows
 /// (amortized, never on the pinned scenario's path).
 const REMAINING_DEPS_RESERVE: usize = 16;
+
+/// The constructor-time reservation for the derived declared-fan-in
+/// counts (T08 §3.1.1 — the `REMAINING_DEPS_RESERVE` precedent):
+/// enough entries that the `spine_allocations` pin scenario — whose
+/// window opens INSIDE `run_wave` after spine construction and
+/// touches exactly two distinct unfinished prerequisites (the
+/// two-dependency blocked event's early and late dependencies) —
+/// never allocates on the admission-check or upkeep path. Beyond the
+/// reservation the map grows amortized, never on the pinned
+/// scenario's path; the steady-state entry ops are allocation-free
+/// within reserve, the `RemainingDepsHasherBuilder` reuse.
+const DECLARED_FAN_IN_RESERVE: usize = 16;
 
 /// A trivially-cheap deterministic hasher for the derived
 /// remaining-dependency counts (FNV-1a over the key bytes — the L5
@@ -1493,6 +1750,11 @@ impl<W: World> Spine<W> {
             backlog_at_break_far: 0,
             scratch_follow_ups: Vec::new(),
             class_index: None,
+            declared_fan_in: HashMap::with_capacity_and_hasher(
+                DECLARED_FAN_IN_RESERVE,
+                RemainingDepsHasherBuilder,
+            ),
+            admission: HousekeepingAdmission::default(),
         }
     }
 
@@ -1738,14 +2000,82 @@ impl<W: World> Spine<W> {
 
     // ---------------------------------------------------------- scheduling
 
+    /// The F admission check's finder (T08 §3.1): the first unique
+    /// dependency whose prerequisite's declared-dependent count would
+    /// cross the cap — `None` when every declaration is within bounds
+    /// (including declarations on executed prerequisites, which have
+    /// no map entry and are free by construction). Read-only: the
+    /// check runs before any mutation, so a refused spec leaves zero
+    /// trace.
+    fn over_cap_prerequisite(&self, deps: &[EventId]) -> Option<(EventId, u32)> {
+        if deps.is_empty() {
+            return None;
+        }
+        let max_fan_in = self.admission.max_declared_dependents.get();
+        let mut over: Option<(EventId, u32)> = None;
+        for_each_unique_dep(deps, |dep| {
+            if over.is_some() {
+                return;
+            }
+            if let Some(&declared) = self.declared_fan_in.get(&dep.seq) {
+                let observed = declared.saturating_add(1);
+                if observed > max_fan_in {
+                    over = Some((dep, observed));
+                }
+            }
+        });
+        over
+    }
+
     /// Schedules an event. Dependency ids must reference already-scheduled
     /// or already-executed events; unknown ids are rejected immediately
     /// (which also makes dependency cycles structurally impossible).
+    ///
+    /// **The admission contract (T08, versioned):** a declaration may
+    /// also be refused by the housekeeping admission bounds — the
+    /// per-event raw dependency length beyond D
+    /// ([`HousekeepingAdmission::max_dependencies`], typed
+    /// [`ScheduleError::DependencyFanOutExceeded`]), or a
+    /// prerequisite's unfinished declared-dependent count beyond F
+    /// ([`HousekeepingAdmission::max_declared_dependents`], typed
+    /// [`ScheduleError::PrerequisiteFanInExceeded`]). Both refusals
+    /// sit BESIDE the unknown-dependency validation — before the seq
+    /// is allocated — so a refused spec consumes nothing (no
+    /// identity minted, no queue push, no counter moves; the dense
+    /// `[0, next_seq)` frontier is untouched). Over-cap graphs move
+    /// from "silently admitted, unbounded engine housekeeping work"
+    /// to "typed refusal, counted": configure through
+    /// [`Self::set_admission_bounds`] (defaults D=64/F=4096/K=1024
+    /// leave 2-500× headroom over every workspace fixture's observed
+    /// maximum — within-cap graphs behave bit-for-bit as before).
     pub fn schedule(&mut self, spec: EventSpec) -> Result<EventId, ScheduleError> {
         // Dense allocation issues exactly `[0, next_seq)`, so `known`
         // is the frontier bounds check (the E3 representation).
         if let Some(unknown) = spec.depends_on.iter().find(|id| id.seq >= self.next_seq) {
             return Err(ScheduleError::UnknownDependency(*unknown));
+        }
+        // The D admission bound (T08 §3.1): the RAW declaration
+        // length, O(1) to check, bounding the unique registration
+        // fan-out (raw ≥ unique) — one park's registration work is
+        // O(D·log n), a closed form. Before any mutation.
+        if spec.depends_on.len() > self.admission.max_dependencies.get() as usize {
+            return Err(ScheduleError::DependencyFanOutExceeded {
+                observed: spec.depends_on.len(),
+                cap: self.admission.max_dependencies.get(),
+            });
+        }
+        // The F admission bound (T08 §3.1), per UNIQUE dependency,
+        // before any mutation: the derived map holds an entry exactly
+        // while the prerequisite is unfinished, so declarations on
+        // executed prerequisites skip the check naturally (the
+        // follow-up-on-producer shape is free); the saturating add
+        // refuses rather than wrapping on a legacy over-F restore.
+        if let Some((prerequisite, observed)) = self.over_cap_prerequisite(&spec.depends_on) {
+            return Err(ScheduleError::PrerequisiteFanInExceeded {
+                prerequisite,
+                observed,
+                cap: self.admission.max_declared_dependents.get(),
+            });
         }
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -1787,6 +2117,22 @@ impl<W: World> Spine<W> {
         }
         self.unfinished.insert(seq);
         let pending = Pending::new(event);
+        // The declared-fan-in upkeep (T08 §4.2, site 1): +1 per UNIQUE
+        // dependency whose target is unfinished — the entry created at
+        // the first declaration. The declarer's declarations are fixed
+        // here and the count never changes while the prerequisite
+        // stays unfinished (the upkeep proof: a declarer can only
+        // finish after its prerequisite, whose own execution already
+        // removed the entry). Before the pending moves into its lane.
+        if !pending.event.depends_on.is_empty() {
+            let unfinished = &self.unfinished;
+            let next_seq = self.next_seq;
+            for_each_unique_dep(&pending.event.depends_on, |dep| {
+                if !is_executed_seq_with(unfinished, next_seq, dep.seq) {
+                    *self.declared_fan_in.entry(dep.seq).or_insert(0) += 1;
+                }
+            });
+        }
         // The class-locality index follows the insert (CA-08): one
         // O(log) set insert per scheduled event on a spine whose
         // index is live — the whole steady-state price of every
@@ -1822,6 +2168,25 @@ impl<W: World> Spine<W> {
         if let Some(unknown) = spec.depends_on.iter().find(|id| id.seq >= self.next_seq) {
             return Err(ScheduleError::UnknownDependency(*unknown));
         }
+        // The admission bounds, identical to [`Self::schedule`]'s and
+        // REQUIRED here by the registered-⊆-declared proof (T08): a
+        // held declarer is unfinished and parks on resume, so an
+        // admission path that skipped held declarations would
+        // undercount the declared fan-in and unbound the release the
+        // F cap exists to bound.
+        if spec.depends_on.len() > self.admission.max_dependencies.get() as usize {
+            return Err(ScheduleError::DependencyFanOutExceeded {
+                observed: spec.depends_on.len(),
+                cap: self.admission.max_dependencies.get(),
+            });
+        }
+        if let Some((prerequisite, observed)) = self.over_cap_prerequisite(&spec.depends_on) {
+            return Err(ScheduleError::PrerequisiteFanInExceeded {
+                prerequisite,
+                observed,
+                cap: self.admission.max_declared_dependents.get(),
+            });
+        }
         let seq = self.next_seq;
         self.next_seq += 1;
         let id = EventId { seq };
@@ -1853,10 +2218,46 @@ impl<W: World> Spine<W> {
         if let Some(index) = self.class_index.as_mut() {
             class_track_held(index, pending.event.class, seq);
         }
+        // The declared-fan-in upkeep (site 1's held arm — a held
+        // declarer counts exactly like a queued one; suspension
+        // invariance by construction), before the pending moves into
+        // the held map.
+        if !pending.event.depends_on.is_empty() {
+            let unfinished = &self.unfinished;
+            let next_seq = self.next_seq;
+            for_each_unique_dep(&pending.event.depends_on, |dep| {
+                if !is_executed_seq_with(unfinished, next_seq, dep.seq) {
+                    *self.declared_fan_in.entry(dep.seq).or_insert(0) += 1;
+                }
+            });
+        }
         self.held.insert(pending.seq, pending);
         self.stats.scheduled += 1;
         self.suspension.scheduled_held_total += 1;
         Ok(id)
+    }
+
+    /// Configures the scheduler-housekeeping admission bounds (T08 —
+    /// see [`HousekeepingAdmission`]). Configuration, never logical
+    /// state: setting the bounds changes no fingerprint, no save
+    /// byte, and no statistic — only which FUTURE declarations are
+    /// admitted. Tighter caps surface over-cap graphs as typed
+    /// [`ScheduleError`] refusals at the producer and over-K
+    /// follow-up emissions as counted crops
+    /// ([`HousekeepingStats::follow_ups_cropped`]); the defaults
+    /// (D=64/F=4096/K=1024) leave headroom over every workspace
+    /// fixture's observed maximum. A restored spine resumes at the
+    /// defaults regardless of what the saving process had configured
+    /// (the retention-policy precedent: the driver re-configures at
+    /// its own configuration boundary after restore).
+    pub fn set_admission_bounds(&mut self, bounds: HousekeepingAdmission) {
+        self.admission = bounds;
+    }
+
+    /// The configured admission bounds (the defaults until
+    /// [`Self::set_admission_bounds`] runs).
+    pub fn admission_bounds(&self) -> HousekeepingAdmission {
+        self.admission
     }
 
     // ---------------------------------------------------------- suspension
@@ -2245,6 +2646,28 @@ impl<W: World> Spine<W> {
             self.housekeeping_stats.dependency_registrations += u64::from(registered);
             self.remaining_deps.insert(event.id.seq, registered);
         }
+        // The declared-fan-in recount (T08 §4.2, site 3 — the
+        // replacement path): the removals and installs change which
+        // unfinished events declare which prerequisites, so every
+        // count is recomputed against the current canonical specs —
+        // queued, blocked, AND held declarers all count (the count
+        // spans every unfinished obligation, where `waiting_on`'s
+        // rebuild spans only the blocked set). The
+        // rebuild-equals-maintained invariant the revalidation
+        // helper pins.
+        let unfinished = &self.unfinished;
+        let next_seq = self.next_seq;
+        rebuild_declared_fan_in(
+            &mut self.declared_fan_in,
+            self.near_queue
+                .iter()
+                .map(|Reverse(pending)| &pending.event)
+                .chain(self.far_queue.iter().map(|Reverse(pending)| &pending.event))
+                .chain(self.blocked.values())
+                .chain(self.held.values().map(|pending| &pending.event)),
+            unfinished,
+            next_seq,
+        );
         // The replacement semantics: the conservation identity holds
         // with the scheduled statistic adjusted by the delta.
         self.stats.scheduled = self
@@ -4138,6 +4561,15 @@ impl<W: World> Spine<W> {
         // equivalent of the executed-set insert — same sequencing,
         // same semantics).
         self.unfinished.remove(&event.id.seq);
+        // The declared-fan-in entry dies with the unfinished
+        // membership (T08 §4.2, site 2 — the upkeep proof: a
+        // declarer of this event can only finish after it, so no
+        // decrement site exists; the executed event's OWN entry as a
+        // prerequisite key is the only one to remove). Follow-ups
+        // declaring on this just-executing producer therefore skip
+        // the F check — the declaration is free, exactly the
+        // follow-up-on-producer shape the design names.
+        self.declared_fan_in.remove(&event.id.seq);
         self.stats.executed += 1;
         if executed_tick > due {
             self.stats.late_executions += 1;
@@ -4163,7 +4595,7 @@ impl<W: World> Spine<W> {
         // returned below with its capacity retained, so a handler
         // emitting one follow-up per wake (the adversary workload's
         // shape) costs no allocation in steady state.
-        let mut follow_ups = {
+        let (mut follow_ups, crops) = {
             let unfinished = &self.unfinished;
             let next_seq = self.next_seq;
             let mut ctx = ExecCtx {
@@ -4172,9 +4604,15 @@ impl<W: World> Spine<W> {
                 next_seq,
                 field: event.field,
                 follow_ups: std::mem::take(&mut self.scratch_follow_ups),
+                // The K admission bound's per-execution budget (T08
+                // §4.3): the slots this execution may admit through
+                // `follow_up`/`schedule_at`/`follow_up_in_field`,
+                // cropped (counted, never silent) beyond it.
+                admissions_remaining: self.admission.max_follow_ups.get(),
+                crops: 0,
             };
             self.world.execute(&event, &mut ctx);
-            ctx.drain()
+            (ctx.drain(), ctx.crops)
         };
         for spec in follow_ups.drain(..) {
             if let Err(error) = self.schedule(spec) {
@@ -4191,6 +4629,20 @@ impl<W: World> Spine<W> {
             }
         }
         self.scratch_follow_ups = follow_ups;
+        // The K crop's publication (T08 §4.3): a config outcome in
+        // the observational class, fail-visible — never silent.
+        if crops > 0 {
+            self.housekeeping_stats.follow_ups_cropped += u64::from(crops);
+            if self.diag.would_log(Level::Error) {
+                self.diag.log(
+                    Level::Error,
+                    format!(
+                        "cropped {crops} follow-up(s) beyond the admission cap from {id} — \
+                         raise the cap through set_admission_bounds or restructure the handler"
+                    ),
+                );
+            }
+        }
 
         // Release dependents that were waiting on this event (E-10:
         // the synchronous waiter release). The whole loop is atomic
@@ -4821,6 +5273,19 @@ impl<W: SaveWorld> Spine<W> {
             // reaches the save — a restored spine reconstructs it on
             // its first class-keyed call, from these canonical parts.
             class_index: None,
+            // The derived declared-fan-in counts rebuild below, from
+            // the canonical specs of every unfinished obligation (the
+            // `remaining_deps` rebuild's precedent) — wire-invisible
+            // by construction, and pre-reserved so the rebuild itself
+            // allocates no more than the entry count needs.
+            declared_fan_in: HashMap::with_capacity_and_hasher(
+                DECLARED_FAN_IN_RESERVE,
+                RemainingDepsHasherBuilder,
+            ),
+            // The admission bounds reset to the defaults (the
+            // retention-policy precedent: configuration never rides
+            // the wire; the driver re-configures after restore).
+            admission: HousekeepingAdmission::default(),
         };
 
         // Queues: heap layout is rebuild-order-dependent and invisible —
@@ -4869,6 +5334,36 @@ impl<W: SaveWorld> Spine<W> {
             spine.held_index.insert((pending.due, pending.seq));
             spine.held.insert(pending.seq, pending);
         }
+
+        // The derived declared-fan-in counts (T08 §4.2, site 4):
+        // rebuilt from the canonical specs of every unfinished
+        // obligation — queued, blocked, and held — the same pure
+        // function the live admission path maintains (the
+        // `remaining_deps` precedent). Restore is fail-closed on
+        // corruption, never on config: the rebuild is faithful to
+        // canonical state and does NOT enforce the caps (a pre-cap
+        // save with a >F waiter list is admitted as-is; its legacy
+        // atomic release performs once, bounded by the saved graph's
+        // actual fan-in — the documented restore contract).
+        let unfinished = &spine.unfinished;
+        let next_seq = spine.next_seq;
+        rebuild_declared_fan_in(
+            &mut spine.declared_fan_in,
+            spine
+                .near_queue
+                .iter()
+                .map(|Reverse(pending)| &pending.event)
+                .chain(
+                    spine
+                        .far_queue
+                        .iter()
+                        .map(|Reverse(pending)| &pending.event),
+                )
+                .chain(spine.blocked.values())
+                .chain(spine.held.values().map(|pending| &pending.event)),
+            unfinished,
+            next_seq,
+        );
 
         // The derived max-intended-due index: recomputed from the
         // canonical ledger on the full path (value-identical to the
@@ -6847,6 +7342,981 @@ mod tests {
             final_counters.exhaustion_backlog_peak, 90,
             "the released herd's re-queue is the largest exhaustion backlog"
         );
+    }
+
+    // ---------------------------- T08 admission-bound tests (Option A)
+    //
+    // Every battery names its oracle and asserts EXACT accepted
+    // execution sequences or EXACT typed outcomes — integers, never
+    // wall-clock (the E-8 discipline; §7.12): every decision the
+    // caps make is a pure function of canonical state + config.
+
+    /// The admission-bounds fixture shorthand (production callers
+    /// construct the `NonZeroU32`s at their configuration boundary).
+    fn admission(d: u64, f: u64, k: u64) -> HousekeepingAdmission {
+        HousekeepingAdmission {
+            max_dependencies: NonZeroU32::new(u32::try_from(d).expect("d fits u32"))
+                .expect("d is non-zero"),
+            max_declared_dependents: NonZeroU32::new(u32::try_from(f).expect("f fits u32"))
+                .expect("f is non-zero"),
+            max_follow_ups: NonZeroU32::new(u32::try_from(k).expect("k fits u32"))
+                .expect("k is non-zero"),
+        }
+    }
+
+    /// THE MAP-INVARIANT ORACLE (T08 §4.2, the
+    /// `remaining_counts_match_full_revalidation` discipline): the
+    /// derived `declared_fan_in` map equals the from-scratch
+    /// re-derivation — for every unfinished prerequisite, the number
+    /// of unfinished events (queued, blocked, OR held) whose
+    /// `depends_on` declares it, unique ids counted once — computed
+    /// here through an independent BTreeMap accumulator, never the
+    /// production rebuild path.
+    fn declared_fan_in_matches_revalidation<W: World>(spine: &Spine<W>) {
+        let mut expected: BTreeMap<u64, u32> = BTreeMap::new();
+        let mut count_declarations = |event: &Event| {
+            let mut seen: BTreeSet<u64> = BTreeSet::new();
+            for dep in &event.depends_on {
+                if !spine.is_executed_seq(dep.seq) && seen.insert(dep.seq) {
+                    *expected.entry(dep.seq).or_insert(0) += 1;
+                }
+            }
+        };
+        for Reverse(pending) in spine.near_queue.iter() {
+            count_declarations(&pending.event);
+        }
+        for Reverse(pending) in spine.far_queue.iter() {
+            count_declarations(&pending.event);
+        }
+        for event in spine.blocked.values() {
+            count_declarations(event);
+        }
+        for pending in spine.held.values() {
+            count_declarations(&pending.event);
+        }
+        assert_eq!(
+            spine.declared_fan_in.len(),
+            expected.len(),
+            "the derived declared-fan-in map lives on exactly the \
+             declared unfinished prerequisites"
+        );
+        for (prerequisite, &declared) in &expected {
+            assert_eq!(
+                spine.declared_fan_in.get(prerequisite),
+                Some(&declared),
+                "declared_fan_in[{prerequisite}] must equal the full \
+                 re-derivation ({declared})"
+            );
+        }
+    }
+
+    /// The release charge identity (T08 §5.1), asserted at battery
+    /// boundaries: every waiter visit resolves to exactly one
+    /// counted outcome.
+    fn assert_release_charge_identity<W: World>(spine: &Spine<W>) {
+        let counters = spine.housekeeping_stats();
+        assert_eq!(
+            counters.waiter_visits,
+            counters.release_decrements + counters.release_unblocks + counters.release_not_blocked,
+            "the release charge identity at this boundary"
+        );
+    }
+
+    /// The before-mutations proof's observable snapshot: the dense
+    /// frontier, both lanes, the blocked and held sets, every
+    /// fingerprinted Stats counter, and every observational
+    /// HousekeepingStats counter (all `Copy + PartialEq`).
+    fn admission_state<W: World>(
+        spine: &Spine<W>,
+    ) -> (u64, usize, usize, usize, usize, Stats, HousekeepingStats) {
+        (
+            spine.next_seq,
+            spine.near_queue.len(),
+            spine.far_queue.len(),
+            spine.blocked.len(),
+            spine.held.len(),
+            spine.stats(),
+            spine.housekeeping_stats(),
+        )
+    }
+
+    /// §7.1 — THE FAN-OUT REFUSAL (D): a declaration longer than the
+    /// cap is refused typed BEFORE the identity is allocated (the
+    /// refused spec leaves zero trace — no seq consumed, no queue
+    /// push, no `unfinished` insert, no counter moves, no map
+    /// mutation), a declaration at exactly the cap is admitted, and
+    /// DUPLICATED ids are admitted at the raw-length check (three
+    /// raw entries, two unique — the registration dedup counts each
+    /// prerequisite once).
+    #[test]
+    fn dependency_declarations_are_capped_before_seq_allocation() {
+        let mut spine = Spine::new(NoopWorld, 100);
+        spine.set_admission_bounds(admission(2, 4096, 1024));
+        let a = spine.schedule(spec(0, Field::Near, 50, 0)).unwrap();
+        let b = spine.schedule(spec(0, Field::Near, 50, 0)).unwrap();
+        let c = spine.schedule(spec(0, Field::Near, 50, 0)).unwrap();
+        // Three raw dependencies at D=2: the typed refusal.
+        let state_before = admission_state(&spine);
+        let map_before = spine.declared_fan_in.clone();
+        assert_eq!(
+            spine.schedule(dep_spec(1, Field::Near, 1, 0, vec![a, b, c])),
+            Err(ScheduleError::DependencyFanOutExceeded {
+                observed: 3,
+                cap: 2
+            })
+        );
+        assert_eq!(
+            admission_state(&spine),
+            state_before,
+            "the refused spec leaves zero trace"
+        );
+        assert_eq!(spine.declared_fan_in, map_before);
+        declared_fan_in_matches_revalidation(&spine);
+        // At exactly D: admitted — the dense frontier untouched by
+        // the refusal (seq 3, not 4).
+        let admitted = spine
+            .schedule(dep_spec(1, Field::Near, 1, 0, vec![a, b]))
+            .unwrap();
+        assert_eq!(admitted.seq, 3);
+        // Duplicates — the lanes.rs fixture's `[first, last, first]`
+        // shape: three raw entries, two unique. The RAW-length check
+        // is the mechanism (§3.1: raw ≥ unique, O(1)), so at D=2 the
+        // three raw entries are refused exactly like the first case;
+        // at D=3 the same spec is admitted and each unique
+        // prerequisite counts ONCE in the map (the registration
+        // dedup — the design §7.1's duplicate example read "admitted
+        // at D=2", which contradicts the raw check its own
+        // parenthetical names; the mechanism wins and the example's
+        // cap is corrected here, recorded in the lane notes).
+        assert_eq!(
+            spine.schedule(dep_spec(1, Field::Near, 1, 0, vec![a, a, b])),
+            Err(ScheduleError::DependencyFanOutExceeded {
+                observed: 3,
+                cap: 2
+            }),
+            "the raw length is what D checks — duplicates do not shrink it"
+        );
+        spine.set_admission_bounds(admission(3, 4096, 1024));
+        let duplicated = spine
+            .schedule(dep_spec(1, Field::Near, 1, 0, vec![a, a, b]))
+            .unwrap();
+        assert_eq!(duplicated.seq, 4);
+        assert_eq!(spine.declared_fan_in.get(&a.seq), Some(&2));
+        assert_eq!(spine.declared_fan_in.get(&b.seq), Some(&2));
+        assert!(!spine.declared_fan_in.contains_key(&c.seq));
+        declared_fan_in_matches_revalidation(&spine);
+        assert_release_charge_identity(&spine);
+        // Configuration alone is fingerprint-invisible (the
+        // retention-policy class).
+        let fingerprint_before = spine.engine_fingerprint();
+        spine.set_admission_bounds(admission(5, 8, 3));
+        assert_eq!(spine.engine_fingerprint(), fingerprint_before);
+        assert_eq!(spine.admission_bounds(), admission(5, 8, 3));
+    }
+
+    /// §7.2 part 1 — THE FAN-IN REFUSAL (F): the (F+1)-th declarer on
+    /// one prerequisite is refused typed before mutation, the first F
+    /// admitted, the before-mutations proof as in §7.1, and the cap
+    /// is PER-PREREQUISITE (a fresh prerequisite admits at the same
+    /// configured bound).
+    #[test]
+    fn prerequisite_fan_in_is_capped_before_seq_allocation() {
+        let mut spine = Spine::new(NoopWorld, 100);
+        spine.set_admission_bounds(admission(64, 4, 1024));
+        let prereq = spine.schedule(spec(0, Field::Near, 50, 9999)).unwrap();
+        for i in 0..4u64 {
+            assert!(
+                spine
+                    .schedule(dep_spec(1, Field::Near, 1, i, vec![prereq]))
+                    .is_ok()
+            );
+        }
+        assert_eq!(spine.declared_fan_in.get(&prereq.seq), Some(&4));
+        // The fifth declarer: the typed refusal, pre-mutation.
+        let state_before = admission_state(&spine);
+        let map_before = spine.declared_fan_in.clone();
+        assert_eq!(
+            spine.schedule(dep_spec(1, Field::Near, 1, 4, vec![prereq])),
+            Err(ScheduleError::PrerequisiteFanInExceeded {
+                prerequisite: prereq,
+                observed: 5,
+                cap: 4
+            })
+        );
+        assert_eq!(
+            admission_state(&spine),
+            state_before,
+            "the refused spec leaves zero trace"
+        );
+        assert_eq!(spine.declared_fan_in, map_before);
+        declared_fan_in_matches_revalidation(&spine);
+        assert_release_charge_identity(&spine);
+        // The cap is per-prerequisite: a fresh one admits.
+        let other = spine.schedule(spec(0, Field::Near, 50, 0)).unwrap();
+        assert!(
+            spine
+                .schedule(dep_spec(2, Field::Near, 1, 5, vec![other]))
+                .is_ok()
+        );
+        assert_eq!(spine.declared_fan_in.get(&other.seq), Some(&1));
+        declared_fan_in_matches_revalidation(&spine);
+    }
+
+    /// §7.2 part 2 — THE BOUND PROVEN: with F configured small (8)
+    /// and a herd admitted up to it, the prerequisite's execution
+    /// visits EXACTLY F waiters — the admission bound, not the
+    /// allowance, is the atomic release's ceiling, and no overshoot
+    /// beyond F appears anywhere in the per-tick worst (the audit's
+    /// per-tick maximum work, pinned as exact integers, never
+    /// wall-clock).
+    #[test]
+    fn the_fan_in_cap_bounds_the_atomic_release_exactly() {
+        let mut spine = Spine::new(
+            RecordingWorld {
+                executed: Vec::new(),
+            },
+            10,
+        );
+        spine.set_admission_bounds(admission(64, 8, 1024));
+        let prereq = spine.schedule(spec(0, Field::Near, 10, 9999)).unwrap();
+        for i in 0..8u64 {
+            assert!(
+                spine
+                    .schedule(dep_spec(1, Field::Near, 1, i, vec![prereq]))
+                    .is_ok()
+            );
+        }
+        assert!(matches!(
+            spine.schedule(dep_spec(1, Field::Near, 1, 8, vec![prereq])),
+            Err(ScheduleError::PrerequisiteFanInExceeded { .. })
+        ));
+        // All eight park inside tick 1's allowance (8 < 15).
+        spine.run_ticks(9);
+        assert_eq!(spine.blocked_count(), 8);
+        declared_fan_in_matches_revalidation(&spine);
+        assert_release_charge_identity(&spine);
+        // Tick 10: the prerequisite executes; its atomic release
+        // visits exactly F waiters — the E-10 release stays
+        // all-or-nothing, bounded by admission rather than suspended.
+        spine.run_tick();
+        let counters = spine.housekeeping_stats();
+        assert_eq!(counters.waiter_visits, 8, "waiter_visits == F exactly");
+        assert_eq!(counters.release_unblocks, 8);
+        assert_eq!(counters.release_decrements, 0);
+        assert_eq!(counters.release_not_blocked, 0);
+        assert_release_charge_identity(&spine);
+        // The per-tick worst: tick 1's eight parks and tick 10's
+        // eight release visits — no overshoot beyond F anywhere.
+        assert_eq!(counters.worst_tick_housekeeping, 8);
+        // The whole herd executes in the release tick (budget 10 ≥
+        // 1 + 8) in canonical (due, seq) order.
+        assert_eq!(spine.stats().executed, 9);
+        let mut expected = vec![9999u64];
+        expected.extend(0..8);
+        assert_eq!(spine.world().executed, expected);
+        assert_eq!(spine.blocked_count(), 0);
+        assert!(!spine.declared_fan_in.contains_key(&prereq.seq));
+        declared_fan_in_matches_revalidation(&spine);
+    }
+
+    /// §7.3 — DECLARATIONS ON EXECUTED PREREQUISITES ARE FREE: at
+    /// F=1, declarers on an already-executed event are admitted
+    /// without refusal, execute directly (never park), and leave the
+    /// map empty — including the follow-up-on-just-executing-producer
+    /// shape, whose admission the `execute_now` ordering (the entry
+    /// dies beside the `unfinished.remove`, before the handler runs)
+    /// makes free by construction.
+    #[test]
+    fn declarations_on_executed_prerequisites_are_free() {
+        // The plain shape: schedule-side declarers on an executed event.
+        let mut spine = Spine::new(
+            RecordingWorld {
+                executed: Vec::new(),
+            },
+            100,
+        );
+        spine.set_admission_bounds(admission(64, 1, 1024));
+        let producer = spine.schedule(spec(0, Field::Near, 1, 9999)).unwrap();
+        spine.run_tick();
+        assert!(spine.is_executed(producer));
+        for i in 0..10u64 {
+            assert!(
+                spine
+                    .schedule(dep_spec(1, Field::Near, 2, i, vec![producer]))
+                    .is_ok(),
+                "declarations on an executed prerequisite are free"
+            );
+        }
+        assert!(spine.declared_fan_in.is_empty());
+        declared_fan_in_matches_revalidation(&spine);
+        spine.run_tick();
+        assert_eq!(
+            spine.stats().executed,
+            11,
+            "every declarer executed directly — none parked"
+        );
+        assert_eq!(spine.blocked_count(), 0);
+        assert_eq!(spine.housekeeping_stats().parks, 0);
+
+        // The follow-up-on-producer shape: a handler whose follow-up
+        // depends on the event currently executing (the :3997-3999
+        // shape) — the executing event's entry is already gone when
+        // the emission's declaration is checked, and the chain of
+        // such follow-ups never parks.
+        struct ProducerChainWorld;
+        impl World for ProducerChainWorld {
+            fn execute(&mut self, event: &Event, ctx: &mut ExecCtx) {
+                if event.payload > 0 {
+                    ctx.follow_up(1, EventClass::new(2), event.payload - 1, vec![event.id]);
+                }
+            }
+            fn fingerprint(&self, fp: &mut Fingerprinter) {
+                fp.write_str("engine-core/spine/t08-producer-chain/1");
+            }
+        }
+        let mut chained = Spine::new(ProducerChainWorld, 100);
+        chained.set_admission_bounds(admission(64, 1, 1024));
+        chained
+            .schedule(spec(3, Field::Near, 1, 3))
+            .expect("the chain root schedules");
+        chained.run_ticks(5);
+        assert_eq!(
+            chained.stats().executed,
+            4,
+            "the root plus three chained follow-ups"
+        );
+        assert_eq!(chained.blocked_count(), 0);
+        assert_eq!(chained.housekeeping_stats().parks, 0);
+        assert!(chained.declared_fan_in.is_empty());
+        declared_fan_in_matches_revalidation(&chained);
+        assert_release_charge_identity(&chained);
+    }
+
+    /// §7.4 — HELD AND CROSS-LANE COUNTING: declarers in BOTH lanes
+    /// count on the same prerequisite (the caps are lane-blind), a
+    /// held declarer counts (a prerequisite's entry survives
+    /// suspension of its declarers — suspension invariance), a
+    /// declarer resumed from held re-parks through the normal path
+    /// with the count unchanged throughout, and the prerequisite's
+    /// execution clears the entry (later declarations free).
+    #[test]
+    fn held_and_cross_lane_declarers_count_with_suspension_invariance() {
+        let mut spine = Spine::new(NoopWorld, 100);
+        spine.set_admission_bounds(admission(64, 3, 1024));
+        let prereq = spine.schedule(spec(0, Field::Near, 50, 0)).unwrap();
+        let near_declarer = spine
+            .schedule(dep_spec(1, Field::Near, 1, 0, vec![prereq]))
+            .unwrap();
+        // The far-lane declarer (the cross-lane half of the count).
+        spine
+            .schedule(dep_spec(1, Field::Far, 1, 1, vec![prereq]))
+            .unwrap();
+        let held_declarer = spine
+            .schedule_held(dep_spec(2, Field::Near, 200, 2, vec![prereq]))
+            .unwrap();
+        assert_eq!(spine.declared_fan_in.get(&prereq.seq), Some(&3));
+        declared_fan_in_matches_revalidation(&spine);
+        // Suspending the queued near declarer keeps its count — a
+        // held declarer is unfinished, and declarations are counted,
+        // not registrations (the suspension invariant).
+        assert_eq!(spine.suspend_matching(|view| view.id == near_declarer), 1);
+        assert_eq!(
+            spine.declared_fan_in.get(&prereq.seq),
+            Some(&3),
+            "suspension does not drop declarations"
+        );
+        declared_fan_in_matches_revalidation(&spine);
+        // Resume re-parks through the normal path; the count is
+        // unchanged throughout.
+        assert_eq!(spine.resume_matching(|view| view.id == near_declarer), 1);
+        assert_eq!(spine.declared_fan_in.get(&prereq.seq), Some(&3));
+        // The held declarer resumes the same way (its due is far;
+        // it queues, still unfinished, still counted).
+        assert_eq!(spine.resume_matching(|view| view.id == held_declarer), 1);
+        assert_eq!(spine.declared_fan_in.get(&prereq.seq), Some(&3));
+        declared_fan_in_matches_revalidation(&spine);
+        // Tick 1: the far declarer parks; the two resumed declarers
+        // re-parked through the resume path (their prerequisite is
+        // unmet) — cross-lane declarations on one prerequisite, all
+        // three counted throughout.
+        spine.run_tick();
+        assert_eq!(spine.blocked_count(), 3);
+        assert_eq!(spine.declared_fan_in.get(&prereq.seq), Some(&3));
+        declared_fan_in_matches_revalidation(&spine);
+        // The cap binds at three: the fourth declarer is refused.
+        assert!(matches!(
+            spine.schedule(dep_spec(3, Field::Near, 1, 3, vec![prereq])),
+            Err(ScheduleError::PrerequisiteFanInExceeded { .. })
+        ));
+        // The prerequisite's execution clears the entry: all three
+        // declarers release (the two due-1 ones execute; the due-200
+        // one re-queues for its own far due), and later declarations
+        // on the prerequisite are free.
+        spine.run_ticks(60);
+        assert_eq!(
+            spine.stats().executed,
+            3,
+            "the prerequisite and the two due-1 declarers (the due-200 one waits)"
+        );
+        assert!(!spine.declared_fan_in.contains_key(&prereq.seq));
+        declared_fan_in_matches_revalidation(&spine);
+        assert!(
+            spine
+                .schedule(dep_spec(3, Field::Near, 300, 4, vec![prereq]))
+                .is_ok(),
+            "declarations on the executed prerequisite are free again"
+        );
+        assert!(spine.declared_fan_in.is_empty());
+    }
+
+    /// §7.6 — THE `reconstruct_held` TRANSFER: the replacement
+    /// identity's declarations are recounted through the
+    /// replacement path's full rebuild — the removed chains'
+    /// declarations leave with them, the replacements' specs count
+    /// as installed — and the revalidation helper stays green across
+    /// the reconstruction (rebuild-equals-maintained).
+    #[test]
+    fn reconstruction_transfers_declarations_through_the_recount() {
+        let mut spine = Spine::new(SaveableNoopWorld, 100);
+        spine.set_admission_bounds(admission(64, 8, 1024));
+        let prereq = spine.schedule(spec(0, Field::Near, 50, 0)).unwrap();
+        let other = spine.schedule(spec(0, Field::Near, 60, 0)).unwrap();
+        // A queued class-2 victim declaring `prereq`, replaced by a
+        // held event whose spec declares `other`.
+        let victim = spine
+            .schedule(dep_spec(2, Field::Near, 5, 0, vec![prereq]))
+            .unwrap();
+        assert_eq!(spine.declared_fan_in.get(&prereq.seq), Some(&1));
+        declared_fan_in_matches_revalidation(&spine);
+        let replacement = Event {
+            id: victim,
+            class: EventClass::new(2),
+            schedule: Schedule::AtLogicalTime { due: Tick(7) },
+            payload: 9,
+            field: Field::Near,
+            depends_on: vec![other],
+        };
+        assert_eq!(
+            spine.try_reconstruct_held(|view| view.class == EventClass::new(2), vec![replacement]),
+            Ok(1)
+        );
+        // The victim's declaration of `prereq` left with it; the
+        // replacement's declaration of `other` arrived.
+        assert!(!spine.declared_fan_in.contains_key(&prereq.seq));
+        assert_eq!(spine.declared_fan_in.get(&other.seq), Some(&1));
+        declared_fan_in_matches_revalidation(&spine);
+        assert_release_charge_identity(&spine);
+        // The recount's admission consequence: with F=1 a further
+        // declarer on `other` (one counted) is refused, while a
+        // declarer on `prereq` (zero counted) is free again.
+        spine.set_admission_bounds(admission(64, 1, 1024));
+        assert!(matches!(
+            spine.schedule(dep_spec(3, Field::Near, 1, 0, vec![other])),
+            Err(ScheduleError::PrerequisiteFanInExceeded { .. })
+        ));
+        assert!(
+            spine
+                .schedule(dep_spec(3, Field::Near, 1, 1, vec![prereq]))
+                .is_ok()
+        );
+        declared_fan_in_matches_revalidation(&spine);
+    }
+
+    /// §7.7 — SAVE/RESTORE: a mid-herd save restores byte-identically,
+    /// the rebuilt `declared_fan_in` map equals the maintained map
+    /// (revalidation), the restored spine — config at DEFAULTS —
+    /// continues the herd to completion with the canonical order
+    /// preserved, and the config-reset behavior is documented live:
+    /// a declaration the saving spine's bounds would refuse is
+    /// admitted after restore (world-content divergence observable),
+    /// while configuration alone never moves a fingerprint.
+    #[test]
+    fn save_restore_rebuilds_declared_fan_in_and_resumes_at_default_bounds() {
+        fn build() -> Spine<SaveableNoopWorld> {
+            let mut spine = Spine::new(SaveableNoopWorld, 100);
+            spine.set_admission_bounds(admission(64, 8, 1024));
+            let prereq = spine
+                .schedule(spec(0, Field::Near, 10, 0))
+                .expect("the prerequisite schedules");
+            for i in 0..5u64 {
+                spine
+                    .schedule(dep_spec(1, Field::Near, 1, i, vec![prereq]))
+                    .expect("the herd schedules");
+            }
+            spine
+        }
+        // The mid-herd boundary: five declarers parked on the
+        // far-due prerequisite.
+        let mut spine = build();
+        spine.run_tick();
+        assert_eq!(spine.blocked_count(), 5);
+        declared_fan_in_matches_revalidation(&spine);
+        let maintained = spine.declared_fan_in.clone();
+        let bytes = spine.save_bytes();
+        let mut restored: Spine<SaveableNoopWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+        assert_eq!(restored.save_bytes(), bytes, "byte-identical round trip");
+        assert_eq!(
+            restored.declared_fan_in, maintained,
+            "the rebuilt map equals the maintained map"
+        );
+        declared_fan_in_matches_revalidation(&restored);
+        assert_eq!(
+            restored.admission_bounds(),
+            HousekeepingAdmission::default(),
+            "configuration never rides the wire — the restored spine resumes at the defaults"
+        );
+        // The continuation: the restored spine drains the herd with
+        // the canonical order preserved, byte-identical to the
+        // uninterrupted control (the :6224/:6490 disciplines).
+        let mut control = build();
+        control.run_tick();
+        spine.run_ticks(12);
+        restored.run_ticks(12);
+        control.run_ticks(12);
+        assert_eq!(spine.stats().executed, 6);
+        assert_eq!(restored.stats().executed, 6);
+        assert_eq!(restored.save_bytes(), spine.save_bytes());
+        assert_eq!(restored.engine_fingerprint(), spine.engine_fingerprint());
+        assert_eq!(restored.engine_fingerprint(), control.engine_fingerprint());
+        declared_fan_in_matches_revalidation(&restored);
+        // The config-reset behavior, live: from the SAME restored
+        // bytes, the spine re-configured to the saving process's F=5
+        // refuses the sixth declarer (five already counted) while
+        // the defaults-admitted twin takes it — the divergence is
+        // observable in world content, never in spine fingerprints
+        // of identical logical state.
+        let mut reconfigured: Spine<SaveableNoopWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+        reconfigured.set_admission_bounds(admission(64, 5, 1024));
+        let mut defaulted: Spine<SaveableNoopWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+        // Config alone never moves a fingerprint: the two restored
+        // twins — one re-configured, one at the defaults — hash
+        // identically over their IDENTICAL logical state.
+        assert_eq!(
+            reconfigured.engine_fingerprint(),
+            defaulted.engine_fingerprint(),
+            "identical restored state under different configs fingerprints identically"
+        );
+        let prereq = EventId { seq: 0 };
+        assert!(matches!(
+            reconfigured.schedule(dep_spec(2, Field::Near, 1, 5, vec![prereq])),
+            Err(ScheduleError::PrerequisiteFanInExceeded { .. })
+        ));
+        assert!(
+            defaulted
+                .schedule(dep_spec(2, Field::Near, 1, 5, vec![prereq]))
+                .is_ok(),
+            "the restored spine sits at the defaults — the sixth declarer is admitted"
+        );
+        // The divergence is observable in world content — the
+        // admitted sixth declarer is real state the refused twin
+        // never gained (which is exactly why it shows in the
+        // fingerprint: the states genuinely differ, the CONFIG never
+        // did).
+        assert_eq!(reconfigured.stats().scheduled, 6);
+        assert_eq!(defaulted.stats().scheduled, 7);
+    }
+
+    /// §7.8 — THE FOLLOW-UP CROP (K): a handler emitting K+1 follow-ups
+    /// gets exactly K admitted (the world's stream reflects exactly K
+    /// children), `follow_ups_cropped` counts the excess,
+    /// `invalid_dropped` stays zero (the classes discriminate — a
+    /// crop is a config outcome, not a dependency-shape refusal), the
+    /// scratch buffer's steady-state element capacity stays ≤ K, and
+    /// a handler emitting within the cap crops nothing.
+    #[test]
+    fn follow_ups_beyond_the_admission_cap_are_cropped_counted_and_fail_visible() {
+        /// The emitter's payload IS its emission count (6 → six
+        /// attempts at K=4: four admitted, two cropped; 3 → three
+        /// attempts: within the cap, zero crops).
+        struct FanoutWorld {
+            executions: Vec<u64>,
+        }
+        impl World for FanoutWorld {
+            fn execute(&mut self, event: &Event, ctx: &mut ExecCtx) {
+                self.executions.push(event.payload);
+                if event.class == EventClass::new(3) {
+                    for i in 0..event.payload {
+                        ctx.follow_up(1, EventClass::new(2), 100 + i, Vec::new());
+                    }
+                }
+            }
+            fn fingerprint(&self, fp: &mut Fingerprinter) {
+                fp.write_str("engine-core/spine/t08-fanout/1");
+                fp.write_usize(self.executions.len());
+            }
+        }
+        let mut spine = Spine::new(
+            FanoutWorld {
+                executions: Vec::new(),
+            },
+            100,
+        );
+        spine.set_admission_bounds(admission(64, 4096, 4));
+        // Two six-attempt emitters at K=4: eight children admitted,
+        // four cropped.
+        for _ in 0..2u64 {
+            spine
+                .schedule(spec(3, Field::Near, 1, 6))
+                .expect("the emitter schedules");
+        }
+        spine.run_ticks(4);
+        assert_eq!(
+            spine.stats().executed,
+            10,
+            "two emitters plus eight admitted children"
+        );
+        let counters = spine.housekeeping_stats();
+        assert_eq!(
+            counters.follow_ups_cropped, 4,
+            "six attempted minus four admitted, twice"
+        );
+        assert_eq!(
+            spine.stats().invalid_dropped,
+            0,
+            "the crop is a config outcome, never a dependency-shape refusal"
+        );
+        assert_eq!(spine.pending_count(), 0);
+        // The world's stream reflects exactly the K admitted children
+        // per emitter, in emission order.
+        let children: Vec<u64> = spine
+            .world()
+            .executions
+            .iter()
+            .copied()
+            .filter(|&payload| payload >= 100)
+            .collect();
+        assert_eq!(
+            children,
+            vec![100, 101, 102, 103, 100, 101, 102, 103],
+            "exactly K children per emitter, the excess never scheduled"
+        );
+        // The scratch buffer's steady-state element capacity is
+        // bounded by K (the crop happens at emission, before the
+        // buffer ever holds the excess).
+        assert!(
+            spine.scratch_follow_ups.capacity() <= 4,
+            "the scratch capacity {} stays at or under K",
+            spine.scratch_follow_ups.capacity()
+        );
+        // A handler emitting WITHIN the cap crops nothing: a
+        // three-attempt emitter at the same K=4 (due the next tick —
+        // the clock sits at 4 after the first phase).
+        spine
+            .schedule(spec(3, Field::Near, 5, 3))
+            .expect("a within-cap emitter schedules");
+        spine.run_ticks(3);
+        assert_eq!(
+            spine.housekeeping_stats().follow_ups_cropped,
+            4,
+            "the within-cap emission cropped nothing"
+        );
+        assert_eq!(spine.stats().executed, 14);
+        assert_eq!(spine.stats().invalid_dropped, 0);
+        assert_release_charge_identity(&spine);
+    }
+
+    /// §7.9 — THE STORMS RE-PINNED AT A CONFIGURED FAN-IN: the
+    /// 600-storm's shape at F=256 admits the first 256 declarers and
+    /// refuses the remaining 344 typed AT ADMISSION (admission order
+    /// = schedule order), the release order and execution order of
+    /// the ADMITTED graph are the canonical integers (the refused
+    /// never exist), and at the DEFAULTS the same 600-declarer shape
+    /// admits all 600 (within-cap graphs unchanged — the compat bar).
+    #[test]
+    fn storms_re_pinned_at_a_configured_fan_in() {
+        let mut spine = Spine::new(
+            RecordingWorld {
+                executed: Vec::new(),
+            },
+            100,
+        );
+        spine.set_admission_bounds(admission(64, 256, 1024));
+        let prereq = spine.schedule(spec(0, Field::Near, 10, 9999)).unwrap();
+        let mut refused = 0u64;
+        let mut admitted = 0u64;
+        for i in 0..600u64 {
+            match spine.schedule(dep_spec(1, Field::Near, 1, i, vec![prereq])) {
+                Ok(_) => admitted += 1,
+                Err(ScheduleError::PrerequisiteFanInExceeded { .. }) => refused += 1,
+                other => panic!("unexpected schedule outcome: {other:?}"),
+            }
+        }
+        assert_eq!(
+            admitted, 256,
+            "the admission-order refusal point: exactly F"
+        );
+        assert_eq!(refused, 344);
+        assert_eq!(
+            spine.stats().scheduled,
+            257,
+            "the refused declarers never exist"
+        );
+        declared_fan_in_matches_revalidation(&spine);
+        // The 256 admitted park inside one tick's allowances (256 ≤
+        // 150 + 106 of the redistribution phase's 150).
+        spine.run_ticks(9);
+        assert_eq!(spine.blocked_count(), 256);
+        declared_fan_in_matches_revalidation(&spine);
+        // Tick 10: the prerequisite executes; the atomic release
+        // visits exactly 256 — bounded by F, overshooting the
+        // phase's 150-unit allowance exactly as the E-10 contract
+        // records (the bound gates the next iteration).
+        spine.run_tick();
+        let counters = spine.housekeeping_stats();
+        assert_eq!(counters.waiter_visits, 256);
+        assert_eq!(counters.release_unblocks, 256);
+        assert_eq!(counters.release_decrements, 0);
+        assert_release_charge_identity(&spine);
+        // The deferred waiters execute over subsequent ticks in
+        // canonical (due, seq) order — the exact accepted sequence.
+        spine.run_to_completion(100);
+        let mut expected = vec![9999u64];
+        expected.extend(0..256);
+        assert_eq!(spine.world().executed, expected);
+        assert_eq!(spine.stats().executed, 257);
+        declared_fan_in_matches_revalidation(&spine);
+
+        // At the DEFAULTS the same shape admits all 600 — within-cap
+        // graphs unchanged (compat bar 0's live re-run).
+        let mut wide = Spine::new(
+            RecordingWorld {
+                executed: Vec::new(),
+            },
+            100,
+        );
+        let wide_prereq = wide.schedule(spec(0, Field::Near, 10, 9999)).unwrap();
+        for i in 0..600u64 {
+            assert!(
+                wide.schedule(dep_spec(1, Field::Near, 1, i, vec![wide_prereq]))
+                    .is_ok()
+            );
+        }
+        assert_eq!(wide.stats().scheduled, 601);
+        declared_fan_in_matches_revalidation(&wide);
+    }
+
+    /// §7.9 part 2 — BLOCKED-ONLY GRAPHS AND CYCLES: cycles remain
+    /// structurally impossible (the unknown-dependency gate — forward
+    /// references refused typed, unchanged by the caps), and a
+    /// blocked-only graph under a held root with over-cap declarers
+    /// behaves exactly as before: the refused declarers never exist,
+    /// the admitted graph parks on the held root, and
+    /// `run_to_completion` stops on the no-progressible-work rule
+    /// without burning its tick budget on motionless time.
+    #[test]
+    fn over_cap_declarers_never_exist_and_cycles_stay_structurally_impossible() {
+        let mut spine = Spine::new(NoopWorld, 100);
+        // The cycle gate: a forward reference is an unknown
+        // dependency, refused typed (unchanged).
+        let ghost = EventId { seq: 99 };
+        assert!(
+            matches!(spine.schedule(dep_spec(1, Field::Near, 1, 0, vec![ghost])), Err(
+                ScheduleError::UnknownDependency(id)
+            ) if id == ghost)
+        );
+        // The blocked-only graph: a held root and six would-be
+        // declarers at F=4.
+        spine.set_admission_bounds(admission(64, 4, 1024));
+        let root = spine.schedule_held(spec(0, Field::Near, 1000, 0)).unwrap();
+        let mut refused = 0u64;
+        for i in 0..6u64 {
+            match spine.schedule(dep_spec(1, Field::Near, 1, i, vec![root])) {
+                Ok(_) => {}
+                Err(ScheduleError::PrerequisiteFanInExceeded { .. }) => refused += 1,
+                other => panic!("unexpected schedule outcome: {other:?}"),
+            }
+        }
+        assert_eq!(refused, 2);
+        assert_eq!(
+            spine.stats().scheduled,
+            5,
+            "one held root plus the four admitted declarers"
+        );
+        assert_eq!(spine.declared_fan_in.get(&root.seq), Some(&4));
+        declared_fan_in_matches_revalidation(&spine);
+        // The admitted declarers park on the held root (blocked-only:
+        // no queued work remains after the parks).
+        spine.run_tick();
+        assert_eq!(spine.blocked_count(), 4);
+        assert_eq!(spine.pending_count(), 0);
+        declared_fan_in_matches_revalidation(&spine);
+        assert_release_charge_identity(&spine);
+        // run_to_completion stops on the no-progressible-work rule —
+        // exactly the pre-cap behavior (motionless time is not
+        // burned; the graph stays unfinished, observably). The
+        // manual tick above already parked everyone and emptied the
+        // queues, so zero further ticks run.
+        assert_eq!(
+            spine.run_to_completion(50),
+            0,
+            "the parks emptied the queues — no motionless time is burned"
+        );
+        assert_eq!(spine.stats().executed, 0);
+        assert_eq!(spine.blocked_count(), 4);
+        assert!(spine.has_unfinished_work());
+    }
+
+    /// §7.10 — 100k UNRELATED OBLIGATIONS AT FIXED BUDGET: 100,000
+    /// independent events, zero dependencies, at budget 200 — the
+    /// audit's fixed-budget case, proving the caps cost nothing when
+    /// unused: zero parks, zero registrations, zero refusals, zero
+    /// crops, the per-tick worst housekeeping at zero (far under the
+    /// 4.5·budget = 900 ceiling), and the backlog slope monotone
+    /// decreasing through the per-tick `LaneReport` fields (no
+    /// hand-sampling).
+    #[test]
+    fn one_hundred_thousand_unrelated_obligations_drain_within_the_closed_form() {
+        let mut spine = Spine::new(
+            RecordingWorld {
+                executed: Vec::new(),
+            },
+            200,
+        );
+        for i in 0..100_000u64 {
+            spine
+                .schedule(spec(0, Field::Near, 1, i))
+                .expect("the unrelated population schedules");
+        }
+        assert_eq!(spine.stats().scheduled, 100_000);
+        // The integer ceiling (§5.3): Σ phase caps ≤ 3·budget, each
+        // phase's allowance 1.5× — 4.5·budget blended — with no
+        // terminal overshoot to add (nothing ever releases: F is
+        // never in play in this fixture).
+        let ceiling = 3u64 * 200 + 3 * (200 / 2);
+        assert_eq!(ceiling, 900, "4.5·budget at B=200");
+        let mut ticks = 0u64;
+        let mut previous_backlog = u64::MAX;
+        while spine.has_unfinished_work() {
+            spine.run_tick();
+            ticks += 1;
+            // The published per-tick worst never crosses the
+            // whole-tick ceiling (§5.3: Σ phase caps ≤ 3·budget →
+            // 4.5·budget blended; no overshoot — nothing to release).
+            assert!(
+                spine.housekeeping_stats().worst_tick_housekeeping <= ceiling,
+                "tick {ticks}: the closed-form ceiling holds"
+            );
+            let report = spine.lane_report();
+            assert!(
+                report.housekeeping_backlog_near <= previous_backlog,
+                "tick {ticks}: the slope is monotone decreasing ({} after {})",
+                report.housekeeping_backlog_near,
+                previous_backlog
+            );
+            previous_backlog = report.housekeeping_backlog_near;
+            if ticks == 1 {
+                assert_eq!(report.housekeeping_backlog_near, 99_800);
+            }
+        }
+        assert!(ticks >= 500, "drains over at least 500 ticks ({ticks})");
+        assert_eq!(ticks, 500);
+        assert_eq!(spine.stats().executed, 100_000);
+        assert_eq!(spine.world().executed.len(), 100_000);
+        let counters = spine.housekeeping_stats();
+        assert_eq!(counters.parks, 0, "unrelated ⇒ no caps touched");
+        assert_eq!(counters.dependency_registrations, 0);
+        assert_eq!(counters.worst_tick_dependency_registrations, 0);
+        assert_eq!(counters.follow_ups_cropped, 0);
+        assert_eq!(counters.worst_tick_housekeeping, 0);
+        assert_eq!(counters.waiter_visits, 0);
+        assert_eq!(spine.stats().budget_exhausted_ticks, 499);
+        // The canonical execution order survived the whole drain.
+        assert_eq!(spine.world().executed, (0..100_000u64).collect::<Vec<_>>());
+    }
+
+    /// §7.11 — THE COMPOSITE PER-TICK MAXIMUM: a storm (a parking
+    /// herd on one prerequisite), a release overshoot, and a
+    /// follow-up emitter in ONE world at small configured caps
+    /// (B=10, D=4, F=8, K=4): after every tick the published tick
+    /// housekeeping sits at or under the §2 ceiling evaluated at
+    /// (B, D, F, K) — `4.5·B + 4F` in blended units — the closed form
+    /// pinned as an integer bound on a real adversarial composition,
+    /// and the run completes with conservation exact.
+    #[test]
+    fn the_composite_per_tick_maximum_respects_the_closed_form_ceiling() {
+        struct CompositeWorld;
+        impl World for CompositeWorld {
+            fn execute(&mut self, event: &Event, ctx: &mut ExecCtx) {
+                if event.class == EventClass::new(3) {
+                    for i in 0..6u64 {
+                        ctx.follow_up(1, EventClass::new(2), 100 + i, Vec::new());
+                    }
+                }
+            }
+            fn fingerprint(&self, fp: &mut Fingerprinter) {
+                fp.write_str("engine-core/spine/t08-composite/1");
+            }
+        }
+        const BUDGET: u64 = 10;
+        const FAN_IN: u64 = 8;
+        let mut spine = Spine::new(CompositeWorld, BUDGET as u32);
+        spine.set_admission_bounds(admission(4, FAN_IN, 4));
+        // The herd: one far-due prerequisite, eight declarers (F=8),
+        // the ninth refused.
+        let prereq = spine.schedule(spec(0, Field::Near, 30, 9999)).unwrap();
+        for i in 0..8u64 {
+            assert!(
+                spine
+                    .schedule(dep_spec(1, Field::Near, 1, i, vec![prereq]))
+                    .is_ok()
+            );
+        }
+        assert!(matches!(
+            spine.schedule(dep_spec(1, Field::Near, 1, 8, vec![prereq])),
+            Err(ScheduleError::PrerequisiteFanInExceeded { .. })
+        ));
+        // The follow-up emitters: two six-attempt emitters at K=4.
+        for _ in 0..2u64 {
+            spine
+                .schedule(spec(3, Field::Near, 1, 6))
+                .expect("the emitter schedules");
+        }
+        assert_eq!(
+            spine.stats().scheduled,
+            11,
+            "1 + 8 + 2 — the refused never exist"
+        );
+        // The integer ceiling (§5.3): Σ phase caps ≤ 3·B, each
+        // phase's allowance 1.5×, plus the per-phase terminal
+        // overshoot 4F — the closed form evaluated at the caps.
+        let ceiling = 3 * BUDGET + 3 * (BUDGET / 2) + 4 * FAN_IN;
+        assert_eq!(ceiling, 77);
+        let mut ticks = 0u64;
+        while spine.has_unfinished_work() {
+            spine.run_tick();
+            ticks += 1;
+            assert!(
+                spine.housekeeping_stats().worst_tick_housekeeping <= ceiling,
+                "tick {ticks}: the published worst {} sits within the closed-form \
+                 ceiling {ceiling}",
+                spine.housekeeping_stats().worst_tick_housekeeping
+            );
+            declared_fan_in_matches_revalidation(&spine);
+            assert_release_charge_identity(&spine);
+            // Conservation at every boundary (a refused or cropped
+            // event simply never enters `scheduled`).
+            let stats = spine.stats();
+            assert_eq!(
+                stats.scheduled,
+                stats.executed
+                    + spine.pending_count() as u64
+                    + spine.blocked_count() as u64
+                    + spine.held_count() as u64,
+                "tick {ticks}: conservation"
+            );
+        }
+        assert_eq!(ticks, 30, "the prerequisite's due bounds the run");
+        assert_eq!(
+            spine.stats().executed,
+            19,
+            "prereq + 8 declarers + 2 emitters + 8 children"
+        );
+        assert_eq!(spine.housekeeping_stats().follow_ups_cropped, 4);
+        assert_eq!(spine.stats().invalid_dropped, 0);
+        assert_eq!(spine.housekeeping_stats().worst_tick_housekeeping, 8);
     }
 
     // -------------------------------- A22-core retention policy tests (P2 L7)

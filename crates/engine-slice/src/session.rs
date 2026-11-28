@@ -121,6 +121,21 @@ impl Session {
             Err(ScheduleError::UnknownDependency(dep)) => Err(format!(
                 "unknown dependency {dep}: dependencies must reference already-scheduled events"
             )),
+            // The T08 admission refusals (engine-core's ScheduleError
+            // grew the DependencyFanOutExceeded/PrerequisiteFanInExceeded
+            // variants — the exhaustive-match extension the spine lane
+            // disclosed in its lane notes; additive arms, the existing
+            // arm's behavior untouched).
+            Err(ScheduleError::DependencyFanOutExceeded { observed, cap }) => Err(format!(
+                "dependency fan-out {observed} exceeds the admission cap {cap}"
+            )),
+            Err(ScheduleError::PrerequisiteFanInExceeded {
+                prerequisite,
+                observed,
+                cap,
+            }) => Err(format!(
+                "declared dependents on {prerequisite} ({observed}) exceed the admission cap {cap}"
+            )),
         }
     }
 
