@@ -141,6 +141,87 @@ pub enum TargetFaultStage {
     Framebuffer,
 }
 
+/// Diagnostic fault-injection site for the renderer LIFECYCLE paths
+/// (the CA-01/CA-10/CA-11 verification knobs — the lifecycle/sync
+/// trio's answer to [`TargetFaultSite`]'s target-builder knobs): each
+/// variant names ONE fallible step in the scene-attach path, the
+/// post-acquire frame ladder, or the arena-growth replacement, and
+/// [`Renderer::inject_lifecycle_fault`] arms a one-shot plan that
+/// makes the ordinal-th matching step return
+/// [`crate::RendererError::InjectedFault`] INSTEAD of its real device
+/// call. Test-only, diagnostic-only: never produced by real device
+/// calls, never consumed by real code.
+///
+/// The sites, by cluster:
+///
+/// **CA-01 (attach atomicity)** — the check sits immediately AFTER
+/// each fallible creation step in
+/// [`crate::Renderer::attach_scene`]'s two halves, so the injected
+/// failure fires with that step's objects created and the rollback
+/// guards below it must clean them up:
+/// [`Self::SceneVertices`]/[`Self::SceneTexture`]/[`Self::SceneSampler`]/[`Self::SceneUniforms`]/[`Self::SceneDescriptors`]
+/// (the corner-resource build) and
+/// [`Self::LitModule`]/[`Self::LitLayout`]/[`Self::LitPipeline`]/[`Self::ProxyModule`]/[`Self::ProxyLayout`]/[`Self::ProxyPipeline`]/[`Self::RainModule`]/[`Self::RainPipeline`]
+/// (the corner-pipeline group).
+///
+/// **CA-10 (the stranded slot)** — the four post-acquire frame
+/// boundaries: [`Self::FrameUpload`], [`Self::FramePresentSemaphore`],
+/// [`Self::FrameRecord`], [`Self::FrameSubmit`].
+///
+/// **CA-11 (the growth handle loss)** — the fallible `device_idle`
+/// BETWEEN the new carve's allocation and the old carve's
+/// retirement: [`Self::RegionGrowthIdle`], [`Self::InstanceGrowthIdle`],
+/// [`Self::PoseGrowthIdle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleFaultSite {
+    // ---- CA-01: the scene-attach path (corner-resource half) ----
+    /// `CornerResources`' device-local vertex buffer upload.
+    SceneVertices,
+    /// One `CornerResources` texture upload (the ordinal selects
+    /// which of the table's textures).
+    SceneTexture,
+    /// `CornerResources`' sampler pool.
+    SceneSampler,
+    /// `CornerResources`' mapped uniform buffer.
+    SceneUniforms,
+    /// `CornerResources`' descriptor pool/layout/set allocation.
+    SceneDescriptors,
+    // ---- CA-01: the scene-attach path (pipeline-group half) ----
+    /// The lit shader module creation.
+    LitModule,
+    /// The lit pipeline layout creation.
+    LitLayout,
+    /// The lit pipeline creation.
+    LitPipeline,
+    /// The proxy shader module creation.
+    ProxyModule,
+    /// The proxy pipeline layout creation.
+    ProxyLayout,
+    /// The proxy pipeline creation.
+    ProxyPipeline,
+    /// The rain shader module creation.
+    RainModule,
+    /// The rain pipeline creation.
+    RainPipeline,
+    // ---- CA-10: the post-acquire frame boundaries ----
+    /// The frame's mapped uploads (Phase 6).
+    FrameUpload,
+    /// The present-wait semaphore creation for the acquired image.
+    FramePresentSemaphore,
+    /// The command-buffer recording (Phase 7).
+    FrameRecord,
+    /// The queue submission (Phase 8).
+    FrameSubmit,
+    // ---- CA-11: the arena-growth idle windows ----
+    /// The region carve's `device_idle` (after the new buffer, before
+    /// the old one dies).
+    RegionGrowthIdle,
+    /// The instance carve's `device_idle` (same window).
+    InstanceGrowthIdle,
+    /// The pose carve's `device_idle` (same window).
+    PoseGrowthIdle,
+}
+
 /// P5 §1.3 (A11/R1): the instance arena's configured HARD CAP — the
 /// typed-refusal boundary ([`crate::proxy_instances::InstancePackError::Capacity`]
 /// fires above it). The CAP, never the current carve, is the

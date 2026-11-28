@@ -19,7 +19,8 @@ use super::context::VulkanContext;
 use super::corner;
 use super::frame_plan::FramePlan;
 use super::resources::{
-    create_device_local_buffer_with_data, create_mapped_buffer, create_shader_module,
+    ScopedMappedBuffer, create_device_local_buffer_with_data, create_mapped_buffer,
+    create_shader_module,
 };
 use super::swapchain::SwapchainState;
 use super::{
@@ -128,6 +129,121 @@ pub(crate) struct PipelineState {
     /// Byte size of one frame slot's region-scene region.
     pub region_slot_bytes: vk::DeviceSize,
     pub(super) region_mapped: *mut core::ffi::c_void,
+}
+
+/// The corner-family pipeline group held by a SCOPED OWNER while
+/// unpublished (CA-01 — the attach-atomicity fix): the lit, proxy,
+/// and rain pipelines plus the lit and proxy layouts — the five
+/// handles [`PipelineState::assemble_corner_pipelines`] creates
+/// against the attached scene's descriptor layout.
+///
+/// BEFORE CA-01 the assembly wrote these handles DIRECTLY into a
+/// `&mut PipelineState`: on the attach path that state is LIVE, so
+/// a mid-assembly failure (e.g. the rain pipeline's creation)
+/// installed a PARTIAL group — `lit_pipeline` non-null with
+/// `proxy_pipeline`/`rain_pipeline` null — while the attach's `?`
+/// propagated the error and the caller's rollback (the context's
+/// staged scene resources) never ran. The renderer was left with
+/// installed resources, no published scene handle, a REFUSED retry
+/// (the context's one-scene guard), and — even if the retry had
+/// been allowed — [`PipelineState::ensure_corner_pipelines`]'s
+/// first-lit-non-null readiness heuristic would have skipped the
+/// rebuild and the first scene-backed frame would bind a null
+/// pipeline (the S6 rig-found access-violation class).
+///
+/// This guard closes the window: the assembly writes into the
+/// GROUP, [`Drop`] releases exactly what exists (every `?` inside
+/// the assembly is leak-free and state-neutral by construction),
+/// and [`Self::adopt_into`] moves the completed set into the live
+/// pipeline state at the commit point — the only place the handles
+/// become reachable by frames. The construction path (the
+/// swapchain-recreation arm, where the whole `PipelineState` is
+/// itself partial and discarded wholesale on failure) adopts
+/// through the same commit; its own destroy handles the null
+/// handles a failed build leaves behind.
+///
+/// The group's objects are counted on the context's census pair
+/// (`corner_pipeline_objects` / `corner_pipeline_object_frees`) —
+/// the target-images/target-frees counters' own discipline — so
+/// the attach battery can prove a failed-and-rolled-back attach
+/// released every staged object.
+struct CornerPipelineGroup {
+    lit_layout: vk::PipelineLayout,
+    lit_pipeline: vk::Pipeline,
+    proxy_layout: vk::PipelineLayout,
+    proxy_pipeline: vk::Pipeline,
+    rain_pipeline: vk::Pipeline,
+    /// The context that created the objects — `Drop` reaches the
+    /// device through it. SAFETY: the raw-borrow shape is confined
+    /// to the renderer's single owning thread exactly like the
+    /// scoped mapped-buffer guard's; the group exists only inside
+    /// one assembly call, adopted or dropped before it returns.
+    ctx: *const VulkanContext,
+}
+
+impl CornerPipelineGroup {
+    fn new(ctx: &VulkanContext) -> Self {
+        Self {
+            lit_layout: vk::PipelineLayout::null(),
+            lit_pipeline: vk::Pipeline::null(),
+            proxy_layout: vk::PipelineLayout::null(),
+            proxy_pipeline: vk::Pipeline::null(),
+            rain_pipeline: vk::Pipeline::null(),
+            ctx,
+        }
+    }
+
+    /// Moves the completed set into the live pipeline state — the
+    /// commit point. Disarms the guard (nulls every field) so its
+    /// `Drop` cannot double-release what the state now owns; the
+    /// state's own `destroy` releases the adopted handles at end of
+    /// life (outside the census pair, exactly like committed target
+    /// objects).
+    fn adopt_into(mut self, state: &mut PipelineState) {
+        state.lit_layout = self.lit_layout;
+        state.lit_pipeline = self.lit_pipeline;
+        state.proxy_layout = self.proxy_layout;
+        state.proxy_pipeline = self.proxy_pipeline;
+        state.rain_pipeline = self.rain_pipeline;
+        self.lit_layout = vk::PipelineLayout::null();
+        self.lit_pipeline = vk::Pipeline::null();
+        self.proxy_layout = vk::PipelineLayout::null();
+        self.proxy_pipeline = vk::Pipeline::null();
+        self.rain_pipeline = vk::Pipeline::null();
+    }
+}
+
+impl Drop for CornerPipelineGroup {
+    fn drop(&mut self) {
+        let ctx = unsafe { &*self.ctx };
+        // Vulkan's per-object destroy calls accept null handles
+        // silently, so the unconditional releases are safe for a
+        // partially-built group; the census pair below counts only
+        // the non-null releases (one per object the group still
+        // owns — the destruction half of the no-leak proof).
+        unsafe {
+            ctx.device.destroy_pipeline(self.lit_pipeline, None);
+            ctx.device.destroy_pipeline_layout(self.lit_layout, None);
+            ctx.device.destroy_pipeline(self.proxy_pipeline, None);
+            ctx.device.destroy_pipeline(self.rain_pipeline, None);
+            ctx.device.destroy_pipeline_layout(self.proxy_layout, None);
+        }
+        if self.lit_pipeline != vk::Pipeline::null() {
+            ctx.record_corner_pipeline_object_free();
+        }
+        if self.lit_layout != vk::PipelineLayout::null() {
+            ctx.record_corner_pipeline_object_free();
+        }
+        if self.proxy_pipeline != vk::Pipeline::null() {
+            ctx.record_corner_pipeline_object_free();
+        }
+        if self.rain_pipeline != vk::Pipeline::null() {
+            ctx.record_corner_pipeline_object_free();
+        }
+        if self.proxy_layout != vk::PipelineLayout::null() {
+            ctx.record_corner_pipeline_object_free();
+        }
+    }
 }
 
 impl PipelineState {
@@ -278,14 +394,27 @@ impl PipelineState {
             let region_slot_bytes = region_capacity as vk::DeviceSize
                 * std::mem::size_of::<SceneVertex>() as vk::DeviceSize;
             let region_size = region_slot_bytes * FRAMES_IN_FLIGHT as vk::DeviceSize;
-            let (region_vbo, region_vbo_memory, region_mapped) =
-                create_mapped_buffer(ctx, vk::BufferUsageFlags::VERTEX_BUFFER, region_size)?;
+            // CA-11 (the growth-handle-loss fix): the replacement
+            // pair lives in a SCOPED OWNER from creation to commit —
+            // a failure at the fallible idle wait below drops the
+            // guard, which destroys the NEW buffer and memory (the
+            // old bindings intact), instead of dropping the bare
+            // handles on the floor as the pre-fix tuple did. The
+            // staging/release events land on the census pair
+            // (`arena_replacements`/`arena_replacement_frees`).
+            let replacement =
+                ScopedMappedBuffer::create(ctx, vk::BufferUsageFlags::VERTEX_BUFFER, region_size)?;
             // The replacement point: the new buffer exists before
             // the old one dies (a failure above leaves the prior
             // state fully intact), and the event is counted. The
             // stall is the renderer's own ordered-teardown helper
-            // (device_wait_idle, typed).
+            // (device_wait_idle, typed). The CA-11 fault knob sits
+            // immediately before the wait: a plan armed here fires
+            // with the replacement allocated and the old carve still
+            // live — the exact leak window the guard closes.
+            ctx.check_lifecycle_fault(crate::LifecycleFaultSite::RegionGrowthIdle)?;
             super::device_idle(ctx)?;
+            let (region_vbo, region_vbo_memory, region_mapped) = replacement.commit();
             unsafe {
                 if !self.region_mapped.is_null() {
                     ctx.device.unmap_memory(self.region_vbo_memory);
@@ -991,7 +1120,13 @@ impl PipelineState {
         .map_err(|(_, error)| RendererError::vk(error, "scene pipeline"))?[0];
 
         if let Some(corner) = &ctx.corner {
-            Self::assemble_corner_pipelines(ctx, corner, out.render_pass, out)?;
+            // CA-01: the corner group STAGES here too — the
+            // construction path's whole `PipelineState` is partial
+            // and discarded wholesale on failure, but the group's
+            // own scoped release keeps the partial state's destroy
+            // from depending on handles this branch never installed.
+            let group = Self::assemble_corner_pipelines(ctx, corner, out.render_pass)?;
+            group.adopt_into(out);
         }
 
         let overlay_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
@@ -1062,8 +1197,17 @@ impl PipelineState {
     /// below are the branch's own, rebuilt verbatim — plain
     /// deterministic data, no ctx-derived handles.
     ///
-    /// Partial-failure safe (the branch's own discipline): handles
-    /// assign as they are created; `destroy` releases what exists.
+    /// CA-01 (attach atomicity): the assembly STAGES its five
+    /// handles into a returned [`CornerPipelineGroup`] — a scoped
+    /// owner whose `Drop` releases exactly what exists — so a
+    /// failure at ANY creation step is state-neutral and leak-free
+    /// for the caller's live pipeline state. The two call sites
+    /// `adopt_into` the completed group only on full success: the
+    /// attach path's rollback (see
+    /// [`crate::Renderer::attach_scene`]) can therefore restore the
+    /// renderer to exactly its pre-attach state, and the readiness
+    /// heuristic in [`Self::ensure_corner_pipelines`] is sound (a
+    /// non-null `lit_pipeline` implies the WHOLE group committed).
     /// The three shader modules are consumed by pipeline creation and
     /// released here (the caller's `modules` list is uninvolved —
     /// module objects may be destroyed once the pipelines that
@@ -1072,8 +1216,7 @@ impl PipelineState {
         ctx: &VulkanContext,
         corner: &corner::CornerResources,
         render_pass: vk::RenderPass,
-        out: &mut PipelineState,
-    ) -> Result<(), RendererError> {
+    ) -> Result<CornerPipelineGroup, RendererError> {
         // The branch's shared config, verbatim (the scene pipeline's
         // own assembly above defines each value's contract).
         let scene_binding = vk::VertexInputBindingDescription {
@@ -1132,11 +1275,12 @@ impl PipelineState {
         // offsets, CCW front face (the lit meshes wind about their
         // outward normals).
         let mut modules: Vec<vk::ShaderModule> = Vec::new();
+        let mut group = CornerPipelineGroup::new(ctx);
         let result = Self::assemble_corner_pipeline_objects(
             ctx,
             corner,
             render_pass,
-            out,
+            &mut group,
             &scene_binding,
             &scene_attributes,
             &viewport_state,
@@ -1157,19 +1301,21 @@ impl PipelineState {
                 ctx.device.destroy_shader_module(module, None);
             }
         }
-        result
+        result.map(|()| group)
     }
 
     /// The corner branch's pipeline-creation body (module lifetime
     /// owned by the caller for exactly-once release). See
     /// [`Self::assemble_corner_pipelines`] for the extraction's
-    /// contract.
+    /// contract — and for the CA-01 group-staging discipline this
+    /// body's `group` parameter carries (the writes land in the
+    /// scoped owner, never directly in a live pipeline state).
     #[allow(clippy::too_many_arguments)]
     fn assemble_corner_pipeline_objects(
         ctx: &VulkanContext,
         corner: &corner::CornerResources,
         render_pass: vk::RenderPass,
-        out: &mut PipelineState,
+        group: &mut CornerPipelineGroup,
         scene_binding: &vk::VertexInputBindingDescription,
         scene_attributes: &[vk::VertexInputAttributeDescription; 2],
         viewport_state: &vk::PipelineViewportStateCreateInfo,
@@ -1192,16 +1338,22 @@ impl PipelineState {
             include_bytes!(concat!(env!("OUT_DIR"), "/lit_scene.spv")),
         )?;
         modules.push(module);
+        // CA-01 fault knob: the step succeeded — a plan armed here
+        // fires with the module created, exercising the caller's
+        // module-drain release.
+        ctx.check_lifecycle_fault(crate::LifecycleFaultSite::LitModule)?;
         let layouts = [corner.layout];
         // SAFETY: corner owns its descriptor layout across pipeline replacements;
-        // the partial PipelineState owns the pipeline layout immediately.
-        out.lit_layout = unsafe {
+        // the group's scoped owner owns the pipeline layout immediately.
+        group.lit_layout = unsafe {
             ctx.device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts),
                 None,
             )
         }
         .map_err(|e| RendererError::vk(e, "lit layout"))?;
+        ctx.record_corner_pipeline_object();
+        ctx.check_lifecycle_fault(crate::LifecycleFaultSite::LitLayout)?;
         let stages = [
             stage(vk::ShaderStageFlags::VERTEX, module, c"vs_main"),
             stage(vk::ShaderStageFlags::FRAGMENT, module, c"fs_main"),
@@ -1238,15 +1390,17 @@ impl PipelineState {
             .depth_stencil_state(scene_depth)
             .color_blend_state(color_blend)
             .dynamic_state(dynamic_state)
-            .layout(out.lit_layout)
+            .layout(group.lit_layout)
             .render_pass(render_pass)
             .subpass(0);
         // SAFETY: same render pass, depth and viewport contract as the world pipeline.
-        out.lit_pipeline = unsafe {
+        group.lit_pipeline = unsafe {
             ctx.device
                 .create_graphics_pipelines(ctx.pipeline_cache, &[info], None)
         }
         .map_err(|(_, e)| RendererError::vk(e, "lit pipeline"))?[0];
+        ctx.record_corner_pipeline_object();
+        ctx.check_lifecycle_fault(crate::LifecycleFaultSite::LitPipeline)?;
 
         // The Cycle 6-E instanced-proxy pipeline (see
         // docs/CYCLE6-6E-BRIEF.md): the SAME render pass,
@@ -1265,16 +1419,21 @@ impl PipelineState {
             include_bytes!(concat!(env!("OUT_DIR"), "/instanced_proxy.spv")),
         )?;
         modules.push(module);
+        // CA-01 fault knob: the proxy module exists — the drain below
+        // releases it when a later step's plan fires.
+        ctx.check_lifecycle_fault(crate::LifecycleFaultSite::ProxyModule)?;
         // SAFETY: corner owns its descriptor layout across pipeline
-        // replacements; the partial PipelineState owns the pipeline
+        // replacements; the group's scoped owner owns the pipeline
         // layout immediately.
-        out.proxy_layout = unsafe {
+        group.proxy_layout = unsafe {
             ctx.device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts),
                 None,
             )
         }
         .map_err(|e| RendererError::vk(e, "proxy layout"))?;
+        ctx.record_corner_pipeline_object();
+        ctx.check_lifecycle_fault(crate::LifecycleFaultSite::ProxyLayout)?;
         let proxy_stages = [
             stage(vk::ShaderStageFlags::VERTEX, module, c"vs_main"),
             stage(vk::ShaderStageFlags::FRAGMENT, module, c"fs_main"),
@@ -1344,15 +1503,17 @@ impl PipelineState {
             .depth_stencil_state(scene_depth)
             .color_blend_state(color_blend)
             .dynamic_state(dynamic_state)
-            .layout(out.proxy_layout)
+            .layout(group.proxy_layout)
             .render_pass(render_pass)
             .subpass(0);
         // SAFETY: same render pass, depth and viewport contract as the lit pipeline.
-        out.proxy_pipeline = unsafe {
+        group.proxy_pipeline = unsafe {
             ctx.device
                 .create_graphics_pipelines(ctx.pipeline_cache, &[proxy_info], None)
         }
         .map_err(|(_, e)| RendererError::vk(e, "proxy pipeline"))?[0];
+        ctx.record_corner_pipeline_object();
+        ctx.check_lifecycle_fault(crate::LifecycleFaultSite::ProxyPipeline)?;
 
         // The Era-2 package C rain pipeline (the THIRD populated
         // kind — the mission's "particle shader variant ... or
@@ -1375,6 +1536,9 @@ impl PipelineState {
             include_bytes!(concat!(env!("OUT_DIR"), "/particle.spv")),
         )?;
         modules.push(rain_module);
+        // CA-01 fault knob: the rain module exists — the drain below
+        // releases it when the rain pipeline's plan fires.
+        ctx.check_lifecycle_fault(crate::LifecycleFaultSite::RainModule)?;
         let rain_stages = [
             stage(vk::ShaderStageFlags::VERTEX, rain_module, c"vs_main"),
             stage(vk::ShaderStageFlags::FRAGMENT, rain_module, c"fs_main"),
@@ -1402,17 +1566,19 @@ impl PipelineState {
             .depth_stencil_state(&rain_depth)
             .color_blend_state(&rain_blend)
             .dynamic_state(dynamic_state)
-            .layout(out.proxy_layout)
+            .layout(group.proxy_layout)
             .render_pass(render_pass)
             .subpass(0);
         // SAFETY: same render pass and viewport contract as the
         // proxy pipeline; the module/layout are the live objects
         // above.
-        out.rain_pipeline = unsafe {
+        group.rain_pipeline = unsafe {
             ctx.device
                 .create_graphics_pipelines(ctx.pipeline_cache, &[rain_info], None)
         }
         .map_err(|(_, e)| RendererError::vk(e, "rain pipeline"))?[0];
+        ctx.record_corner_pipeline_object();
+        ctx.check_lifecycle_fault(crate::LifecycleFaultSite::RainPipeline)?;
         Ok(())
     }
 
@@ -1428,6 +1594,19 @@ impl PipelineState {
     /// construction-time build on the recreation path) returns
     /// unchanged; a state with no attached scene returns unchanged
     /// (the pre-S6 Omitted shape — no scene, no corner pipelines).
+    ///
+    /// CA-01 (attach atomicity): the readiness test below —
+    /// `lit_pipeline` non-null — is SOUND only because the assembly
+    /// stages its whole group in a [`CornerPipelineGroup`] and adopts
+    /// it in ONE commit: a non-null `lit_pipeline` therefore implies
+    /// the lit/proxy/rain pipelines AND both layouts exist. Before
+    /// the group staging, a mid-assembly failure could leave
+    /// `lit_pipeline` set with `proxy_pipeline`/`rain_pipeline`
+    /// null, and this test would have skipped the rebuild — the
+    /// null-pipeline bind the S6 rig found as an access violation.
+    /// The attach caller's rollback guard releases the staged scene
+    /// resources when THIS fails, so the failed attach leaves the
+    /// renderer exactly as before and the retry rebuilds everything.
     pub(crate) fn ensure_corner_pipelines(
         &mut self,
         ctx: &VulkanContext,
@@ -1439,7 +1618,9 @@ impl PipelineState {
             return Ok(());
         };
         let render_pass = self.render_pass;
-        Self::assemble_corner_pipelines(ctx, corner, render_pass, self)
+        let group = Self::assemble_corner_pipelines(ctx, corner, render_pass)?;
+        group.adopt_into(self);
+        Ok(())
     }
 
     pub(crate) fn destroy(&mut self, ctx: &VulkanContext) {

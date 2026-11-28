@@ -119,6 +119,26 @@ pub(crate) struct VulkanContext {
     /// builders (e.g., shadow's per-slot loop). The plan is NEVER
     /// touched by real device calls — it is test-only and diagnostic.
     target_fault: Cell<Option<(TargetFaultSite, TargetFaultStage, u32)>>,
+    /// Diagnostic fault-injection seam for the LIFECYCLE paths (the
+    /// CA-01/CA-10/CA-11 verification knobs — the same one-shot
+    /// plan/ordinal discipline as `target_fault` above, one flat
+    /// site enum naming a single fallible step: see
+    /// [`crate::LifecycleFaultSite`]). Test-only, diagnostic-only:
+    /// never touched by real device calls.
+    lifecycle_fault: Cell<Option<(crate::LifecycleFaultSite, u32)>>,
+    /// CA-01 census counters (see `crate::AllocationStats`'s
+    /// `corner_pipeline_objects` / `corner_pipeline_object_frees` —
+    /// the field docs are the contract): creation counts of the
+    /// corner pipeline group's staged objects, and the scoped
+    /// owner's destruction counts.
+    corner_pipeline_objects: Cell<u64>,
+    corner_pipeline_object_frees: Cell<u64>,
+    /// CA-11 census counters (see `crate::AllocationStats`'s
+    /// `arena_replacements` / `arena_replacement_frees`): staging
+    /// counts of the arena growth paths' replacement buffer pairs,
+    /// and the scoped owner's destruction counts.
+    arena_replacements: Cell<u64>,
+    arena_replacement_frees: Cell<u64>,
     /// The one-shot acquire-out-of-date injection (finding 6's
     /// verification knob — the driver-forced
     /// `VK_ERROR_OUT_OF_DATE_KHR` acquire path, unreachable from the
@@ -493,6 +513,11 @@ impl VulkanContext {
             indirect_draws_issued: Cell::new(0),
             arena_growth_events: Cell::new(0),
             target_fault: Cell::new(None),
+            lifecycle_fault: Cell::new(None),
+            corner_pipeline_objects: Cell::new(0),
+            corner_pipeline_object_frees: Cell::new(0),
+            arena_replacements: Cell::new(0),
+            arena_replacement_frees: Cell::new(0),
             acquire_out_of_date_armed: Cell::new(false),
             target_images: Cell::new(0),
             target_image_views: Cell::new(0),
@@ -531,7 +556,13 @@ impl VulkanContext {
     /// orphan them — refused here, and a fresh renderer is the
     /// supported path for different content. A failed build
     /// changes nothing (the builder's partial-failure discipline
-    /// releases its own partials; `corner` stays `None`).
+    /// releases its own partials; `corner` stays `None`). Since
+    /// CA-01 the INSTALL is itself a STAGING step: the caller
+    /// (`Renderer::attach_scene`) completes the attach by building
+    /// the dependent corner pipeline group, and rolls back through
+    /// [`Self::release_staged_scene_resources`] if THAT fails — so
+    /// the one-scene budget is consumed only by a fully-completed
+    /// attach.
     pub(crate) fn attach_scene_resources(
         &mut self,
         description: &crate::scene_description::SceneDescription,
@@ -546,6 +577,24 @@ impl VulkanContext {
         let resources = corner::CornerResources::new(self, description)?;
         self.corner = Some(resources);
         Ok(())
+    }
+
+    /// CA-01 (attach atomicity): releases the STAGED scene resources
+    /// — the set `attach_scene_resources` installed while the attach
+    /// was still assembling its dependent pipeline group. Called
+    /// only from [`crate::Renderer::attach_scene`]'s rollback guard
+    /// when the corner-pipeline ensure fails: the context returns to
+    /// exactly its pre-attach state (no installed resources, the
+    /// one-scene budget unconsumed), so a retry of the SAME
+    /// description is as clean as a first attach. This is NOT a
+    /// detach API for attached scenes — a scene whose pipelines
+    /// committed stays for the renderer's lifetime (the pass
+    /// families bind its buffers); only a never-completed attach's
+    /// staging is releasable.
+    pub(crate) fn release_staged_scene_resources(&mut self) {
+        if let Some(resources) = self.corner.take() {
+            resources.destroy(self);
+        }
     }
 
     fn init_atlas(&mut self, atlas: &crate::glyph_atlas::GlyphAtlas) -> Result<(), RendererError> {
@@ -597,6 +646,10 @@ impl VulkanContext {
             upload_blocking_wait_ns: self.upload_blocking_wait_ns.get(),
             staged_buffer_uploads: self.staged_buffer_uploads.get(),
             texture_staging_tail_bytes: self.texture_staging_tail_bytes.get(),
+            corner_pipeline_objects: self.corner_pipeline_objects.get(),
+            corner_pipeline_object_frees: self.corner_pipeline_object_frees.get(),
+            arena_replacements: self.arena_replacements.get(),
+            arena_replacement_frees: self.arena_replacement_frees.get(),
         }
     }
 
@@ -678,6 +731,71 @@ impl VulkanContext {
                 Ok(())
             }
         }
+    }
+
+    /// Arms a one-shot lifecycle fault plan (the CA-01/CA-10/CA-11
+    /// verification knobs — the `target_fault` discipline on the
+    /// lifecycle site enum). The `ordinal` is 1-based and decrements
+    /// per MATCHING check across the renderer's lifetime; the plan
+    /// is consumed when the ordinal reaches 0. Diagnostic-only,
+    /// test-only: never produced by real device calls.
+    pub(crate) fn set_lifecycle_fault(&self, site: crate::LifecycleFaultSite, ordinal: u32) {
+        // A zero ordinal can never fire (it would underflow below);
+        // clamp to 1 so an armed plan is always fireable by its
+        // first matching check — the target-fault seam's own rule.
+        self.lifecycle_fault.set(Some((site, ordinal.max(1))));
+    }
+
+    /// Checks a lifecycle fault plan for the named step. Identical
+    /// semantics to [`Self::check_target_fault`]: `Ok(())` when no
+    /// plan matches; on match the ordinal decrements and the fault
+    /// fires (consuming the plan) at zero. The advance logic lives
+    /// in [`super::resources::advance_lifecycle_fault_plan`] (pure,
+    /// unit-tested without a device — the mock-free discipline).
+    pub(crate) fn check_lifecycle_fault(
+        &self,
+        site: crate::LifecycleFaultSite,
+    ) -> Result<(), RendererError> {
+        let mut plan = self.lifecycle_fault.get();
+        match super::resources::advance_lifecycle_fault_plan(&mut plan, site) {
+            Some(error) => {
+                self.lifecycle_fault.set(plan);
+                Err(error)
+            }
+            None => {
+                self.lifecycle_fault.set(plan);
+                Ok(())
+            }
+        }
+    }
+
+    /// CA-01: records the creation of one corner pipeline group
+    /// object (the group's staged layouts and pipelines — the
+    /// census pair's creation half).
+    pub(super) fn record_corner_pipeline_object(&self) {
+        self.corner_pipeline_objects
+            .set(self.corner_pipeline_objects.get() + 1);
+    }
+
+    /// CA-01: records the scoped owner's release of one corner
+    /// pipeline group object (the census pair's destruction half).
+    pub(super) fn record_corner_pipeline_object_free(&self) {
+        self.corner_pipeline_object_frees
+            .set(self.corner_pipeline_object_frees.get() + 1);
+    }
+
+    /// CA-11: records one staged arena-carve replacement (the scoped
+    /// mapped-buffer owner's creation half).
+    pub(super) fn record_arena_replacement_staged(&self) {
+        self.arena_replacements
+            .set(self.arena_replacements.get() + 1);
+    }
+
+    /// CA-11: records the scoped owner's release of one staged
+    /// arena-carve replacement (the destruction half).
+    pub(super) fn record_arena_replacement_released(&self) {
+        self.arena_replacement_frees
+            .set(self.arena_replacement_frees.get() + 1);
     }
 
     /// Arms a one-shot acquire-out-of-date injection (finding 6's

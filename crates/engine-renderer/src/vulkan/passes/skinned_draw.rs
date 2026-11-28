@@ -83,7 +83,7 @@
 
 use super::corner::CornerResources;
 use super::{
-    RendererError, VulkanContext, create_mapped_buffer, create_shader_module,
+    RendererError, ScopedMappedBuffer, VulkanContext, create_mapped_buffer, create_shader_module,
     descriptors::create_sets,
 };
 use crate::animation::POSE_STRIDE;
@@ -254,17 +254,34 @@ impl SkinnedRetained {
         }
         let slot_stride = u64::from(target) * POSE_STRIDE as u64;
         check_slot_alignment(ctx, slot_stride)?;
-        let (buffer, memory, mapped) = create_mapped_buffer(
+        // CA-11 (the growth-handle-loss fix): the replacement pair
+        // lives in a SCOPED OWNER from creation to commit — a
+        // failure at the fallible idle wait below drops the guard,
+        // which destroys the NEW buffer and memory (the old
+        // bindings and their descriptor sets intact), instead of
+        // dropping the bare handles on the floor as the pre-fix
+        // tuple did. The staging/release events land on the census
+        // pair (`arena_replacements`/`arena_replacement_frees`).
+        let replacement = ScopedMappedBuffer::create(
             ctx,
             vk::BufferUsageFlags::STORAGE_BUFFER,
             slot_stride * FRAMES_IN_FLIGHT as u64,
         )?;
         // The replacement point: everything above can fail with the
-        // prior state intact; below this line the swap is
+        // prior state intact; below the guard's commit the swap is
         // commit-only (update_descriptor_sets cannot fail). The
         // stall is the renderer's own ordered-teardown helper
-        // (device_wait_idle, typed).
+        // (device_wait_idle, typed) — the ONE fallible step in the
+        // window, which is why the CA-11 fault knob sits immediately
+        // before it: a plan armed there fires with the replacement
+        // allocated, the binding-5 sets not yet rewritten, and the
+        // old carve still live — the exact leak window the guard
+        // closes (the pre-fix comment here claimed "below this line
+        // the swap is commit-only", which the fallible wait itself
+        // falsified).
+        ctx.check_lifecycle_fault(crate::LifecycleFaultSite::PoseGrowthIdle)?;
         super::device_idle(ctx)?;
+        let (buffer, memory, mapped) = replacement.commit();
         let storage_dynamic = vk::DescriptorType::STORAGE_BUFFER_DYNAMIC;
         for set in self.sets {
             let poses = [vk::DescriptorBufferInfo::default()

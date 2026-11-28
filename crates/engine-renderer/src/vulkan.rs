@@ -172,8 +172,8 @@ pub(crate) use swapchain::{
 use ash::vk;
 use context::depth_aspect;
 use resources::{
-    create_device_local_buffer_with_data, create_mapped_buffer, create_shader_module,
-    find_memory_type, with_upload_commands,
+    ScopedMappedBuffer, create_device_local_buffer_with_data, create_mapped_buffer,
+    create_shader_module, find_memory_type, with_upload_commands,
 };
 use swapchain::{drawable_extent, recreate_swapchain};
 use textures::{SamplerPool, Texture};
@@ -235,6 +235,20 @@ pub enum RendererError {
     /// produced by a real Vulkan call. Distinguishes an injected
     /// recoverable construction failure from a genuine device error.
     InjectedFault(String),
+    /// CA-10's typed terminal refusal: a post-acquire frame failure
+    /// whose RELEASE could not be completed — `source` carries the
+    /// frame's original error, `release` the release step that
+    /// failed (the empty consume-and-heal submission). The frame
+    /// slot's synchronization state (its fence and/or its acquire
+    /// semaphore) is unrecoverable: continuing to use this renderer
+    /// risks a fence wait timeout or an invalid semaphore signal;
+    /// constructing a fresh renderer is the supported path. Never a
+    /// silent strand — the failure is typed at the boundary, not
+    /// discovered as a 2-second wait on the next frame.
+    FrameSlotUnrecoverable {
+        source: Box<RendererError>,
+        release: Box<RendererError>,
+    },
 }
 
 impl RendererError {
@@ -285,6 +299,12 @@ impl std::fmt::Display for RendererError {
             RendererError::InjectedFault(message) => write!(
                 f,
                 "injected fault: {message} (diagnostic-only, not a device error)"
+            ),
+            RendererError::FrameSlotUnrecoverable { source, release } => write!(
+                f,
+                "frame slot unrecoverable: the post-acquire release for the frame error \
+                 ({source}) itself failed ({release}) — this renderer's frame-slot \
+                 synchronization can no longer be trusted; construct a fresh renderer"
             ),
         }
     }

@@ -71,7 +71,7 @@ pub use animation::{
     rest_pose_block, sample_pose, skin_matrices, skin_vertex, skinned_humanoid_mesh, walk_clip,
 };
 pub use config::{
-    DemoScenePreference, DepthFormatPreference, InstanceCapacity, PoseCapacity,
+    DemoScenePreference, DepthFormatPreference, InstanceCapacity, LifecycleFaultSite, PoseCapacity,
     PresentModePreference, RegionCapacity, RenderConfig, TargetFaultSite, TargetFaultStage,
     ValidationPreference,
 };
