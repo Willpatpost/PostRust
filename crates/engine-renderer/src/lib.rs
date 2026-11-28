@@ -65,17 +65,27 @@ mod scene_description;
 mod submission;
 mod vulkan;
 
-pub use animation::{
-    BOX_JOINT, Clip, HUMANOID_BOXES, HUMANOID_JOINTS, Joint, JointPose, Keyframe, MAX_POSE_BLOCKS,
-    POSE_STRIDE, PosePackError, SkinnedVertex, compose_joint_matrices, humanoid_skeleton,
-    pack_pose_bytes, pose_sequence_digest, posed_box_bounds, repack_poses, repack_poses_bounded,
-    rest_pose_block, sample_pose, skin_matrices, skin_vertex, skinned_humanoid_mesh, walk_clip,
-};
+// The root animation surface (E-S3, DECISION-A06 §4's recommended arm):
+// every `engine_renderer::<Symbol>` path stays STABLE — the 19 pure-core
+// items re-pointed at `engine_animation` (their home since E-S1), the
+// packing items still at the `animation` module (defined there), and the
+// mesh derivation at `populated_meshes` (its home since E-S1). The
+// `animation` module's own public path now carries ONLY the packing
+// layer; `SkinBind`/`skin_matrices_bound` remain module-path-only in
+// `engine_animation` (the §3 P6 API-pass fold, unchanged here).
+pub use animation::{MAX_POSE_BLOCKS, PosePackError, repack_poses, repack_poses_bounded};
 pub use config::{
     DemoScenePreference, DepthFormatPreference, InstanceCapacity, LifecycleFaultSite, PoseCapacity,
     PresentModePreference, RegionCapacity, RenderConfig, TargetFaultSite, TargetFaultStage,
     ValidationPreference,
 };
+pub use engine_animation::{
+    BOX_JOINT, Clip, HUMANOID_BOXES, HUMANOID_JOINTS, Joint, JointPose, Keyframe, POSE_STRIDE,
+    SkinnedVertex, compose_joint_matrices, humanoid_skeleton, pack_pose_bytes,
+    pose_sequence_digest, posed_box_bounds, rest_pose_block, sample_pose, skin_matrices,
+    skin_vertex, walk_clip,
+};
+pub use populated_meshes::skinned_humanoid_mesh;
 pub use renderer::{
     AllocationStats, FrameResult, GeometryStats, ProxyDrawMode, ProxyPopulation,
     RIPPLE_ROUGHEN_GAIN, RIPPLE_UV_GAIN, RenderStats, Renderer, RippleDebugMode, SceneLayer,

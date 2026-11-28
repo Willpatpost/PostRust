@@ -1,47 +1,56 @@
-//! The animation surface's E-S1 compatibility shim (DECISION-A06 §4,
-//! owner-approved per D-EE-10 §2): the deterministic pose/skeleton/
-//! sampling core now lives in the `engine-animation` crate, and this
-//! module re-exports it so every existing import path —
-//! `engine_renderer::animation::*`, the crate-root re-export block,
-//! and every `crate::animation::` site inside the renderer — is
-//! STABLE through the extraction (zero consumer edits at this
-//! stage; engine-slice's rewiring to `engine_animation::` is E-S2).
+//! The renderer's animation surface, post-E-S3 (DECISION-A06 §4, the
+//! owner-approved A06 migration): the GPU PACKING LAYER — the module
+//! that owns the renderer's pose-upload carve. The deterministic
+//! pose/skeleton/sampling core lives in the `engine-animation` crate
+//! (E-S1); engine-slice speaks `engine_animation::` directly (E-S2);
+//! and the E-S1 compatibility shim's PUBLIC re-export block is
+//! deleted HERE (E-S3) — `engine_renderer::animation::<moved
+//! symbol>` is no longer a public path. Root-path consumers keep
+//! their paths through the lib.rs root re-export (re-pointed at
+//! `engine_animation`); the packing symbols below keep this module
+//! path (they are defined here).
 //!
 //! What stays HERE (the GPU packing layer, per the owner's
 //! "separated from GPU packing" clause): the retained-buffer repack
 //! family (`repack_poses`, `repack_poses_bounded`,
 //! `repack_poses_generation`, `verify_pose_generation`), the
-//! capacity mirror `MAX_POSE_BLOCKS`, and the typed refusal
-//! `PosePackError` — the buffer/capacity/generation machinery that
-//! owns the renderer's upload carve. `skinned_humanoid_mesh` moved
-//! to `populated_meshes` (it derives from that module's unskinned
-//! mesh) and is re-exported here for path stability.
+//! capacity mirror `MAX_POSE_BLOCKS`, the typed refusal
+//! `PosePackError`, and the pose source identity `PoseSourceToken`
+//! — the buffer/capacity/generation machinery that owns the
+//! renderer's upload carve. `skinned_humanoid_mesh` lives in
+//! `populated_meshes` (it derives from that module's unskinned
+//! mesh); the crate-visible alias below holds the renderer's
+//! internal `crate::animation::` consumers of it.
 //!
-//! What moved to `engine-animation` (the pure core): the clip model,
-//! the skeleton, the sampling and transform math, the skinning
-//! equation with its CPU reference `skin_vertex` and the
-//! `SkinnedVertex` byte-boundary type it evaluates, the
-//! single-block byte serialization `pack_pose_bytes` with
-//! `POSE_STRIDE` (the pose digest pin folds exactly these bytes, so
-//! the digest moved with them), `sin_cos_turn` (re-exported by
-//! `proxy_instances` for its existing consumers), and
-//! `mat3_multiply` (public in engine-animation, re-exported
-//! crate-visibly below for `shadows.rs`'s populated oracle — the
-//! rotation convention still exists exactly once).
+//! The crate-visible aliases below are NOT compatibility surface:
+//! they are the renderer's INTERNAL wiring — the same treatment
+//! `mat3_multiply` has always had. The renderer's own modules
+//! (`shadows`, `renderer`, `submission`, `frame_plan`, `config`,
+//! the `vulkan` tree) speak `crate::animation::<symbol>` for the
+//! moved pure-core symbols; the aliases keep that path resolving
+//! against the ONE engine-animation implementation — the convention
+//! still exists exactly once.
 //!
 //! The test module at the bottom stays renderer-side ON PURPOSE:
-//! those tests exercise the kept repack/generation machinery and the
-//! shipped mesh derivation THROUGH this shim's re-exports — the
-//! path-stability proof at test level, not just check level.
+//! those tests exercise the kept repack/generation machinery and
+//! the shipped mesh derivation — the packing layer's own batteries.
 
 use crate::proxy_instances::GenerationDecision;
 
-pub use crate::populated_meshes::skinned_humanoid_mesh;
-pub use engine_animation::{
-    BOX_JOINT, Clip, HUMANOID_BOXES, HUMANOID_JOINTS, Joint, JointPose, Keyframe, POSE_STRIDE,
-    SkinBind, SkinnedVertex, compose_joint_matrices, humanoid_skeleton, pack_pose_bytes,
-    pose_sequence_digest, posed_box_bounds, rest_pose_block, sample_pose, skin_matrices,
-    skin_matrices_bound, skin_vertex, walk_clip,
+pub(crate) use crate::populated_meshes::skinned_humanoid_mesh;
+pub(crate) use engine_animation::{
+    BOX_JOINT, HUMANOID_BOXES, HUMANOID_JOINTS, POSE_STRIDE, SkinnedVertex, pack_pose_bytes,
+};
+
+/// The pure-core symbols the renderer reaches only from its own
+/// `cfg(test)` batteries — the shadow oracle's pose machinery
+/// (shadows.rs), the submission/frame generation-oracle tests, and
+/// this module's own tests. Crate-visible and test-gated so the
+/// non-test lib build carries no unused alias.
+#[cfg(test)]
+pub(crate) use engine_animation::{
+    JointPose, compose_joint_matrices, humanoid_skeleton, rest_pose_block, sample_pose,
+    skin_matrices, skin_vertex, walk_clip,
 };
 
 /// The column-major 3x3 product the shadow oracle composes
