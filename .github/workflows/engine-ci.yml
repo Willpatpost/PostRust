@@ -2341,7 +2341,7 @@ jobs:
           # allocations constant): ignored 46 -> 47 (measured on
           # the lane tree with this step's own parse — 664/47/64
           # Windows, passed and result lines unchanged).
-          [ "$ignored" -eq 59 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 47"; exit 1; }
+          [ "$ignored" -eq 59 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 59"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
