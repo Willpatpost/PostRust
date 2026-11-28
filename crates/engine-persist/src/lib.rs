@@ -63,6 +63,7 @@ pub mod record;
 pub mod recovery;
 pub mod recovery_classification;
 pub mod recovery_discovery;
+pub mod residency;
 pub mod rotation;
 pub mod session_anchor;
 pub mod sqlite;
