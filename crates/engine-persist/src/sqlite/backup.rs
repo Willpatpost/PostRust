@@ -272,12 +272,20 @@ mod tests {
         cleanup_db(&path);
     }
 
-    /// (CA-19, Unix) The native path is BYTE-FAITHFUL where the OS
+    /// (CA-19, Linux) The native path is BYTE-FAITHFUL where the OS
     /// allows it: a non-UTF-8 target (raw invalid-UTF-8 bytes) backs
-    /// up AT THE NATIVE NAME — the file exists under exactly those
-    /// bytes and validates to the source chain — and no substituted
-    /// (U+FFFD) sibling exists.
-    #[cfg(unix)]
+    /// up AT THE NATIVE NAME - the file exists under exactly those
+    /// bytes and validates to the source chain - and no substituted
+    /// (U+FFFD) sibling exists. LINUX-ONLY by platform capability:
+    /// macOS APFS requires valid-UTF-8 (NFD-normalized) filenames -
+    /// a raw 0xFF byte name cannot exist there, the fixture itself
+    /// is unrepresentable (observed: SQLite's open fails with the
+    /// mangled-name error on the macos CI, run 46123129580) - so
+    /// the byte-faithfulness proof runs where the capability exists.
+    /// The Windows twin (the unpaired-surrogate test above) covers
+    /// the Windows shape; macOS's path handling is the lossless
+    /// UTF-8 subset, exercised by every other test.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_non_utf8_target_backs_up_at_the_native_name() {
         use std::os::unix::ffi::OsStringExt as _;
