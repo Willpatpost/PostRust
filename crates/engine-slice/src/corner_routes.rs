@@ -646,7 +646,7 @@ pub fn corner_instances(states: &[NpcLocomotion], table_tints: &[[f32; 3]]) -> V
 /// IDENTICAL to the pre-dedup evaluation (the identity proof's test
 /// below).
 pub fn evaluate_population_poses_locomotion(states: &[NpcLocomotion], out: &mut Vec<Block>) {
-    use engine_renderer::animation::{
+    use engine_animation::{
         SkinBind, compose_joint_matrices, humanoid_skeleton, rest_pose_block, sample_pose,
         skin_matrices_bound, walk_clip,
     };
@@ -1359,7 +1359,7 @@ mod tests {
     /// THE POSE EVALUATION LOCOMOTION: matches the phase-column path.
     #[test]
     fn pose_evaluation_matches_the_phase_column_path() {
-        use engine_renderer::animation::{
+        use engine_animation::{
             compose_joint_matrices, rest_pose_block, sample_pose, skin_matrices, walk_clip,
         };
 
@@ -1376,7 +1376,7 @@ mod tests {
         evaluate_population_poses_locomotion(&[states[8]], &mut blocks);
         let t = 0.0 * WALK_STRIDE_SECONDS;
         let clip = walk_clip();
-        let skeleton = engine_renderer::animation::humanoid_skeleton();
+        let skeleton = engine_animation::humanoid_skeleton();
         let pose = sample_pose(&clip, t);
         let joint_worlds = compose_joint_matrices(&skeleton, &pose);
         let expected = skin_matrices(&joint_worlds, &skeleton);
@@ -1402,7 +1402,7 @@ mod tests {
     /// THE POSE BYTES FNV PINS: the packed pose bytes' FNV-1a at frames 0, 33, 300.
     #[test]
     fn pose_bytes_fnv_pins() {
-        use engine_renderer::animation::pack_pose_bytes;
+        use engine_animation::pack_pose_bytes;
 
         let (_, states, _) = corner_population_locomotion();
         let mut blocks = Vec::new();
@@ -1471,7 +1471,7 @@ mod tests {
     /// digit for digit through the dedup.
     #[test]
     fn locomotion_dedup_preserves_every_npcs_skin_matrices() {
-        use engine_renderer::animation::{
+        use engine_animation::{
             SkinBind, compose_joint_matrices, humanoid_skeleton, rest_pose_block, sample_pose,
             skin_matrices_bound, walk_clip,
         };

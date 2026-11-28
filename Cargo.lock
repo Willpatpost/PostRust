@@ -207,6 +207,7 @@ dependencies = [
 name = "engine-slice"
 version = "0.1.0"
 dependencies = [
+ "engine-animation",
  "engine-core",
  "engine-persist",
  "engine-renderer",

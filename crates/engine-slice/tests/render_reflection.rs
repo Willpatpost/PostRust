@@ -912,7 +912,7 @@ fn wet_ground_gate_at(preference: DepthFormatPreference, label: &str) {
     // The Era-2 rest-pose blocks (the skinning input at rest —
     // bit-exact identity, so the composition's pixels are the
     // authored-silhouette equation).
-    let npc_poses = vec![engine_renderer::animation::rest_pose_block(); npc.len()];
+    let npc_poses = vec![engine_animation::rest_pose_block(); npc.len()];
     let population = engine_renderer::ProxyPopulation {
         instance_generation: 0,
         pose_generation: 0,

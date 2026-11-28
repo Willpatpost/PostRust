@@ -215,11 +215,8 @@ impl<'a> FixturePopulation<'a> {
         // bounded by the fixture count — the same discipline the
         // turn-interpolation keyframes use; the blocks are constant,
         // so the leak is one identical block array per fixture).
-        let poses: &'a [[[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS]] =
-            Vec::leak(vec![
-                engine_renderer::animation::rest_pose_block();
-                npc.len()
-            ]);
+        let poses: &'a [[[[f32; 4]; 4]; engine_animation::HUMANOID_JOINTS]] =
+            Vec::leak(vec![engine_animation::rest_pose_block(); npc.len()]);
         FixturePopulation {
             population: ProxyPopulation {
                 instance_generation: 0,
@@ -242,7 +239,7 @@ impl<'a> FixturePopulation<'a> {
     fn new_with_poses(
         npc: &'a [ProxyInstance],
         vehicle: &'a [ProxyInstance],
-        poses: &'a [[[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS]],
+        poses: &'a [[[[f32; 4]; 4]; engine_animation::HUMANOID_JOINTS]],
         npc_material: u32,
         vehicle_material: u32,
     ) -> Self {
@@ -276,7 +273,7 @@ fn populated<'a>(
 fn populated_locomotion<'a>(
     npc: &'a [ProxyInstance],
     vehicle: &'a [ProxyInstance],
-    poses: &'a [[[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS]],
+    poses: &'a [[[[f32; 4]; 4]; engine_animation::HUMANOID_JOINTS]],
     npc_material: u32,
     vehicle_material: u32,
 ) -> FixturePopulation<'a> {
@@ -1415,7 +1412,7 @@ fn full_corner_population_matches_per_object_pixels() {
             // battery's byte pins use).
             let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
             for block in &blocks {
-                let bytes = engine_renderer::animation::pack_pose_bytes(block);
+                let bytes = engine_animation::pack_pose_bytes(block);
                 for &byte in bytes.iter() {
                     hash ^= u64::from(byte);
                     hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
@@ -2520,13 +2517,13 @@ fn skinned_pose_matches_the_cpu_oracle() {
         &mut blocks,
     );
     let block = &blocks[0];
-    let rest_block = engine_renderer::animation::rest_pose_block();
+    let rest_block = engine_animation::rest_pose_block();
     assert_ne!(*block, rest_block, "frame 33 is off the rest pose");
 
     // --- THE SURFACE: the torso's front face through skin_vertex.
-    let (lo, hi) = engine_renderer::animation::HUMANOID_BOXES[1];
+    let (lo, hi) = engine_animation::HUMANOID_BOXES[1];
     assert_eq!((lo, hi), ([-0.21, 1.06, -0.12], [0.21, 1.60, 0.12]));
-    let joint = engine_renderer::animation::BOX_JOINT[1];
+    let joint = engine_animation::BOX_JOINT[1];
     assert_eq!(joint, 1, "the torso box binds to the torso joint");
     // The four front-face corners, in authored order: bottom-left,
     // bottom-right, top-right, top-left (local z = hi[2]).
@@ -2537,8 +2534,8 @@ fn skinned_pose_matches_the_cpu_oracle() {
         [lo[0], hi[1], hi[2]],
     ];
     let skin_at = |pos: [f32; 3], normal: [f32; 3]| {
-        engine_renderer::animation::skin_vertex(
-            &engine_renderer::animation::SkinnedVertex {
+        engine_animation::skin_vertex(
+            &engine_animation::SkinnedVertex {
                 pos,
                 normal,
                 uv: [0.0, 0.0],
@@ -3013,7 +3010,7 @@ fn animated_population_matches_per_object_pixels() {
     );
     // The walk is real: some walker is off rest, the 16 walkers'
     // phases are distinct, and no two states share (position, phase).
-    let rest_block = engine_renderer::animation::rest_pose_block();
+    let rest_block = engine_animation::rest_pose_block();
     assert!(
         blocks.iter().any(|b| *b != rest_block),
         "frame 33 is off the rest pose"
@@ -3103,7 +3100,7 @@ fn animated_population_matches_per_object_pixels() {
     // bit-exact rest either way, so the differential's pixels are
     // unchanged.
     let rest_blocks: Vec<_> = (0..blocks.len())
-        .map(|_| engine_renderer::animation::rest_pose_block())
+        .map(|_| engine_animation::rest_pose_block())
         .collect();
     let at_rest = ProxyPopulation {
         instance_generation: 0,
@@ -3597,7 +3594,7 @@ fn composed_population_matches_per_object_pixels() {
             // The frame's pose digest.
             let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
             for block in &composed_poses {
-                let bytes = engine_renderer::animation::pack_pose_bytes(block);
+                let bytes = engine_animation::pack_pose_bytes(block);
                 for &byte in bytes.iter() {
                     hash ^= u64::from(byte);
                     hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
@@ -3640,7 +3637,7 @@ fn composed_population_matches_per_object_pixels() {
             "the composed crowd's palette: one shared rest + the walkers"
         );
         let rest_blocks: Vec<_> = (0..palette_slots)
-            .map(|_| engine_renderer::animation::rest_pose_block())
+            .map(|_| engine_animation::rest_pose_block())
             .collect();
         let at_rest = ProxyPopulation {
             instance_generation: 0,

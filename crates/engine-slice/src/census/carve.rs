@@ -35,7 +35,11 @@
 //!   1024² cascade (format prediction: the renderer's negotiated
 //!   depth format; the census counters check it).
 
-use engine_renderer::animation::{MAX_POSE_BLOCKS, POSE_STRIDE};
+// A06 E-S2: POSE_STRIDE moved to engine-animation at E-S1 (it folds
+// the digest-pinned pose bytes); MAX_POSE_BLOCKS is the renderer's
+// capacity mirror and stays on the renderer's animation module.
+use engine_animation::POSE_STRIDE;
+use engine_renderer::animation::MAX_POSE_BLOCKS;
 use engine_renderer::config::FRAMES_IN_FLIGHT;
 use engine_renderer::proxy_instances::{INSTANCE_STRIDE, MAX_INSTANCES};
 use engine_renderer::scene::{SceneVertex, region_scene_capacity_vertices};
