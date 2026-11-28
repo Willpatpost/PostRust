@@ -684,6 +684,154 @@ s6_evidence's device leg) require SDL_VIDEODRIVER=offscreen +
 headless-surface Vulkan, unavailable in this loader — the
 orchestrator's rig bar.
 
+## E-16 P5 R3 — A20 the staging pool with batched uploads; the texture tails retired (2026-11-28, lane worktree tree at commit, branch `ee/p5-r3-staging-pool`, base `3a419a7`; rig GPU RTX 5070 Ti, release, real windows, the E-7/E-12 discipline)
+
+The A20 implementation lane (the design §4.3's recommendation (b)+(c),
+owner-ruled APPROVED at D-EE-10 item 1D): ONE device-lifetime staging
+pool (a persistently mapped HOST_VISIBLE|HOST_COHERENT TRANSFER_SRC
+backing, 64-KiB floor, power-of-two growth to the demand's quantum,
+64-MiB ceiling with the typed
+`RendererError::StagingCapacity` refusal after the in-flight drain —
+bounded backpressure, never a partial upload), a bump allocator whose
+regions recycle ONLY past the retired watermark (every flushed batch
+owns its fence; a region is released exactly when its OWN fence has
+signaled with every earlier batch's already retired — sync follows
+these ACTUAL upload completions, never a frame-slot fence), and a
+batch API whose replay-log design keeps mid-batch growth safe by
+construction (the recorded entries carry destination handles and pool
+offsets only; the log executes once at flush against the final
+backing — the per-object command sequences concatenated verbatim, so
+the device-local contents are byte-identical). The DEFERRABLE
+structure is present and used where the honest assessment says the
+overlap is real: the ATTACH path flushes deferred at the end of the
+resource build (every CA-01 knob fires with the batch still OPEN — an
+abort reclaims the regions with nothing submitted) and drains at the
+attach's completion, overlapping the pipeline-group build (~ms of
+shader compilation) — the wait completes before any first use by
+construction; the construction/proxy/Included-buffer sites wait
+INLINE at batch end (no meaningful independent work overlaps there;
+the frame-path proxy ensure's first use is the same frame). The
+texture staging TAILS are retired (each texture's allocation is the
+image alone; the `cmd_update_buffer`-for-unmappable-VRAM fallback arm
+retained verbatim as the pool-unavailable path — a device with no
+HOST_VISIBLE staging memory keeps exactly its pre-R3 behavior, none
+per Vulkan's minimum guarantees).
+
+**§9.4 — the attach/upload census (AFTER R3, the same
+session/hardware as the BEFORE run on the base tree `3a419a7`):**
+`cargo test -p engine-slice --test census_attach --release --
+--ignored --nocapture --test-threads=1` → 2 passed / 0 failed (the
+battery re-based to pin the AFTER shape; the archived log at
+`Temp\opencode\ee\r3-logs\census_attach-after.log`):
+
+| scene | attach-wall-ms | submits (attach/construction) | blocking-wait-ms | staged-pairs | tail-B | tex-mem | tex-bytes | dev-mem | pool-B | growth | bound-B |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| corner (BEFORE) | 6.9–13.4 | 5 (4/1) | 0.65–2.74 | 1 | 794,624 | 4 | 1,589,248 | 10 | — | — | — |
+| corner (AFTER) | 8.5–11.8 | **2 (1/1)** | 0.31–1.49 | **0** | **0** | 4 | **794,624** | 12 | 1,048,576 | 2 | 0 |
+| garage (AFTER) | 8.5–9.0 | 2 (1/1) | 0.57–0.90 | 0 | 0 | 4 | 794,624 | 12 | 1,048,576 | 2 | 0 |
+
+The census's own headline: objects → 1 pool (the construction atlas
+batch creates the 64-KiB floor backing; the attach batch grows it
+TWICE to the 1-MiB demand quantum — the corner mesh fits the floor,
+each texture boundary exceeds the intermediate quantum), submits →
+1/batch, staged pairs → 0, tails → 0, `texture_bytes` 1,589,248 →
+794,624 (image-only — the tails were EXACTLY the 794,624 B = 50% of
+texture residency E-12 measured), dev-mem 10 → 12 (the pool's two
+backing allocations, monotonic), and the readiness tracking fully
+retired at every attach's drain (bound 0). The frame-path freeze
+assertion extended to the pool columns holds: unpopulated frames
+touch no staging machinery.
+
+**§4.5 — the in-flight safety gate (the battery's new leg, rig GPU,
+release):** `LifecycleFaultSite::StagingFenceNeverSignals` (the seam
+extension) makes the attach's deferred batch submit WITHOUT its fence
+— a structurally real never-signaling fence. The FAULTED leg: the
+attach fails VISIBLY at the drain's 2-s bounded timeout (the
+fail-visible stuck-submission protocol — never an unresponsive
+window) and the region STAYS BOUND (`staging_bound_region_bytes` >
+0 — the RED witness: a naive retire-anything-signaled or
+retire-on-flush implementation reads 0 and lets the bump allocator
+reuse bytes a pending submission reads; the pure seam's unit twin
+`a_never_signaling_fence_never_rets_its_region_or_any_behind_it`
+pins the same property device-free, written to catch exactly that
+bug shape); the teardown drops the renderer clean (the idle-then-
+release protocol). The CLEAN twin: the deferred batch drains at the
+attach's end (bound 0), the following frames draw the uploaded
+content with sync validation ON — validation 0/0 (the deferred wait
+completing before first use).
+
+**The equivalence battery (the full rig set through the pooled
+path, release, serial, all exit 0):** render_corner 1/1,
+render_garage 1/1, render_glyph_atlas 1/1, render_sky 1/1,
+render_shadows 4/4, render_instanced 8/8 (the N-vs-1 pixel
+equivalence, the indirect mechanism's +1 memory pin, the
+replace-pipelines lifecycle — the printed replacement device_memory
+delta moves −3, the throwaway pairs per recreation, a print not a
+pin), render_reflection 7/7 (the (7,2,8,2) wet allocation delta
+UNCHANGED — the reflection family stages nothing; the
+60/1653/2619/5551 known-answer patches digit-for-digit), render_post
+7/7 (the ink and known-answer fixtures digit-for-digit — composed
+ink 34171, fixtures S/L max 1/255), render_weather 11/11 (E-7's
+pinned ink values reproduced DIGIT-FOR-DIGIT through the pooled
+path: rain ink 17041 differing bytes; broadside 3482 px / 2162
+upper-third; the ripple reflection ink 236114 bytes / 98131 px /
+10187 displayed-RGB-qualified; the sweep 22/255 at
+[-1.929102, 0.0, -2.6461658]; the young-field census 22/22, best
+(577, 350, 22); the measured sweep left 22 / right −21 / plateau
+−1; the term separations 96548/67535/7625 blend-only and
+27149/27149/2538 displacement-only), render_encounter 1/1. The
+batch-vs-per-object ORACLE: the device-free half is the pure seam
+test `the_batched_plan_stages_the_same_bytes_into_the_same_copies`
+(the same items through the batch's bump/alignment arithmetic and
+the per-object throwaway form — identical bytes at the recorded
+copies, regions disjoint and ordered); the device-local half IS the
+pixel/capture set above (digit-for-digit through the pooled path).
+
+**§9.1 re-run (the VRAM census table, rig GPU, release):** `cargo
+test -p engine-slice --test census_vram --release -- --ignored
+--nocapture --test-threads=1` → 3 passed / 0 failed (the archived
+log at `Temp\opencode\ee\r3-logs\census_vram-after.log`): all 24
+family × extent cells re-measured — uploads 3 submits (atlas +
+attach + the first-populated proxy batch) / 0 staged / 0 tails at
+every cell, tex-bytes 794,624 (image-only, extent-independent as
+before), the target/pool/set counters byte-identical to E-12/E-15's
+shape (the pool changes STAGING residency, never the target
+families); the R1 arena legs re-ran green unchanged (the four
+populations' carves and the growth gate boundary's four legs —
+relative deltas, the pool predates every baseline).
+
+**THE CONSCIOUS PIN MOVEMENTS (D-EE-06, each measured on the rig,
+batched for the integration re-pin):** (1) E-7's `texture_bytes`
+1,589,248 → 794,624 (the tails retired — the image-only sum; the
+attribution counter `texture_staging_tail_bytes` now reads 0 on
+every pooled device); (2) the absolute device_memory counts move
++2 at construction+attach (the pool's two backings; the census
+rows: 10 → 12 attach, the E-7 run-summary tuple's device_memory
+likewise — every battery pin is RELATIVE and holds); (3)
+render_post's shadowed-populated one-time delta (8,4,16,0) →
+(5,4,16,0) re-based in-lane from the measured actual (the three
+per-kind mesh VBOs' throwaway staging memories are gone — the
+assertion's derivation comment carries the D-EE-06 note); (4)
+render_instanced's PRINTED replacement device_memory delta moves
+−3 (a print, not a pin); (5) the renderer test count 212 → 216
+(+4: the capacity quantum table, the never-signaling retirement
+property + its prefix twin, the batch-vs-per-object oracle);
+census_attach's ignored count 1i → 2i (the in-flight safety leg).
+No CI pin was edited in-lane (the orchestrator's batched `ci:`
+commit at integration).
+
+**Lane gates (this lane's tree):** `cargo fmt --all -- --check`
+exit 0; `cargo clippy -p engine-renderer -p engine-slice
+--all-targets -- -D warnings` exit 0; `cargo test -p
+engine-renderer` **216 passed / 0 failed debug AND release** (=
+the 212 base + 4 new); `cargo test -p engine-slice --lib` **162
+passed / 0 failed** (the base tree's own count — this lane adds no
+slice lib test); `cargo check --workspace --all-targets` exit 0.
+The four offscreen-gated smokes (render_overflow,
+render_orientation, render_scene_separation, s6_evidence's device
+leg) remain the orchestrator's rig bar (this loader has no
+headless-surface Vulkan — the E-15 boundary, unchanged).
+
 ## Measurement baselines
 
 Established: E-8 is the baseline battery (2026-11-26, tree `263532f` — the

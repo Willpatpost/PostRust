@@ -3092,12 +3092,14 @@ fn shadowed_populated_composes_through_the_hdr_chain() {
     );
     assert_eq!(
         delta,
-        (8, 4, 16, 0),
+        (5, 4, 16, 0),
         "the populated families' lazy states, one-time: the proxy state's instance-buffer \
          memory + the three per-kind mesh VBO memories (npc, vehicle, and the Era-2 \
-         package C rain kind's streak quad — dc7eadc's third kind) + their staged \
-         uploads' staging memories + the skinned pose storage's memory (8 \
-         device_memory); the skinned \
+         package C rain kind's streak quad — dc7eadc's third kind) + the skinned pose \
+         storage's memory (5 device_memory — since P5 R3/A20 the mesh uploads stage \
+         through the SHARED staging pool, so their throwaway HOST_VISIBLE staging \
+         memories are gone; the re-based 8 → 5 is the conscious D-EE-06 pin movement, \
+         measured on the rig); the skinned \
          family's pool + the shadowed-populated state's three pools (the depth-cast, \
          skinned-receiving, and plain-receiving families); the skinned family's 3 \
          per-material sets + the shadowed-populated state's 13 (1 depth + 6 + 6 \

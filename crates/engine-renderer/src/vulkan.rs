@@ -87,6 +87,19 @@
 //! recreation for the next renderable frame. At context teardown (after
 //! every PipelineState) the retained skinned state releases BEFORE the
 //! corner it binds (reverse creation order).
+//!
+//! **The staging pool (P5 R3 / A20)** — one device-lifetime persistently
+//! mapped HOST_VISIBLE TRANSFER_SRC backing owned by the context (grown
+//! power-of-two on demand, the old backing retired only after the pool's
+//! own in-flight fences drain), one command pool, and a bump allocator
+//! whose regions recycle ONLY past the retired watermark: every flushed
+//! batch owns its fence and its region, and a region is released exactly
+//! when its OWN fence has signaled with every earlier batch's already
+//! retired. Synchronization follows these actual upload completions —
+//! never a frame-slot fence. Attach-time uploads batch per build (one
+//! submit, one fence); the texture staging tails are retired (each
+//! texture's allocation is the image alone); the per-object machinery
+//! survives only as the unavailable-pool fallback.
 
 // Unsafe containment (Stage 2 authorization, item 1): this module-level
 // allow overrides the crate-level `#![deny(unsafe_code)]` in lib.rs —
@@ -103,6 +116,7 @@ mod context;
 mod frame;
 mod pipelines;
 mod resources;
+mod staging;
 mod swapchain;
 mod uploads;
 
@@ -172,8 +186,8 @@ pub(crate) use swapchain::{
 use ash::vk;
 use context::depth_aspect;
 use resources::{
-    ScopedMappedBuffer, create_device_local_buffer_with_data, create_mapped_buffer,
-    create_shader_module, find_memory_type, with_upload_commands,
+    ScopedMappedBuffer, create_device_local_buffer_staged, create_device_local_buffer_with_data,
+    create_mapped_buffer, create_shader_module, find_memory_type, with_upload_commands,
 };
 use swapchain::{drawable_extent, recreate_swapchain};
 use textures::{SamplerPool, Texture};
@@ -230,6 +244,17 @@ pub enum RendererError {
     /// same no-partial-overflow discipline the instance pack
     /// carries; the Era-2 skinning path).
     PosePack(crate::animation::PosePackError),
+    /// P5 R3 (A20, design §4.3): the staging pool's bounded
+    /// backpressure refusal — one batch's live staged bytes exceed
+    /// the pool's configured ceiling. Nothing was submitted (the
+    /// partial batch aborts, its regions reclaimed; every live
+    /// object is intact — the D2 no-partial-overflow discipline at
+    /// batch scale). `requested` is the byte extent the batch needed
+    /// (the open batch's staged bytes plus the refusing item, from
+    /// the bump base); `capacity` is the ceiling it would have to
+    /// exceed. Retriable only with a smaller batch or a raised
+    /// ceiling — never by silent truncation.
+    StagingCapacity { requested: u64, capacity: u64 },
     /// A fault deliberately injected through the renderer's diagnostic
     /// seam (the corrective finding 3+8 verification knobs): never
     /// produced by a real Vulkan call. Distinguishes an injected
@@ -387,6 +412,15 @@ impl std::fmt::Display for RendererError {
             RendererError::InjectedFault(message) => write!(
                 f,
                 "injected fault: {message} (diagnostic-only, not a device error)"
+            ),
+            RendererError::StagingCapacity {
+                requested,
+                capacity,
+            } => write!(
+                f,
+                "staging pool capacity exceeded: one batch needs {requested} bytes of \
+                 live staging against the {capacity}-byte ceiling (no partial upload was \
+                 submitted; split the batch or raise the ceiling)"
             ),
             RendererError::FrameSlotUnrecoverable { source, release } => write!(
                 f,

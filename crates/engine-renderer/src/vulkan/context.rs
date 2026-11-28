@@ -23,8 +23,10 @@ use super::corner;
 use super::descriptors::DescriptorFoundation;
 use super::resources::advance_target_fault_plan;
 use super::skinned_draw;
+use super::staging::StagingPool;
 use super::textures::{SamplerPool, Texture};
 use crate::config::{DepthFormatPreference, RenderConfig, TargetFaultSite, TargetFaultStage};
+use std::cell::RefCell;
 
 const VALIDATION_LAYER_NAME: &str = "VK_LAYER_KHRONOS_validation";
 
@@ -184,6 +186,14 @@ pub(crate) struct VulkanContext {
     /// P5 R0 (§9.4): the permanent per-texture staging tail bytes
     /// (`texture_staging_tail_bytes`).
     texture_staging_tail_bytes: Cell<u64>,
+    /// P5 R3 (A20, design §4.3): the device-lifetime STAGING POOL —
+    /// one shared, persistently mapped, power-of-two-grown backing
+    /// replacing every per-object staging pair and the per-texture
+    /// tails. Interior-mutable like every counter here (the callers
+    /// hold `&VulkanContext`); confined to the renderer's single
+    /// owning thread (the mapped pointer makes it `!Send`/`!Sync`).
+    /// See [`super::staging`] — the module doc is the design.
+    pub(super) staging: RefCell<StagingPool>,
 }
 
 impl VulkanContext {
@@ -540,6 +550,7 @@ impl VulkanContext {
             upload_blocking_wait_ns: Cell::new(0),
             staged_buffer_uploads: Cell::new(0),
             texture_staging_tail_bytes: Cell::new(0),
+            staging: RefCell::new(StagingPool::new()),
         };
         if let Err(e) = context.init_atlas(atlas) {
             context.destroy();
@@ -600,7 +611,26 @@ impl VulkanContext {
     /// committed stays for the renderer's lifetime (the pass
     /// families bind its buffers); only a never-completed attach's
     /// staging is releasable.
+    ///
+    /// P5 R3 (A20): the attach's staging batch may be IN FLIGHT here
+    /// (the build's deferred flush; the pipeline-group failure this
+    /// rollback serves happens after it) — the batch's copies write
+    /// the very images and buffers being released, so the pool
+    /// drains FIRST (the actual resource dependency). A drain that
+    /// times out (a stuck submission) falls back to
+    /// `device_wait_idle` before the destroys — the releases must
+    /// proceed (the rollback is infallible by contract; the ORIGINAL
+    /// error propagates, never this best-effort cleanup's).
     pub(crate) fn release_staged_scene_resources(&mut self) {
+        // P5 R3: the in-flight check first (the Ref borrow must end
+        // before the drain's mutable borrow begins).
+        let staging_in_flight = self.staging.borrow().has_in_flight();
+        if staging_in_flight && self.drain_staging().is_err() {
+            // SAFETY: the rollback's last resort — the stuck fence
+            // cannot be waited, so the whole device idles before any
+            // destroy (teardown's own protocol).
+            unsafe { self.device.device_wait_idle() }.ok();
+        }
         if let Some(resources) = self.corner.take() {
             resources.destroy(self);
         }
@@ -655,6 +685,9 @@ impl VulkanContext {
             upload_blocking_wait_ns: self.upload_blocking_wait_ns.get(),
             staged_buffer_uploads: self.staged_buffer_uploads.get(),
             texture_staging_tail_bytes: self.texture_staging_tail_bytes.get(),
+            staging_pool_bytes: self.staging.borrow().capacity_bytes(),
+            staging_pool_growth_events: self.staging.borrow().growth_events(),
+            staging_bound_region_bytes: self.staging.borrow().bound_region_bytes(),
             corner_pipeline_objects: self.corner_pipeline_objects.get(),
             corner_pipeline_object_frees: self.corner_pipeline_object_frees.get(),
             arena_replacements: self.arena_replacements.get(),
@@ -668,9 +701,21 @@ impl VulkanContext {
     /// destruction) together with the wall time spent blocked in its
     /// `wait_for_fences`. Called only after the wait succeeded, so a
     /// failed upload counts neither the submit nor its partial wait
-    /// (fail-visible, never overcounted).
+    /// (fail-visible, never overcounted). Since P5 R3 the SAME census
+    /// carries the pooled batches: one submit per flush (inline or
+    /// deferred — the deferred arm's blocking time lands here
+    /// through [`Self::record_upload_wait`] at the drain that waits
+    /// it).
     pub(super) fn record_upload_submit(&self, blocking_wait: std::time::Duration) {
         self.upload_submits.set(self.upload_submits.get() + 1);
+        self.record_upload_wait(blocking_wait);
+    }
+
+    /// P5 R3 (§9.4): the wait-time half of the upload census on its
+    /// own — the deferred flush counts its submit at submission and
+    /// its blocking time only when the drain actually waits the
+    /// fence (never overcounted, never lost).
+    pub(super) fn record_upload_wait(&self, blocking_wait: std::time::Duration) {
         let ns = u64::try_from(blocking_wait.as_nanos()).unwrap_or(u64::MAX);
         self.upload_blocking_wait_ns
             .set(self.upload_blocking_wait_ns.get().saturating_add(ns));
@@ -1050,6 +1095,16 @@ impl VulkanContext {
         std::mem::take(&mut self.descriptors).destroy(self);
         std::mem::take(&mut self.samplers).destroy(self);
         std::mem::take(&mut self.texture).destroy(self);
+        // The staging pool LAST of the resource owners (reverse
+        // creation order: its backing may carry the atlas/attach
+        // batches staged through it, and its teardown idles the
+        // device first when anything is still in flight — the
+        // stuck-fence protocol; see [`super::staging`]). Valid after
+        // every state above: no pool region outlives its batch.
+        // Taken out of the context first so the pool's `&mut` and
+        // the context's `&` never alias.
+        let mut staging = std::mem::take(&mut self.staging);
+        staging.get_mut().destroy(self);
         unsafe {
             if self.messenger != vk::DebugUtilsMessengerEXT::null() {
                 self.debug_utils

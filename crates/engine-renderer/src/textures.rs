@@ -1,6 +1,10 @@
 //! Static, device-local textures. Creation and the complete transfer happen
-//! before the first frame. Each image owns exactly one allocation.
+//! before the first frame. Each image owns exactly one allocation — since
+//! P5 R3 (A20) an IMAGE-ONLY one: the staging tail is retired and the bytes
+//! ride the shared staging pool (the per-texture combined allocation
+//! survives only as the pool-unavailable fallback, verbatim).
 
+use super::staging::{FlushMode, StagingBatch};
 use super::{RendererError, VulkanContext, find_memory_type, with_upload_commands};
 use ash::vk;
 
@@ -15,10 +19,200 @@ pub struct Texture {
 }
 
 impl Texture {
-    /// Uploads tightly packed R8 or RGBA8 UNORM texels. The image and the temporary transfer
-    /// buffer occupy disjoint pages in one device-local allocation. Its full
-    /// size (including alignment and the staging tail) is reported at runtime.
+    /// Uploads tightly packed R8 or RGBA8 UNORM texels. The image owns
+    /// exactly one IMAGE-ONLY device-local allocation (P5 R3: the
+    /// temporary transfer buffer's permanent tail is retired — the
+    /// bytes stage through the shared pool and the reported
+    /// `allocation_bytes` is the image's own memory requirement). The
+    /// single-shot form opens its own batch and waits inline — one
+    /// submit, one fence, one wait (the construction atlas's shape).
+    /// On a device that cannot back the pool, the retained per-object
+    /// path runs instead (see [`Self::upload_unpooled`]).
     pub(crate) fn upload(
+        ctx: &VulkanContext,
+        format: vk::Format,
+        extent: vk::Extent2D,
+        texels: &[u8],
+    ) -> Result<Self, RendererError> {
+        let mut batch = ctx.begin_staging_batch();
+        match &mut batch {
+            Some(batch) => {
+                let texture = Self::upload_pooled(batch, ctx, format, extent, texels)?;
+                if let Err(error) = batch.flush(FlushMode::InlineWait) {
+                    // The flush failed (submit or wait): the partial
+                    // texture must not survive its never-submitted or
+                    // stuck upload.
+                    let mut texture = texture;
+                    texture.destroy(ctx);
+                    return Err(error);
+                }
+                Ok(texture)
+            }
+            None => Self::upload_unpooled(ctx, format, extent, texels),
+        }
+    }
+
+    /// The BATCHED form (the attach path's one-submit shape): stages
+    /// the texels and records the copy into the CALLER'S batch — the
+    /// flush (and its fence) belongs to the caller, so a whole build's
+    /// textures ride ONE submission. Only reachable with a live batch
+    /// (the pool exists — no fallback arm needed here).
+    pub(crate) fn upload_in(
+        batch: &mut StagingBatch<'_>,
+        ctx: &VulkanContext,
+        format: vk::Format,
+        extent: vk::Extent2D,
+        texels: &[u8],
+    ) -> Result<Self, RendererError> {
+        Self::upload_pooled(batch, ctx, format, extent, texels)
+    }
+
+    /// The shared validation prefix (the retained path's own, verbatim
+    /// in behavior): the format's texel size, the tight-packing check,
+    /// and the device's format/usage support at the requested extent.
+    fn validate_upload(
+        ctx: &VulkanContext,
+        format: vk::Format,
+        extent: vk::Extent2D,
+        texels: &[u8],
+    ) -> Result<(), RendererError> {
+        let bytes_per_pixel = match format {
+            vk::Format::R8_UNORM => 1,
+            vk::Format::R8G8B8A8_UNORM => 4,
+            _ => return Err(RendererError::Vulkan("unsupported texture format".into())),
+        };
+        let pixels = u64::from(extent.width) * u64::from(extent.height);
+        if texels.is_empty() || pixels.checked_mul(bytes_per_pixel) != Some(texels.len() as u64) {
+            return Err(RendererError::Vulkan(
+                "expected tightly packed, nonempty texture".into(),
+            ));
+        }
+        let usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED;
+        // SAFETY: the physical device is live; query the exact tiling and usage.
+        let limits = unsafe {
+            ctx.instance.get_physical_device_image_format_properties(
+                ctx.physical_device,
+                format,
+                vk::ImageType::TYPE_2D,
+                vk::ImageTiling::OPTIMAL,
+                usage,
+                vk::ImageCreateFlags::empty(),
+            )
+        }
+        .map_err(|e| RendererError::vk(e, "texture image format/usage"))?;
+        if extent.width > limits.max_extent.width || extent.height > limits.max_extent.height {
+            return Err(RendererError::Vulkan(
+                "texture exceeds device format extent".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The POOLED upload (P5 R3, design §4.3): the image-only
+    /// allocation plus one staged region and one recorded copy in the
+    /// caller's batch — the recorded command sequence (the barrier
+    /// pair around the buffer→image copy) is the per-object path's
+    /// own, verbatim; only the copy's SOURCE is the shared backing.
+    fn upload_pooled(
+        batch: &mut StagingBatch<'_>,
+        ctx: &VulkanContext,
+        format: vk::Format,
+        extent: vk::Extent2D,
+        texels: &[u8],
+    ) -> Result<Self, RendererError> {
+        Self::validate_upload(ctx, format, extent, texels)?;
+        let usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED;
+        let mut texture = Self {
+            format,
+            extent,
+            ..Default::default()
+        };
+        let image_extent = vk::Extent3D {
+            width: extent.width,
+            height: extent.height,
+            depth: 1,
+        };
+        // SAFETY: handles are owned immediately, released on every exit below.
+        let result = (|| unsafe {
+            let info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(image_extent)
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            texture.image = ctx
+                .device
+                .create_image(&info, None)
+                .map_err(|e| RendererError::vk(e, "create texture image"))?;
+            let image_req = ctx.device.get_image_memory_requirements(texture.image);
+            // P5 R3: IMAGE-ONLY — the staging tail is retired. The
+            // bytes ride the pool's HOST_VISIBLE backing (transfers
+            // need no mapping of the destination), so the allocation
+            // is the image's own requirement in plain DEVICE_LOCAL
+            // memory (the hardware-strategy discipline: the pool is
+            // primary on every device with any HOST_VISIBLE type —
+            // all of them, per Vulkan's minimum guarantees).
+            let memory_type = find_memory_type(
+                ctx,
+                image_req.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+            .ok_or_else(|| RendererError::NoDevice("no DEVICE_LOCAL texture memory".into()))?;
+            let alloc = vk::MemoryAllocateInfo::default()
+                .memory_type_index(memory_type)
+                .allocation_size(image_req.size);
+            texture.memory = ctx
+                .allocate_memory(&alloc)
+                .map_err(|e| RendererError::vk(e, "allocate texture image memory"))?;
+            ctx.texture_allocations
+                .set(ctx.texture_allocations.get() + 1);
+            texture.allocation_bytes = image_req.size;
+            ctx.device
+                .bind_image_memory(texture.image, texture.memory, 0)
+                .map_err(|e| RendererError::vk(e, "bind texture image"))?;
+            // The staged region + the recorded copy (the barrier pair
+            // and the tightly packed copy live in the batch's replay
+            // log — executed at the batch's one submit).
+            let region = batch.stage(texels)?;
+            batch.record_texture_copy(texture.image, image_extent, region);
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(texture.image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            texture.view = ctx
+                .device
+                .create_image_view(&view_info, None)
+                .map_err(|e| RendererError::vk(e, "create texture view"))?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            texture.destroy(ctx);
+            return Err(e);
+        }
+        Ok(texture)
+    }
+
+    /// The RETAINED per-object upload — the pre-R3 path, verbatim
+    /// (the combined image-and-staging allocation, the permanent
+    /// tail it reports, and the `cmd_update_buffer` fallback for
+    /// unmappable VRAM): the POOL-UNAVAILABLE arm only (a device
+    /// with no HOST_VISIBLE|HOST_COHERENT staging memory — none per
+    /// Vulkan's minimum guarantees, so on every conformant device
+    /// the pooled path above runs and the tails read zero). Kept so
+    /// the hardware-strategy choice stays explicit and reviewable
+    /// and a non-conformant device keeps exactly its pre-R3
+    /// behavior.
+    fn upload_unpooled(
         ctx: &VulkanContext,
         format: vk::Format,
         extent: vk::Extent2D,
@@ -140,6 +334,7 @@ impl Texture {
             // subtraction is total-ordered by construction
             // (`allocation_bytes` = the image requirement rounded up
             // to the staging alignment, plus the staging size).
+            // POOLED DEVICES NEVER REACH HERE (R3 retires the tail).
             ctx.record_texture_staging_tail(
                 texture.allocation_bytes.saturating_sub(image_req.size),
             );

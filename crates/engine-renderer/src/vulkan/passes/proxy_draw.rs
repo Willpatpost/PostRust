@@ -71,9 +71,10 @@
 //! of pipeline assembly with the SAME descriptor set layout as the
 //! lit pipeline (the 6-B foundation; no new bindings).
 
+use super::staging::FlushMode;
 use super::{
-    RendererError, ScopedMappedBuffer, VulkanContext, create_device_local_buffer_with_data,
-    create_mapped_buffer,
+    RendererError, ScopedMappedBuffer, VulkanContext, create_device_local_buffer_staged,
+    create_device_local_buffer_with_data, create_mapped_buffer,
 };
 use crate::ProxyDrawMode;
 use crate::config::FRAMES_IN_FLIGHT;
@@ -438,21 +439,58 @@ impl ProxyResources {
         vehicle: &[ProxyVertex],
         rain: &[ProxyVertex],
     ) -> Result<(), RendererError> {
-        (self.npc_vbo, self.npc_memory) = create_device_local_buffer_with_data(
-            ctx,
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-            bytemuck::cast_slice(npc),
-        )?;
-        (self.vehicle_vbo, self.vehicle_memory) = create_device_local_buffer_with_data(
-            ctx,
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-            bytemuck::cast_slice(vehicle),
-        )?;
-        (self.rain_vbo, self.rain_memory) = create_device_local_buffer_with_data(
-            ctx,
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-            bytemuck::cast_slice(rain),
-        )?;
+        // P5 R3 (A20): the three proxy mesh VBOs ride ONE pool batch,
+        // flushed INLINE — this is the FRAME path (the first
+        // populated frame's lazy ensure): the frame's own draws read
+        // these buffers in the SAME submission cycle, so first use
+        // follows the inline wait directly (the deferred arm would
+        // need the frame-submit plumbing — the streaming seam this
+        // pool is groundwork for, not this milestone's claim). The
+        // census: 3 per-object submits → 1. The pool-unavailable arm
+        // keeps the per-object helper.
+        let mut staging_batch = ctx.begin_staging_batch();
+        let npc_bytes = bytemuck::cast_slice(npc);
+        (self.npc_vbo, self.npc_memory) = match &mut staging_batch {
+            Some(batch) => create_device_local_buffer_staged(
+                batch,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                npc_bytes,
+            ),
+            None => create_device_local_buffer_with_data(
+                ctx,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                npc_bytes,
+            ),
+        }?;
+        let vehicle_bytes = bytemuck::cast_slice(vehicle);
+        (self.vehicle_vbo, self.vehicle_memory) = match &mut staging_batch {
+            Some(batch) => create_device_local_buffer_staged(
+                batch,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                vehicle_bytes,
+            ),
+            None => create_device_local_buffer_with_data(
+                ctx,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                vehicle_bytes,
+            ),
+        }?;
+        let rain_bytes = bytemuck::cast_slice(rain);
+        (self.rain_vbo, self.rain_memory) = match &mut staging_batch {
+            Some(batch) => create_device_local_buffer_staged(
+                batch,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                rain_bytes,
+            ),
+            None => create_device_local_buffer_with_data(
+                ctx,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                rain_bytes,
+            ),
+        }?;
+        if let Some(batch) = staging_batch.as_mut() {
+            batch.flush(FlushMode::InlineWait)?;
+        }
         (self.instances, self.instances_memory, self.instances_mapped) = create_mapped_buffer(
             ctx,
             vk::BufferUsageFlags::VERTEX_BUFFER,
