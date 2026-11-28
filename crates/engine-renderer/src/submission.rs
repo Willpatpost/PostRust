@@ -14,11 +14,16 @@
 //! discipline, made the contract's own): a submission is validated
 //! WHOLE, before any frame state is touched. A refused submission
 //! renders nothing, touches no synchronization state, and leaves
-//! every sticky setting and capture request intact. The order is the
-//! per-feature entries' own: scene/preference coherence (checked by
-//! [`crate::Renderer::submit_frame`]), then material indices, then
-//! the instance repack, the pose-index-vs-blocks check, and the pose
-//! repack.
+//! every sticky setting and capture request intact. The order
+//! (R1, D-EE-11 — the CA-10 deferred-commit discipline): scene/
+//! preference coherence (checked by [`crate::Renderer::submit_frame`]),
+//! then material indices, then the pose-index-vs-blocks admission
+//! check, then the instance and pose repacks — every PURE validation
+//! runs before any buffer or record mutation, so a refusal commits
+//! nothing an identical retry could reuse (the one documented
+//! refusal-precedence change: a population invalid in both an
+//! instance field and a pose index reports the pose-index refusal
+//! first; pre-R1 the instance pack error fired first).
 //!
 //! **Zero-cost statement:** every type here is a borrow bundle —
 //! `Copy`, no `Vec`, no `Box`, no trait objects. The adapter
@@ -449,14 +454,16 @@ fn verify_population_reuse(
 /// constructed inline (the expectation is hand-built in the
 /// test, so the proof survives the entry's S6 deletion).
 ///
-/// Validation order — the populated entries' own sequence, preserved
-/// exactly: material indices vs the ATTACHED scene's table (the
-/// S2 parameter — the corner routes' former
+/// Validation order — the populated entries' own sequence with the
+/// R1/CA-10 correction: material indices vs the ATTACHED scene's
+/// table (the S2 parameter — the corner routes' former
 /// `lit_scene::materials().len()` read, now the handle's count),
-/// then the instance repack, then the pose-index-vs-blocks check,
-/// then the pose repack. Every refusal is a typed error that leaves
-/// both repack buffers and all frame state untouched (an atomic
-/// repack, never a partial buffer).
+/// then the pose-index-vs-blocks admission check, then the instance
+/// repack, then the pose repack. Every refusal is a typed error
+/// that leaves both repack buffers, the generation/identity
+/// records, and all frame state untouched (an atomic repack, never
+/// a partial buffer — and, since R1, never a committed record a
+/// refused frame could hand to its own retry).
 ///
 /// **P5 §3.3 (A18/R2) — the dirty-generation protocol's CPU half:**
 /// both repacks are GENERATION-GATED (see
@@ -629,6 +636,60 @@ pub(crate) fn adapt_frame<'a, 'x>(
                 && generations.pose == population.pose_generation
                 && instance_bytes.len() == total * crate::proxy_instances::INSTANCE_STRIDE
                 && pose_bytes.len() == population.npc_poses.len() * crate::animation::POSE_STRIDE;
+            // The pose contract (the capture-refusal discipline):
+            // every POPULATED npc's pose index must select a supplied
+            // block; the block-count bound is the pose repack's own
+            // typed refusal below. The check runs on every ADMITTED or
+            // CHANGED frame — generation-gated or not (a
+            // declared-identical population that outgrew its block
+            // list still refuses: a count change is a token change,
+            // which the identity gate above turned into a
+            // re-admission). Only the fully-reused between-tick
+            // frame skips it (its indices were validated at the
+            // admission this frame's records still vouch for).
+            //
+            // R1 (D-EE-11, Arm B) — THE CA-10 DEFERRED-COMMIT
+            // DISCIPLINE: this check runs BEFORE both repacks, so an
+            // unsuccessful admission establishes NOTHING — no
+            // buffer byte, no generation record, no digest record.
+            // Pre-R1 it ran between the instance repack and the pose
+            // repack, and the instance repack had already COMMITTED
+            // `generations.instance` and the repacked bytes: an
+            // identical retry then computed `full_reuse` against the
+            // record the REFUSAL itself established, skipped this
+            // check, and admitted the invalid population (the
+            // reviewer's regression witness — an unsuccessful
+            // admission must not establish a reusable validated
+            // generation). Hoisting the check restores the module's
+            // own validated-WHOLE-before-any-state-is-touched
+            // invariant for the one admission check that is
+            // conditionally skipped; the repacks' own typed
+            // refusals stay atomic (validation-before-mutation
+            // inside each), and the identity gate's resets above
+            // only ever move records toward unknown (fail-safe).
+            // NOTE (a documented refusal-precedence change): a
+            // population invalid in BOTH an instance field and a
+            // pose index now reports the pose-index refusal first
+            // (pre-R1: the instance pack error); no test pinned the
+            // former precedence.
+            if !full_reuse
+                && population
+                    .npc
+                    .iter()
+                    .any(|instance| instance.pose_index as usize >= population.npc_poses.len())
+            {
+                return Err(RendererError::Vulkan(format!(
+                    "a npc pose index falls outside the supplied pose blocks \
+                     ({} blocks, highest index {})",
+                    population.npc_poses.len(),
+                    population
+                        .npc
+                        .iter()
+                        .map(|instance| instance.pose_index)
+                        .max()
+                        .unwrap_or(0)
+                )));
+            }
             let instance_decision = crate::proxy_instances::repack_populations_generation(
                 instance_bytes,
                 population.npc,
@@ -647,35 +708,6 @@ pub(crate) fn adapt_frame<'a, 'x>(
             // vouching for nothing).
             if instance_decision == crate::proxy_instances::GenerationDecision::Repacked {
                 generations.instance_digest = instance_digest;
-            }
-            // The pose contract (the capture-refusal discipline):
-            // every POPULATED npc's pose index must select a supplied
-            // block; the block-count bound is the repack's own typed
-            // refusal below. The check runs on every ADMITTED or
-            // CHANGED frame — generation-gated or not (a
-            // declared-identical population that outgrew its block
-            // list still refuses: a count change is a token change,
-            // which the identity gate above turned into a
-            // re-admission). Only the fully-reused between-tick
-            // frame skips it (its indices were validated at the
-            // admission this frame's records still vouch for).
-            if !full_reuse
-                && population
-                    .npc
-                    .iter()
-                    .any(|instance| instance.pose_index as usize >= population.npc_poses.len())
-            {
-                return Err(RendererError::Vulkan(format!(
-                    "a npc pose index falls outside the supplied pose blocks \
-                     ({} blocks, highest index {})",
-                    population.npc_poses.len(),
-                    population
-                        .npc
-                        .iter()
-                        .map(|instance| instance.pose_index)
-                        .max()
-                        .unwrap_or(0)
-                )));
             }
             let pose_decision = crate::animation::repack_poses_generation(
                 pose_bytes,
@@ -1938,5 +1970,217 @@ mod tests {
         )
         .expect("the stable resubmission validates");
         assert_eq!(pose_bytes, expected, "the reuse regenerated nothing");
+    }
+
+    /// R1 (D-EE-11, Arm B) — THE SUBMISSION-ORDERING WITNESS (the
+    /// reviewer's regression hypothesis): an INVALID changed
+    /// instance population (a bumped generation 6 whose npc carries
+    /// an out-of-range pose index — field-valid, so the instance
+    /// repack itself succeeds), an UNCHANGED pose source and
+    /// generation, an initial refusal (the pose-index admission
+    /// rejects), then an IDENTICAL retry. Pre-fix RED: the instance
+    /// repack ran BEFORE the pose-index check, so the refused frame
+    /// had already COMMITTED `generations.instance = 6` and the
+    /// repacked `instance_bytes` — the identical retry then computed
+    /// `full_reuse = true` against the record the REFUSAL
+    /// established, the pose-index check was SKIPPED, and the
+    /// identical invalid population ADMITTED (an out-of-range GPU
+    /// pose-block read). An unsuccessful admission must not
+    /// establish a reusable validated generation. Post-fix (the
+    /// CA-10 deferred-commit discipline): the pose-index check runs
+    /// BEFORE any buffer or record mutation, the refusal leaves the
+    /// prior validated state fully intact, identical retries refuse
+    /// identically, and the caller's FIXED population (valid
+    /// indices, the same generation 6) admits cleanly.
+    #[test]
+    fn an_unsuccessful_admission_leaves_no_reusable_validated_generation() {
+        use crate::animation::{HUMANOID_JOINTS, rest_pose_block};
+        use crate::proxy_instances::{InstanceTransform, ProxyInstance, repack_populations};
+        let matrix = [
+            [0.9, 0.0, 0.0, 0.0],
+            [0.0, 0.9, 0.0, 0.0],
+            [0.0, 0.0, 0.9, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let light = crate::lit_scene::day_preset();
+        let policy = SubmissionPolicy {
+            proxy_draw_mode: ProxyDrawMode::default(),
+            ripple_debug: RippleDebugMode::default(),
+            instance_capacity: crate::proxy_instances::MAX_INSTANCES,
+            pose_capacity: crate::animation::MAX_POSE_BLOCKS,
+        };
+        let instance = |x: f32, y: f32, turn: u16, pose_index: u32| ProxyInstance {
+            transform: InstanceTransform {
+                pos: [x, 0.02, y],
+                turn,
+                scale: 1.0,
+            },
+            tint: [0.8, 0.7, 0.6],
+            alpha: 1.0,
+            pose_index,
+        };
+        let poses: Vec<[[[f32; 4]; 4]; HUMANOID_JOINTS]> =
+            vec![rest_pose_block(), rest_pose_block()];
+        fn build<'a>(
+            instances: &'a [ProxyInstance],
+            poses: &'a [[[[f32; 4]; 4]; HUMANOID_JOINTS]],
+            instance_generation: u64,
+            pose_generation: u64,
+            matrix: [[f32; 4]; 4],
+            light: crate::lit_scene::LightParams,
+        ) -> FrameSubmission<'a> {
+            FrameSubmission {
+                camera: FrameCamera {
+                    view_proj: matrix,
+                    eye: [4.0, 1.7, 12.0],
+                },
+                output: OutputTarget {
+                    window_size: (1280, 720),
+                },
+                layers: DynamicLayers::default(),
+                scene: Some(SceneFrame {
+                    light,
+                    shadows: None,
+                    population: Some(crate::renderer::ProxyPopulation {
+                        npc: &instances[..2],
+                        npc_poses: poses,
+                        npc_material: 0,
+                        vehicle: &instances[2..],
+                        vehicle_material: 0,
+                        rain: &[],
+                        rain_material: 0,
+                        instance_generation,
+                        pose_generation,
+                    }),
+                    sky: None,
+                    post: false,
+                    wet: None,
+                }),
+            }
+        }
+        let mut source = vec![
+            instance(1.0, -2.0, 1000, 0),
+            instance(-3.0, 4.0, 40000, 1),
+            instance(7.0, 1.0, 8192, 0),
+        ];
+        let mut instance_bytes = Vec::new();
+        let mut pose_bytes = Vec::new();
+        let mut generations = PopulationGenerations::default();
+        // The honest history: the source is admitted at instance
+        // generation 5 / pose generation 3 with VALID indices.
+        let submission = build(&source, &poses, 5, 3, matrix, light);
+        adapt_frame(
+            policy,
+            &submission,
+            3,
+            &[],
+            &mut instance_bytes,
+            &mut pose_bytes,
+            &mut generations,
+        )
+        .expect("the valid population admits");
+        let admitted_bytes = instance_bytes.clone();
+        let admitted_digest = generations.instance_digest;
+        assert_eq!(generations.instance, 5);
+        // THE INVALID CHANGED POPULATION: the content moves (pos and
+        // the npc's pose index), the generation honestly bumps to 6,
+        // but npc[0]'s pose index now falls outside the 2 supplied
+        // blocks — the pose-index admission must refuse, and the
+        // refusal must leave the prior validated state intact.
+        source[0].transform.pos[0] += 4.0;
+        source[0].pose_index = 9;
+        let submission = build(&source, &poses, 6, 3, matrix, light);
+        let error = adapt_frame(
+            policy,
+            &submission,
+            3,
+            &[],
+            &mut instance_bytes,
+            &mut pose_bytes,
+            &mut generations,
+        )
+        .expect_err("the out-of-range pose index refuses");
+        let RendererError::Vulkan(text) = &error else {
+            panic!("the refusal is a Vulkan error: {error:?}");
+        };
+        assert_eq!(
+            text,
+            "a npc pose index falls outside the supplied pose blocks \
+              (2 blocks, highest index 9)"
+        );
+        // CA-10: nothing was committed by the refused frame — the
+        // records still vouch for exactly the PRIOR validated state.
+        assert_eq!(
+            generations.instance, 5,
+            "an unsuccessful admission must not advance the record"
+        );
+        assert_eq!(
+            generations.instance_digest, admitted_digest,
+            "an unsuccessful admission must not commit new content"
+        );
+        assert_eq!(
+            instance_bytes, admitted_bytes,
+            "an unsuccessful admission must not touch the retained bytes"
+        );
+        // THE IDENTICAL RETRY: same population, same generations —
+        // it must refuse IDENTICALLY (pre-fix RED: the refused frame
+        // had already established the reusable record, the retry's
+        // full_reuse skipped the check, and this expect panicked).
+        let submission = build(&source, &poses, 6, 3, matrix, light);
+        let retry_error = adapt_frame(
+            policy,
+            &submission,
+            3,
+            &[],
+            &mut instance_bytes,
+            &mut pose_bytes,
+            &mut generations,
+        )
+        .expect_err(
+            "the identical retry refuses identically — a refused \
+                 frame must not have established a validated generation",
+        );
+        assert_eq!(
+            format!("{retry_error:?}"),
+            format!("{error:?}"),
+            "the retry's refusal is the same refusal"
+        );
+        assert_eq!(generations.instance, 5);
+        assert_eq!(instance_bytes, admitted_bytes);
+        // THE CALLER'S FIX: the pose index returns in range at the
+        // SAME bumped generation 6 — the admission now succeeds, the
+        // repack runs, and the records advance WITH the success.
+        source[0].pose_index = 1;
+        let submission = build(&source, &poses, 6, 3, matrix, light);
+        adapt_frame(
+            policy,
+            &submission,
+            3,
+            &[],
+            &mut instance_bytes,
+            &mut pose_bytes,
+            &mut generations,
+        )
+        .expect("the fixed population admits at generation 6");
+        let mut expected = Vec::new();
+        repack_populations(&mut expected, &source[..2], &source[2..], &[]).unwrap();
+        assert_eq!(instance_bytes, expected);
+        assert_eq!(generations.instance, 6, "the success commits the record");
+        // And the fixed population's between-tick frame keeps its
+        // R2 reuse (the CA-10 discipline costs nothing on the happy
+        // path).
+        let submission = build(&source, &poses, 6, 3, matrix, light);
+        adapt_frame(
+            policy,
+            &submission,
+            3,
+            &[],
+            &mut instance_bytes,
+            &mut pose_bytes,
+            &mut generations,
+        )
+        .expect("the stable resubmission validates");
+        assert_eq!(instance_bytes, expected, "the reuse regenerated nothing");
+        assert_eq!(generations.instance, 6);
     }
 }
