@@ -357,6 +357,75 @@ pub enum CompactionError {
     /// The requested retained window exceeds the ledger length — the
     /// explicit operation takes an exact window, never a clamped one.
     RetainExceedsLedger { ledger_len: u64, retain: u64 },
+    /// The cut would summarize PAST the held consumer frontier (R2,
+    /// D-EE-11's safe-compaction-vs-administrative split): a frontier
+    /// is armed and the requested window's post-cut
+    /// `summarized_records` would exceed the MINIMUM registered
+    /// consumer acknowledgment — records a registered consumer has
+    /// not released would be summarized away by the ORDINARY explicit
+    /// path. `Spine::compact` is safe by default; the consciously
+    /// authorized administrative cut is
+    /// [`Spine::compact_authorized`] with
+    /// [`AdministrativeCompaction`]. An armed frontier with ZERO
+    /// registered consumers holds everything (the empty-frontier
+    /// fail-closed rule, mirrored from the cadence: `min(∅)` is a
+    /// refusal, never a permission — `frontier_through` then reports
+    /// the standing cut and `consumers` reports `0`).
+    ConsumerFrontierHolds {
+        /// The live tail's record count at the refused call.
+        ledger_len: u64,
+        /// The requested retained window.
+        retain: u64,
+        /// The standing summarized prefix the cut would extend.
+        summarized_records: u64,
+        /// The frontier: the minimum registered consumer
+        /// acknowledgment in global executed ordinals (the standing
+        /// cut itself when no consumer is registered).
+        frontier_through: u64,
+        /// The registered consumer count (zero is the empty-frontier
+        /// hold).
+        consumers: usize,
+    },
+}
+
+/// The explicit administrative authorization to compact PAST a held
+/// consumer frontier (R2, D-EE-11: "distinguish safe compaction from
+/// explicitly authorized administrative operations"). The ORDINARY
+/// [`Spine::compact`] refuses a window that would summarize past the
+/// minimum registered consumer acknowledgment
+/// ([`CompactionError::ConsumerFrontierHolds`]); this value —
+/// constructible only through the named, loud
+/// [`AdministrativeCompaction::explicit_override`] — is the driver's
+/// conscious escape hatch, the operator authority the T07 landing
+/// documented prose-only. Constructing it is the assertion that the
+/// administrative cut is INTENDED to override every registered
+/// consumer's standing acknowledgment (the frontier accounting stays
+/// coherent fail-closed afterwards: the releasable clamp saturates at
+/// zero until each consumer's acknowledgment catches up past the new
+/// standing cut).
+///
+/// The honest limit, stated in the type (the
+/// [`ConsequenceFreedom`] precedent): Rust cannot prove intent; the
+/// value is still an assertion. What the split changes is that the
+/// override is SCOPED to a named, greppable call shape —
+/// `compact_authorized(.., AdministrativeCompaction::explicit_override())`
+/// — instead of the ordinary `compact` silently performing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdministrativeCompaction {
+    /// Construction is the authorization; the field keeps the value
+    /// opaque (there is nothing to read — the call shape is the
+    /// proof).
+    _authorized: (),
+}
+
+impl AdministrativeCompaction {
+    /// Constructs the administrative override authorization: by
+    /// constructing this value the driver asserts the cut PAST the
+    /// consumer frontier is an explicitly authorized administrative
+    /// operation, not an ordinary safe compaction (see the type doc).
+    pub const fn explicit_override() -> Self {
+        AdministrativeCompaction { _authorized: () }
+    }
 }
 
 /// The execution-ledger retention policy (A22-core, P2 design §6.2 —
@@ -670,6 +739,26 @@ pub enum RetentionAckError {
         /// The regressing value the call attempted.
         attempted_through: u64,
     },
+    /// The attempted acknowledgment names ordinals BEYOND the
+    /// executed-ordinal space's extent (`summarized_records` + the
+    /// retained tail — the count identity `summarized + retained ==
+    /// executed`): records that were never executed cannot have been
+    /// durably processed by anyone, so an ack past the extent is a
+    /// caller bug (a mis-derived ordinal, a wrong spine, an
+    /// off-by-lifetime confusion), REFUSED typed and fail-visible —
+    /// never silently clamped (R2, D-EE-11: the register rule sets
+    /// the initial ack's floor; the executed extent is its ceiling;
+    /// beyond-history acks were never in the contract). The refusal
+    /// keeps the frontier from vouching for records that do not
+    /// exist.
+    BeyondExecutedHistory {
+        id: RetentionConsumerId,
+        /// The executed-ordinal space's extent (the largest ordinal
+        /// any consumer could have durably processed).
+        executed_through: u64,
+        /// The beyond-history value the call attempted.
+        attempted_through: u64,
+    },
 }
 
 /// Typed refusals of [`Spine::register_retention_consumer`] (the
@@ -713,6 +802,22 @@ pub enum RetentionRegisterError {
     /// typed — never a silent registry entry the checkpoint would
     /// ignore.
     FrontierNotArmed { id: RetentionConsumerId },
+    /// The offered durable read point (`vouches_through`) names
+    /// ordinals BEYOND the executed-ordinal space's extent
+    /// (`summarized_records` + the retained tail): a consumer cannot
+    /// have durably processed records that were never executed, so a
+    /// join-time vouch past the extent is the same caller bug
+    /// [`RetentionAckError::BeyondExecutedHistory`] refuses at ack
+    /// time — confronted at JOIN time, fail-visible, never clamped
+    /// (the register rule's floor is the standing cut; its ceiling
+    /// is the executed extent).
+    BeyondExecutedHistory {
+        id: RetentionConsumerId,
+        /// The executed-ordinal space's extent.
+        executed_through: u64,
+        /// The beyond-history read point the registration offered.
+        offered_read_point: u64,
+    },
 }
 
 /// The retention cadence's eligibility mode (T07's two-class model —
@@ -3566,6 +3671,28 @@ impl<W: World> Spine<W> {
     /// T07 two-class model: [`ConsequenceFreedom`] or the frontier,
     /// CA-07).
     ///
+    /// **THE CONSUMER-FRONTIER GATE (R2, D-EE-11's
+    /// safe-vs-administrative split)**: when a frontier is armed
+    /// ([`Self::arm_retention_frontier`]), this ORDINARY path is
+    /// SAFE by default — it refuses, typed
+    /// ([`CompactionError::ConsumerFrontierHolds`]), any window whose
+    /// post-cut `summarized_records` would exceed the MINIMUM
+    /// registered consumer acknowledgment, and an armed frontier
+    /// with zero registered consumers holds everything (the
+    /// empty-frontier fail-closed rule, mirrored from the cadence).
+    /// The explicitly authorized administrative cut PAST a held
+    /// frontier is its own loud, named call shape:
+    /// [`Self::compact_authorized`] with
+    /// [`AdministrativeCompaction::explicit_override`]. The gate is
+    /// vacuous with no frontier armed (the Class-1 capability or no
+    /// eligibility at all — the driver's B4 verification governs, as
+    /// before), so compositions that never arm a frontier see
+    /// exactly the pre-R2 behavior; a composition that arms a
+    /// frontier AND uses an external compaction driver (the
+    /// `crossing.rs` session, whose own eligibility is separate by
+    /// design — the T07 design §8's flagged non-unification) must
+    /// keep the two coherent itself.
+    ///
     /// **THE LOGICAL HEAD (T07 §7's Option 4 — the drain
     /// replacement)**: the prefix is hashed first (read-only, the
     /// same chain bytes as ever), then the cut becomes a `head` bump
@@ -3585,6 +3712,94 @@ impl<W: World> Spine<W> {
     /// dead prefix and its restored tight image encode IDENTICAL
     /// bytes (pinned by the dead-prefix round-trip test).
     pub fn compact(&mut self, retain: u64) -> Result<HistoryKind, CompactionError> {
+        if let Some(refusal) = self.compaction_window_refusal(retain) {
+            return Err(refusal);
+        }
+        if let Some(refusal) = self.consumer_frontier_refusal(retain) {
+            return Err(refusal);
+        }
+        self.compact_window(retain)
+    }
+
+    /// The explicitly authorized ADMINISTRATIVE compaction — the
+    /// override of the consumer-frontier gate [`Self::compact`] now
+    /// enforces (R2, D-EE-11: "distinguish safe compaction from
+    /// explicitly authorized administrative operations"). The window
+    /// semantics are exactly [`Self::compact`]'s (the same typed
+    /// window refusals, the same authenticated prefix summary, the
+    /// same logical-head cut and wire bytes); the ONLY difference is
+    /// that a held consumer frontier does not refuse the call — the
+    /// [`AdministrativeCompaction`] value IS the driver's conscious,
+    /// named assertion that cutting past every registered consumer's
+    /// standing acknowledgment is intended.
+    ///
+    /// After an authorized cut PAST a consumer's acknowledgment, the
+    /// frontier accounting stays coherent fail-closed (the cadence's
+    /// releasable clamp saturates at zero) until the consumer's
+    /// acknowledgment catches up past the new `summarized_records`;
+    /// an ack still below the standing cut is accepted (progress
+    /// toward catching up) as long as it does not regress below the
+    /// consumer's own prior value. This was the T07 landing's
+    /// documented manual-operator authority; R2 makes it typed — the
+    /// ordinary [`Self::compact`] refused, the override named.
+    pub fn compact_authorized(
+        &mut self,
+        retain: u64,
+        _authorization: AdministrativeCompaction,
+    ) -> Result<HistoryKind, CompactionError> {
+        self.compact_window(retain)
+    }
+
+    /// The explicit window's typed refusals (the degenerate-window
+    /// class shared by both explicit paths — safe and administrative
+    /// — and mirrored read-only by the `crossing.rs`
+    /// `compact_session` phase-0 preflight, whose failure-atomicity
+    /// contract depends on these being the whole window-refusal set).
+    fn compaction_window_refusal(&self, retain: u64) -> Option<CompactionError> {
+        let ledger_len = (self.ledger.len() - self.head) as u64;
+        if retain > ledger_len {
+            return Some(CompactionError::RetainExceedsLedger { ledger_len, retain });
+        }
+        if ledger_len - retain == 0 {
+            return Some(CompactionError::NothingToSummarize { ledger_len, retain });
+        }
+        None
+    }
+
+    /// The consumer-frontier gate of the ORDINARY
+    /// [`Spine::compact`]: `Some(refusal)` when a frontier is armed
+    /// and the window's post-cut `summarized_records` would exceed
+    /// the minimum registered acknowledgment — the safe-by-default
+    /// rule of R2/D-EE-11. An armed-but-empty registry holds
+    /// everything (`min(∅)` is a refusal, never a permission — the
+    /// cadence's empty-frontier rule mirrored here: `frontier_through`
+    /// reports the standing cut, `consumers` reports zero). Vacuous
+    /// with the Class-1 capability or no eligibility armed (the
+    /// driver's own B4 verification governs those compositions).
+    fn consumer_frontier_refusal(&self, retain: u64) -> Option<CompactionError> {
+        let RetentionEligibility::Frontier { consumers } = self.retention_eligibility.as_ref()?
+        else {
+            return None;
+        };
+        let summarized = self.standing_summarized_records();
+        let frontier_through = consumers.values().copied().min().unwrap_or(summarized);
+        let ledger_len = (self.ledger.len() - self.head) as u64;
+        let would_summarize_through = summarized + (ledger_len - retain);
+        (would_summarize_through > frontier_through).then(|| {
+            let consumers = consumers.len();
+            CompactionError::ConsumerFrontierHolds {
+                ledger_len,
+                retain,
+                summarized_records: summarized,
+                frontier_through,
+                consumers,
+            }
+        })
+    }
+
+    /// The explicit window's mechanism (both public paths' shared
+    /// body — the window refusals were decided by the caller).
+    fn compact_window(&mut self, retain: u64) -> Result<HistoryKind, CompactionError> {
         let ledger_len = (self.ledger.len() - self.head) as u64;
         if retain > ledger_len {
             return Err(CompactionError::RetainExceedsLedger { ledger_len, retain });
@@ -3712,16 +3927,36 @@ impl<W: World> Spine<W> {
     /// the join-time impossibility confronted, never discovered at
     /// read time; the driver must handle it, the engine cannot make
     /// history reconstructible). A fresh consumer on an uncut spine
-    /// registers at zero.
+    /// registers at zero. The offered vouch also has a CEILING (R2):
+    /// it must lie within the executed-ordinal space's extent
+    /// (`summarized_records` + the retained tail) — a read point
+    /// past records that were never executed is a caller bug refused
+    /// typed
+    /// ([`RetentionRegisterError::BeyondExecutedHistory`]), never
+    /// clamped.
     ///
     /// The initial acknowledgment is the offered vouch (the §2.2
     /// sketch's "the current summarized prefix" is the register
     /// rule's FLOOR, not its ceiling: a consumer whose durable state
     /// already absorbed past the standing cut joins at its true
-    /// point). An over-ack is the caller's trust boundary — the
-    /// engine cannot verify a consumer read what it vouches (the
-    /// design's honest limit); an under-ack merely holds the
-    /// frontier.
+    /// point). An over-ack within the executed extent is the
+    /// caller's trust boundary — the engine cannot verify a consumer
+    /// read what it vouches (the design's honest limit); an under-ack
+    /// merely holds the frontier.
+    ///
+    /// **THE PARTIAL-REGISTRATION BOUNDARY (R2's census answer)**:
+    /// the frontier governs exactly the consumers REGISTERED on it —
+    /// the minimum acknowledgment over the registry — and an
+    /// application reader the driver does not register is outside
+    /// the engine's knowledge entirely: no mechanism in this crate
+    /// can see it, and its un-registered consequence lane is the
+    /// DRIVER's failure, observable only through the driver's own
+    /// discipline (the registry is the driver's census of its
+    /// history readers, declared at the same configuration boundary
+    /// as the arming; the counters expose the registered set's
+    /// needs, never the unregistered world's). A driver uncertain of
+    /// its reader census must not arm the frontier and cut on the
+    /// partial minimum.
     pub fn register_retention_consumer(
         &mut self,
         id: RetentionConsumerId,
@@ -3733,6 +3968,17 @@ impl<W: World> Spine<W> {
                 id,
                 summarized_records: summarized,
                 consumer_read_point: vouches_through,
+            });
+        }
+        // The register rule's ceiling (R2): the executed-ordinal
+        // space's extent — a vouch past records never executed is a
+        // caller bug, fail-visible at join time.
+        let executed_through = summarized + (self.ledger.len() - self.head) as u64;
+        if vouches_through > executed_through {
+            return Err(RetentionRegisterError::BeyondExecutedHistory {
+                id,
+                executed_through,
+                offered_read_point: vouches_through,
             });
         }
         let Some(RetentionEligibility::Frontier { consumers }) = &mut self.retention_eligibility
@@ -3761,16 +4007,49 @@ impl<W: World> Spine<W> {
     /// value is a typed [`RetentionAckError::Regression`] refusal
     /// (monotonicity is enforced, never assumed), an unknown
     /// consumer a typed [`RetentionAckError::UnknownConsumer`]
-    /// refusal (the registry is explicit). A consumer acknowledging
+    /// refusal (the registry is explicit), and — R2's ceiling — a
+    /// value beyond the executed-ordinal space's extent
+    /// (`summarized_records` + the retained tail) is a typed
+    /// [`RetentionAckError::BeyondExecutedHistory`] refusal: an ack
+    /// for records that were never executed is a caller bug the
+    /// engine fails visible, never clamps (the frontier must never
+    /// vouch for records that do not exist). A consumer acknowledging
     /// only what it has DURABLY processed holds the frontier through
     /// every unknown/indeterminate commit — the engine never
     /// resolves an unknown into an ack (the persist side's
     /// settled-transaction watermark rule).
     ///
-    /// After an explicit [`Spine::compact`] cut PAST a consumer's
-    /// acknowledgment (the manual operator authority — the frontier
-    /// polices only the automatic path), the consumer's vouch sits
-    /// below the standing cut: the frontier accounting stays
+    /// **THE TRUST BOUNDARY (R2's answer on authenticated progress —
+    /// the T07 design §8 re-confirmed)**: within the executed extent
+    /// the ack is still a caller assertion — named, monotone,
+    /// per-consumer, observable, never persisted, but not
+    /// cryptographically proven against what the consumer read. The
+    /// cheap strengthening was considered and is RECORDED here, not
+    /// implemented: the ack carrying `(ordinal, digest)` — the tail
+    /// hash the consumer absorbed, the frontier storing the pair. It
+    /// was deferred in the design (§8: "adds a per-ack O(live) hash
+    /// with no enforcement against a lying consumer") and that
+    /// reasoning still holds: a caller that mis-reports its ordinal
+    /// can mis-report its digest just as cheaply (both are values the
+    /// same caller computes), so the pair authenticates byte-ACCESS,
+    /// not durable ABSORPTION — it cannot close the lying-consumer
+    /// gap the trust boundary names, while costing a per-ack O(live)
+    /// hash and a per-consumer digest store. The engine's own
+    /// authenticated prefix-summary chain could anchor such a pair (a
+    /// content-bound ack would carry the chain value at its ordinal),
+    /// but the engine retains only the latest link, so verification
+    /// would need either a per-ordinal digest store (heavy machinery,
+    /// explicitly out) or trust in the pair anyway (no gain). The
+    /// honest claim stands: no standing assertion, no fabricated
+    /// proof, every cut min-vouched, every refusal observable — not
+    /// "consumers cannot lie." Re-open only with evidence of a real
+    /// mis-ack class the ordinal ceiling does not catch.
+    ///
+    /// After an explicitly authorized [`Spine::compact_authorized`]
+    /// cut PAST a consumer's acknowledgment (the administrative
+    /// override — the frontier polices the automatic path AND the
+    /// ordinary explicit [`Spine::compact`]), the consumer's vouch
+    /// sits below the standing cut: the frontier accounting stays
     /// coherent fail-closed (the clamp saturates at zero) until the
     /// consumer's acknowledgment catches up past the new
     /// `summarized_records`; an ack still below the standing cut is
@@ -3781,6 +4060,12 @@ impl<W: World> Spine<W> {
         id: RetentionConsumerId,
         through: u64,
     ) -> Result<(), RetentionAckError> {
+        // Computed before the registry borrow: the executed-ordinal
+        // space's extent — the summarized prefix plus the retained
+        // tail (the count identity `summarized + retained ==
+        // executed`).
+        let executed_through =
+            self.standing_summarized_records() + (self.ledger.len() - self.head) as u64;
         let Some(RetentionEligibility::Frontier { consumers }) = &mut self.retention_eligibility
         else {
             return Err(RetentionAckError::UnknownConsumer { id });
@@ -3792,6 +4077,15 @@ impl<W: World> Spine<W> {
             return Err(RetentionAckError::Regression {
                 id,
                 acknowledged_through: *acknowledged,
+                attempted_through: through,
+            });
+        }
+        // The ack ceiling (R2): an ack for ordinals that were never
+        // executed is a caller bug, fail-visible.
+        if through > executed_through {
+            return Err(RetentionAckError::BeyondExecutedHistory {
+                id,
+                executed_through,
                 attempted_through: through,
             });
         }
@@ -4047,8 +4341,12 @@ impl<W: World> Spine<W> {
     /// Fires one policy compaction of `cut` records (the invocation
     /// the eligibility gate admitted — Class 1 unclamped, Class 2
     /// clamped to the frontier): the shared firing tail of
-    /// [`Self::apply_retention_policy`]'s two armed arms. The cut is
-    /// a valid compaction window by the caller's construction
+    /// [`Self::apply_retention_policy`]'s two armed arms, routed
+    /// through the ORDINARY [`Self::compact`] (one compaction
+    /// authority — the frontier gate included; the cadence's cut is
+    /// frontier-clamped by construction, so the gate's refusal is as
+    /// unreachable here as the window refusals). The cut is a valid
+    /// compaction window by the caller's construction
     /// (`1 ≤ cut ≤ excess = ledger_len − retain`, so the window
     /// retains ≥ `retain` ≥ 1 records and summarizes ≥ 1).
     fn fire_retention(&mut self, ledger_len: u64, cut: u64) {
@@ -4057,7 +4355,11 @@ impl<W: World> Spine<W> {
             "the retention policy's cut is a valid compaction window by construction: the \
              threshold gate guarantees excess ≥ chunk ≥ 1, the frontier clamp only ever \
              lowers it, and the firing requires cut ≥ 1, so the window retains ≥ retain ≥ 1 \
-             records and summarizes ≥ 1 — neither typed refusal is reachable",
+             records and summarizes ≥ 1; the consumer-frontier gate equally cannot refuse — \
+             the Frontier arm fires only cut ≤ releasable = min-ack − summarized, so the \
+             post-cut summarized prefix never exceeds the minimum acknowledgment (and the \
+             Freedom arm carries no frontier to hold) — neither typed refusal of \
+             Spine::compact is reachable",
         );
         self.retention_stats.compactions += 1;
         self.retention_stats.summarized_total += cut;
@@ -9530,14 +9832,20 @@ mod tests {
         // The frontier cadence: the consumer acknowledges BETWEEN
         // ticks (its durable cadence — the value is visible to the
         // next checkpoint), and the firings cut [150, 150, 300, 100]
-        // at ticks 4, 5, 7, 10 (700 summarized, 300 retained).
+        // at ticks 4, 5, 7, 10 (700 summarized, 300 retained). The
+        // step values are honest against the executed extent AT ACK
+        // TIME (before the tick's own 100 executions — R2's ack
+        // ceiling): the tick-7 step is 600 (the six ticks' executed
+        // count), which releases the same 300-record window the
+        // pre-R2 schedule's 700 did once the tick's own arrivals are
+        // counted by the NEXT crossing.
         let mut frontier = build();
         frontier.arm_retention_frontier(policy(10, 300));
         let accounting = consumer("accounting");
         frontier
             .register_retention_consumer(accounting, 0)
             .expect("register");
-        let schedule: [(u64, u64); 4] = [(4, 150), (5, 300), (7, 700), (10, 700)];
+        let schedule: [(u64, u64); 4] = [(4, 150), (5, 300), (7, 600), (10, 700)];
         let mut acked = 0u64;
         let mut cuts: Vec<(u64, u64)> = Vec::new(); // (tick, cut)
         for tick in 1..=10u64 {
@@ -10225,14 +10533,20 @@ mod tests {
         );
     }
 
-    /// MANUAL AUTHORITY (the §5.10 bar, the audit's explicit clause):
-    /// an explicit [`Spine::compact`] between frontier-held firings
-    /// SUCCEEDS — the frontier polices only the automatic path, the
-    /// operator who explicitly cuts takes the responsibility
-    /// explicitly — and the frontier accounting stays COHERENT
-    /// fail-closed around it: a manual cut past a consumer's ack
-    /// leaves the clamp saturating at zero (the frontier holds until
-    /// the consumer's acknowledgment catches up past the new
+    /// ADMINISTRATIVE AUTHORITY (the §5.10 bar, the audit's explicit
+    /// clause, extended by R2's safe-vs-administrative split): the
+    /// ORDINARY explicit [`Spine::compact`] between frontier-held
+    /// firings REFUSES the cut past a consumer's ack — typed
+    /// [`CompactionError::ConsumerFrontierHolds`], mutating nothing —
+    /// while the explicitly authorized administrative cut
+    /// ([`Spine::compact_authorized`] with
+    /// [`AdministrativeCompaction::explicit_override`]) SUCCEEDS: the
+    /// operator who explicitly authorizes the cut takes the
+    /// responsibility explicitly, through a named, greppable call
+    /// shape. The frontier accounting stays COHERENT fail-closed
+    /// around the authorized cut: a cut past a consumer's ack leaves
+    /// the clamp saturating at zero (the frontier holds until the
+    /// consumer's acknowledgment catches up past the new
     /// `summarized_records`), and once it catches up the next firing
     /// is measured from the new standing prefix.
     #[test]
@@ -10259,12 +10573,30 @@ mod tests {
         assert_eq!(stats.compactions, 0);
         assert_eq!(stats.frontier_hold_ticks, 1);
         assert_eq!(stats.retention_frontier_lag_records, 300);
-        // The manual authority: the operator cuts 300 anyway —
-        // PAST the consumer's 0-ordinal ack. The explicit call
-        // succeeds (manual responsibility, never frontier-policed).
+        // The safe-by-default rule (R2): the ORDINARY explicit compact
+        // now REFUSES the cut past the consumer's 0-ordinal ack —
+        // typed, with the frontier named in the refusal (the crossing
+        // tick executed 100 more records: 700 live).
+        assert!(matches!(
+            spine.compact(300),
+            Err(CompactionError::ConsumerFrontierHolds {
+                ledger_len: 700,
+                retain: 300,
+                summarized_records: 0,
+                frontier_through: 0,
+                consumers: 1,
+            })
+        ));
+        assert!(
+            matches!(spine.history_kind(), HistoryKind::Full),
+            "the refused ordinary compact mutated nothing"
+        );
+        // The administrative authority (R2's loud, named override):
+        // the operator cuts 300 anyway — PAST the consumer's
+        // 0-ordinal ack — through the explicitly authorized path.
         spine
-            .compact(300)
-            .expect("the manual cut is the operator's authority");
+            .compact_authorized(300, AdministrativeCompaction::explicit_override())
+            .expect("the authorized administrative cut is the operator's authority");
         let HistoryKind::Compacted {
             summarized_records, ..
         } = spine.history_kind()
