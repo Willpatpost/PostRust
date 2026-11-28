@@ -330,6 +330,33 @@ pub(crate) struct FrameOutcome {
     /// through cmd_draw — this field is what observes the
     /// difference).
     pub indirect_draws_issued: u32,
+    /// P5 §1.3 (A11/R1): the frame's instance-arena facts — the
+    /// population supplied (npc + vehicle + rain) and the carve's
+    /// per-slot capacity AFTER this frame's ensure (0 on unpopulated
+    /// and deferred frames, the region discipline). The safe layer
+    /// accumulates them into `RenderStats`' capacity/peak-used
+    /// fields.
+    pub instance_supplied: u32,
+    pub instance_capacity: u32,
+    /// P5 §1.3: the frame's pose-arena facts — blocks supplied and
+    /// the carve's per-slot block capacity after the ensure (0 on
+    /// unpopulated and deferred frames).
+    pub pose_supplied: u32,
+    pub pose_capacity: u32,
+    /// P5 §1.6: arena growth events THIS frame (the delta of the
+    /// context's monotonic counter — the indirect-issuance
+    /// observation's exact discipline). A growth event is a carve
+    /// RE-CREATION at a larger size (the initial demand-sized carve
+    /// is not an event: nothing existed to replace, nothing could
+    /// have referenced it, no stall); each event stalls the frame
+    /// once under `device_wait_idle`, bounded by the power-of-two
+    /// quantum to at most `log2(cap / 64)` per session. Deferred
+    /// frames record nothing at their own return; the counter is
+    /// monotonic, so a growth that preceded an acquire-time
+    /// deferral (the one deferral arm after the ensure ladder)
+    /// lands on the NEXT frame's delta — no event is ever lost,
+    /// at most attributed to the following frame.
+    pub arena_growth_events: u32,
 }
 
 /// Construction-time frame policy (P4 D2 §3.4, stage A04): the
@@ -366,6 +393,19 @@ pub(crate) struct FramePolicy {
     /// `RenderConfig::demo_scene`) — the LIVE preference every
     /// replacement pipeline is built with.
     pub demo_scene: DemoScenePreference,
+    /// P5 §1.3 (A11/R1): the instance arena's configured cap
+    /// (`RenderConfig::instance_capacity`) — the lazy-ensure
+    /// ladder's growth ceiling for the instance carve.
+    pub instance_capacity: usize,
+    /// P5 §1.3: the pose arena's configured cap
+    /// (`RenderConfig::pose_capacity`) — the retained pose storage's
+    /// growth ceiling.
+    pub pose_capacity: usize,
+    /// P5 §1.3: the region arena's configured per-slot vertex budget
+    /// (`RenderConfig::region_capacity`) — the region carve's growth
+    /// ceiling AND the F-03 clamp's boundary (unchanged semantics:
+    /// truncation above it stays fail-visible with the counters).
+    pub region_capacity: u32,
 }
 
 /// One validated frame, one level down (P4 D2 §3.4, stage A04): the
@@ -485,6 +525,14 @@ pub(crate) fn render_frame(
     // delta lands on the outcome after the submission. Deferred and
     // refused frames record nothing, so their delta is zero.
     let indirect_issued_before = ctx.indirect_draws_issued.get();
+    // P5 §1.6's arena-growth baseline, the same discipline: the
+    // lazy-ensure ladder (prepare, below) may re-create a carve at a
+    // larger size under `device_wait_idle`; the monotonic counter's
+    // delta is this frame's growth events. Deferred frames record
+    // nothing at their own return; a growth that preceded an
+    // acquire-time deferral lands on the next frame's delta (the
+    // counter is monotonic — no event is lost).
+    let arena_growth_before = ctx.arena_growth_events.get();
 
     // Phase 1 — validate_inputs: the proxy material validation,
     // before ANY synchronization state is touched.
@@ -591,6 +639,7 @@ pub(crate) fn render_frame(
     outcome.gpu_render_ms = gpu_render_ms;
     outcome.indirect_draws_issued =
         (ctx.indirect_draws_issued.get() - indirect_issued_before) as u32;
+    outcome.arena_growth_events = (ctx.arena_growth_events.get() - arena_growth_before) as u32;
     frames.frame_slot = (slot + 1) % FRAMES_IN_FLIGHT as usize;
     Ok(outcome)
 }
@@ -878,6 +927,16 @@ fn upload_frame_data(
     // state exists — the frame flow's ensure ran before the fence
     // wait, outside command recording).
     if let (Some(proxy_state), Some(upload)) = (&pipes.proxy, proxy) {
+        // P5 §1.3's observability half: the frame's arena facts,
+        // recorded at the write site (the capacities are the carve's
+        // AFTER this frame's ensure — the growth, if any, already
+        // landed in prepare; the region discipline of reading them
+        // per frame, never guessing).
+        outcome.instance_supplied = upload
+            .npc_count
+            .saturating_add(upload.vehicle_count)
+            .saturating_add(upload.rain_count);
+        outcome.instance_capacity = proxy_state.capacity();
         unsafe { proxy_state.write_slot(slot, upload.bytes) };
         if let Some(indirect) = proxy_state.indirect.as_ref()
             && matches!(upload.mode, crate::ProxyDrawMode::Indirect)
@@ -898,6 +957,9 @@ fn upload_frame_data(
         // unconditional on proxy presence; the debug_assert co-pins
         // the structural invariant the way the indirect path does).
         if let Some(retained) = ctx.skinned_retained.as_ref() {
+            outcome.pose_supplied = (upload.pose_bytes.len() / crate::animation::POSE_STRIDE)
+                .min(u32::MAX as usize) as u32;
+            outcome.pose_capacity = retained.blocks_capacity();
             unsafe { retained.write_slot(slot, upload.pose_bytes) };
         } else {
             debug_assert!(

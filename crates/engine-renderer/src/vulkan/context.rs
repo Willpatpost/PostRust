@@ -100,6 +100,16 @@ pub(crate) struct VulkanContext {
     /// like the allocation counters (frame deltas, not live
     /// counts; survives pipeline replacement).
     pub(super) indirect_draws_issued: Cell<u64>,
+    /// P5 §1.6 (A11/R1): arena growth events since renderer
+    /// construction — every RE-CREATION of a mapped carve at a
+    /// larger size (the instance/pose/region arenas' overlay-style
+    /// growth; the initial demand-sized carve is not an event:
+    /// nothing existed to replace). Each event stalls its frame once
+    /// under `device_wait_idle` (the growth paths' documented
+    /// discipline); the frame flow reads the DELTA per frame (the
+    /// indirect-issuance observation's exact shape) into
+    /// `FrameOutcome::arena_growth_events` → `RenderStats`.
+    pub(super) arena_growth_events: Cell<u64>,
     /// Diagnostic fault-injection seam: arms a one-shot plan for the
     /// corrective finding 3+8 verification. The `u32` ordinal is
     /// 1-based and decrements per MATCHING check across the renderer's
@@ -481,6 +491,7 @@ impl VulkanContext {
             descriptor_sets: Cell::new(0),
             sampler_creations: Cell::new(0),
             indirect_draws_issued: Cell::new(0),
+            arena_growth_events: Cell::new(0),
             target_fault: Cell::new(None),
             acquire_out_of_date_armed: Cell::new(false),
             target_images: Cell::new(0),
@@ -791,18 +802,65 @@ impl VulkanContext {
     /// the first populated frame EVER (the same lazy discipline as
     /// the pipeline states, one level up in ownership: the state
     /// lives HERE, at device lifetime, so every pipeline generation
-    /// inherits it and a replacement never re-creates it). A no-op
-    /// once allocated; the unpopulated path pays nothing.
-    pub(crate) fn ensure_skinned_retained(&mut self) -> Result<(), RendererError> {
-        if self.skinned_retained.is_some() {
-            return Ok(());
+    /// inherits it and a replacement never re-creates it). The
+    /// unpopulated path pays nothing.
+    ///
+    /// Since P5 §1.3 (A11/R1) the pose carve is DEMAND-SIZED under
+    /// the configured cap: the first populated frame carves
+    /// `max(64, first-demand)` blocks (pow2, clamped to the cap),
+    /// and a later frame whose pose-block supply exceeds the carve
+    /// (still under the cap) grows it once through
+    /// [`SkinnedRetained::ensure_capacity`] — the device-lifetime
+    /// tier's `device_wait_idle` re-ensure, counted on the arena
+    /// counter. `required` is this frame's block demand (the frame
+    /// plan's `pose_demand_blocks`).
+    pub(crate) fn ensure_skinned_retained(
+        &mut self,
+        required_blocks: u32,
+        cap: usize,
+    ) -> Result<(), RendererError> {
+        // The growth dispatch: take the retained state out so the
+        // growth path can borrow the context (its device, its
+        // counters) beside the &mut state — put back on BOTH arms
+        // (the growth path is failure-atomic: it creates the new
+        // buffer before the old one dies, so an error leaves the
+        // prior state exactly as it was).
+        if let Some(mut retained) = self.skinned_retained.take() {
+            let target = crate::config::arena_capacity_for(
+                retained.blocks_capacity(),
+                required_blocks,
+                cap as u32,
+            );
+            let result = retained.ensure_capacity(self, target);
+            self.skinned_retained = Some(retained);
+            return result;
         }
         let corner = self.corner.as_ref().ok_or_else(|| {
             RendererError::Vulkan("skinned proxy requires an attached scene".into())
         })?;
-        let retained = skinned_draw::SkinnedRetained::new(self, corner)?;
+        // The carve's first demand: the quantum's floor applies (an
+        // empty pose supply still carves the floor so the binding-5
+        // vertex input always has a live buffer — a populated frame
+        // with no npc blocks yet draws zero npc instances, never
+        // binds a null buffer). The creation floor is 1 block: a
+        // degenerate zero-cap config refuses every non-empty pose
+        // supply at the CAP while the empty supply keeps a valid
+        // (704 B, 16-aligned) buffer — a zero-sized VkBuffer is
+        // spec-invalid, never created.
+        let capacity =
+            crate::config::arena_capacity_for(0, required_blocks.max(1), cap as u32).max(1);
+        let retained = skinned_draw::SkinnedRetained::new(self, corner, capacity)?;
         self.skinned_retained = Some(retained);
         Ok(())
+    }
+
+    /// P5 §1.6 (A11/R1): records one arena growth event (a carve
+    /// RE-CREATION at a larger size — see the field's doc). Called
+    /// by the three growth paths only, after the replacement
+    /// committed.
+    pub(crate) fn record_arena_growth(&self) {
+        self.arena_growth_events
+            .set(self.arena_growth_events.get() + 1);
     }
 
     /// Full teardown in manifest order (assumes swapchain/pipelines/frames

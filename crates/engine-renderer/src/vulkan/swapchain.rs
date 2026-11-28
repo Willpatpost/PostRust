@@ -458,7 +458,18 @@ pub(super) fn recreate_swapchain(
         // `--render` path never has a region buffer, so it never pays
         // this allocation.
         if pipes.region_vbo != vk::Buffer::null()
-            && let Err(error) = replacement.ensure_region_capacity(ctx)
+            && let Err(error) = replacement.ensure_region_capacity(
+                ctx,
+                policy.region_capacity,
+                // Replicate the OUTGOING carve exactly (the demand
+                // quantum is idempotent at required == current): the
+                // replacement's region buffer is the same size the
+                // outgoing state carved — the finding-A replication,
+                // with P5 §1.3's demand-sized carve carried across
+                // the replacement (the tuple pins hold: same count,
+                // same size).
+                pipes.region_capacity,
+            )
         {
             replacement.destroy(ctx);
             return Err(error);
@@ -473,7 +484,15 @@ pub(super) fn recreate_swapchain(
         // replacement's indirect draws read the same lazily-created
         // command buffer.
         if pipes.proxy.is_some() {
-            if let Err(error) = replacement.ensure_proxy_resources(ctx) {
+            if let Err(error) = replacement.ensure_proxy_resources(
+                ctx,
+                policy.instance_capacity,
+                // Replicate the OUTGOING instance carve exactly (the
+                // P5 §1.3 demand-sized carve carried across the
+                // replacement — same count, same size; the tuple
+                // pins hold).
+                pipes.proxy.as_ref().map_or(0, |state| state.capacity()),
+            ) {
                 replacement.destroy(ctx);
                 return Err(error);
             }
@@ -512,7 +531,7 @@ pub(super) fn recreate_swapchain(
         // gates' pin) — so only the replacement's main-pass pipeline
         // rebuilds here.
         if pipes.skinned.is_some()
-            && let Err(error) = replacement.ensure_skinned_resources(ctx)
+            && let Err(error) = replacement.ensure_skinned_resources(ctx, policy.pose_capacity, 0)
         {
             replacement.destroy(ctx);
             return Err(error);

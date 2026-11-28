@@ -22,8 +22,10 @@ use super::resources::{
     create_device_local_buffer_with_data, create_mapped_buffer, create_shader_module,
 };
 use super::swapchain::SwapchainState;
-use super::{post_draw, proxy_draw, reflection_draw, shadow_draw, skinned_draw, sky_draw};
-use crate::config::{DemoScenePreference, FRAMES_IN_FLIGHT};
+use super::{
+    FramePolicy, post_draw, proxy_draw, reflection_draw, shadow_draw, skinned_draw, sky_draw,
+};
+use crate::config::{DemoScenePreference, FRAMES_IN_FLIGHT, arena_capacity_for};
 use crate::overlay::OverlayVertex;
 use crate::scene::SceneVertex;
 
@@ -226,20 +228,86 @@ impl PipelineState {
 
     /// Allocates the dynamic region-scene buffer on first use (the
     /// overlay's mapped-buffer pattern): persistently mapped host
-    /// visible memory with one disjoint region per frame slot, sized by
-    /// `region_scene_capacity_vertices()` divided by
-    /// `FRAMES_IN_FLIGHT`. Called from `render_frame` OUTSIDE command
-    /// recording whenever a frame carries region geometry; a no-op once
-    /// allocated. Partial-state safe: `destroy` handles the null
-    /// handles this leaves on the default path.
+    /// visible memory with one disjoint region per frame slot.
+    /// Called from `render_frame` OUTSIDE command recording whenever
+    /// a frame carries region geometry; a no-op once allocated.
+    /// Partial-state safe: `destroy` handles the null handles this
+    /// leaves on the default path.
+    ///
+    /// Since P5 §1.3 (A11/R1) the carve is DEMAND-SIZED under the
+    /// configured per-slot budget (`cap` — `RenderConfig`'s
+    /// `region_capacity`, default the closed form's 36,800; the
+    /// literal `8 + 1000` demo arithmetic no longer sizes this
+    /// buffer — the A05-coupling closure). `required` is this
+    /// frame's world+foreground vertex supply (the frame plan's
+    /// `region_demand_vertices`); the first region frame carves
+    /// `max(64, first-demand)` vertices (pow2, clamped to the cap),
+    /// and a later frame whose supply exceeds the carve (still
+    /// under the cap) grows it once. The F-03 clamp/truncation
+    /// machinery is UNTOUCHED: the cap is still the boundary, the
+    /// counters still count every truncation (growth never masks —
+    /// the counter is not cleared), and a supply at or above the cap
+    /// carves exactly the cap (byte-identical with the pre-P5
+    /// full-carve behavior the overflow gates pin).
     pub(crate) fn ensure_region_capacity(
         &mut self,
         ctx: &VulkanContext,
+        cap: u32,
+        required: u32,
     ) -> Result<(), RendererError> {
+        let target = arena_capacity_for(self.region_capacity, required, cap);
         if self.region_vbo != vk::Buffer::null() {
+            if target <= self.region_capacity {
+                return Ok(());
+            }
+            // GROWTH — the overlay slot's reserve shape on the
+            // SHARED per-slot buffer: the region VBO is one buffer
+            // object every slot's draws read (disjoint regions,
+            // shared handles), so the old buffer's destruction
+            // requires no PENDING submission anywhere, not just this
+            // slot's fence. `device_wait_idle` is the conservative,
+            // already-precedented point (the design's "device-idle
+            // recreation window" arm); bounded by the pow2 quantum,
+            // counted on the context's arena counter. No content
+            // copy: every frame that DRAWS from a slot's region
+            // first WROTE it (the fence-before-write discipline), so
+            // the first draw after the growth is preceded by that
+            // slot's write at the new offsets — the overlay
+            // growth's own argument.
+            let region_capacity = target;
+            let region_slot_bytes = region_capacity as vk::DeviceSize
+                * std::mem::size_of::<SceneVertex>() as vk::DeviceSize;
+            let region_size = region_slot_bytes * FRAMES_IN_FLIGHT as vk::DeviceSize;
+            let (region_vbo, region_vbo_memory, region_mapped) =
+                create_mapped_buffer(ctx, vk::BufferUsageFlags::VERTEX_BUFFER, region_size)?;
+            // The replacement point: the new buffer exists before
+            // the old one dies (a failure above leaves the prior
+            // state fully intact), and the event is counted. The
+            // stall is the renderer's own ordered-teardown helper
+            // (device_wait_idle, typed).
+            super::device_idle(ctx)?;
+            unsafe {
+                if !self.region_mapped.is_null() {
+                    ctx.device.unmap_memory(self.region_vbo_memory);
+                }
+                ctx.device.destroy_buffer(self.region_vbo, None);
+                ctx.device.free_memory(self.region_vbo_memory, None);
+            }
+            self.region_vbo = region_vbo;
+            self.region_vbo_memory = region_vbo_memory;
+            self.region_mapped = region_mapped;
+            self.region_capacity = region_capacity;
+            self.region_slot_bytes = region_slot_bytes;
+            ctx.record_arena_growth();
             return Ok(());
         }
-        self.region_capacity = crate::scene::region_scene_capacity_vertices() / FRAMES_IN_FLIGHT;
+        if target == 0 {
+            // No demand and nothing allocated (the replacement path's
+            // unallocated shape, or a zero-budget cap): nothing to
+            // carve.
+            return Ok(());
+        }
+        self.region_capacity = target;
         self.region_slot_bytes = self.region_capacity as vk::DeviceSize
             * std::mem::size_of::<SceneVertex>() as vk::DeviceSize;
         let region_size = self.region_slot_bytes * FRAMES_IN_FLIGHT as vk::DeviceSize;
@@ -256,14 +324,33 @@ impl PipelineState {
     /// the unpopulated corner path pays nothing). A no-op once
     /// allocated. Partial-state safe: `destroy` handles the `None`
     /// this leaves on the unpopulated path.
+    ///
+    /// Since P5 §1.3 (A11/R1) the instance carve is DEMAND-SIZED
+    /// under the configured cap (`cap` — `RenderConfig`'s
+    /// `instance_capacity`, default MAX_INSTANCES): the first
+    /// populated frame carves `max(64, first-demand)` instances
+    /// (pow2, clamped to the cap) — the repack's typed refusal at
+    /// the CAP is unchanged, and the carve grows toward it on
+    /// demand.
     pub(crate) fn ensure_proxy_resources(
         &mut self,
         ctx: &VulkanContext,
+        cap: usize,
+        required: u32,
     ) -> Result<(), RendererError> {
-        if self.proxy.is_some() {
-            return Ok(());
+        let existing = self.proxy.as_ref().map_or(0, |state| state.capacity());
+        // The creation floor is 1 instance (96 B): a degenerate
+        // zero-cap config still refuses every non-empty population
+        // at the CAP (the typed boundary) while an EMPTY population
+        // keeps a live buffer for the instance-rate vertex binding —
+        // a zero-sized VkBuffer is spec-invalid, never created.
+        let target = arena_capacity_for(existing, required.max(1), cap as u32).max(1);
+        match &mut self.proxy {
+            Some(state) => state.ensure_capacity(ctx, target)?,
+            None => {
+                self.proxy = Some(proxy_draw::ProxyResources::new(ctx, target)?);
+            }
         }
-        self.proxy = Some(proxy_draw::ProxyResources::new(ctx)?);
         Ok(())
     }
 
@@ -278,11 +365,29 @@ impl PipelineState {
     /// built here, once per state. A pipeline replacement therefore
     /// re-runs this ensure against the inherited retained state and
     /// rebuilds ONLY the pipelines (the flat replacement tuple).
+    ///
+    /// Since P5 §1.3 (A11/R1) the pose carve is DEMAND-SIZED under
+    /// the configured cap through the CONTEXT's ensure (the
+    /// device-lifetime tier), and — because this state's
+    /// SHADOWED-POPULATED family keeps its own binding-5 sets
+    /// against the retained pose buffer — a growth leaves them
+    /// stale until the re-ensure below rewrites them (the
+    /// staleness token is the buffer handle; the shadowed family's
+    /// own ladder step re-checks it too).
     pub(crate) fn ensure_skinned_resources(
         &mut self,
         ctx: &mut VulkanContext,
+        pose_cap: usize,
+        required_blocks: u32,
     ) -> Result<(), RendererError> {
-        ctx.ensure_skinned_retained()?;
+        ctx.ensure_skinned_retained(required_blocks, pose_cap)?;
+        if let Some(shadowed) = &mut self.shadowed_proxy {
+            let retained = ctx.skinned_retained.as_ref().expect(
+                "the retained ensure above makes a missing retained \
+                 state unreachable",
+            );
+            shadowed.ensure_pose_binding(ctx, retained)?;
+        }
         if self.skinned.is_none() {
             let retained = ctx.skinned_retained.as_ref().expect(
                 "the retained ensure above makes a missing retained \
@@ -328,12 +433,25 @@ impl PipelineState {
     /// never draws through). The state needs shadows, the context's
     /// RETAINED skinned state (the pose buffer its sets bind), AND
     /// a corner — a no-op once allocated.
+    ///
+    /// Since P5 §1.3 (A11/R1) the existing-state arm re-ensures the
+    /// family's binding-5 sets against the retained pose buffer's
+    /// CURRENT handle: a pose-carve growth re-created that buffer,
+    /// and this family's sets (per-generation, unlike the retained's
+    /// own) would otherwise point at a destroyed buffer.
     pub(crate) fn ensure_shadowed_proxy_resources(
         &mut self,
         ctx: &VulkanContext,
     ) -> Result<(), RendererError> {
-        if self.shadowed_proxy.is_some() {
-            return Ok(());
+        if let Some(shadowed) = &mut self.shadowed_proxy {
+            // The frame flow's ensure order (skinned before the
+            // shadowed-populated gate) makes the retained state's
+            // existence unreachable to miss here.
+            let retained = ctx.skinned_retained.as_ref().expect(
+                "the skinned ensure discipline makes a missing retained \
+                 state unreachable on a shadowed populated frame",
+            );
+            return shadowed.ensure_pose_binding(ctx, retained);
         }
         let corner = ctx.corner.as_ref().ok_or_else(|| {
             RendererError::Vulkan("shadowed proxy requires an attached scene".into())
@@ -467,14 +585,17 @@ impl PipelineState {
         swapchain: &SwapchainState,
         slot: usize,
         plan: &FramePlan,
+        policy: FramePolicy,
     ) -> Result<(), RendererError> {
         let uses = &plan.uses;
         // Lazy region-scene buffer (Stage 4 final-verification finding):
         // allocated on first use only, outside command recording — the
         // default renderer path (no dynamic region geometry) pays no
-        // allocation, mapping, or memory cost.
+        // allocation, mapping, or memory cost. P5 §1.3: the carve is
+        // sized by THIS frame's demand (the plan's count) under the
+        // configured per-slot budget (the policy's cap).
         if uses.region_layers {
-            self.ensure_region_capacity(ctx)?;
+            self.ensure_region_capacity(ctx, policy.region_capacity, plan.region_demand_vertices)?;
         }
 
         // The 6-E lazy proxy resources (the same discipline): created at
@@ -482,19 +603,21 @@ impl PipelineState {
         // the unpopulated corner path pays nothing. Structural invariant:
         // a proxy upload implies corner resources (the safe layer's
         // scene-preference gate), hence `ctx.corner` in the pattern.
-        // The 6-E2 indirect command state is one level lazier still:
-        // created at the first INDIRECT-mode populated frame only, so
-        // the direct instanced path's allocation pins (the 6-E gates)
-        // pay nothing for the mechanism they never touch.
+        // P5 §1.3: the instance and pose carves size by this frame's
+        // demand under the configured caps. The 6-E2 indirect command
+        // state is one level lazier still: created at the first
+        // INDIRECT-mode populated frame only, so the direct instanced
+        // path's allocation pins (the 6-E gates) pay nothing for the
+        // mechanism they never touch.
         if uses.populated && ctx.corner.is_some() {
-            self.ensure_proxy_resources(ctx)?;
+            self.ensure_proxy_resources(ctx, policy.instance_capacity, plan.instance_demand)?;
             // The Era-2 companion: the npc kind ALWAYS skins (the
             // pose storage + the skinned pipeline exist from the
             // first populated frame; the vehicle kind's plain path
             // never reads them). One level deeper: the HDR variant
             // waits for a populated POST frame (the family-growth
             // block below).
-            self.ensure_skinned_resources(ctx)?;
+            self.ensure_skinned_resources(ctx, policy.pose_capacity, plan.pose_demand_blocks)?;
             if uses.indirect
                 && let Some(proxy_state) = self.proxy.as_mut()
             {

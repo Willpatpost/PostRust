@@ -21,8 +21,8 @@
 
 use engine_renderer::scene::{SceneVertex, push_box};
 use engine_renderer::{
-    DemoScenePreference, DepthFormatPreference, PresentModePreference, RenderConfig, Renderer,
-    ValidationPreference,
+    DemoScenePreference, DepthFormatPreference, InstanceCapacity, PoseCapacity,
+    PresentModePreference, RegionCapacity, RenderConfig, Renderer, ValidationPreference,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 
@@ -90,6 +90,15 @@ fn oversized_region_and_overlay_report_exact_truncation() {
         replace_pipelines: false,
         demo_scene: DemoScenePreference::Included,
         depth_format: DepthFormatPreference::Auto,
+        // P5 R1 (A11): the arena budgets at their DEFAULTS, stated
+        // for checkability — the region budget IS this smoke's
+        // 36,800-per-slot boundary (the closed form's per-slot
+        // share, now the configured cap the demand-sized carve grows
+        // toward; the oversize 37,800 supply still truncates exactly
+        // 1,000, the pin below).
+        instance_capacity: InstanceCapacity::default(),
+        pose_capacity: PoseCapacity::default(),
+        region_capacity: RegionCapacity::default(),
     };
     let mut app = ShellApp::new(ShellConfig {
         title: "Sektor7 F-03 Step 1 oversize smoke".to_string(),

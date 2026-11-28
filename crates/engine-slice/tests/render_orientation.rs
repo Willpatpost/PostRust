@@ -21,8 +21,8 @@
 
 use engine_renderer::scene::push_box;
 use engine_renderer::{
-    CaptureFormat, DemoScenePreference, DepthFormatPreference, PresentModePreference, RenderConfig,
-    Renderer, ValidationPreference,
+    CaptureFormat, DemoScenePreference, DepthFormatPreference, InstanceCapacity, PoseCapacity,
+    PresentModePreference, RegionCapacity, RenderConfig, Renderer, ValidationPreference,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 use engine_slice::math;
@@ -109,6 +109,12 @@ fn world_renders_right_side_up_offscreen() {
         replace_pipelines: false,
         demo_scene: DemoScenePreference::Included,
         depth_format: DepthFormatPreference::Auto,
+        // P5 R1 (A11): the arena budgets at their DEFAULTS, stated
+        // for checkability — today's constants (the orientation
+        // smoke's populations sit far below every cap).
+        instance_capacity: InstanceCapacity::default(),
+        pose_capacity: PoseCapacity::default(),
+        region_capacity: RegionCapacity::default(),
     };
     let mut app = ShellApp::new(ShellConfig {
         title: "Sektor7 orientation smoke".to_string(),

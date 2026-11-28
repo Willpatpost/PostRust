@@ -2045,6 +2045,59 @@ fn rain_warmed_allocation_constancy() {
 
     let mut layer = RainLayer::new(GATE_EYE);
     renderer.set_proxy_draw_mode(ProxyDrawMode::Instanced);
+    // P5 R1 re-basing (the a6e5adc warm-the-maximal-population
+    // discipline, applied to the demand-sized arenas): since
+    // A11/R1 the instance carve sizes at the first populated
+    // frame's demand and grows by power-of-two events — the rain
+    // field's per-frame churn (spawn/decay around the steady
+    // state) can cross a carve boundary INSIDE the measured window,
+    // and one growth event re-creates one device memory (the exact
+    // per-frame +1 the S6 corrective taught the capture path's
+    // warm-up for). One warm frame at the layer's OWN pool bound —
+    // 1024 streaks, the `Vec::with_capacity(1024)` the layer can
+    // never exceed — sizes the carve past anything the window can
+    // demand, so the warmed window below measures the steady state,
+    // never a growth. The pose carve stays at its floor (the rain
+    // kind never skins).
+    let pool_bound: Vec<_> = (0..1024)
+        .map(|i| ProxyInstance {
+            transform: InstanceTransform {
+                pos: [(i % 32) as f32 * 0.5, 6.0, (i / 32) as f32 * 0.5],
+                turn: 0,
+                scale: 1.0,
+            },
+            tint: [1.0, 1.0, 1.0],
+            alpha: RAIN_ALPHA,
+            pose_index: 0,
+        })
+        .collect();
+    let saturated = ProxyPopulation {
+        npc: &[],
+        npc_poses: &[],
+        npc_material: 0,
+        vehicle: &[],
+        vehicle_material: 0,
+        rain: &pool_bound,
+        rain_material: RAIN_MATERIAL,
+    };
+    assert!(
+        renderer
+            .submit_frame(corner_submission(
+                &matrix,
+                GATE_EYE,
+                light,
+                None,
+                corner_bounds(),
+                Some(saturated),
+                None,
+                false,
+                None,
+                SIZE,
+            ))
+            .unwrap()
+            .presented,
+        "the pool-bound warm frame presents"
+    );
     let mut warm: Option<engine_renderer::AllocationStats> = None;
     let mut distinct: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     for frame in 0..12 {

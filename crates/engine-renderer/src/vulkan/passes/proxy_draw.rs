@@ -78,7 +78,7 @@ use crate::ProxyDrawMode;
 use crate::config::FRAMES_IN_FLIGHT;
 use crate::populated_meshes::{rain_streak_mesh, sedan_mesh};
 use crate::proxy_indirect::{INDIRECT_COMMAND_BYTES, INDIRECT_SLOT_BYTES, indirect_kind_offset};
-use crate::proxy_instances::{INSTANCE_STRIDE, MAX_INSTANCES};
+use crate::proxy_instances::INSTANCE_STRIDE;
 use crate::proxy_mesh::ProxyVertex;
 use ash::vk;
 use core::ops::Range;
@@ -107,15 +107,16 @@ pub(crate) struct ProxyFrameUpload<'a> {
     /// after, rain LAST — [`crate::proxy_instances::repack_populations`]'s
     /// fixed order); exactly `(npc_count + vehicle_count +
     /// rain_count) * INSTANCE_STRIDE` bytes (the repack's validated
-    /// total, at most [`MAX_INSTANCES`] instances).
+    /// total, bounded by the CONFIGURED instance cap — the typed
+    /// refusal's boundary since P5 §1.3).
     pub bytes: &'a [u8],
     /// The repacked pose bytes: the npc kind's skin-matrix blocks in
     /// POSE-INDEX order (block i serves every npc whose
     /// `pose_index` is i — the safe layer validated `max(npc
-    /// pose_index) < blocks.len()`), at most [`MAX_POSE_BLOCKS`] *
-    /// [`crate::animation::POSE_STRIDE`] bytes (the repack's
-    /// validated capacity). The vehicle and rain kinds never read
-    /// them.
+    /// pose_index) < blocks.len()`), at most the CONFIGURED pose
+    /// cap's blocks × [`crate::animation::POSE_STRIDE`] bytes (the
+    /// repack's validated capacity). The vehicle and rain kinds
+    /// never read them.
     pub pose_bytes: &'a [u8],
     pub npc_count: u32,
     pub vehicle_count: u32,
@@ -365,9 +366,15 @@ pub(crate) struct ProxyResources {
     instances: vk::Buffer,
     instances_memory: vk::DeviceMemory,
     instances_mapped: *mut core::ffi::c_void,
+    /// The instance carve's per-slot capacity, INSTANCES (P5 §1.3,
+    /// A11/R1 — demand-sized under the configured cap, was the
+    /// MAX_INSTANCES constant). One frame slot's byte region is
+    /// `capacity * INSTANCE_STRIDE`.
+    capacity: u32,
     /// One frame slot's region of the instance buffer, bytes
-    /// ([`MAX_INSTANCES`] * [`INSTANCE_STRIDE`] — the repack's bound,
-    /// one region per frames-in-flight slot).
+    /// (`capacity * INSTANCE_STRIDE` — the repack's validated bound
+    /// against the configured cap, one region per frames-in-flight
+    /// slot).
     slot_bytes: u64,
     /// The 6-E2 indirect command state — lazily created at the
     /// first INDIRECT-mode populated frame (see [`IndirectResources`]).
@@ -375,7 +382,15 @@ pub(crate) struct ProxyResources {
 }
 
 impl ProxyResources {
-    pub(super) fn new(ctx: &VulkanContext) -> Result<Self, RendererError> {
+    /// `capacity` is the instance carve's per-slot size in instances
+    /// (P5 §1.3: the demand quantum's choice at the first populated
+    /// frame — `max(64, first-demand)` rounded to the power of two,
+    /// clamped to the configured cap; the overlay slot's
+    /// `capacity_for` arithmetic). The zero-per-frame-allocation
+    /// discipline is unchanged: the carve is created once and grows
+    /// only when a later frame's population exceeds it (still under
+    /// the cap).
+    pub(super) fn new(ctx: &VulkanContext, capacity: u32) -> Result<Self, RendererError> {
         // The Era-2 skinning claim: the npc kind's mesh is the
         // SKINNED humanoid (the same 396 vertices — pos/normal/uv
         // byte-identical to humanoid_mesh, per animation.rs's
@@ -404,7 +419,8 @@ impl ProxyResources {
             instances: vk::Buffer::null(),
             instances_memory: vk::DeviceMemory::null(),
             instances_mapped: core::ptr::null_mut(),
-            slot_bytes: (MAX_INSTANCES * INSTANCE_STRIDE) as u64,
+            capacity,
+            slot_bytes: (capacity as usize * INSTANCE_STRIDE) as u64,
             indirect: None,
         };
         if let Err(error) = partial.build(ctx, &npc, &vehicle, &rain) {
@@ -444,6 +460,77 @@ impl ProxyResources {
             // needs no smaller carve.
             self.slot_bytes * FRAMES_IN_FLIGHT as u64,
         )?;
+        Ok(())
+    }
+
+    /// The instance carve's per-slot capacity (instances) — the
+    /// observability read (the frame flow records it into
+    /// `FrameOutcome`) and the growth target's current value.
+    pub(super) fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    /// P5 §1.3 (A11/R1): grows the instance carve to `target`
+    /// instances per slot when `target` exceeds the current capacity
+    /// — the overlay slot's `reserve` shape on the SHARED per-slot
+    /// buffer. A no-op at or below the current capacity (the steady
+    /// state; also the pipeline-replacement replication, whose
+    /// target IS the outgoing capacity).
+    ///
+    /// # The growth path's sync discipline (the design's §1.3
+    /// ownership tier: PipelineState-owned, mapped, vertex-buffer
+    /// bound with per-draw offsets — no descriptors)
+    /// The instance buffer is ONE buffer object shared by every
+    /// frame slot (disjoint regions, shared handles), so destroying
+    /// the old buffer requires that no PENDING submission reads it —
+    /// not just this slot's fence but every slot's. The conservative
+    /// and already-precedented point is `device_wait_idle` (the
+    /// design's "device-idle recreation window" arm; the
+    /// reflection/post targets' rebuild-safety shape): bounded by
+    /// the power-of-two quantum to at most `log2(cap / 64)` events
+    /// per session, counted on the context's monotonic
+    /// arena-growth counter. No content copy: every frame that
+    /// DRAWS from a slot's region first WROTE it (the
+    /// fence-before-write discipline), so the first draw after the
+    /// growth is preceded by that slot's write at the new offsets —
+    /// the overlay growth's own argument, verbatim.
+    pub(super) fn ensure_capacity(
+        &mut self,
+        ctx: &VulkanContext,
+        target: u32,
+    ) -> Result<(), RendererError> {
+        if target <= self.capacity {
+            return Ok(());
+        }
+        let slot_bytes = u64::from(target) * INSTANCE_STRIDE as u64;
+        let (instances, instances_memory, instances_mapped) = create_mapped_buffer(
+            ctx,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            // One disjoint region per frame slot, each holding a
+            // full bounded population — the fence-before-write
+            // discipline needs no smaller carve.
+            slot_bytes * FRAMES_IN_FLIGHT as u64,
+        )?;
+        // The replacement point: the device is drained FIRST, the
+        // new buffer exists BEFORE the old one dies (a failure above
+        // leaves the prior state fully intact — the finding-G
+        // discipline), and the event is counted. The stall is the
+        // renderer's own ordered-teardown helper (device_wait_idle,
+        // typed).
+        super::device_idle(ctx)?;
+        unsafe {
+            if !self.instances_mapped.is_null() {
+                ctx.device.unmap_memory(self.instances_memory);
+            }
+            ctx.device.destroy_buffer(self.instances, None);
+            ctx.device.free_memory(self.instances_memory, None);
+        }
+        self.instances = instances;
+        self.instances_memory = instances_memory;
+        self.instances_mapped = instances_mapped;
+        self.capacity = target;
+        self.slot_bytes = slot_bytes;
+        ctx.record_arena_growth();
         Ok(())
     }
 
