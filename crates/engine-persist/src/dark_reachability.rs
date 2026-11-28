@@ -60,7 +60,11 @@
 //! The memo ([`VerificationMemo`]) is threaded through the whole
 //! walk: chunks shared across the visited roots are read and
 //! hash-verified ONCE per walk — the bounded verification operation
-//! the memo is defined over.
+//! the memo is defined over. Each verified identity's payload is
+//! materialized as ONE shared `Arc<[u8]>` backing (the composite
+//! reader's B03 ownership shape); the sharing never outlives the
+//! walk's own memo — a later walk re-reads and re-verifies
+//! everything.
 
 use std::collections::{BTreeMap, BTreeSet};
 
