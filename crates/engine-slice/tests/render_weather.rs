@@ -806,9 +806,15 @@ fn project_ground(matrix: &[[f32; 4]; 4], ground: [f32; 3]) -> (f32, f32) {
 /// `planar::ripple_perturbation` consumes exactly the uniform the
 /// GPU did). rows[1]'s debug lane reads 0 — the oracle mirrors the
 /// shipped mode-0 path; the separation knobs suppress whole terms
-/// and never reshape the survivors.
-fn oracle_rows(rings: &[RippleRing]) -> [[f32; 4]; 2 + engine_core::ripple::RIPPLE_POOL_BOUND] {
-    let mut rows = [[0.0f32; 4]; 2 + engine_core::ripple::RIPPLE_POOL_BOUND];
+/// and never reshape the survivors. rows[2] is the A19
+/// field-extent bound — the versioned claim's LAYOUT COMPANION
+/// (the ring rows moved rows[2 + i] → rows[3 + i] in the same
+/// renderer change; the bound itself is the shared
+/// `planar::ripple_field_bound`, the packer's own implementation —
+/// no gate value or assertion changes, only the row encoding
+/// tracks the shader's uniform).
+fn oracle_rows(rings: &[RippleRing]) -> [[f32; 4]; 3 + engine_core::ripple::RIPPLE_POOL_BOUND] {
+    let mut rows = [[0.0f32; 4]; 3 + engine_core::ripple::RIPPLE_POOL_BOUND];
     rows[0] = [
         rings.len() as f32,
         RIPPLE_POLICY.speed,
@@ -816,8 +822,14 @@ fn oracle_rows(rings: &[RippleRing]) -> [[f32; 4]; 2 + engine_core::ripple::RIPP
         RIPPLE_UV_GAIN,
     ];
     rows[1] = [RIPPLE_ROUGHEN_GAIN, 0.0, 0.0, 0.0];
+    let (bound_center, bound_radius) = engine_renderer::planar::ripple_field_bound(
+        rings,
+        RIPPLE_POLICY.speed,
+        RIPPLE_POLICY.width,
+    );
+    rows[2] = [bound_center[0], bound_center[1], bound_radius, 0.0];
     for (i, ring) in rings.iter().enumerate() {
-        rows[2 + i] = [
+        rows[3 + i] = [
             ring.center[0],
             ring.center[1],
             ring.age,

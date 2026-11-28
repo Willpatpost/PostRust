@@ -43,6 +43,68 @@ pub fn reflection_blend(n_dot_v: f32) -> f32 {
     REFLECTION_R0 + (1.0 - REFLECTION_R0) * pow5
 }
 
+/// The A19 field-extent bound radius's ULP travel budget (the
+/// packer's padding factor): the fragment shader measures a
+/// ground point's distance to the bound center through its own
+/// rounded chain (two subtractions, two multiplies, one add, the
+/// sqrt — each ≤ 1 ulp) and admits band points through the rounded
+/// band compare, so a point a ring's band genuinely contains can
+/// measure up to ~14 ulps FARTHER from the bound center than the
+/// exact triangle-inequality reach
+/// (|P − cᵢ| ≤ radiusᵢ + width ⇒ |P − bc| ≤ |cᵢ − bc| + radiusᵢ +
+/// width), while this CPU packing's own chain can round the reach
+/// DOWN by a few ulps. The pad — a relative 2⁻¹⁹ (16–32 ulps
+/// depending on the mantissa) — covers the whole travel budget
+/// with margin, at invisible cost (a few ulps of radius on a
+/// ground-scale bound). The no-false-negative property test
+/// verifies the margin empirically over adversarial layouts; both
+/// operands and the sum are exact f32 values.
+pub const RIPPLE_BOUND_ULP_TRAVEL: f32 = 1.0 + 1.0 / 524_288.0;
+
+/// THE A19 FIELD-EXTENT BOUND (the ripple uniform's rows[2] — the
+/// shader's early-out gate): the conservative bounding circle over
+/// a field's LIVE rings. The center is the live centers'
+/// bounding-box center, `(min + max) / 2` per axis; the radius is
+/// the max over the live rings of `|centerᵢ − bc| + radiusᵢ +
+/// width` — `radiusᵢ = speed × ageᵢ`, the SAME f32 product the
+/// shader computes per ring — then padded by
+/// [`RIPPLE_BOUND_ULP_TRAVEL`]. An empty slice packs the zero
+/// bound (count 0 gates it away in the shader; the value is never
+/// read). Pure function, no allocation; the renderer's packer, the
+/// gate-side oracle row builders, and the property tests all share
+/// THIS one implementation (the packer↔shader mirror's single
+/// source for the claim).
+pub fn ripple_field_bound(
+    rings: &[engine_core::ripple::RippleRing],
+    speed: f32,
+    width: f32,
+) -> ([f32; 2], f32) {
+    let Some(first) = rings.first() else {
+        return ([0.0, 0.0], 0.0);
+    };
+    let mut min = first.center;
+    let mut max = first.center;
+    for ring in rings {
+        let [cx, cz] = ring.center;
+        min[0] = min[0].min(cx);
+        max[0] = max[0].max(cx);
+        min[1] = min[1].min(cz);
+        max[1] = max[1].max(cz);
+    }
+    let center = [(min[0] + max[0]) * 0.5, (min[1] + max[1]) * 0.5];
+    let mut reach = 0.0f32;
+    for ring in rings {
+        // The center offset in the shader's own dist form (the
+        // sqrt-of-dot chain — mirrored so the pad's ULP budget is
+        // derived against the same arithmetic shape).
+        let delta = [ring.center[0] - center[0], ring.center[1] - center[1]];
+        let offset = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+        let ring_radius = speed * ring.age;
+        reach = reach.max(offset + ring_radius + width);
+    }
+    (center, reach * RIPPLE_BOUND_ULP_TRAVEL)
+}
+
 /// THE RIPPLE ORACLE (the CPU mirror of ground_reflect.wgsl's
 /// ripple perturbation, term-for-term — the lit_surface_color
 /// discipline applied to the ripple field; the technique mined
@@ -57,17 +119,23 @@ pub fn reflection_blend(n_dot_v: f32) -> f32 {
 /// reflection gates' documented tolerance class, never
 /// bit-exactly.
 ///
-/// THE ROW CONTRACT (the shader's layout, term-for-term):
-/// rows[0] = (live count, expansion speed m/s, band width m,
-/// tangent-displacement gain m); rows[1] = (roughen gain, debug
-/// mode, ..) — NEVER READ by this function (the roughen gain is
-/// applied in the shader's blend stage and the debug bits are
-/// test-only term suppressors; this oracle mirrors the SHIPPED
-/// mode-0 path); rows[2 + i] = (center_x, center_z, age s, current
-/// amplitude). A `rows` shorter than 2 + count PANICS at the ring
-/// read — fail-visible, never a silent wrong answer (the shader's
-/// pool bound makes the well-formed case impossible to trip). The
-/// arithmetic mirrors the WGSL in its exact order: the count gate,
+/// THE ROW CONTRACT (the shader's layout, term-for-term — the A19
+/// versioned claim included): rows[0] = (live count, expansion
+/// speed m/s, band width m, tangent-displacement gain m); rows[1] =
+/// (roughen gain, debug mode, ..) — NEVER READ by this function
+/// (the roughen gain is applied in the shader's blend stage and
+/// the debug bits are test-only term suppressors; this oracle
+/// mirrors the SHIPPED mode-0 path); rows[2] = the field-extent
+/// bound (center_x, center_z, radius, ..); rows[3 + i] =
+/// (center_x, center_z, age s, current amplitude). A `rows`
+/// shorter than 3 + count PANICS at the ring read — fail-visible,
+/// never a silent wrong answer (the shader's pool bound makes the
+/// well-formed case impossible to trip). The arithmetic mirrors
+/// the WGSL in its exact order: the count gate, the A19
+/// field-extent early-out (outside the bound circle the identity
+/// stands directly — value-exact, since every band gate is false
+/// out there by the bound's conservativeness; the harness compares
+/// this against the loop by feeding an infinite-radius bound row),
 /// the pool-order ring loop, `dist = sqrt(dx² + dz²)`, `radius =
 /// speed × age`, `band = |dist − radius|` gated `band < width` (the
 /// bump's own support), the signed slope `amp / width` (positive
@@ -83,29 +151,40 @@ pub fn ripple_perturbation(rows: &[[f32; 4]], ground: [f32; 2]) -> ([f32; 2], f3
     // empty field's identity: the loop never runs, the zeros stand).
     let count = rows[0][0] as i32;
     if count > 0 {
-        for i in 0..count as usize {
-            let ring = rows[2 + i];
-            let delta = [ground[0] - ring[0], ground[1] - ring[1]];
-            let dist = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
-            let radius = rows[0][1] * ring[2];
-            let band = (dist - radius).abs();
-            let width = rows[0][2];
-            if band < width {
-                // The signed slope: +amp/width inside the ring line,
-                // − outside (one subtraction and a sign — fixed
-                // order, the shader's select).
-                let slope = ring[3] / width;
-                let signed = if dist > radius { -slope } else { slope };
-                // The radial direction (dist == 0 has none: zero
-                // contribution — the exact center of a ring).
-                let dir = if dist > 0.0 {
-                    [delta[0] / dist, delta[1] / dist]
-                } else {
-                    [0.0, 0.0]
-                };
-                let push = dir.map(|component| component * (signed * rows[0][3]));
-                uv_offset = [uv_offset[0] + push[0], uv_offset[1] + push[1]];
-                roughen += ring[3] * (1.0 - band / width);
+        // THE FIELD-EXTENT EARLY-OUT (A19 — the shader's bound gate,
+        // mirrored): outside the packed bound circle the identity
+        // stands directly. The values are the same the loop would
+        // produce for an out-of-band fragment (every band gate false
+        // by the bound's conservativeness — the no-false-negative
+        // property), so the mirror is value-exact either way; the
+        // gate is mirrored for term-for-term fidelity.
+        let delta = [ground[0] - rows[2][0], ground[1] - rows[2][1]];
+        let bound_dist = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+        if bound_dist <= rows[2][2] {
+            for i in 0..count as usize {
+                let ring = rows[3 + i];
+                let delta = [ground[0] - ring[0], ground[1] - ring[1]];
+                let dist = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+                let radius = rows[0][1] * ring[2];
+                let band = (dist - radius).abs();
+                let width = rows[0][2];
+                if band < width {
+                    // The signed slope: +amp/width inside the ring line,
+                    // − outside (one subtraction and a sign — fixed
+                    // order, the shader's select).
+                    let slope = ring[3] / width;
+                    let signed = if dist > radius { -slope } else { slope };
+                    // The radial direction (dist == 0 has none: zero
+                    // contribution — the exact center of a ring).
+                    let dir = if dist > 0.0 {
+                        [delta[0] / dist, delta[1] / dist]
+                    } else {
+                        [0.0, 0.0]
+                    };
+                    let push = dir.map(|component| component * (signed * rows[0][3]));
+                    uv_offset = [uv_offset[0] + push[0], uv_offset[1] + push[1]];
+                    roughen += ring[3] * (1.0 - band / width);
+                }
             }
         }
     }
@@ -276,12 +355,22 @@ mod tests {
         }
         // The packed rows exactly as the renderer's packing builds
         // them: rows[0] = (count, speed, width, tangent-displacement
-        // gain), rows[2] = (center_x, center_z, age, faded amplitude).
+        // gain), rows[2] = the A19 field-extent bound (the shared
+        // ripple_field_bound over the live prefix — one ring here, so
+        // the bound is that ring's outer band edge), rows[3] =
+        // (center_x, center_z, age, faded amplitude).
         let faded = 1.0f32 * (1.0f32 - age / 2.5f32);
-        let mut rows = [[0.0f32; 4]; 2 + engine_core::ripple::RIPPLE_POOL_BOUND];
+        let ring = engine_core::ripple::RippleRing {
+            center: [0.0, 0.0],
+            age,
+            amplitude: 1.0,
+        };
+        let mut rows = [[0.0f32; 4]; 3 + engine_core::ripple::RIPPLE_POOL_BOUND];
         rows[0] = [1.0, 0.8, 0.35, crate::renderer::RIPPLE_UV_GAIN];
         rows[1] = [crate::renderer::RIPPLE_ROUGHEN_GAIN, 0.0, 0.0, 0.0];
-        rows[2] = [0.0, 0.0, age, faded];
+        let (bound_center, bound_radius) = ripple_field_bound(&[ring], 0.8, 0.35);
+        rows[2] = [bound_center[0], bound_center[1], bound_radius, 0.0];
+        rows[3] = [0.0, 0.0, age, faded];
         let radius = 0.8f32 * age;
         let width = 0.35f32;
         let slope = faded / width;
@@ -332,10 +421,61 @@ mod tests {
         );
 
         // OUTSIDE the band: the gate `band < width` fails — the
-        // contribution is EXACTLY zero (no arithmetic runs).
+        // contribution is EXACTLY zero. This probe sits at radius +
+        // width + 0.1, OUTSIDE the single ring's honest bound too,
+        // so the A19 early-out returns the identity directly — the
+        // loop's own gate zero is proven by the two-ring gap probe
+        // below (a point inside the bound but outside every band).
         let (uv, roughen) = ripple_perturbation(&rows, [radius + width + 0.1, 0.0]);
         assert_eq!(uv, [0.0, 0.0], "outside the band: the exact gate zero");
         assert_eq!(roughen, 0.0, "outside the band: no coverage");
+
+        // THE BAND GATE'S OWN ZERO, INSIDE THE BOUND (the gap between
+        // two rings): two mature rings 10 m apart, the probe at the
+        // midpoint — inside the two-ring bound (the bound covers both
+        // rings' reaches) but outside BOTH bands (5 − radius > width),
+        // so the loop RUNS and every gate fails: the identity is the
+        // LOOP's product here, not the early-out's.
+        let gap_rows = {
+            let mut rows = [[0.0f32; 4]; 3 + engine_core::ripple::RIPPLE_POOL_BOUND];
+            rows[0] = [2.0, 0.8, 0.35, crate::renderer::RIPPLE_UV_GAIN];
+            rows[1] = [crate::renderer::RIPPLE_ROUGHEN_GAIN, 0.0, 0.0, 0.0];
+            let rings = [
+                engine_core::ripple::RippleRing {
+                    center: [-5.0, 0.0],
+                    age,
+                    amplitude: 1.0,
+                },
+                engine_core::ripple::RippleRing {
+                    center: [5.0, 0.0],
+                    age,
+                    amplitude: 1.0,
+                },
+            ];
+            let (center, bound) = ripple_field_bound(&rings, 0.8, 0.35);
+            rows[2] = [center[0], center[1], bound, 0.0];
+            for (i, ring) in rings.iter().enumerate() {
+                rows[3 + i] = [
+                    ring.center[0],
+                    ring.center[1],
+                    ring.age,
+                    1.0f32 * (1.0f32 - ring.age / 2.5f32),
+                ];
+            }
+            rows
+        };
+        assert!(
+            radius + width < 5.0,
+            "the fixture's bands leave a gap at the midpoint (radius {radius} + width \
+             {width} vs the 5 m half-separation)"
+        );
+        let (uv, roughen) = ripple_perturbation(&gap_rows, [0.0, 0.0]);
+        assert_eq!(
+            uv,
+            [0.0, 0.0],
+            "inside the bound, outside both bands: the loop's own gate zero"
+        );
+        assert_eq!(roughen, 0.0, "the gap carries no coverage");
 
         // THE EXACT CENTER (dist == 0): the mature ring's radius
         // (≈ 0.79 m) exceeds the width, so the gate itself zeroes
@@ -360,9 +500,16 @@ mod tests {
             young_age += dt;
         }
         let young_faded = 1.0f32 * (1.0f32 - young_age / 2.5f32);
-        let mut young_rows = [[0.0f32; 4]; 2 + engine_core::ripple::RIPPLE_POOL_BOUND];
+        let young_ring = engine_core::ripple::RippleRing {
+            center: [0.0, 0.0],
+            age: young_age,
+            amplitude: 1.0,
+        };
+        let mut young_rows = [[0.0f32; 4]; 3 + engine_core::ripple::RIPPLE_POOL_BOUND];
         young_rows[0] = rows[0];
-        young_rows[2] = [0.0, 0.0, young_age, young_faded];
+        let (young_center, young_bound) = ripple_field_bound(&[young_ring], 0.8, 0.35);
+        young_rows[2] = [young_center[0], young_center[1], young_bound, 0.0];
+        young_rows[3] = [0.0, 0.0, young_age, young_faded];
         let young_radius = 0.8f32 * young_age;
         assert!(
             young_radius < width,
@@ -385,14 +532,15 @@ mod tests {
     /// THE IDENTITY GATE's CPU HALF: the empty field (count 0) is a
     /// BIT-IDENTICAL no-op — the oracle returns exactly
     /// ([0.0, 0.0], 0.0) for every ground point, both for the
-    /// all-zero rows (the never-set uniform) and the realistic
-    /// rainless rows (a live policy's params with count 0 — every
-    /// ring expired; the loop never runs, the params are never
-    /// read).
+    /// all-zero rows (the never-set uniform — the A19 bound row
+    /// included, zeros the count gate never reads) and the
+    /// realistic rainless rows (a live policy's params with count 0
+    /// — every ring expired; the loop never runs, the params are
+    /// never read).
     #[test]
     fn empty_field_is_the_bit_identity() {
-        let zero_rows = [[0.0f32; 4]; 2 + engine_core::ripple::RIPPLE_POOL_BOUND];
-        let mut param_rows = [[0.0f32; 4]; 2 + engine_core::ripple::RIPPLE_POOL_BOUND];
+        let zero_rows = [[0.0f32; 4]; 3 + engine_core::ripple::RIPPLE_POOL_BOUND];
+        let mut param_rows = [[0.0f32; 4]; 3 + engine_core::ripple::RIPPLE_POOL_BOUND];
         param_rows[0] = [0.0, 0.8, 0.35, crate::renderer::RIPPLE_UV_GAIN];
         param_rows[1] = [crate::renderer::RIPPLE_ROUGHEN_GAIN, 0.0, 0.0, 0.0];
         for ground in [
@@ -413,6 +561,317 @@ mod tests {
                 "count 0 skips the loop regardless of the params at {ground:?}"
             );
         }
+    }
+
+    /// THE A19 BATTERY's shared row packer (the test-side twin of
+    /// renderer.rs's pack_ripple_field for the oracle's input — the
+    /// same rows the shader reads: the params row, the shared
+    /// [`ripple_field_bound`] row, the ring rows at rows[3 + i];
+    /// the fade uses the test policy's 2.5 s lifetime, the
+    /// known-answer fixture's own convention).
+    /// `verbatim_loop` inflates the bound radius to INFINITY — the
+    /// early-out never fires, the loop runs ungated: the reference
+    /// arm the equivalence property compares against (a TEST-ONLY
+    /// row form no production pack ever carries).
+    fn a19_rows(
+        rings: &[engine_core::ripple::RippleRing],
+        speed: f32,
+        width: f32,
+        verbatim_loop: bool,
+    ) -> [[f32; 4]; 3 + engine_core::ripple::RIPPLE_POOL_BOUND] {
+        let mut rows = [[0.0f32; 4]; 3 + engine_core::ripple::RIPPLE_POOL_BOUND];
+        rows[0] = [
+            rings.len() as f32,
+            speed,
+            width,
+            crate::renderer::RIPPLE_UV_GAIN,
+        ];
+        let (center, radius) = ripple_field_bound(rings, speed, width);
+        rows[2] = [
+            center[0],
+            center[1],
+            if verbatim_loop { f32::INFINITY } else { radius },
+            0.0,
+        ];
+        for (i, ring) in rings.iter().enumerate() {
+            rows[3 + i] = [
+                ring.center[0],
+                ring.center[1],
+                ring.age,
+                ring.amplitude * (1.0 - ring.age / 2.5),
+            ];
+        }
+        rows
+    }
+
+    /// A deterministic LCG (the sim-side seeded-sweep discipline —
+    /// no rand dependency, bit-for-bit reproducible): returns
+    /// uniform units in [0, 1).
+    struct SeededSweep(u64);
+
+    impl SeededSweep {
+        fn unit(&mut self) -> f32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) as f32 / (1u64 << 31) as f32
+        }
+        /// A symmetric sample in [-scale, scale].
+        fn centered(&mut self, scale: f32) -> f32 {
+            (self.unit() * 2.0 - 1.0) * scale
+        }
+    }
+
+    /// The A19 battery's adversarial field fixtures: layouts aimed
+    /// at the bound's exact corners — the newborn disk (radius 0),
+    /// the near-lifetime ring, the two-ring bbox diagonal (max
+    /// center offset), the four-corner square (every ring at the
+    /// bbox center's diagonal reach), coincident centers, the
+    /// axis-aligned pair (the triangle-inequality equality case —
+    /// the probe direction collinear with the center offset), the
+    /// huge-coordinate field (ULP travel at 10⁴ scale), and seeded
+    /// random fields up to the pool bound.
+    fn a19_fields() -> Vec<Vec<engine_core::ripple::RippleRing>> {
+        let ring = |center: [f32; 2], age: f32| engine_core::ripple::RippleRing {
+            center,
+            age,
+            amplitude: 1.0,
+        };
+        let mut fields = vec![
+            vec![ring([0.0, 0.0], 0.0)],
+            vec![ring([3.25, -7.5], 2.4)],
+            vec![ring([-8.0, -6.0], 1.0), ring([8.0, 6.0], 0.4)],
+            vec![
+                ring([-6.0, -6.0], 0.8),
+                ring([6.0, -6.0], 1.4),
+                ring([-6.0, 6.0], 0.2),
+                ring([6.0, 6.0], 1.9),
+            ],
+            vec![ring([2.5, 9.75], 0.0); engine_core::ripple::RIPPLE_POOL_BOUND],
+            vec![ring([-10.0, 0.0], 1.0), ring([10.0, 0.0], 0.25)],
+            vec![
+                ring([9_999.0, 9_998.0], 0.5),
+                ring([10_001.0, 10_002.0], 1.5),
+                ring([10_000.0, 9_999.0], 0.9),
+            ],
+        ];
+        // The seeded random fields: three shapes (one ring, a
+        // handful, the full pool bound) over the demo policy's
+        // ground scale.
+        for count in [1usize, 5, engine_core::ripple::RIPPLE_POOL_BOUND] {
+            let mut sweep = SeededSweep(0x2545_F491_4F6C_DD1D);
+            let field: Vec<_> = (0..count)
+                .map(|_| {
+                    ring(
+                        [sweep.centered(20.0), sweep.centered(20.0)],
+                        sweep.unit() * 2.4,
+                    )
+                })
+                .collect();
+            fields.push(field);
+        }
+        fields
+    }
+
+    /// The A19 battery's probe set for one field: per ring, the
+    /// adversarial distances (the exact center, the apex, the inner
+    /// and outer band edges — the outer probed just inside the
+    /// gate, `radius + width · (1 − 2⁻¹²)`, the farthest point the
+    /// band admits) along the eight compass directions AND the two
+    /// directions collinear with the bound center (the triangle-
+    /// inequality equality axes), plus a seeded random sweep over
+    /// the wider ground.
+    fn a19_probes(
+        rings: &[engine_core::ripple::RippleRing],
+        speed: f32,
+        width: f32,
+        bound_center: [f32; 2],
+    ) -> Vec<[f32; 2]> {
+        let mut probes = Vec::new();
+        let mut push_at = |center: [f32; 2], dir: [f32; 2], dist: f32| {
+            probes.push([center[0] + dir[0] * dist, center[1] + dir[1] * dist]);
+        };
+        let compass = [
+            [1.0, 0.0],
+            [-1.0, 0.0],
+            [0.0, 1.0],
+            [0.0, -1.0],
+            [1.0, 1.0],
+            [1.0, -1.0],
+            [-1.0, 1.0],
+            [-1.0, -1.0],
+        ];
+        for ring in rings {
+            let radius = speed * ring.age;
+            let mut dirs = compass.to_vec();
+            // The collinear-with-bc axes: toward and away from the
+            // bound center (the equality case's directions).
+            let to_bc = [
+                bound_center[0] - ring.center[0],
+                bound_center[1] - ring.center[1],
+            ];
+            let bc_len = (to_bc[0] * to_bc[0] + to_bc[1] * to_bc[1]).sqrt();
+            if bc_len > 0.0 {
+                dirs.push([to_bc[0] / bc_len, to_bc[1] / bc_len]);
+                dirs.push([-to_bc[0] / bc_len, -to_bc[1] / bc_len]);
+            }
+            for mut dir in dirs {
+                // Normalize (the diagonals arrive unnormalized; the
+                // axis and collinear directions are unit already).
+                let len = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
+                dir = [dir[0] / len, dir[1] / len];
+                push_at(ring.center, dir, 0.0);
+                push_at(ring.center, dir, radius);
+                push_at(ring.center, dir, (radius - width).max(0.0) * 0.999);
+                push_at(ring.center, dir, (radius + width) * (1.0 - 1.0 / 4096.0));
+                push_at(ring.center, dir, (radius + width) * 0.5);
+            }
+        }
+        let mut sweep = SeededSweep(0x0DDB_1A5E_5BAD_1DEA);
+        for _ in 0..64 {
+            probes.push([sweep.centered(30.0), sweep.centered(30.0)]);
+        }
+        probes
+    }
+
+    /// THE A19 NO-FALSE-NEGATIVE PROPERTY (the design §5.5's gate
+    /// boundary — the charter's "no false-negative culling" bar):
+    /// for randomized AND adversarial fields, the packed bound
+    /// NEVER excludes a fragment any ring's band contains — every
+    /// ground point where the verbatim loop produces a non-identity
+    /// contribution must sit inside the bound circle, measured
+    /// through the shader's own dist form (the sqrt-of-dot chain
+    /// the early-out runs). A failure here is the one hazard the
+    /// localization could introduce: an early-out that changes a
+    /// banded fragment's value.
+    #[test]
+    fn the_field_extent_bound_never_culls_a_banded_fragment() {
+        let policies = [(0.8f32, 0.35f32), (3.0, 0.05), (0.1, 1.5)];
+        for (speed, width) in policies {
+            for rings in a19_fields() {
+                let (bound_center, bound_radius) = ripple_field_bound(&rings, speed, width);
+                let rows = a19_rows(&rings, speed, width, true);
+                for probe in a19_probes(&rings, speed, width, bound_center) {
+                    let (uv, roughen) = ripple_perturbation(&rows, probe);
+                    if (uv, roughen) == ([0.0, 0.0], 0.0) {
+                        continue; // an identity output early-outs harmlessly
+                    }
+                    let delta = [probe[0] - bound_center[0], probe[1] - bound_center[1]];
+                    let dist = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+                    assert!(
+                        dist <= bound_radius,
+                        "a banded fragment at {probe:?} (field of {} rings, policy \
+                         {speed}/{width}) sits OUTSIDE the packed bound: dist {dist} > \
+                         radius {bound_radius} — a false-negative cull (the ULP travel \
+                         budget is too tight)",
+                        rings.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE A19 EQUIVALENCE BATTERY (the design §5.5's first bullet,
+    /// the CPU half of the ink gates' digit-for-digit bar): for
+    /// randomized and adversarial fields, fragments inside AND
+    /// outside the bound produce IDENTICAL fragment outputs — the
+    /// oracle with the honest packed bound equals the oracle with
+    /// the verbatim-loop (infinite) bound row at every probe,
+    /// bit-for-bit. This is the identity contract made executable:
+    /// the early-out is value-transparent everywhere it fires.
+    #[test]
+    fn the_early_out_is_value_transparent_against_the_verbatim_loop() {
+        let policies = [(0.8f32, 0.35f32), (3.0, 0.05), (0.1, 1.5)];
+        for (speed, width) in policies {
+            for rings in a19_fields() {
+                let (bound_center, _) = ripple_field_bound(&rings, speed, width);
+                let honest = a19_rows(&rings, speed, width, false);
+                let verbatim = a19_rows(&rings, speed, width, true);
+                for probe in a19_probes(&rings, speed, width, bound_center) {
+                    assert_eq!(
+                        ripple_perturbation(&honest, probe),
+                        ripple_perturbation(&verbatim, probe),
+                        "the early-out changed a fragment's value at {probe:?} (field \
+                         of {} rings, policy {speed}/{width})",
+                        rings.len()
+                    );
+                }
+                // Far-outside probes (the early-out's home ground):
+                // points far beyond any bound still agree, and the
+                // honest arm returns the exact identity there.
+                for probe in [
+                    [100.0, 100.0],
+                    [-100.0, 60.0],
+                    [0.0, -250.0],
+                    [9_000.0, 9_000.0],
+                ] {
+                    assert_eq!(
+                        ripple_perturbation(&honest, probe),
+                        ripple_perturbation(&verbatim, probe),
+                        "a far-outside probe at {probe:?} still matches the verbatim \
+                         loop"
+                    );
+                    assert_eq!(
+                        ripple_perturbation(&honest, probe),
+                        ([0.0, 0.0], 0.0),
+                        "outside every band and bound: the exact identity at {probe:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE A19 VERSIONED-ROW CLAIM's cross-side agreement (the
+    /// design §5.5's "one layout test"): the WGSL struct and the
+    /// Rust-side uniform row count agree — params0, params1, the
+    /// bound row, then the rings array at engine-core's pool bound,
+    /// with [`crate::vulkan::reflection_draw::RIPPLE_UNIFORM_ROWS`]
+    /// == 3 + bound. The shader source is read from the crate's
+    /// shaders directory (the shader_composition tests' own
+    /// pattern); a regression — a struct edit without the packer's
+    /// versioned claim, or the reverse — fails here, not on the
+    /// GPU.
+    #[test]
+    fn the_ripple_uniform_layout_agrees_with_the_shader_struct() {
+        let source = std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("shaders/ground_reflect.wgsl"),
+        )
+        .expect("the shader source reads from the crate's shaders directory");
+        let start = source
+            .find("struct RippleField {")
+            .expect("ground_reflect.wgsl declares its ripple uniform struct (binding 4's block)");
+        let body = &source[start
+            ..source[start..]
+                .find("};")
+                .map(|end| start + end + 2)
+                .expect("the struct closes")];
+        let order = |member: &str| {
+            body.find(member)
+                .unwrap_or_else(|| panic!("the struct declares {member}"))
+        };
+        let params0 = order("params0");
+        let params1 = order("params1");
+        let bound = order("bound");
+        let rings = order("rings");
+        assert!(
+            params0 < params1 && params1 < bound && bound < rings,
+            "the struct's member order is params0, params1, bound, rings (the A19 \
+             versioned claim sits between the params and the ring array)"
+        );
+        assert!(
+            body.contains(&format!(
+                "array<vec4<f32>, {}>",
+                engine_core::ripple::RIPPLE_POOL_BOUND
+            )),
+            "the rings array carries engine-core's pool bound"
+        );
+        assert_eq!(
+            crate::vulkan::reflection_draw::RIPPLE_UNIFORM_ROWS,
+            3 + engine_core::ripple::RIPPLE_POOL_BOUND,
+            "the Rust-side row count: two params rows + the bound row + the rings"
+        );
     }
 
     /// THE PROJECTION TESTS' OWN CAMERA KIT (the finding-19 deciding
@@ -676,10 +1135,20 @@ mod tests {
         // ring line, so the push points AT the center from both
         // sides). The center sits on the road cross, ~8.4 m out.
         let dt = 1.0f32 / 60.0f32;
-        let mut rows = [[0.0f32; 4]; 2 + engine_core::ripple::RIPPLE_POOL_BOUND];
+        let ring = engine_core::ripple::RippleRing {
+            center: [1.0, 7.5],
+            age: dt,
+            amplitude: 1.0,
+        };
+        let mut rows = [[0.0f32; 4]; 3 + engine_core::ripple::RIPPLE_POOL_BOUND];
         rows[0] = [1.0, 0.8, 0.35, crate::renderer::RIPPLE_UV_GAIN];
         let center = [1.0, 7.5];
-        rows[2] = [center[0], center[1], dt, 1.0];
+        // The A19 bound row (the honest single-ring bound: the ring's
+        // own outer band edge around its center — the probes below sit
+        // within 0.05 m of the center, well inside).
+        let (bound_center, bound_radius) = ripple_field_bound(&[ring], 0.8, 0.35);
+        rows[2] = [bound_center[0], bound_center[1], bound_radius, 0.0];
+        rows[3] = [center[0], center[1], dt, 1.0];
         // The asymmetric mirror feature: a vertical edge crossing
         // the ring center's column in the reflected content — dark
         // (0.2) left, bright (0.8) right.
