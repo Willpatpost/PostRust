@@ -25,6 +25,69 @@
 //! size by firing the existing explicit [`Spine::compact`] at the tick
 //! boundary, chunk-bounded per invocation. The default is no policy:
 //! exactly today's behavior, byte for byte.
+//!
+//! # The housekeeping cost model (T08 §2 — the audit's demanded split)
+//!
+//! With execution budget `B`, the admission caps `D`/`F`/`K`
+//! ([`HousekeepingAdmission`]), `n` the pending population, and
+//! `hk ≤ 4.5·B + 4F` the whole-tick housekeeping-unit bound (see
+//! [`housekeeping_cap`]'s ceiling paragraph), the ENGINE-bounded work
+//! per tick is the closed form
+//! `O(B·(F + K·(D + log n)) + hk·D·log n)`:
+//!
+//! | Work class | Per-unit engine cost | Per-tick count bound |
+//! |---|---|---|
+//! | Execution (the drain's execute arm) | ledger push (amortized O(1)), `unfinished` remove O(log n), stats | ≤ B |
+//! | — its atomic waiter release | one O(1) `try_unblock` per registered waiter | ≤ B·F (registered ⊆ declared) |
+//! | — its follow-up admissions | O(D) validation + O(log n) push (cropped at K) | ≤ B·K |
+//! | Park (the drain's park arm) | O(D) unmet scan + ≤ D `waiting_on` inserts (O(log n) each) + O(1) hashed counter insert + O(log n) blocked insert | ≤ Σ allowances ≤ 4.5·B |
+//! | Heap churn | O(log n) per push/pop | ≤ (B + parks + unblocks) · O(log n) |
+//! | Declared-fan-in upkeep | O(1) hashed entry op per site | ≤ B + parks, allocation-free in reserve |
+//! | Stale entries | `NotBlocked` charged (the charge identity); the lifecycle keeps the arm unreachable | 0 in admitted graphs |
+//! | Compaction (T07) | per firing: chunk-bounded SHA-256 + head bump; amortized ≤ one move per discarded record | policy-bounded |
+//! | Class index (CA-08) | O(log n) membership update per transition | ≤ the counts above |
+//!
+//! The `log n` term is the pending population's heap/B-tree depth —
+//! the engine's per-tick work is population-log, never
+//! population-linear (the T09 regional-locality finding is a
+//! different defect and stays open).
+//!
+//! **External handler cost — NOT engine-bounded, stated plainly:**
+//! handler bodies (`World::execute` runs arbitrary user code inside
+//! `execute_now` — the engine bounds its own bookkeeping around the
+//! handler, never the handler); the follow-up count a handler
+//! ATTEMPTS beyond K (the engine admits ≤ K per execution and crops
+//! the rest fail-visibly — the emission effort is the handler's own
+//! cost); and driver-side costs (world fingerprinting, enabled
+//! diagnostics, the driver's own scheduling and retention-consumer
+//! policy).
+//!
+//! # T08 measurement obligations (the next rig window)
+//!
+//! The bounds are landed; these measurements are what actually close
+//! B01, and none is claimed done by the observations above:
+//!
+//! 1. **The 1.5× `[ASSUMPTION]` re-pin** (see [`housekeeping_cap`]):
+//!    the sustained matrix plus adversarial graphs must re-measure
+//!    the housekeeping-per-execution ratio at production fan-in
+//!    mixes and re-pin the multiple under the placeholder protocol.
+//! 2. **The default-cap headroom audit**: D=64/F=4096/K=1024 exceed
+//!    every workspace fixture's observed maximum, but whether
+//!    production worlds fit under them — or prefer tighter caps
+//!    with visible refusals — is driver policy the observability
+//!    (refusal counts, crop counts, backlog slope) makes
+//!    conscious; audit the headroom at the landing measurement.
+//! 3. **The composite per-tick actual at production scale**: the
+//!    batteries pin actuals at fixture scales (≤ 600-herd, 100k
+//!    unrelated); production-scale adversarial composites at the
+//!    §2 ceiling are a rig obligation, not a test-bed claim.
+//! 4. **The declared-vs-registered conservative gap**: F caps
+//!    DECLARED fan-in, not registered — whether the conservative
+//!    gap matters in real workloads is measurable
+//!    (`dependency_registrations` against the map's counts); a
+//!    registered-count cap would reintroduce the park-time
+//!    livelock class and is rejected pending evidence it is
+//!    needed.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
