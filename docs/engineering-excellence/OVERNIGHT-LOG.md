@@ -321,3 +321,13 @@ prior single-platform failures recorded as shared-runner variance (each
 passing in the other runs; the third-occurrence protocol noted).
 **Wave 0 + Wave 1 of the strict-audit-IV campaign are now complete and
 CI-verified at exact heads.**
+
+## E-S2 — the engine-slice animation rewire landed (`5afce2d`)
+
+The lane (`182391c`): a symbol-level map — 41 sites to `engine_animation::`,
+1 to `skinned_humanoid_mesh`'s E-S1 home, 11 deliberate keeps on renderer
+paths (the GPU packing layer + the sin_cos_turn test-oracle re-export).
+Zero count movement (173/0/0 measured identical); the pose FNV pins proven
+by name; the minimal lock delta ratified. The E-S3 recommendation recorded:
+re-point the root re-export (slice touches nothing on the shim's re-export
+surface). Verification run `46142180934` dispatched.
