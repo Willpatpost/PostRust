@@ -378,3 +378,17 @@ reproduced standalone in release). The F-03 lever's animation slice realized
 (−46 crates vs the renderer pre-extraction); the types-only half explicitly
 open. **The owner-approved A06 extraction is fully executed: E-S1..E-S4,
 every stage with its equivalence bars and green runs.**
+
+## T08 — the admission bounds implemented
+
+The lane (three staged commits): the charge identity closed mechanically;
+the D/F/K caps checked before any graph mutation; the twelve batteries
+(the F=8 herd releasing at exactly 8 visits, the 600-storm re-pinned with
+defaults admitting all, the 100k drain within the closed form, the composite
+per-tick ceiling respected); the save/restore byte-identity with the rebuilt
+map. Orchestrator verification: gates re-run (432/0/1 +12, every other
+target identical, allocation pins unmoved); the session.rs deviation
+ratified (additive match arms, disclosed before the edit); the design's
+§7.1 example contradiction resolved to the mechanism. B01
+implemented-pending-measurement — the four obligations recorded. CI pins
+corrected (`c50a62c`: main 1673/1622). Confirming run `46147200290`.
