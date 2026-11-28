@@ -133,7 +133,7 @@ Classes: CONFIRMED (source-derived), HYPOTHESIS (reproduce-or-refute mandated), 
 | T18 | CONFIRMED | A18 | whole-set generation only coarse dirty tracking |
 | T19 | CONFIRMED | A06 | **E-S1 LANDED `f4ce19b`** (lane `c9700eb`, orchestrator-verified: diff scope exact, gates re-run, all four digest pins reproduced, conservation exact); E-S2/E-S3/E-S4 queued as their own lanes; T32's render-types investigation composes after E-S4 |
 | T20 | CONFIRMED direct paths | R02/A19 | numerical admission inconsistent frame/asset boundaries |
-| T21 | CONFIRMED | Q07/CA02 | decode bounds exclude transients; defaults wire max |
+| T21 | CONFIRMED | Q07/CA02 | **LANDED** (lane `adaab2e`+`51006f0`+`a6dfe3a`, FIXED-AWAITING-RE-AUDIT): the total decode-transient budget with every reservation charged at 64-B-granular actual capacity before the request; the whole-input minimum proof (typed, never rejecting valid encodings); the seen-ID BTreeSet replaced by the bounded k-way merge (no dense bitset, no ID-policy change); the public `decode_reservation_bytes` mirror with the off-by-one boundary; v1 fallible reserves; the default's transient arithmetic stated (~1.8× input + ~54 KiB vs the pre-gate ~62×); the red witness inverted (the 5.6×-budget regions reservation now refusing typed before it happens) |
 | T22 | OBLIGATION (open) | A14 | distributed fallible bare-handle ownership ladders |
 | T23 | CONFIRMED-REPORTED | A20/B14/B15 | pool net residency + measurement narrative |
 | T24 | CONFIRMED | A19 | ripple one global circle, not per-region culling |

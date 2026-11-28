@@ -262,3 +262,17 @@ audit: the FSU release-half latch gap and the textures.rs InlineWait
 destination-destruction hazard (verified real). The serialized staged plan
 L1–L5 with the CPU/rig split named per stage. The implementation queues as
 ONE lane (the audit's one-team mandate) behind the memory ceiling.
+
+## T21 — the decode transient/index bounds landed
+
+The lane (red witness `adaab2e` + mechanism `51006f0` + integration witnesses
+`a6dfe3a`): `max_reserve_bytes` is now the total decode-transient budget with
+every reservation charged at 64-B-granular actual capacity before the request;
+the whole-input minimum proof; the seen-ID BTreeSet replaced by a bounded
+k-way merge; the public `decode_reservation_bytes` mirror; v1 fallible
+reserves. Orchestrator verification: gates re-run (the lane's numbers
+reproduced exactly; spine allocation pins unmoved). The housekeeper incident
+reviewed and accepted: the lane's memory-pressure sweep removed three
+COMPLETED lanes' target caches (t01-ci 6.7 GiB, t04 2.32 GiB, t19 1.35 GiB —
+all integrated, no work lost, only cold rebuilds). CI pins corrected
+(`a19c773`: main 1654/1603, lines 37). Confirming run `46138588717`.
