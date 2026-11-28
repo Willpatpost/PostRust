@@ -246,3 +246,7 @@ at 24.45/32 GiB cgroup (page-cache-heavy; no OOM events) — the lane's
 recorded gates + diff review + the dispatched exact-head CI run carry the
 verification; the local re-run queued for when the memory axis eases.
 Confirming run `46133893849` dispatched.
+
+**T05 CI-verified green:** run `46133893849` at `121aa5d` — all five jobs
+success; the main 1650/1599/2/37 and renderer-release 220/3 pin arithmetic
+confirmed on all platforms.
