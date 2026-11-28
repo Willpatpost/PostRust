@@ -528,3 +528,67 @@ own pin inference (233 measured vs 226 inferred from a stale base). Pins:
 main 1692/1641, renderer-release 233. The R2 batch verified green in
 isolation (`46164606020` at `1dcc3cb`); the R1 batch run `46166085364`
 dispatched at `3b4ba23`.
+
+## R3 landed — the follow-up cap's consequence semantics + the work-ceiling claims (T08 follow-up, D-EE-11)
+
+The lane (branch `ee/overnight-r3-followups`, base `e7bde8c`, spine.rs + lib.rs
+re-export + this register/log pair): all three arms closed with witnesses.
+
+Arm 1 (the K crop's consequence semantics) CONFIRMED with the red witness
+captured pre-fix (the contract battery against the absent API: housekeeper exit
+101, 17 compile errors — `FollowUpAdmission`, `try_follow_up`,
+`follow_up_admissions_remaining` all absent; the producer's only crop signals
+publish after the handler returns). Fixed with TYPED ADMISSION + the
+reservation query: `FollowUpAdmission` (`Admitted` / `BeyondAdmissionCap
+{ cap }`, deliberately not `#[must_use]` — the legacy `()`-returning
+`follow_up`/`schedule_at`/`follow_up_in_field` keep byte-identical T08
+semantics for every existing caller, the match-arm call shapes in
+engine-slice's save_demo and tests/common included), the `try_*` mirrors
+refusing typed at emission (synchronous, in-hand, beside the unchanged
+after-the-drain counter + Error-level diagnostic), and
+`ExecCtx::follow_up_admissions_remaining()` publishing the per-execution K
+slots reserved before the handler runs — the transactional pattern (check
+capacity → mutate → emit, refused consequences retained in world state and
+pumped through a later execution's fresh budget) loses nothing: the battery's
+typed handler's six mandatory consequences all exist at K=4 while the legacy
+ignoring handler's two excess ones vanish (the documented defect, unchanged
+for compat). Deterministic deferral (engine-side preservation of over-K
+emissions) PARKED as the owner decision at the enum's doc — the deferral
+queue is new canonical state (wire change) or immediate admission (ceiling
+gone), and it changes gameplay-visible consequence timing; re-open condition:
+an owner ruling for a handler class that cannot restructure under K. The
+closed-form ceiling survives verbatim (admission counts unchanged); the
+allocation pins unmoved; determinism byte-identity pinned in the battery.
+
+Arm 2 (the restored legacy graph exception) CONFIRMED — the module cost model
+claimed the closed form unconditionally while restore admits over-F graphs
+as-is (fail-closed on corruption, never config). CORRECTED: the spine module
+doc + the `HousekeepingAdmission` doc now state the admission-epoch scope
+(runtime tightening never re-bounds admitted obligations; a restored legacy
+save's one-time release bounded by its saved F-shape; no universal
+configured-work ceiling claimed while admitted existing graphs can exceed the
+current caps). The witness pins it live: an 8-fan-in save restored under F=4
+releases exactly 8 visits (no stranding), new declarations refused at 4, the
+defaults control twin identical in executions/fingerprint/save bytes.
+
+Arm 3 (runtime-bound changes) CONFIRMED-AS-DESIGNED and DOCUMENTED:
+`set_admission_bounds` tightening binds future admissions immediately but
+never re-bounds admitted obligations — the witness pins an F=8-admitted herd
+releasing at exactly 8 visits under a tightened F=2, no waiter stranded (the
+E-10 all-or-nothing release preserved; re-checking at the transition would
+strand waiters or mutate canonical state — the design §8 reasoning, now
+recorded at `set_admission_bounds`). The retention-family runtime setters
+censused: a bound change there drops eligibility + the frontier registry,
+fail-closed (R2's lane). Nothing becomes unbounded — the admitted graph's
+work stays a finite, deterministic, observable integer.
+
+Gates (through the housekeeper): fmt clean; clippy `-p engine-core
+--all-targets -D warnings` zero warnings; `cargo test -p engine-core` exit 0 —
+lib 437/0/1 (+3 = the three R3 batteries, every other target identical:
+determinism 2, lanes 10, lod 12, save_corruption 21, save_roundtrip 12,
+spatial_query_allocations 1, spine_allocations 1 pins (18,6880)/(9,3024)
+unmoved, spine_bookkeeping 3, spine_contracts 15, spine_history 12,
+spine_queued_transition_allocations 1, suspension 20, doc-tests 0);
+`cargo check --workspace --all-targets` exit 0, zero warnings (the legacy
+emission API's `()` returns preserved — no engine-slice caller moved). CI pin
+movement for the orchestrator's batch: the main shard's engine-core lib +3.
