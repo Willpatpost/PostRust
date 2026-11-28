@@ -54,7 +54,7 @@
 //! outcome, so a stale `HEAD.tmp` is simply overwritten by the next
 //! publish.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -106,31 +106,13 @@ pub(crate) const MAX_OBJECT_BYTES: u64 = MAX_BYTE_LEN;
 
 /// The ephemeral trusted cursor (§5.3.2) — session-scoped derived
 /// state rebuilt by the cold walk; never persisted to a file.
-struct Cursor {
-    head: Hash,
-    epoch: u64,
-    /// Idempotency keys seen across the chain (session index for O(1)
-    /// duplicate checks at append; O(chain) memory, documented).
-    seen_keys: BTreeSet<Vec<u8>>,
-    /// Every record id and content hash reachable from HEAD.
-    reachable: BTreeSet<Hash>,
-    /// The chain's revision ids alone (dependency resolution requires
-    /// a *prior revision*, never a content hash that happens to be
-    /// reachable).
-    record_ids: BTreeSet<Hash>,
-    /// The reclaim-indexed revisions (identity → epoch) from every
-    /// on-chain MK's index whose records are genuinely absent — the
-    /// historical membership evidence (PP-B3's condition 2: a
-    /// reclaimed revision's key-dedup and depends_on resolution
-    /// survive its deletion). The observational counts (the MK list,
-    /// the reclaimed totals) live on the [`ChainSummary`] the walk
-    /// returns, never on the cursor.
-    reclaimed: BTreeMap<Hash, u64>,
-    founding: Hash,
-    authority: AuthorityMode,
-    campaign_id: String,
-    content_objects: u64,
-}
+/// (P3-L9b) The §5.3.2 ten-field cursor is the SHARED walk core's
+/// [`crate::chain_walk::WalkCursor`]: the field sets the two
+/// providers carried were identical (the same names, types, and
+/// order — the evidence the differential battery's cursor
+/// fingerprint relies on), so the core owns the one definition and
+/// each provider aliases it.
+type Cursor = crate::chain_walk::WalkCursor;
 
 /// The local file-backed canonical medium.
 pub struct LocalFileMedium {
@@ -473,4 +455,28 @@ mod c5b_local_tests;
 mod c5d_local_tests;
 #[cfg(test)]
 mod exclusion_tests;
-use crate::record::{AuthorityMode, RevisionRecord};
+
+/// (P3-L9b) The walk differential battery's observation seams —
+/// test-only, `pub(crate)` so the crate-root battery
+/// (`walk_differential.rs`) can observe this provider's CURRENT walk
+/// forms without widening any production surface: the pure
+/// virtual-exclusion cold walk (its summary plus the established
+/// cursor's Debug fingerprint) and the live trusted cursor's
+/// fingerprint. The fingerprints are comparable across providers
+/// because the cursor field sets are the identical §5.3.2 contract.
+#[cfg(test)]
+impl LocalFileMedium {
+    pub(crate) fn walk_differential_cold(
+        &self,
+        head: Hash,
+        exclude: &BTreeSet<Hash>,
+    ) -> Result<(ChainSummary, String), MediumError> {
+        self.cold_walk_excluding(head, exclude)
+            .map(|(summary, cursor)| (summary, format!("{cursor:?}")))
+    }
+
+    pub(crate) fn walk_differential_cursor(&self) -> Option<String> {
+        self.cursor.as_ref().map(|cursor| format!("{cursor:?}"))
+    }
+}
+use crate::record::RevisionRecord;

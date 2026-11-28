@@ -128,7 +128,7 @@ impl LocalFileMedium {
     // ----------------------------------------------------------- internals
 
     pub(super) fn object_path(&self, hash: &Hash) -> PathBuf {
-        self.root.join(OBJECTS_DIR).join(hash.hex())
+        object_path_at(&self.root, hash)
     }
 
     /// The test-visible object-namespace path (the OC-C1 reader
@@ -138,49 +138,69 @@ impl LocalFileMedium {
     #[cfg(any(test, feature = "composite-test-fixture"))]
     #[doc(hidden)]
     pub fn object_path_pub(&self, hash: &Hash) -> PathBuf {
-        self.root.join(OBJECTS_DIR).join(hash.hex())
+        object_path_at(&self.root, hash)
     }
 
     pub(super) fn load_object(&self, hash: &Hash) -> Result<Vec<u8>, MediumError> {
-        let path = self.object_path(hash);
-        let metadata = fs::metadata(&path).map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => MediumError::MissingObject { hash: *hash },
-            _ => io_err("stat object", &path, e),
-        })?;
-        if metadata.len() > MAX_OBJECT_BYTES {
-            return Err(MediumError::Format(engine_core::SaveError::Limit {
-                section: "object-store",
-                kind: "byte-length",
-                value: metadata.len(),
-                max: MAX_OBJECT_BYTES,
-            }));
-        }
-        let bytes = fs::read(&path).map_err(|e| io_err("read object", &path, e))?;
-        let observed = hash_object(&bytes);
-        if observed != *hash {
-            return Err(MediumError::HashMismatch {
-                expected: *hash,
-                observed,
-                context: "object-store",
-            });
-        }
-        Ok(bytes)
+        load_object_at(&self.root, hash)
     }
 
     /// Loads an object a validation walk reached by reference: a hash
     /// mismatch here is referenced corruption — fail closed with the
     /// specific condition (the file is never replaced or deleted).
     pub(super) fn load_referenced(&self, hash: &Hash) -> Result<Vec<u8>, MediumError> {
-        self.load_object(hash).map_err(|error| match error {
-            MediumError::HashMismatch { .. } => {
-                MediumError::ReferencedObjectCorrupt { hash: *hash }
-            }
-            other => other,
-        })
+        load_referenced_at(&self.root, hash)
     }
     pub(super) fn read_head_file(&self) -> Result<Option<Hash>, MediumError> {
         super::read_head_at(&self.root)
     }
+}
+
+// -------------------------------------------------- the root-path loads
+// (P3-L9b) The free-function forms of the layout's loads — the shared
+// walk core's local reader adapter holds a `&Path` (disjoint from the
+// provider's `&mut` cursor borrow), so the loads are expressed over
+// the root rather than the medium.
+
+/// The content-addressed object path under a store root.
+pub(super) fn object_path_at(root: &Path, hash: &Hash) -> PathBuf {
+    root.join(OBJECTS_DIR).join(hash.hex())
+}
+
+/// The hash-verified object load under a store root.
+pub(super) fn load_object_at(root: &Path, hash: &Hash) -> Result<Vec<u8>, MediumError> {
+    let path = object_path_at(root, hash);
+    let metadata = fs::metadata(&path).map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => MediumError::MissingObject { hash: *hash },
+        _ => io_err("stat object", &path, e),
+    })?;
+    if metadata.len() > MAX_OBJECT_BYTES {
+        return Err(MediumError::Format(engine_core::SaveError::Limit {
+            section: "object-store",
+            kind: "byte-length",
+            value: metadata.len(),
+            max: MAX_OBJECT_BYTES,
+        }));
+    }
+    let bytes = fs::read(&path).map_err(|e| io_err("read object", &path, e))?;
+    let observed = hash_object(&bytes);
+    if observed != *hash {
+        return Err(MediumError::HashMismatch {
+            expected: *hash,
+            observed,
+            context: "object-store",
+        });
+    }
+    Ok(bytes)
+}
+
+/// The referenced-corruption escalation of the object load under a
+/// store root.
+pub(super) fn load_referenced_at(root: &Path, hash: &Hash) -> Result<Vec<u8>, MediumError> {
+    load_object_at(root, hash).map_err(|error| match error {
+        MediumError::HashMismatch { .. } => MediumError::ReferencedObjectCorrupt { hash: *hash },
+        other => other,
+    })
 }
 
 fn platform_tier() -> SyncTier {

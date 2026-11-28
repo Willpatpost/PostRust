@@ -41,6 +41,7 @@ pub mod ancestry_accounting;
 pub mod ancestry_history;
 pub mod ancestry_witness;
 pub mod batch_completion;
+mod chain_walk;
 pub mod checkpoint;
 pub mod composite_append;
 pub mod composite_manifest;
@@ -74,6 +75,8 @@ mod migrate_tests;
 mod sqlite_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod walk_differential;
 
 pub use ancestry_accounting::{
     AccountingCounts, AccountingLimitations, AccountingLimits, Classification,
