@@ -120,6 +120,10 @@ mod staging;
 mod swapchain;
 mod uploads;
 
+// The T03/T16 transaction surface (renderer.rs consumes these
+// through the `vulkan::` path the S4 split froze).
+pub(crate) use staging::UploadTicket;
+
 // The pass-resource family modules (design §5.1's passes row): the
 // files live under `vulkan/passes/` but stay declared HERE — not under
 // a `passes` parent module — so their module paths
@@ -174,7 +178,9 @@ pub(crate) use capture::{
     drain_validation_messages, environment_pending, last_capture_refusal, request_capture,
     request_shadow_readback, take_capture, take_shadow_readback,
 };
-pub(crate) use context::{VulkanContext, device_idle, pick_depth_format, pick_surface_format};
+pub(crate) use context::{
+    QuarantineReconciliation, VulkanContext, device_idle, pick_depth_format, pick_surface_format,
+};
 pub(crate) use frame::{FrameOutcome, FramePolicy, FrameState, InternalFrame, render_frame};
 pub(crate) use pipelines::PipelineState;
 pub(crate) use swapchain::{

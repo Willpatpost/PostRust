@@ -71,7 +71,7 @@
 //! of pipeline assembly with the SAME descriptor set layout as the
 //! lit pipeline (the 6-B foundation; no new bindings).
 
-use super::staging::FlushMode;
+use super::staging::{FlushDisposition, FlushMode};
 use super::{
     RendererError, ScopedMappedBuffer, VulkanContext, create_device_local_buffer_staged,
     create_device_local_buffer_with_data, create_mapped_buffer,
@@ -499,13 +499,26 @@ impl ProxyResources {
             ),
         }?;
         if let Some(batch) = staging_batch.as_mut() {
-            // T16/T03: the flush's TYPED disposition — the `.error()` half is
-            // behavior-identical to the former `?` at this stage
-            // (the partial state's destroy releases the
-            // destinations); L3 lands the in-flight-destination
-            // rule for the SubmittedUnwaited arm.
-            if let Some(error) = batch.flush(FlushMode::InlineWait).error() {
-                return Err(error);
+            // T16/T03: the flush's TYPED disposition. On
+            // `SubmittedUnwaited` the three mesh-VBO destinations are
+            // IN FLIGHT under the ticket (registered with the batch
+            // at their creation; the flush moved the registrations to
+            // the ticket's quarantine) — this partial state must NOT
+            // destroy them: the handles detach here so `release`'s
+            // null destroys are no-ops, and the quarantine releases
+            // them when the ticket completes.
+            match batch.flush(FlushMode::InlineWait) {
+                FlushDisposition::Completed | FlushDisposition::Deferred { .. } => {}
+                FlushDisposition::NotSubmitted(error) => return Err(error),
+                FlushDisposition::SubmittedUnwaited { error, .. } => {
+                    self.npc_vbo = vk::Buffer::null();
+                    self.npc_memory = vk::DeviceMemory::null();
+                    self.vehicle_vbo = vk::Buffer::null();
+                    self.vehicle_memory = vk::DeviceMemory::null();
+                    self.rain_vbo = vk::Buffer::null();
+                    self.rain_memory = vk::DeviceMemory::null();
+                    return Err(error);
+                }
             }
         }
         (self.instances, self.instances_memory, self.instances_mapped) = create_mapped_buffer(

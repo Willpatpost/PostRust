@@ -809,6 +809,181 @@ fn classified_ordered_prefix_poll_keeps_the_stuck_head_bound() {
     );
 }
 
+/// T03/L3 (the transaction's rig leg — the design's §6 L3 row: "the
+/// new `StagingDrainTimeout` witness: attach fails, `scene()` is
+/// `None`, submit with scene refuses typed, retry succeeds on a
+/// healthy device"): the commit-on-readiness order. The knob fires
+/// at the attach's drain — AFTER the deferred batch submitted, WITH
+/// the pipeline group committed — the exact state the pre-fix order
+/// published first (the scene went live behind the `Err`; the CA-01
+/// rollback could not reach it). The transaction instead
+/// QUARANTINES the staged resources under their ticket: no handle
+/// published (`scene()` is `None`), a scene-backed submit refuses
+/// typed, and the RETRY on the healthy device reconciles the
+/// ticket (the fence signaled in the meantime — the T16 typed poll
+/// reports completed), releases the quarantine (the pipeline group
+/// first, then the resources — the census pair equal), and the
+/// attach succeeds and renders validation-clean.
+#[test]
+#[ignore = "requires a real Vulkan device and windows (the rig run: release, serial, archived per E-8)"]
+fn staging_drain_timeout_quarantines_and_the_retry_succeeds() {
+    let _guard = sdl_lock();
+    let (mut app, mut renderer) = lifecycle_renderer("T03 L3 drain timeout transaction");
+    let _ = app.frame();
+    let size = app.window().size_in_pixels();
+    let matrix = lifecycle_matrix(size);
+    // THE FAILED ATTACH: the drain's one-shot timeout, with the
+    // batch already submitted under its ticket.
+    renderer.inject_lifecycle_fault(LifecycleFaultSite::StagingDrainTimeout, 1);
+    match attach_corner_scene(&mut renderer) {
+        Err(engine_renderer::RendererError::InjectedFault(message)) => assert!(
+            message.contains("StagingDrainTimeout"),
+            "the drivable drain timeout: {message}"
+        ),
+        other => panic!("the transaction fails at the drain, got {other:?}"),
+    }
+    // THE PUBLISH-ORDER FIX (the red witness of the pre-fix tree,
+    // which published the scene BEFORE the drain): no handle.
+    assert!(
+        renderer.scene().is_none(),
+        "the drain-failed attach published no handle — the transaction \
+         quarantined instead"
+    );
+    // A scene-backed submit refuses typed (the layers-only shape
+    // still renders — the renderer is usable, outcome (b)).
+    let refused = renderer.submit_frame(corner_submission(
+        &matrix,
+        [0.0, 1.7, 15.0],
+        day_preset(),
+        None,
+        corner_bounds(),
+        None,
+        None,
+        false,
+        None,
+        size,
+    ));
+    match refused {
+        Err(engine_renderer::RendererError::Vulkan(message)) => assert!(
+            message.contains("requires an attached scene"),
+            "the scene-less refusal is typed: {message}"
+        ),
+        other => panic!("the scene-backed submit refuses typed, got {other:?}"),
+    }
+    // The quarantined first attach's census: its group committed
+    // (creations counted, nothing staged-released yet — the
+    // quarantine retains it).
+    let after_failure = renderer.allocations();
+    assert_eq!(
+        after_failure.corner_pipeline_objects, 5,
+        "the first attach's group committed (five objects created)"
+    );
+    assert_eq!(
+        after_failure.corner_pipeline_object_frees, 0,
+        "nothing staged-released yet — the quarantine retains the group"
+    );
+    // THE RETRY (the reconciliation): the knob is one-shot and the
+    // device healthy, so the ticket's fence signaled — the probe
+    // reports completed, the quarantine releases (the group first:
+    // its five objects staged-released), and the SAME description
+    // attaches cleanly on the SAME renderer.
+    let handle = attach_corner_scene(&mut renderer)
+        .unwrap_or_else(|error| panic!("the retry attach must succeed: {error:?}"));
+    assert!(renderer.scene().is_some(), "the handle is live");
+    assert_eq!(
+        handle.material_count as usize,
+        engine_renderer::lit_scene::materials().len(),
+        "the retried attach's handle"
+    );
+    let allocations = renderer.allocations();
+    assert_eq!(
+        allocations.corner_pipeline_object_frees, 5,
+        "the reconciliation released the FIRST group's five objects \
+         (the quarantined resources' dependent pipelines die before the \
+         resources themselves)"
+    );
+    assert_eq!(
+        allocations.corner_pipeline_objects - allocations.corner_pipeline_object_frees,
+        5,
+        "exactly the SECOND group's five objects remain live (committed, \
+         released at end of life outside the census pair)"
+    );
+    // The retried renderer RENDERS: three scene-backed frames (past
+    // both frame slots), validation-clean — the rebuilt group is
+    // complete.
+    for _ in 0..3 {
+        let outcome = submit_plain_scene_frame(&mut renderer, &matrix, size);
+        assert!(outcome.presented, "the retried frame presents");
+    }
+    let stats = renderer.stats();
+    assert_eq!(stats.validation_errors, 0, "{:?}", stats.recent_validation);
+    drop(renderer);
+    drop(app);
+    println!("T03 L3: drain timeout → quarantined (no handle), retry reconciled and attached");
+}
+
+/// T03/L3 (the transaction's NEVER-SIGNALING leg — the design's
+/// rig-deferred row: "`StagingFenceNeverSignals` during attach →
+/// scene never published, quarantine survives, teardown releases"):
+/// the stuck-fence quarantine. The deferred batch's fence never
+/// signals, so the attach's drain times out with the batch IN
+/// FLIGHT — the transaction quarantines (a timeout is not
+/// completion: the in-flight destinations are never destroyed), the
+/// handle is never published, and the RETRY refuses typed at the
+/// reconciliation (the ticket is still pending — outcome (b)'s
+/// retry-supported contract, refused while the upload is genuinely
+/// stuck). The teardown then releases the quarantined resources
+/// under the classified idle's legality proof (the drop completes).
+#[test]
+#[ignore = "requires a real Vulkan device and windows (the rig run: release, serial, archived per E-8)"]
+fn never_signaling_attach_quarantine_survives_and_teardown_releases() {
+    let _guard = sdl_lock();
+    let (mut app, mut renderer) = lifecycle_renderer("T03 L3 never-signaling quarantine");
+    let _ = app.frame();
+    renderer.inject_lifecycle_fault(LifecycleFaultSite::StagingFenceNeverSignals, 1);
+    match attach_corner_scene(&mut renderer) {
+        Err(engine_renderer::RendererError::Vulkan(message)) => assert!(
+            message.contains("staging drain"),
+            "the stuck-fence drain timeout: {message}"
+        ),
+        other => panic!("the never-signaling fence fails the attach's drain, got {other:?}"),
+    }
+    assert!(
+        renderer.scene().is_none(),
+        "the stuck-drain attach published no handle"
+    );
+    // The quarantine survives: the retry REFUSES typed at the
+    // reconciliation (the ticket is still in flight — never
+    // destroyed, never published).
+    match attach_corner_scene(&mut renderer) {
+        Err(engine_renderer::RendererError::Vulkan(message)) => assert!(
+            message.contains("still in flight"),
+            "the reconciliation refuses while the ticket is pending: {message}"
+        ),
+        other => panic!("the retry refuses at the pending quarantine, got {other:?}"),
+    }
+    // The stuck batch's region stays bound (the honest state) and
+    // the quarantined resources survive with it (never destroyed on
+    // the quarantine arm — the in-flight-destination rule at scene
+    // scale).
+    let allocations = renderer.allocations();
+    assert!(
+        allocations.staging_bound_region_bytes > 0,
+        "the never-signaling region stays bound (the quarantine's \
+         resources survive with it)"
+    );
+    let stats = renderer.stats();
+    assert_eq!(stats.validation_errors, 0, "{:?}", stats.recent_validation);
+    // THE TEARDOWN: the classified idle makes the quarantined
+    // resources' and the stuck entries' release legal — the drop
+    // completes (a wedged teardown fails right here).
+    drop(renderer);
+    drop(app);
+    println!(
+        "T03 L3: the never-signaling quarantine survives the retry refusal, teardown releases"
+    );
+}
+
 /// T06/L1 (the lifecycle substrate's rig leg — the design's
 /// LIFECYCLE-T02-T03-T06-T16 §6 L1 row): the CA-13 latch absorbed
 /// into the `RendererLifecycle` state machine keeps every refusal

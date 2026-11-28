@@ -7,7 +7,7 @@
 //! The name keeps its history (the corner was the first — and so
 //! far only — attached scene); the CONTENT is caller data now.
 use super::descriptors::create_sets_sized;
-use super::staging::{FlushDisposition, FlushMode};
+use super::staging::{FlushDisposition, FlushMode, UploadTicket};
 use super::{
     RendererError, SamplerPool, Texture, VulkanContext, create_device_local_buffer_staged,
     create_device_local_buffer_with_data, create_mapped_buffer, shader_layout_pins,
@@ -115,20 +115,32 @@ impl CornerResources {
     /// first; a refusal here never happens for a validated
     /// description, and a construction failure releases exactly
     /// what exists). Partial-failure safe, as ever.
-    pub fn new(ctx: &VulkanContext, description: &SceneDescription) -> Result<Self, RendererError> {
+    ///
+    /// T03 (the transaction): returns the build's DEFERRED batch's
+    /// [`UploadTicket`] too — the identity the attach transaction
+    /// tracks until the drain proves readiness (`None` on the
+    /// pool-unavailable fallback arm, whose per-object uploads
+    /// complete inline).
+    pub fn new(
+        ctx: &VulkanContext,
+        description: &SceneDescription,
+    ) -> Result<(Self, Option<UploadTicket>), RendererError> {
         let mut state = Self::default();
-        if let Err(e) = state.build(ctx, description) {
-            state.destroy(ctx);
-            return Err(e);
-        }
-        Ok(state)
+        let ticket = match state.build(ctx, description) {
+            Ok(ticket) => ticket,
+            Err(e) => {
+                state.destroy(ctx);
+                return Err(e);
+            }
+        };
+        Ok((state, ticket))
     }
 
     fn build(
         &mut self,
         ctx: &VulkanContext,
         description: &SceneDescription,
-    ) -> Result<(), RendererError> {
+    ) -> Result<Option<UploadTicket>, RendererError> {
         let materials = &description.materials;
         self.materials = materials.clone();
         // CA-14/CA-15: the TYPED admission — the same whole
@@ -309,16 +321,18 @@ impl CornerResources {
         // the attach transaction tracks to readiness), and a
         // `NotSubmitted` failure (nothing pending — the submit
         // failed) propagates as before.
+        let mut ticket = None;
         if let Some(batch) = staging_batch.as_mut() {
             match batch.flush(FlushMode::Deferred) {
-                FlushDisposition::Completed | FlushDisposition::Deferred { .. } => {}
+                FlushDisposition::Completed => {}
+                FlushDisposition::Deferred { ticket: flushed } => ticket = Some(flushed),
                 FlushDisposition::NotSubmitted(error) => return Err(error),
                 // Structurally impossible in Deferred mode (no wait
                 // runs); defended anyway — propagate, never swallow.
                 FlushDisposition::SubmittedUnwaited { error, .. } => return Err(error),
             }
         }
-        Ok(())
+        Ok(ticket)
     }
 
     pub fn texture_bytes(&self) -> u64 {

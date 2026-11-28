@@ -22,7 +22,7 @@ use super::resources::{
     ScopedMappedBuffer, create_device_local_buffer_staged, create_device_local_buffer_with_data,
     create_mapped_buffer, create_shader_module,
 };
-use super::staging::FlushMode;
+use super::staging::{FlushDisposition, FlushMode};
 use super::swapchain::SwapchainState;
 use super::{
     FramePolicy, post_draw, proxy_draw, reflection_draw, shadow_draw, skinned_draw, sky_draw,
@@ -368,13 +368,25 @@ impl PipelineState {
             self.scene_ibo = scene_ibo;
             self.scene_ibo_memory = scene_ibo_memory;
             if let Some(batch) = staging_batch.as_mut() {
-                // T16/T03: the flush's TYPED disposition — the `.error()` half is
-                // behavior-identical to the former `?` at this stage
-                // (the partial state's destroy releases the
-                // destinations); L3 lands the in-flight-destination
-                // rule for the SubmittedUnwaited arm.
-                if let Some(error) = batch.flush(FlushMode::InlineWait).error() {
-                    return Err(error);
+                // T16/T03: the flush's TYPED disposition. On
+                // `SubmittedUnwaited` the scene VBO/IBO destinations
+                // are IN FLIGHT under the ticket (registered with the
+                // batch at their creation; the flush moved the
+                // registrations to the ticket's quarantine) — this
+                // partial state must NOT destroy them: the handles
+                // detach here so the construction-failure cleanup's
+                // null destroys are no-ops, and the quarantine
+                // releases them when the ticket completes.
+                match batch.flush(FlushMode::InlineWait) {
+                    FlushDisposition::Completed | FlushDisposition::Deferred { .. } => {}
+                    FlushDisposition::NotSubmitted(error) => return Err(error),
+                    FlushDisposition::SubmittedUnwaited { error, .. } => {
+                        self.scene_vbo = vk::Buffer::null();
+                        self.scene_vbo_memory = vk::DeviceMemory::null();
+                        self.scene_ibo = vk::Buffer::null();
+                        self.scene_ibo_memory = vk::DeviceMemory::null();
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -1670,6 +1682,58 @@ impl PipelineState {
         let group = Self::assemble_corner_pipelines(ctx, corner, render_pass)?;
         group.adopt_into(self);
         Ok(())
+    }
+
+    /// T03 (strict audit IV, §3.2 — the quarantine's retry): releases
+    /// the COMMITTED corner pipeline group. Called when a quarantined
+    /// scene's resources release (the reconciliation's `Released`
+    /// arm): the group's pipelines were built against THAT scene's
+    /// descriptor set layout, and the retry's fresh resources bring a
+    /// FRESH layout — the group must rebuild through
+    /// [`Self::ensure_corner_pipelines`] against it (the non-null
+    /// readiness heuristic below then rebuilds rather than skips).
+    ///
+    /// SAFETY/legality: no command buffer ever BOUND these pipelines —
+    /// the quarantined scene's handle was never published (the frame
+    /// flow's corner paths gate on `ctx.corner`, which the quarantine
+    /// emptied), and the failed attach itself held the renderer's
+    /// `&mut` through the whole transaction. Pipeline objects may be
+    /// destroyed while no pending command buffer references them —
+    /// proven here by construction. The releases count on the CA-01
+    /// census pair (the group Drop's own discipline), so a
+    /// quarantined-then-retried attach leaves the pair equal, the
+    /// same proof a rolled-back attach carries.
+    pub(crate) fn release_corner_group(&mut self, ctx: &VulkanContext) {
+        // SAFETY: the handles are this state's own (adopted from the
+        // group's commit); the null-handle destroys are no-ops per
+        // the spec's destroy semantics.
+        unsafe {
+            ctx.device.destroy_pipeline(self.lit_pipeline, None);
+            ctx.device.destroy_pipeline_layout(self.lit_layout, None);
+            ctx.device.destroy_pipeline(self.proxy_pipeline, None);
+            ctx.device.destroy_pipeline(self.rain_pipeline, None);
+            ctx.device.destroy_pipeline_layout(self.proxy_layout, None);
+        }
+        if self.lit_pipeline != vk::Pipeline::null() {
+            ctx.record_corner_pipeline_object_free();
+        }
+        if self.lit_layout != vk::PipelineLayout::null() {
+            ctx.record_corner_pipeline_object_free();
+        }
+        if self.proxy_pipeline != vk::Pipeline::null() {
+            ctx.record_corner_pipeline_object_free();
+        }
+        if self.rain_pipeline != vk::Pipeline::null() {
+            ctx.record_corner_pipeline_object_free();
+        }
+        if self.proxy_layout != vk::PipelineLayout::null() {
+            ctx.record_corner_pipeline_object_free();
+        }
+        self.lit_pipeline = vk::Pipeline::null();
+        self.lit_layout = vk::PipelineLayout::null();
+        self.proxy_pipeline = vk::Pipeline::null();
+        self.rain_pipeline = vk::Pipeline::null();
+        self.proxy_layout = vk::PipelineLayout::null();
     }
 
     pub(crate) fn destroy(&mut self, ctx: &VulkanContext) {

@@ -295,9 +295,16 @@ pub(super) fn create_device_local_buffer_staged(
             .map_err(|error| RendererError::vk(error, "bind_buffer_memory"))?;
         // The pooled staging: one region in the shared backing, one
         // recorded copy — the bytes and the destination semantics
-        // identical to the per-object path's pair-and-copy.
+        // identical to the per-object path's pair-and-copy. T03 §3.3:
+        // the DESTINATION registers with the open batch — on a
+        // `SubmittedUnwaited` flush the registration moves to the
+        // ticket's quarantine (the caller is then forbidden to
+        // destroy these handles: a submitted copy may still reference
+        // them); on every other disposition the registration is
+        // discarded (the caller owns the pair).
         let region = batch.stage(data)?;
         batch.record_buffer_copy(buffer, 0, region);
+        batch.register_destination(super::staging::StagingDestination::Buffer { buffer, memory });
         Ok(())
     })();
     match result {

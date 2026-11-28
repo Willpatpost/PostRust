@@ -44,25 +44,33 @@ impl Texture {
                 let texture = Self::upload_pooled(batch, ctx, format, extent, texels)?;
                 // T16/T03: the flush's TYPED disposition — the
                 // cleanup decision depends on whether the batch is
-                // PENDING. `NotSubmitted` (nothing pending — the
-                // submit failed, or the wait proved completion before
-                // a poll surfaced device health) keeps today's
-                // destroy. `SubmittedUnwaited` (the batch IS in
-                // flight) keeps today's destroy AT THIS STAGE; L3
-                // lands the in-flight-destination rule (the
-                // textures.rs:41–48 hazard — the destination hands
-                // off to the ticket's quarantine instead).
+                // PENDING.
                 match batch.flush(FlushMode::InlineWait) {
                     FlushDisposition::Completed => Ok(texture),
-                    FlushDisposition::NotSubmitted(error)
-                    | FlushDisposition::SubmittedUnwaited { error, .. } => {
+                    // Nothing pending references the destination (the
+                    // submit failed, or the wait proved completion
+                    // before a poll surfaced device health): today's
+                    // destroy is correct.
+                    FlushDisposition::NotSubmitted(error) => {
                         // The partial texture must not survive its
-                        // never-submitted or (at this stage) stuck
-                        // upload.
+                        // never-submitted upload.
                         let mut texture = texture;
                         texture.destroy(ctx);
                         Err(error)
                     }
+                    // T03 §3.3 — THE IN-FLIGHT-DESTINATION RULE (the
+                    // textures.rs:41–48 hazard, the audit's cleanest
+                    // existing form): the batch IS in flight and the
+                    // destination is registered with the ticket's
+                    // QUARANTINE (the flush moved it) — a submitted
+                    // copy may still reference the image. Do NOT
+                    // destroy; the quarantine releases the handles
+                    // when the ticket completes (the drain sweep) or
+                    // at the teardown's classified idle. The error
+                    // propagates; the abandoned `texture` value
+                    // carries no destructor, so the handles live on
+                    // under the quarantine's ownership exactly once.
+                    FlushDisposition::SubmittedUnwaited { error, .. } => Err(error),
                     // Structurally impossible: only the Deferred arm
                     // constructs this variant, and no wait runs here.
                     FlushDisposition::Deferred { .. } => {
@@ -215,6 +223,17 @@ impl Texture {
                 .device
                 .create_image_view(&view_info, None)
                 .map_err(|e| RendererError::vk(e, "create texture view"))?;
+            // T03 §3.3: the destination registers with the open
+            // batch — on a `SubmittedUnwaited` flush the registration
+            // moves to the ticket's quarantine (the caller is then
+            // forbidden to destroy the texture: a submitted copy may
+            // still reference the image); on every other disposition
+            // the registration is discarded (the caller owns it).
+            batch.register_destination(super::staging::StagingDestination::Image {
+                image: texture.image,
+                memory: texture.memory,
+                view: texture.view,
+            });
             Ok(())
         })();
         if let Err(e) = result {

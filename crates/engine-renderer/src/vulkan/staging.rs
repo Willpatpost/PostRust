@@ -231,10 +231,7 @@ struct InFlight {
     end: vk::DeviceSize,
     /// The pool-minted monotonic batch id — the ticket's identity
     /// half (unique per flush, never reused: the id, not the fence
-    /// handle, is what a quarantined upload tracks). Consumed by the
-    /// ticket completion check (L3's quarantine reconciliation reads
-    /// it through [`VulkanContext::staging_ticket_completed`]).
-    #[allow(dead_code)]
+    /// handle, is what a quarantined upload tracks).
     batch: u64,
 }
 
@@ -283,20 +280,66 @@ pub(crate) enum FlushDisposition {
     },
 }
 
-impl FlushDisposition {
-    /// The error half, if any (the disposition's caller-facing
-    /// failure): `NotSubmitted` and `SubmittedUnwaited` carry one,
-    /// the success arms none. The pooled builders whose partial
-    /// states already destroy their destinations on failure use this
-    /// to keep the `?` shape.
-    pub(crate) fn error(&self) -> Option<RendererError> {
-        match self {
-            Self::Completed | Self::Deferred { .. } => None,
-            Self::NotSubmitted(error) | Self::SubmittedUnwaited { error, .. } => {
-                Some(error.clone())
+/// T03 §3.3 / T16 §5.3: one DESTINATION handed to the ticket's
+/// quarantine — the raw handles of a resource whose upload is IN
+/// FLIGHT under the ticket (a submitted copy may still reference
+/// it). Created beside an open batch through
+/// [`StagingBatch::register_destination`]; moved to the pool's
+/// quarantine by the flush's `SubmittedUnwaited` arm (the caller is
+/// then FORBIDDEN to destroy it — the textures.rs:41–48 hazard's
+/// rule); released when the ticket completes (the drain's sweep) or
+/// at the teardown's classified idle.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StagingDestination {
+    Buffer {
+        buffer: vk::Buffer,
+        memory: vk::DeviceMemory,
+    },
+    Image {
+        image: vk::Image,
+        memory: vk::DeviceMemory,
+        view: vk::ImageView,
+    },
+}
+
+impl StagingDestination {
+    /// Releases the destination's handles. SAFETY/legality: the
+    /// owning ticket's fence signaled (the drain sweep proved it) or
+    /// the teardown's classified idle completed (or was
+    /// loss-abandoned) — no pending submission reads these handles.
+    /// Null handles (a caller's partial state) are no-ops per the
+    /// spec's destroy semantics.
+    fn release(self, ctx: &VulkanContext) {
+        unsafe {
+            match self {
+                Self::Buffer { buffer, memory } => {
+                    ctx.device.destroy_buffer(buffer, None);
+                    ctx.device.free_memory(memory, None);
+                }
+                Self::Image {
+                    image,
+                    memory,
+                    view,
+                } => {
+                    ctx.device.destroy_image_view(view, None);
+                    ctx.device.destroy_image(image, None);
+                    ctx.device.free_memory(memory, None);
+                }
             }
         }
     }
+}
+
+/// One quarantined upload: the destinations abandoned to a ticket
+/// whose inline wait failed (T03 §3.3) — retained until the ticket
+/// completes, never destroyed by the abandoning caller.
+struct QuarantinedUpload {
+    /// The upload's identity (diagnostic: the landed sweep releases
+    /// at FULL drain/teardown, where every ticket completed — a
+    /// future per-ticket streaming sweep reads this).
+    #[allow(dead_code)]
+    ticket: UploadTicket,
+    destinations: Vec<StagingDestination>,
 }
 
 /// The device-lifetime staging pool, owned by the
@@ -328,6 +371,12 @@ pub(crate) struct StagingPool {
     /// loudly).
     batch_open: bool,
     growth_events: u64,
+    /// T03 §3.3 / T16 §5.3: the destination QUARANTINE — uploads
+    /// whose inline wait failed (the `SubmittedUnwaited` arm), their
+    /// destinations retained under the ticket until it completes
+    /// (the drain sweep) or the teardown's classified idle releases
+    /// them. Normally empty; bounded by the flush-failure rate.
+    quarantine: Vec<QuarantinedUpload>,
     /// §5.4: the teardown idle's classification, recorded — the
     /// destroy path cannot propagate, but the audit's "don't assert
     /// device_idle succeeded when result was ignored" is answered
@@ -349,6 +398,7 @@ impl StagingPool {
             batch_ids: 0,
             batch_open: false,
             growth_events: 0,
+            quarantine: Vec::new(),
             last_destroy_idle: std::cell::Cell::new(None),
         }
     }
@@ -454,6 +504,13 @@ impl StagingPool {
     /// stay bound — the honest state: an unsignaled fence means the
     /// bytes are not provably free) and the error propagates.
     fn drain(&mut self, ctx: &VulkanContext) -> Result<(), RendererError> {
+        // T03's drivable fault knob (the design's §6 L3 row): fires
+        // BEFORE the wait, with the batch already submitted and in
+        // flight under its ticket — the exact state the attach
+        // transaction must QUARANTINE rather than roll back over.
+        // One-shot like every lifecycle site; a healthy device's
+        // retry then reconciles the ticket as completed.
+        ctx.check_lifecycle_fault(crate::LifecycleFaultSite::StagingDrainTimeout)?;
         while let Some(entry) = self.in_flight.front().cloned() {
             let wait_started = std::time::Instant::now();
             // SAFETY: the fence is owned by the in-flight entry.
@@ -534,6 +591,15 @@ impl StagingPool {
                     };
                 }
                 Err(error) => return Err(RendererError::vk(error, "staging drain")),
+            }
+        }
+        // T03 §3.3: the drain completed EVERY in-flight ticket — the
+        // destination quarantine's retained uploads are all complete
+        // now, so their handles release (the abandoning callers
+        // never destroyed them; this is their single release).
+        for quarantined in self.quarantine.drain(..) {
+            for destination in quarantined.destinations {
+                destination.release(ctx);
             }
         }
         Ok(())
@@ -647,6 +713,14 @@ impl StagingPool {
                     .free_command_buffers(self.command_pool, &[entry.command]);
             }
         }
+        // T03 §3.3: the quarantined destinations release under the
+        // same legality proof (the idle above completed every
+        // submission, or was loss-abandoned).
+        for quarantined in self.quarantine.drain(..) {
+            for destination in quarantined.destinations {
+                destination.release(ctx);
+            }
+        }
         if let Some(backing) = self.backing.take() {
             // SAFETY: the mapping and the objects are the pool's own;
             // no submission reads them (idled above or never created).
@@ -690,6 +764,11 @@ pub(crate) struct StagingBatch<'a> {
     /// The bump frontier at begin — the abort rollback point.
     start: vk::DeviceSize,
     records: Vec<StagingRecord>,
+    /// T03 §3.3: the destinations created beside this batch (the
+    /// pooled helpers register them as they create) — moved to the
+    /// ticket's quarantine by the flush's `SubmittedUnwaited` arm;
+    /// discarded on every other disposition (the caller owns them).
+    destinations: Vec<StagingDestination>,
     closed: bool,
 }
 
@@ -751,6 +830,17 @@ impl<'a> StagingBatch<'a> {
         }
         pool.committed = needed_end;
         Ok(StagedRegion { offset, len })
+    }
+
+    /// T03 §3.3: registers a DESTINATION created beside this batch —
+    /// the raw handles of a resource the batch's copies write. On
+    /// the flush's `SubmittedUnwaited` arm the registration moves to
+    /// the ticket's quarantine (the caller is then forbidden to
+    /// destroy the handles: a submitted copy may still reference
+    /// them); on every other disposition the registration is
+    /// discarded (the caller owns the destination).
+    pub(crate) fn register_destination(&mut self, destination: StagingDestination) {
+        self.destinations.push(destination);
     }
 
     /// Records one whole-region buffer copy (the per-object helper's
@@ -986,23 +1076,47 @@ impl<'a> StagingBatch<'a> {
                                     Err(error) => FlushDisposition::NotSubmitted(error),
                                 }
                             }
-                            FenceTimeoutClass::Stuck => FlushDisposition::SubmittedUnwaited {
-                                error: RendererError::Vulkan(format!(
-                                    "staging upload: fence wait timed out after {} ns \
+                            FenceTimeoutClass::Stuck => {
+                                // T03 §3.3: the destinations created
+                                // beside this batch move to the
+                                // ticket's QUARANTINE — the caller is
+                                // forbidden to destroy them (a
+                                // submitted copy may still reference
+                                // them; a timeout is not completion).
+                                let destinations = std::mem::take(&mut self.destinations);
+                                if !destinations.is_empty() {
+                                    pool.quarantine.push(QuarantinedUpload {
+                                        ticket,
+                                        destinations,
+                                    });
+                                }
+                                FlushDisposition::SubmittedUnwaited {
+                                    error: RendererError::Vulkan(format!(
+                                        "staging upload: fence wait timed out after {} ns \
                                          (a stuck upload submission; constructing a fresh \
                                          renderer is the supported path)",
-                                    super::WAIT_TIMEOUT_NS
-                                )),
-                                ticket,
-                            },
-                            FenceTimeoutClass::DeviceLost => FlushDisposition::SubmittedUnwaited {
-                                error: RendererError::DeviceLost {
-                                    operation:
-                                        "get_fence_status (staging inline wait, after timeout)"
-                                            .into(),
-                                },
-                                ticket,
-                            },
+                                        super::WAIT_TIMEOUT_NS
+                                    )),
+                                    ticket,
+                                }
+                            }
+                            FenceTimeoutClass::DeviceLost => {
+                                let destinations = std::mem::take(&mut self.destinations);
+                                if !destinations.is_empty() {
+                                    pool.quarantine.push(QuarantinedUpload {
+                                        ticket,
+                                        destinations,
+                                    });
+                                }
+                                FlushDisposition::SubmittedUnwaited {
+                                    error: RendererError::DeviceLost {
+                                        operation:
+                                            "get_fence_status (staging inline wait, after timeout)"
+                                                .into(),
+                                    },
+                                    ticket,
+                                }
+                            }
                             FenceTimeoutClass::PollError(error) => FlushDisposition::NotSubmitted(
                                 RendererError::vk(error, "get_fence_status (staging inline wait)"),
                             ),
@@ -1231,6 +1345,7 @@ impl VulkanContext {
             ctx: self,
             start,
             records: Vec::new(),
+            destinations: Vec::new(),
             closed: false,
         }))
     }
@@ -1239,13 +1354,6 @@ impl VulkanContext {
     /// read — `Pressure` appears here only transiently between the
     /// failed begin and the retry; the stored states are `Available`,
     /// the sticky `UnsupportedMemory`, and the latched `Terminal`).
-    // Consumed by L3's transaction (the quarantine reconciliation
-    // consults the pool state beside the ticket poll).
-    #[allow(dead_code)]
-    pub(crate) fn staging_availability(&self) -> StagingAvailability {
-        self.staging.borrow().availability.clone()
-    }
-
     /// T16 §5.3 / T03 §3.3: the ticket's completion check — the T16
     /// typed poll over the ticket's own fence. `Ok(true)` when the
     /// batch completed (the fence signaled, or the entry already
@@ -1254,8 +1362,6 @@ impl VulkanContext {
     /// classified poll failure (a typed loss propagates — the T06
     /// composition). The quarantine's re-drain and the teardown
     /// release both consume THIS check.
-    // Consumed by L3's transaction (the quarantine reconciliation).
-    #[allow(dead_code)]
     pub(crate) fn staging_ticket_completed(
         &self,
         ticket: UploadTicket,
@@ -1290,15 +1396,6 @@ impl VulkanContext {
                 "get_fence_status (upload ticket completion check)",
             )),
         }
-    }
-
-    /// §5.4: the teardown idle's recorded classification (the
-    /// staging destroy path's diagnostic surface — `None` in the
-    /// ordinary teardown).
-    // Consumed by L3's observability surface.
-    #[allow(dead_code)]
-    pub(crate) fn staging_destroy_idle_failure(&self) -> Option<RendererError> {
-        self.staging.borrow().last_destroy_idle.take()
     }
 
     /// Waits every in-flight staging batch (the DEFERRED flushes'
@@ -1464,47 +1561,6 @@ mod staging_pool_seam_tests {
             classify_backing_failure(&RendererError::InjectedFault("StagingBacking".into())),
             StagingAvailability::Pressure(_)
         ));
-    }
-
-    /// T16/T03: the disposition's error half — the success arms
-    /// (`Completed`, `Deferred`) carry none, both failure arms carry
-    /// their error (the caller-facing failure surface the pooled
-    /// builders propagate).
-    #[test]
-    fn the_flush_dispositions_error_half_maps_only_the_failures() {
-        use super::{FlushDisposition, UploadTicket};
-        use crate::vulkan::RendererError;
-
-        let ticket = UploadTicket {
-            batch: 1,
-            fence: ash::vk::Fence::null(),
-        };
-        assert_eq!(
-            FlushDisposition::Completed.error(),
-            None,
-            "a completed batch carries no error"
-        );
-        assert_eq!(
-            FlushDisposition::Deferred { ticket }.error(),
-            None,
-            "a deferred batch carries no error"
-        );
-        let not_submitted = RendererError::Vulkan("staging batch submit: ...".into());
-        assert_eq!(
-            FlushDisposition::NotSubmitted(not_submitted.clone()).error(),
-            Some(not_submitted),
-            "a not-submitted flush carries its error"
-        );
-        let stuck = RendererError::Vulkan("staging upload: fence wait timed out".into());
-        assert_eq!(
-            FlushDisposition::SubmittedUnwaited {
-                error: stuck.clone(),
-                ticket,
-            }
-            .error(),
-            Some(stuck),
-            "an in-flight-unwaited flush carries its error"
-        );
     }
 }
 
