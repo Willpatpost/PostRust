@@ -1,12 +1,12 @@
 //! The shared live, capture and benchmark presentation path for the courtyard.
 use engine_core::{
     AttackProfile, AttackRequest, CameraMode, CameraPose, Combatant, WeaponId, look_direction,
-    resolve_attack,
 };
 use engine_renderer::{FrameResult, Renderer, RendererError, SceneLayer, scene::SceneVertex};
 use engine_shell::Cue;
 use std::time::Duration;
 
+use crate::combat_adoption::FireRoster;
 use crate::encounter_demo::{
     EncounterDemo, EncounterOutcome, EncounterPhase, PLAYER_ID, build_arena, encounter_targets,
 };
@@ -131,6 +131,17 @@ impl EncounterFrame {
             };
             if self.sight.as_ref().is_none_or(|(prev, _)| *prev != key) {
                 encounter_targets(&mut self.targets, demo.spine.world());
+                // F09 (Q04) — the indexed-query ADOPTION BOUNDARY at
+                // the sight composition: the roster is THIS key's
+                // (rebuilt per changed SightKey — the bodies move),
+                // carrying ONE trace. Both gate halves decline
+                // (roster 1–4 far below the composition's roster
+                // gate; queries 1 below its query gate), so the seam
+                // keeps the exact linear resolver — bit-identical by
+                // the same-call identity; a scaled composition
+                // adopts the CombatIndex through this same call (see
+                // `combat_adoption`).
+                let roster = FireRoster::for_revision(&self.targets, 1);
                 let range = match weapon {
                     WeaponId::Precision => demo.config().weapon_range,
                     WeaponId::Spread => demo.config().spread_range,
@@ -144,7 +155,7 @@ impl EncounterFrame {
                         occlusion_margin: 0.,
                     },
                 };
-                let hit = resolve_attack(demo.driver.world(), &request, &self.targets);
+                let hit = roster.resolve(demo.driver.world(), &request);
                 self.sight = hit.endpoint(origin, aim, range).map(|point| (key, point));
             }
             if let Some((_, p)) = &self.sight {

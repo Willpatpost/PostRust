@@ -43,11 +43,12 @@ use engine_core::clock::Tick;
 use engine_core::event::{Event, EventClass, EventId, EventSpec, Field, Schedule};
 use engine_core::fingerprint::Fingerprinter;
 use engine_core::lod::LodLevel;
-use engine_core::npc_execution::enumerate_witnesses;
+use engine_core::npc_execution::{enumerate_witnesses, enumerate_witnesses_indexed};
 use engine_core::npc_memory::{
     CaptureOutcome, ClassifyOutcome, ConfirmOutcome, MemoryDelta, MemoryKey, MemoryKind,
     MemoryLane, MemoryRecord,
 };
+use engine_core::npc_perception::CensusIndexScratch;
 use engine_core::npc_perception::NpcRecord;
 use engine_core::npc_perception::perception_budget;
 use engine_core::spine::{ExecCtx, ObligationView, ScheduleError, Spine, World};
@@ -70,6 +71,22 @@ pub const MEMORY_REGIONS: usize = 4;
 /// design §5.1's measured-trigger clause: the linear census is exact
 /// and cheap here; any future index is a measured decision).
 pub const MEMORY_POPULATION: usize = 24;
+
+/// The census queries one adoption batch can serve at THIS
+/// composition (F09/Q04's measured input): the spine executes events
+/// ONE AT A TIME (`World::execute` has no per-tick batch hook), and
+/// each encounter event runs exactly ONE census, so the batch this
+/// composition can present to the census adoption gate
+/// (`CensusIndexScratch::build_if_advisable`) is a single query —
+/// the handle borrows the world's scratch and cannot outlive the
+/// event. The population half of the gate declines at the authored
+/// 24-record corner scale regardless (24 < 512 — the design §2.2.3's
+/// "the linear path is sub-timer-resolution and wins forever"), and
+/// the query half (1 < 4) would decline independently; a scaled
+/// census composition adopts through the same seam when it presents
+/// a per-tick batch (the engine-side batch hook is the recorded
+/// follow-up).
+const CENSUS_BATCH_QUERIES: u64 = 1;
 
 /// The NPCs per region (the population's layout constant).
 pub const REGION_NPCS: usize = MEMORY_POPULATION / MEMORY_REGIONS;
@@ -306,6 +323,12 @@ pub struct MemoryLaneWorld {
     pub levels: [LodLevel; MEMORY_REGIONS],
     pub encounter_log: Vec<Encounter>,
     census: Vec<u32>,
+    /// The census index scratch (F-02's caller-held buffers, F09's
+    /// adoption-seam carrier): retained for the world's lifetime,
+    /// touched only when the adoption gate builds (never at the
+    /// corner scale — `build_if_advisable` declines before the
+    /// buffers, so the field costs nothing there).
+    census_scratch: CensusIndexScratch,
     pub executed_encounters: u64,
     pub unknown_payloads: u64,
     pub last_tick: Tick,
@@ -319,6 +342,7 @@ impl MemoryLaneWorld {
             levels: [LodLevel::Full; MEMORY_REGIONS],
             encounter_log: Vec::new(),
             census: Vec::new(),
+            census_scratch: CensusIndexScratch::new(),
             executed_encounters: 0,
             unknown_payloads: 0,
             last_tick: Tick(0),
@@ -379,7 +403,27 @@ impl World for MemoryLaneWorld {
 
         let place_pos = PLACES[place as usize];
         let radius = ENCOUNTER_TABLE[kind as usize - 1].radius;
-        enumerate_witnesses(place_pos, radius, &POPULATION, &tiers, &mut self.census);
+        // F09 (Q04) — the indexed-query ADOPTION BOUNDARY at the
+        // census composition: the reusable scratch (F-02) consults
+        // the gate with THIS composition's measured batch shape
+        // (the static 24-record population; one census per event —
+        // `CENSUS_BATCH_QUERIES`). Both halves decline at the corner
+        // scale, so the exact linear census runs — bit-identical to
+        // the pre-F09 behavior by the same-call identity (the gate
+        // declines before the scratch buffers are touched, so the
+        // declined arm costs two integer compares). The indexed arm
+        // is the wired sibling a scaled composition adopts through
+        // (its equivalence at this composition's own filter shape is
+        // pinned in the tests below).
+        match self
+            .census_scratch
+            .build_if_advisable(&POPULATION, CENSUS_BATCH_QUERIES)
+        {
+            Some(mut index) => {
+                enumerate_witnesses_indexed(place_pos, radius, &mut index, &tiers, &mut self.census)
+            }
+            None => enumerate_witnesses(place_pos, radius, &POPULATION, &tiers, &mut self.census),
+        }
 
         // The authored actor rule (POLICY): the encounter's subject is
         // the region-local NPC the event id selects — deterministic,
@@ -1989,6 +2033,139 @@ mod tests {
             altercation_cross,
             vec![5, 17],
             "Altercation reaches only the two exact-boundary cross-region witnesses (inclusive)"
+        );
+    }
+
+    /// F09 (Q04) — the census adoption boundary's DECISION at this
+    /// composition, pinned with the measured counts: BOTH gate
+    /// halves decline at the corner scale. The population half
+    /// (24 < 512) declines at ANY query count — the authored scale's
+    /// permanent decision (design §2.2.3's "wins forever"); the
+    /// query half (1 per event — the spine's per-event cadence,
+    /// `CENSUS_BATCH_QUERIES`) would decline independently. The
+    /// engine gate's own boundary and adoption quadrant are pinned
+    /// beside them (the wired arm's reachability).
+    #[test]
+    fn census_adoption_boundary_declines_at_the_corner_scale() {
+        use engine_core::npc_perception::census_index_advisable;
+        assert!(
+            !census_index_advisable(MEMORY_POPULATION, CENSUS_BATCH_QUERIES),
+            "the corner scale declines at the measured batch shape (24 records, 1 query)"
+        );
+        assert!(
+            !census_index_advisable(MEMORY_POPULATION, u64::MAX),
+            "the population half alone declines — no query count adopts at 24 records"
+        );
+        assert!(
+            !census_index_advisable(MEMORY_POPULATION - 1, u64::MAX),
+            "the engine gate's boundary holds below 512"
+        );
+        assert!(
+            census_index_advisable(512, 4),
+            "the engine gate's adoption quadrant (the wired arm's reachability)"
+        );
+        assert!(
+            !census_index_advisable(512, 3),
+            "the query half below 4 declines at the adoption population"
+        );
+    }
+
+    /// F09 (Q04) — the wired arm's EQUIVALENCE at this composition's
+    /// own policy shape: the indexed census
+    /// (`enumerate_witnesses_indexed` through a built
+    /// `CensusIndexScratch` — the exact `Some` arm `execute` wires)
+    /// vs the exact linear census, at a population laid out in the
+    /// corner's own pattern (region clusters of six at translated
+    /// places, 6 m spacing — the cross-region adjacency class the
+    /// authored 24 carry), at the authored encounter radii, with the
+    /// tier mix including dormant regions (the I2 gate through the
+    /// arm). The build here is the test/battery CONTROL
+    /// (`CensusIndexScratch::build`, unconditional — the composition
+    /// gate itself is pinned above): the arm a scaled composition
+    /// adopts through must produce the IDENTICAL witness sets.
+    #[test]
+    fn census_indexed_arm_matches_linear_at_the_composition_filter() {
+        // The scaled layout: 128 regions × 6 NPCs at the corner's
+        // own local offsets around 6 m-spaced places (the grid
+        // pattern the authored population carries; ids in region
+        // order like the authored 24).
+        const REGIONS: usize = 128;
+        const SCALED_POP: usize = REGIONS * REGION_NPCS;
+        let local = [
+            [0.5, 0.0],
+            [0.75, 0.75],
+            [0.0, 1.5],
+            [-1.25, 1.25],
+            [-2.5, 0.0],
+            [3.0, 0.0],
+        ];
+        let mut population = Vec::with_capacity(SCALED_POP);
+        for region in 0..REGIONS {
+            let place = [(region % 32) as f32 * 6.0, (region / 32) as f32 * 6.0];
+            for (offset, record) in local.iter().enumerate() {
+                population.push(NpcRecord {
+                    id: ((region * REGION_NPCS) + offset) as u32,
+                    pos: [place[0] + record[0], place[1] + record[1]],
+                });
+            }
+        }
+        // The tier mix: every third region Simplified, every third
+        // Dormant (the zero-budget exclusion through the arm), the
+        // rest Full — the composition's own tier-gating shape.
+        let tiers: Vec<LodLevel> = (0..SCALED_POP)
+            .map(|i| match (i / REGION_NPCS) % 3 {
+                0 => LodLevel::Full,
+                1 => LodLevel::Simplified,
+                _ => LodLevel::Dormant,
+            })
+            .collect();
+        let mut scratch = CensusIndexScratch::new();
+        let mut linear = Vec::new();
+        let mut indexed = Vec::new();
+        let mut index = scratch
+            .build(&population)
+            .expect("the scaled fixture is finite and in-domain (the control build)");
+        // The query sweep: every seventh region's place × every
+        // authored encounter radius (2.0/3.0/4.0) — the composition's
+        // own query set, adjacency and boundary cases included (the
+        // 6 m spacing puts the (3,0)-offset NPC exactly 3.0 from the
+        // horizontally adjacent place, the authored inclusive
+        // boundary class).
+        let mut queries = 0;
+        let mut cross_region_witnesses = 0;
+        let mut empty_censuses = 0;
+        for region in (0..REGIONS).step_by(7) {
+            let place = [(region % 32) as f32 * 6.0, (region / 32) as f32 * 6.0];
+            for radius in [2.0f32, 3.0, 4.0] {
+                enumerate_witnesses(place, radius, &population, &tiers, &mut linear);
+                enumerate_witnesses_indexed(place, radius, &mut index, &tiers, &mut indexed);
+                assert_eq!(
+                    linear, indexed,
+                    "region {region} radius {radius}: the indexed arm is bit-identical \
+                     to the linear census at the composition's filter shape"
+                );
+                queries += 1;
+                if linear.is_empty() {
+                    empty_censuses += 1;
+                }
+                cross_region_witnesses += linear
+                    .iter()
+                    .filter(|&&w| (w as usize / REGION_NPCS) != region)
+                    .count();
+            }
+        }
+        // Non-vacuity: the sweep exercises the dormant exclusion
+        // (empty censuses at Dormant regions' places), the populated
+        // censuses, and the cross-region adjacency class (the
+        // authored boundary geometry through the arm).
+        assert!(queries > 0, "the sweep ran");
+        assert!(
+            empty_censuses > 0,
+            "the dormant-region censuses yield nothing (the I2 gate through the arm)"
+        );
+        assert!(
+            cross_region_witnesses > 0,
+            "the cross-region adjacency class is exercised (the authored boundary geometry)"
         );
     }
 }

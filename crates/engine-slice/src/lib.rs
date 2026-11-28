@@ -13,6 +13,7 @@ pub mod backup;
 pub mod behavior_measurement;
 pub mod benchmark;
 pub mod census;
+pub mod combat_adoption;
 pub mod combat_demo;
 pub mod corner_behavior;
 pub mod corner_demo;
