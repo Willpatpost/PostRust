@@ -228,10 +228,17 @@ pub enum CompactionError {
 /// default: a spine constructed without one never auto-compacts,
 /// keeping today's exact behavior (the no-silent-default rule — the
 /// application opts in explicitly through
-/// [`Spine::set_retention_policy`], and opting in IS the eligibility
-/// decision [`Spine::compact`]'s own doc delegates to the driver:
-/// the engine policy bounds RAM; the driver decides when consequence
-/// lanes tolerate a prefix cut).
+/// [`Spine::set_retention_policy`], and opting in now CARRIES the
+/// eligibility decision [`Spine::compact`]'s own doc delegates to
+/// the driver: the acknowledgment token [`ConsequenceEligibility`]
+/// is constructed only by a composition boundary that has proven
+/// every consequence consumer of the ledger prefix can relinquish
+/// it — the engine policy bounds RAM, the driver proves when
+/// consequence lanes tolerate a prefix cut, and the proof is
+/// required at every reconfiguration, never standing configuration
+/// alone; a driver that wants the bound declared without the proof
+/// uses [`Spine::set_retention_bound`] and the checkpoint's
+/// refusal and lag are observable instead of the cut).
 ///
 /// **The evidence/history split (the contract this policy polices):**
 /// executed-membership, exactly-once, conservation, and the
@@ -285,6 +292,26 @@ pub enum CompactionError {
 /// driver re-configures, while the compaction the policy already
 /// performed persists in the `spine-history/2` save form exactly as
 /// an explicit compaction would.
+///
+/// **WHY the runtime policy is not persisted separately from the
+/// canonical world bytes (CA-07's documented why-not):** a
+/// spine-side persistence channel would have to ride either the
+/// canonical save (making save bytes depend on non-logical
+/// configuration — the same logical state would encode
+/// differently with and without a policy, breaking the
+/// byte-identity discipline every digest pin enforces) or a
+/// sidecar (which the engine cannot authenticate into the
+/// rotation anchor's evidence without a new trust surface — the
+/// on-disk-index rejection's reasoning). Decisively: persisting
+/// the eligibility ACKNOWLEDGMENT would let a restored process
+/// resume cutting history its consequence consumers never
+/// re-vouched for — exactly the hazard this policy's
+/// acknowledgment requirement exists to close. The driver that
+/// wants continuity re-applies its policy at its own
+/// configuration boundary after restore (the pinned
+/// restore → reconfigure → next-compact equivalence makes that
+/// lossless), and the cuts already performed ride the wire as
+/// `spine-history/2` state either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPolicy {
     /// The guaranteed verbatim tail window, in records — the policy
@@ -343,6 +370,55 @@ pub struct RetentionStats {
     pub last_chunk: u64,
     /// The largest cut any single invocation has performed.
     pub max_chunk: u64,
+    /// Ticks at which the checkpoint found the threshold exceeded
+    /// but declined to cut for want of consequence eligibility (a
+    /// bound declared through [`Spine::set_retention_bound`] without
+    /// the acknowledgment [`Spine::set_retention_policy`] requires)
+    /// — the refusal the lag observer
+    /// ([`Spine::retention_lag_records`]) makes visible as the
+    /// ledger's growth past the bound.
+    pub refused_ticks: u64,
+}
+
+/// The composition boundary's consequence-eligibility acknowledgment
+/// (CA-07/F07 — Q05's eligibility half): the token a driver can only
+/// construct by explicitly asserting the proof [`Spine::compact`]'s
+/// own doc delegates to it. Constructing this value through
+/// [`Self::acknowledged`] is the assertion that EVERY consequence
+/// consumer of the execution-ledger prefix — every application
+/// lane that reads history records (late accounting over the
+/// verbatim tail, the history APIs, audit consumers) — can
+/// relinquish those records, because the engine cannot know them:
+/// the ledger cut is structurally safe for every ENGINE invariant
+/// (the authority hangs off `next_seq`, the unfinished complement,
+/// `waiting_on`, and the max-due index — never the ledger), so the
+/// only eligibility that can be violated is the caller's own.
+///
+/// The acknowledgment is REQUIRED at every (re)configuration of the
+/// retention policy — the cadence never fires on standing
+/// configuration alone, and a restored spine (whose configuration
+/// restore clears, an intentional contract) must re-prove it before
+/// the next compact. A driver that wants the RAM bound declared
+/// without the proof uses [`Spine::set_retention_bound`]: the
+/// checkpoint then REFUSES to cut and the refusal and lag are
+/// observable ([`RetentionStats::refused_ticks`],
+/// [`Spine::retention_lag_records`]) — never a silent default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsequenceEligibility {
+    /// Construction is the assertion; the field keeps the value
+    /// opaque (there is nothing to read — the words are the proof).
+    _asserted: (),
+}
+
+impl ConsequenceEligibility {
+    /// Constructs the acknowledgment. By constructing this value the
+    /// composition boundary asserts it has established that every
+    /// consequence consumer of the ledger prefix can relinquish it
+    /// — the eligibility proof is the CALLER's, made here, made
+    /// explicitly, and re-made at every reconfiguration.
+    pub const fn acknowledged() -> Self {
+        ConsequenceEligibility { _asserted: () }
+    }
 }
 
 /// Typed refusals of the held-reconstruction replacement set
@@ -428,6 +504,68 @@ pub struct LaneTotals {
     /// Observational like every `LaneTotals` field — never
     /// fingerprinted, never serialized, never affecting scheduling.
     pub housekeeping_exhausted_ticks: u64,
+}
+
+/// Observational housekeeping-work counters (CA-03/F03 — Q03/B01's
+/// bounded-work contract): the drain's bookkeeping, counted by CLASS
+/// instead of the one blended `housekeeping` number. The blended
+/// number stays the charge model (the allowance's unit — one per
+/// park, one per release attempt, per `housekeeping_cap`'s
+/// documented granularity); these counters publish what the blend
+/// hides, which the audit found the phase could perform more of
+/// than the counter suggested:
+///
+/// * a blocked move registers one DEPENDENCY EDGE per unique unmet
+///   dependency but charges one unit per PARK — the fan-out is
+///   [`Self::dependency_registrations`], not `parks`;
+/// * a parent's synchronous release visits one WAITER LIST ENTRY
+///   per registered waiter but charges per attempt, summed only
+///   after the whole loop — the atomic overshoot is
+///   [`Self::waiter_visits`] against the allowance, never a
+///   surprise in the total;
+/// * a release attempt either DECREMENTS (the waiter still has
+///   unmet dependencies — partial release) or UNBLOCKS (the last
+///   dependency resolved, the waiter re-queued) —
+///   [`Self::release_decrements`] and [`Self::release_unblocks`].
+///
+/// Like every observational class ([`LaneTotals`],
+/// [`SuspensionStats`], [`RetentionStats`]): never fingerprinted,
+/// never serialized, never affecting scheduling; a restored spine
+/// resumes them at defaults. The registration count covers every
+/// waiter-edge registration the spine performs — drain parks,
+/// restore-time reconstruction, suspension resumption re-parks, and
+/// the held-reconstruction rebuild — the same map mutation is the
+/// same work wherever it happens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HousekeepingStats {
+    /// Blocked moves parked by a drain phase (the pop + unmet scan +
+    /// registration class — the unit the allowance charges).
+    pub parks: u64,
+    /// Dependency edges registered across every registration site
+    /// (parks, restore reconstruction, resumption re-parks, held
+    /// rebuilds) — the park's real bookkeeping fan-out.
+    pub dependency_registrations: u64,
+    /// Waiter-list entries visited by synchronous release (the
+    /// release loop's true iteration count — the atomic overshoot's
+    /// size).
+    pub waiter_visits: u64,
+    /// Release visits that only decremented the waiter's remaining
+    /// count (partial release — the waiter stays blocked).
+    pub release_decrements: u64,
+    /// Release visits that resolved the waiter's last unmet
+    /// dependency and re-queued it.
+    pub release_unblocks: u64,
+    /// The worst per-tick blended housekeeping total across all four
+    /// drain phases (the quantity the per-phase allowance bounds —
+    /// published per tick, not just at exhaustion).
+    pub worst_tick_housekeeping: u64,
+    /// The worst lane queue length observed at a housekeeping
+    /// exhaustion break (an O(1) upper bound on the due backlog
+    /// that remained — exact when every queued event is due, the
+    /// adversarial shape; the per-tick series a caller samples
+    /// through [`Spine::near_pending_count`] /
+    /// [`Spine::far_pending_count`] yields the backlog slope).
+    pub exhaustion_backlog_peak: u64,
 }
 
 /// Observational suspension and reclassification counters (Stage 4
@@ -627,16 +765,31 @@ pub struct Spine<W: World> {
     suspension: SuspensionStats,
     /// The configured execution-ledger retention policy (A22-core):
     /// `None` — the default — never auto-compacts (today's exact
-    /// behavior, byte for byte); `Some` fires the chunked compaction
+    /// behavior, byte for byte); `Some` declares the bound the
+    /// checkpoint enforces — and, with the eligibility
+    /// acknowledgment present (CA-07), FIRES the chunked compaction
     /// at the tick boundary (see [`RetentionPolicy`]). Configuration,
     /// never logical state: not fingerprinted, not serialized — a
     /// restored spine resumes with no policy until the driver
     /// re-configures.
     retention: Option<RetentionPolicy>,
+    /// The consequence-eligibility acknowledgment arming the
+    /// retention cadence (CA-07 — see [`ConsequenceEligibility`]):
+    /// a policy may be declared WITHOUT it (the refusal arm — the
+    /// checkpoint declines to cut, the lag exposed), and the
+    /// acknowledgment must accompany every (re)configuration that
+    /// wants firing. Same configuration class as `retention`:
+    /// never fingerprinted, never serialized, cleared at restore.
+    retention_eligibility: Option<ConsequenceEligibility>,
     /// Observational retention counters (the [`RetentionStats`] doc
     /// — the `LaneTotals`/`SuspensionStats` never-fingerprinted,
     /// never-serialized class).
     retention_stats: RetentionStats,
+    /// Observational housekeeping-work counters (the
+    /// [`HousekeepingStats`] doc — the same never-fingerprinted,
+    /// never-serialized class; the CA-03 class-separate publication
+    /// of the drain's bookkeeping).
+    housekeeping_stats: HousekeepingStats,
     /// Reusable handler follow-up buffer — taken per execution, drained
     /// into `schedule`, and returned with its capacity retained (the
     /// F-02 caller-held-scratch discipline applied to the spine's
@@ -800,13 +953,35 @@ fn housekeeping_cap(cap: u32) -> u64 {
     u64::from(cap) + u64::from(cap) / 2
 }
 
+/// One waiter-release attempt's class (CA-03 — the release
+/// accounting, counted separately from the blended charge): the
+/// charge model stays ONE housekeeping unit per `Decrement` and per
+/// `Unblocked` (B01's granularity, unchanged — the class split is
+/// observability, never a behavior change).
+enum ReleaseAttempt {
+    /// The waiter is not currently blocked — a defensive no-op
+    /// (uncharged, as ever).
+    NotBlocked,
+    /// The waiter's remaining-count decremented: still blocked
+    /// (partial release), or the lifecycle-unreachable
+    /// counter-consumed-without-waiter branch (charged as the
+    /// attempt it performed).
+    Decrement,
+    /// The waiter's last unmet dependency resolved: re-queued.
+    Unblocked,
+}
+
 /// One drain phase's outcome: the executions performed (the phase's
-/// consumption of the tick's execution budget) and whether the
-/// housekeeping allowance — not the execution cap — stopped the
-/// drain while due work remained queued in the phase's lane (B01's
+/// consumption of the tick's execution budget), the blended
+/// housekeeping total the phase charged (parks + release attempts —
+/// published per tick through [`HousekeepingStats`]'s
+/// `worst_tick_housekeeping`), and whether the housekeeping
+/// allowance — not the execution cap — stopped the drain while due
+/// work remained queued in the phase's lane (B01's
 /// observable-exhaustion signal, recorded at the break).
 struct DrainOutcome {
     executed: u32,
+    housekeeping: u64,
     housekeeping_exhausted: bool,
 }
 
@@ -865,7 +1040,9 @@ impl<W: World> Spine<W> {
             held_index: BTreeSet::new(),
             suspension: SuspensionStats::default(),
             retention: None,
+            retention_eligibility: None,
             retention_stats: RetentionStats::default(),
+            housekeeping_stats: HousekeepingStats::default(),
             scratch_follow_ups: Vec::new(),
         }
     }
@@ -1559,6 +1736,7 @@ impl<W: World> Spine<W> {
                 register_waiters_for_unmet_into(&mut self.waiting_on, event.id.seq, event, |seq| {
                     seq < self.next_seq && !self.unfinished.contains(&seq)
                 });
+            self.housekeeping_stats.dependency_registrations += u64::from(registered);
             self.remaining_deps.insert(event.id.seq, registered);
         }
         // The replacement semantics: the conservation identity holds
@@ -1671,6 +1849,7 @@ impl<W: World> Spine<W> {
                 // suspension may have spanned prerequisite
                 // executions, and the old count left with the
                 // suspension).
+                self.housekeeping_stats.dependency_registrations += u64::from(remaining);
                 self.remaining_deps.insert(seq, remaining);
                 self.blocked.insert(seq, pending.event);
             }
@@ -1851,6 +2030,20 @@ impl<W: World> Spine<W> {
         let near_executed = near_guaranteed.executed + near_extra.executed;
         let far_executed = far_guaranteed.executed + far_extra.executed;
         let executed = near_executed + far_executed;
+        // CA-03's worst-per-tick publication: the blended housekeeping
+        // total across all four drain phases (parks + release
+        // attempts), published at its worst — the quantity the
+        // per-phase allowance bounds, now observable without
+        // tripping the bound. Observational only (the
+        // `HousekeepingStats` class).
+        let tick_housekeeping = near_guaranteed.housekeeping
+            + far_guaranteed.housekeeping
+            + near_extra.housekeeping
+            + far_extra.housekeeping;
+        self.housekeeping_stats.worst_tick_housekeeping = self
+            .housekeeping_stats
+            .worst_tick_housekeeping
+            .max(tick_housekeeping);
         // B01's observable-exhaustion signal, recorded at the break:
         // any phase's drain was stopped by the housekeeping allowance
         // while due work remained queued in that phase's lane. The
@@ -1974,6 +2167,22 @@ impl<W: World> Spine<W> {
     /// lane state may be summarized — the B4 extension) are the
     /// application compaction driver's to verify before calling this;
     /// compaction is an explicit operation, never a silent default.
+    /// The CALL is the driver's acknowledgment (each invocation an
+    /// explicit, between-ticks decision); the policy cadence — the
+    /// automatic path — carries its own acknowledgment requirement
+    /// ([`ConsequenceEligibility`], CA-07).
+    ///
+    /// **THE RETAINED-TAIL MOVE (CA-07's measured cost)**: the prefix
+    /// is hashed first (read-only), then removed IN PLACE through
+    /// [`Vec::drain`] — the retained tail memmoves down within the
+    /// ledger's own buffer, `retained × size_of::<ExecutionRecord>()`
+    /// bytes per invocation (the unavoidable cost of Vec prefix
+    /// removal), with NO fresh allocation and the high-water capacity
+    /// RETAINED (the pre-CA-07 `split_off` shape allocated a fresh
+    /// tight vector per compaction and forced a reallocation on the
+    /// next push past it — the drain shape keeps the sustained-load
+    /// loop allocation-free across every firing; pinned by the
+    /// retention tests).
     pub fn compact(&mut self, retain: u64) -> Result<HistoryKind, CompactionError> {
         let ledger_len = self.ledger.len() as u64;
         if retain > ledger_len {
@@ -1993,8 +2202,11 @@ impl<W: World> Spine<W> {
             hasher.update(&record_wire_bytes(record));
             chain = hasher.finish();
         }
-        let tail = self.ledger.split_off(cut as usize);
-        self.ledger = tail;
+        // The in-place prefix removal: the retained tail moves down
+        // within the same buffer (no allocation, capacity retained);
+        // the discarded prefix records are dropped as the drain
+        // yields them.
+        self.ledger.drain(..cut as usize);
         let summarized_records = match &self.compacted {
             Some(prior) => prior.summarized_records + cut,
             None => cut,
@@ -2009,14 +2221,43 @@ impl<W: World> Spine<W> {
     // ---------------------------------------------------- retention policy
 
     /// Configures the execution-ledger retention policy (A22-core —
-    /// see [`RetentionPolicy`]). Opt-in: the default spine never
-    /// auto-compacts. Setting a policy never changes logical state —
-    /// the fingerprint domains and save bytes are untouched by
-    /// configuration alone; only a FIRING changes the history
-    /// representation, through the same authenticated cut the explicit
-    /// [`Spine::compact`] performs.
-    pub fn set_retention_policy(&mut self, policy: RetentionPolicy) {
+    /// see [`RetentionPolicy`]) WITH the consequence-eligibility
+    /// acknowledgment (CA-07): the cadence this arms is the
+    /// ACKNOWLEDGED safe cut — the eligibility token is the
+    /// composition boundary's explicit proof that every consequence
+    /// consumer of the ledger prefix can relinquish it, required at
+    /// every (re)configuration (a restored spine re-proves before
+    /// its next compact; the cadence never fires on standing
+    /// configuration a prior process once vouched for). Setting a
+    /// policy never changes logical state — the fingerprint domains
+    /// and save bytes are untouched by configuration alone; only a
+    /// FIRING changes the history representation, through the same
+    /// authenticated cut the explicit [`Spine::compact`] performs.
+    pub fn set_retention_policy(
+        &mut self,
+        policy: RetentionPolicy,
+        eligibility: ConsequenceEligibility,
+    ) {
         self.retention = Some(policy);
+        self.retention_eligibility = Some(eligibility);
+    }
+
+    /// Declares the retention bound WITHOUT the eligibility
+    /// acknowledgment (CA-07's refusal arm): the checkpoint observes
+    /// the threshold but REFUSES to cut — the refusal counted in
+    /// [`RetentionStats::refused_ticks`], the ledger's growth past
+    /// the bound exposed by [`Self::retention_lag_records`]. This is
+    /// the state for a driver that knows its RAM bound but has not
+    /// (or no longer) proven consequence eligibility: never a silent
+    /// default, never a cut on unproven standing. Arming afterwards
+    /// is a fresh [`Self::set_retention_policy`] call — the bound
+    /// and the proof together.
+    pub fn set_retention_bound(&mut self, policy: RetentionPolicy) {
+        self.retention = Some(policy);
+        // A bound change re-opens the eligibility question: a prior
+        // acknowledgment vouched for cutting under the old bound's
+        // cadence, so it does not survive the reconfiguration.
+        self.retention_eligibility = None;
     }
 
     /// Removes the policy — the explicit opt-out. Future ticks never
@@ -2026,6 +2267,7 @@ impl<W: World> Spine<W> {
     /// their last values.
     pub fn clear_retention_policy(&mut self) {
         self.retention = None;
+        self.retention_eligibility = None;
     }
 
     /// The configured policy, if any. Never serialized: a restored
@@ -2034,10 +2276,43 @@ impl<W: World> Spine<W> {
         self.retention
     }
 
+    /// Whether the configured policy's cadence is ARMED — the
+    /// consequence-eligibility acknowledgment is present, so the
+    /// checkpoint will fire when the threshold is exceeded. A
+    /// declared-but-unarmed policy (see [`Self::set_retention_bound`])
+    /// refuses instead, observably.
+    pub fn retention_armed(&self) -> bool {
+        self.retention_eligibility.is_some()
+    }
+
+    /// How far the retained ledger sits ABOVE the configured
+    /// policy's resident bound (CA-07's lag observer): zero at or
+    /// under the bound; the growth past it otherwise — the
+    /// hysteresis band's normal float, a misconfigured chunk below
+    /// the sustained rate's drift, or an unarmed policy's refused
+    /// accumulation (with [`RetentionStats::refused_ticks`], the
+    /// refusal made visible instead of silent). Zero with no policy
+    /// configured (no bound is declared, so no lag is defined).
+    pub fn retention_lag_records(&self) -> u64 {
+        match self.retention {
+            Some(policy) => {
+                (self.ledger.len() as u64).saturating_sub(policy.resident_bound_records())
+            }
+            None => 0,
+        }
+    }
+
     /// Observational retention counters (never fingerprinted, never
     /// serialized; see [`RetentionStats`]).
     pub fn retention_stats(&self) -> RetentionStats {
         self.retention_stats
+    }
+
+    /// Observational housekeeping-work counters (never fingerprinted,
+    /// never serialized; see [`HousekeepingStats`] — the CA-03
+    /// class-separate publication of the drain's bookkeeping).
+    pub fn housekeeping_stats(&self) -> HousekeepingStats {
+        self.housekeeping_stats
     }
 
     /// THE POLICY CHECKPOINT (A22-core): the cadence's one firing
@@ -2049,6 +2324,16 @@ impl<W: World> Spine<W> {
     /// `min(excess, chunk)` records through the existing compaction —
     /// at the gate exactly one chunk — and records the invocation in
     /// the observational counters. A no-op with no policy configured.
+    ///
+    /// **THE ELIGIBILITY GATE (CA-07):** firing additionally requires
+    /// the consequence-eligibility acknowledgment
+    /// ([`Self::retention_armed`] — the acknowledged safe cut). A
+    /// declared-but-unarmed policy (see [`Self::set_retention_bound`])
+    /// REFUSES here when the threshold is exceeded: the refusal
+    /// counted in [`RetentionStats::refused_ticks`], the ledger's
+    /// growth past the bound exposed by [`Self::retention_lag_records`]
+    /// — the cut is never made on unproven standing, and the lag is
+    /// never silent.
     ///
     /// The cut is a valid compaction window BY CONSTRUCTION: the gate
     /// guarantees `excess ≥ chunk ≥ 1` and `cut ≥ 1`, so the window
@@ -2062,6 +2347,22 @@ impl<W: World> Spine<W> {
         let ledger_len = self.ledger.len() as u64;
         let threshold = policy.resident_bound_records();
         if ledger_len <= threshold {
+            return;
+        }
+        if self.retention_eligibility.is_none() {
+            self.retention_stats.refused_ticks += 1;
+            if self.diag.would_log(Level::Info) {
+                self.diag.log(
+                    Level::Info,
+                    format!(
+                        "retention threshold exceeded at {} (retained {ledger_len} > bound \
+                         {threshold}) without consequence eligibility — refusing to cut; \
+                         lag {} records",
+                        self.clock,
+                        ledger_len - threshold
+                    ),
+                );
+            }
             return;
         }
         let excess = ledger_len - policy.retain.get();
@@ -2524,6 +2825,7 @@ impl<W: World> Spine<W> {
                 // budget. The parked event caps the safe watermark
                 // until its dependencies resolve.
                 self.stats.blocked_transitions += 1;
+                self.housekeeping_stats.parks += 1;
                 if self.diag.would_log(Level::Trace) {
                     self.diag.log(
                         Level::Trace,
@@ -2539,12 +2841,29 @@ impl<W: World> Spine<W> {
                 self.remaining_deps.insert(event.id.seq, remaining);
                 self.blocked.insert(event.id.seq, event);
                 // One blocked park (the pop + unmet scan +
-                // registration): one housekeeping unit (B01).
+                // registration): one housekeeping unit (B01). The
+                // registration fan-out the park performs beyond the
+                // one unit is published separately (CA-03 —
+                // `HousekeepingStats::dependency_registrations`,
+                // counted at the registration site).
                 housekeeping += 1;
             }
         }
+        // The backlog witness at the exhaustion break (CA-03): the
+        // lane's queue length — an O(1) upper bound on the due work
+        // that remained when the allowance stopped the drain (exact
+        // when every queued event is due, the adversarial shape).
+        if executed < cap && housekeeping >= hk_cap && self.lane_has_due_work(field) {
+            let queued = match field {
+                Field::Near => self.near_queue.len(),
+                Field::Far => self.far_queue.len(),
+            } as u64;
+            self.housekeeping_stats.exhaustion_backlog_peak =
+                self.housekeeping_stats.exhaustion_backlog_peak.max(queued);
+        }
         DrainOutcome {
             executed,
+            housekeeping,
             // The exhaustion signal, recorded at the break: the
             // allowance (not the execution cap — `executed < cap`
             // discriminates) stopped the drain while due work
@@ -2660,10 +2979,38 @@ impl<W: World> Spine<W> {
         // units it consumes (one per release attempt, B01) are
         // returned for accounting and may overshoot the drain's
         // allowance; the drain loop's bound gates the NEXT iteration.
+        //
+        // THE ATOMIC RELEASE/ORDER CONTRACT (CA-03's decided
+        // contract, recorded BEFORE any resumable cursor exists): a
+        // release is ALL-OR-NOTHING per execution — the loop runs to
+        // exhaustion within this call, visiting the waiter list in
+        // REGISTRATION order (the `waiting_on` vector's push order,
+        // itself the blocked event's `depends_on` declaration order,
+        // consecutively deduplicated — deterministic), and no
+        // observable state exists between its iterations. A future
+        // resumable drain cursor must therefore suspend ONLY at
+        // execution boundaries — never inside a release loop — and
+        // the class-separate counters
+        // (`HousekeepingStats::waiter_visits` against
+        // `release_decrements` + `release_unblocks`) are exactly the
+        // surface that proves no partial release survives any
+        // interruption: visits must equal decrements + unblocks +
+        // not-blocked no-ops at every boundary.
         let mut released: u64 = 0;
         if let Some(waiters) = self.waiting_on.remove(&event.id.seq) {
+            self.housekeeping_stats.waiter_visits += waiters.len() as u64;
             for waiter in waiters {
-                released += self.try_unblock(waiter);
+                match self.try_unblock(waiter) {
+                    ReleaseAttempt::Decrement => {
+                        self.housekeeping_stats.release_decrements += 1;
+                        released += 1;
+                    }
+                    ReleaseAttempt::Unblocked => {
+                        self.housekeeping_stats.release_unblocks += 1;
+                        released += 1;
+                    }
+                    ReleaseAttempt::NotBlocked => {}
+                }
             }
         }
         released
@@ -2696,37 +3043,45 @@ impl<W: World> Spine<W> {
     /// share. Allocation-free. Delegates to the
     /// free-function form over split borrows, and returns the
     /// registration count that seeds the derived remaining-dependency
-    /// counter (B01 — see [`register_waiters_for_unmet_into`]).
+    /// counter (B01 — see [`register_waiters_for_unmet_into`]). The
+    /// registration count is also published observationally (CA-03:
+    /// [`HousekeepingStats::dependency_registrations`] — the park's
+    /// real bookkeeping fan-out, which the one-unit park charge
+    /// does not scale with).
     fn register_waiters_for_unmet(&mut self, dependent: u64, event: &Event) -> u32 {
         let unfinished = &self.unfinished;
         let next_seq = self.next_seq;
-        register_waiters_for_unmet_into(&mut self.waiting_on, dependent, event, |seq| {
-            seq < next_seq && !unfinished.contains(&seq)
-        })
+        let registered =
+            register_waiters_for_unmet_into(&mut self.waiting_on, dependent, event, |seq| {
+                seq < next_seq && !unfinished.contains(&seq)
+            });
+        self.housekeeping_stats.dependency_registrations += u64::from(registered);
+        registered
     }
 
     /// Attempts to release one waiter of a just-executed event,
-    /// returning the housekeeping units consumed (one per attempt —
-    /// B01's charge; the successful unblock's queue push is folded
-    /// into the attempt, the granularity the design's
-    /// healthy-ratio derivation dictates). O(1) through the derived
-    /// remaining-dependency count: the count of UNIQUE unmet
-    /// dependencies at park time, decremented once per executed
-    /// prerequisite, is zero exactly when a full-list revalidation
-    /// of the unmet dependencies would pass — equivalent by the
-    /// registration dedup (repeated dependency ids register, and
-    /// count, once) and
-    /// by the lifecycle rule that a waiter's registrations exist
-    /// only while it is blocked and the prerequisite unexecuted.
-    fn try_unblock(&mut self, seq: u64) -> u64 {
+    /// returning the attempt's class (CA-03: the release accounting
+    /// counted separately — the charge model stays one housekeeping
+    /// unit per Decrement/Unblocked attempt, B01's granularity with
+    /// the successful unblock's queue push folded into its attempt,
+    /// the granularity the design's healthy-ratio derivation
+    /// dictates). O(1) through the derived remaining-dependency
+    /// count: the count of UNIQUE unmet dependencies at park time,
+    /// decremented once per executed prerequisite, is zero exactly
+    /// when a full-list revalidation of the unmet dependencies would
+    /// pass — equivalent by the registration dedup (repeated
+    /// dependency ids register, and count, once) and by the
+    /// lifecycle rule that a waiter's registrations exist only while
+    /// it is blocked and the prerequisite unexecuted.
+    fn try_unblock(&mut self, seq: u64) -> ReleaseAttempt {
         let Some(remaining) = self.remaining_deps.get_mut(&seq) else {
             // Not currently blocked — a defensive no-op (the
             // lifecycle keeps waiter lists inside the blocked set).
-            return 0;
+            return ReleaseAttempt::NotBlocked;
         };
         if *remaining > 1 {
             *remaining -= 1;
-            return 1;
+            return ReleaseAttempt::Decrement;
         }
         // The completing prerequisite resolves the waiter's last
         // unmet dependency: consume the counter, then unblock. Only
@@ -2735,7 +3090,10 @@ impl<W: World> Spine<W> {
         // consumed by its own execution.
         self.remaining_deps.remove(&seq);
         let Some(event) = self.blocked.remove(&seq) else {
-            return 1;
+            // The derived counter resolved without a blocked entry —
+            // the lifecycle invariant says unreachable; charged as an
+            // attempt exactly as before (the counter WAS consumed).
+            return ReleaseAttempt::Decrement;
         };
         let due = event.schedule.due();
         if self.diag.would_log(Level::Trace) {
@@ -2746,7 +3104,7 @@ impl<W: World> Spine<W> {
             Field::Near => self.near_queue.push(Reverse(Pending::new(event))),
             Field::Far => self.far_queue.push(Reverse(Pending::new(event))),
         }
-        1
+        ReleaseAttempt::Unblocked
     }
 
     fn has_any_work(&self) -> bool {
@@ -3206,7 +3564,9 @@ impl<W: SaveWorld> Spine<W> {
             held_index: BTreeSet::new(),
             suspension: SuspensionStats::default(),
             retention: None,
+            retention_eligibility: None,
             retention_stats: RetentionStats::default(),
+            housekeeping_stats: HousekeepingStats::default(),
             scratch_follow_ups: Vec::new(),
         };
 
@@ -4929,6 +5289,259 @@ mod tests {
         assert_eq!(restored.engine_fingerprint(), storm.engine_fingerprint());
     }
 
+    // ----------------------- CA-03 housekeeping class-counter tests (F03)
+
+    /// THE CLASS-SEPARATE PUBLICATION (CA-03): the drain's bookkeeping,
+    /// counted by class instead of the one blended number — a park's
+    /// dependency-registration fan-out, a parent release's waiter-list
+    /// visits, and the partial-release decrements against full
+    /// unblocks. The scenario pins every counter exactly: two
+    /// single-dependency near waiters, one single-dependency far
+    /// waiter, and one two-dependency waiter (the partial-release
+    /// arm) on two prerequisites across both lanes.
+    #[test]
+    fn housekeeping_counters_separate_parks_registrations_and_releases() {
+        let mut spine = Spine::new(
+            RecordingWorld {
+                executed: Vec::new(),
+            },
+            100,
+        );
+        let p = spine
+            .schedule(spec(0, Field::Near, 3, 0))
+            .expect("schedule");
+        let p2 = spine.schedule(spec(0, Field::Far, 4, 1)).expect("schedule");
+        spine
+            .schedule(dep_spec(0, Field::Near, 1, 10, vec![p]))
+            .expect("schedule");
+        spine
+            .schedule(dep_spec(0, Field::Near, 1, 11, vec![p]))
+            .expect("schedule");
+        spine
+            .schedule(dep_spec(0, Field::Far, 1, 12, vec![p]))
+            .expect("schedule");
+        spine
+            .schedule(dep_spec(0, Field::Near, 1, 13, vec![p, p2]))
+            .expect("schedule");
+        // Five ticks: the far-lane prerequisite executes in the
+        // tick-4 redistribution phase, so the waiter it completes
+        // runs at tick 5 (the three-phase policy's documented shape
+        // under a full near reservation).
+        spine.run_ticks(5);
+        assert_eq!(spine.stats().executed, 6, "every event runs");
+        let counters = spine.housekeeping_stats();
+        // Four blocked moves parked across the tick-1 drains (three
+        // near, one far).
+        assert_eq!(counters.parks, 4, "each blocked move parks once");
+        // Five dependency edges: four waiters × one edge, plus the
+        // two-dependency waiter's second edge — the fan-out the one
+        // blended park charge never scaled with.
+        assert_eq!(counters.dependency_registrations, 5);
+        // Five release visits: four on the first prerequisite's
+        // execution (three unblocks, one decrement for the
+        // two-dependency waiter), one on the second's (the completing
+        // unblock).
+        assert_eq!(counters.waiter_visits, 5);
+        assert_eq!(counters.release_decrements, 1, "the partial release");
+        assert_eq!(counters.release_unblocks, 4);
+        // The no-partial-release invariant (the resumable-cursor
+        // contract's proof surface): every visit resolves to exactly
+        // one counted outcome.
+        assert_eq!(
+            counters.waiter_visits,
+            counters.release_decrements + counters.release_unblocks,
+            "no release visit is lost mid-loop (the atomic-release contract)"
+        );
+        // Worst per-tick blended total: tick 1 parks four (4 units);
+        // tick 3 executes the prerequisite whose atomic release
+        // visits four waiters (4 units); tick 4's release-and-execute
+        // is 2 — the worst is 4.
+        assert_eq!(counters.worst_tick_housekeeping, 4);
+        assert_eq!(
+            counters.exhaustion_backlog_peak, 0,
+            "no exhaustion in the healthy shape"
+        );
+    }
+
+    /// THE PHASE-BOUNDARY PIN (CA-03's save/restore mandate): blocked
+    /// work in flight, saved mid-cadence at a drain-phase boundary,
+    /// restored, and continued — the continued run's canonical saves
+    /// are byte-identical to the uninterrupted control's, and the
+    /// RELEASE-side counters (visits, decrements, unblocks) reproduce
+    /// exactly on the restored spine while the park-side work is
+    /// reconstructed as restore-time registrations (the same map
+    /// mutation, the same counter, a different site — the documented
+    /// accounting).
+    #[test]
+    fn blocked_work_survives_phase_boundary_save_restore_with_identical_counters() {
+        fn build() -> Spine<SaveableNoopWorld> {
+            let mut spine = Spine::new(SaveableNoopWorld, 100);
+            let p = spine
+                .schedule(spec(0, Field::Near, 3, 0))
+                .expect("schedule");
+            let p2 = spine.schedule(spec(0, Field::Far, 4, 1)).expect("schedule");
+            spine
+                .schedule(dep_spec(0, Field::Near, 1, 10, vec![p]))
+                .expect("schedule");
+            spine
+                .schedule(dep_spec(0, Field::Near, 1, 11, vec![p]))
+                .expect("schedule");
+            spine
+                .schedule(dep_spec(0, Field::Far, 1, 12, vec![p]))
+                .expect("schedule");
+            spine
+                .schedule(dep_spec(0, Field::Near, 1, 13, vec![p, p2]))
+                .expect("schedule");
+            spine
+        }
+        // The uninterrupted control.
+        let mut control = build();
+        control.run_ticks(5);
+        // The split: one tick (all four waiters parked mid-drain),
+        // save at the phase boundary, restore, continue.
+        let mut split = build();
+        split.run_tick();
+        assert_eq!(split.blocked_count(), 4, "waiters parked at the boundary");
+        let bytes = split.save_bytes();
+        let mut restored: Spine<SaveableNoopWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+        assert_eq!(restored.save_bytes(), bytes, "the round trip is stable");
+        // …and the restore-time reconstruction registers the same
+        // five edges (counted at the registration site) while every
+        // park-side and release-side counter starts at zero — the
+        // counters never ride the wire, only the rebuild's own work
+        // is counted as it happens.
+        let reconstructed = restored.housekeeping_stats();
+        assert_eq!(reconstructed.parks, 0);
+        assert_eq!(reconstructed.dependency_registrations, 5);
+        assert_eq!(reconstructed.waiter_visits, 0);
+        assert_eq!(reconstructed.release_decrements, 0);
+        assert_eq!(reconstructed.release_unblocks, 0);
+        assert_eq!(reconstructed.worst_tick_housekeeping, 0);
+        assert_eq!(reconstructed.exhaustion_backlog_peak, 0);
+        assert_eq!(restored.blocked_count(), 4, "the blocked set survived");
+        // …and the restore-time reconstruction registers the same
+        // five edges (counted at the registration site).
+        restored.run_ticks(4);
+        assert_eq!(
+            restored.save_bytes(),
+            control.save_bytes(),
+            "the interrupted run is byte-identical to the control"
+        );
+        let restored_counters = restored.housekeeping_stats();
+        let control_counters = control.housekeeping_stats();
+        // The release-side work reproduces exactly — the same waiter
+        // lists, the same decrements and unblocks, after the rebuild.
+        assert_eq!(
+            restored_counters.waiter_visits,
+            control_counters.waiter_visits
+        );
+        assert_eq!(
+            restored_counters.release_decrements,
+            control_counters.release_decrements
+        );
+        assert_eq!(
+            restored_counters.release_unblocks,
+            control_counters.release_unblocks
+        );
+        // The park-side work was reconstructed, not re-parked: the
+        // restored spine registered the edges at restore time and
+        // parked nothing.
+        assert_eq!(restored_counters.parks, 0);
+        assert_eq!(
+            restored_counters.dependency_registrations, control_counters.dependency_registrations,
+            "the reconstruction registers the same edges"
+        );
+    }
+
+    /// THE BOUNDED-STORM WITNESS (CA-03's worst-work and backlog
+    /// publication): ninety single-dependency waiters against a
+    /// far-due prerequisite at budget 10 — each drain phase's
+    /// allowance parks fifteen (hk cap 15), the two near phases park
+    /// thirty per tick, the exhaustion breaks publish the shrinking
+    /// queue (the queued series 61 → 31 → 1 across the three ticks it
+    /// takes to park the herd — the backlog slope made observable),
+    /// and the prerequisite's eventual execution performs the
+    /// documented ATOMIC OVERSHOOT: ninety release visits in one tick
+    /// against the fifteen-unit phase allowance, published as the
+    /// worst per-tick blended total (the E-10 contract — the release
+    /// is all-or-nothing, the bound gates the NEXT iteration).
+    #[test]
+    fn housekeeping_publishes_worst_tick_work_and_the_exhaustion_backlog() {
+        let mut spine = Spine::new(
+            RecordingWorld {
+                executed: Vec::new(),
+            },
+            10,
+        );
+        let p = spine
+            .schedule(spec(0, Field::Near, 100, 0))
+            .expect("schedule");
+        for payload in 1..=90u64 {
+            spine
+                .schedule(dep_spec(0, Field::Near, 1, payload, vec![p]))
+                .expect("schedule");
+        }
+        spine.run_tick();
+        let tick1 = spine.housekeeping_stats();
+        assert_eq!(tick1.parks, 30, "the two near phases park fifteen each");
+        assert_eq!(tick1.dependency_registrations, 30);
+        // The queue-length bound includes the not-yet-due prerequisite
+        // (91 queued events, 15 parked): 76 — the documented O(1)
+        // upper bound on the due backlog, exact up to the one
+        // far-due event.
+        assert_eq!(
+            tick1.exhaustion_backlog_peak, 76,
+            "the backlog at the first break"
+        );
+        assert_eq!(spine.lane_totals().housekeeping_exhausted_ticks, 1);
+        assert_eq!(
+            spine.near_pending_count(),
+            61,
+            "the backlog slope's first sample"
+        );
+        spine.run_tick();
+        let tick2 = spine.housekeeping_stats();
+        assert_eq!(tick2.parks, 60);
+        assert_eq!(
+            spine.near_pending_count(),
+            31,
+            "the slope: 31 queued after two ticks"
+        );
+        spine.run_tick();
+        let tick3 = spine.housekeeping_stats();
+        assert_eq!(tick3.parks, 90, "the whole herd parked");
+        assert_eq!(
+            tick3.exhaustion_backlog_peak, 76,
+            "the peak stays the first break's"
+        );
+        assert_eq!(
+            spine.near_pending_count(),
+            1,
+            "only the far-due prerequisite remains"
+        );
+        assert_eq!(spine.lane_totals().housekeeping_exhausted_ticks, 3);
+        // The prerequisite executes at tick 100: the whole herd
+        // releases atomically (ninety visits — the overshoot), then
+        // the budget admits ten per tick.
+        spine.run_to_completion(200);
+        assert_eq!(spine.stats().executed, 91, "the storm drains completely");
+        let final_counters = spine.housekeeping_stats();
+        assert_eq!(final_counters.parks, 90);
+        assert_eq!(final_counters.dependency_registrations, 90);
+        assert_eq!(final_counters.waiter_visits, 90);
+        assert_eq!(final_counters.release_decrements, 0);
+        assert_eq!(final_counters.release_unblocks, 90);
+        assert_eq!(
+            final_counters.worst_tick_housekeeping, 90,
+            "the atomic release overshoot published as the worst tick"
+        );
+        assert_eq!(
+            final_counters.exhaustion_backlog_peak, 90,
+            "the released herd's re-queue is the largest exhaustion backlog"
+        );
+    }
+
     // -------------------------------- A22-core retention policy tests (P2 L7)
 
     /// A retention policy from plain non-zero integers (the fixtures'
@@ -4939,6 +5552,14 @@ mod tests {
             NonZeroU64::new(retain).expect("retain is non-zero"),
             NonZeroU64::new(chunk).expect("chunk is non-zero"),
         )
+    }
+
+    /// The consequence-eligibility acknowledgment (the fixtures'
+    /// shorthand — the test driver asserting the consequence
+    /// consumers it controls can relinquish the prefix; production
+    /// callers construct it at their own composition boundary, CA-07).
+    fn eligibility() -> ConsequenceEligibility {
+        ConsequenceEligibility::acknowledged()
     }
 
     /// THE OPT-OUT CONTRACT: no policy — the default — never
@@ -4974,7 +5595,7 @@ mod tests {
         // configuration alone is not logical state.
         let mut configured = build();
         let fingerprint_before = configured.engine_fingerprint();
-        configured.set_retention_policy(policy(10_000, 4_096));
+        configured.set_retention_policy(policy(10_000, 4_096), eligibility());
         assert_eq!(
             configured.engine_fingerprint(),
             fingerprint_before,
@@ -4992,7 +5613,7 @@ mod tests {
         // 10 executions against retain 10 / chunk 40 (threshold 50)
         // fire exactly once, at tick 6 (60 > 50, cutting 40).
         let mut frozen = build();
-        frozen.set_retention_policy(policy(10, 40));
+        frozen.set_retention_policy(policy(10, 40), eligibility());
         frozen.run_ticks(6);
         let fired = frozen.retention_stats();
         assert_eq!(fired.compactions, 1);
@@ -5059,7 +5680,7 @@ mod tests {
             spine
         };
         let mut spine = build();
-        spine.set_retention_policy(policy(10, 300));
+        spine.set_retention_policy(policy(10, 300), eligibility());
         let mut twin = build();
 
         // The exact per-tick shape: (retained length, cumulative
@@ -5187,7 +5808,7 @@ mod tests {
             spine
         };
         let mut spine = build();
-        spine.set_retention_policy(policy(10, 300));
+        spine.set_retention_policy(policy(10, 300), eligibility());
         let mut twin = build();
         spine.run_ticks(7);
         twin.run_ticks(7);
@@ -5281,7 +5902,7 @@ mod tests {
         // The auto cadence: 10 ticks, firings at 4/7/10 (900
         // summarized, 100 retained).
         let mut auto = build();
-        auto.set_retention_policy(policy(10, 300));
+        auto.set_retention_policy(policy(10, 300), eligibility());
         auto.run_ticks(10);
         assert_eq!(auto.retention_stats().compactions, 3);
         // The explicit equivalent: the same ticks, one manual cut to
@@ -5301,7 +5922,7 @@ mod tests {
         // restored spine fires at ticks 7 and 10 — the cadence
         // resumes exactly where the wire left it.
         let mut interrupted = build();
-        interrupted.set_retention_policy(policy(10, 300));
+        interrupted.set_retention_policy(policy(10, 300), eligibility());
         interrupted.run_ticks(5);
         let bytes = interrupted.save_bytes();
         let mut restored: Spine<SaveableNoopWorld> =
@@ -5316,7 +5937,7 @@ mod tests {
             None,
             "configuration never rides the wire"
         );
-        restored.set_retention_policy(policy(10, 300));
+        restored.set_retention_policy(policy(10, 300), eligibility());
         restored.run_ticks(5);
         assert_eq!(restored.retention_stats().compactions, 2);
         assert_eq!(
@@ -5344,7 +5965,7 @@ mod tests {
         }
         spine.run_ticks(10);
         assert_eq!(spine.ledger_retained().len(), 1000);
-        spine.set_retention_policy(policy(10, 100));
+        spine.set_retention_policy(policy(10, 100), eligibility());
         let mut len = 1000u64;
         for tick in 0..9u64 {
             spine.run_tick(); // no due work remains: only the checkpoint acts
@@ -5437,7 +6058,7 @@ mod tests {
                     .schedule(spec(5, Field::Near, 1, i))
                     .expect("schedule");
             }
-            spine.set_retention_policy(policy_config);
+            spine.set_retention_policy(policy_config, eligibility());
             for tick in 1..=TICKS {
                 spine.run_tick();
                 let len = spine.ledger_retained().len() as u64;
@@ -5527,5 +6148,244 @@ mod tests {
             spine.compacted_fingerprint()
         );
         assert_eq!(replay.retention_stats(), spine.retention_stats());
+    }
+
+    // ----------------------------- CA-07 eligibility/lag/tail-move tests (F07)
+
+    /// THE REFUSAL ARM (CA-07): a retention bound declared WITHOUT the
+    /// consequence-eligibility acknowledgment never cuts — the
+    /// checkpoint refuses at every threshold crossing (counted), the
+    /// ledger's growth past the bound is exposed as lag, and arming
+    /// afterwards (the acknowledgment constructed at the composition
+    /// boundary) resumes the cadence and converges to the bound. The
+    /// sustained shape at ten executions per tick against
+    /// retain 4 / chunk 30 (bound 34): ticks 4–6 cross the threshold
+    /// and refuse, arming at tick 7 fires chunk-bounded cuts until the
+    /// ledger sits inside the band.
+    #[test]
+    fn unacknowledged_retention_bounds_refuse_and_expose_the_lag() {
+        let mut spine = Spine::new(SustainedWorld, 10);
+        for i in 0..10u64 {
+            spine
+                .schedule(spec(5, Field::Near, 1, i))
+                .expect("schedule");
+        }
+        spine.set_retention_bound(policy(4, 30));
+        assert_eq!(spine.retention_policy(), Some(policy(4, 30)));
+        assert!(
+            !spine.retention_armed(),
+            "a bound alone never arms the cadence"
+        );
+        spine.run_ticks(6);
+        // 60 records against the 34 bound: three threshold crossings,
+        // three refusals, zero cuts, the lag exposed.
+        assert_eq!(spine.stats().executed, 60);
+        assert_eq!(spine.retention_stats().refused_ticks, 3);
+        assert_eq!(spine.retention_stats().compactions, 0);
+        assert_eq!(spine.ledger_retained().len(), 60);
+        assert_eq!(spine.retention_lag_records(), 60 - 34);
+        assert!(matches!(spine.history_kind(), HistoryKind::Full));
+        // Arming: the acknowledgment accompanies a fresh
+        // configuration (the re-proof), and the cadence fires.
+        spine.set_retention_policy(policy(4, 30), eligibility());
+        assert!(spine.retention_armed());
+        spine.run_tick();
+        assert_eq!(spine.retention_stats().compactions, 1);
+        assert_eq!(
+            spine.retention_stats().refused_ticks,
+            3,
+            "armed: no more refusals"
+        );
+        // 70 records, one chunk of 30 cut: 40 retained, 6 above the
+        // bound — the hysteresis band converging.
+        assert_eq!(spine.ledger_retained().len(), 40);
+        assert_eq!(spine.retention_lag_records(), 6);
+        spine.run_ticks(3);
+        // Tick 8 fires again (50 → 20); ticks 9–10 float inside the
+        // band then fire once more (40 → 10): three armed firings
+        // total, the ledger at or under the bound.
+        assert_eq!(spine.retention_stats().compactions, 3);
+        assert!(spine.ledger_retained().len() <= 34);
+        assert_eq!(spine.retention_lag_records(), 0);
+        assert!(matches!(
+            spine.history_kind(),
+            HistoryKind::Compacted { .. }
+        ));
+    }
+
+    /// THE RESTORE→RECONFIGURE→NEXT-COMPACT PIN with UNRESOLVED
+    /// CONSEQUENCES (CA-07's mandated control): a spine whose blocked
+    /// waiter depends on a HELD prerequisite (an obligation that can
+    /// never complete while the hold stands — the unresolved
+    /// consequence) compacts on schedule around it; a mid-cadence
+    /// save→restore→re-arm→continue reproduces the uninterrupted
+    /// control's canonical saves BYTE FOR BYTE, and the re-arm is
+    /// required (the restored spine arrives unarmed — configuration
+    /// never rides the wire, and the acknowledgment never survives a
+    /// process boundary it was not re-proved at).
+    #[test]
+    fn restore_reconfigure_next_compact_matches_the_control_with_unresolved_consequences() {
+        fn build() -> Spine<SaveableNoopWorld> {
+            let mut spine = Spine::new(SaveableNoopWorld, 100);
+            // The unresolved consequence: a waiter on a held
+            // prerequisite — blocked forever, serialized with every
+            // save, present at every compaction boundary.
+            let held = spine
+                .schedule_held(spec(0, Field::Near, 1, 999))
+                .expect("schedule held");
+            spine
+                .schedule(dep_spec(0, Field::Near, 1, 1000, vec![held]))
+                .expect("schedule");
+            for t in 1..=6u64 {
+                for i in 0..100u64 {
+                    spine
+                        .schedule(spec(0, Field::Near, t, t * 100 + i))
+                        .expect("schedule");
+                }
+            }
+            spine
+        }
+        // The uninterrupted control: six ticks of 100 executions
+        // against retain 10 / chunk 300 (bound 310) — one firing at
+        // tick 4 (400 > 310, cutting 300), the blocked waiter
+        // unresolved at every boundary.
+        let mut control = build();
+        control.set_retention_policy(policy(10, 300), eligibility());
+        control.run_ticks(6);
+        assert_eq!(control.retention_stats().compactions, 1);
+        assert_eq!(
+            control.blocked_count(),
+            1,
+            "the consequence stays unresolved"
+        );
+        assert_eq!(control.held_count(), 1);
+        // The split: three ticks (no firing yet), save at the
+        // boundary, restore, re-arm, continue.
+        let mut split = build();
+        split.set_retention_policy(policy(10, 300), eligibility());
+        split.run_ticks(3);
+        assert_eq!(split.retention_stats().compactions, 0);
+        assert_eq!(split.blocked_count(), 1);
+        let bytes = split.save_bytes();
+        let mut restored: Spine<SaveableNoopWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+        assert_eq!(restored.save_bytes(), bytes, "the round trip is stable");
+        assert_eq!(
+            restored.retention_policy(),
+            None,
+            "the policy never rides the wire"
+        );
+        assert!(
+            !restored.retention_armed(),
+            "the acknowledgment never rides the wire"
+        );
+        assert_eq!(
+            restored.blocked_count(),
+            1,
+            "the unresolved consequence survived"
+        );
+        assert_eq!(restored.retention_stats(), RetentionStats::default());
+        // A bound without the proof would refuse; the re-armed policy
+        // fires the SAME cut the control fired.
+        restored.set_retention_bound(policy(10, 300));
+        restored.run_ticks(1);
+        assert_eq!(restored.retention_stats().refused_ticks, 1);
+        assert_eq!(restored.retention_stats().compactions, 0);
+        restored.set_retention_policy(policy(10, 300), eligibility());
+        restored.run_ticks(2);
+        assert_eq!(restored.retention_stats().compactions, 1);
+        assert_eq!(
+            restored.save_bytes(),
+            control.save_bytes(),
+            "restore → reconfigure → next compact is byte-identical to the control"
+        );
+        assert_eq!(
+            restored.compacted_fingerprint(),
+            control.compacted_fingerprint()
+        );
+    }
+
+    /// THE RETAINED-TAIL MOVE, MEASURED (CA-07's mandated measurement):
+    /// at constant chunk size, one compaction's cost is exactly
+    /// `chunk` SHA-256 record hashes plus `retained` in-place record
+    /// moves (the [`Vec::drain`] prefix removal — the pre-CA-07
+    /// `split_off` shape additionally allocated a fresh tight vector
+    /// per firing and forced a reallocation on the next push past
+    /// it). The operation counts are exact and deterministic (the
+    /// IA-07 discipline: costs are operation counts until a
+    /// benchmark times them — wall-clock is deliberately not pinned
+    /// here); the capacity witness below is the allocation proof:
+    /// the in-place drain retains the high-water capacity across
+    /// every firing, so the sustained loop fires with ZERO ledger
+    /// allocations, while the bytes moved grow with the retained
+    /// history at constant chunk.
+    #[test]
+    fn policy_compaction_moves_the_tail_in_place_at_constant_chunk() {
+        const CHUNK: u64 = 300;
+        // Two retained-history sizes at the same chunk: the moves per
+        // firing are the retained-record counts after each cut.
+        for (retain, ticks) in [(128u64, 12u64), (300, 12u64)] {
+            let mut spine = Spine::new(SustainedWorld, 100);
+            for i in 0..100u64 {
+                spine
+                    .schedule(spec(5, Field::Near, 1, i))
+                    .expect("schedule");
+            }
+            spine.set_retention_policy(policy(retain, CHUNK), eligibility());
+            let mut moves: Vec<u64> = Vec::new();
+            let mut capacity_high_water: usize = 0;
+            for tick in 1..=ticks {
+                spine.run_tick();
+                // The capacity witness: never shrinks, never regrows
+                // after the first firing (drain keeps the buffer;
+                // split_off would have re-allocated it tight).
+                let capacity = spine.ledger.capacity();
+                assert!(
+                    capacity >= capacity_high_water,
+                    "tick {tick}: the ledger buffer never shrinks (retain {retain})"
+                );
+                capacity_high_water = capacity_high_water.max(capacity);
+                let stats = spine.retention_stats();
+                if stats.compactions > moves.len() as u64 {
+                    // The firing's move count: the retained tail's
+                    // length after the cut (exactly the records
+                    // drain moved down within the buffer).
+                    moves.push(spine.ledger_retained().len() as u64);
+                }
+            }
+            let stats = spine.retention_stats();
+            assert_eq!(stats.last_chunk, CHUNK, "the chunk is constant");
+            assert_eq!(stats.max_chunk, CHUNK);
+            // The published cost table: per firing, `CHUNK` hashes +
+            // `retained` moves — the moves grow with the retained
+            // history at constant chunk (128-retain moves 200 per
+            // firing; 300-retain moves 400 per firing).
+            assert!(
+                moves.iter().all(|&retained_after| retained_after >= retain),
+                "every firing retains at least the verbatim window"
+            );
+            assert_eq!(
+                moves.len() as u64,
+                stats.compactions,
+                "one move-count sample per firing (retain {retain})"
+            );
+            // The capacity discriminator: after the first firing the
+            // buffer is strictly larger than the retained tail (the
+            // high-water survives the cuts — split_off's fresh tight
+            // vector would have made them equal).
+            assert!(
+                spine.ledger.capacity() > spine.ledger_retained().len(),
+                "the in-place drain retains the high-water capacity (retain {retain})"
+            );
+            if retain == 300 {
+                // Bound 600: firings at ticks 7 and 10, each cutting
+                // one 300 chunk from 700 down to 400 retained.
+                assert_eq!(moves, vec![400, 400]);
+            } else {
+                // Bound 428: firings at ticks 5, 8, and 11, each
+                // cutting one 300 chunk from 500 down to 200 retained.
+                assert_eq!(moves, vec![200, 200, 200]);
+            }
+        }
     }
 }

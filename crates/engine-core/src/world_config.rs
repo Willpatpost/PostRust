@@ -48,6 +48,19 @@ pub const MAX_REGION_COUNT: u32 = 256;
 /// `0..npc_count`. The wire reader bounds every per-region block
 /// count by the remaining bytes as well, so a corrupted count is
 /// rejected before any allocation trusts it.
+///
+/// **The scoped/global identity policy (a separate owner decision,
+/// CA-02's documented boundary):** this bound is over the GLOBAL
+/// identity space — the v2 section's identity table is globally
+/// scoped (ids unique across the whole section, blocks positional
+/// and region-major, the block counts summing to `npc_count`
+/// exactly). Whether a future format version scopes identity
+/// uniqueness per region instead (letting each block's budget stand
+/// alone) is a format-versioning decision with wire and migration
+/// consequences, deliberately NOT folded into the decode-admission
+/// limits ([`crate::npc_world_save::SectionDecodeLimits`] bounds
+/// what the decoder may spend, never what the identity policy
+/// means); it stays an owner call until a workload demands it.
 pub const MAX_NPC_COUNT: u32 = u32::MAX;
 
 /// The world's population and partition parameters as plain data —
