@@ -671,6 +671,25 @@ pub struct LaneReport {
     /// that work, so this is the bound-fired signal; the end-of-tick
     /// backlog state is `near_backlogged`/`far_backlogged`.
     pub housekeeping_exhausted: bool,
+    /// The near lane's queue length at the tick's most recent
+    /// EXHAUSTION BREAK — a housekeeping-allowance break (B01, any
+    /// drain phase) or the execution-budget break below — an O(1)
+    /// snapshot of the backlog that remained, per-tick reset (zero
+    /// on a tick with no break). Together with
+    /// [`Self::housekeeping_backlog_far`] this publishes the backlog
+    /// SLOPE per tick (T08 §5.4) where only the cumulative
+    /// [`HousekeepingStats::exhaustion_backlog_peak`] existed before:
+    /// a caller sampling the report series sees the queue drain
+    /// without hand-sampling `near_pending_count`. Observational
+    /// class — never fingerprinted, never serialized (a restored
+    /// spine resumes at defaults); an upper bound on the DUE backlog
+    /// (exact when every queued event is due, the adversarial
+    /// shape).
+    pub housekeeping_backlog_near: u64,
+    /// The far lane's queue length at the tick's most recent
+    /// exhaustion break — the far-lane half of the slope publication
+    /// (see [`Self::housekeeping_backlog_near`]).
+    pub housekeeping_backlog_far: u64,
 }
 
 /// Cumulative lane execution totals (observational, Stage 3): derivable
@@ -709,7 +728,15 @@ pub struct LaneTotals {
 /// * a release attempt either DECREMENTS (the waiter still has
 ///   unmet dependencies — partial release) or UNBLOCKS (the last
 ///   dependency resolved, the waiter re-queued) —
-///   [`Self::release_decrements`] and [`Self::release_unblocks`].
+///   [`Self::release_decrements`] and [`Self::release_unblocks`];
+/// * a release visit that finds the waiter no longer blocked is the
+///   defensively-unreachable `NotBlocked` no-op arm — charged as the
+///   visit it performed and published as
+///   [`Self::release_not_blocked`] (T08 §5.1), so the release
+///   accounting is the CLOSED CHARGE IDENTITY
+///   `waiter_visits == release_decrements + release_unblocks +
+///   release_not_blocked` at every boundary: every visit resolves to
+///   exactly one counted outcome, no class uncharged.
 ///
 /// Like every observational class ([`LaneTotals`],
 /// [`SuspensionStats`], [`RetentionStats`]): never fingerprinted,
@@ -738,10 +765,26 @@ pub struct HousekeepingStats {
     /// Release visits that resolved the waiter's last unmet
     /// dependency and re-queued it.
     pub release_unblocks: u64,
+    /// Release visits that found the waiter no longer blocked — the
+    /// defensively-unreachable no-op arm (the lifecycle keeps
+    /// registrations inside the blocked set; no battery reaches it
+    /// through the public API), CHARGED as the visit it performed
+    /// since T08 §5.1 and counted here so the identity
+    /// `waiter_visits == release_decrements + release_unblocks +
+    /// release_not_blocked` closes mechanically. If a future path
+    /// ever makes the arm reachable, its charge is already correct.
+    pub release_not_blocked: u64,
     /// The worst per-tick blended housekeeping total across all four
     /// drain phases (the quantity the per-phase allowance bounds —
     /// published per tick, not just at exhaustion).
     pub worst_tick_housekeeping: u64,
+    /// The worst per-tick dependency-registration total across all
+    /// four drain phases (mirroring
+    /// [`Self::worst_tick_housekeeping`]): the park fan-out's
+    /// per-tick slope — the per-edge truth the one-unit park charge
+    /// deliberately does not scale with (B01's granularity, kept;
+    /// T08 §5.2 publishes the slope beside it instead).
+    pub worst_tick_dependency_registrations: u64,
     /// The worst lane queue length observed at a housekeeping
     /// exhaustion break (an O(1) upper bound on the due backlog
     /// that remained — exact when every queued event is due, the
@@ -1025,6 +1068,17 @@ pub struct Spine<W: World> {
     /// never-serialized class; the CA-03 class-separate publication
     /// of the drain's bookkeeping).
     housekeeping_stats: HousekeepingStats,
+    /// The at-break lane queue lengths feeding
+    /// [`LaneReport::housekeeping_backlog_near`] /
+    /// [`LaneReport::housekeeping_backlog_far`] (T08 §5.4): reset at
+    /// the top of every `run_tick`, written at each exhaustion break
+    /// the tick passes through (a drain phase's housekeeping break or
+    /// the end-of-tick budget break — the most recent break's
+    /// snapshot wins), read once at report assembly. Observational
+    /// scratch in the never-fingerprinted, never-serialized class;
+    /// zero on a tick with no break.
+    backlog_at_break_near: u64,
+    backlog_at_break_far: u64,
     /// Reusable handler follow-up buffer — taken per execution, drained
     /// into `schedule`, and returned with its capacity retained (the
     /// F-02 caller-held-scratch discipline applied to the spine's
@@ -1305,6 +1359,38 @@ impl BuildHasher for RemainingDepsHasherBuilder {
 /// three-phase near/far reservation arithmetic is untouched: each
 /// phase's housekeeping allowance is proportional to its execution
 /// allowance, preserving near/far fairness by construction.
+///
+/// THE WHOLE-TICK CEILING (T08 §5.3, the analysis the audit
+/// demanded): `run_tick` runs four drain phases — near guaranteed
+/// (`near_reserve`), far guaranteed (`budget − near_reserve`), and
+/// the two redistribution phases against the remaining budget — and
+/// each computes this allowance fresh, so the whole-tick sum of
+/// phase caps is at most `3·budget` (the guaranteed phases sum to
+/// `budget`, the two extras to at most `2·budget` more) and the
+/// blended whole-tick housekeeping is bounded by `4.5·budget + 4F`:
+/// the per-phase caps contribute `1.5 × 3·budget`, and the `+4F` is
+/// the per-phase TERMINAL OVERSHOOT — one execution's atomic waiter
+/// release may push a phase past its cap by at most F units (the
+/// admission bound on the prerequisite's declared dependents; the
+/// bound gates the next iteration, never the release itself — the
+/// E-10 all-or-nothing contract). `worst_tick_housekeeping`
+/// therefore measures a quantity that is actually bounded, and —
+/// with the T08 admission caps — every charged unit bounds
+/// closed-form engine work (a park bounds `O(D·log n)`
+/// registration work, a release visit is one O(1) `try_unblock`, a
+/// follow-up admission is `O(D)` validation).
+///
+/// VERSION NOTE (the conscious, recorded strengthening): the
+/// allowance's NUMBER and GRANULARITY are unchanged — one unit per
+/// park, one per release attempt, the 1.5× multiple, per-phase
+/// allowances — what changed (T08) is the unit's MEANING: before the
+/// admission caps a unit's underlying work was unbounded in the
+/// graph (a park could register unbounded edges; a release could
+/// walk an unbounded waiter list), so the allowance bounded only a
+/// count, never the work. The caps bound admission before any
+/// mutation, making each unit's work closed-form without moving a
+/// single counter at the defaults. The 1.5× multiple itself remains
+/// `[ASSUMPTION]` (see above).
 fn housekeeping_cap(cap: u32) -> u64 {
     u64::from(cap) + u64::from(cap) / 2
 }
@@ -1315,8 +1401,11 @@ fn housekeeping_cap(cap: u32) -> u64 {
 /// `Unblocked` (B01's granularity, unchanged — the class split is
 /// observability, never a behavior change).
 enum ReleaseAttempt {
-    /// The waiter is not currently blocked — a defensive no-op
-    /// (uncharged, as ever).
+    /// The waiter is not currently blocked — a defensive no-op,
+    /// charged as the visit it performed (T08 §5.1: every visit
+    /// class charges exactly one unit, keeping
+    /// `waiter_visits == decrements + unblocks + not_blocked` the
+    /// closed charge identity).
     NotBlocked,
     /// The waiter's remaining-count decremented: still blocked
     /// (partial release), or the lifecycle-unreachable
@@ -1400,6 +1489,8 @@ impl<W: World> Spine<W> {
             retention_eligibility: None,
             retention_stats: RetentionStats::default(),
             housekeeping_stats: HousekeepingStats::default(),
+            backlog_at_break_near: 0,
+            backlog_at_break_far: 0,
             scratch_follow_ups: Vec::new(),
             class_index: None,
         }
@@ -2802,6 +2893,16 @@ impl<W: World> Spine<W> {
     /// phases collapse to the Stage 0 single-queue behavior exactly.
     pub fn run_tick(&mut self) -> Tick {
         self.clock = self.clock.saturating_add(1);
+        // The per-tick report scratch resets (T08 §5.4): a tick with
+        // no exhaustion break reports zero backlog samples.
+        self.backlog_at_break_near = 0;
+        self.backlog_at_break_far = 0;
+        // The per-tick registration delta's base (T08 §5.2): every
+        // registration the four drain phases below perform lands in
+        // `dependency_registrations`, so the tick's own total is the
+        // delta across them — the worst published beside
+        // `worst_tick_housekeeping`.
+        let registrations_before = self.housekeeping_stats.dependency_registrations;
         let near_guaranteed = self.drain_due(Field::Near, self.near_reserve);
         let far_guaranteed = self.drain_due(Field::Far, self.budget - self.near_reserve);
         let near_extra = self.drain_due(
@@ -2829,6 +2930,17 @@ impl<W: World> Spine<W> {
             .housekeeping_stats
             .worst_tick_housekeeping
             .max(tick_housekeeping);
+        // The registration slope's per-tick worst (T08 §5.2),
+        // mirroring the blended worst above: the edge fan-out the
+        // one-unit park charge deliberately does not scale with,
+        // published per tick so the slope is observable without
+        // tripping anything.
+        let tick_registrations =
+            self.housekeeping_stats.dependency_registrations - registrations_before;
+        self.housekeeping_stats.worst_tick_dependency_registrations = self
+            .housekeeping_stats
+            .worst_tick_dependency_registrations
+            .max(tick_registrations);
         // B01's observable-exhaustion signal, recorded at the break:
         // any phase's drain was stopped by the housekeeping allowance
         // while due work remained queued in that phase's lane. The
@@ -2855,6 +2967,14 @@ impl<W: World> Spine<W> {
         let far_backlogged = self.lane_has_due_work(Field::Far);
         if executed >= self.budget && (near_backlogged || far_backlogged) {
             self.stats.budget_exhausted_ticks += 1;
+            // The budget break's snapshot (T08 §5.4): the execution
+            // budget is an exhaustion break exactly like the
+            // housekeeping allowance's — the most recent break's
+            // queue lengths are what the tick's report carries, so a
+            // budget-bound tick (the fixed-budget drain shape)
+            // publishes its backlog slope through the same fields.
+            self.backlog_at_break_near = self.near_queue.len() as u64;
+            self.backlog_at_break_far = self.far_queue.len() as u64;
             if self.diag.would_log(Level::Info) {
                 self.diag.log(
                     Level::Info,
@@ -2878,6 +2998,8 @@ impl<W: World> Spine<W> {
             near_backlogged,
             far_backlogged,
             housekeeping_exhausted,
+            housekeeping_backlog_near: self.backlog_at_break_near,
+            housekeeping_backlog_far: self.backlog_at_break_far,
         };
         // The A22-core retention checkpoint: the policy's ONE firing
         // site, at the tick boundary — after every drain phase and the
@@ -3953,6 +4075,12 @@ impl<W: World> Spine<W> {
             } as u64;
             self.housekeeping_stats.exhaustion_backlog_peak =
                 self.housekeeping_stats.exhaustion_backlog_peak.max(queued);
+            // The per-tick report snapshot at the break (T08 §5.4):
+            // both lanes' queue lengths, the backlog slope's sample
+            // for this tick — the most recent break's snapshot wins
+            // (the budget break at the tick's end may overwrite it).
+            self.backlog_at_break_near = self.near_queue.len() as u64;
+            self.backlog_at_break_far = self.far_queue.len() as u64;
         }
         DrainOutcome {
             executed,
@@ -4102,7 +4230,20 @@ impl<W: World> Spine<W> {
                         self.housekeeping_stats.release_unblocks += 1;
                         released += 1;
                     }
-                    ReleaseAttempt::NotBlocked => {}
+                    ReleaseAttempt::NotBlocked => {
+                        // Charged as the visit it performed (T08
+                        // §5.1): the arm is defensively unreachable
+                        // through the public API (the lifecycle
+                        // keeps registrations inside the blocked
+                        // set), but an uncharged visit class is
+                        // exactly the "observations do not bound
+                        // work" shape — the charge identity
+                        // `waiter_visits == decrements + unblocks +
+                        // not_blocked` closes only with this arm
+                        // counted.
+                        self.housekeeping_stats.release_not_blocked += 1;
+                        released += 1;
+                    }
                 }
             }
         }
@@ -4673,6 +4814,8 @@ impl<W: SaveWorld> Spine<W> {
             retention_eligibility: None,
             retention_stats: RetentionStats::default(),
             housekeeping_stats: HousekeepingStats::default(),
+            backlog_at_break_near: 0,
+            backlog_at_break_far: 0,
             scratch_follow_ups: Vec::new(),
             // Wire-invisible (CA-08): the class-locality index never
             // reaches the save — a restored spine reconstructs it on
@@ -6460,11 +6603,18 @@ mod tests {
         assert_eq!(counters.release_unblocks, 4);
         // The no-partial-release invariant (the resumable-cursor
         // contract's proof surface): every visit resolves to exactly
-        // one counted outcome.
+        // one counted outcome — the CLOSED CHARGE IDENTITY since the
+        // `NotBlocked` arm was charged (T08 §5.1): all three release
+        // classes count, so the loop's true iteration count can
+        // never hide behind an uncharged class.
+        assert_eq!(
+            counters.release_not_blocked, 0,
+            "the no-op arm is defensively unreachable through the public API"
+        );
         assert_eq!(
             counters.waiter_visits,
-            counters.release_decrements + counters.release_unblocks,
-            "no release visit is lost mid-loop (the atomic-release contract)"
+            counters.release_decrements + counters.release_unblocks + counters.release_not_blocked,
+            "no release visit is lost mid-loop (the atomic-release charge identity)"
         );
         // Worst per-tick blended total: tick 1 parks four (4 units);
         // tick 3 executes the prerequisite whose atomic release
@@ -6600,6 +6750,16 @@ mod tests {
         let tick1 = spine.housekeeping_stats();
         assert_eq!(tick1.parks, 30, "the two near phases park fifteen each");
         assert_eq!(tick1.dependency_registrations, 30);
+        assert_eq!(
+            tick1.worst_tick_dependency_registrations, 30,
+            "the registration slope's per-tick worst (T08 §5.2) — thirty per tick here"
+        );
+        // The per-tick backlog samples (T08 §5.4): the report fields
+        // carry the slope the hand-sampled near_pending_count
+        // assertions below already pin — 61 queued at the tick's last
+        // break.
+        assert_eq!(spine.lane_report().housekeeping_backlog_near, 61);
+        assert_eq!(spine.lane_report().housekeeping_backlog_far, 0);
         // The queue-length bound includes the not-yet-due prerequisite
         // (91 queued events, 15 parked): 76 — the documented O(1)
         // upper bound on the due backlog, exact up to the one
@@ -6618,6 +6778,11 @@ mod tests {
         let tick2 = spine.housekeeping_stats();
         assert_eq!(tick2.parks, 60);
         assert_eq!(
+            tick2.worst_tick_dependency_registrations, 30,
+            "the per-tick worst, not the cumulative — each tick registers thirty"
+        );
+        assert_eq!(spine.lane_report().housekeeping_backlog_near, 31);
+        assert_eq!(
             spine.near_pending_count(),
             31,
             "the slope: 31 queued after two ticks"
@@ -6625,6 +6790,13 @@ mod tests {
         spine.run_tick();
         let tick3 = spine.housekeeping_stats();
         assert_eq!(tick3.parks, 90, "the whole herd parked");
+        assert_eq!(tick3.worst_tick_dependency_registrations, 30);
+        // Tick 3's LAST break is the guaranteed phase's (16 queued
+        // at that break); the redistribution phase parks the rest
+        // without breaking — no due work remains beyond the
+        // far-due prerequisite — so the snapshot keeps the
+        // mid-tick value, the documented O(1) upper bound.
+        assert_eq!(spine.lane_report().housekeeping_backlog_near, 16);
         assert_eq!(
             tick3.exhaustion_backlog_peak, 76,
             "the peak stays the first break's"
@@ -6638,11 +6810,32 @@ mod tests {
         // The prerequisite executes at tick 100: the whole herd
         // releases atomically (ninety visits — the overshoot), then
         // the budget admits ten per tick.
+        spine.run_ticks(96);
+        spine.run_tick();
+        // The release tick's report: BOTH exhaustion classes fired
+        // (the housekeeping break mid-drain at 90 re-queued, the
+        // budget break at the tick's end after the redistribution
+        // phase drained nine more) — the most recent break's
+        // snapshot wins, so the fields carry the end-of-tick
+        // remaining backlog, the slope's sample for this tick.
+        let release_report = spine.lane_report();
+        assert_eq!(release_report.housekeeping_backlog_near, 81);
+        assert_eq!(release_report.housekeeping_backlog_far, 0);
+        assert!(release_report.near_backlogged);
+        assert_eq!(
+            spine.stats().executed,
+            10,
+            "the prerequisite plus the nine the redistribution phase admitted within the budget"
+        );
         spine.run_to_completion(200);
         assert_eq!(spine.stats().executed, 91, "the storm drains completely");
         let final_counters = spine.housekeeping_stats();
         assert_eq!(final_counters.parks, 90);
         assert_eq!(final_counters.dependency_registrations, 90);
+        assert_eq!(
+            final_counters.worst_tick_dependency_registrations, 30,
+            "the worst per-tick registration slope across the whole run"
+        );
         assert_eq!(final_counters.waiter_visits, 90);
         assert_eq!(final_counters.release_decrements, 0);
         assert_eq!(final_counters.release_unblocks, 90);
