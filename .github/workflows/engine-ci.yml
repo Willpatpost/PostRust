@@ -2145,7 +2145,7 @@ jobs:
           # the isolated rerun and the full protocol rerun both
           # green — the SECOND recorded occurrence, a third
           # makes it a register investigation; the weather rig
-# battery 11/11 in the same first run).
+          # battery 11/11 in the same first run).
           expected=716
           if [ "$(uname -s)" != "Linux" ]; then expected=715; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
