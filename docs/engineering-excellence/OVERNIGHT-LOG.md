@@ -450,3 +450,55 @@ Windows delete-semantics trap eliminated by construction (three iterations:
 the swallowed wipe → the loud wipe naming the lock → the fresh-root
 allocator). Every iteration root-caused from the run evidence before the
 next dispatch.
+
+## STATE AT DAWN — 2026-11-29 (the ODU orchestrator session, continuously maintained)
+
+**One-paragraph summary:** Waves 0+1 of the Strict Audit IV campaign are
+complete and CI-verified (T01, T38, T19-E-S1, T04, T07, T05, T21, and the
+T02/T03/T06/T16 lifecycle cluster L1–L5); the owner-approved A06 animation
+extraction is FULLY executed (E-S1..E-S4, the re-measure confirming the
+ratified near-core closure); the spine trio is dispositioned (T07
+implemented, T08 implemented-pending-measurement, T09 parked-with-trigger on
+the honest workload-warrant evidence); the walker residency (T29) is
+implemented with the prefix summary parked as an owner decision. Every
+landing carries red witnesses where constructible, measured pin corrections,
+orchestrator-verified diffs, and exact-head green runs.
+
+**Exact state:** integration head `c4a21f8` (remote synced; every recent
+candidate green — latest run `46158294657` at `52714d6`, all five jobs).
+Main `5b93167` and the tag untouched. CI pins: main 1684/1633 passed / 2
+ignored / 38 lines; renderer-release 227/3; heavy 720/66/72; local-only
+exclusion 132/133. The count-gate control plane now centralizes ALL THREE
+shards (the T01 class completed on the third after a caught near-miss) with
+the selftest fixture guarding it.
+
+**Owner decisions genuinely pending (nothing decided by the orchestrator):**
+1. DECISION-T29-prefix-summary (`designs/T29-walker-residency.md` Appendix A
+   — five points: durable contents, the trust trade, cursor posture,
+   activation policy, warrant threshold).
+2. DECISION-t09-keyed-lane contingency (`designs/T09-queued-locality.md`) —
+   parked unless the reopen trigger fires (≥5k unrelated queued at
+   transition in a production/rig workload).
+3. The T08 measurement obligations (the 1.5× assumption re-pin pending the
+   sustained matrix; default-cap headroom; composite per-tick at production
+   scale; declared-vs-registered gap) — B01/Q03 NOT claimed closed without
+   them.
+
+**Rig-deferred verifications owed (each named in the register):** the six
+lifecycle fault batteries (interrupted-growth retry, classified prefix,
+drain-timeout quarantine + retry, never-signaling quarantine, render_layers
+latch, the first-use WSI deciding run); T04's render_overflow battery
+(CI-Linux mesa the authority); the A06 rig batteries (the pose/instance
+digest pins re-verified on-device at E-S2/E-S3 trees); the T39
+exact-tree measurement matrix; T40's coverage ledger.
+
+**Remaining campaign:** Wave 2's spatial cluster (T10/T11/T37), the persist
+residency pair (T13/T14 — CA-17 stage 2 gated on owner-rig census data),
+T30, Waves 3–4 (T12/T15/T17/T18/T20/T23–T28/T31/T33–T36), T32's
+render-types half (the types-only surface), the
+recovery_classification.rs no-default clippy item (the handoff's standing
+narrow follow-up), T39/T40 throughout, P7 only at the bar.
+
+**Recovery:** `~/postrust-logs/overnight-state/` (STATE.md, events.jsonl,
+per-lane notes); the register (FINDINGS.md) current per landing; this log.
+The self-resume message is saved alongside the checkpoint.
