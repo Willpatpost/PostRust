@@ -141,7 +141,7 @@ Classes: CONFIRMED (source-derived), HYPOTHESIS (reproduce-or-refute mandated), 
 | T26 | OBLIGATION (open) | A26-class | CPU whole-scene/proxy capacity architecture |
 | T27 | INVESTIGATION | A21/R05 | frame stats/timestamp bounded meaningful semantics |
 | T28 | CONFIRMED | B13 | worker measurement does not resolve authority-thread blocking |
-| T29 | CONFIRMED structure | B02/B03 | **DESIGN LANDED `c2701ee`** (`designs/T29-walker-residency.md`, lane `e87aee2`): the three-lifetime-class adjudication (the cursor O(chain) load-bearing; the walk-transient ~2·o_max peak and the ~1.15 MiB per-validation churn removable with no format change; the prefix summary parked as DECISION-T29-prefix-summary); the implementation dispatched for commits 1–2 |
+| T29 | CONFIRMED structure | B02/B03 | **IMPLEMENTED (commits 1–2; commit 3 PARKED as DECISION-T29-prefix-summary)**: the census measured (the 2·o_max 11.01 MiB peak → the 65,536 B window; the churn → pins zero; whole-read volume 0 B after); the streaming verified reads with the L5 oracle discipline (3 seeded regressions caught); the borrow-not-clone fixes; the equivalence proof green both providers over the full corpus; the rusqlite blob finding handled via the sanctioned substr fallback (no manifest change); the wall-time trade honest (~15–35% cold open — the parked summary the asymptotic fix) |
 | T30 | REPORTED/DESIGN | R07/B04 | transaction state-machine consolidation staged |
 | T31 | CONFIRMED improvements + proof needed | CA18-20 | backup/restore durability + path portability cross-provider |
 | T32 | CONFIRMED | B15/A06/F03 | animation/render contract footprint outstanding |

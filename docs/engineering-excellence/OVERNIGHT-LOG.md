@@ -429,3 +429,16 @@ stage 2). CI pins corrected (`ff99da7`: main 1676/1625, lines 38). Run
 
 **T09 stage-1 verified green:** run `46152480236` at `ff99da7` — all five
 jobs; the +3/+1-line pin arithmetic confirmed on both platforms.
+
+## T29 — the bounded walker residency implemented (commits 1–2)
+
+The census confirmed the design's estimates (11.01 MiB peak → 65,536 B;
+churn → zero pinned; whole-read volume 0 B after); the streaming verified
+reads with the frozen whole-read reference and three seeded regressions
+caught; the borrow-not-clone fixes; the equivalence proof green on both
+providers. The rusqlite blob finding handled via the sanctioned substr
+fallback. The wall-time trade recorded honestly. Commit 3 (the prefix
+summary) PARKED as DECISION-T29-prefix-summary. The pre-existing no-default
+clippy error in recovery_classification.rs verified at base — the handoff's
+standing item, queued for its narrow follow-up. CI pins corrected
+(`aaf9c8e`: main 1684/1633). Run `46154762231` dispatched.
