@@ -5,6 +5,8 @@ use engine_renderer::lit_scene::{
 use engine_renderer::proc_texture::{TEXTURE_SIZE, procedural_texture};
 use engine_renderer::{DemoScenePreference, RenderConfig, Renderer, ValidationPreference};
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
+use engine_slice::corner_demo::corner_submission;
+use engine_slice::corner_scene::{attach_corner_scene, corner_bounds};
 
 fn check_patch(renderer: &mut Renderer, size: (u32, u32), material: usize, light: LightParams) {
     // Orthographic 2 m square on the ground or on the +Z facade at z=-6.
@@ -38,7 +40,18 @@ fn check_patch(renderer: &mut Renderer, size: (u32, u32), material: usize, light
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(&matrix, eye, light, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                None,
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -105,13 +118,17 @@ fn corner_pixels_match_oracle_and_warmed_route_reuses_allocations() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             replace_pipelines: true,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner
+    // construction preference is deleted) — the same public
+    // attach every consumer uses.
+    attach_corner_scene(&mut renderer).unwrap();
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
@@ -142,7 +159,18 @@ fn corner_pixels_match_oracle_and_warmed_route_reuses_allocations() {
         let matrix = engine_slice::corner_demo::view_projection(pose, 1.);
         assert!(
             renderer
-                .render_corner(&matrix, pose.position, day_preset(), size)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    pose.position,
+                    day_preset(),
+                    None,
+                    corner_bounds(),
+                    None,
+                    None,
+                    false,
+                    None,
+                    size
+                ))
                 .unwrap()
                 .presented
         );
@@ -151,12 +179,18 @@ fn corner_pixels_match_oracle_and_warmed_route_reuses_allocations() {
     // Force replacement of the render pass and lit pipeline while retaining
     // all static textures/sets, then repeat the oracle on the replacement.
     let replacement = renderer
-        .render_corner(
+        .submit_frame(corner_submission(
             &[[0.; 4]; 4],
             [0.; 3],
             night_preset(),
+            None,
+            corner_bounds(),
+            None,
+            None,
+            false,
+            None,
             (size.0 + 8, size.1 + 8),
-        )
+        ))
         .unwrap();
     assert!(replacement.recreated);
     check_patch(&mut renderer, size, 1, night_preset());

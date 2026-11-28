@@ -12,7 +12,7 @@ use crate::config::{RenderConfig, TargetFaultSite, TargetFaultStage, present_mod
 use crate::overlay::{AtlasText, OverlayVertex};
 use crate::scene::SceneVertex;
 use crate::scene_description::{SceneDescription, SceneHandle};
-use crate::submission::{FrameSubmission, SceneBounds, SubmissionPolicy, adapt_frame};
+use crate::submission::{FrameSubmission, SubmissionPolicy, adapt_frame};
 use crate::vulkan::{
     self, CapturedFrame, FrameState, PipelineState, RendererError, SwapchainState, VulkanContext,
     drain_validation_messages, environment_pending, pick_depth_format, pick_surface_format,
@@ -53,11 +53,10 @@ pub struct SceneLayer<'a> {
 ///
 /// THE SHADOW EXCLUSION (the Era-2 package C documented contract):
 /// rain casts no shadows — translucent streaks have no silhouette —
-/// so the shadowed populated path (`render_corner_populated_shadowed`)
-/// submits only the npc and vehicle kinds through the shadow depth
-/// pass; the rain kind rides the LIT pass alone (drawn through the
-/// unlit blended particle pipeline, which receives no shadows by
-/// construction).
+/// so a shadowed populated frame submits only the npc and vehicle
+/// kinds through the shadow depth pass; the rain kind rides the LIT
+/// pass alone (drawn through the unlit blended particle pipeline,
+/// which receives no shadows by construction).
 #[derive(Debug, Clone, Copy)]
 pub struct ProxyPopulation<'a> {
     pub npc: &'a [crate::proxy_instances::ProxyInstance],
@@ -276,16 +275,17 @@ pub struct Renderer {
     frames: FrameState,
     config: RenderConfig,
     stats: RenderStats,
-    /// The attached scene's CPU-side facts (P4 S2): the handle (the
-    /// material-count bound the population validation reads) and
-    /// the shadow cascade's world bounds (the shadowed routes'
-    /// input). `None` until [`Self::attach_scene`]; the `Corner`
-    /// construction preference auto-attaches the migration shim's
-    /// content (see `corner_content`) at construction — the S6 step
-    /// deletes that adapter and the shim. The description itself is
-    /// consumed at attach (the GPU half lives in the context's
-    /// scene resources; these are the facts the per-frame paths
-    /// read).
+    /// The attached scene's CPU-side facts (P4 S2, completed at S6):
+    /// the handle — the material-count bound the population
+    /// validation reads. `None` until [`Self::attach_scene`]; the
+    /// former `Corner` construction preference (the S2 migration's
+    /// auto-attach adapter) is DELETED, so every consumer — the
+    /// corner demo included — attaches its own
+    /// [`SceneDescription`] through the public API. The description
+    /// itself is consumed at attach (the GPU half lives in the
+    /// context's scene resources; the shadow cascade's bounds travel
+    /// per frame in the submission's [`crate::SceneFrame`], the
+    /// authored value the caller holds with the description).
     scene: Option<AttachedScene>,
     overlay_enabled: bool,
     overlay_color: [f32; 4],
@@ -307,44 +307,17 @@ pub struct Renderer {
     /// its capacity from the first frames reused forever).
     pose_bytes: Vec<u8>,
     proxy_draw_mode: ProxyDrawMode,
-    /// The Era-1 sky layer's sticky setting (the set_overlay_enabled
-    /// precedent): `Some` makes every subsequent corner-family frame
-    /// draw the sky pass first; `None` keeps the skyless byte-identical
-    /// path.
-    sky: Option<SkyFrame>,
-    /// The Era-1 post chain's sticky setting (the same precedent):
-    /// `true` makes every subsequent corner-family frame render
-    /// through the HDR chain (the scene pass into the R16G16B16A16
-    /// target, the bloom mips, the composite + tonemap into the
-    /// swapchain); `false` keeps the postless byte-identical path.
-    /// The region path (`render_layers`) stays postless regardless —
-    /// the chain is a corner-family feature (the brief's reference
-    /// scene), documented like the sky's scope.
-    post: bool,
-    /// The Era-1 wet-ground reflection's sticky setting: `true`
-    /// makes every subsequent corner-family frame render the
-    /// mirrored scene into an offscreen target and re-draw the
-    /// ground Schlick-blended over it (planar.rs's matrix and
-    /// blend); `false` keeps the dry byte-identical path. Carries
-    /// the post state implicitly (the reflection pass rides its
-    /// HDR render pass object) — the post CHAIN itself stays
-    /// optional.
-    wet: bool,
-    /// The rain-ripple field's packed uniform (Era-2 package C
-    /// recursive item 1): a fixed-size Copy, written by
-    /// `set_ripple_field` and copied into every wet frame's
-    /// `WetCamera` — zero per-frame allocation (the sticky-setting
-    /// precedent's frame-data lane).
-    ripple: vulkan::reflection_draw::RippleUniformData,
     /// The TEST-ONLY ripple debug mode (finding 15b's separation
-    /// fixtures — see [`RippleDebugMode`]). Sticky like every other
-    /// presentation setting; `Off` by default and in every
+    /// fixtures — see [`RippleDebugMode`]). The one retained
+    /// renderer-level policy the submission adapter still reads per
+    /// frame (with the proxy mode); `Off` by default and in every
     /// production frame.
     ripple_debug: RippleDebugMode,
 }
 
-/// The Era-1 sky layer's frame description (the sticky `set_sky`
-/// setting): the palette and the celestial disc's direction. The
+/// The Era-1 sky layer's frame description (the per-frame
+/// [`crate::SceneFrame`] field the former sticky `set_sky` setting
+/// fed): the palette and the celestial disc's direction. The
 /// renderer derives the pass's remaining input (the inverse
 /// view-projection) per frame from the camera matrix it is already
 /// given — the caller supplies nothing per frame.
@@ -428,41 +401,36 @@ impl RippleDebugMode {
     }
 }
 
-/// The attached scene's retained facts (the renderer's `scene`
-/// field's payload — see its doc): plain `Copy` data distilled
-/// from the consumed [`SceneDescription`] at attach. The bounds
-/// are the shadowed routes' cascade input (the S1-era
-/// `shadows::scene_bounds(lit_scene::intersection_boxes())`
-/// inline computation, now the description's authored value); the
-/// handle's material count is the population validation bound
-/// (the S1-era `lit_scene::materials().len()` read).
+/// The attached scene's retained fact (the renderer's `scene`
+/// field's payload — see its doc): plain `Copy` data distilled from
+/// the consumed [`SceneDescription`] at attach. The handle's
+/// material count is the population validation bound (the S1-era
+/// `lit_scene::materials().len()` read). The shadow cascade's
+/// bounds are NOT retained here: the submission's
+/// [`crate::SceneFrame`] carries them per frame — authored content
+/// the caller holds alongside the description it attached.
 #[derive(Debug, Clone, Copy)]
 struct AttachedScene {
     handle: SceneHandle,
-    bounds: SceneBounds,
 }
 
-/// The attach step shared by the public API
-/// ([`Renderer::attach_scene`]) and the construction adapter (the
-/// `Corner` preference in [`Renderer::new`]): validate the
-/// description WHOLE, device-free (a refusal builds nothing and
-/// leaves the context untouched), then upload through the
-/// context's scene-resource machinery (partial-failure-safe — on
-/// error the context is unchanged), then distill the retained
-/// facts. ONE scene per renderer lifetime (the context's attach
-/// refuses a second; the device-lifetime pass families bind the
-/// attached buffers).
+/// The attach step behind the public API
+/// ([`Renderer::attach_scene`]): validate the description WHOLE,
+/// device-free (a refusal builds nothing and leaves the context
+/// untouched), then upload through the context's scene-resource
+/// machinery (partial-failure-safe — on error the context is
+/// unchanged), then distill the retained facts. ONE scene per
+/// renderer lifetime (the context's attach refuses a second; the
+/// device-lifetime pass families bind the attached buffers).
 fn attach_description(
     ctx: &mut VulkanContext,
     description: SceneDescription,
 ) -> Result<AttachedScene, RendererError> {
     description.validate()?;
     let material_count = description.materials.len() as u32;
-    let bounds = description.bounds;
     ctx.attach_scene_resources(&description)?;
     Ok(AttachedScene {
         handle: SceneHandle { material_count },
-        bounds,
     })
 }
 
@@ -471,26 +439,12 @@ impl Renderer {
         let atlas_text = AtlasText::default();
         let (mut ctx, validation_active, sync_validation) =
             VulkanContext::new(window, atlas_text.atlas(), &config)?;
-        // The Corner preference's construction adapter (P4 S2): the
-        // preference keeps uploading the corner content at
-        // construction — now through the SAME attach path every
-        // consumer uses (the migration shim's description; the
-        // upload this preference used to trigger inside
-        // `VulkanContext::new` moved behind the `SceneDescription`
-        // handle). Same ladder position (the context's own stages,
-        // then the scene upload — the allocation order the
-        // batteries pin), same cross-stage teardown on failure.
-        let scene = if config.demo_scene == crate::DemoScenePreference::Corner {
-            match attach_description(&mut ctx, crate::corner_content::corner_scene_description()) {
-                Ok(attached) => Some(attached),
-                Err(error) => {
-                    ctx.destroy();
-                    return Err(error);
-                }
-            }
-        } else {
-            None
-        };
+        // P4 S6: the `Corner` construction preference is deleted —
+        // authored scene content reaches the renderer ONLY through
+        // [`Self::attach_scene`] (the demo and every test attach
+        // their own description). Construction builds no scene
+        // resources; the ladder below is the plain
+        // context→format→pipelines→swapchain→frames climb.
         // Cross-stage cleanup (corrective finding G): each constructor
         // cleans up its own partials; this ladder releases completed
         // stages when a later stage fails.
@@ -580,7 +534,7 @@ impl Renderer {
             frames,
             config,
             stats,
-            scene,
+            scene: None,
             overlay_enabled: true,
             overlay_color: [0.72, 1.0, 0.78, 0.85],
             overlay_vertices: Vec::new(),
@@ -588,10 +542,6 @@ impl Renderer {
             instance_bytes: Vec::new(),
             pose_bytes: Vec::new(),
             proxy_draw_mode: ProxyDrawMode::default(),
-            sky: None,
-            post: false,
-            wet: false,
-            ripple: vulkan::reflection_draw::RippleUniformData::empty(),
             ripple_debug: RippleDebugMode::Off,
         })
     }
@@ -676,420 +626,15 @@ impl Renderer {
             None,
             None,
             None,
-            // The sky layer is a corner-family feature (the sticky
-            // setting's documented scope); the general region path
-            // stays skyless.
+            // The sky layer is a scene-backed-family feature (the
+            // submission's `scene.sky` field); the general region
+            // path stays skyless.
             None,
             // The post chain likewise (the region path stays
-            // postless — the setting's documented scope), and the
-            // wet reflection with it.
+            // postless — the layers-only shape's documented scope),
+            // and the wet reflection with it.
             false,
             None,
-        )?;
-        Ok(self.finish_frame(outcome))
-    }
-
-    /// Draws the resident corner mesh with this camera and preset.
-    pub fn render_corner(
-        &mut self,
-        view_proj: &[[f32; 4]; 4],
-        eye: [f32; 3],
-        light: crate::lit_scene::LightParams,
-        size: (u32, u32),
-    ) -> Result<FrameResult, RendererError> {
-        // The scene gate (P4 S2: the preference gate's
-        // generalization — the routes require the ATTACHED scene;
-        // the Corner preference auto-attaches at construction, so
-        // every existing construction behaves exactly as before,
-        // and an explicit `attach_scene` is the new public way in).
-        if self.scene.is_none() {
-            return Err(RendererError::Vulkan(
-                "render_corner requires an attached scene (attach_scene, or construct \
-                 with the Corner preference)"
-                    .into(),
-            ));
-        }
-        let params = vulkan::corner::FrameParams::new(*view_proj, eye, light);
-        let sky = self.sky_params(view_proj);
-        let wet = self.wet_camera(view_proj, eye, light);
-        let outcome = vulkan::render_frame(
-            &mut self.ctx,
-            &mut self.swapchain,
-            &mut self.pipes,
-            &mut self.frames,
-            size,
-            self.config.present_mode,
-            self.config.replace_pipelines,
-            self.config.demo_scene,
-            view_proj,
-            &[],
-            None,
-            &[],
-            &[],
-            Some(&params),
-            None,
-            None,
-            sky.as_ref(),
-            self.post,
-            wet.as_ref(),
-        )?;
-        Ok(self.finish_frame(outcome))
-    }
-
-    /// Draws the resident corner mesh PLUS a proxy population, the
-    /// Cycle 6-E path: the instances are repacked into the retained
-    /// buffer (zero per-frame allocation after the first populated
-    /// frames) and submitted per [`ProxyDrawMode`] — one draw call
-    /// per populated kind in the production `Instanced` mode and the
-    /// 6-E2 `Indirect` mode alike (the latter reads the instance
-    /// counts from the GPU-side command block — see
-    /// [`crate::proxy_indirect`]). The
-    /// population is validated BEFORE any frame state is touched: a
-    /// typed refusal (over-capacity total, invalid field, or a
-    /// material index outside the corner table) renders nothing and
-    /// leaves the frame flow untouched.
-    pub fn render_corner_populated(
-        &mut self,
-        view_proj: &[[f32; 4]; 4],
-        eye: [f32; 3],
-        light: crate::lit_scene::LightParams,
-        population: &ProxyPopulation<'_>,
-        size: (u32, u32),
-    ) -> Result<FrameResult, RendererError> {
-        if self.scene.is_none() {
-            return Err(RendererError::Vulkan(
-                "render_corner_populated requires an attached scene (attach_scene, or \
-                 construct with the Corner preference)"
-                    .into(),
-            ));
-        }
-        // The material-table bound (P4 S2: the S1-era read of
-        // `lit_scene::materials().len()` — now the attached scene's
-        // own table length through the handle; the shim-equality
-        // gate pins the corner's to the reference table's three).
-        let material_table = self.scene.map_or(0, |scene| scene.handle.material_count);
-        if population.npc_material >= material_table
-            || population.vehicle_material >= material_table
-            || population.rain_material >= material_table
-        {
-            return Err(RendererError::Vulkan(format!(
-                "proxy material index outside the scene material table \
-                 ({} materials, npc {}, vehicle {}, rain {})",
-                material_table,
-                population.npc_material,
-                population.vehicle_material,
-                population.rain_material
-            )));
-        }
-        crate::proxy_instances::repack_populations(
-            &mut self.instance_bytes,
-            population.npc,
-            population.vehicle,
-            population.rain,
-        )
-        .map_err(RendererError::ProxyPack)?;
-        // The pose contract, validated BEFORE any frame state is
-        // touched (the capture-refusal discipline): every POPULATED
-        // npc's pose index must select a supplied block, and the
-        // block count is bounded (the repack's own typed refusal
-        // below enforces MAX_POSE_BLOCKS — this check is the
-        // index-vs-count half the repack cannot see).
-        if population
-            .npc
-            .iter()
-            .any(|instance| instance.pose_index as usize >= population.npc_poses.len())
-        {
-            return Err(RendererError::Vulkan(format!(
-                "a npc pose index falls outside the supplied pose blocks \
-                 ({} blocks, highest index {})",
-                population.npc_poses.len(),
-                population
-                    .npc
-                    .iter()
-                    .map(|instance| instance.pose_index)
-                    .max()
-                    .unwrap_or(0)
-            )));
-        }
-        crate::animation::repack_poses(&mut self.pose_bytes, population.npc_poses)
-            .map_err(RendererError::PosePack)?;
-        let params = vulkan::corner::FrameParams::new(*view_proj, eye, light);
-        let upload = vulkan::proxy_draw::ProxyFrameUpload {
-            bytes: &self.instance_bytes,
-            pose_bytes: &self.pose_bytes,
-            npc_count: population.npc.len() as u32,
-            vehicle_count: population.vehicle.len() as u32,
-            rain_count: population.rain.len() as u32,
-            npc_material: population.npc_material,
-            vehicle_material: population.vehicle_material,
-            rain_material: population.rain_material,
-            mode: self.proxy_draw_mode,
-        };
-        let sky = self.sky_params(view_proj);
-        let wet = self.wet_camera(view_proj, eye, light);
-        let outcome = vulkan::render_frame(
-            &mut self.ctx,
-            &mut self.swapchain,
-            &mut self.pipes,
-            &mut self.frames,
-            size,
-            self.config.present_mode,
-            self.config.replace_pipelines,
-            self.config.demo_scene,
-            view_proj,
-            &[],
-            None,
-            &[],
-            &[],
-            Some(&params),
-            Some(&upload),
-            None,
-            sky.as_ref(),
-            self.post,
-            wet.as_ref(),
-        )?;
-        Ok(self.finish_frame(outcome))
-    }
-
-    /// Draws the corner scene with DIRECTIONAL SHADOWS (Cycle 6-F):
-    /// one cascade computed from the light direction and the scene's
-    /// world AABB (the deterministic core's `cascade_for`), rendered
-    /// through the depth-only pass, then the main pass with the
-    /// shadowed lit pipeline sampling the map (Era-1 PCF soft
-    /// shadows — the 3×3 `shadow_filter` tap table over the validated
-    /// map, the compare-time analytical bias shared verbatim with the
-    /// CPU oracle). The unshadowed `render_corner`
-    /// path is untouched — pixel-identical to the pre-6-F renderer.
-    /// The bias parameters are CALLER policy (documented per caller;
-    /// the shader and the CPU oracle share the same expression).
-    pub fn render_corner_shadowed(
-        &mut self,
-        view_proj: &[[f32; 4]; 4],
-        eye: [f32; 3],
-        light: crate::lit_scene::LightParams,
-        bias: crate::shadows::ShadowBias,
-        size: (u32, u32),
-    ) -> Result<FrameResult, RendererError> {
-        if self.scene.is_none() {
-            return Err(RendererError::Vulkan(
-                "render_corner_shadowed requires an attached scene (attach_scene, or \
-                 construct with the Corner preference)"
-                    .into(),
-            ));
-        }
-        // The cascade's world bounds (P4 S2: the S1-era inline
-        // `shadows::scene_bounds(lit_scene::intersection_boxes())`
-        // — now the attached scene's authored bounds through the
-        // handle; the shim-equality gate pins the corner's to the
-        // reference computation's value).
-        let (min, max) = self.scene.map_or(([0.0; 3], [0.0; 3]), |scene| {
-            (scene.bounds.min, scene.bounds.max)
-        });
-        let cascade = crate::shadows::cascade_for(light.dir_toward_light, min, max);
-        let [r, g, b] = light.ambient;
-        let params = vulkan::shadow_draw::ShadowFrameParams {
-            view_proj: *view_proj,
-            light_dir: [
-                light.dir_toward_light[0],
-                light.dir_toward_light[1],
-                light.dir_toward_light[2],
-                eye[0],
-            ],
-            light_color: [
-                light.light_color[0],
-                light.light_color[1],
-                light.light_color[2],
-                eye[1],
-            ],
-            ambient: [r, g, b, eye[2]],
-            light_view_proj: cascade.matrix,
-            shadow_control: [
-                crate::shadows::SHADOW_MAP_EXTENT as f32,
-                bias.constant,
-                bias.slope_scale,
-                0.0,
-            ],
-        };
-        let sky = self.sky_params(view_proj);
-        let wet = self.wet_camera(view_proj, eye, light);
-        // The ground re-draw (finding 5) needs the current camera in the
-        // corner buffer regardless of the lighting branch. Build the
-        // ordinary FrameParams and pass it in corner_params.
-        let corner_params = vulkan::corner::FrameParams::new(*view_proj, eye, light);
-        let outcome = vulkan::render_frame(
-            &mut self.ctx,
-            &mut self.swapchain,
-            &mut self.pipes,
-            &mut self.frames,
-            size,
-            self.config.present_mode,
-            self.config.replace_pipelines,
-            self.config.demo_scene,
-            view_proj,
-            &[],
-            None,
-            &[],
-            &[],
-            Some(&corner_params),
-            None,
-            Some(&params),
-            sky.as_ref(),
-            self.post,
-            wet.as_ref(),
-        )?;
-        Ok(self.finish_frame(outcome))
-    }
-
-    /// Draws the corner scene with DIRECTIONAL SHADOWS PLUS a proxy
-    /// population (Era-2 stage 4b — the --populated --shadows
-    /// together path): the proxy instances CAST their shadows
-    /// through the shadowed depth pass AND receive shadows through
-    /// the shadowed lit pipeline, all through the same one-cascade
-    /// cascade (the deterministic core's `cascade_for`). THE RAIN
-    /// KIND EXCLUDED FROM THE CAST: translucent streaks have no
-    /// silhouette, so the shadow depth pass submits only the npc and
-    /// vehicle kinds — rain rides the LIT pass alone (the unlit
-    /// blended particle pipeline receives no shadows by
-    /// construction). The safe layer's repacked instance and pose
-    /// blocks are uploaded after the slot's fence wait, before the
-    /// command recording begins — the proxy_instances and animation
-    /// patterns. The proxy
-    /// population is validated BEFORE any frame state is touched: a
-    /// typed refusal (over-capacity total, invalid field, or a
-    /// material index outside the corner table) renders nothing and
-    /// leaves the frame flow untouched.
-    pub fn render_corner_populated_shadowed(
-        &mut self,
-        view_proj: &[[f32; 4]; 4],
-        eye: [f32; 3],
-        light: crate::lit_scene::LightParams,
-        bias: crate::shadows::ShadowBias,
-        population: &ProxyPopulation<'_>,
-        size: (u32, u32),
-    ) -> Result<FrameResult, RendererError> {
-        if self.scene.is_none() {
-            return Err(RendererError::Vulkan(
-                "render_corner_populated_shadowed requires an attached scene \
-                 (attach_scene, or construct with the Corner preference)"
-                    .into(),
-            ));
-        }
-        // The material-table bound (P4 S2: as render_corner_populated's
-        // — the attached scene's own table length through the handle).
-        let material_table = self.scene.map_or(0, |scene| scene.handle.material_count);
-        if population.npc_material >= material_table
-            || population.vehicle_material >= material_table
-            || population.rain_material >= material_table
-        {
-            return Err(RendererError::Vulkan(format!(
-                "proxy material index outside the scene material table \
-                 ({} materials, npc {}, vehicle {}, rain {})",
-                material_table,
-                population.npc_material,
-                population.vehicle_material,
-                population.rain_material
-            )));
-        }
-        crate::proxy_instances::repack_populations(
-            &mut self.instance_bytes,
-            population.npc,
-            population.vehicle,
-            population.rain,
-        )
-        .map_err(RendererError::ProxyPack)?;
-        // The pose contract, validated BEFORE any frame state is
-        // touched (the capture-refusal discipline): every POPULATED
-        // npc's pose index must select a supplied block, and the
-        // block count is bounded (the repack's own typed refusal
-        // below enforces MAX_POSE_BLOCKS — this check is the
-        // index-vs-count half the repack cannot see).
-        if population
-            .npc
-            .iter()
-            .any(|instance| instance.pose_index as usize >= population.npc_poses.len())
-        {
-            return Err(RendererError::Vulkan(format!(
-                "a npc pose index falls outside the supplied pose blocks \
-                 ({} blocks, highest index {})",
-                population.npc_poses.len(),
-                population
-                    .npc
-                    .iter()
-                    .map(|instance| instance.pose_index)
-                    .max()
-                    .unwrap_or(0)
-            )));
-        }
-        crate::animation::repack_poses(&mut self.pose_bytes, population.npc_poses)
-            .map_err(RendererError::PosePack)?;
-        // The cascade's world bounds (P4 S2: as
-        // render_corner_shadowed's — the attached scene's authored
-        // bounds through the handle).
-        let (min, max) = self.scene.map_or(([0.0; 3], [0.0; 3]), |scene| {
-            (scene.bounds.min, scene.bounds.max)
-        });
-        let cascade = crate::shadows::cascade_for(light.dir_toward_light, min, max);
-        let [r, g, b] = light.ambient;
-        let params = vulkan::shadow_draw::ShadowFrameParams {
-            view_proj: *view_proj,
-            light_dir: [
-                light.dir_toward_light[0],
-                light.dir_toward_light[1],
-                light.dir_toward_light[2],
-                eye[0],
-            ],
-            light_color: [
-                light.light_color[0],
-                light.light_color[1],
-                light.light_color[2],
-                eye[1],
-            ],
-            ambient: [r, g, b, eye[2]],
-            light_view_proj: cascade.matrix,
-            shadow_control: [
-                crate::shadows::SHADOW_MAP_EXTENT as f32,
-                bias.constant,
-                bias.slope_scale,
-                0.0,
-            ],
-        };
-        let sky = self.sky_params(view_proj);
-        let wet = self.wet_camera(view_proj, eye, light);
-        // The ground re-draw (finding 5) needs the current camera in the
-        // corner buffer regardless of the lighting branch. Build the
-        // ordinary FrameParams and pass it in corner_params.
-        let corner_params = vulkan::corner::FrameParams::new(*view_proj, eye, light);
-        let upload = vulkan::proxy_draw::ProxyFrameUpload {
-            bytes: &self.instance_bytes,
-            pose_bytes: &self.pose_bytes,
-            npc_count: population.npc.len() as u32,
-            vehicle_count: population.vehicle.len() as u32,
-            rain_count: population.rain.len() as u32,
-            npc_material: population.npc_material,
-            vehicle_material: population.vehicle_material,
-            rain_material: population.rain_material,
-            mode: self.proxy_draw_mode,
-        };
-        let outcome = vulkan::render_frame(
-            &mut self.ctx,
-            &mut self.swapchain,
-            &mut self.pipes,
-            &mut self.frames,
-            size,
-            self.config.present_mode,
-            self.config.replace_pipelines,
-            self.config.demo_scene,
-            view_proj,
-            &[],
-            None,
-            &[],
-            &[],
-            Some(&corner_params),
-            Some(&upload),
-            Some(&params),
-            sky.as_ref(),
-            self.post,
-            wet.as_ref(),
         )?;
         Ok(self.finish_frame(outcome))
     }
@@ -1104,20 +649,34 @@ impl Renderer {
     /// the renderer exactly as it was), then uploaded once through
     /// the scene-resource machinery, and the returned
     /// [`SceneHandle`] is the proof the content is live: every
-    /// scene-backed frame (the `render_corner*` routes and
-    /// [`Self::submit_frame`]'s `scene` half) draws it.
+    /// scene-backed frame ([`Self::submit_frame`]'s `scene` half)
+    /// draws it.
     ///
     /// ONE scene per renderer lifetime: the device-lifetime pass
     /// families (the retained skinned state, the shadow/reflection
     /// per-material sets) bind the attached mesh/material buffers,
     /// so a second attachment is a typed refusal — construct a
-    /// fresh renderer for different content. The `Corner`
-    /// construction preference auto-attaches the migration shim's
-    /// corner description (see `corner_content`) — the demo's
-    /// existing routes keep working unchanged; S6 deletes the shim
-    /// and the preference arm.
+    /// fresh renderer for different content. Since S6 this is the
+    /// ONLY way authored scene content reaches the renderer (the
+    /// `Corner` construction preference and its migration shim are
+    /// deleted); the corner demo and every corner gate attach
+    /// their own description through this call, and the second
+    /// scene (engine-slice's garage) proves the boundary.
     pub fn attach_scene(&mut self, scene: SceneDescription) -> Result<SceneHandle, RendererError> {
         let attached = attach_description(&mut self.ctx, scene)?;
+        // The corner-family pipelines (P4 S6): the scene attaches
+        // AFTER construction, so the lit/proxy/rain objects — which
+        // bind the ATTACHED scene's descriptor layout — are assembled
+        // here (idempotent; the swapchain-recreation path builds them
+        // at pipeline-state creation because the scene predates the
+        // new state there). Before this ensure, a scene attached
+        // after construction left those handles null and the first
+        // scene-backed frame bound a null pipeline — found as an
+        // access violation on the rig GPU, invisible to every
+        // pre-S6 path (the Corner preference attached before
+        // construction; the Omitted path never drew the scene
+        // family).
+        self.pipes.ensure_corner_pipelines(&self.ctx)?;
         let handle = attached.handle;
         self.scene = Some(attached);
         Ok(handle)
@@ -1131,21 +690,24 @@ impl Renderer {
     }
 
     /// Renders one frame from a typed, scene-independent submission
-    /// (the P4 D1 contract's entry point, stage S1's additive
-    /// landing). The submission is validated WHOLE before any frame
-    /// state is touched — a refusal renders nothing and leaves every
-    /// sticky setting and capture request intact — then mapped onto
-    /// the frame flow's inputs through [`crate::submission`]'s
-    /// adapter, which produces the same parameter set the
-    /// per-feature entry points construct inline (that equivalence is
-    /// pinned at the type level by the submission module's unit
-    /// test).
+    /// (the P4 D1 contract's entry point — since S6 THE production
+    /// entry point for scene-backed frames). The submission is
+    /// validated WHOLE before any frame state is touched — a refusal
+    /// renders nothing and leaves every capture request intact —
+    /// then mapped onto the frame flow's inputs through
+    /// [`crate::submission`]'s adapter, which produces the same
+    /// parameter set the former per-feature entry points constructed
+    /// inline (that equivalence was pinned at the type level by the
+    /// submission module's unit test and on-device by the S1 gate's
+    /// byte-equality; both pins survive the entries' S6 deletion —
+    /// the expectations are hand-built in the tests).
     ///
     /// `scene: None` is the [`Self::render_layers`] shape (dynamic
-    /// layers only); `scene: Some(_)` is the corner family's — the
-    /// light, the optional shadows/population, and the per-frame
-    /// sky/post/wet state the sticky setters fed (S3 migrates the
-    /// stickies into per-frame fields; S6 removes the old routes).
+    /// layers only); `scene: Some(_)` is the scene-backed family's —
+    /// the light, the optional shadows/population, and the per-frame
+    /// sky/post/wet state (the former sticky setters' fields, per
+    /// frame since S3; the stickies themselves are deleted at S6 —
+    /// the submission is the one declaration of the frame's passes).
     /// The debug overlay builds exactly like `render_layers`'s path
     /// (the F-05 retained rebuild) whenever `layers.debug_text` is
     /// set. The proxy submission mode and the TEST-ONLY ripple debug
@@ -1154,22 +716,20 @@ impl Renderer {
         &mut self,
         submission: FrameSubmission<'_>,
     ) -> Result<FrameResult, RendererError> {
-        // Scene/attach coherence (the render_corner gate's S2
-        // generalization, the design's §3.3 order step 1): a
-        // SceneFrame requires an ATTACHED scene — the Corner
-        // preference auto-attaches at construction (the migration
-        // shim), and attach_scene is the public way to bring your
-        // own. The layers-only shape (`scene: None`) needs none.
-        // The attached table's length rides down to the adapter for
-        // the population validation (0 on the layers-only shape —
-        // unread there).
+        // Scene/attach coherence (the design's §3.3 order step 1):
+        // a SceneFrame requires an ATTACHED scene — attach_scene is
+        // the only way to bring one (the Corner preference's
+        // construction adapter is deleted). The layers-only shape
+        // (`scene: None`) needs none. The attached table's length
+        // rides down to the adapter for the population validation
+        // (0 on the layers-only shape — unread there).
         let material_table = match (&submission.scene, self.scene) {
             (None, _) => 0,
             (Some(_), Some(scene)) => scene.handle.material_count,
             (Some(_), None) => {
                 return Err(RendererError::Vulkan(
                     "submit_frame with a scene requires an attached scene \
-                     (attach_scene, or construct with the Corner preference)"
+                     (attach the SceneDescription first)"
                         .into(),
                 ));
             }
@@ -1246,120 +806,16 @@ impl Renderer {
         self.proxy_draw_mode
     }
 
-    /// Sets the Era-1 sky layer (the set_overlay_enabled precedent:
-    /// a sticky per-renderer setting). `Some` makes every subsequent
-    /// corner-family frame draw the sky pass FIRST — the fullscreen
-    /// triangle with NO depth interaction, so the scene's own
-    /// fragments are untouched and only the uncovered background
-    /// changes (the skyless path stays byte-identical). `None`
-    /// restores the skyless path (the state is lazily created either
-    /// way — the skyless allocation pins never move).
-    pub fn set_sky(&mut self, sky: Option<SkyFrame>) {
-        self.sky = sky;
-    }
-
-    /// The current sky setting.
-    pub fn sky(&self) -> Option<SkyFrame> {
-        self.sky
-    }
-
-    /// Sets the Era-1 post chain (the set_sky precedent: a sticky
-    /// per-renderer setting). `true` makes every subsequent
-    /// corner-family frame render through the HDR chain — the
-    /// scene pass into the offscreen R16G16B16A16 target, the
-    /// bloom mips, and the composite + ACES tonemap into the
-    /// swapchain (`post.rs`'s equations, the shader chain's
-    /// mirrors). `false` restores the postless path
-    /// (byte-identical to the pre-package renderer; the post
-    /// state, once created, stays allocated — the lazy
-    /// discipline's either-way rule).
-    pub fn set_post(&mut self, post: bool) {
-        self.post = post;
-    }
-
-    /// The current post setting.
-    pub fn post(&self) -> bool {
-        self.post
-    }
-
-    /// Sets the Era-1 wet-ground reflection (the set_sky/set_post
-    /// precedent: a sticky per-renderer setting). `true` makes
-    /// every subsequent corner-family frame render the mirrored
-    /// scene (the corner mesh's building masses, the world-mirror
-    /// construction — planar.rs's `ground_reflection_matrix`, the
-    /// winding flipped) into an offscreen RGBA16F target, then
-    /// re-draw the ground with the reflection sampled at the same
-    /// screen position, Schlick-blended by view angle
-    /// (`planar.rs::reflection_blend`). `false` restores the dry
-    /// path (byte-identical; the state, once created, stays
-    /// allocated). The mirrored scene is the BUILDINGS only — the
-    /// sky and the proxy population are the documented follow-ups
-    /// (a wet populated frame renders the population unreflected,
-    /// honestly labeled).
-    pub fn set_wet(&mut self, wet: bool) {
-        self.wet = wet;
-    }
-
-    /// The current wet setting.
-    pub fn wet(&self) -> bool {
-        self.wet
-    }
-
-    /// Sets the rain-ripple field for subsequent wet frames (None
-    /// clears — the empty uniform; the rainless wet path stays
-    /// byte-identical to Era-1's). The field is PACKED NOW, in fixed
-    /// order: rows[0] = (count, policy speed, policy width,
-    /// RIPPLE_UV_GAIN); rows[1] = (RIPPLE_ROUGHEN_GAIN, the
-    /// [`RippleDebugMode`] lane, 0, 0); rows[2 + i] = (center_x,
-    /// center_z, age, the faded amplitude amplitude * (1.0 - age /
-    /// lifetime) — the fade applied at read time in the pinned
-    /// order, never stored in the core).
-    pub fn set_ripple_field(&mut self, field: Option<&engine_core::ripple::RippleField>) {
-        self.ripple = pack_ripple_field(field, self.ripple_debug);
-    }
-
     /// Sets the TEST-ONLY ripple debug mode for subsequent wet
     /// frames (finding 15b's separation fixtures — see
-    /// [`RippleDebugMode`]). The mode rides the packed uniform's
-    /// rows[1].y spare lane; it NEVER appears in a production frame
-    /// (the default is [`RippleDebugMode::Off`], the shipped path).
-    /// Sticky: applies at the next `set_ripple_field` packing.
+    /// [`RippleDebugMode`]). The mode rides the packed ripple
+    /// uniform's rows[1].y spare lane; it NEVER appears in a
+    /// production frame (the default is [`RippleDebugMode::Off`],
+    /// the shipped path). The one retained renderer-level policy
+    /// the submission adapter reads per frame (with the proxy
+    /// mode): applies at the next wet submission's packing.
     pub fn set_ripple_debug_mode(&mut self, mode: RippleDebugMode) {
         self.ripple_debug = mode;
-    }
-
-    /// The wet reflection's camera description (the sticky
-    /// setting's frame data — the true camera the mirrored math
-    /// consumes, plus the packed ripple uniform the ground re-draw
-    /// perturbs with — the sticky `set_ripple_field` state rides the
-    /// per-frame camera description; `vulkan::render_frame`'s flat
-    /// parameter list does NOT change).
-    fn wet_camera(
-        &self,
-        view_proj: &[[f32; 4]; 4],
-        eye: [f32; 3],
-        light: crate::lit_scene::LightParams,
-    ) -> Option<vulkan::reflection_draw::WetCamera> {
-        self.wet.then_some(vulkan::reflection_draw::WetCamera {
-            view_proj: *view_proj,
-            eye,
-            light,
-            ripple: self.ripple,
-        })
-    }
-
-    /// The sky pass's per-frame parameters from the sticky setting
-    /// and this frame's camera matrix (the CPU-computed inverse the
-    /// vertex shader reconstructs its ray from — `sky::mat4_inverse`,
-    /// the tested deterministic core).
-    fn sky_params(&self, view_proj: &[[f32; 4]; 4]) -> Option<vulkan::sky_draw::SkyFrameParams> {
-        self.sky.map(|frame| {
-            vulkan::sky_draw::SkyFrameParams::new(
-                crate::sky::mat4_inverse(view_proj),
-                frame.palette,
-                frame.disc_dir,
-            )
-        })
     }
 
     /// Requests the NEXT shadowed frame's shadow-map readback (the
@@ -1374,8 +830,8 @@ impl Renderer {
         if self.pipes.shadows.is_none() {
             if self.scene.is_none() {
                 return Err(RendererError::Vulkan(
-                    "shadow capture requires an attached scene (attach_scene, or \
-                     construct with the Corner preference)"
+                    "shadow capture requires an attached scene \
+                     (attach the SceneDescription first)"
                         .into(),
                 ));
             }
@@ -1581,9 +1037,12 @@ impl Drop for Renderer {
     }
 }
 
-/// The ripple field's uniform packing (the pure core behind
-/// [`Renderer::set_ripple_field`] — device-free, the unit test's
-/// target). Fixed order, one pass, zero allocation: rows[0] =
+/// The ripple field's uniform packing (the pure core behind the
+/// submission adapter's wet path — device-free, the unit test's
+/// target; the former `set_ripple_field` sticky was this function's
+/// one-line delegation, and the per-frame `WetFrame` packs it on
+/// every wet submission now). Fixed order, one pass, zero
+/// allocation: rows[0] =
 /// (active count — exact for ≤ 32, the pool's bound, policy speed,
 /// policy width, [`RIPPLE_UV_GAIN`]); rows[1] =
 /// ([`RIPPLE_ROUGHEN_GAIN`], the [`RippleDebugMode`] uniform lane,
@@ -1638,10 +1097,11 @@ mod tests {
         }
     }
 
-    /// THE PACKING KNOWN ANSWERS (the pure core behind
-    /// `set_ripple_field` — device-free; `set_ripple_field` is this
-    /// function's one-line delegation, so the None branch below IS
-    /// the `set_ripple_field(None)` branch): a RippleField driven
+    /// THE PACKING KNOWN ANSWERS (the pure core behind the wet
+    /// submission path — device-free; the per-frame `WetFrame`
+    /// packing is this function's one-line call site, so the None
+    /// branch below IS the `WetFrame { ripple: None }` branch): a
+    /// RippleField driven
     /// by hand, every expected value written as the SAME f32
     /// expression the packing performs. The layout contract is the
     /// shader's (ground_reflect.wgsl's RippleField block,
@@ -1751,7 +1211,7 @@ mod tests {
             assert_eq!(*row, [0.0; 4]);
         }
 
-        // set_ripple_field(None) — the exact branch it runs — packs
+        // The rainless wet path — the exact branch it runs — packs
         // the EMPTY uniform (all zeros; the shader's count gate
         // makes it the bit-identity no-op).
         let cleared = pack_ripple_field(None, RippleDebugMode::DisplacementOnly);

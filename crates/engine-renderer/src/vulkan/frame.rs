@@ -372,8 +372,8 @@ pub(crate) fn render_frame(
         }
         // A proxy upload without scene resources is structurally
         // unreachable (the safe layer requires an attached scene —
-        // the Corner preference auto-attaches at construction, and
-        // attach_scene is the public path) — treated as the
+        // attach_scene is the only path, and it sets the context's
+        // scene resources) — treated as the
         // unpopulated frame rather than an error.
         (None, Some(_)) | (None, None) | (Some(_), None) => None,
     };

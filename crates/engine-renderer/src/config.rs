@@ -78,13 +78,18 @@ impl ValidationPreference {
 /// (`--render`, `--player`, `--demo-persist`, the render smokes)
 /// exactly. The preference is per-renderer-instance and is carried
 /// across every pipeline replacement.
+///
+/// P4 S6 deleted the third arm, `Corner`: the lit intersection's
+/// authored content now reaches the renderer only through
+/// [`crate::Renderer::attach_scene`] (engine-slice's
+/// `corner_scene::corner_scene_description` builds it) — the
+/// construction-time content import the arm performed was the
+/// last authored-content path left inside the renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DemoScenePreference {
     #[default]
     Omitted,
     Included,
-    /// Upload the static lit intersection and its material descriptors.
-    Corner,
 }
 
 /// Verification scenario for depth format fallback testing

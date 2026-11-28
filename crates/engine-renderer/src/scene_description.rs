@@ -17,11 +17,13 @@
 //! the render path. From S2 the render path reads ONE attached
 //! description — [`crate::Renderer::attach_scene`] hands it over,
 //! [`SceneHandle`] is the proof it exists — so authored content
-//! stops being a renderer constant and becomes caller data (the
-//! `DemoScenePreference::Corner` construction preference keeps
-//! working through the migration shim, `corner_content.rs`, which
-//! attaches the same corner content through this same API; S6
-//! deletes the shim and the preference arm).
+//! stopped being a renderer constant and became caller data. S6
+//! completed the migration: the `Corner` construction preference
+//! and its renderer-side migration shim (`corner_content.rs`) are
+//! DELETED, and every description consumers attach is built on
+//! their side of the boundary (engine-slice's `corner_scene`
+//! holds the corner's; the garage scene holds the second
+//! consumer's).
 //!
 //! VALIDATION (the capture-refusal discipline, attach-time form):
 //! [`SceneDescription::validate`] checks the description WHOLE,
@@ -45,9 +47,16 @@
 //! pass families' descriptor sets (the shadowed, skinned, and
 //! reflection per-material sets) are built for
 //! [`PASS_FAMILY_MATERIAL_COUNT`] materials — the corner-era
-//! table — so attach refuses any other count (generalizing those
-//! families is the migration's S6 step; the second scene of the
-//! design's §7 fits the shape).
+//! table — so attach refuses any other count. THE S6 DISPOSITION
+//! of that boundary: the second scene (engine-slice's garage)
+//! authors a THREE-material table and fits the compiled shape
+//! as-is, so generalizing the fixed arrays is NOT paid for by
+//! this stage — the boundary is documented here as the named
+//! follow-up (relaxing it means rebuilding the shadowed/skinned/
+//! reflection set families against dynamic counts; the design's
+//! §7 second scene deliberately stayed inside the compiled
+//! shape, and the boundary refuses fail-visibly rather than
+//! truncating silently).
 //!
 //! ZERO-COST PLACEMENT: this is ATTACH-TIME data — `Vec`-backed,
 //! built once, consumed once (the GPU copies live in the
@@ -71,11 +80,19 @@ pub use crate::lit_mesh::LitVertex;
 /// reflection state's six reflected sets), and the depth-only
 /// pass draws the whole mesh as one range — all corner-era
 /// shapes. [`SceneDescription::validate`] refuses any other table
-/// length at attach (fail-visible, never a silent truncation);
-/// relaxing this is the migration's S6 generalization step (the
-/// design's second scene, §7, authors a 3-material table and
-/// fits as-is).
-pub(crate) const PASS_FAMILY_MATERIAL_COUNT: usize = 3;
+/// length at attach (fail-visible, never a silent truncation).
+/// THE S6 BOUNDARY, made explicit: both live scenes (the corner
+/// and the second consumer's garage) author THREE-material tables
+/// and fit the compiled shape, so the generalization the S2
+/// design sketched for this step is NOT exercised — relaxing the
+/// count means rebuilding the per-material descriptor-set
+/// families against dynamic sizes, deferred until a real scene
+/// needs it (the refusal is the named, fail-visible boundary).
+/// Public since S6 (the description authors' named boundary): the
+/// compiled family shape is part of the attach contract's
+/// documented surface, asserted at build sites on the consumer's
+/// side of the boundary.
+pub const PASS_FAMILY_MATERIAL_COUNT: usize = 3;
 
 /// One static lit mesh: world-space triangle-list vertices plus
 /// ONE draw range per material, in MATERIAL ORDER — range `i`
@@ -435,20 +452,60 @@ pub struct SceneHandle {
 mod tests {
     use super::*;
 
-    /// The corner description (the migration shim's own content —
-    /// the one description the render path attaches today), as the
-    /// validation fixtures' valid baseline: the shim-equality test
-    /// in `corner_content` proves it equals the reference tables;
-    /// here it is the KNOWN-GOOD input each refusal mutates.
-    fn corner() -> SceneDescription {
-        crate::corner_content::corner_scene_description()
+    /// The validation fixtures' valid baseline: a synthetic
+    /// three-material description in the corner's own authoring
+    /// SHAPE (a ground quad + one mass per remaining material),
+    /// built through the same public builder every consumer's
+    /// description uses (`lit_mesh::mesh_from_boxes`). The
+    /// corner's CONTENT moved to engine-slice at S6
+    /// (`corner_scene`, carrying the drift gate that pins it to
+    /// the `lit_scene` reference tables); this renderer-local
+    /// fixture keeps the ADMISSION contract's tests device-free
+    /// and content-independent — what each refusal below mutates
+    /// is the table's STRUCTURE, never which scene built it.
+    fn valid_scene() -> SceneDescription {
+        let boxes = [
+            crate::lit_scene::SceneBox {
+                min: [6.0, 0.0, 6.0],
+                max: [24.0, 18.0, 24.0],
+                material: 1,
+            },
+            crate::lit_scene::SceneBox {
+                min: [-24.0, 0.0, -24.0],
+                max: [-6.0, 9.0, -6.0],
+                material: 2,
+            },
+        ];
+        let (vertices, draws) =
+            crate::lit_mesh::mesh_from_boxes(&boxes, 24.0, 0.0, PASS_FAMILY_MATERIAL_COUNT);
+        let (min, max) = crate::shadows::scene_bounds(&boxes);
+        SceneDescription {
+            mesh: SceneMesh {
+                vertices,
+                draws: draws.clone(),
+            },
+            materials: crate::lit_scene::materials().to_vec(),
+            textures: crate::proc_texture::ProcTextureSet {
+                textures: (0..crate::proc_texture::TEXTURE_COUNT)
+                    .map(crate::proc_texture::procedural_texture)
+                    .collect(),
+            },
+            bounds: SceneBounds { min, max },
+            ground: GroundRoles {
+                receiver: draws[0].clone(),
+                receiver_plane_y: 0.0,
+                reflected: [draws[1].clone(), draws[2].clone()],
+            },
+        }
     }
 
-    /// The valid baseline passes: the corner description is
-    /// coherent (the attach path accepts exactly this).
+    /// The valid baseline passes: the synthetic description is
+    /// coherent (the attach path accepts exactly this shape).
     #[test]
-    fn the_corner_description_validates() {
-        corner().validate().expect("the corner content is valid");
+    fn the_valid_baseline_description_validates() {
+        valid_scene()
+            .validate()
+            .expect("the baseline content is valid");
     }
 
     /// The pass-family count boundary: a table whose length is not
@@ -458,7 +515,7 @@ mod tests {
     /// worse, a silent truncation).
     #[test]
     fn a_table_outside_the_pass_family_shape_is_refused() {
-        let mut scene = corner();
+        let mut scene = valid_scene();
         // Four materials: one MORE than the families are built for.
         scene.materials.push(scene.materials[0]);
         scene.mesh.draws.push(scene.mesh.draws[2].clone());
@@ -472,12 +529,12 @@ mod tests {
         );
         // Two materials: one FEWER refuses the same way (the check is
         // equality, not an upper bound).
-        let mut scene = corner();
+        let mut scene = valid_scene();
         scene.materials.pop();
         scene.mesh.draws.pop();
         assert!(scene.validate().is_err(), "two materials must refuse");
         // The empty table has its own refusal.
-        let mut scene = corner();
+        let mut scene = valid_scene();
         scene.materials.clear();
         scene.mesh.draws.clear();
         let error = scene.validate().expect_err("an empty table must refuse");
@@ -494,7 +551,7 @@ mod tests {
     #[test]
     fn mesh_range_contract_violations_are_refused() {
         // A range-count mismatch.
-        let mut scene = corner();
+        let mut scene = valid_scene();
         scene.mesh.draws.push(scene.mesh.draws[2].clone());
         let error = scene.validate().expect_err("a spare range must refuse");
         let RendererError::Vulkan(text) = &error else {
@@ -505,7 +562,7 @@ mod tests {
             "the refusal names the per-material contract: {text}"
         );
         // A gap between ranges.
-        let mut scene = corner();
+        let mut scene = valid_scene();
         let end = scene.mesh.draws[0].end;
         scene.mesh.draws[1].start = end + 6;
         let error = scene.validate().expect_err("a gap must refuse");
@@ -517,7 +574,7 @@ mod tests {
             "the refusal names contiguity: {text}"
         );
         // A tail that does not reach the buffer's end.
-        let mut scene = corner();
+        let mut scene = valid_scene();
         scene.mesh.vertices.push(scene.mesh.vertices[0]);
         let error = scene.validate().expect_err("a short tail must refuse");
         let RendererError::Vulkan(text) = &error else {
@@ -528,11 +585,11 @@ mod tests {
             "the refusal names coverage: {text}"
         );
         // A first range that does not start at 0.
-        let mut scene = corner();
+        let mut scene = valid_scene();
         scene.mesh.draws[0].start = 3;
         assert!(scene.validate().is_err(), "a nonzero start must refuse");
         // An empty mesh.
-        let mut scene = corner();
+        let mut scene = valid_scene();
         scene.mesh.vertices.clear();
         let error = scene.validate().expect_err("an empty mesh must refuse");
         let RendererError::Vulkan(text) = &error else {
@@ -547,7 +604,7 @@ mod tests {
     /// RGBA8 with no runtime shape check).
     #[test]
     fn albedo_set_contract_violations_are_refused() {
-        let mut scene = corner();
+        let mut scene = valid_scene();
         scene.materials[1].texture = 9;
         let error = scene
             .validate()
@@ -559,7 +616,7 @@ mod tests {
             text.contains("falls outside the attached set"),
             "the refusal names the set boundary: {text}"
         );
-        let mut scene = corner();
+        let mut scene = valid_scene();
         scene.textures.textures[2] = Vec::new();
         let error = scene
             .validate()
@@ -579,7 +636,7 @@ mod tests {
     /// disable the wet re-draw).
     #[test]
     fn bounds_and_ground_role_violations_are_refused() {
-        let mut scene = corner();
+        let mut scene = valid_scene();
         scene.bounds.min[1] = scene.bounds.max[1] + 1.0;
         let error = scene.validate().expect_err("an inverted AABB must refuse");
         let RendererError::Vulkan(text) = &error else {
@@ -589,10 +646,10 @@ mod tests {
             text.contains("degenerate on axis 1"),
             "the refusal names the axis: {text}"
         );
-        let mut scene = corner();
+        let mut scene = valid_scene();
         scene.bounds.min[0] = f32::NAN;
         assert!(scene.validate().is_err(), "a NaN bound must refuse");
-        let mut scene = corner();
+        let mut scene = valid_scene();
         scene.ground.receiver.end = u32::MAX;
         let error = scene
             .validate()
@@ -604,7 +661,7 @@ mod tests {
             text.contains("receiver range") && text.contains("falls outside the mesh"),
             "the refusal names the receiver and the mesh: {text}"
         );
-        let mut scene = corner();
+        let mut scene = valid_scene();
         scene.ground.receiver.start = scene.ground.receiver.end;
         let error = scene.validate().expect_err("an empty receiver must refuse");
         let RendererError::Vulkan(text) = &error else {
@@ -616,12 +673,12 @@ mod tests {
         );
         // An EMPTY reflected range is legal (a no-op draw — the mirror
         // reflects fewer masses); only out-of-mesh ranges refuse.
-        let mut scene = corner();
+        let mut scene = valid_scene();
         scene.ground.reflected[1] = 0..0;
         scene
             .validate()
             .expect("an empty reflected range is a legal no-op");
-        let mut scene = corner();
+        let mut scene = valid_scene();
         scene.ground.reflected[0].end = u32::MAX;
         assert!(
             scene.validate().is_err(),
@@ -631,7 +688,7 @@ mod tests {
 
     /// THE R01 WITNESS (the re-audit's confirmed pass-today shape,
     /// verified RED at the lane's base `600bff2`: the table
-    /// [[0,5],[5,3],[3,N]] over the corner's own vertex count
+    /// [[0,5],[5,3],[3,N]] over the fixture's own vertex count
     /// passed validate — contiguity compares end to the NEXT
     /// start, so it holds on both sides of an inverted range, and
     /// the coverage check only reads the LAST end). The lit pass's
@@ -644,7 +701,7 @@ mod tests {
     #[allow(clippy::reversed_empty_ranges)]
     #[test]
     fn inverted_draw_ranges_are_refused() {
-        let mut scene = corner();
+        let mut scene = valid_scene();
         let vertex_count = scene.mesh.vertices.len() as u32;
         scene.mesh.draws[0] = 0..5;
         scene.mesh.draws[1] = 5..3;
@@ -659,9 +716,10 @@ mod tests {
         );
         // The same inversion in the LAST range: the tail's start
         // exceeds its end while every legacy check still holds —
-        // contiguity at the shared 127, coverage at the end value
-        // itself (126 == the vertex count).
-        let mut scene = corner();
+        // contiguity at the shared boundary (draws[1]'s end ==
+        // the tail's fabricated start), coverage at the end value
+        // itself (the vertex count).
+        let mut scene = valid_scene();
         let vertex_count = scene.mesh.vertices.len() as u32;
         scene.mesh.draws[1] = scene.mesh.draws[0].end..vertex_count + 1;
         scene.mesh.draws[2] = vertex_count + 1..vertex_count;
@@ -684,7 +742,7 @@ mod tests {
     /// consumption is safe with NO guard: a vertexCount-0
     /// `cmd_draw` is a Vulkan no-op, and the depth pass's
     /// whole-mesh draw reads only the last range's end. This
-    /// description — the corner's masses minus material 1's — is
+    /// description — the baseline's masses minus material 1's — is
     /// the builder-faithful shape, empty middle range and empty
     /// reflected role both, and it admits.
     #[test]
@@ -703,7 +761,7 @@ mod tests {
             draws[0].end..draws[0].end,
             "the builder emits the empty range for the unpopulated material"
         );
-        let mut scene = corner();
+        let mut scene = valid_scene();
         scene.mesh = SceneMesh {
             vertices,
             draws: draws.clone(),
@@ -733,7 +791,7 @@ mod tests {
     #[test]
     fn nonfinite_scene_bounds_are_refused() {
         // [-inf, 0] on axis 0.
-        let mut scene = corner();
+        let mut scene = valid_scene();
         scene.bounds.min[0] = f32::NEG_INFINITY;
         scene.bounds.max[0] = 0.0;
         let error = scene.validate().expect_err("[-inf, 0] bounds must refuse");
@@ -745,7 +803,7 @@ mod tests {
             "the refusal names the axis and the domain: {text}"
         );
         // [0, +inf] on axis 0.
-        let mut scene = corner();
+        let mut scene = valid_scene();
         scene.bounds.min[0] = 0.0;
         scene.bounds.max[0] = f32::INFINITY;
         let error = scene.validate().expect_err("[0, +inf] bounds must refuse");
@@ -757,7 +815,7 @@ mod tests {
             "the refusal names the axis and the domain: {text}"
         );
         // [-inf, +inf] on axis 0.
-        let mut scene = corner();
+        let mut scene = valid_scene();
         scene.bounds.min[0] = f32::NEG_INFINITY;
         scene.bounds.max[0] = f32::INFINITY;
         let error = scene
@@ -772,7 +830,7 @@ mod tests {
         );
         // [inf, inf] — the Equal shape that ALSO ordered before
         // the finite check (partial_cmp returns Some(Equal)).
-        let mut scene = corner();
+        let mut scene = valid_scene();
         scene.bounds.min[1] = f32::INFINITY;
         scene.bounds.max[1] = f32::INFINITY;
         let error = scene.validate().expect_err("[inf, inf] bounds must refuse");
@@ -794,7 +852,7 @@ mod tests {
     #[test]
     fn a_nonfinite_mirror_plane_is_refused() {
         for plane in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            let mut scene = corner();
+            let mut scene = valid_scene();
             scene.ground.receiver_plane_y = plane;
             let error = scene
                 .validate()

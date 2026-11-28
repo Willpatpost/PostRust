@@ -48,6 +48,8 @@ use engine_renderer::{
     ValidationPreference,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
+use engine_slice::corner_demo::corner_submission;
+use engine_slice::corner_scene::corner_bounds;
 
 // The host allocation counter test-support module (finding 10's
 // missing gate; tests/common/ — not a standalone test target).
@@ -105,7 +107,18 @@ fn capture_corner(
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner(matrix, eye, light, size)
+            .submit_frame(corner_submission(
+                matrix,
+                eye,
+                light,
+                None,
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -122,7 +135,18 @@ fn capture_shadowed(
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(matrix, eye, light, BIAS, size)
+            .submit_frame(corner_submission(
+                matrix,
+                eye,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -629,13 +653,16 @@ fn shadow_map_depths_match_the_raycaster_and_pixels_gate() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             replace_pipelines: true,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
@@ -667,7 +694,18 @@ fn shadow_map_depths_match_the_raycaster_and_pixels_gate() {
     let (matrix, eye) = ground_camera([0.0, 0.0], 1.0);
     assert!(
         renderer
-            .render_corner_shadowed(&matrix, eye, light, BIAS, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -764,7 +802,18 @@ fn shadow_map_depths_match_the_raycaster_and_pixels_gate() {
     {
         let scope = common::HostAllocScope::new();
         let outcome = renderer
-            .render_corner_shadowed(&matrix, eye, light, BIAS, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size,
+            ))
             .unwrap();
         let allocs = scope.count();
         drop(scope);
@@ -780,13 +829,35 @@ fn shadow_map_depths_match_the_raycaster_and_pixels_gate() {
     // rebuilds the shadow state; the map known-answer holds on the
     // replacement, and the counters resume constant.
     let replacement = renderer
-        .render_corner_shadowed(&matrix, eye, light, BIAS, (size.0 + 8, size.1 + 8))
+        .submit_frame(corner_submission(
+            &matrix,
+            eye,
+            light,
+            Some(BIAS),
+            corner_bounds(),
+            None,
+            None,
+            false,
+            None,
+            (size.0 + 8, size.1 + 8),
+        ))
         .unwrap();
     assert!(replacement.recreated, "the resize forced a recreation");
     renderer.request_shadow_map_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&matrix, eye, light, BIAS, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -892,13 +963,16 @@ fn populated_shadow_map_matches_the_raycaster() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             replace_pipelines: true,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     assert!(renderer.stats().validation_active);
@@ -928,7 +1002,18 @@ fn populated_shadow_map_matches_the_raycaster() {
     };
     renderer.request_shadow_map_capture().unwrap();
     let frame = renderer
-        .render_corner_populated_shadowed(&matrix, eye, light, BIAS, &at_rest, size)
+        .submit_frame(corner_submission(
+            &matrix,
+            eye,
+            light,
+            Some(BIAS),
+            corner_bounds(),
+            Some(at_rest),
+            None,
+            false,
+            None,
+            size,
+        ))
         .unwrap();
     assert!(frame.presented);
     assert_eq!(
@@ -997,7 +1082,18 @@ fn populated_shadow_map_matches_the_raycaster() {
     };
     renderer.request_shadow_map_capture().unwrap();
     let walked_frame = renderer
-        .render_corner_populated_shadowed(&matrix, eye, light, BIAS, &walking, size)
+        .submit_frame(corner_submission(
+            &matrix,
+            eye,
+            light,
+            Some(BIAS),
+            corner_bounds(),
+            Some(walking),
+            None,
+            false,
+            None,
+            size,
+        ))
         .unwrap();
     assert!(walked_frame.presented);
     let walked_map = renderer.take_shadow_map_capture().unwrap().unwrap();
@@ -1060,7 +1156,18 @@ fn populated_shadow_map_matches_the_raycaster() {
     for _ in 0..2 {
         renderer.request_shadow_map_capture().unwrap();
         let repeat_frame = renderer
-            .render_corner_populated_shadowed(&matrix, eye, light, BIAS, &walking, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                Some(walking),
+                None,
+                false,
+                None,
+                size,
+            ))
             .unwrap();
         assert!(repeat_frame.presented);
         let repeat_map = renderer.take_shadow_map_capture().unwrap().unwrap();
@@ -1381,13 +1488,16 @@ fn pcf_penumbra_pixels_match_the_cpu_filter_over_the_same_map_bytes() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             replace_pipelines: true,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
     let _ = app.frame();
@@ -1401,7 +1511,18 @@ fn pcf_penumbra_pixels_match_the_cpu_filter_over_the_same_map_bytes() {
     let probe = ground_camera([0.0, 0.0], 1.0);
     assert!(
         renderer
-            .render_corner_shadowed(&probe.0, probe.1, light, BIAS, size)
+            .submit_frame(corner_submission(
+                &probe.0,
+                probe.1,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1436,7 +1557,18 @@ fn pcf_penumbra_pixels_match_the_cpu_filter_over_the_same_map_bytes() {
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&matrix, eye, light, BIAS, size)
+            .submit_frame(corner_submission(
+                &matrix,
+                eye,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1611,7 +1743,18 @@ fn pcf_penumbra_pixels_match_the_cpu_filter_over_the_same_map_bytes() {
         renderer.request_frame_capture().unwrap();
         assert!(
             renderer
-                .render_corner_shadowed(&matrix, eye, light, BIAS, size)
+                .submit_frame(corner_submission(
+                    &matrix,
+                    eye,
+                    light,
+                    Some(BIAS),
+                    corner_bounds(),
+                    None,
+                    None,
+                    false,
+                    None,
+                    size
+                ))
                 .unwrap()
                 .presented
         );
@@ -1667,13 +1810,16 @@ fn shadow_readback_belongs_to_the_shadowed_frame_and_its_buffer() {
     let mut renderer = Renderer::new(
         app.window(),
         RenderConfig {
-            demo_scene: DemoScenePreference::Corner,
+            demo_scene: DemoScenePreference::Omitted,
             validation: ValidationPreference::On,
             replace_pipelines: true,
             ..Default::default()
         },
     )
     .unwrap();
+    // P4 S6: the corner content is ATTACHED (the Corner construction
+    // preference is deleted) - the same public attach every consumer uses.
+    engine_slice::corner_scene::attach_corner_scene(&mut renderer).unwrap();
     let size = app.window().size_in_pixels();
     assert_eq!(size, (256, 256));
 
@@ -1684,7 +1830,18 @@ fn shadow_readback_belongs_to_the_shadowed_frame_and_its_buffer() {
     let probe = ground_camera([0.0, 0.0], 1.0);
     assert!(
         renderer
-            .render_corner_shadowed(&probe.0, probe.1, light, BIAS, size)
+            .submit_frame(corner_submission(
+                &probe.0,
+                probe.1,
+                light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1695,7 +1852,18 @@ fn shadow_readback_belongs_to_the_shadowed_frame_and_its_buffer() {
     let light_first = light;
     assert!(
         renderer
-            .render_corner(&probe.0, probe.1, light_first, size)
+            .submit_frame(corner_submission(
+                &probe.0,
+                probe.1,
+                light_first,
+                None,
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1729,7 +1897,18 @@ fn shadow_readback_belongs_to_the_shadowed_frame_and_its_buffer() {
     // Render the shadowed frame with the second light and take.
     assert!(
         renderer
-            .render_corner_shadowed(&probe.0, probe.1, second_light, BIAS, size)
+            .submit_frame(corner_submission(
+                &probe.0,
+                probe.1,
+                second_light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1750,7 +1929,18 @@ fn shadow_readback_belongs_to_the_shadowed_frame_and_its_buffer() {
     renderer.request_shadow_map_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&probe.0, probe.1, light_first, BIAS, size)
+            .submit_frame(corner_submission(
+                &probe.0,
+                probe.1,
+                light_first,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1773,7 +1963,18 @@ fn shadow_readback_belongs_to_the_shadowed_frame_and_its_buffer() {
         renderer.request_shadow_map_capture().unwrap();
         assert!(
             renderer
-                .render_corner_shadowed(&probe.0, probe.1, light_first, BIAS, size)
+                .submit_frame(corner_submission(
+                    &probe.0,
+                    probe.1,
+                    light_first,
+                    Some(BIAS),
+                    corner_bounds(),
+                    None,
+                    None,
+                    false,
+                    None,
+                    size
+                ))
                 .unwrap()
                 .presented
         );
@@ -1786,7 +1987,18 @@ fn shadow_readback_belongs_to_the_shadowed_frame_and_its_buffer() {
         renderer.request_shadow_map_capture().unwrap();
         assert!(
             renderer
-                .render_corner_shadowed(&probe.0, probe.1, second_light, BIAS, size)
+                .submit_frame(corner_submission(
+                    &probe.0,
+                    probe.1,
+                    second_light,
+                    Some(BIAS),
+                    corner_bounds(),
+                    None,
+                    None,
+                    false,
+                    None,
+                    size
+                ))
                 .unwrap()
                 .presented
         );
@@ -1807,7 +2019,18 @@ fn shadow_readback_belongs_to_the_shadowed_frame_and_its_buffer() {
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&probe.0, probe.1, light_first, BIAS, size)
+            .submit_frame(corner_submission(
+                &probe.0,
+                probe.1,
+                light_first,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1816,7 +2039,18 @@ fn shadow_readback_belongs_to_the_shadowed_frame_and_its_buffer() {
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&probe.0, probe.1, second_light, BIAS, size)
+            .submit_frame(corner_submission(
+                &probe.0,
+                probe.1,
+                second_light,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1835,7 +2069,18 @@ fn shadow_readback_belongs_to_the_shadowed_frame_and_its_buffer() {
     renderer.request_frame_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&probe.0, probe.1, light_first, BIAS, size)
+            .submit_frame(corner_submission(
+                &probe.0,
+                probe.1,
+                light_first,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
@@ -1846,19 +2091,35 @@ fn shadow_readback_belongs_to_the_shadowed_frame_and_its_buffer() {
     renderer.request_shadow_map_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&probe.0, probe.1, light_first, BIAS, size)
+            .submit_frame(corner_submission(
+                &probe.0,
+                probe.1,
+                light_first,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );
     // Force the replacement: the resize forces recreation.
     let replacement = renderer
-        .render_corner_shadowed(
+        .submit_frame(corner_submission(
             &probe.0,
             probe.1,
             light_first,
-            BIAS,
+            Some(BIAS),
+            corner_bounds(),
+            None,
+            None,
+            false,
+            None,
             (size.0 + 8, size.1 + 8),
-        )
+        ))
         .unwrap();
     assert!(replacement.recreated, "the resize forced a recreation");
     // Take after replacement must return the typed drop.
@@ -1873,7 +2134,18 @@ fn shadow_readback_belongs_to_the_shadowed_frame_and_its_buffer() {
     renderer.request_shadow_map_capture().unwrap();
     assert!(
         renderer
-            .render_corner_shadowed(&probe.0, probe.1, light_first, BIAS, size)
+            .submit_frame(corner_submission(
+                &probe.0,
+                probe.1,
+                light_first,
+                Some(BIAS),
+                corner_bounds(),
+                None,
+                None,
+                false,
+                None,
+                size
+            ))
             .unwrap()
             .presented
     );

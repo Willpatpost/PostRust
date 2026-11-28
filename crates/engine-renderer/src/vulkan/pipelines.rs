@@ -16,6 +16,7 @@ use ash::vk;
 
 use super::RendererError;
 use super::context::VulkanContext;
+use super::corner;
 use super::frame_plan::FramePlan;
 use super::resources::{
     create_device_local_buffer_with_data, create_mapped_buffer, create_shader_module,
@@ -867,227 +868,7 @@ impl PipelineState {
         .map_err(|(_, error)| RendererError::vk(error, "scene pipeline"))?[0];
 
         if let Some(corner) = &ctx.corner {
-            use crate::lit_mesh::LitVertex;
-            let module = create_shader_module(
-                ctx,
-                include_bytes!(concat!(env!("OUT_DIR"), "/lit_scene.spv")),
-            )?;
-            modules.push(module);
-            let layouts = [corner.layout];
-            // SAFETY: corner owns its descriptor layout across pipeline replacements;
-            // the partial PipelineState owns the pipeline layout immediately.
-            out.lit_layout = unsafe {
-                ctx.device.create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts),
-                    None,
-                )
-            }
-            .map_err(|e| RendererError::vk(e, "lit layout"))?;
-            let stages = [
-                scene_stages[0].module(module).name(c"vs_main"),
-                scene_stages[1].module(module).name(c"fs_main"),
-            ];
-            let bindings = [vk::VertexInputBindingDescription {
-                stride: size_of::<LitVertex>() as u32,
-                ..scene_binding
-            }];
-            let attributes = [
-                scene_attributes[0],
-                vk::VertexInputAttributeDescription {
-                    offset: std::mem::offset_of!(LitVertex, normal) as u32,
-                    ..scene_attributes[1]
-                },
-                vk::VertexInputAttributeDescription {
-                    location: 2,
-                    binding: 0,
-                    format: vk::Format::R32G32_SFLOAT,
-                    offset: std::mem::offset_of!(LitVertex, uv) as u32,
-                },
-            ];
-            let inputs = vk::PipelineVertexInputStateCreateInfo::default()
-                .vertex_binding_descriptions(&bindings)
-                .vertex_attribute_descriptions(&attributes);
-            // The corner mesh winds CCW about its outward normals.
-            let raster = scene_rasterizer.front_face(vk::FrontFace::COUNTER_CLOCKWISE);
-            let info = scene_info
-                .stages(&stages)
-                .vertex_input_state(&inputs)
-                .rasterization_state(&raster)
-                .layout(out.lit_layout);
-            // SAFETY: same render pass, depth and viewport contract as the world pipeline.
-            out.lit_pipeline = unsafe {
-                ctx.device
-                    .create_graphics_pipelines(ctx.pipeline_cache, &[info], None)
-            }
-            .map_err(|(_, e)| RendererError::vk(e, "lit pipeline"))?[0];
-
-            // The Cycle 6-E instanced-proxy pipeline (see
-            // docs/CYCLE6-6E-BRIEF.md): the SAME render pass,
-            // descriptor layout, rasterizer (the proxy meshes wind
-            // CCW about their outward normals — the lit convention),
-            // and depth contract as the lit pipeline. The vertex
-            // input carries TWO bindings: binding 0 the proxy mesh at
-            // VERTEX rate (the lit 32-byte pos/normal/uv format,
-            // locations 0-2), binding 1 the packed instance bytes at
-            // INSTANCE rate (stride INSTANCE_STRIDE, locations 3-7
-            // as R32G32B32A32_SFLOAT: the four column-major matrix
-            // columns then the tint vec4 — the
-            // proxy_instances::pack layout, byte-pinned by tests).
-            let module = create_shader_module(
-                ctx,
-                include_bytes!(concat!(env!("OUT_DIR"), "/instanced_proxy.spv")),
-            )?;
-            modules.push(module);
-            // SAFETY: corner owns its descriptor layout across pipeline
-            // replacements; the partial PipelineState owns the pipeline
-            // layout immediately.
-            out.proxy_layout = unsafe {
-                ctx.device.create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts),
-                    None,
-                )
-            }
-            .map_err(|e| RendererError::vk(e, "proxy layout"))?;
-            let proxy_stages = [
-                scene_stages[0].module(module).name(c"vs_main"),
-                scene_stages[1].module(module).name(c"fs_main"),
-            ];
-            let mesh_binding = vk::VertexInputBindingDescription {
-                binding: 0,
-                stride: std::mem::size_of::<crate::proxy_mesh::ProxyVertex>() as u32,
-                input_rate: vk::VertexInputRate::VERTEX,
-            };
-            let instance_binding = vk::VertexInputBindingDescription {
-                binding: 1,
-                stride: crate::proxy_instances::INSTANCE_STRIDE as u32,
-                input_rate: vk::VertexInputRate::INSTANCE,
-            };
-            let proxy_bindings = [mesh_binding, instance_binding];
-            let vec4 = vk::Format::R32G32B32A32_SFLOAT;
-            let proxy_attributes = [
-                scene_attributes[0],
-                scene_attributes[1],
-                vk::VertexInputAttributeDescription {
-                    location: 2,
-                    binding: 0,
-                    format: vk::Format::R32G32_SFLOAT,
-                    offset: std::mem::offset_of!(crate::proxy_mesh::ProxyVertex, uv) as u32,
-                },
-                vk::VertexInputAttributeDescription {
-                    location: 3,
-                    binding: 1,
-                    format: vec4,
-                    offset: 0,
-                },
-                vk::VertexInputAttributeDescription {
-                    location: 4,
-                    binding: 1,
-                    format: vec4,
-                    offset: 16,
-                },
-                vk::VertexInputAttributeDescription {
-                    location: 5,
-                    binding: 1,
-                    format: vec4,
-                    offset: 32,
-                },
-                vk::VertexInputAttributeDescription {
-                    location: 6,
-                    binding: 1,
-                    format: vec4,
-                    offset: 48,
-                },
-                vk::VertexInputAttributeDescription {
-                    location: 7,
-                    binding: 1,
-                    format: vec4,
-                    offset: 64,
-                },
-            ];
-            let proxy_inputs = vk::PipelineVertexInputStateCreateInfo::default()
-                .vertex_binding_descriptions(&proxy_bindings)
-                .vertex_attribute_descriptions(&proxy_attributes);
-            let proxy_info = vk::GraphicsPipelineCreateInfo::default()
-                .stages(&proxy_stages)
-                .vertex_input_state(&proxy_inputs)
-                .input_assembly_state(&scene_input_assembly)
-                .viewport_state(&viewport_state)
-                .rasterization_state(&raster)
-                .multisample_state(&multisampling)
-                .depth_stencil_state(&scene_depth)
-                .color_blend_state(&color_blend)
-                .dynamic_state(&dynamic_state)
-                .layout(out.proxy_layout)
-                .render_pass(out.render_pass)
-                .subpass(0);
-            // SAFETY: same render pass, depth and viewport contract as the lit pipeline.
-            out.proxy_pipeline = unsafe {
-                ctx.device
-                    .create_graphics_pipelines(ctx.pipeline_cache, &[proxy_info], None)
-            }
-            .map_err(|(_, e)| RendererError::vk(e, "proxy pipeline"))?[0];
-
-            // The Era-2 package C rain pipeline (the THIRD populated
-            // kind — the mission's "particle shader variant ... or
-            // unlit tinted quads" option, the documented choice in
-            // particle.wgsl's header): the SAME vertex input state
-            // (the two proxy bindings, locations 0-7), raster,
-            // input assembly, viewport, and multisample as the proxy
-            // pipeline above — no new pipeline CLASS, one more
-            // object through the identical assembly. The DEPTH
-            // contract copies `scene_depth` and flips the write flag
-            // (a dedicated `rain_depth` value: TEST on, WRITE off —
-            // rain is occluded by geometry, never occludes). The
-            // COLOR BLEND is the OVERLAY precedent's attachment
-            // state verbatim (SRC_ALPHA/ONE_MINUS_SRC_ALPHA, ADD;
-            // alpha ONE/ZERO, ADD — defined below it in this
-            // assembly; restated here because the corner branch
-            // precedes it). The layout is the SAME corner proxy
-            // layout, so the rain material's corner sets bind
-            // unchanged.
-            let rain_module = create_shader_module(
-                ctx,
-                include_bytes!(concat!(env!("OUT_DIR"), "/particle.spv")),
-            )?;
-            modules.push(rain_module);
-            let rain_stages = [
-                scene_stages[0].module(rain_module).name(c"vs_main"),
-                scene_stages[1].module(rain_module).name(c"fs_main"),
-            ];
-            let rain_depth = scene_depth.depth_write_enable(false);
-            let rain_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
-                .color_write_mask(vk::ColorComponentFlags::RGBA)
-                .blend_enable(true)
-                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
-                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-                .color_blend_op(vk::BlendOp::ADD)
-                .src_alpha_blend_factor(vk::BlendFactor::ONE)
-                .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
-                .alpha_blend_op(vk::BlendOp::ADD);
-            let rain_blend_attachments = [rain_blend_attachment];
-            let rain_blend = vk::PipelineColorBlendStateCreateInfo::default()
-                .attachments(&rain_blend_attachments);
-            let rain_info = vk::GraphicsPipelineCreateInfo::default()
-                .stages(&rain_stages)
-                .vertex_input_state(&proxy_inputs)
-                .input_assembly_state(&scene_input_assembly)
-                .viewport_state(&viewport_state)
-                .rasterization_state(&raster)
-                .multisample_state(&multisampling)
-                .depth_stencil_state(&rain_depth)
-                .color_blend_state(&rain_blend)
-                .dynamic_state(&dynamic_state)
-                .layout(out.proxy_layout)
-                .render_pass(out.render_pass)
-                .subpass(0);
-            // SAFETY: same render pass and viewport contract as the
-            // proxy pipeline; the module/layout are the live objects
-            // above.
-            out.rain_pipeline = unsafe {
-                ctx.device
-                    .create_graphics_pipelines(ctx.pipeline_cache, &[rain_info], None)
-            }
-            .map_err(|(_, e)| RendererError::vk(e, "rain pipeline"))?[0];
+            Self::assemble_corner_pipelines(ctx, corner, out.render_pass, out)?;
         }
 
         let overlay_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
@@ -1141,6 +922,401 @@ impl PipelineState {
         .map_err(|(_, error)| RendererError::vk(error, "overlay pipeline"))?[0];
 
         Ok(())
+    }
+
+    /// Assembles the scene-backed (corner-family) pipelines — the lit
+    /// mesh, the Cycle 6-E instanced proxy, and the Era-2 package C
+    /// rain object — against the ATTACHED scene's descriptor layout
+    /// and the given render pass. THE P4 S6 EXTRACTION: this body was
+    /// `assemble_pipelines`' corner branch, runnable only when the
+    /// scene predates the pipeline state (the deleted `Corner`
+    /// construction preference's guarantee). With the public
+    /// [`crate::Renderer::attach_scene`] attaching AFTER
+    /// construction, the same assembly runs at attach time through
+    /// [`Self::ensure_corner_pipelines`] — one body, two call sites
+    /// (the swapchain-recreation path still builds at pipeline-state
+    /// creation, where the scene already exists). The config structs
+    /// below are the branch's own, rebuilt verbatim — plain
+    /// deterministic data, no ctx-derived handles.
+    ///
+    /// Partial-failure safe (the branch's own discipline): handles
+    /// assign as they are created; `destroy` releases what exists.
+    /// The three shader modules are consumed by pipeline creation and
+    /// released here (the caller's `modules` list is uninvolved —
+    /// module objects may be destroyed once the pipelines that
+    /// captured them exist).
+    fn assemble_corner_pipelines(
+        ctx: &VulkanContext,
+        corner: &corner::CornerResources,
+        render_pass: vk::RenderPass,
+        out: &mut PipelineState,
+    ) -> Result<(), RendererError> {
+        // The branch's shared config, verbatim (the scene pipeline's
+        // own assembly above defines each value's contract).
+        let scene_binding = vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: std::mem::size_of::<SceneVertex>() as u32,
+            input_rate: vk::VertexInputRate::VERTEX,
+        };
+        let scene_attributes = [
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 1,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 12,
+            },
+        ];
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let scene_rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::CLOCKWISE)
+            .line_width(1.0);
+        let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA);
+        let color_blend_attachments = [color_blend_attachment];
+        let color_blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
+        let scene_depth = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS);
+        let scene_input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let stage = |flags, module, name| {
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(flags)
+                .module(module)
+                .name(name)
+        };
+
+        // The lit mesh pipeline (lit_scene.spv — the shader pair the
+        // S5 composition serves): the scene binding at the LIT
+        // 32-byte stride, the normal/uv attributes at the LitVertex
+        // offsets, CCW front face (the lit meshes wind about their
+        // outward normals).
+        let mut modules: Vec<vk::ShaderModule> = Vec::new();
+        let result = Self::assemble_corner_pipeline_objects(
+            ctx,
+            corner,
+            render_pass,
+            out,
+            &scene_binding,
+            &scene_attributes,
+            &viewport_state,
+            &scene_rasterizer,
+            &multisampling,
+            &color_blend,
+            &scene_depth,
+            &scene_input_assembly,
+            &dynamic_state,
+            stage,
+            &mut modules,
+        );
+        // SAFETY: the modules were consumed by the pipeline creations
+        // above (or the build failed — the pipelines that captured a
+        // module exist only after its creation call succeeded).
+        unsafe {
+            for module in modules.drain(..) {
+                ctx.device.destroy_shader_module(module, None);
+            }
+        }
+        result
+    }
+
+    /// The corner branch's pipeline-creation body (module lifetime
+    /// owned by the caller for exactly-once release). See
+    /// [`Self::assemble_corner_pipelines`] for the extraction's
+    /// contract.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_corner_pipeline_objects(
+        ctx: &VulkanContext,
+        corner: &corner::CornerResources,
+        render_pass: vk::RenderPass,
+        out: &mut PipelineState,
+        scene_binding: &vk::VertexInputBindingDescription,
+        scene_attributes: &[vk::VertexInputAttributeDescription; 2],
+        viewport_state: &vk::PipelineViewportStateCreateInfo,
+        scene_rasterizer: &vk::PipelineRasterizationStateCreateInfo,
+        multisampling: &vk::PipelineMultisampleStateCreateInfo,
+        color_blend: &vk::PipelineColorBlendStateCreateInfo,
+        scene_depth: &vk::PipelineDepthStencilStateCreateInfo,
+        scene_input_assembly: &vk::PipelineInputAssemblyStateCreateInfo,
+        dynamic_state: &vk::PipelineDynamicStateCreateInfo,
+        stage: impl Fn(
+            vk::ShaderStageFlags,
+            vk::ShaderModule,
+            &'static std::ffi::CStr,
+        ) -> vk::PipelineShaderStageCreateInfo,
+        modules: &mut Vec<vk::ShaderModule>,
+    ) -> Result<(), RendererError> {
+        use crate::lit_mesh::LitVertex;
+        let module = create_shader_module(
+            ctx,
+            include_bytes!(concat!(env!("OUT_DIR"), "/lit_scene.spv")),
+        )?;
+        modules.push(module);
+        let layouts = [corner.layout];
+        // SAFETY: corner owns its descriptor layout across pipeline replacements;
+        // the partial PipelineState owns the pipeline layout immediately.
+        out.lit_layout = unsafe {
+            ctx.device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts),
+                None,
+            )
+        }
+        .map_err(|e| RendererError::vk(e, "lit layout"))?;
+        let stages = [
+            stage(vk::ShaderStageFlags::VERTEX, module, c"vs_main"),
+            stage(vk::ShaderStageFlags::FRAGMENT, module, c"fs_main"),
+        ];
+        let bindings = [vk::VertexInputBindingDescription {
+            stride: size_of::<LitVertex>() as u32,
+            ..*scene_binding
+        }];
+        let attributes = [
+            scene_attributes[0],
+            vk::VertexInputAttributeDescription {
+                offset: std::mem::offset_of!(LitVertex, normal) as u32,
+                ..scene_attributes[1]
+            },
+            vk::VertexInputAttributeDescription {
+                location: 2,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: std::mem::offset_of!(LitVertex, uv) as u32,
+            },
+        ];
+        let inputs = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&bindings)
+            .vertex_attribute_descriptions(&attributes);
+        // The corner mesh winds CCW about its outward normals.
+        let raster = scene_rasterizer.front_face(vk::FrontFace::COUNTER_CLOCKWISE);
+        let info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&inputs)
+            .input_assembly_state(scene_input_assembly)
+            .viewport_state(viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(multisampling)
+            .depth_stencil_state(scene_depth)
+            .color_blend_state(color_blend)
+            .dynamic_state(dynamic_state)
+            .layout(out.lit_layout)
+            .render_pass(render_pass)
+            .subpass(0);
+        // SAFETY: same render pass, depth and viewport contract as the world pipeline.
+        out.lit_pipeline = unsafe {
+            ctx.device
+                .create_graphics_pipelines(ctx.pipeline_cache, &[info], None)
+        }
+        .map_err(|(_, e)| RendererError::vk(e, "lit pipeline"))?[0];
+
+        // The Cycle 6-E instanced-proxy pipeline (see
+        // docs/CYCLE6-6E-BRIEF.md): the SAME render pass,
+        // descriptor layout, rasterizer (the proxy meshes wind
+        // CCW about their outward normals — the lit convention),
+        // and depth contract as the lit pipeline. The vertex
+        // input carries TWO bindings: binding 0 the proxy mesh at
+        // VERTEX rate (the lit 32-byte pos/normal/uv format,
+        // locations 0-2), binding 1 the packed instance bytes at
+        // INSTANCE rate (stride INSTANCE_STRIDE, locations 3-7
+        // as R32G32B32A32_SFLOAT: the four column-major matrix
+        // columns then the tint vec4 — the
+        // proxy_instances::pack layout, byte-pinned by tests).
+        let module = create_shader_module(
+            ctx,
+            include_bytes!(concat!(env!("OUT_DIR"), "/instanced_proxy.spv")),
+        )?;
+        modules.push(module);
+        // SAFETY: corner owns its descriptor layout across pipeline
+        // replacements; the partial PipelineState owns the pipeline
+        // layout immediately.
+        out.proxy_layout = unsafe {
+            ctx.device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts),
+                None,
+            )
+        }
+        .map_err(|e| RendererError::vk(e, "proxy layout"))?;
+        let proxy_stages = [
+            stage(vk::ShaderStageFlags::VERTEX, module, c"vs_main"),
+            stage(vk::ShaderStageFlags::FRAGMENT, module, c"fs_main"),
+        ];
+        let mesh_binding = vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: std::mem::size_of::<crate::proxy_mesh::ProxyVertex>() as u32,
+            input_rate: vk::VertexInputRate::VERTEX,
+        };
+        let instance_binding = vk::VertexInputBindingDescription {
+            binding: 1,
+            stride: crate::proxy_instances::INSTANCE_STRIDE as u32,
+            input_rate: vk::VertexInputRate::INSTANCE,
+        };
+        let proxy_bindings = [mesh_binding, instance_binding];
+        let vec4 = vk::Format::R32G32B32A32_SFLOAT;
+        let proxy_attributes = [
+            scene_attributes[0],
+            scene_attributes[1],
+            vk::VertexInputAttributeDescription {
+                location: 2,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: std::mem::offset_of!(crate::proxy_mesh::ProxyVertex, uv) as u32,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 3,
+                binding: 1,
+                format: vec4,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 4,
+                binding: 1,
+                format: vec4,
+                offset: 16,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 5,
+                binding: 1,
+                format: vec4,
+                offset: 32,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 6,
+                binding: 1,
+                format: vec4,
+                offset: 48,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 7,
+                binding: 1,
+                format: vec4,
+                offset: 64,
+            },
+        ];
+        let proxy_inputs = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&proxy_bindings)
+            .vertex_attribute_descriptions(&proxy_attributes);
+        let proxy_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&proxy_stages)
+            .vertex_input_state(&proxy_inputs)
+            .input_assembly_state(scene_input_assembly)
+            .viewport_state(viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(multisampling)
+            .depth_stencil_state(scene_depth)
+            .color_blend_state(color_blend)
+            .dynamic_state(dynamic_state)
+            .layout(out.proxy_layout)
+            .render_pass(render_pass)
+            .subpass(0);
+        // SAFETY: same render pass, depth and viewport contract as the lit pipeline.
+        out.proxy_pipeline = unsafe {
+            ctx.device
+                .create_graphics_pipelines(ctx.pipeline_cache, &[proxy_info], None)
+        }
+        .map_err(|(_, e)| RendererError::vk(e, "proxy pipeline"))?[0];
+
+        // The Era-2 package C rain pipeline (the THIRD populated
+        // kind — the mission's "particle shader variant ... or
+        // unlit tinted quads" option, the documented choice in
+        // particle.wgsl's header): the SAME vertex input state
+        // (the two proxy bindings, locations 0-7), raster,
+        // input assembly, viewport, and multisample as the proxy
+        // pipeline above — no new pipeline CLASS, one more
+        // object through the identical assembly. The DEPTH
+        // contract copies `scene_depth` and flips the write flag
+        // (a dedicated `rain_depth` value: TEST on, WRITE off —
+        // rain is occluded by geometry, never occludes). The
+        // COLOR BLEND is the OVERLAY precedent's attachment
+        // state verbatim (SRC_ALPHA/ONE_MINUS_SRC_ALPHA, ADD;
+        // alpha ONE/ZERO, ADD). The layout is the SAME corner
+        // proxy layout, so the rain material's corner sets bind
+        // unchanged.
+        let rain_module = create_shader_module(
+            ctx,
+            include_bytes!(concat!(env!("OUT_DIR"), "/particle.spv")),
+        )?;
+        modules.push(rain_module);
+        let rain_stages = [
+            stage(vk::ShaderStageFlags::VERTEX, rain_module, c"vs_main"),
+            stage(vk::ShaderStageFlags::FRAGMENT, rain_module, c"fs_main"),
+        ];
+        let rain_depth = scene_depth.depth_write_enable(false);
+        let rain_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .alpha_blend_op(vk::BlendOp::ADD);
+        let rain_blend_attachments = [rain_blend_attachment];
+        let rain_blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&rain_blend_attachments);
+        let rain_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&rain_stages)
+            .vertex_input_state(&proxy_inputs)
+            .input_assembly_state(scene_input_assembly)
+            .viewport_state(viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(multisampling)
+            .depth_stencil_state(&rain_depth)
+            .color_blend_state(&rain_blend)
+            .dynamic_state(dynamic_state)
+            .layout(out.proxy_layout)
+            .render_pass(render_pass)
+            .subpass(0);
+        // SAFETY: same render pass and viewport contract as the
+        // proxy pipeline; the module/layout are the live objects
+        // above.
+        out.rain_pipeline = unsafe {
+            ctx.device
+                .create_graphics_pipelines(ctx.pipeline_cache, &[rain_info], None)
+        }
+        .map_err(|(_, e)| RendererError::vk(e, "rain pipeline"))?[0];
+        Ok(())
+    }
+
+    /// The attach-time corner-pipeline ensure (P4 S6): with the scene
+    /// attached AFTER construction (the public
+    /// [`crate::Renderer::attach_scene`] — the only path since the
+    /// `Corner` construction preference's deletion), the corner-family
+    /// pipelines are assembled HERE, against the live render pass and
+    /// the attached scene's descriptor layout — exactly the objects
+    /// [`Self::assemble_pipelines`] builds when the scene predates the
+    /// pipeline state (the swapchain-recreation path). IDEMPOTENT: a
+    /// state that already carries the objects (a prior ensure, or a
+    /// construction-time build on the recreation path) returns
+    /// unchanged; a state with no attached scene returns unchanged
+    /// (the pre-S6 Omitted shape — no scene, no corner pipelines).
+    pub(crate) fn ensure_corner_pipelines(
+        &mut self,
+        ctx: &VulkanContext,
+    ) -> Result<(), RendererError> {
+        if self.lit_pipeline != vk::Pipeline::null() {
+            return Ok(());
+        }
+        let Some(corner) = ctx.corner.as_ref() else {
+            return Ok(());
+        };
+        let render_pass = self.render_pass;
+        Self::assemble_corner_pipelines(ctx, corner, render_pass, self)
     }
 
     pub(crate) fn destroy(&mut self, ctx: &VulkanContext) {
