@@ -395,3 +395,11 @@ corrected (`c50a62c`: main 1673/1622). Confirming run `46147200290`.
 
 **T08 CI-verified green:** run `46147200290` at `c50a62c` — all five jobs
 success; the +12 pin arithmetic confirmed on both platforms.
+
+## The T29 design landed (`c2701ee`)
+
+The three-lifetime-class adjudication with the load-bearing cites verified at
+source; the stage-2 mechanics (streaming verified reads + borrow-not-clone)
+removing classes 2+3 with no format change; the authenticated prefix summary
+designed to the field level and PARKED as DECISION-T29-prefix-summary (five
+points, nothing decided). Implementation dispatched for commits 1–2.

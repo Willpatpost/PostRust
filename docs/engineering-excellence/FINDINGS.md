@@ -141,7 +141,7 @@ Classes: CONFIRMED (source-derived), HYPOTHESIS (reproduce-or-refute mandated), 
 | T26 | OBLIGATION (open) | A26-class | CPU whole-scene/proxy capacity architecture |
 | T27 | INVESTIGATION | A21/R05 | frame stats/timestamp bounded meaningful semantics |
 | T28 | CONFIRMED | B13 | worker measurement does not resolve authority-thread blocking |
-| T29 | CONFIRMED structure | B02/B03 | chain walker bounded startup/suffix residency proof |
+| T29 | CONFIRMED structure | B02/B03 | **DESIGN LANDED `c2701ee`** (`designs/T29-walker-residency.md`, lane `e87aee2`): the three-lifetime-class adjudication (the cursor O(chain) load-bearing; the walk-transient ~2·o_max peak and the ~1.15 MiB per-validation churn removable with no format change; the prefix summary parked as DECISION-T29-prefix-summary); the implementation dispatched for commits 1–2 |
 | T30 | REPORTED/DESIGN | R07/B04 | transaction state-machine consolidation staged |
 | T31 | CONFIRMED improvements + proof needed | CA18-20 | backup/restore durability + path portability cross-provider |
 | T32 | CONFIRMED | B15/A06/F03 | animation/render contract footprint outstanding |
