@@ -691,8 +691,13 @@ fn arena_growth_gate_boundary() {
         );
         assert_eq!(stats.region_supplied_peak_vertices, 612);
         assert_eq!(
-            stats.region_truncated_vertices, 112,
-            "612 supplied - 500 carved: the truncation the growth did NOT mask"
+            stats.region_truncated_vertices, 114,
+            "612 supplied - 498 carved (the RegionCapacity(500) triangle floor, 500 - 500%3): \
+             the truncation the growth did NOT mask — the T04 whole-triangle admission \
+             (the R4 census catch: this rig-#[ignore]d leg pinned the pre-T04 byte-cut \
+             arithmetic 112, the T04 re-pin pass having updated render_overflow but \
+             missed this leg; CI green today because the rig battery never ran — \
+             corrected before the next rig run goes red)"
         );
         assert_eq!(stats.arena_growth_events, 1, "the region growth, counted");
         assert_eq!(renderer.stats().validation_errors, 0);

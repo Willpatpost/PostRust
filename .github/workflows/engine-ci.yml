@@ -765,8 +765,8 @@ jobs:
           # result-lines and renderer-release literals — the passed
           # gate caught the omission (the system working as
           # designed); recorded honestly here.
-          expected=1692
-          if [ "$(uname -s)" != "Linux" ]; then expected=1641; fi
+          expected=1698
+          if [ "$(uname -s)" != "Linux" ]; then expected=1647; fi
           # T01 (2026-11-28): the main-shard pins centralized the same
           # way as the heavy shard's — the sibling defect here was the
           # echo printing a stale 33 while the gate enforced 34 (green
@@ -903,7 +903,7 @@ jobs:
           # class extends beyond the two shards the original repair
           # covered. The echo, the assertions and the failure
           # messages now derive from these two variables.
-          expected=233
+          expected=236
           expected_results=3
           echo "renderer release: $passed passed, $results test-result lines (expected $expected / $expected_results)"
           # ENGINEERING EXCELLENCE P1-B09 (2026-11-26): +1
