@@ -46,8 +46,11 @@ pub const MAX_REGION_COUNT: u32 = 256;
 /// The maximum population a [`WorldConfig`] admits: the `NpcId`
 /// identity space (`u32`), since ids are dense over
 /// `0..npc_count`. The wire reader bounds every per-region block
-/// count by the remaining bytes as well, so a corrupted count is
-/// rejected before any allocation trusts it.
+/// count by the remaining bytes as well, and the whole section's
+/// declaration by its all-dormant minimum size (T21: region framing
+/// plus 35 wire bytes per declared identity must fit in the section
+/// bytes actually remaining), so a corrupted count is rejected
+/// before any allocation trusts it.
 ///
 /// **The scoped/global identity policy (a separate owner decision,
 /// CA-02's documented boundary):** this bound is over the GLOBAL
