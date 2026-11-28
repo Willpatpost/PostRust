@@ -352,3 +352,14 @@ design docs).
 `ba0a089` — all five jobs success. The A06 extraction now stands at
 E-S1+E-S2 landed; the combat guard's recalibrated bound held on all
 platforms.
+
+## E-S3 — the shim deletion + root re-point landed (`fcecedd`)
+
+The lane (`f4bdc8d`, 2 files): the public re-export block deleted, the root
+block re-pointed (19 moved items → `engine_animation`, 4 packing items
+staying, `skinned_humanoid_mesh` → `populated_meshes`), every root path
+stable, the ~30 internal `crate::animation` sites kept through census-verified
+crate-visible aliases (internal wiring; the full re-point a P6 fold item).
+Zero count movement (21/225/173 identical); the pose digest + FNV pins green.
+The E-S4 recommendation recorded (the B15 minimal-consumer re-measure).
+Verification run `46144553154` dispatched.
