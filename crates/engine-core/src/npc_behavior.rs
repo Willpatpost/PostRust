@@ -12,8 +12,7 @@
 //! RNG stream in fixed order, and the identity's wire encoding
 //! ([`NpcIdentity::wire_bytes`]) is little-endian fixed-width
 //! integers in a fixed field order — the codec this module owns,
-//! pinned by an asymmetric golden record and round trip (finding 7's
-//! correction: the claim now names the bytes actually exercised). A
+//! pinned by an asymmetric golden record and round trip. A
 //! fixed rule table over a fixed record produces the same activity
 //! sequence forever — pinned by digest.
 //!
@@ -84,8 +83,8 @@ pub struct Activity {
 
 /// The durable identity lane (§3's rule of thumb: persists through
 /// the commit pipeline). Wire-encodable through THIS module's codec
-/// — [`NpcIdentity::wire_bytes`]/[`NpcIdentity::from_wire`], the
-/// seam the docs claim, byte-exact through save/load (pinned by an
+/// — [`NpcIdentity::wire_bytes`]/[`NpcIdentity::from_wire`] — and
+/// byte-exact through save/load (pinned by an
 /// asymmetric golden record and round trip). `Eq` (P2 L8): every
 /// field is totally ordered wire data — the id, the home cell, the
 /// region tag, the seed — so the v2 save section's identity table
@@ -106,15 +105,12 @@ impl NpcIdentity {
     /// and appearance_seed (u32) — 11 bytes total.
     pub const WIRE_STRIDE: usize = 11;
 
-    /// THE WIRE ENCODING — the actual serialization seam (finding
-    /// 7's correction: the durable lane's docs claimed a fixed wire
-    /// order and byte-exact save/load, but the reviewed tree had no
-    /// encoder for the type; this IS the encoder, and the golden
-    /// record below pins it). Fixed field order, little-endian
-    /// fixed-width integers: id (u32 LE), home_cell.0 (u8),
-    /// home_cell.1 (u8), region (u8), appearance_seed (u32 LE).
-    /// Total: every call site that persists an identity goes through
-    /// these bytes.
+    /// THE WIRE ENCODING — the actual serialization seam: every call
+    /// site that persists an identity goes through these bytes, and
+    /// the asymmetric golden record plus round trip below pin them.
+    /// Fixed field order, little-endian fixed-width integers: id
+    /// (u32 LE), home_cell.0 (u8), home_cell.1 (u8), region (u8),
+    /// appearance_seed (u32 LE).
     pub fn wire_bytes(&self) -> [u8; Self::WIRE_STRIDE] {
         let mut bytes = [0u8; Self::WIRE_STRIDE];
         bytes[0..4].copy_from_slice(&self.id.0.to_le_bytes());
@@ -206,7 +202,7 @@ pub struct Rule {
 
 impl Rule {
     /// The served need's current level — fail-closed on an
-    /// out-of-range index (finding 6's defense-in-depth: admission
+    /// out-of-range index (defense-in-depth: admission
     /// refuses such tables via [`validate_rule_table`], and the
     /// selector treats an unvalidated out-of-range rule as
     /// inapplicable — never a panic in either selection pass).
@@ -270,12 +266,12 @@ fn view_live(view: &WorldView) -> &[(u32, NpcId)] {
     &view.perceptions[..count]
 }
 
-/// Validates a rule table at ADMISSION (finding 6's correction: a
-/// policy-authored out-of-range need index used to panic inside the
-/// selector's both passes; it is now refused here — typed,
+/// Validates a rule table at ADMISSION: a policy-authored
+/// out-of-range need index is refused here — typed,
 /// fail-visible — before any evaluation trusts the table, and the
 /// selector additionally fails closed per-rule so an unvalidated
-/// table can never crash, only mis-serve). Refusals are
+/// table can never crash, only mis-serve (admission plus
+/// defense-in-depth). Refusals are
 /// `&'static str` reasons (the npc_memory validation-refusal
 /// style).
 pub fn validate_rule_table(rules: &[Rule]) -> Result<(), &'static str> {
@@ -342,7 +338,7 @@ impl NpcRng {
         (self.next_unit() * bound as f32) as u32 % bound
     }
 
-    /// The stream's current position, as bits (finding 7's
+    /// The stream's current position, as bits (the
     /// diagnostic-digest input: two worlds whose NPCs have drawn
     /// different amounts of tie-break entropy are worlds whose
     /// FUTURE behavior differs — a read-only observation, never a
@@ -373,8 +369,8 @@ fn mix64(mut x: u64) -> u64 {
 /// REACTIVE class is offered to the policy's rules like any other
 /// input — the engine imposes no fear semantics — and a rule with a
 /// witness matcher BINDS the matched perception's subject into its
-/// `React` activity when it wins (finding 6: the perception can now
-/// both gate a rule and name whom the reaction concerns).
+/// `React` activity when it wins (the perception both gates a rule
+/// and names whom the reaction concerns).
 ///
 /// Same inputs — same activity, byte-identical, cross-platform.
 pub fn select_activity(
