@@ -7,6 +7,7 @@
 //! is typed with the failing identity; no partial success exists.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use engine_persist::composite_manifest::{
     self, CompositeManifest, HistoryKind, ManifestEntry, SectionKind, TAG_BLOCKED,
@@ -594,6 +595,131 @@ fn the_memo_shares_verification_across_manifests_deterministically() {
     assert_eq!(source.reads, 2 * first.chunks.len());
     assert_eq!(read_first, again_first);
     assert_eq!(read_second, again_second);
+}
+
+#[test]
+fn the_memo_hit_clones_the_refcount_not_the_payload_bytes() {
+    // The B03 Arc shared backing's ALLOCATION PROOF (the design's
+    // Option 1): a memo hit must no longer duplicate the verified
+    // payload. Two grammatical composites — disjoint identity sets
+    // except ONE shared sealed chunk — read through a single
+    // threaded memo: the second read's chunk for the shared
+    // identity is the SAME `Arc<[u8]>` allocation as the first's
+    // (`Arc::ptr_eq`), because the hit cloned the backing's
+    // REFCOUNT. The pre-Arc shape cloned the full payload bytes per
+    // hit (the payload existed twice live per reuse).
+    let first = valid_full();
+    let second = SyntheticComposite::build(HistoryKind::Full, 4, 2, 2, 40);
+    // The shared sealed chunk both roots declare (same tag, same
+    // payload length, same content identity — a legitimate
+    // cross-manifest reuse within ONE verification operation).
+    let shared_payload = vec![42u8; 4 * 31];
+    let shared_envelope =
+        composite_manifest::encode_chunk_envelope(TAG_LEDGER_RECORDS, &shared_payload);
+    let shared = shared_envelope.hash();
+    let shared_bytes = shared_envelope.into_bytes();
+    let declare_shared = |composite: &SyntheticComposite| {
+        let mut manifest = composite.manifest.clone();
+        for entry in &mut manifest.entries {
+            if entry.kind == SectionKind::LedgerSealed {
+                entry.identity = shared;
+                break;
+            }
+        }
+        StoredObject::new(composite_manifest::encode(&manifest)).unwrap()
+    };
+    let first_root = declare_shared(&first);
+    let second_root = declare_shared(&second);
+    let mut source = first.store();
+    for (identity, bytes) in &second.chunks {
+        source.insert(*identity, bytes.clone());
+    }
+    source.insert(shared, shared_bytes.clone());
+
+    let mut memo = VerificationMemo::new();
+    let read_first = composite_reader::read_composite_closure_with_memo(
+        &mut source,
+        &first_root,
+        &ReadLimits::default(),
+        &mut memo,
+    )
+    .unwrap();
+    let read_second = composite_reader::read_composite_closure_with_memo(
+        &mut source,
+        &second_root,
+        &ReadLimits::default(),
+        &mut memo,
+    )
+    .unwrap();
+    // The memo accounted each distinct identity exactly once — the
+    // shared chunk was read and hash-verified ONCE (the hit skipped
+    // the re-read, the pinned memo cost model).
+    assert_eq!(source.reads, first.chunks.len() + second.chunks.len() - 1);
+    assert_eq!(memo.len(), first.chunks.len() + second.chunks.len() - 1);
+    let first_shared = read_first
+        .chunks
+        .iter()
+        .find(|chunk| chunk.identity == shared)
+        .expect("the first read carries the shared chunk");
+    let second_shared = read_second
+        .chunks
+        .iter()
+        .find(|chunk| chunk.identity == shared)
+        .expect("the second read carries the shared chunk");
+    // THE SHARING PROOF: the memo hit and the fresh read hold the
+    // SAME payload allocation — a refcount clone, not a byte copy.
+    assert!(
+        Arc::ptr_eq(&first_shared.payload, &second_shared.payload),
+        "the memo hit shares the verified payload's backing"
+    );
+    // ptr_eq is a real discriminator, not vacuously true:
+    // content-distinct chunks never share a backing.
+    let (first_header, second_header) = (&read_first.chunks[0], &read_second.chunks[0]);
+    assert_eq!(first_header.tag, second_header.tag);
+    assert_ne!(first_header.identity, second_header.identity);
+    assert!(!Arc::ptr_eq(&first_header.payload, &second_header.payload));
+
+    // The no-memo differential: INDEPENDENT operations (fresh memos
+    // per read — the no-memo behavior) verify the same identities
+    // independently — byte-identical contents, DISTINCT backings.
+    // The sharing is exactly the memo-hit path within one
+    // operation, never a cross-operation cache.
+    let mut source = first.store();
+    for (identity, bytes) in &second.chunks {
+        source.insert(*identity, bytes.clone());
+    }
+    source.insert(shared, shared_bytes);
+    let alone_first =
+        composite_reader::read_composite_closure(&mut source, &first_root, &ReadLimits::default())
+            .unwrap();
+    let alone_second =
+        composite_reader::read_composite_closure(&mut source, &second_root, &ReadLimits::default())
+            .unwrap();
+    // Every identity re-read: one full extra read set.
+    assert_eq!(source.reads, first.chunks.len() + second.chunks.len());
+    assert_eq!(
+        alone_first, read_first,
+        "the verified contents are memo-independent"
+    );
+    assert_eq!(alone_second, read_second);
+    let alone_first_shared = alone_first
+        .chunks
+        .iter()
+        .find(|chunk| chunk.identity == shared)
+        .unwrap();
+    let alone_second_shared = alone_second
+        .chunks
+        .iter()
+        .find(|chunk| chunk.identity == shared)
+        .unwrap();
+    assert!(!Arc::ptr_eq(
+        &alone_first_shared.payload,
+        &alone_second_shared.payload
+    ));
+    assert_eq!(
+        alone_first_shared.payload, alone_second_shared.payload,
+        "distinct backings, identical verified bytes"
+    );
 }
 
 #[test]

@@ -71,8 +71,26 @@
 //! forbids duplicate identities within one manifest, so the memo
 //! only fires across manifests sharing chunks). No production
 //! reuse-verification cache exists or is introduced.
+//!
+//! **The verified payload's ownership (the B03 Arc shared
+//! backing):** a fully verified chunk's payload is materialized
+//! ONCE per fresh read as one shared `Arc<[u8]>` backing — the
+//! memo's entry and every [`VerifiedChunk`] citing that identity
+//! within the operation hold a REFCOUNT to the same allocation,
+//! never a second byte copy (a memo hit clones the refcount; the
+//! pre-Arc shape duplicated the payload bytes per hit). The
+//! sharing changes ownership only: the verification SCOPE is
+//! untouched — every fresh read still re-reads and re-hashes the
+//! whole framed object, and every entry-level coherence check
+//! still runs on every hit. The per-operation lifetime above is
+//! what makes the sharing safe: the backing lives exactly as long
+//! as the operation's memo and its results, never across a medium
+//! mutation (no cross-operation memo exists — the providers do not
+//! expose the content-addressed immutability such reuse would
+//! require for reclaim-deleted chunks).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use engine_core::wire::MAX_TAG_LEN;
 use engine_core::{Decoder, SaveError};
@@ -183,7 +201,12 @@ struct MemoEntry {
     /// (the envelope's observed tag, proven equal to the declaring
     /// manifest entry's tag).
     tag: &'static str,
-    payload: Vec<u8>,
+    /// The verified payload's SHARED backing — the one `Arc<[u8]>`
+    /// allocation the fresh read materialized. The memo entry, the
+    /// returned [`VerifiedChunk`], and every later hit within this
+    /// operation hold refcounts to these same bytes; cloning the
+    /// entry's payload is a refcount, never a byte copy.
+    payload: Arc<[u8]>,
 }
 
 impl VerificationMemo {
@@ -220,11 +243,16 @@ impl VerificationMemo {
 /// One fully verified dependency chunk: the manifest entry's
 /// section tag, its authenticated identity, and its verified
 /// payload (an unmodified slice of the exact legacy serialization).
+/// The payload is the SHARED `Arc<[u8]>` backing the fresh read
+/// materialized — chunks of one operation citing the same identity
+/// (across manifests, through the memo) share the allocation by
+/// refcount; equality (`PartialEq`) still compares the BYTES, so
+/// the sharing is invisible to every consumer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedChunk {
     pub tag: &'static str,
     pub identity: Hash,
-    pub payload: Vec<u8>,
+    pub payload: Arc<[u8]>,
 }
 
 /// The complete verified dependency closure of one composite root.
@@ -411,8 +439,9 @@ pub fn read_composite_closure(
 /// root in the same verification pass) skip the re-read and re-hash
 /// under the documented content-addressing assumptions, while every
 /// entry-level coherence check (the tag, the declared length) still
-/// runs against THIS manifest's declaration. Deterministic with or
-/// without the memo.
+/// runs against THIS manifest's declaration. A memo hit clones the
+/// shared payload backing's REFCOUNT, never the bytes. Deterministic
+/// with or without the memo.
 pub fn read_composite_closure_with_memo(
     source: &mut dyn ObjectSource,
     root: &StoredObject,
@@ -456,11 +485,13 @@ pub fn read_composite_closure_with_memo(
         // The memoized path: the identity was FULLY verified within
         // this operation (the envelope, the tag, the length, and
         // the hash) — reuse the verified payload under the
-        // documented immutability assumption. The entry-level
+        // documented immutability assumption. The hit clones the
+        // shared backing's REFCOUNT only (never the payload bytes —
+        // the B03 Arc shared backing), and the entry-level
         // coherence checks below still run: a memoized chunk is
         // never blanket-accepted against a new declaration.
         let (observed_tag, payload) = if let Some(memoized) = memo.entries.get(&entry.identity) {
-            (memoized.tag.to_owned(), memoized.payload.clone())
+            (memoized.tag, Arc::clone(&memoized.payload))
         } else {
             // The fresh path: load, parse, and verify the exact
             // object. Every failure is typed with the identity.
@@ -532,19 +563,32 @@ pub fn read_composite_closure_with_memo(
                     identity: entry.identity,
                 });
             }
-            let observed_tag = observed_tag.to_owned();
-            let payload = payload.to_vec();
+            // The ONE retained copy (the B03 Arc shared backing):
+            // the verified payload moves out of the framed object
+            // read into a single `Arc<[u8]>` allocation — the memo
+            // entry, this chunk, and every later hit within the
+            // operation share that backing by refcount. The
+            // transient framed-object `bytes` (the source read the
+            // hash re-verification consumed) is dropped at the end
+            // of this iteration; the payload exists ONCE, plus Arc
+            // refcounts — where the pre-Arc shape retained a
+            // `to_vec` copy AND a memo clone of it. The observed
+            // tag was proven equal to the declaration above, so
+            // the shared re-check below remains the documented
+            // idempotent comparison for the fresh path.
+            let payload = Arc::from(payload);
             // The complete verified read EARNS the memo entry —
             // only now may a later manifest in this operation reuse
-            // the identity.
+            // the identity (the entry shares the payload's backing
+            // by refcount; no second byte copy exists).
             memo.entries.insert(
                 entry.identity,
                 MemoEntry {
                     tag: entry.tag,
-                    payload: payload.clone(),
+                    payload: Arc::clone(&payload),
                 },
             );
-            (observed_tag, payload)
+            (entry.tag, payload)
         };
         // THE entry-level coherence (both paths — the tag and the
         // declared length are checked against THIS manifest's
@@ -555,7 +599,7 @@ pub fn read_composite_closure_with_memo(
             return Err(CompositeReadError::Tag {
                 identity: entry.identity,
                 expected: entry.tag,
-                observed: observed_tag,
+                observed: observed_tag.to_owned(),
             });
         }
         if payload.len() as u64 != entry.payload_length {

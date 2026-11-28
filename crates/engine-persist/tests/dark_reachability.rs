@@ -441,6 +441,114 @@ fn the_corrupt_shared_chunk_fails_both_roots_identically() {
 }
 
 #[test]
+fn the_memo_stays_per_operation_across_a_medium_mutation() {
+    // The B03 Arc shared backing's TRUST BOUNDARY, restated as a
+    // proof: the memo — whose entries now hold a SHARED payload
+    // backing — remains PER-OPERATION. Two independent chains share
+    // one sealed chunk; operation 1 (chain A's walk, one fresh
+    // memo) verifies it. The source then MUTATES the shared
+    // identity's bytes under the same identity — the reclaim-
+    // delete-and-replace a real medium can perform (the providers
+    // expose no content-addressed immutability across operations).
+    // Operation 2 (chain B's walk, its OWN fresh memo — the
+    // `VerificationMemo::new()` every call site constructs)
+    // re-reads and re-verifies every identity and FAILS CLOSED on
+    // the mutation: no stale verification crosses the operation
+    // boundary. The final contrast demonstrates WHY the discipline
+    // is mandatory — the WRONG usage demonstrated, never endorsed.
+    let (shared, shared_bytes) = shared_chunk();
+    let root_a = synthetic_composite(0, Some(shared));
+    let root_b = synthetic_composite(60, Some(shared));
+    let mut source = MapSource::new();
+    install(&mut source, &root_a);
+    install(&mut source, &root_b);
+    source.insert(shared, shared_bytes);
+    let (head_a, head_a_bytes) = record(vec![root_a.root.hash()], None, 0);
+    let (head_b, head_b_bytes) = record(vec![root_b.root.hash()], None, 0);
+    source.insert(head_a, head_a_bytes);
+    source.insert(head_b, head_b_bytes);
+
+    // Operation 1: chain A walks green with its own memo — the
+    // shared chunk is read, fully verified, and memoized.
+    let mut first_memo = VerificationMemo::new();
+    let live = dark_reachability::live_set(
+        &mut source,
+        &[head_a],
+        &ReachabilityLimits::default(),
+        &mut first_memo,
+    )
+    .unwrap();
+    assert_eq!(live.chunk_reference_counts[&shared], 1);
+    assert!(
+        first_memo.contains(&shared),
+        "operation 1 earned the shared identity"
+    );
+
+    // The medium mutation between the operations: the shared
+    // identity now holds DIFFERENT mis-hashed bytes (same tag, same
+    // declared length — only the content hash moves).
+    let mut mutated = vec![77u8; 4 * 31];
+    mutated[0] ^= 0xff;
+    let mis_hashed = composite_manifest::encode_chunk_envelope(TAG_LEDGER_RECORDS, &mutated);
+    source.insert(shared, mis_hashed.into_bytes());
+
+    // Operation 2 with a FRESH memo (the actual discipline): the
+    // walk re-verifies the mutated identity and fails CLOSED — the
+    // mutation is caught, never papered over by a stale
+    // verification.
+    let mut fresh_memo = VerificationMemo::new();
+    let error = dark_reachability::live_set(
+        &mut source,
+        &[head_b],
+        &ReachabilityLimits::default(),
+        &mut fresh_memo,
+    )
+    .unwrap_err();
+    match error {
+        ReachError::Composite { root, error } => {
+            assert_eq!(root, root_b.root.hash());
+            assert!(
+                matches!(
+                    *error,
+                    engine_persist::composite_reader::CompositeReadError::HashMismatch {
+                        identity
+                    } if identity == shared
+                ),
+                "the fresh memo's re-verification catches the mutation: {error:?}"
+            );
+        }
+        other => panic!("the mutated shared chunk fails as Composite: {other:?}"),
+    }
+    assert!(
+        !fresh_memo.contains(&shared),
+        "the mutated identity never earns an entry"
+    );
+
+    // THE CONTRAST — the hazard the per-operation lifetime exists
+    // to prevent, demonstrated to prove the safety is the memo's
+    // LIFETIME and nothing else: had operation 2 WRONGLY threaded
+    // OPERATION 1's memo across the mutation, the memo hit would
+    // skip the re-read and the stale verification would stand
+    // (green). This is exactly why the memo is created per bounded
+    // operation and dropped with it, and why no cross-operation
+    // memo is proposed: the providers do not expose the
+    // content-addressed immutability such reuse would need to be
+    // sound. DO NOT thread a memo across operations.
+    let mut stale_memo = first_memo;
+    let stale = dark_reachability::live_set(
+        &mut source,
+        &[head_b],
+        &ReachabilityLimits::default(),
+        &mut stale_memo,
+    )
+    .unwrap();
+    assert_eq!(
+        stale.chunk_reference_counts[&shared], 1,
+        "the stale (wrongly reused) memo accepts the mutated identity — the hazard demonstrated"
+    );
+}
+
+#[test]
 fn the_walk_respects_the_revision_limit() {
     // A five-record chain under a three-revision limit refuses
     // typed (the bounded traversal).
