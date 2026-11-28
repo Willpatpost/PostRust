@@ -2896,12 +2896,20 @@ mod tests {
             // population, so a fixed bound trips on its own scaling
             // under a slow/shared runner (the CI measured 51.3 ms
             // at 32,768 against the old fixed 50 ms — the local rig
-            // reads ~13.7 ms); 5 ms + 4 µs/record gives ~2.6x
-            // headroom over the CI actual while a quadratic blowup
-            // (seconds at 32k) still fails by an order of magnitude.
+            // reads ~13.7 ms). The 4 µs/record form (a2e6e86, ~2.6x
+            // headroom over its era's actuals) has since been
+            // exceeded TWICE at the 8,192 arm by shared-runner
+            // variance: 39.5 ms (run 46139366087) and 38.2 ms
+            // (run 46142180934) against its 37.8 ms bound — the
+            // second-occurrence protocol firing the measured-
+            // actuals correction. 5 ms + 6 µs/record gives ~1.37x
+            // headroom over the worst accumulated actual while a
+            // quadratic blowup (the diagonal reading quadrupling
+            // per population doubling: ~150 ms at 8,192, seconds at
+            // 32k) still fails by 3x and more.
             for ns in grid_times.iter().chain(linear_times.iter()) {
                 assert!(
-                    ns.is_finite() && *ns < 5_000_000.0 + size as f64 * 4_000.0,
+                    ns.is_finite() && *ns < 5_000_000.0 + size as f64 * 6_000.0,
                     "pop {size}: a probe is absurdly slow: {ns} ns"
                 );
             }
