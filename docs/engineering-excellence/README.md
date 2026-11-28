@@ -20,7 +20,8 @@ Every state claim below carries its SHA; re-verify against
   `pre-excellence-5b93167` (tag object `4ca7846f6a5453da0afe2e82d204246cbf6a7180`,
   verified on origin).
 - **Integration branch:** `refactor/engineering-excellence` (from the tagged
-  commit, pushed, synced with origin at `1d4ecc9`). Lane branches `ee/<package>`
+  commit, pushed, synced with origin at `9690284` — the T01 CI repair; this
+  reconciliation lands next). Lane branches `ee/<package>`
   merge into it under the orchestrator's review; **main is never touched, no
   merges into main until the owner's explicit final GO**.
 - **Program law:** the repo's standing discipline governs where the charter is
@@ -34,17 +35,23 @@ Every state claim below carries its SHA; re-verify against
     adjudicated (R05 landed `e2aa89e`, R06 closed-by-S6 `7e4c8f8`, R07
     accepted-investigate).
   - **The owner's independent re-audit at `083f617` + the D-EE-10 authorization
-    block (2026-11-27/28, registered `1d4ecc9`) is the current governing
-    mandate:** substantial but NOT acceptance — scalability NOT code-complete.
-    Scores 8.0/8.1/7.2/7.7/8.1/8.4/7.8-provisional/7.6. Eleven new findings
-    Q01–Q11 registered; A08 regional scheduler locality, R07, B08/B13 and the
-    coverage/performance obligations retained. Four pending decisions ruled:
-    the P5 resource architecture (conditionally approved), the A06 animation
-    crate extraction (APPROVED, sequenced after P5 R1/R2 in the P6 window),
-    the SDL exact pin (APPROVED), SQLite feature isolation (APPROVED,
-    default-on) — plus the rendering-contract/types surface investigation
-    authorized. Continue autonomously; every category ≥ 9/10; stop only at the
-    final owner integration gate.
+    block (2026-11-27/28, registered `1d4ecc9` — BINDING):** four decisions
+    ruled (the P5 resource architecture conditionally approved; the A06
+    animation crate extraction APPROVED, sequenced after P5 R1/R2 — both
+    landed, the window open; the SDL exact pin APPROVED — landed `6b9fa2a`;
+    SQLite feature isolation APPROVED default-on — landed `3a419a7`) plus the
+    rendering-contract/types surface investigation authorized. Continue
+    autonomously; every category ≥ 9/10; stop only at the final owner
+    integration gate.
+  - **The Strict Audit IV (2026-11-28, `audits/strict-audit-IV-096f8d9.md`,
+    the owner-delivered comprehensive report at `096f8d9`) is the current
+    governing campaign mandate:** NOT ACCEPTED — provisional scores 8.0/8.2/
+    7.3/7.6/8.2/8.6/7.8/7.3, every category below the 9/10 bar; 40 findings
+    T01–T40 registered with the five-wave execution plan (§9), the mandatory
+    acceptance-measurement matrix (§7) and the source-coverage ledger (§8);
+    the overnight directive (`OVERNIGHT-DIRECTIVE.md`) is its execution brief.
+    Wave 0 (T01 CI repair + this T38 reconciliation) executing 2026-11-28 in
+    the ODU orchestrator session.
 
 ## The eight rubrics (each ≥ 9/10, independently reviewed — charter §9)
 
@@ -85,18 +92,18 @@ directory); `engine-persist/src` carries `local/`, `sqlite/`, `reclaim/`
 submodule trees under their root facades — pre-split "monolith" file
 references in older records describe the baseline tree, not this one.
 
-| Package | Scope (charter IDs) | Status at head `1d4ecc9` |
+| Package | Scope (charter IDs) | Status at head `9690284` |
 |---|---|---|
 | P0 | tag/branch, census, coverage ledger, baseline measurements, architecture map | **COMPLETE** — tag/branch E-1; all five crate audits landed (`audits/*.md`, incl. the core retry after the MiMo wedge); census E-2/E-5 superseded by the IA-13 single-convention table; first gate baseline E-6; measurement battery E-8 (the "before" numbers); the owner's maximal-composition walk E-9; the B15 footprint E-11; the P5 census harness E-12 |
-| P1 | A16 A17 A21 A25 B05 B07 B08 B09 B04(partial) | **8/9 landed** — A16 `f9901f3`, A17 `3439633`, B09 `9dce061`+corrective, B04 `e31dc61`+corrective, A21 `a213563`, A25 `7c30aee`, B05 `1815a2d`→`bceb3fa`; B07 RESOLVED no-change (design evidence); B08 deferred to measurement (retained by the owner re-audit) |
-| P2 | A05 A07–A10 A22 A24 B01 B06 B12 | **all lanes landed** — design `c7de072`; L1 tie `356ef92`, L2 bulk-partition `e1031e5`, L3 housekeeping `34975f5`, L5 StaticGrid `11cf669`, L6 census grid `40e0828`/`7af1f54`, L4 witness index `c79a5c4`, B06 combat broad phase `d489b7f`, L7 A22-core `4dd78e3`, L8 A05/B12 world-config `1396ba6`, A24 `1884582` rig-verified. Remaining: Q01/Q02/Q09 (lane RUNNING), Q03/Q04/Q05/Q07, B01's bounded-work contract |
-| P3 | A13 A22 B02 B03 B04 B12 B13 | **core lanes landed; L9b in flight** — design `bceb3fa`; L1 `19fe59d`, L2 `c084230`, L3 `8636d89`, L4 `f437bd7`, L5 `79b2fde`, L6 A22-persist `42ac117`, L7 B13 `3057f66`, L8 B03-Arc `23609bd`, L9 module split `622623b`; L9b walk unification RUNNING (lane commits `2ecadf5`+`59aec7e`, worktree b09). Remaining: Q08, R07 (investigation), the B13 release-rig confirmation, the SQLite feature gate (D-EE-10 §4 — approved, not started) |
-| P4 | A01 A03–A06 A11 A12 A14 A15 B14 B15 | **migration complete (S1–S6)** — S1 `954f843`, S2 `f8f308c`, S3 `70b876d`, S4 `46f29e3`, S5 `585187d`, S6 `7e4c8f8` + rig corrective `a6e5adc` (R06 closed); A04 `9e17516` (device bar `df508da`); A02-core `72c91d3`; the A06 decision record `064f866` (extraction APPROVED per D-EE-10 §2); B15 measured `72d636b`. Remaining: A14 (register row restored — resource ownership/device-lost), R01/R02, Q06/Q10, A02's renderer half |
-| P5 | A11 A17–A20 A23 B14 | **in flight** — design LANDED `ab7cf2a` (`designs/P5-resource-residency.md`); R0 census harness `1ea3e05` (E-12: the repack matrix, the attach census — 794,624 B staging tails = 50.0% of texture residency, the ripple rows); R1 arenas RUNNING (worktree a16); R4 ring localization RUNNING (worktree a17); R2 dirty-generation, R3 staging, R5 the gated aliasing decision queued; D-EE-10 §1 approved the architecture |
-| P6 | A01–A06 A12–A15 B15 B16 | **incremental** — A02-core landed; B10/B11 `63b01d4`; the LOW doc notes registered (NEW-REND-04/05/06, NEW-SLICE-02/03/05); the A06 extraction window queued (after P5 R1/R2); the SDL exact-pin lane RUNNING (NEW-REND-11, worktree q1) |
+| P1 | A16 A17 A21 A25 B05 B07 B08 B09 B04(partial) | **COMPLETE (all nine dispositioned)** — A16 `f9901f3`, A17 `3439633`, B09 `9dce061`+corrective, B04 `e31dc61`+corrective, A21 `a213563`, A25 `7c30aee`, B05 `1815a2d`→`bceb3fa`, B07 RESOLVED no-change (design evidence), B08 `6cf1a0d` (the codex lane) |
+| P2 | A05 A07–A10 A22 A24 B01 B06 B12 | **all lanes landed** — design `c7de072`; L1 tie `356ef92`, L2 bulk-partition `e1031e5`, L3 housekeeping `34975f5`, L5 StaticGrid `11cf669`, L6 census grid `40e0828`/`7af1f54`, L4 witness index `c79a5c4`, B06 combat broad phase `d489b7f`, L7 A22-core `4dd78e3`, L8 A05/B12 world-config `1396ba6`, A24 `1884582` rig-verified, Q01+Q02+Q09 `bce11d3` (lane `e4d5c38`). Remaining per strict audit IV: T08/T09 (B01's bounded-work contract + queued locality), T10/T11/T37 |
+| P3 | A13 A22 B02 B03 B04 B12 B13 | **all core lanes landed (L9b complete)** — design `bceb3fa`; L1 `19fe59d`, L2 `c084230`, L3 `8636d89`, L4 `f437bd7`, L5 `79b2fde`, L6 A22-persist `42ac117`, L7 B13 `3057f66`, L8 B03-Arc `23609bd`, L9 module split `622623b`, L9b walk unification `10d3d13`; the SQLite feature gate LANDED `3a419a7` (D-EE-10 §4). Remaining per strict audit IV: T13/T14 (Q08), T29/T30, T31, T28 |
+| P4 | A01 A03–A06 A11 A12 A14 A15 B14 B15 | **migration complete (S1–S6)** — S1 `954f843`, S2 `f8f308c`, S3 `70b876d`, S4 `46f29e3`, S5 `585187d`, S6 `7e4c8f8` + rig corrective `a6e5adc` (R06 closed); A04 `9e17516` (device bar `df508da`); A02-core `72c91d3`; the A06 decision record `064f866`; B15 measured `72d636b`; CA-05/CA-06 `838a304`, CA-12..15 `a45a60e`, CA-01/10/11 `483de34`, R01/R02 `3a426b9`. Remaining per strict audit IV: T02/T03/T05/T06/T16/T22 (the renderer lifecycle team), T12 (Q06), A02's renderer half |
+| P5 | A11 A17–A20 A23 B14 | **COMPLETE (R0–R5)** — design `ab7cf2a`; R0 census `1ea3e05` (E-12), R1 arenas `4d77c69`, R2 dirty-generation `0b1a60e`+correctives `145391c`/`0a72854`, R3 staging `59eac30`, R4 ring `d6d7254`, R5 aliasing `624488a` (night close `78b0664`, the renderer-release/main pins measured); E-15..E-18. Remaining per strict audit IV: T15/T17/T18/T23/T24/T25/T26 |
+| P6 | A01–A06 A12–A15 B15 B16 | **incremental** — A02-core landed; B10/B11 `63b01d4`; the SDL exact pin LANDED `6b9fa2a` (NEW-REND-11); the SQLite feature gate landed `3a419a7`; the A06 extraction IN FLIGHT (T19, branch `ee/overnight-t19-animation`, base `9690284`); T32 (render-types footprint) follows T19 |
 | P7 | full re-audit, rubric scoring, final report + PR | NOT STARTED — only after every category independently reaches the bar |
 
-## Current tree facts (the measured state at head `1d4ecc9`)
+## Current tree facts (the measured state; census at `1d4ecc9`, pins at `9690284`)
 
 - **Census (IA-13 single convention, nonempty lines; supersedes E-2/E-5):**
   production ≈ 126,483 lines; test material ≈ 134,308 inline + 71,027
@@ -105,52 +112,51 @@ references in older records describe the baseline tree, not this one.
   22,320/6,970/0 · shell 1,784/672/498 · slice 42,797/6,478/57,374. Shader
   inputs 19 (15 WGSL + 4 GLSL).
 - **CI pins (`.github/workflows/engine-ci.yml`, corrected from measured
-  actuals at each integration per D-EE-06):** main shard 1529 Linux / 1478
-  Windows passed / 2 ignored / 33 result lines; renderer release 190 passed /
-  2 result lines; heavy shard (engine-slice) 674 Linux / 673 Windows / 46
-  ignored / 64 result lines. All eight rig gate sets green on the RTX 5070 Ti
-  at `df508da` (render_post 7/7, render_instanced 8/8, render_shadows 4/4,
-  render_reflection 7/7, render_weather 11/11, render_garage 1/1,
-  render_corner 1/1, render_sky 1/1).
+  actuals at each integration per D-EE-06; the T01 repair `9690284`
+  centralized them as per-shard expectation variables):** main shard
+  1629 Linux / 1578 Windows passed / 2 ignored / 34 result lines; renderer
+  release 232 passed / 2 result lines; heavy shard (engine-slice) 720
+  Linux / 720 Windows / 60 ignored / 72 result lines (platform-uniform,
+  dual-platform CI-measured; the census: 68 targets + 4 crash-seams child
+  lines). The count-gate self-test (`scripts/ci-count-gate-selftest.sh`)
+  runs in the main matrix job on every push. All eight rig gate sets green
+  on the RTX 5070 Ti at `df508da` (render_post 7/7, render_instanced 8/8,
+  render_shadows 4/4, render_reflection 7/7, render_weather 11/11,
+  render_garage 1/1, render_corner 1/1, render_sky 1/1).
 - **Footprint (B15, `FOOTPRINT.md` / E-11):** slice exe 16.4 MiB debug /
   10.5 MiB release (−36%); cold full-workspace release build 48 s; minimal
   consumers on fresh locks: core 2.9 s / 2 crates, persist 9.0 s / 26, shell
   44.5 s / 15 (SDL static 38.4 s of it), renderer 41.9 s / 54, slice 52.6 s /
   71 — all five through public API only.
-- **In flight right now (the live worktrees):** `ee/p5-r1-arenas-budgets`
-  (worktree a16), `ee/p5-r4-ring-localization` (a17),
-  `ee/p3-l9b-walk-unification` (b09), `ee/shell-sdl-exact-pin` (q1),
-  `ee/core-q01-q02-q09-spatial` (q2), `ee/docs-q11-status-reconciliation`
-  (q3 — this lane).
+- **In flight right now (the live lanes, ODU orchestrator session
+  2026-11-28):** `ee/overnight-t19-animation` (worktree t19 — the A06
+  E-S1 extraction, subordinate agent), this T38 reconciliation
+  (`ee/overnight-t38-register`), and the T01 CI verification run
+  `46127751223` at exact head `9690284` (in progress). All prior
+  "RUNNING" registry rows were stale — those six lanes landed
+  (`4d77c69`, `d6d7254`, `10d3d13`, `6b9fa2a`, `bce11d3`, `0439894`).
 
-## Next actions (the continuation mandate, reconciled with the register)
+## Next actions (the strict-audit-IV wave plan, reconciled with the register)
 
-1. RUNNING: the six live lanes above — P5 R1 (arenas), P5 R4 (ring
-   localization), P3-L9b (the walk unification), the SDL exact pin
-   (NEW-REND-11 / D-EE-10 §3), Q01+Q02+Q09 (the spatial triad), and this
-   Q11 documentation reconciliation.
-2. P5 queued: R2 (the A18 dirty-generation + pose dedup), R3 (the A20 staging
-   pool — retiring the measured 794,624 B per-texture tails), R5 (the B14
-   aliasing decision, gated on the census + the owner's D-EE-10 §1 criteria).
-3. The owner re-audit's Q-findings not yet in flight: Q03 (the scheduler
-   housekeeping bounded-work contract), Q04 (production adoption of the
-   indexed paths at composition boundaries), Q05 (compaction consequence
-   eligibility), Q06 (scene generalization — the PASS_FAMILY boundary and
-   beyond), Q07 (configurable npc-world decode admission), Q08 (proportional
-   active working sets + authenticated cold historical retrieval), Q10
-   (scene-attach failure atomicity).
-4. R01-R04 LANDED long ago (the admission invariants `343824b`/`3a426b9`, the accumulator and presentation coherence `0462cfe`/`bb38504`) - the Q11 lane mis-diagnosed these as never-dispatched (the register rows carried stale pre-landing dispositions); the git history corrected it, the rows now carry their SHAs.
-
-   earlier "RUNNING" claim here was wrong; queued).
-5. Retained obligations: A08's regional scheduler locality, R07 (the memory
-   transaction lifecycle consolidation investigation), B08 (input churn,
-   measurement-gated), B13's release-rig confirmation of the
-   deferred-confirmation draft, A14 (renderer resource ownership /
-   device-lost — register row restored this pass).
-6. The approved-but-not-started owner decisions: the A06 extraction window
-   (after P5 R1/R2, in P6), the SQLite feature gate (D-EE-10 §4, default-on),
-   the rendering-contract/types surface investigation (D-EE-10 §5).
-7. P7 only after every category independently reaches the bar.
+1. **Wave 0 (executing):** T01's exact-head CI verification run
+   `46127751223` at `9690284` — all five jobs green closes the gate;
+   T38 this reconciliation pass; the durable overnight log
+   (`OVERNIGHT-LOG.md`) now maintained per landing.
+2. **Wave 1 (next, CPU-verifiable first):** T19 (the A06 extraction,
+   IN FLIGHT); T07 (the retention safe moving cut — the S0 headline,
+   spine.rs); T04 (complete-primitive admission); T05 (generation
+   identity contracts); T21 (decode transients); then the renderer
+   lifecycle team T02/T03/T06/T16 as ONE coordinated stream.
+3. **Wave 2:** T08/T09 (scheduler bounding + queued locality — the
+   spine trio serialized with T07), T10/T11/T37 (spatial), T13/T14/T29/T30
+   (persistence residency).
+4. **Wave 3:** T12 (scene generalization stages), T15/T17/T18/T20,
+   T32 (render types, after T19), T24/T25/T26.
+5. **Wave 4:** T23/T27/T28/T31/T33/T34/T35/T36, T39's measurement
+   discipline applied throughout, T40's coverage ledger.
+6. **Wave 5 / P7:** freeze, exact-tree measurement, independent audit —
+   only after every category independently reaches the bar. No main
+   merge before the owner's explicit GO.
 
 ## File map
 
@@ -164,6 +170,7 @@ references in older records describe the baseline tree, not this one.
 | `FOOTPRINT.md` | the B15 workspace footprint measurement (closure matrix, sizes, consumers) |
 | `INDEPENDENT-AUDIT-be910bf.md` | the astra independent audit (the IA findings) |
 | `AGENTS.md` | session/agent registry: role, model, base, worktree, status |
+| `OVERNIGHT-LOG.md` | the ODU orchestrator's durable engineering log (per-landing records, STATE AT DAWN handoffs) |
 | `briefs/` | per-package implementation briefs (each lane's contract) |
 | `designs/` | the architecture decision records: B05, B07, P2, P3, P4, P5 |
 | `audits/` | independent audit reports (per area), committed as program evidence |

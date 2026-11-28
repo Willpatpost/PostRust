@@ -94,3 +94,20 @@ the crash-seams arming children mapped at the `44da040` re-measurement.
 **Expected CI closure:** one dispatched run at the exact candidate SHA; all
 five jobs green including steps after the previously failing check. Only an
 exact-head green run closes this gate.
+
+## T38 — the register reconciliation pass (Wave 0, branch `ee/overnight-t38-register`)
+
+The six AGENTS.md "RUNNING" rows and their README/FINDINGS mirrors were all
+stale — every named lane landed (verified against git history before any
+edit): p5-r1 `4d77c69`, p5-r4 `d6d7254`, p3-l9b `10d3d13`, sdl-pin `6b9fa2a`,
+q01-q02-q09 `bce11d3`, q11 `0439894`. Corrected rows, each citing its
+integration SHA: A11 (P5 complete R0–R5), A13 (L9b landed), A06 (extraction
+lane dispatched — T19), CA-05/CA-06 (fixed at `838a304`, verified against
+collision.rs source: the F05 private-fields contract), CA-09 (landed
+`30126fa`), NEW-REND-11 (landed `6b9fa2a`), the T01/T19/T38 T-rows, the
+README program-state (CI pins 1629/1578/2/34 main, 232/2 renderer-release,
+720/720/60/72 heavy; the strict-audit-IV governing mandate added beside the
+binding D-EE-10 block; the wave-plan next actions; the stray paragraph
+removed), and the AGENTS.md registry (rig orchestrator retired, the ODU
+session + t01/t19/t38 lanes registered). The durable maintenance obligation
+restated: every landing updates the register rows AND the README together.

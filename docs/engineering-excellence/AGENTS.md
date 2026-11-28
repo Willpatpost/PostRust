@@ -7,7 +7,7 @@ main checkout `C:\Users\Willp\Code\GitHub\PostRust` on
 
 | Agent | Role / Model | Base | Worktree / Branch | Package | Status |
 |---|---|---|---|---|---|
-| orchestrator (this session) | integration coordinator / glm-5.3-w4a8 | 5b93167 | main checkout, `refactor/engineering-excellence` | all | ACTIVE |
+| orchestrator (rig session, 2026-11-26..28) | integration coordinator / glm-5.3-w4a8 | 5b93167 | main checkout, `refactor/engineering-excellence` | all | RETIRED — the owner handoff of 2026-11-28 transferred the integration-writer role to the ODU session below |
 | auditor-core | read-only audit, engine-core / MiMo-V2.6-Pro-RL | 5b93167 | read-only, no branch | P0 | RETIRED — wedged without producing anything (owner-observed; the session was formally cancelled afterward, ID `…M3cDpCUOUofd13` — the one my nudges never reached due to the crossed-session bookkeeping error); no calibration data; replaced below |
 | auditor-core-2 | read-only audit, engine-core / gpt-oss-120b | (records at report) | read-only, no branch | P0 | COMPLETED — `audits/core.md`; 10 seeds verified (8 CONFIRM / 2 PARTIAL / 1 honestly UNEXAMINED), one label error (B05) adjudicated by direct read; anti-wedge discipline worked |
 | auditor-persist | read-only audit, engine-persist / gpt-oss-120b | 5b93167 | read-only, no branch | P0 | COMPLETED — `audits/persist.md`; verdicts reconciled in FINDINGS.md (A13 label corrected) |
@@ -56,12 +56,15 @@ main checkout `C:\Users\Willp\Code\GitHub\PostRust` on
 | lane-p5-r0 | census harness / glm-5.3-w4a8 | ab7cf2a | commit `72467f7` → integrated `1ea3e05` | P5-R0 | LANDED — counts before mechanisms; the four AllocationStats counters; E-12; slice lib 156 |
 | design-p5 | resource-residency design / glm-5.3-w4a8 | 9e17516 | commit `668fc89` → integrated `ab7cf2a` | P5 | COMPLETED — 1,095 lines, `designs/P5-resource-residency.md`; the R0–R5 lane table; D-EE-10 §1 ruled on the architecture |
 | lane-rend-a06 | animation-crate decision record / glm-5.3-w4a8 | 63b01d4 | commit `708a937` → integrated `064f866` | P4/A06 | LANDED — 483 lines, docs-only, `DECISION-A06-animation-crate.md`; the owner APPROVED extraction per D-EE-10 §2 (after P5 R1/R2, the P6 window) |
-| lane-p5-r1 | demand-sized arenas / glm-5.3-w4a8 | 1ea3e05 | worktree a16, `ee/p5-r1-arenas-budgets` | P5-R1 (A11/A23) | RUNNING |
-| lane-p5-r4 | ring localization / glm-5.3-w4a8 | 083f617 | worktree a17, `ee/p5-r4-ring-localization` | P5-R4 (A19) | RUNNING |
-| lane-p3-l9b | walk unification / glm-5.3-w4a8 | 622623b | worktree b09, `ee/p3-l9b-walk-unification`, commits `2ecadf5`+`59aec7e` | P3-L9b (A13 walk half) | RUNNING — the shared walk core + both providers rewired, the differential battery green throughout |
-| lane-shell-sdl-pin | sdl3-sys exact pin / glm-5.3-w4a8 | 1d4ecc9 | worktree q1, `ee/shell-sdl-exact-pin` | NEW-REND-11 (D-EE-10 §3) | RUNNING |
-| lane-core-q01-q02-q09 | spatial triad / glm-5.3-w4a8 | 1d4ecc9 | worktree q2, `ee/core-q01-q02-q09-spatial` | Q01+Q02+Q09 | RUNNING |
-| lane-docs-q11 | program-status reconciliation / glm-5.3-w4a8 | 1d4ecc9 | worktree q3, `ee/docs-q11-status-reconciliation` | Q11 | RUNNING — this pass |
+| lane-p5-r1 | demand-sized arenas / glm-5.3-w4a8 | 1ea3e05 | worktree a16, `ee/p5-r1-arenas-budgets` | P5-R1 (A11/A23) | LANDED — integrated `4d77c69` (lane commit `07d0033`); the merged-tree bar ALL EIGHT rig gate sets green (`4e140ae`) — the registry's earlier RUNNING row was stale (T38 reconciliation) |
+| lane-p5-r4 | ring localization / glm-5.3-w4a8 | 083f617 | worktree a17, `ee/p5-r4-ring-localization` | P5-R4 (A19) | LANDED — integrated `d6d7254` (lane commit `84b63b9`) — the registry's earlier RUNNING row was stale (T38 reconciliation) |
+| lane-p3-l9b | walk unification / glm-5.3-w4a8 | 622623b | worktree b09, `ee/p3-l9b-walk-unification`, commits `2ecadf5`+`59aec7e` | P3-L9b (A13 walk half) | LANDED — integrated `10d3d13`; the shared walk core + both providers rewired, the differential battery green throughout — the registry's earlier RUNNING row was stale (T38 reconciliation) |
+| lane-shell-sdl-pin | sdl3-sys exact pin / glm-5.3-w4a8 | 1d4ecc9 | worktree q1, `ee/shell-sdl-exact-pin` | NEW-REND-11 (D-EE-10 §3) | LANDED — integrated `6b9fa2a` (lane commit `97ec0ad`) — the registry's earlier RUNNING row was stale (T38 reconciliation) |
+| lane-core-q01-q02-q09 | spatial triad / glm-5.3-w4a8 | 1d4ecc9 | worktree q2, `ee/core-q01-q02-q09-spatial` | Q01+Q02+Q09 | LANDED — integrated `bce11d3` (lane commit `e4d5c38`) — the registry's earlier RUNNING row was stale (T38 reconciliation) |
+| lane-docs-q11 | program-status reconciliation / glm-5.3-w4a8 | 1d4ecc9 | worktree q3, `ee/docs-q11-status-reconciliation` | Q11 | LANDED — integrated `0439894` + correctives `c1624bf`/`42bf4ef` — the registry's earlier RUNNING row was stale (T38 reconciliation) |
+| orchestrator-odu | integration coordinator (ODU cloud workspace) / glm-5.3-w4a8 | 9690284 | main checkout `~/PostRust` on `refactor/engineering-excellence` + worktrees t01/t38 | all | ACTIVE (2026-11-28, the owner handoff session) — T01 repair landed `9690284`, CI run `46127751223` in flight; T38 this pass; the overnight-state checkpoint at `~/postrust-logs/overnight-state/` |
+| lane-t01-ci | the count-gate control-plane repair / glm-5.3-w4a8 (orchestrator-implemented) | a2e6e86 | worktree t01, `ee/overnight-t01-ci-counts`, commit `9690284` | T01 (Wave 0) | LANDED — integrated (ff) + pushed; the repair + the selftest fixture; closure pending the exact-head CI run `46127751223` all-green |
+| lane-t19-animation | the A06 E-S1 extraction / glm-5.3-w4a8 (subordinate agent, session ses_ddea4dae7ffeOnDKgXFR4TcoM6) | 9690284 | worktree t19, `ee/overnight-t19-animation` | T19+T32 (A06) | RUNNING (dispatched 2026-11-28) — pure pose/skeleton/sampling to engine-animation, GPU packing renderer-side, compat re-exports, fingerprints preserved |
 
 
 Retired/completed agents stay listed with their final status and evidence link.
