@@ -313,3 +313,11 @@ occurrence makes it a register investigation). The combat bound carries
 the T39 evidence obligation: if the 8192 arm recurs, the per-record
 calibration revisits the accumulated CI actuals per the 877580f/3e0c729/
 a2e6e86 precedent. Third dispatch at the unchanged tree.
+
+**The lifecycle candidate verified green:** run `46140806781` at `e13c4eb` —
+all five jobs success (main 1661/1610/2/37, renderer-release 227/3, heavy
+720/66/72 — the ignored pin's +6 rig-deferred batteries confirmed). The two
+prior single-platform failures recorded as shared-runner variance (each
+passing in the other runs; the third-occurrence protocol noted).
+**Wave 0 + Wave 1 of the strict-audit-IV campaign are now complete and
+CI-verified at exact heads.**
