@@ -111,3 +111,19 @@ binding D-EE-10 block; the wave-plan next actions; the stray paragraph
 removed), and the AGENTS.md registry (rig orchestrator retired, the ODU
 session + t01/t19/t38 lanes registered). The durable maintenance obligation
 restated: every landing updates the register rows AND the README together.
+
+## T01 — CLOSED (the exact-head green run, 2026-11-28)
+
+**Run `46127751223` at exact head `9690284`: conclusion SUCCESS — all five
+jobs green** (heavy-tests ubuntu + windows, the main matrix ubuntu-latest +
+windows-latest + macos-15 ARM64). The previously failing heavy result-line
+gate now passes with the corrected centralized pin — both platforms print
+`heavy shard: 720 passed, 60 ignored, 72 test-result lines (expected 720 /
+60 / 72)` (echo = enforced = actual). The steps AFTER the previously failing
+check executed green (the release render-path canary; the heavy job's
+post-Tests steps). The new CI count-gate self-test step ran green on every
+main job. This is the first fully green engineering-branch run after eight
+consecutive failures. Green logs preserved:
+`~/postrust-logs/t01-evidence/run46127751223-{ubuntu,windows}-heavy-GREEN.log`.
+Any later code change requalifies on its own exact-head run (the docs-only
+T38 landing `23c5249` touches no tested surface).

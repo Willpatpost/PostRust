@@ -113,7 +113,7 @@ Classes: CONFIRMED (source-derived), HYPOTHESIS (reproduce-or-refute mandated), 
 
 | ID | Class | Cross-links | Note (one line) |
 |---|---|---|---|
-| T01 | CONFIRMED (remote) | F04/CA04 | **REPAIR LANDED `9690284` (2026-11-28)** — the three-literals defect closed at class level (centralized expectation variables + the selftest fixture); exact-head CI verification run `46127751223` dispatched at `9690284`, all five jobs green = the closure bar |
+| T01 | CONFIRMED (remote) | F04/CA04 | **VERIFIED-CLOSED (2026-11-28): run `46127751223` at exact head `9690284` — ALL FIVE JOBS GREEN** (heavy ubuntu+windows, main ubuntu+windows, macos ARM64; steps after the previously failing check executed green; the new count-gate self-test step green on every main job; the echo/enforced/actual triples agree at 720/60/72 both platforms — logs preserved `~/postrust-logs/t01-evidence/`). The repair `9690284`; any later code change requalifies on its own run |
 | T02 | HYPOTHESIS (strong) | CA11/A18 | generation-stamp invalidation too late on interrupted preparation |
 | T03 | CONFIRMED ordering + HYPOTHESIS error | Q10/CA01 | attach publishes before deferred upload readiness; error outcome unresolved |
 | T04 | CONFIRMED (S0, owner contract) | A11/CA15 | dynamic geometry violates complete-primitive admission |
