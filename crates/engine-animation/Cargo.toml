@@ -1,0 +1,16 @@
+[package]
+name = "engine-animation"
+version.workspace = true
+edition.workspace = true
+description = "PostRust — the deterministic skeletal pose-evaluation core (A06)"
+license.workspace = true
+
+[dependencies]
+# Zero-copy Pod casts of the #[repr(C)] SkinnedVertex — the
+# byte-boundary type whose pure CPU skinning oracle (skin_vertex)
+# moved with it at E-S1 (DECISION-A06 §4 E-S1: "deps: bytemuck
+# only"; the derives are this crate's single external touch, the
+# justification the owner's "bytemuck belongs at the byte boundary
+# unless justified" clause asked for — the boundary IS skin_vertex's
+# parameter type).
+bytemuck = { version = "1", features = ["derive"] }
