@@ -11288,4 +11288,408 @@ mod tests {
             "the generic tick path's maintenance keeps the index exact at scale"
         );
     }
+
+    // --------------------- T09 stage-1 census batteries (the audit slope)
+
+    /// The audit's exact slope sizes (strict-audit-IV T09): the
+    /// unrelated queued population grows 1k / 5k / 20k / 100k against
+    /// one active class — CA-08 measured 1k/10k/100k only; 5k and
+    /// 20k are this battery's additions (the T09 design §7 stage 1).
+    const T09_SLOPE_SIZES: [usize; 4] = [1_000, 5_000, 20_000, 100_000];
+
+    /// The fixed affected work at every size — the audit's battery
+    /// fixes m = 40 (the CA-08 fixture used the same).
+    const T09_OWN: usize = 40;
+
+    /// Builds the T09 stage-1 queued fixture: the target class owns
+    /// EXACTLY `own` queued obligations (the fixed affected work at
+    /// every size) while the unrelated foreign population grows with
+    /// `total`, ALL of it queued — no held foreign seed (the held
+    /// side is CA-08's measured flat ground; the queued arm is this
+    /// census's subject). `one_lane` concentrates the entire
+    /// population in the near lane (the worst per-lane shape — the
+    /// whole unrelated population sits in the one lane the
+    /// transition scans); otherwise the CA-08 alternation splits both
+    /// lanes. Every due is far-future and NO tick ever runs: the
+    /// battery measures the BETWEEN-TICKS transition exactly where
+    /// the region director runs it (engine-slice `region.rs`'s
+    /// `apply` — outside `run_tick`, never housekeeping-charged). The
+    /// index is materialized WITHOUT moving the target (an
+    /// absent-class `suspend_class`), so no measured window contains
+    /// the one-time adoption build (CA-08's already-measured price).
+    fn build_t09_queued_fixture(
+        total: usize,
+        own: usize,
+        one_lane: bool,
+    ) -> Spine<SaveableNoopWorld> {
+        let mut spine = Spine::new(SaveableNoopWorld, 100_000);
+        let field_of = |index: usize| {
+            if one_lane || index.is_multiple_of(2) {
+                Field::Near
+            } else {
+                Field::Far
+            }
+        };
+        for i in 0..own {
+            spine
+                .schedule(spec(
+                    TARGET_CLASS.0,
+                    field_of(i),
+                    500 + u64::try_from(i).expect("due fits u64") * 3,
+                    i as u64,
+                ))
+                .expect("fixture scheduling is valid");
+        }
+        for i in 0..total - own {
+            spine
+                .schedule(spec(
+                    u16::try_from(i % 6).expect("class fits u16"),
+                    field_of(i),
+                    500 + u64::try_from(i % 97).expect("due fits u64") * 3,
+                    100_000 + u64::try_from(i).expect("payload fits u64"),
+                ))
+                .expect("fixture scheduling is valid");
+        }
+        spine.suspend_class(ABSENT_CLASS);
+        spine
+    }
+
+    /// An `Ord`-instrumented `(due, seq)` mirror key for the census:
+    /// `Pending`'s `Ord` is EXACTLY `(due, seq)` (spine.rs's own
+    /// `impl Ord for Pending`), so a `BinaryHeap` over
+    /// `Reverse<T09HeapKey>` holding the same keys in the same buffer
+    /// order performs the IDENTICAL comparison sequence as the
+    /// production `BinaryHeap<Reverse<Pending>>` heapify — the
+    /// counter reads the production rebuild's exact compare count
+    /// without touching production code (the stage-1
+    /// zero-production-change discipline; the T09 design's stage-2
+    /// inline probe replaces this mirror when those paths are edited
+    /// anyway).
+    struct T09HeapKey {
+        due: u64,
+        seq: u64,
+    }
+
+    /// The heapify compare counter (test-local; single-threaded use
+    /// inside one test — reset before each measured heapify).
+    static T09_HEAP_COMPARES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    impl T09HeapKey {
+        /// Mirrors one retained buffer (same keys, same order) into
+        /// the counting form.
+        fn mirror_of(pendings: &[Reverse<Pending>]) -> Vec<Reverse<T09HeapKey>> {
+            pendings
+                .iter()
+                .map(|Reverse(pending)| {
+                    Reverse(T09HeapKey {
+                        due: pending.due.0,
+                        seq: pending.seq,
+                    })
+                })
+                .collect()
+        }
+    }
+
+    impl PartialEq for T09HeapKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.due == other.due && self.seq == other.seq
+        }
+    }
+
+    impl Eq for T09HeapKey {}
+
+    impl PartialOrd for T09HeapKey {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Ord for T09HeapKey {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            T09_HEAP_COMPARES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (self.due, self.seq).cmp(&(other.due, other.seq))
+        }
+    }
+
+    /// One census measurement of the with-members queue arm's lane
+    /// transform — the step-for-step mirror of `suspend_class_queue`
+    /// (into_vec, membership-keyed `extract_if`, `BinaryHeap::from`)
+    /// run over a CLONE of a real fixture lane with the counting
+    /// closure the production `members.contains` arm carries.
+    /// Returns `(entries_touched, membership_hits, extracted,
+    /// retained, heapify_compares)`.
+    fn t09_census_one_lane(
+        queue: &BinaryHeap<Reverse<Pending>>,
+        members: &BTreeSet<(Tick, u64)>,
+    ) -> (u64, u64, usize, usize, u64) {
+        let mut items = queue.clone().into_vec();
+        let mut entries_touched = 0u64;
+        let mut membership_hits = 0u64;
+        let extracted: Vec<Reverse<Pending>> = items
+            .extract_if(.., |Reverse(pending)| {
+                entries_touched += 1;
+                let hit = members.contains(&(pending.due, pending.seq));
+                membership_hits += u64::from(hit);
+                hit
+            })
+            .collect();
+        // The extraction post-condition: every extracted entry IS a
+        // member, and only members were extracted (the equivalence
+        // discipline's local mirror).
+        for Reverse(pending) in &extracted {
+            assert!(
+                members.contains(&(pending.due, pending.seq)),
+                "only membership-keyed entries leave the lane"
+            );
+        }
+        let retained = items.len();
+        // The re-heapify's compare count, read through the
+        // counting-key mirror over the SAME retained buffer (see
+        // `T09HeapKey` — the comparison sequence is identical).
+        T09_HEAP_COMPARES.store(0, std::sync::atomic::Ordering::Relaxed);
+        let rebuilt: BinaryHeap<Reverse<T09HeapKey>> =
+            BinaryHeap::from(T09HeapKey::mirror_of(&items));
+        let heapify_compares = T09_HEAP_COMPARES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            rebuilt.len(),
+            retained,
+            "the mirror heap holds the retained multiset"
+        );
+        (
+            entries_touched,
+            membership_hits,
+            extracted.len(),
+            retained,
+            heapify_compares,
+        )
+    }
+
+    /// THE T09 STAGE-1 CENSUS (zero production change): what the
+    /// with-members queued class transition actually touches today.
+    /// The audit's finding, made executable: for a nonempty class the
+    /// arm converts the ENTIRE lane heap into a Vec, `extract_if`
+    /// scans ALL entries with a per-entry `BTreeSet` membership
+    /// lookup, and `BinaryHeap::from` re-heapifies the whole
+    /// remainder. The measured counters at the audit's four sizes:
+    /// **entries touched = the whole lane population N** (every entry
+    /// visits the membership predicate — N + m today, exactly m
+    /// post-stage-2, the design's headline assertion), the heapify
+    /// rebuild ≈ 1–2 compares per retained entry (std's bottom-up
+    /// heapify — O(N), pinned below 4×N so an N·log N regression can
+    /// never pass silently), and zero allocation (measured in the
+    /// `spine_queued_transition_allocations` binary — `into_vec`
+    /// reuses the buffer, `extract_if` is in-place, `from` adopts the
+    /// Vec). Pod-observational numbers in the unoptimized test
+    /// profile; the assertions are the structural invariants only
+    /// (the CA-08 discipline).
+    #[test]
+    fn t09_queued_census_touches_every_lane_entry_today() {
+        for (variant, one_lane) in [("one-lane", true), ("both-lanes", false)] {
+            let mut first_compares = 0u64;
+            let mut last_compares = 0u64;
+            for &total in T09_SLOPE_SIZES.iter() {
+                let spine = build_t09_queued_fixture(total, T09_OWN, one_lane);
+                let membership = spine
+                    .class_index
+                    .as_ref()
+                    .and_then(|index| index.get(&TARGET_CLASS))
+                    .expect("the fixture materialized the class index");
+                let near_members = membership.near.clone();
+                let far_members = membership.far.clone();
+                assert_eq!(
+                    near_members.len() + far_members.len(),
+                    T09_OWN,
+                    "the target's queued membership is the fixed affected work"
+                );
+                let mut touched_total = 0u64;
+                let mut hits_total = 0u64;
+                let mut compares_total = 0u64;
+                for (label, queue, members) in [
+                    ("near", &spine.near_queue, &near_members),
+                    ("far", &spine.far_queue, &far_members),
+                ] {
+                    if members.is_empty() {
+                        // The empty-membership early exit's census row:
+                        // the real arm returns BEFORE `into_vec` (the
+                        // dormant-region common case — CA-08 measured
+                        // it ~200 ns), so nothing is touched at all.
+                        // (In these fixtures an empty member set
+                        // always implies the empty lane — the one-lane
+                        // variant's far side.)
+                        assert!(
+                            queue.is_empty(),
+                            "the fixture's empty member set implies the empty lane"
+                        );
+                        continue;
+                    }
+                    let (touched, hits, extracted, retained, compares) =
+                        t09_census_one_lane(queue, members);
+                    assert_eq!(
+                        touched,
+                        queue.len() as u64,
+                        "{variant} {label} (population {total}): the with-members arm \
+                         touches EVERY lane entry — the census finding"
+                    );
+                    assert_eq!(hits, members.len() as u64);
+                    assert_eq!(extracted, members.len());
+                    assert_eq!(retained, queue.len() - members.len());
+                    assert!(
+                        compares <= 4 * retained as u64 + 64,
+                        "{variant} {label} (population {total}): the re-heapify is \
+                         O(N) ({compares} compares over {retained} retained)"
+                    );
+                    touched_total += touched;
+                    hits_total += hits;
+                    compares_total += compares;
+                }
+                assert_eq!(
+                    touched_total, total as u64,
+                    "{variant} (population {total}): the with-members transition \
+                     touches every queued entry in the lanes it scans — N + m today"
+                );
+                assert_eq!(hits_total, T09_OWN as u64);
+                if total == T09_SLOPE_SIZES[0] {
+                    first_compares = compares_total;
+                }
+                if total == T09_SLOPE_SIZES[3] {
+                    last_compares = compares_total;
+                }
+                println!(
+                    "t09 census ({variant}, population {total:6}, target owns {T09_OWN}): \
+                     entries touched {touched_total:6} (every lane entry), membership hits \
+                     {hits_total}, heapify compares {compares_total:7} (~{:.2} per retained \
+                     entry) — pod-observational, test profile",
+                    compares_total as f64 / total.saturating_sub(T09_OWN).max(1) as f64
+                );
+            }
+            assert!(
+                last_compares >= 10 * first_compares.max(1),
+                "{variant}: the heap-rebuild work grows with the unrelated population \
+                 (measured {first_compares} → {last_compares} compares across 1k → 100k)"
+            );
+        }
+    }
+
+    /// THE T09 STAGE-1 SLOPE BATTERY (the audit's exact test): one
+    /// active class fixed at m = 40 while the unrelated queued
+    /// population grows 1k / 5k / 20k / 100k, both the one-lane and
+    /// both-lanes variants, the generic predicate form
+    /// (`suspend_matching`) beside the indexed form
+    /// (`suspend_class`). The honest recording: CA-08 removed the
+    /// O(N log N) canonical sort and the per-entry predicate calls —
+    /// the measured 3.8× — but the O(lane) `extract_if` scan and the
+    /// whole-remainder re-heapify remain (`BinaryHeap` admits no
+    /// keyed removal), so the with-members indexed arm STILL grows
+    /// linearly with the unrelated population today. This battery
+    /// pins that residual as the stage-1 baseline the stage-2 indexed
+    /// lane would replace (flat ≤3× + headroom, the design's §6
+    /// headline assertion); until then the arm keeps CA-08's honest
+    /// never-regress pin, here extended to the audit's four sizes and
+    /// both lane variants. Pod-observational numbers; robust-invariant
+    /// assertions only (the medians of state-mutating cycle legs, the
+    /// CA-08 held→queued→held discipline — every timed leg moves the
+    /// same real members).
+    #[test]
+    fn t09_queued_slope_at_the_audit_sizes_records_the_linear_residual() {
+        for (variant, one_lane) in [("one-lane", true), ("both-lanes", false)] {
+            let mut scan = [0u64; 4];
+            let mut indexed = [0u64; 4];
+            let mut scan_max = [0u64; 4];
+            let mut indexed_max = [0u64; 4];
+            for (i, &total) in T09_SLOPE_SIZES.iter().enumerate() {
+                let mut scan_spine = build_t09_queued_fixture(total, T09_OWN, one_lane);
+                let mut indexed_spine = build_t09_queued_fixture(total, T09_OWN, one_lane);
+                let mut scan_samples = Vec::with_capacity(9);
+                let mut indexed_samples = Vec::with_capacity(9);
+                for _ in 0..9 {
+                    let started = std::time::Instant::now();
+                    let moved = scan_spine.suspend_matching(|view| view.class == TARGET_CLASS);
+                    scan_samples.push(started.elapsed().as_nanos() as u64);
+                    assert_eq!(
+                        moved, T09_OWN as u32,
+                        "the scan cycle moves the whole target membership"
+                    );
+                    let resumed = scan_spine.resume_matching(|view| view.class == TARGET_CLASS);
+                    assert_eq!(resumed, T09_OWN as u32);
+
+                    let started = std::time::Instant::now();
+                    let moved = indexed_spine.suspend_class(TARGET_CLASS);
+                    indexed_samples.push(started.elapsed().as_nanos() as u64);
+                    assert_eq!(
+                        moved, T09_OWN as u32,
+                        "the indexed cycle moves the whole target membership"
+                    );
+                    let resumed = indexed_spine.resume_class(TARGET_CLASS);
+                    assert_eq!(resumed, T09_OWN as u32);
+                }
+                let median = |samples: &mut Vec<u64>| {
+                    samples.sort_unstable();
+                    samples[samples.len() / 2]
+                };
+                scan[i] = median(&mut scan_samples);
+                indexed[i] = median(&mut indexed_samples);
+                // After the median sort the last sample is the max —
+                // the p99-of-9 proxy, reported but never asserted.
+                scan_max[i] = *scan_samples.last().expect("nine samples");
+                indexed_max[i] = *indexed_samples.last().expect("nine samples");
+                println!(
+                    "t09 slope ({variant}, population {total:6}, target owns {T09_OWN}): \
+                     with-members suspend scan {s:9} ns (max-of-9 {sm:9}) vs indexed \
+                     {n:8} ns (max-of-9 {nm:8}) — pod-observational, test profile",
+                    s = scan[i],
+                    sm = scan_max[i],
+                    n = indexed[i],
+                    nm = indexed_max[i],
+                );
+            }
+            // The scan forms grow linearly with the unrelated
+            // population (CA-08's factor-10 discipline over the
+            // 100× range; the 20k midpoint's 20× range gets 8×).
+            assert!(
+                scan[3] >= 10 * scan[0].max(1),
+                "{variant}: the scan form grows with the unrelated population (measured \
+                 {} → {} ns across 1k → 100k)",
+                scan[0],
+                scan[3]
+            );
+            assert!(
+                scan[2] >= 8 * scan[0].max(1),
+                "{variant}: the scan form grows into the 20k midpoint (measured {} → {} ns \
+                 across 1k → 20k)",
+                scan[0],
+                scan[2]
+            );
+            // THE HONEST RESIDUAL: the with-members indexed arm grows
+            // linearly TOO — structurally certain (the O(lane) scan
+            // and re-heapify touch every entry; only the sort and the
+            // predicate calls were removed). Recorded as the stage-1
+            // baseline, never hidden.
+            assert!(
+                indexed[3] >= 10 * indexed[0].max(1),
+                "{variant}: the with-members indexed residual grows with the unrelated \
+                 population (measured {} → {} ns across 1k → 100k) — the O(lane) scan and \
+                 re-heapify remain",
+                indexed[0],
+                indexed[3]
+            );
+            assert!(
+                indexed[2] >= 8 * indexed[0].max(1),
+                "{variant}: the indexed residual grows into the 20k midpoint (measured \
+                 {} → {} ns across 1k → 20k)",
+                indexed[0],
+                indexed[2]
+            );
+            // CA-08's residual pin (:11191–11197 shape), extended to
+            // the audit's sizes and both lane variants: removing the
+            // canonical sort and the per-entry predicate calls must
+            // never regress against the form that still pays them.
+            assert!(
+                indexed[3] <= scan[3],
+                "{variant}: the indexed with-members suspend never regresses against the \
+                 predicate form (measured {} vs {} ns at 100k)",
+                indexed[3],
+                scan[3]
+            );
+        }
+    }
 }
