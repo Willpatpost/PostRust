@@ -386,6 +386,31 @@ it links the whole workspace statically minus the demo's main.rs).
   consumer, or a `cargo update`, silently changes the linked native SDL.
   One-line fix exists (`=0.7.2` pin) but is an owner manifest decision —
   this lane changed no manifests.
+  **DISPOSITION (2026-11-27, lane NEW-REND-11, owner-approved per
+  D-EE-10 item 3): FIXED — every SDL requirement in the workspace
+  manifests now carries an exact pin** (the resolution-contract sweep:
+  the repo's six manifests contain SDL requirements only in engine-shell
+  and engine-renderer). Pin map (nominal → lock-carried → pinned):
+  `sdl3` "0.20" → 0.20.0 → `=0.20.0` in both crates' `[dependencies]`;
+  `sdl3-sys` "0.7.2" → 0.7.2+SDL-3.4.18 → `=0.7.2` in both crates'
+  `cfg(unix)` console-build sections (the only sdl3-sys requirements in
+  the workspace). The pins match what the committed lock already
+  resolves, so the workspace build and `Cargo.lock` are byte-identical
+  before/after (the manifest now enforces what the lock carried). The
+  facade pin closes the same caret aperture one level up — without it a
+  future sdl3 0.20.x would drift fresh consumers again while the
+  workspace lock held 0.20.0. Native identity is transitively exact:
+  sdl3-sys 0.7.2's own manifest pins `sdl3-src = "=3.4.18"` (upstream,
+  outside workspace control, but anchored by the sys pin). Fresh-consumer
+  demonstration (the §6.1 method, throwaway dirs outside the repo,
+  recorded in EVIDENCE.md E-13): pre-pin fresh lock resolved
+  sdl3-sys 0.7.3+SDL-3.4.20 + sdl3-src 3.4.20 and ran
+  `Version { 3, 4, 20 }`; post-pin fresh lock resolves
+  sdl3-sys 0.7.2+SDL-3.4.18 + sdl3-src 3.4.18 (cargo notes the newer
+  versions "available" and does not select them) and runs
+  `Version { 3, 4, 18 }`; closure shape unchanged (15 unique, the §6.3
+  shell-consumer figure). Any future SDL upgrade is now a deliberate
+  manifest edit, per the owner's clause.
 - **F-02 (MED — optional-dep candidate): rusqlite is unconditional in
   engine-persist.** Local-only consumers pay 3.5 s of SQLite C compile +
   10 external crates they never call. A `sqlite` feature gate is the

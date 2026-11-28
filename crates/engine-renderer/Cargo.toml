@@ -13,7 +13,7 @@ ash = "0.38.0"
 # Surface creation and instance-extension discovery stay on the SDL
 # boundary the wrapper already provides; the wrapper's `ash` feature makes
 # its VkInstance/VkSurfaceKHR types alias ash's handles directly.
-sdl3 = { version = "0.20", default-features = false, features = ["build-from-source-static", "ash"] }
+sdl3 = { version = "=0.20.0", default-features = false, features = ["build-from-source-static", "ash"] }
 # Validation-layer messages, swapchain events, and renderer diagnostics
 # flow through the shared engine-core logger (L0, TECH-ARCHITECTURE §2.12).
 engine-core = { path = "../engine-core" }
@@ -47,4 +47,4 @@ naga = { version = "=29.0.4", features = ["spv-in"] }
 # unifies this feature in anyway; the isolated release battery (the
 # batch-3 review's CI step) builds this crate alone, so the enabler
 # must be carried here too. Inert on Windows.
-sdl3-sys = { version = "0.7.2", default-features = false, features = ["sdl-unix-console-build"] }
+sdl3-sys = { version = "=0.7.2", default-features = false, features = ["sdl-unix-console-build"] }

@@ -17,7 +17,7 @@ engine-core = { path = "../engine-core" }
 # identical native version on the dev pod, CI runners, and the lead's
 # Windows rig; no system SDL packages, no DLL redistribution. SDL3 is
 # zlib-licensed, so static linking is unproblematic.
-sdl3 = { version = "0.20", default-features = false, features = ["build-from-source-static"] }
+sdl3 = { version = "=0.20.0", default-features = false, features = ["build-from-source-static"] }
 
 [target.'cfg(unix)'.dependencies]
 # Unix environments without X11/Wayland development libraries (the dev pod,
@@ -26,7 +26,7 @@ sdl3 = { version = "0.20", default-features = false, features = ["build-from-sou
 # with the dummy video driver (any available backends are still
 # autodetected). Windows builds are unaffected by this target-scoped
 # dependency.
-sdl3-sys = { version = "0.7.2", default-features = false, features = ["sdl-unix-console-build"] }
+sdl3-sys = { version = "=0.7.2", default-features = false, features = ["sdl-unix-console-build"] }
 
 [lints]
 workspace = true
