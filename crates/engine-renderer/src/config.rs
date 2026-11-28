@@ -2,6 +2,8 @@
 
 use ash::vk;
 
+use crate::vulkan::RendererError;
+
 /// Preferred Vulkan present mode (Stage 2 authorization, item 3).
 ///
 /// The engine's long-term direction is configurable high-refresh
@@ -463,14 +465,153 @@ pub(crate) const ARENA_FLOOR: u32 = 64;
 ///   at or above the cap lands exactly ON the cap — the pre-P5
 ///   full carve, byte-identical behavior for over-cap workloads).
 ///
+/// CA-12 (F12): the cap enters the REPRESENTABLE domain first and
+/// the round-up is CHECKED. The pre-fix shape rounded up before any
+/// representability bound: on a cap or demand above 2^31 the
+/// `next_power_of_two` leaves the `u32` type entirely (a debug
+/// panic; a release WRAP TO ZERO, which the trailing `.min(cap)`
+/// then carved as a zero-capacity buffer). The clamp below restates
+/// the construction-validated domain
+/// ([`ArenaBudgets::validate`] refuses a budget outside it) at the
+/// one arithmetic that consumes it, and the checked round-up makes
+/// the proof local — with `required ≤ ARENA_CAP_MAX = 2^31` the
+/// next power of two is at most 2^31, inside `u32`, so the
+/// `None` arm is unreachable on the clamped domain and the domain
+/// ceiling is its correct answer (never a wrapped zero carve).
+///
 /// Pure — unit-testable without a GPU; the quantum table and the
 /// §1.5 scaling predictions are pinned in this module's tests.
 pub(crate) fn arena_capacity_for(current: u32, required: u32, cap: u32) -> u32 {
+    let cap = cap.min(ARENA_CAP_MAX);
     let required = required.min(cap);
     if required <= current {
         return current;
     }
-    required.max(ARENA_FLOOR).next_power_of_two().min(cap)
+    required
+        .max(ARENA_FLOOR)
+        .checked_next_power_of_two()
+        .unwrap_or(ARENA_CAP_MAX)
+        .min(cap)
+}
+
+/// CA-12 (F12): the representable domain every arena cap shares.
+/// The three mapped arenas' caps enter as PUBLIC `usize` budgets
+/// ([`InstanceCapacity`]/[`PoseCapacity`]/[`RegionCapacity`]) while
+/// the device carving, the growth quantum, and the per-slot byte
+/// arithmetic all live in `u32` — the audit's "different integer
+/// domains": a budget above `u32::MAX` narrowed (`as u32`) to a
+/// DIFFERENT number than the CPU repack admitted against (the
+/// pre-fix `cap as u32` sites — pipelines.rs/context.rs — wrapped
+/// `2^32 + 1000` to `1000` while the repack admitted 2^32 + 1000),
+/// and the growth helper's power-of-two round-up on a value near
+/// `u32::MAX` left the type entirely (see
+/// [`arena_capacity_for`]).
+///
+/// The ceiling is `2^31`, not `u32::MAX`: the round-up of any value
+/// ≤ 2^31 is at most 2^31 — inside `u32` — so clamping every cap
+/// here FIRST makes the growth arithmetic representable by
+/// construction. Construction ([`crate::Renderer::new`], through
+/// [`ArenaBudgets::validate`]) refuses a budget above it; the
+/// growth helper re-clamps defensively (the same domain, stated
+/// once, safe even on an unvalidated caller).
+pub(crate) const ARENA_CAP_MAX: u32 = 1 << 31;
+
+/// CA-12 (F12): the shared narrowing — the ONE place a configured
+/// `usize` budget becomes the `u32` cap the device carve and the CPU
+/// repack BOTH read (the audit's "shared representable capacity").
+/// Refuses (typed) a budget outside the representable domain
+/// instead of truncating it: the pre-fix `cap as u32` narrowings
+/// silently wrapped, so the CPU repack's typed-refusal boundary and
+/// the device carve's ceiling were different numbers. Pure —
+/// unit-testable without a GPU.
+pub(crate) fn arena_cap_domain(budget: &str, cap: usize) -> Result<u32, RendererError> {
+    if cap > ARENA_CAP_MAX as usize {
+        return Err(RendererError::Vulkan(format!(
+            "the {budget} budget {cap} exceeds the representable arena domain \
+             ({}): the device carve and the CPU repack would disagree at the \
+             narrowing — configure a budget at or below it",
+            ARENA_CAP_MAX
+        )));
+    }
+    Ok(cap as u32)
+}
+
+/// CA-12 (F12): the three arena budgets VALIDATED at construction —
+/// the shared representable capacity the audit's correction names.
+/// Built once in [`crate::Renderer::new`] against the LIVE device's
+/// pose-binding facts and carried as the ONE `u32` trio every later
+/// boundary reads: the frame policy (the device carve's cap — the
+/// growth target's clamp) AND the submission policy (the CPU
+/// repack's typed-refusal boundary, widened back to `usize` only at
+/// the public repack calls, losslessly), so the two domains are the
+/// SAME NUMBER by construction.
+///
+/// The pose arena additionally validates its PER-SLOT SIZE and
+/// DYNAMIC-OFFSET ALIGNMENT against the binding-5
+/// `STORAGE_BUFFER_DYNAMIC` descriptor's device limits (the audit's
+/// "device limits, per-slot sizes and dynamic-offset alignment"):
+/// the cap-clamped carve's slot stride is `pose × POSE_STRIDE`
+/// bytes, which must fit `maxStorageBufferRange` (the sets' concrete
+/// `.range()` write) and be a multiple of
+/// `minStorageBufferOffsetAlignment` (the per-slot dynamic offsets).
+/// The quantum's own arithmetic keeps every sub-cap carve aligned
+/// (`ARENA_FLOOR = 64` blocks × 704 B is a multiple of every
+/// spec-legal alignment), so the CAP is the only reachable
+/// misalignment — checked here, fail-visible at construction
+/// instead of at the growth that reaches it. The instance and
+/// region arenas are plain per-draw vertex bindings (no descriptor
+/// range, no portable device byte ceiling), so their per-slot sizes
+/// carry no construction-time device bound — the carve's own
+/// creation failure is their visible bound.
+#[derive(Debug)]
+pub(crate) struct ArenaBudgets {
+    /// The instance arena's validated cap (instances).
+    pub(crate) instance: u32,
+    /// The pose arena's validated cap (blocks).
+    pub(crate) pose: u32,
+    /// The region arena's validated cap (per-slot vertices).
+    pub(crate) region: u32,
+}
+
+impl ArenaBudgets {
+    /// Validates the configured budgets against the shared
+    /// representable domain and the pose binding's device facts.
+    /// The device facts arrive as plain numbers so the validation is
+    /// PURE — device-free, unit-testable — with the construction
+    /// site supplying the live device's
+    /// `maxStorageBufferRange`/`minStorageBufferOffsetAlignment`
+    /// (see [`crate::vulkan::VulkanContext::pose_binding_limits`]).
+    pub(crate) fn validate(
+        config: &RenderConfig,
+        max_storage_buffer_range: u64,
+        min_storage_buffer_offset_alignment: u64,
+    ) -> Result<Self, RendererError> {
+        let instance = arena_cap_domain("instance_capacity", config.instance_capacity.0)?;
+        let pose = arena_cap_domain("pose_capacity", config.pose_capacity.0)?;
+        let region = arena_cap_domain("region_capacity", config.region_capacity.0 as usize)?;
+        let pose_slot_bytes = u64::from(pose) * crate::animation::POSE_STRIDE as u64;
+        if pose_slot_bytes > max_storage_buffer_range {
+            return Err(RendererError::Vulkan(format!(
+                "the pose_capacity budget {pose} needs a {pose_slot_bytes} B per-slot \
+                 storage range, above the device's maxStorageBufferRange \
+                 {max_storage_buffer_range} (the binding-5 descriptor's concrete \
+                 range) — configure a smaller pose budget",
+            )));
+        }
+        if !pose_slot_bytes.is_multiple_of(min_storage_buffer_offset_alignment) {
+            return Err(RendererError::Vulkan(format!(
+                "the pose_capacity budget {pose} needs a {pose_slot_bytes} B per-slot \
+                 stride, not a multiple of the device's \
+                 minStorageBufferOffsetAlignment {min_storage_buffer_offset_alignment} \
+                 (the binding-5 dynamic offsets) — configure a smaller pose budget",
+            )));
+        }
+        Ok(Self {
+            instance,
+            pose,
+            region,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -918,6 +1059,179 @@ mod tests {
         assert_eq!(
             resolve_depth_format(DepthFormatPreference::ForceD16, true, false, negotiated),
             negotiated
+        );
+    }
+
+    /// CA-12 (F12): the shared narrowing's representability edges —
+    /// the domain ceiling admits, everything above it refuses with
+    /// the budget named. These are plain `Result` checks (no
+    /// `debug_assert`), so the debug and release batteries run the
+    /// SAME assertions — the audit's "representability edges in
+    /// debug and release" (the pre-fix failure mode was itself
+    /// build-profile-dependent: a debug panic vs a release wrap).
+    #[test]
+    fn arena_budgets_refuse_outside_the_representable_domain() {
+        use crate::proxy_instances::MAX_INSTANCES;
+        // The ceiling itself is representable (2^31 narrows cleanly;
+        // its round-up is itself).
+        assert_eq!(
+            arena_cap_domain("instance_capacity", ARENA_CAP_MAX as usize),
+            Ok(ARENA_CAP_MAX)
+        );
+        // One past the ceiling refuses, naming the budget — never a
+        // silent `as u32` truncation to a different number.
+        for (budget, over) in [
+            ("instance_capacity", ARENA_CAP_MAX as usize + 1),
+            ("pose_capacity", ARENA_CAP_MAX as usize + 1),
+            ("region_capacity", ARENA_CAP_MAX as usize + 1),
+            ("instance_capacity", usize::MAX),
+            ("pose_capacity", u32::MAX as usize + 5),
+        ] {
+            let error =
+                arena_cap_domain(budget, over).expect_err("a budget above the domain must refuse");
+            let RendererError::Vulkan(text) = &error else {
+                panic!("the refusal is a Vulkan error: {error:?}");
+            };
+            assert!(
+                text.contains(budget) && text.contains("representable arena domain"),
+                "the refusal names the budget and the domain: {text}"
+            );
+        }
+        // The ordinary budgets (including the defaults) narrow to
+        // themselves.
+        assert_eq!(arena_cap_domain("instance_capacity", 0), Ok(0));
+        assert_eq!(arena_cap_domain("instance_capacity", 64), Ok(64));
+        assert_eq!(
+            arena_cap_domain("instance_capacity", MAX_INSTANCES),
+            Ok(MAX_INSTANCES as u32)
+        );
+    }
+
+    /// CA-12 (F12): the growth quantum's representability edges —
+    /// the domain ceiling carves exactly the ceiling (no debug
+    /// panic, no release wrap-to-zero), and an UNVALIDATED caller
+    /// (a cap above the domain, straight from `u32`) is clamped to
+    /// the domain, never wrapped. Same assertions in debug and
+    /// release (the checked round-up replaces the panicking/wrapping
+    /// one).
+    #[test]
+    fn arena_growth_is_representable_at_the_domain_edges() {
+        // The ceiling: demand == cap == 2^31 carves 2^31.
+        assert_eq!(
+            arena_capacity_for(0, ARENA_CAP_MAX, ARENA_CAP_MAX),
+            ARENA_CAP_MAX
+        );
+        // Just under the ceiling rounds UP TO the ceiling (2^31 − 1's
+        // next power of two is 2^31 — representable).
+        assert_eq!(
+            arena_capacity_for(0, ARENA_CAP_MAX - 1, ARENA_CAP_MAX),
+            ARENA_CAP_MAX
+        );
+        // The pre-fix failure shape, clamped instead of wrapped: a
+        // cap of u32::MAX (an unvalidated caller — construction
+        // refuses this budget) with an over-domain demand carves the
+        // domain ceiling, NOT a wrapped zero carve (the release-mode
+        // defect the audit's round-up-before-clamp produced).
+        assert_eq!(arena_capacity_for(0, u32::MAX, u32::MAX), ARENA_CAP_MAX);
+        assert_eq!(arena_capacity_for(0, u32::MAX - 1, u32::MAX), ARENA_CAP_MAX);
+        // The steady-state arm still holds at the edges (a live carve
+        // never shrinks).
+        assert_eq!(
+            arena_capacity_for(ARENA_CAP_MAX, u32::MAX, u32::MAX),
+            ARENA_CAP_MAX
+        );
+        // Non-power-of-two caps keep the configured-boundary
+        // behavior (the demand lands ON the cap).
+        assert_eq!(arena_capacity_for(0, 300, 500), 500);
+        assert_eq!(arena_capacity_for(0, 612, 500), 500);
+        assert_eq!(arena_capacity_for(0, 200, 500), 256);
+    }
+
+    /// CA-12 (F12): the pose arena's per-slot device facts — the
+    /// binding-5 descriptor's range ceiling and offset alignment,
+    /// checked at the CAP (the only reachable misalignment; the
+    /// quantum keeps every sub-cap carve aligned). Pure validation,
+    /// spec-min and realistic device facts both exercised.
+    #[test]
+    fn pose_budgets_validate_against_the_binding_device_limits() {
+        // The DEFAULT budget passes every spec-legal device: 4096
+        // blocks × 704 B = 2,883,584 B — below every implementation's
+        // storage range, a multiple of every spec-legal alignment
+        // (the spec maximum alignment is 256; 2,883,584 = 2^18·11).
+        ArenaBudgets::validate(&RenderConfig::default(), u64::from(u32::MAX), 256)
+            .expect("the default budgets pass a spec-legal device");
+        // A device whose storage range sits below the cap's per-slot
+        // stride refuses, naming the binding's limit.
+        let error = ArenaBudgets::validate(
+            &RenderConfig {
+                pose_capacity: PoseCapacity(4096),
+                ..RenderConfig::default()
+            },
+            1_000_000,
+            1,
+        )
+        .expect_err("an over-range pose budget must refuse");
+        let RendererError::Vulkan(text) = &error else {
+            panic!("the refusal is a Vulkan error: {error:?}");
+        };
+        assert!(
+            text.contains("maxStorageBufferRange"),
+            "the refusal names the binding's range limit: {text}"
+        );
+        // A cap whose stride misaligns the dynamic offsets refuses
+        // (6 blocks × 704 B = 4224 = 16.5 × 256 on a 256-alignment
+        // device): the cap-clamped carve would write an invalid
+        // descriptor range — fail-visible at construction, not at
+        // the growth that reaches the cap.
+        let error = ArenaBudgets::validate(
+            &RenderConfig {
+                pose_capacity: PoseCapacity(6),
+                ..RenderConfig::default()
+            },
+            u64::from(u32::MAX),
+            256,
+        )
+        .expect_err("a misaligned pose budget must refuse");
+        let RendererError::Vulkan(text) = &error else {
+            panic!("the refusal is a Vulkan error: {error:?}");
+        };
+        assert!(
+            text.contains("minStorageBufferOffsetAlignment"),
+            "the refusal names the alignment limit: {text}"
+        );
+        // An ALIGNED small cap (4 × 704 = 2816 = 11 × 256) passes on
+        // the same device, and a non-power-of-two aligned cap
+        // (500 × 704 = 352000 = 1375 × 256) passes too — the check
+        // refuses only genuine misalignment.
+        for cap in [4_usize, 500] {
+            ArenaBudgets::validate(
+                &RenderConfig {
+                    pose_capacity: PoseCapacity(cap),
+                    ..RenderConfig::default()
+                },
+                u64::from(u32::MAX),
+                256,
+            )
+            .unwrap_or_else(|error| panic!("an aligned pose budget {cap} passes: {error:?}"));
+        }
+        // The over-domain budget refuses through the SAME
+        // construction validation (the shared narrowing, second line
+        // of defense beside the frame-flow clamp).
+        let error = ArenaBudgets::validate(
+            &RenderConfig {
+                pose_capacity: PoseCapacity(usize::MAX),
+                ..RenderConfig::default()
+            },
+            u64::from(u32::MAX),
+            1,
+        )
+        .expect_err("an over-domain pose budget must refuse");
+        let RendererError::Vulkan(text) = &error else {
+            panic!("the refusal is a Vulkan error: {error:?}");
+        };
+        assert!(
+            text.contains("representable arena domain"),
+            "the refusal names the domain: {text}"
         );
     }
 }

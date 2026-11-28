@@ -324,6 +324,14 @@ impl SkinnedRetained {
         self.blocks_capacity
     }
 
+    /// The pose carve's per-slot byte stride
+    /// (`blocks_capacity * POSE_STRIDE`) — CA-12's admitted-vs-carve
+    /// upload backstop reads it beside the block capacity (the
+    /// write's true byte bound).
+    pub(super) fn slot_stride(&self) -> u64 {
+        self.slot_stride
+    }
+
     fn build(
         &mut self,
         ctx: &VulkanContext,

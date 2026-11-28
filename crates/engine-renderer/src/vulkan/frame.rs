@@ -405,14 +405,21 @@ pub(crate) struct FramePolicy {
     /// `RenderConfig::demo_scene`) — the LIVE preference every
     /// replacement pipeline is built with.
     pub demo_scene: DemoScenePreference,
-    /// P5 §1.3 (A11/R1): the instance arena's configured cap
-    /// (`RenderConfig::instance_capacity`) — the lazy-ensure
-    /// ladder's growth ceiling for the instance carve.
-    pub instance_capacity: usize,
-    /// P5 §1.3: the pose arena's configured cap
-    /// (`RenderConfig::pose_capacity`) — the retained pose storage's
-    /// growth ceiling.
-    pub pose_capacity: usize,
+    /// P5 §1.3 (A11/R1) + CA-12 (F12): the instance arena's
+    /// VALIDATED cap — the construction-time
+    /// [`crate::config::ArenaBudgets`] value (`RenderConfig`'s
+    /// `instance_capacity` budget after the shared representable-
+    /// capacity narrowing), the lazy-ensure ladder's growth ceiling
+    /// for the instance carve. `u32` — the ONE domain the carve, the
+    /// growth quantum, and the CPU repack's refusal boundary share
+    /// (the pre-fix `usize` here re-narrowed at the carve sites).
+    pub instance_capacity: u32,
+    /// P5 §1.3 + CA-12: the pose arena's VALIDATED cap (the
+    /// `ArenaBudgets` value — device-checked against the binding-5
+    /// storage range and offset alignment at construction) — the
+    /// retained pose storage's growth ceiling, the same number the
+    /// CPU pose repack refuses above.
+    pub pose_capacity: u32,
     /// P5 §1.3: the region arena's configured per-slot vertex budget
     /// (`RenderConfig::region_capacity`) — the region carve's growth
     /// ceiling AND the F-03 clamp's boundary (unchanged semantics:
@@ -821,15 +828,31 @@ fn acquire_with_retry(
     frame: &InternalFrame<'_>,
     slot: usize,
 ) -> Result<Acquisition, RendererError> {
-    // If the acquire-out-of-date plan is armed, inject the error at the
-    // FIRST acquire site only (the retry acquire inside the out-of-date
-    // arm is NEVER injected — the plan is consumed at the first site
-    // only, so the retry remains structurally real). The injected result
-    // models the driver contract exactly (ERROR_OUT_OF_DATE_KHR means no
-    // image was acquired and the semaphore is untouched — precisely the
-    // state the out-of-date arm below already handles; skipping the real
-    // call is therefore the faithful simulation, not an approximation).
-    let mut acquire_result = if ctx.take_acquire_out_of_date() {
+    // The one-shot fault knobs, checked in arm order (device loss
+    // first — CA-13's knob models the terminal outcome, so it wins
+    // over the recoverable out-of-date when both are armed; only
+    // the TAKEN plan is consumed, the other stays armed for the
+    // next frame — the one-shot discipline holds for both):
+    //
+    // - CA-13's device-loss plan (F13/A14): the FIRST acquire site
+    //   returns VK_ERROR_DEVICE_LOST instead of the real call — the
+    //   faithful driver contract (DEVICE_LOST means no image was
+    //   acquired), the same argument as the out-of-date knob below.
+    //   The final match's generic arm converts it through
+    //   RendererError::vk into the TYPED DeviceLost classification
+    //   whose operation context ("acquire_next_image") rides the
+    //   variant; the renderer's entry gates latch it.
+    // - Finding 6's out-of-date plan: the injected result models the
+    //   driver contract exactly (ERROR_OUT_OF_DATE_KHR means no
+    //   image was acquired and the semaphore is untouched —
+    //   precisely the state the out-of-date arm below already
+    //   handles; skipping the real call is therefore the faithful
+    //   simulation, not an approximation). The plan is consumed at
+    //   the first site only, so the retry acquire inside the
+    //   out-of-date arm remains structurally real.
+    let mut acquire_result = if ctx.take_acquire_device_lost() {
+        Err(vk::Result::ERROR_DEVICE_LOST)
+    } else if ctx.take_acquire_out_of_date() {
         Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
     } else {
         unsafe {
@@ -1173,6 +1196,30 @@ fn dispose_failed_acquisition(
     error
 }
 
+/// CA-12 (F12): the admitted-counts-vs-physical-carve check before
+/// upload — PURE so the bound is unit-testable without a device.
+/// Unreachable on the validated domain (the CPU repack and the
+/// device carve share one construction-validated cap, and the carve
+/// never sits below the frame's demand), but the pre-fix write sites
+/// carried only a `debug_assert` — in release a mismatch wrote past
+/// the mapped slot. The backstop converts that to a typed refusal;
+/// the region buffer needs no twin (its F-03 `DynamicClamp`
+/// truncates fail-visibly by design).
+pub(crate) fn admitted_bytes_fit(
+    admitted: usize,
+    slot_bytes: u64,
+    what: &str,
+) -> Result<(), RendererError> {
+    if admitted as u64 > slot_bytes {
+        return Err(RendererError::Vulkan(format!(
+            "the admitted {what} needs {admitted} B but the frame slot's physical \
+             carve is {slot_bytes} B (the repack/carve domains disagree — \
+             refusing rather than writing past the mapping)"
+        )));
+    }
+    Ok(())
+}
+
 /// Phase 6 — `upload_frame_data` (§5.1's uploads row, §5.4's phase):
 /// the mapped per-slot writes this slot's fence wait now owns — the
 /// region/foreground layers, the overlay vertices, and the proxy
@@ -1257,6 +1304,19 @@ fn upload_frame_data(
             .saturating_add(upload.vehicle_count)
             .saturating_add(upload.rain_count);
         outcome.instance_capacity = proxy_state.capacity();
+        // CA-12 (F12): the admitted-counts-vs-physical-carve check
+        // BEFORE the upload — the audit's backstop at the one place
+        // the repacked bytes meet the carve. Unreachable on the
+        // validated domain (the CPU repack and the carve share one
+        // cap, and the carve never sits below the frame's demand),
+        // but the pre-fix write carried only a `debug_assert` — in
+        // release a mismatch wrote past the mapped slot. Typed
+        // refusal instead.
+        admitted_bytes_fit(
+            upload.bytes.len(),
+            proxy_state.slot_bytes(),
+            "instance population",
+        )?;
         unsafe { proxy_state.write_slot(slot, upload.bytes) };
         if let Some(indirect) = proxy_state.indirect.as_ref()
             && matches!(upload.mode, crate::ProxyDrawMode::Indirect)
@@ -1280,6 +1340,15 @@ fn upload_frame_data(
             outcome.pose_supplied = (upload.pose_bytes.len() / crate::animation::POSE_STRIDE)
                 .min(u32::MAX as usize) as u32;
             outcome.pose_capacity = retained.blocks_capacity();
+            // CA-12 (F12): the same admitted-vs-carve backstop on the
+            // pose path (the instance check's own discipline — the
+            // pre-fix `debug_assert` alone gated this write in
+            // release).
+            admitted_bytes_fit(
+                upload.pose_bytes.len(),
+                retained.slot_stride(),
+                "pose population",
+            )?;
             unsafe { retained.write_slot(slot, upload.pose_bytes) };
         } else {
             debug_assert!(
@@ -2037,5 +2106,46 @@ mod policy_tests {
         assert_eq!(OverlaySlot::capacity_for(64, 64), 64);
         assert_eq!(OverlaySlot::capacity_for(64, usize::MAX), limit);
         assert_eq!(OverlaySlot::capacity_for(limit, usize::MAX), limit);
+    }
+
+    /// CA-12 (F12): the upload backstop's bound — exactly the
+    /// carve's byte length admits, one byte past it refuses with the
+    /// population named, zero always admits (an empty population
+    /// writes nothing). The pre-fix sites gated this with
+    /// `debug_assert` alone (a release-mode write past the mapping).
+    #[test]
+    fn admitted_bytes_fit_exactly_at_the_carve_and_refuses_past_it() {
+        use crate::animation::POSE_STRIDE;
+        use crate::proxy_instances::INSTANCE_STRIDE;
+        // The floor quantum's real carves: 64 instances × 96 B and
+        // 64 pose blocks × 704 B.
+        let instance_slot = 64 * INSTANCE_STRIDE as u64;
+        let pose_slot = 64 * POSE_STRIDE as u64;
+        admitted_bytes_fit(instance_slot as usize, instance_slot, "instance population")
+            .expect("exactly the carve admits");
+        admitted_bytes_fit(pose_slot as usize, pose_slot, "pose population")
+            .expect("exactly the carve admits");
+        admitted_bytes_fit(0, 0, "instance population").expect("an empty population admits");
+        for (what, admitted, slot_bytes) in [
+            (
+                "instance population",
+                instance_slot as usize + 1,
+                instance_slot,
+            ),
+            ("pose population", pose_slot as usize + 1, pose_slot),
+            ("instance population", usize::MAX, instance_slot),
+        ] {
+            let error = admitted_bytes_fit(admitted, slot_bytes, what)
+                .expect_err("one byte past the carve refuses");
+            let RendererError::Vulkan(text) = &error else {
+                panic!("the refusal is a Vulkan error: {error:?}");
+            };
+            assert!(
+                text.contains(what)
+                    && text.contains("physical carve")
+                    && text.contains("refusing rather than writing past the mapping"),
+                "the refusal names the population and the carve: {text}"
+            );
+        }
     }
 }

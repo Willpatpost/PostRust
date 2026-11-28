@@ -941,6 +941,11 @@ impl ReflectionResources {
                     &[set],
                     &[slot as u32 * self.params_stride],
                 );
+                // CA-15 (F15): the range is a validated
+                // triangle-list boundary pair (the admission's
+                // GroundRoles check) — this draw assembles exactly
+                // the primitives the lit pass drew over the same
+                // vertices.
                 ctx.device
                     .cmd_draw(cmd, range.end - range.start, 1, range.start, 0);
             }
@@ -1061,6 +1066,12 @@ impl ReflectionResources {
             );
             ctx.device
                 .cmd_bind_vertex_buffers(cmd, 0, &[vertices], &[0]);
+            // CA-15 (F15): the receiver is a validated
+            // triangle-list boundary pair (the admission's
+            // GroundRoles check) — the EQUAL-depth re-draw
+            // rasterizes exactly the primitives the lit pass drew
+            // over the same vertices, so the depth equality the
+            // receiver relies on holds.
             ctx.device
                 .cmd_draw(cmd, receiver.end - receiver.start, 1, receiver.start, 0);
         }

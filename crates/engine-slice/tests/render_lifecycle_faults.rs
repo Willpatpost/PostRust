@@ -28,6 +28,15 @@
 //!   retirement) must release the staged replacement (the census
 //!   pair equal, the old bindings intact, the capacity unchanged)
 //!   and the retry must grow and land.
+//! - **CA-13** (`device_loss_is_typed_and_latched` — the
+//!   CA-12..CA-15 config/scene lane's FAULT-SEAM EXTENSION of this
+//!   battery): an injected `VK_ERROR_DEVICE_LOST` at the acquire
+//!   site must surface as the TYPED
+//!   `RendererError::DeviceLost` (the operation context riding the
+//!   variant), and the renderer's latch must refuse every later
+//!   frame/attach/capture entry WITHOUT touching the dead device
+//!   (the unarmed second submit is the proof: reaching the device
+//!   would present a real frame).
 //!
 //! `#[ignore]`d like the binary's other lavapipe/rig gates: it
 //! requires a real Vulkan device and windows. THE RIG RUN (the
@@ -594,4 +603,115 @@ fn growth_idle_failures_release_the_staged_carve() {
         drop(app);
         println!("CA-11 Instance/PoseGrowthIdle: released, grew on the retry");
     }
+}
+
+/// CA-13 (F13/A14 — the device-loss lane's rig leg, added by the
+/// CA-12..CA-15 config/scene lane as a FAULT-SEAM EXTENSION of this
+/// battery): the injected `VK_ERROR_DEVICE_LOST` at the acquire site
+/// must surface as the TYPED `RendererError::DeviceLost` (the
+/// operation context riding the variant), and the renderer's LATCH
+/// must prevent every later device-touching entry — the second,
+/// UNARMED submit refuses with the same typed error WITHOUT
+/// reaching the acquire (an unarmed second call that touched the
+/// device would acquire a real image and present), and the attach
+/// and capture families refuse the same way. The knob is
+/// `Renderer::inject_device_loss` (the one-shot
+/// `set_acquire_device_lost` cell — the acquire-out-of-date knob's
+/// own discipline); real device removal stays the separate owner
+/// validation question the audit names.
+#[test]
+#[ignore = "requires a real Vulkan device and windows (the rig run: release, serial, archived per E-8)"]
+fn device_loss_is_typed_and_latched() {
+    let _guard = sdl_lock();
+    let (mut app, mut renderer) = lifecycle_renderer("CA-13 device loss");
+    let _ = app.frame();
+    let size = app.window().size_in_pixels();
+    let matrix = lifecycle_matrix(size);
+    attach_corner_scene(&mut renderer).expect("the scene attaches");
+    // Warm past both frame slots so the loss lands on a slot with
+    // real previous submissions.
+    for _ in 0..3 {
+        let outcome = submit_plain_scene_frame(&mut renderer, &matrix, size);
+        assert!(outcome.presented, "the warm frame presents");
+    }
+    // The injected loss: the next frame's FIRST acquire returns
+    // VK_ERROR_DEVICE_LOST (the faithful driver contract — no image
+    // was acquired).
+    renderer.inject_device_loss();
+    match renderer.submit_frame(corner_submission(
+        &matrix,
+        [0.0, 1.7, 15.0],
+        day_preset(),
+        None,
+        corner_bounds(),
+        None,
+        None,
+        false,
+        None,
+        size,
+    )) {
+        Err(engine_renderer::RendererError::DeviceLost { operation }) => assert_eq!(
+            operation, "acquire_next_image",
+            "the operation context rides the typed variant"
+        ),
+        other => panic!("expected the typed device-loss refusal, got {other:?}"),
+    }
+    // THE LATCH: the second submit is UNARMED — if it reached the
+    // device it would acquire a real image and present; the latch
+    // must refuse with the same typed error and the FIRST
+    // observation's context, without touching the dead device.
+    let second_started = Instant::now();
+    match renderer.submit_frame(corner_submission(
+        &matrix,
+        [0.0, 1.7, 15.0],
+        day_preset(),
+        None,
+        corner_bounds(),
+        None,
+        None,
+        false,
+        None,
+        size,
+    )) {
+        Err(engine_renderer::RendererError::DeviceLost { operation }) => assert_eq!(
+            operation, "acquire_next_image",
+            "the first observation's context is stable"
+        ),
+        other => panic!("the latched refusal, got {other:?}"),
+    }
+    assert!(
+        second_started.elapsed().as_millis() < 2_000,
+        "the latched refusal returns without device work (no acquire timeout)"
+    );
+    // Attach refuses the same way (the uploads and pipeline group
+    // are device work).
+    match attach_corner_scene(&mut renderer) {
+        Err(engine_renderer::RendererError::DeviceLost { .. }) => {}
+        other => panic!("the latched attach refusal, got {other:?}"),
+    }
+    // The capture family refuses (the request would never complete;
+    // the take's fence wait is device work).
+    match renderer.request_frame_capture() {
+        Err(engine_renderer::RendererError::DeviceLost { .. }) => {}
+        other => panic!("the latched capture-request refusal, got {other:?}"),
+    }
+    match renderer.take_frame_capture() {
+        Err(engine_renderer::RendererError::DeviceLost { .. }) => {}
+        other => panic!("the latched capture-take refusal, got {other:?}"),
+    }
+    match renderer.request_shadow_map_capture() {
+        Err(engine_renderer::RendererError::DeviceLost { .. }) => {}
+        other => panic!("the latched shadow-request refusal, got {other:?}"),
+    }
+    match renderer.take_shadow_map_capture() {
+        Err(engine_renderer::RendererError::DeviceLost { .. }) => {}
+        other => panic!("the latched shadow-take refusal, got {other:?}"),
+    }
+    // Nothing above touched the device validation-wise (the losses
+    // are the injection's, not a real driver error).
+    let stats = renderer.stats();
+    assert_eq!(stats.validation_errors, 0, "{:?}", stats.recent_validation);
+    drop(renderer);
+    drop(app);
+    println!("CA-13 device loss: typed at the boundary, latched across every entry");
 }

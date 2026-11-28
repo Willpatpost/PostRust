@@ -464,7 +464,7 @@ impl PipelineState {
     pub(crate) fn ensure_proxy_resources(
         &mut self,
         ctx: &VulkanContext,
-        cap: usize,
+        cap: u32,
         required: u32,
     ) -> Result<(), RendererError> {
         let existing = self.proxy.as_ref().map_or(0, |state| state.capacity());
@@ -473,7 +473,9 @@ impl PipelineState {
         // at the CAP (the typed boundary) while an EMPTY population
         // keeps a live buffer for the instance-rate vertex binding —
         // a zero-sized VkBuffer is spec-invalid, never created.
-        let target = arena_capacity_for(existing, required.max(1), cap as u32).max(1);
+        // (CA-12: `cap` is the construction-VALIDATED u32 — the same
+        // number the CPU repack refuses above, no re-narrowing.)
+        let target = arena_capacity_for(existing, required.max(1), cap).max(1);
         match &mut self.proxy {
             Some(state) => state.ensure_capacity(ctx, target)?,
             None => {
@@ -506,7 +508,7 @@ impl PipelineState {
     pub(crate) fn ensure_skinned_resources(
         &mut self,
         ctx: &mut VulkanContext,
-        pose_cap: usize,
+        pose_cap: u32,
         required_blocks: u32,
     ) -> Result<(), RendererError> {
         ctx.ensure_skinned_retained(required_blocks, pose_cap)?;

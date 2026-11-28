@@ -13,8 +13,7 @@ use super::{
 };
 use crate::config::FRAMES_IN_FLIGHT;
 use crate::lit_scene::{LightParams, Material};
-use crate::proc_texture::TEXTURE_SIZE;
-use crate::scene_description::{GroundRoles, SceneDescription};
+use crate::scene_description::{DrawTable, GroundRoles, SceneDescription};
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use std::mem::offset_of;
@@ -90,10 +89,13 @@ pub(super) struct CornerResources {
     stride: u32,
     vertices: vk::Buffer,
     vertex_memory: vk::DeviceMemory,
-    /// The attached mesh's per-material draw ranges (one per
-    /// material, contiguous, covering the buffer — the attach
-    /// validation's contract).
-    draws: Vec<Range<u32>>,
+    /// The attached mesh's per-material draw table (CA-14/CA-15's
+    /// typed admission — [`SceneMesh::admit_draws`]'s retained
+    /// [`DrawTable`]: one range per material, contiguous, covering,
+    /// non-inverted, and TRIANGLE-ALIGNED at every boundary, so the
+    /// lit loop's per-range draws and the depth pass's whole-mesh
+    /// draw assemble the same primitive set).
+    draws: DrawTable,
     /// The attached material table (kept for the downstream
     /// pass-family builders — the shadow/reflection material tails
     /// and the albedo-index mapping — and the table-length checks
@@ -128,7 +130,13 @@ impl CornerResources {
     ) -> Result<(), RendererError> {
         let materials = &description.materials;
         self.materials = materials.clone();
-        self.draws = description.mesh.draws.clone();
+        // CA-14/CA-15: the TYPED admission — the same whole
+        // validation `SceneDescription::validate` performed at
+        // attach (idempotent, pure, attach-time-cheap), producing
+        // the retained DrawTable. The description is pre-validated
+        // by the attach path, so this cannot refuse; running it
+        // here keeps the RETAINED table typed by construction.
+        self.draws = description.mesh.admit_draws(materials.len())?;
         self.ground = description.ground.clone();
         (self.vertices, self.vertex_memory) = create_device_local_buffer_with_data(
             ctx,
@@ -139,13 +147,18 @@ impl CornerResources {
         // here fires with it created, exercising this build's own
         // partial-failure release below.
         ctx.check_lifecycle_fault(crate::LifecycleFaultSite::SceneVertices)?;
+        // CA-14 (Q06): the TYPED extent — the upload consumes the
+        // same shape the admission matched the bytes against (the
+        // description's `albedo_extent`, single-sourced from the
+        // generator's constants through `TextureExtent`).
+        let extent = description.albedo_extent();
         for bytes in &description.textures.textures {
             self.textures.push(Texture::upload(
                 ctx,
                 vk::Format::R8G8B8A8_UNORM,
                 vk::Extent2D {
-                    width: TEXTURE_SIZE,
-                    height: TEXTURE_SIZE,
+                    width: extent.width,
+                    height: extent.height,
                 },
                 bytes,
             )?);
@@ -292,13 +305,15 @@ impl CornerResources {
     ) {
         // SAFETY: the bound vertex buffer is the attached mesh's own;
         // all draws refer to complete triangle ranges in it (the
-        // attach validation's contiguity/coverage contract). The
+        // typed admission's contracts: one range per material,
+        // contiguous, covering, and TRIANGLE-ALIGNED at every
+        // boundary — CA-15). The
         // sets' frame regions were written after the slot's fence
         // wait (the caller's write, the coherent-buffer discipline).
         unsafe {
             ctx.device
                 .cmd_bind_vertex_buffers(cmd, 0, &[self.vertices], &[0]);
-            for (set, range) in sets.iter().zip(&self.draws) {
+            for (set, range) in sets.iter().zip(self.draws.ranges()) {
                 ctx.device.cmd_bind_descriptor_sets(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -383,10 +398,23 @@ impl CornerResources {
     }
 
     /// The attached mesh's vertex buffer and its material-grouped
-    /// draw ranges (the shadow state's depth-only pass draws the
-    /// whole mesh through them).
+    /// draw ranges (the typed admission's per-material view — the
+    /// shadow state's depth-only pass and the reflection's redraws
+    /// draw through them).
     pub(crate) fn mesh(&self) -> (vk::Buffer, &[Range<u32>]) {
-        (self.vertices, &self.draws)
+        (self.vertices, self.draws.ranges())
+    }
+
+    /// CA-15 (F15): the whole-mesh vertex count as a TYPED
+    /// admission fact — the shadow depth pass's whole-buffer draw
+    /// (`[0, count)`) reads this instead of re-deriving it from the
+    /// raw table. The admission guarantees the count is a
+    /// triangle-list boundary (a multiple of
+    /// [`crate::scene_description::VERTICES_PER_TRIANGLE`]), so the
+    /// single whole-mesh draw assembles exactly the primitive set
+    /// the lit pass's per-material ranges assemble.
+    pub(crate) fn whole_mesh_vertex_count(&self) -> u32 {
+        self.draws.whole_mesh_vertex_count()
     }
 
     /// The ground quad's draw range — the planar mirror's RECEIVER:
