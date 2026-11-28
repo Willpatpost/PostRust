@@ -429,6 +429,64 @@ census); the batteries' non-ignored portions: census_repack 2/1i,
 census_vram 1/1i, census_ripple 1/1i, census_attach 0/1i,
 census_composition 0/1i — all ok.
 
+## E-13 NEW-REND-11 — the exact SDL pin + fresh-consumer identity demonstration (2026-11-27, lane worktree tree `1d4ecc9`, branch `ee/shell-sdl-exact-pin`)
+
+Owner-approved per D-EE-10 item 3. Four manifest lines changed (version
+requirement strings only — no code, no features, no new dependencies):
+engine-shell and engine-renderer `sdl3` "0.20" → "=0.20.0" (both
+`[dependencies]`) and `sdl3-sys` "0.7.2" → "=0.7.2" (both
+`[target.'cfg(unix)'.dependencies]` — the only sdl3-sys requirements in
+the workspace; the contract sweep covered all six repo manifests, the
+other four are SDL-free, engine-slice reaches SDL only transitively).
+Pins match the committed lock (sdl3 0.20.0 · sdl3-sys 0.7.2+SDL-3.4.18 ·
+sdl3-src 3.4.18); sdl3-sys 0.7.2's own upstream manifest pins
+`sdl3-src = "=3.4.18"`, so the vendored native source is transitively
+exact. Inside vs outside workspace control: the facade sdl3 0.20.0's own
+sdl3-sys requirements (`^0.7.1`, normal + build copies) and the optional
+satellite crates (sdl3-image/mixer/ttf-sys and their -src crates —
+features off, locked but never compiled) are upstream; the workspace
+controls exactly its own four requirements, all four now exact.
+
+Fresh-consumer demonstration (B15 §6.1 method, throwaway consumers at
+`Temp\opencode\ee\q1-minimal-consumer\{shell-before,shell-after}\`,
+path dep on the lane tree's engine-shell, fresh locks, own target dirs;
+every command exit 0):
+
+- BEFORE (pre-pin manifests): `cargo generate-lockfile` → sdl3-sys
+  0.7.3+SDL-3.4.20 + sdl3-src 3.4.20, sdl3 0.20.0, 20 packages (F-01
+  reproduced on the lane tree); `cargo run -q` → "input state
+  constructed; linked SDL version Version { major: 3, minor: 4,
+  patch: 20 }".
+- AFTER (post-pin manifests): `cargo generate-lockfile` → sdl3-sys
+  0.7.2+SDL-3.4.18 + sdl3-src 3.4.18, sdl3 0.20.0, 20 packages — cargo
+  prints "available: v0.7.3+SDL-3.4.20" / "available: v3.4.20" and does
+  not select them; `cargo run -q` → "input state constructed; linked SDL
+  version Version { major: 3, minor: 4, patch: 18 }";
+  `cargo tree -i sdl3-sys -e normal,build` → sdl3-sys v0.7.2+SDL-3.4.18
+  ← sdl3 v0.20.0 ← engine-shell (path) ← consumer, the build-graph copy
+  unified at the same 0.7.2; closure 15 unique (`--edges normal,build
+  --prefix none`) = the B15 shell consumer's §6.3 figure — identity
+  changed, shape unchanged. Both consumer runs print the known benign
+  LNK4098 (F-10 — outside the workspace's `.cargo/config.toml` CRT
+  toolchain scope; cosmetic). Post-pin re-resolve in the BEFORE
+  directory DOWNGRADES its existing lock 0.7.3 → 0.7.2 ("Downgrading
+  sdl3-sys v0.7.3+SDL-3.4.20 -> v0.7.2+SDL-3.4.18"): the enforcement is
+  manifest-side, reaches existing consumers' locks, and `cargo update`
+  can no longer silently drift the native SDL.
+
+Lane gates (post-pin tree; all exit 0): `cargo fmt --all -- --check`;
+`cargo check --workspace --all-targets` (45.33 s — `git status`: only
+the two manifests modified, `Cargo.lock` byte-identical, i.e. the pins
+enforce exactly what the lock already resolved); `cargo test -p
+engine-shell` — lib 23 passed/0 failed, tests\audio 1/0,
+tests\input_dispatch 13/0, tests\lifecycle 2/0 (incl.
+`linked_sdl_version_is_the_vendored_3_4_18`), tests\soak 0 passed/1
+ignored (the opt-in 60 s measurement), doc-tests 0 — **TRUE total 39
+passed / 0 failed / 1 ignored**; `cargo clippy -p engine-shell -p
+engine-renderer --all-targets -- -D warnings` (the D-EE-03
+touched-crates discipline). No behavior change: no `.rs` file touched,
+lock untouched, dependency closure shape unchanged.
+
 ## Measurement baselines
 
 (To be established in P0: first full build of the integration tree, then the
