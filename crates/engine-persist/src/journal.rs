@@ -138,7 +138,7 @@ use engine_core::{Decoder, Encoder, SaveError};
 use sha2::{Digest, Sha256};
 
 use crate::consequence::ConsequenceId;
-use crate::envelope::{ConsequenceEnvelope, DurabilityClass, SourcePosition};
+use crate::envelope::{ClassifiedSpan, ConsequenceEnvelope, DurabilityClass, SourcePosition};
 use crate::fault::FaultAction;
 use crate::hash::{Hash, hash_object};
 use crate::medium::SyncTier;
@@ -3165,6 +3165,54 @@ impl T1Journal {
     /// The validated cancellation records, in sequence order.
     pub fn cancellations(&self) -> &[RecordedCancellation] {
         &self.state.cancellations
+    }
+
+    /// (R07) The decoded committed history's estimated resident bytes
+    /// — the in-memory T1 state THIS session holds, the largest
+    /// per-identity bookkeeping surface: per committed transaction,
+    /// the fixed `CommittedTransaction` skeleton, the COMPLETE
+    /// envelopes (the fixed struct plus the sub-span and dependency
+    /// heap), the plan bytes, the frontier entries, and the causal
+    /// dependencies; per cancellation, the record plus its detail;
+    /// plus the committed-index, canceled-id, and session
+    /// acknowledgment lookups (the BTree node share amortized per
+    /// entry). The CA-17 formula discipline throughout: an ESTIMATE
+    /// (std's exact node occupancy is its own business), structurally
+    /// testable — linear in the generation's committed transactions
+    /// at fixed live obligations, bounded generationally by the
+    /// rotation's retirement (the reopened journal decodes the
+    /// smaller generation). The on-disk journal remains the
+    /// authority; this state is the session's decoded view of it.
+    pub fn decoded_residency_bytes(&self) -> u64 {
+        const BTREE_ENTRY_OVERHEAD: u64 = 48;
+        let envelope_fixed = std::mem::size_of::<ConsequenceEnvelope>() as u64;
+        let span = std::mem::size_of::<ClassifiedSpan>() as u64;
+        let id = std::mem::size_of::<ConsequenceId>() as u64;
+        let mut total = 0;
+        for transaction in &self.state.committed {
+            total += std::mem::size_of::<CommittedTransaction>() as u64;
+            for envelope in &transaction.envelopes {
+                total += envelope_fixed
+                    + envelope.sub_spans.capacity() as u64 * span
+                    + envelope.dependencies.capacity() as u64 * id;
+            }
+            total += transaction.plan.capacity() as u64;
+            total += transaction.frontier.capacity() as u64
+                * std::mem::size_of::<FrontierEntry>() as u64;
+            total += transaction.dependencies.capacity() as u64
+                * std::mem::size_of::<TransactionId>() as u64;
+        }
+        for cancellation in &self.state.cancellations {
+            total += std::mem::size_of::<RecordedCancellation>() as u64
+                + cancellation.detail.capacity() as u64;
+        }
+        total += (std::mem::size_of::<TransactionId>() as u64
+            + std::mem::size_of::<usize>() as u64
+            + BTREE_ENTRY_OVERHEAD)
+            * self.state.committed_index.len() as u64;
+        total += (std::mem::size_of::<TransactionId>() as u64 + BTREE_ENTRY_OVERHEAD)
+            * (self.state.canceled_ids.len() + self.acknowledged.len()) as u64;
+        total
     }
 
     /// The observed trailing state (diagnostic truth — retained even

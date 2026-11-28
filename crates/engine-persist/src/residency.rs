@@ -139,6 +139,19 @@
 //! * The eviction eligibility's subsumption arm (the anchor
 //!   boundary's per-region episodes — the rotation's rule, applied
 //!   to map residency).
+//!
+//! ## The R07 census (this module's test suite)
+//!
+//! The Sol re-audit's memory-transaction consolidation investigation
+//! (R07) extends the same measurement surface to EVERY
+//! transaction-bookkeeping surface — the journal's decoded committed
+//! history, the authority's tracked-key map, the staged accrual, and
+//! the retained attempt joined the confirmed map and the shed
+//! discriminator in [`crate::pipeline::RetentionStats`]. The census
+//! row and its design record live here:
+//! `r07_bookkeeping_census_grows_linearly_at_fixed_live_obligations`
+//! and
+//! `docs/engineering-excellence/INVESTIGATION-R07-transaction-consolidation.md`.
 
 use crate::checkpoint::{CHECKPOINT_METADATA_DOMAIN, CheckpointMetadata};
 use crate::consequence::ConsequenceId;
@@ -854,5 +867,109 @@ mod tests {
             "the 2048→8192 residency ratio {ratio23:.2} must track the history ratio \
              {history_ratio:.2} (linear)"
         );
+    }
+
+    /// (R07) THE TRANSACTION-BOOKKEEPING CENSUS — the consolidation
+    /// investigation's measurement row (pod-observational, printed
+    /// never pinned): at FIXED live obligations (eight
+    /// staged-then-journaled, never-confirmed envelopes live at every
+    /// scale) over growing confirmed histories, the estimated
+    /// residency of EVERY bookkeeping surface — the journal's decoded
+    /// committed history, the authority's tracked-key map, the
+    /// verifier's confirmed map (the CA-17 row), the shed
+    /// discriminator, the staged accrual, and the retained attempt.
+    /// The structural claims the census exists to measure: the
+    /// HISTORY-bearing surfaces (journal, tracked, confirmed, shed)
+    /// grow linearly in the confirmed history at fixed live
+    /// obligations; the BOUNDARY-scoped surface (staged — drained by
+    /// the capture) and the ATTEMPT-scoped surface (pending — nothing
+    /// retained on the clean path) stay at their fixed values at
+    /// every scale. The design record:
+    /// `docs/engineering-excellence/INVESTIGATION-R07-transaction-consolidation.md`.
+    #[test]
+    fn r07_bookkeeping_census_grows_linearly_at_fixed_live_obligations() {
+        let mut rows: Vec<(u64, u64, u64, u64)> = Vec::new();
+        for history in [512u64, 2048, 8192] {
+            let dir = TestDir::new(format!("r07-census-{history}").as_str());
+            let mut pipeline = local_pipeline(&dir);
+            const PER_BATCH: u64 = 256;
+            let batches = history / PER_BATCH;
+            for episode in 1..=batches {
+                commit_batch(&mut pipeline, episode, PER_BATCH);
+            }
+            // The fixed live obligation: eight staged, journaled,
+            // never-confirmed envelopes held at every scale.
+            for live in 0..8u64 {
+                pipeline.stage(bulk_envelope(10_000 + live, 1)).unwrap();
+            }
+            let (position, classification, dependencies, frontier, plan) = bulk_boundary(10_000);
+            pipeline
+                .capture(position, classification, dependencies, frontier, plan)
+                .unwrap();
+            let stats = pipeline.retention_stats();
+            assert_eq!(stats.confirmed_keys, history);
+            rows.push((
+                history,
+                stats.journal_residency_bytes,
+                stats.tracked_residency_bytes,
+                stats.shed_residency_bytes,
+            ));
+            println!(
+                "r07 census row: history {history} confirmed identities, 8 live unsettled — \
+                 journal {} B (~{} B/identity), tracked {} B (~{} B/identity), confirmed {} B \
+                 (~{} B/identity), shed {} B, staged {} B, pending {} B",
+                stats.journal_residency_bytes,
+                stats.journal_residency_bytes / (history + 8),
+                stats.tracked_residency_bytes,
+                stats.tracked_residency_bytes / (history + 8),
+                stats.confirmed_residency_bytes,
+                stats.confirmed_residency_bytes / history,
+                stats.shed_residency_bytes,
+                stats.staged_residency_bytes,
+                stats.pending_residency_bytes,
+            );
+            // THE BOUNDARY-SCOPED SURFACE: the capture drained the
+            // staged accrual — zero at every scale (never a history
+            // term; a crash loses it honestly, P0-5).
+            assert_eq!(
+                stats.staged_residency_bytes, 0,
+                "the staged accrual is boundary-scoped (drained by the capture)"
+            );
+            // THE ATTEMPT-SCOPED SURFACE: the clean path retains no
+            // unresolved attempt — zero at every scale (the pending
+            // slot holds at most one live attempt, written only at
+            // uncertainty-or-acceptance).
+            assert_eq!(
+                stats.pending_residency_bytes, 0,
+                "no retained attempt exists on the clean path"
+            );
+        }
+        // THE HISTORY TERMS: the journal's decoded history and the
+        // tracked-key map grow linearly in the confirmed history (the
+        // 4x history steps must scale both surfaces within the
+        // estimate's documented variance — the same band the CA-17
+        // row pins the confirmed map with).
+        let (h1, j1, t1, _) = rows[0];
+        let (h2, j2, t2, _) = rows[1];
+        let (_, j3, t3, _) = rows[2];
+        let history_ratio = h2 as f64 / h1 as f64;
+        for (name, small, large) in [
+            ("journal", j1, j2),
+            ("journal", j2, j3),
+            ("tracked", t1, t2),
+            ("tracked", t2, t3),
+        ] {
+            let ratio = large as f64 / small as f64;
+            assert!(
+                ratio > history_ratio * 0.8 && ratio < history_ratio * 1.4,
+                "the {name} residency ratio {ratio:.2} must track the history ratio \
+                 {history_ratio:.2} (linear)"
+            );
+        }
+        // THE SHED TERM: silent below the documented retention bound
+        // (the 512 row), fired past it (the 8,192 row) — both honest,
+        // reported in the stats, never silent.
+        assert_eq!(rows[0].3, 0, "no shed below the retention bound at 512");
+        assert!(rows[2].3 > 0, "the shed fired past the bound at 8,192");
     }
 }
