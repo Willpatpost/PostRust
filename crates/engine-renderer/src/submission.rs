@@ -210,7 +210,13 @@ pub(crate) struct SubmissionPolicy {
 /// config stay out: they are the renderer's own). This struct is the
 /// equivalence proof's comparison target — the module test builds
 /// `render_corner`'s parameter set by hand and asserts the adapter
-/// reproduces it.
+/// reproduces it. Since A04 (design §3.4) the frame flow consumes
+/// this set wrapped in
+/// [`InternalFrame`](crate::vulkan::frame::InternalFrame) — the same
+/// bundle carrying the derived
+/// [`FramePlan`](crate::vulkan::frame_plan::FramePlan) — as ONE
+/// parameter beside the `Copy`
+/// [`FramePolicy`](crate::vulkan::frame::FramePolicy).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct FrameInputs<'x> {
     /// The current window size in pixels.

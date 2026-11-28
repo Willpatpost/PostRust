@@ -12,10 +12,11 @@ use crate::config::{RenderConfig, TargetFaultSite, TargetFaultStage, present_mod
 use crate::overlay::{AtlasText, OverlayVertex};
 use crate::scene::SceneVertex;
 use crate::scene_description::{SceneDescription, SceneHandle};
-use crate::submission::{FrameSubmission, SubmissionPolicy, adapt_frame};
+use crate::submission::{FrameInputs, FrameSubmission, SubmissionPolicy, adapt_frame};
 use crate::vulkan::{
-    self, CapturedFrame, FrameState, PipelineState, RendererError, SwapchainState, VulkanContext,
-    drain_validation_messages, environment_pending, pick_depth_format, pick_surface_format,
+    self, CapturedFrame, FrameState, InternalFrame, PipelineState, RendererError, SwapchainState,
+    VulkanContext, drain_validation_messages, environment_pending, pick_depth_format,
+    pick_surface_format,
 };
 
 /// One captured shadow-map readback (the 6-F known-answer path): the
@@ -609,32 +610,36 @@ impl Renderer {
         } else {
             self.overlay_vertices.clear();
         }
+        // The frame flow — the layers-only input set as ONE bundle
+        // (A04, design §3.4): the same fifteen positional parameters
+        // this call once threaded, with every scene-half input off
+        // (the sky layer is a scene-backed-family feature — the
+        // submission's `scene.sky` field; the general region path
+        // stays skyless. The post chain likewise (the region path
+        // stays postless — the layers-only shape's documented
+        // scope), and the wet reflection with it).
+        let frame = InternalFrame::new(FrameInputs {
+            window_size,
+            view_proj: *view_proj,
+            region_vertices: world,
+            foreground,
+            hud,
+            debug_overlay: &self.overlay_vertices,
+            corner_params: None,
+            proxy: None,
+            shadowed: None,
+            sky: None,
+            post: false,
+            wet: None,
+        });
+        let policy = self.frame_policy();
         let outcome = vulkan::render_frame(
             &mut self.ctx,
             &mut self.swapchain,
             &mut self.pipes,
             &mut self.frames,
-            window_size,
-            self.config.present_mode,
-            self.config.replace_pipelines,
-            self.config.demo_scene,
-            view_proj,
-            world,
-            foreground,
-            hud,
-            &self.overlay_vertices,
-            None,
-            None,
-            None,
-            // The sky layer is a scene-backed-family feature (the
-            // submission's `scene.sky` field); the general region
-            // path stays skyless.
-            None,
-            // The post chain likewise (the region path stays
-            // postless — the layers-only shape's documented scope),
-            // and the wet reflection with it.
-            false,
-            None,
+            policy,
+            &frame,
         )?;
         Ok(self.finish_frame(outcome))
     }
@@ -755,11 +760,16 @@ impl Renderer {
         }
         // Validate + repack + build the input set (the adapter —
         // device-free, whole-submission validation before the frame
-        // flow).
+        // flow). The frame policy is collected BEFORE the adapter
+        // runs (it reads `self.config` while the adapter's output
+        // holds the repack buffers' borrows — disjoint fields, but
+        // collected once up front either way: it is `Copy`
+        // construction-time config, never state).
         let policy = SubmissionPolicy {
             proxy_draw_mode: self.proxy_draw_mode,
             ripple_debug: self.ripple_debug,
         };
+        let frame_policy = self.frame_policy();
         let inputs = adapt_frame(
             policy,
             &submission,
@@ -768,28 +778,19 @@ impl Renderer {
             &mut self.instance_bytes,
             &mut self.pose_bytes,
         )?;
-        // The frame flow — the identical parameter set the existing
-        // entries hand vulkan::render_frame.
+        // The frame flow — the validated input set as ONE bundle
+        // (A04, design §3.4): the same parameter set the former
+        // entries handed `vulkan::render_frame` through fifteen
+        // positional parameters, with the frame plan derived once
+        // at the bundle's construction.
+        let frame = InternalFrame::new(inputs);
         let outcome = vulkan::render_frame(
             &mut self.ctx,
             &mut self.swapchain,
             &mut self.pipes,
             &mut self.frames,
-            inputs.window_size,
-            self.config.present_mode,
-            self.config.replace_pipelines,
-            self.config.demo_scene,
-            &inputs.view_proj,
-            inputs.region_vertices,
-            inputs.foreground,
-            inputs.hud,
-            inputs.debug_overlay,
-            inputs.corner_params.as_ref(),
-            inputs.proxy.as_ref(),
-            inputs.shadowed.as_ref(),
-            inputs.sky.as_ref(),
-            inputs.post,
-            inputs.wet.as_ref(),
+            frame_policy,
+            &frame,
         )?;
         Ok(self.finish_frame(outcome))
     }
@@ -853,6 +854,19 @@ impl Renderer {
             extent: crate::shadows::SHADOW_MAP_EXTENT,
             depths,
         }))
+    }
+
+    /// The frame flow's construction-time policy (P4 D2 §3.4, stage
+    /// A04): the `RenderConfig` values `vulkan::render_frame` reads
+    /// per call, collected as one `Copy` value. The four owning
+    /// states stay separate `&mut` parameters (the design's §5.2
+    /// rule); this carries ONLY configuration.
+    fn frame_policy(&self) -> vulkan::FramePolicy {
+        vulkan::FramePolicy {
+            present_preference: self.config.present_mode,
+            replace_pipelines: self.config.replace_pipelines,
+            demo_scene: self.config.demo_scene,
+        }
     }
 
     fn finish_frame(&mut self, outcome: vulkan::FrameOutcome) -> FrameResult {

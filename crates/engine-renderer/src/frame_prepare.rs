@@ -22,19 +22,27 @@
 //! future reshaping of this seam.
 //!
 //! **Stage S3 (P4 D2 §4.2/§4.4):** the per-frame pass uses arrive as
-//! the frame's EXPLICIT declaration — the [`FramePlan`] derived once
-//! at the top of `render_frame` — instead of the positional
+//! the frame's EXPLICIT declaration — the [`FramePlan`] carried by the
+//! [`InternalFrame`] — instead of the positional
 //! `Option`/slice parameters each preparation path re-threaded. The
 //! lazy-ensure dispatcher and the extent-target ensures below read
-//! the plan's bits; the ONE derivation lives in `frame_plan`, and
-//! this module's two entry points are two of its three consumers
-//! (the third is `prepare_frame`'s own `Recreated`-arm re-entry).
-//! The request-side `capture_pending` bit stays a LIVE read passed
-//! per call — `frames.capture.pending` is prepare-mutable (a refused
-//! capture ensure clears it mid-frame), so freezing it in the plan
-//! would change the refused-capture-then-recreate path's behavior.
+//! the plan's bits; the ONE derivation lives in `frame_plan` (at the
+//! `InternalFrame` construction since A04), and this module's two
+//! entry points are two of its three consumers (the third is
+//! `prepare_frame`'s own `Recreated`-arm re-entry).
+//!
+//! **Stage A04 (P4 D2 §3.4):** the parameter set collapsed to the
+//! four owning states plus the two §3.4 values — [`FramePolicy`]
+//! (construction-time config, `Copy`) and [`InternalFrame`] (the
+//! validated input bundle carrying the plan). The request-side
+//! `capture_pending` bit stays a LIVE read — `frames.capture.pending`
+//! is prepare-mutable (a refused capture ensure clears it
+//! mid-frame), so freezing it in the plan would change the
+//! refused-capture-then-recreate path's behavior; it is read at
+//! entry here (the same value the caller passed per call before the
+//! collapse — nothing runs between the call and the entry).
 
-use crate::config::DemoScenePreference;
+use crate::vulkan::frame::{FramePolicy, InternalFrame};
 use crate::vulkan::frame_plan::FramePlan;
 
 /// Result of the preparation phase, indicating what action the frame
@@ -84,20 +92,21 @@ pub(crate) enum FramePreparationResult {
 /// All Vulkan operations happen while the context and states are valid.
 /// The caller must ensure no synchronization state (fences, semaphores)
 /// is modified until this function returns.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_frame(
     ctx: &mut crate::vulkan::VulkanContext,
     swapchain: &mut crate::vulkan::SwapchainState,
     pipes: &mut crate::vulkan::PipelineState,
     frames: &mut crate::vulkan::FrameState,
-    window_size: (u32, u32),
-    present_preference: crate::config::PresentModePreference,
-    replace_pipelines: bool,
-    demo_scene: DemoScenePreference,
-    plan: &FramePlan,
-    capture_pending: bool,
+    policy: FramePolicy,
+    frame: &InternalFrame<'_>,
 ) -> Result<FramePreparationResult, crate::vulkan::RendererError> {
     let slot = frames.frame_slot;
+    let window_size = frame.inputs.window_size;
+    let plan = &frame.plan;
+    // The request-side capture bit — a LIVE read at entry (see the
+    // module docs: the value the caller passed per call before A04;
+    // prepare-mutable below, never frozen in the plan).
+    let capture_pending = frames.capture.pending;
 
     // Minimized windows report a zero extent — present nothing.
     if window_size.0 == 0 || window_size.1 == 0 {
@@ -145,16 +154,7 @@ pub(crate) fn prepare_frame(
     // (verification requirement: suboptimal must eventually trigger
     // recreation).
     if crate::vulkan::consume_recreate(&mut frames.needs_recreate) {
-        crate::vulkan::recreate_swapchain(
-            ctx,
-            swapchain,
-            pipes,
-            frames,
-            window_size,
-            present_preference,
-            replace_pipelines,
-            demo_scene,
-        )?;
+        crate::vulkan::recreate_swapchain(ctx, swapchain, pipes, frames, window_size, policy)?;
         // The generation that draws carries every active variant —
         // calling the helper here ensures sky, reflection, and HDR
         // variant pipelines exist on the new generation (finding 6).
@@ -218,19 +218,20 @@ pub(crate) fn prepare_frame(
 /// - `FramePreparationResult::Recreated` if swapchain was rebuilt
 /// - `FramePreparationResult::Deferred` if probe decision is deferred
 /// - `FramePreparationResult::Proceeded` if preparation succeeded
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_after_recreation(
     ctx: &mut crate::vulkan::VulkanContext,
     swapchain: &mut crate::vulkan::SwapchainState,
     pipes: &mut crate::vulkan::PipelineState,
     frames: &mut crate::vulkan::FrameState,
-    window_size: (u32, u32),
-    present_preference: crate::config::PresentModePreference,
-    replace_pipelines: bool,
-    demo_scene: DemoScenePreference,
-    plan: &FramePlan,
-    capture_pending: bool,
+    policy: FramePolicy,
+    frame: &InternalFrame<'_>,
 ) -> Result<FramePreparationResult, crate::vulkan::RendererError> {
+    let window_size = frame.inputs.window_size;
+    let plan = &frame.plan;
+    // The request-side capture bit — a LIVE read at entry (the same
+    // value the caller passed per call before A04; see the module
+    // docs for why it is never frozen in the plan).
+    let capture_pending = frames.capture.pending;
     // The out-of-date inline recreation ALSO probes first (the
     // batch-3 review's directive: every recreation path checks
     // surface availability before recreating) — a mid-transition
@@ -255,16 +256,7 @@ pub(crate) fn prepare_after_recreation(
         return Ok(FramePreparationResult::Deferred);
     }
 
-    crate::vulkan::recreate_swapchain(
-        ctx,
-        swapchain,
-        pipes,
-        frames,
-        window_size,
-        present_preference,
-        replace_pipelines,
-        demo_scene,
-    )?;
+    crate::vulkan::recreate_swapchain(ctx, swapchain, pipes, frames, window_size, policy)?;
 
     // The generation that draws carries every active variant —
     // re-running the state-ensure helper here creates sky,

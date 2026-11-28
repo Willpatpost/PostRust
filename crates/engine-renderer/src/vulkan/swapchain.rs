@@ -10,12 +10,10 @@ use ash::vk;
 
 use super::RendererError;
 use super::context::{VulkanContext, pick_surface_format};
-use super::frame::FrameState;
+use super::frame::{FramePolicy, FrameState};
 use super::pipelines::PipelineState;
 use super::resources::find_memory_type;
-use crate::config::{
-    DemoScenePreference, FRAMES_IN_FLIGHT, PresentModePreference, resolve_present_mode,
-};
+use crate::config::{FRAMES_IN_FLIGHT, PresentModePreference, resolve_present_mode};
 
 /// Swapchain + attachments + framebuffers. Recreated on resize,
 /// out-of-date, and suboptimal-present.
@@ -418,16 +416,16 @@ pub(crate) fn next_swapchain_generation() -> u64 {
 /// When the surface format changed, the replacement pipelines are built
 /// first — framebuffers are always created against the render pass that
 /// will be current after the swap, never a stale one.
-#[allow(clippy::too_many_arguments)]
+/// A04 (P4 D2 §3.4): the three trailing configuration parameters
+/// collapsed into the `Copy` [`FramePolicy`] — the same value
+/// `render_frame` and the preparation pair carry (6 parameters).
 pub(super) fn recreate_swapchain(
     ctx: &mut VulkanContext,
     swapchain: &mut SwapchainState,
     pipes: &mut PipelineState,
     frames: &mut FrameState,
     window_size: (u32, u32),
-    present_preference: PresentModePreference,
-    replace_pipelines: bool,
-    demo_scene: DemoScenePreference,
+    policy: FramePolicy,
 ) -> Result<(), RendererError> {
     // Keep the request pending across failures, including an error before
     // the replacement reaches vkCreateSwapchainKHR.
@@ -447,8 +445,8 @@ pub(super) fn recreate_swapchain(
     // a recreated pipeline renders exactly what its predecessor did —
     // an omitted renderer must not gain demo content by recreating,
     // and an opted-in demonstration must not lose it.
-    let replacement_pipes = if replace_pipelines || new_format != swapchain.format {
-        let mut replacement = PipelineState::new(ctx, new_format, depth_format, demo_scene)?;
+    let replacement_pipes = if policy.replace_pipelines || new_format != swapchain.format {
+        let mut replacement = PipelineState::new(ctx, new_format, depth_format, policy.demo_scene)?;
         // Stage 4 final-review finding A: a replacement pipeline must
         // be fully prepared for dynamic region drawing BEFORE it
         // becomes active. If the outgoing state owns a lazily
@@ -561,7 +559,7 @@ pub(super) fn recreate_swapchain(
     match SwapchainState::new(
         ctx,
         window_size,
-        present_preference,
+        policy.present_preference,
         new_format,
         new_color_space,
         render_pass_for_new,
