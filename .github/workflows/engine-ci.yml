@@ -765,8 +765,8 @@ jobs:
           # result-lines and renderer-release literals — the passed
           # gate caught the omission (the system working as
           # designed); recorded honestly here.
-          expected=1645
-          if [ "$(uname -s)" != "Linux" ]; then expected=1594; fi
+          expected=1650
+          if [ "$(uname -s)" != "Linux" ]; then expected=1599; fi
           # T01 (2026-11-28): the main-shard pins centralized the same
           # way as the heavy shard's — the sibling defect here was the
           # echo printing a stale 33 while the gate enforced 34 (green
@@ -774,7 +774,7 @@ jobs:
           # printed expectation was wrong, the same duplicate-literal
           # drift class).
           expected_ignored=2
-          expected_results=36
+          expected_results=37
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -895,7 +895,17 @@ jobs:
           # sixth). The failure message now names the actual pin
           # (the audit's stale-163 note: the message was never
           # updated at the 166 move).
-          echo "renderer release: $passed passed, $results test-result lines (expected 215 / 2)"
+          # T05 class-level completion (2026-11-28): the third shard
+          # centralized the same way as heavy/main (the T01 repair's
+          # pattern) — the orchestrator's own T05 pin batch nearly
+          # shipped an echo/gate literal drift here (the echo caught
+          # at 215/2 against the corrected 220/3 gates), proving the
+          # class extends beyond the two shards the original repair
+          # covered. The echo, the assertions and the failure
+          # messages now derive from these two variables.
+          expected=220
+          expected_results=3
+          echo "renderer release: $passed passed, $results test-result lines (expected $expected / $expected_results)"
           # ENGINEERING EXCELLENCE P1-B09 (2026-11-26): +1
           # platform-uniform engine-renderer lib test (the macOS
           # windowed metal list never gets the headless fallback):
@@ -909,8 +919,8 @@ jobs:
           # equivalence pin): 173 + 1 = 174 (Windows MEASURED
           # locally on the integrated tree — 174/2 result lines,
           # exit 0; Linux the platform-uniform inference).
-          [ "$passed" -eq 215 ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != 215"; exit 1; }
-          [ "$results" -eq 2 ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != 2"; exit 1; }
+          [ "$passed" -eq "$expected" ] || { echo "RENDERER RELEASE COUNT MISMATCH: $passed != $expected"; exit 1; }
+          [ "$results" -eq "$expected_results" ] || { echo "RENDERER RELEASE RESULT-LINE MISMATCH: $results != $expected_results"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production
       # tests are cfg(test)-only (never feature-gated), and this

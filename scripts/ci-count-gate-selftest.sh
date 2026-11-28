@@ -113,14 +113,24 @@ fi
 n=$(grep -c '\[ "\$ignored" -eq "\$expected_ignored" \]' "$wf")
 [ "$n" -eq 2 ] && note "both ignored gates enforce \$expected_ignored" || failed "expected 2 ignored gates on \$expected_ignored, found $n"
 n=$(grep -c '\[ "\$results" -eq "\$expected_results" \]' "$wf")
-[ "$n" -eq 2 ] && note "both result-line gates enforce \$expected_results" || failed "expected 2 result-line gates on \$expected_results, found $n"
+[ "$n" -eq 3 ] && note "all three result-line gates enforce \$expected_results" || failed "expected 3 result-line gates on \$expected_results (heavy/main/renderer-release), found $n"
+
+# The renderer-release shard derives its echo and gates from the
+# centralized variables too (the T05 completion of the T01 class).
+if grep -q 'echo "renderer release: \$passed passed, \$results test-result lines (expected \$expected / \$expected_results)"' "$wf"; then
+  note "renderer-release echo derives from the centralized variables"
+else
+  failed "renderer-release echo no longer derives from the centralized variables"
+fi
+n=$(grep -c '\[ "\$passed" -eq "\$expected" \]' "$wf")
+[ "$n" -eq 3 ] && note "all three passed gates enforce \$expected" || failed "expected 3 passed gates on \$expected (heavy/main/renderer-release), found $n"
 
 # The centralized variables must be defined exactly once per shard
 # step, after the passed pin (the one-authoritative-set rule).
 n=$(grep -c 'expected_ignored=' "$wf")
-[ "$n" -eq 2 ] && note "expected_ignored defined once per shard" || failed "expected 2 expected_ignored definitions, found $n"
+[ "$n" -eq 2 ] && note "expected_ignored defined once per shard (heavy/main)" || failed "expected 2 expected_ignored definitions, found $n"
 n=$(grep -c 'expected_results=' "$wf")
-[ "$n" -eq 2 ] && note "expected_results defined once per shard" || failed "expected 2 expected_results definitions, found $n"
+[ "$n" -eq 3 ] && note "expected_results defined once per shard (heavy/main/renderer-release)" || failed "expected 3 expected_results definitions, found $n"
 
 if [ "$failures" -ne 0 ]; then
   printf 'ci-count-gate-selftest: %d FAILURE(S)\n' "$failures"
