@@ -217,3 +217,6 @@ physical-index stability, sustained loop zero-allocation, pins
 (register signature, lag formula, zero-moves clause, stride). CI pins
 corrected from lane-measured actuals: main 1645/1594 passed (+12), lines 36,
 heavy/renderer unchanged; confirming run `46131503857` dispatched.
+
+**T07 CI-verified green:** run `46131503857` at `4d17f14` — all five jobs
+success; the main shard 1645/1594 pin arithmetic confirmed on both platforms.
