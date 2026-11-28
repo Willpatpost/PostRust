@@ -672,6 +672,31 @@ struct CompactedHistory {
     prefix_summary: [u8; 32],
 }
 
+/// One class's membership across the spine's four obligation homes
+/// (CA-08/F08 — the regional scheduler-locality index's value type).
+/// The queued sets carry the spine's canonical priority key
+/// `(due, seq)` — a `BTreeSet` over it iterates in exactly the order
+/// a lane's canonical sort produces; the blocked and held sets carry
+/// bare seqs — ascending seq is the canonical visitation order the
+/// blocked/held extract passes already guarantee (IA-02). The
+/// blocked set is deliberately LANE-BLIND: a blocked obligation's
+/// field is its future lane, consulted only when it re-enters a
+/// queue, so a reclassify of blocked members changes no membership.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ClassMembership {
+    near: BTreeSet<(Tick, u64)>,
+    far: BTreeSet<(Tick, u64)>,
+    blocked: BTreeSet<u64>,
+    held: BTreeSet<u64>,
+}
+
+/// The derived class-locality index (CA-08): class → that class's
+/// membership across the lanes, the blocked map, and the held set.
+/// The outer map is keyed-lookup only in production code (never
+/// iterated), so its ordering cannot reach an observable — the
+/// `witness_index` / `remaining_deps` lookup-only discipline.
+type ClassIndex = BTreeMap<EventClass, ClassMembership>;
+
 /// The event spine.
 pub struct Spine<W: World> {
     clock: Tick,
@@ -798,6 +823,32 @@ pub struct Spine<W: World> {
     /// fingerprint-invisible — the same class of state as
     /// `max_executed_index`.
     scratch_follow_ups: Vec<EventSpec>,
+    /// The derived class-locality index (CA-08/F08 — the regional
+    /// scheduler-locality index): `EventClass` → that class's
+    /// membership across both lane queues, the blocked map, and the
+    /// held set, maintained at every obligation-mutation site once
+    /// materialized. `None` — the default — is the UNMATERIALIZED
+    /// state: no class-keyed call has ever run, every maintenance
+    /// site short-circuits on a `None` check, and the generic
+    /// scheduling main path pays nothing (the `spine_allocations`
+    /// pins' scenario never materializes — the F09 adoption-boundary
+    /// discipline applied to the spine: the index is built only when
+    /// a class-keyed transition actually occurs, the first such call
+    /// rebuilding it from canonical state in one pass).
+    ///
+    /// DERIVED, never serialized, never fingerprinted (the
+    /// `held_index` / `remaining_deps` / `witness_index` precedent):
+    /// the canonical structures (queues, `blocked`, `held`) stay the
+    /// single authority; the index is a pure function of them
+    /// (rebuild-equals-maintained, pinned by test), a restored spine
+    /// starts `None` and reconstructs on its first class-keyed call,
+    /// and save bytes, fingerprints, and every statistic are
+    /// untouched by its existence. Memory cost, once live: one
+    /// `BTreeSet` entry per unfinished obligation (~the price
+    /// `witness_index` pays per captured key) — the price of
+    /// class-keyed transitions that touch only their own members;
+    /// entries vanish when a class's last member leaves.
+    class_index: Option<ClassIndex>,
 }
 
 /// Registers a freshly blocked event on every unmet dependency and
@@ -850,6 +901,101 @@ fn has_unmet_dependencies_with(unfinished: &BTreeSet<u64>, next_seq: u64, event:
         .depends_on
         .iter()
         .any(|id| !is_executed_seq_with(unfinished, next_seq, id.seq))
+}
+
+// -- the class-locality index's maintenance helpers (CA-08) ----------
+//
+// Free functions over the index alone (the
+// `register_waiters_for_unmet_into` split-borrow precedent): every
+// obligation-mutation site calls one of these behind a
+// `if let Some(index) = &mut self.class_index` gate, so an
+// unmaterialized spine — the generic scheduling main path — executes
+// one `None` check and nothing else. Each helper is O(log) in the
+// class's own membership; none allocates beyond the B-tree node a
+// genuinely new member needs (the `witness_index` price).
+
+/// Whether a class's membership has emptied in every home — the
+/// signal to drop the outer entry, keeping the index bounded by
+/// classes with LIVE members, never by classes ever seen.
+fn class_membership_is_empty(membership: &ClassMembership) -> bool {
+    membership.near.is_empty()
+        && membership.far.is_empty()
+        && membership.blocked.is_empty()
+        && membership.held.is_empty()
+}
+
+/// Records one queued member under its lane's canonical
+/// `(due, seq)` key.
+fn class_track_queued(
+    index: &mut ClassIndex,
+    class: EventClass,
+    field: Field,
+    due: Tick,
+    seq: u64,
+) {
+    let membership = index.entry(class).or_default();
+    match field {
+        Field::Near => {
+            membership.near.insert((due, seq));
+        }
+        Field::Far => {
+            membership.far.insert((due, seq));
+        }
+    }
+}
+
+/// Drops one queued member; the outer entry leaves with the class's
+/// last member anywhere.
+fn class_drop_queued(index: &mut ClassIndex, class: EventClass, field: Field, due: Tick, seq: u64) {
+    let Some(membership) = index.get_mut(&class) else {
+        return;
+    };
+    match field {
+        Field::Near => {
+            membership.near.remove(&(due, seq));
+        }
+        Field::Far => {
+            membership.far.remove(&(due, seq));
+        }
+    }
+    if class_membership_is_empty(membership) {
+        index.remove(&class);
+    }
+}
+
+/// Records one blocked member (ascending-seq canonical order comes
+/// from the set itself).
+fn class_track_blocked(index: &mut ClassIndex, class: EventClass, seq: u64) {
+    index.entry(class).or_default().blocked.insert(seq);
+}
+
+/// Drops one blocked member (the queued-field==lane invariant makes a
+/// blocked obligation's field irrelevant here — membership is
+/// lane-blind until the release path re-queues it).
+fn class_drop_blocked(index: &mut ClassIndex, class: EventClass, seq: u64) {
+    let Some(membership) = index.get_mut(&class) else {
+        return;
+    };
+    membership.blocked.remove(&seq);
+    if class_membership_is_empty(membership) {
+        index.remove(&class);
+    }
+}
+
+/// Records one held member.
+fn class_track_held(index: &mut ClassIndex, class: EventClass, seq: u64) {
+    index.entry(class).or_default().held.insert(seq);
+}
+
+/// Drops one held member.
+fn class_drop_held(index: &mut ClassIndex, class: EventClass, seq: u64) {
+    let Some(membership) = index.get_mut(&class) else {
+        return;
+    };
+    membership.held.remove(&seq);
+    if class_membership_is_empty(membership) {
+        index.remove(&class);
+    }
 }
 
 /// The constructor-time reservation for the derived
@@ -1044,6 +1190,7 @@ impl<W: World> Spine<W> {
             retention_stats: RetentionStats::default(),
             housekeeping_stats: HousekeepingStats::default(),
             scratch_follow_ups: Vec::new(),
+            class_index: None,
         }
     }
 
@@ -1335,9 +1482,24 @@ impl<W: World> Spine<W> {
             );
         }
         self.unfinished.insert(seq);
-        match event.field {
-            Field::Near => self.near_queue.push(Reverse(Pending::new(event))),
-            Field::Far => self.far_queue.push(Reverse(Pending::new(event))),
+        let pending = Pending::new(event);
+        // The class-locality index follows the insert (CA-08): one
+        // O(log) set insert per scheduled event on a spine whose
+        // index is live — the whole steady-state price of every
+        // class-keyed transition touching only its own members. A
+        // `None` index (never materialized) checks and stops.
+        if let Some(index) = self.class_index.as_mut() {
+            class_track_queued(
+                index,
+                pending.event.class,
+                pending.event.field,
+                pending.due,
+                pending.seq,
+            );
+        }
+        match pending.event.field {
+            Field::Near => self.near_queue.push(Reverse(pending)),
+            Field::Far => self.far_queue.push(Reverse(pending)),
         }
         self.stats.scheduled += 1;
         Ok(id)
@@ -1382,6 +1544,11 @@ impl<W: World> Spine<W> {
         }
         self.unfinished.insert(seq);
         self.held_index.insert((pending.due, pending.seq));
+        // The class-locality index follows the insert (CA-08) — same
+        // shape as the queued insert above.
+        if let Some(index) = self.class_index.as_mut() {
+            class_track_held(index, pending.event.class, seq);
+        }
         self.held.insert(pending.seq, pending);
         self.stats.scheduled += 1;
         self.suspension.scheduled_held_total += 1;
@@ -1463,12 +1630,14 @@ impl<W: World> Spine<W> {
             &mut self.near_queue,
             &mut self.held,
             &mut self.held_index,
+            &mut self.class_index,
             &mut matches,
         );
         suspended += Self::suspend_from_queue(
             &mut self.far_queue,
             &mut self.held,
             &mut self.held_index,
+            &mut self.class_index,
             &mut matches,
         );
         // The blocked arm of the same bulk-partition shape (A08a): one
@@ -1501,6 +1670,12 @@ impl<W: World> Spine<W> {
                         self.waiting_on.remove(&dep.seq);
                     }
                 }
+            }
+            // The class-locality index follows the move (CA-08):
+            // blocked membership leaves, held membership arrives.
+            if let Some(index) = self.class_index.as_mut() {
+                class_drop_blocked(index, event.class, seq);
+                class_track_held(index, event.class, seq);
             }
             let pending = Pending::new(event);
             self.held_index.insert((pending.due, pending.seq));
@@ -1679,10 +1854,28 @@ impl<W: World> Spine<W> {
         // executed-membership answers are identical).
         let mut removed = 0u64;
         for Reverse(pending) in near_dropped {
+            if let Some(index) = self.class_index.as_mut() {
+                class_drop_queued(
+                    index,
+                    pending.event.class,
+                    Field::Near,
+                    pending.due,
+                    pending.seq,
+                );
+            }
             self.unfinished.remove(&pending.seq);
             removed += 1;
         }
         for Reverse(pending) in far_dropped {
+            if let Some(index) = self.class_index.as_mut() {
+                class_drop_queued(
+                    index,
+                    pending.event.class,
+                    Field::Far,
+                    pending.due,
+                    pending.seq,
+                );
+            }
             self.unfinished.remove(&pending.seq);
             removed += 1;
         }
@@ -1702,12 +1895,18 @@ impl<W: World> Spine<W> {
                         }
                     }
                 }
+                if let Some(index) = self.class_index.as_mut() {
+                    class_drop_blocked(index, event.class, seq);
+                }
                 self.unfinished.remove(&seq);
                 removed += 1;
             }
         }
         for seq in held_drop {
             if let Some(pending) = self.held.remove(&seq) {
+                if let Some(index) = self.class_index.as_mut() {
+                    class_drop_held(index, pending.event.class, seq);
+                }
                 self.held_index.remove(&(pending.due, pending.seq));
                 self.unfinished.remove(&seq);
                 removed += 1;
@@ -1716,6 +1915,9 @@ impl<W: World> Spine<W> {
         let mut inserted = 0u32;
         for event in events {
             let pending = Pending::new(event);
+            if let Some(index) = self.class_index.as_mut() {
+                class_track_held(index, pending.event.class, pending.seq);
+            }
             self.held_index.insert((pending.due, pending.seq));
             self.unfinished.insert(pending.seq);
             self.held.insert(pending.seq, pending);
@@ -1832,10 +2034,22 @@ impl<W: World> Spine<W> {
         });
         for (seq, pending) in extracted {
             self.held_index.remove(&(pending.due, pending.seq));
+            // The class-locality index follows the move (CA-08):
+            // held membership leaves; the routing arm decides which
+            // set receives it.
+            let event_class = pending.event.class;
+            let event_field = pending.event.field;
+            let event_due = pending.due;
+            if let Some(index) = self.class_index.as_mut() {
+                class_drop_held(index, event_class, seq);
+            }
             if !has_unmet_dependencies_with(unfinished, next_seq, &pending.event) {
-                match pending.event.field {
+                match event_field {
                     Field::Near => self.near_queue.push(Reverse(pending)),
                     Field::Far => self.far_queue.push(Reverse(pending)),
+                }
+                if let Some(index) = self.class_index.as_mut() {
+                    class_track_queued(index, event_class, event_field, event_due, seq);
                 }
             } else {
                 let remaining = register_waiters_for_unmet_into(
@@ -1852,6 +2066,9 @@ impl<W: World> Spine<W> {
                 self.housekeeping_stats.dependency_registrations += u64::from(remaining);
                 self.remaining_deps.insert(seq, remaining);
                 self.blocked.insert(seq, pending.event);
+                if let Some(index) = self.class_index.as_mut() {
+                    class_track_blocked(index, event_class, seq);
+                }
             }
             resumed += 1;
         }
@@ -1886,6 +2103,7 @@ impl<W: World> Spine<W> {
         queue: &mut BinaryHeap<Reverse<Pending>>,
         held: &mut BTreeMap<u64, Pending>,
         held_index: &mut BTreeSet<(Tick, u64)>,
+        class_index: &mut Option<ClassIndex>,
         matches: &mut impl FnMut(&ObligationView) -> bool,
     ) -> u32 {
         let mut suspended = 0u32;
@@ -1899,6 +2117,21 @@ impl<W: World> Spine<W> {
         });
         for Reverse(pending) in extracted {
             held_index.insert((pending.due, pending.seq));
+            // The class-locality index follows the move (CA-08): the
+            // pending's own field names its lane (the
+            // queued-field==lane invariant — every push site pushes
+            // by the event's field), so the queued membership leaves
+            // the right set wherever this bulk pass runs.
+            if let Some(index) = class_index {
+                class_drop_queued(
+                    index,
+                    pending.event.class,
+                    pending.event.field,
+                    pending.due,
+                    pending.seq,
+                );
+                class_track_held(index, pending.event.class, pending.seq);
+            }
             held.insert(pending.seq, pending);
             suspended += 1;
         }
@@ -1950,10 +2183,21 @@ impl<W: World> Spine<W> {
         );
         let mut reclassified = moved.len() as u32;
         for mut pending in moved {
+            let source_field = pending.event.field;
+            let (due, seq, class) = (pending.due, pending.seq, pending.event.class);
             pending.event.field = field;
             match field {
                 Field::Near => self.near_queue.push(Reverse(pending)),
                 Field::Far => self.far_queue.push(Reverse(pending)),
+            }
+            // The class-locality index follows the lane change
+            // (CA-08): queued membership moves between the lane sets
+            // under the same canonical key. The blocked arm below
+            // changes only `field` — the blocked set is lane-blind,
+            // so its membership is already correct.
+            if let Some(index) = self.class_index.as_mut() {
+                class_drop_queued(index, class, source_field, due, seq);
+                class_track_queued(index, class, field, due, seq);
             }
         }
         for event in self.blocked.values_mut() {
@@ -2000,6 +2244,334 @@ impl<W: World> Spine<W> {
             moved.push(pending);
         }
         *queue = BinaryHeap::from(items);
+    }
+
+    // --------------------------- CA-08: the class-keyed indexed forms
+
+    /// Materializes the class-locality index from canonical state —
+    /// the F09 adoption-boundary discipline applied to the spine: the
+    /// build is paid once, by the FIRST class-keyed call, and every
+    /// mutation site maintains the index from then on. Idempotent;
+    /// the one-pass rebuild is the same shape the restore path's
+    /// first class-keyed call performs (wire-invisibility).
+    fn materialize_class_index(&mut self) {
+        if self.class_index.is_some() {
+            return;
+        }
+        let mut index: ClassIndex = BTreeMap::new();
+        for Reverse(pending) in self.near_queue.iter() {
+            class_track_queued(
+                &mut index,
+                pending.event.class,
+                Field::Near,
+                pending.due,
+                pending.seq,
+            );
+        }
+        for Reverse(pending) in self.far_queue.iter() {
+            class_track_queued(
+                &mut index,
+                pending.event.class,
+                Field::Far,
+                pending.due,
+                pending.seq,
+            );
+        }
+        for (seq, event) in &self.blocked {
+            class_track_blocked(&mut index, event.class, *seq);
+        }
+        for (seq, pending) in &self.held {
+            class_track_held(&mut index, pending.event.class, *seq);
+        }
+        self.class_index = Some(index);
+    }
+
+    /// Suspends every queued and blocked obligation of `class` into
+    /// the held set — the INDEXED form of
+    /// [`Self::suspend_matching`] with the predicate
+    /// `|view| view.class == class` (CA-08/F08: the known
+    /// region/identity transitions). Answers are IDENTICAL to the
+    /// predicate form's: the same entries move with full identity,
+    /// the same count returns, the same statistics move — pinned by
+    /// the equivalence battery across fixture shapes, save/restore
+    /// boundaries included.
+    ///
+    /// WHY NO SORT (the audit's own distinction — "ordering is
+    /// required for the public stateful predicate"): this path runs
+    /// no public predicate. The selection is the membership itself —
+    /// exactly the predicate form's extension — and every downstream
+    /// observable (the moved multiset, the held keys, save bytes,
+    /// fingerprints, the returned count) derives from canonical
+    /// keys, never from visitation order. The lane partition is the
+    /// A08a bulk shape minus the canonical sort: `into_vec`,
+    /// membership-keyed `extract_if`, `BinaryHeap::from` — zero
+    /// scratch allocation. A class with no queued members in a lane
+    /// costs ONE set lookup (the early exit — the dormant-region
+    /// common case); the buffer partition that remains when members
+    /// exist is the `BinaryHeap`'s own bound (no keyed removal
+    /// exists for a heap; the O(N log N) sort and the per-entry
+    /// predicate calls are what this path removes).
+    pub fn suspend_class(&mut self, class: EventClass) -> u32 {
+        self.materialize_class_index();
+        // The member sets move OUT with the entries they name
+        // (`mem::take` — allocation-free, and the post-transition
+        // membership is exactly the emptied set, the held arm
+        // re-filling `held` below).
+        let mut near_members = BTreeSet::new();
+        let mut far_members = BTreeSet::new();
+        let mut blocked_members = BTreeSet::new();
+        if let Some(membership) = self.class_index.as_mut().and_then(|i| i.get_mut(&class)) {
+            near_members = std::mem::take(&mut membership.near);
+            far_members = std::mem::take(&mut membership.far);
+            blocked_members = std::mem::take(&mut membership.blocked);
+        }
+        let mut suspended = 0u32;
+        suspended += Self::suspend_class_queue(
+            &mut self.near_queue,
+            &mut self.held,
+            &mut self.held_index,
+            &mut self.class_index,
+            class,
+            &mut near_members,
+        );
+        suspended += Self::suspend_class_queue(
+            &mut self.far_queue,
+            &mut self.held,
+            &mut self.held_index,
+            &mut self.class_index,
+            class,
+            &mut far_members,
+        );
+        // The blocked arm — the same mechanics as the predicate
+        // form's, visited in the same canonical ascending-seq order
+        // (the member set iterates it).
+        let unfinished = &self.unfinished;
+        let next_seq = self.next_seq;
+        for seq in blocked_members {
+            if let Some(event) = self.blocked.remove(&seq) {
+                // Leave the dependency-release path hold-unaware: drop
+                // this event's registrations on its unexecuted deps.
+                for dep in &event.depends_on {
+                    if !is_executed_seq_with(unfinished, next_seq, dep.seq)
+                        && let Some(waiters) = self.waiting_on.get_mut(&dep.seq)
+                    {
+                        waiters.retain(|&waiter| waiter != seq);
+                        if waiters.is_empty() {
+                            self.waiting_on.remove(&dep.seq);
+                        }
+                    }
+                }
+                if let Some(index) = self.class_index.as_mut() {
+                    class_track_held(index, event.class, seq);
+                }
+                let pending = Pending::new(event);
+                self.held_index.insert((pending.due, pending.seq));
+                self.held.insert(pending.seq, pending);
+                suspended += 1;
+            }
+        }
+        // The derived remaining-dependency counts follow the blocked
+        // map's lifecycle exactly, as in the predicate form.
+        let blocked = &self.blocked;
+        self.remaining_deps
+            .retain(|&seq, _| blocked.contains_key(&seq));
+        self.suspension.suspended_total += u64::from(suspended);
+        suspended
+    }
+
+    /// Bulk-partitions one lane by class membership — the indexed
+    /// suspend's queue arm (see [`Self::suspend_class`]). The
+    /// member set is already TAKEN from the index (the entries it
+    /// names are leaving), so this pass performs no index removal —
+    /// only the held-side insertions.
+    fn suspend_class_queue(
+        queue: &mut BinaryHeap<Reverse<Pending>>,
+        held: &mut BTreeMap<u64, Pending>,
+        held_index: &mut BTreeSet<(Tick, u64)>,
+        class_index: &mut Option<ClassIndex>,
+        class: EventClass,
+        members: &mut BTreeSet<(Tick, u64)>,
+    ) -> u32 {
+        if members.is_empty() {
+            // The early exit: a class with no queued members in this
+            // lane never drains, sorts, or re-heaps it.
+            return 0;
+        }
+        let mut suspended = 0u32;
+        let mut items = std::mem::take(queue).into_vec();
+        let extracted = items.extract_if(.., |Reverse(pending)| {
+            members.contains(&(pending.due, pending.seq))
+        });
+        for Reverse(pending) in extracted {
+            held_index.insert((pending.due, pending.seq));
+            if let Some(index) = class_index {
+                class_track_held(index, class, pending.seq);
+            }
+            held.insert(pending.seq, pending);
+            suspended += 1;
+        }
+        *queue = BinaryHeap::from(items);
+        suspended
+    }
+
+    /// Returns matching held obligations of `class` to pending state
+    /// — the INDEXED form of [`Self::resume_matching`] with the
+    /// predicate `|view| view.class == class` (CA-08). Identity,
+    /// routing, re-parking, statistics, and the returned count are
+    /// IDENTICAL to the predicate form's; the visited order is the
+    /// same canonical ascending-seq order (the member set iterates
+    /// it), and the held map's keyed removal makes the walk FLAT in
+    /// the unrelated held population — O(log + own) per member, no
+    /// scan of foreign entries.
+    pub fn resume_class(&mut self, class: EventClass) -> u32 {
+        self.materialize_class_index();
+        let mut held_members = BTreeSet::new();
+        if let Some(membership) = self.class_index.as_mut().and_then(|i| i.get_mut(&class)) {
+            held_members = std::mem::take(&mut membership.held);
+        }
+        let unfinished = &self.unfinished;
+        let next_seq = self.next_seq;
+        let mut resumed = 0u32;
+        for seq in held_members {
+            let Some(pending) = self.held.remove(&seq) else {
+                continue;
+            };
+            self.held_index.remove(&(pending.due, pending.seq));
+            let event_class = pending.event.class;
+            let event_field = pending.event.field;
+            let event_due = pending.due;
+            if let Some(index) = self.class_index.as_mut() {
+                class_drop_held(index, event_class, seq);
+            }
+            if !has_unmet_dependencies_with(unfinished, next_seq, &pending.event) {
+                match event_field {
+                    Field::Near => self.near_queue.push(Reverse(pending)),
+                    Field::Far => self.far_queue.push(Reverse(pending)),
+                }
+                if let Some(index) = self.class_index.as_mut() {
+                    class_track_queued(index, event_class, event_field, event_due, seq);
+                }
+            } else {
+                let remaining = register_waiters_for_unmet_into(
+                    &mut self.waiting_on,
+                    seq,
+                    &pending.event,
+                    |dep| dep < next_seq && !unfinished.contains(&dep),
+                );
+                self.housekeeping_stats.dependency_registrations += u64::from(remaining);
+                self.remaining_deps.insert(seq, remaining);
+                self.blocked.insert(seq, pending.event);
+                if let Some(index) = self.class_index.as_mut() {
+                    class_track_blocked(index, event_class, seq);
+                }
+            }
+            resumed += 1;
+        }
+        self.suspension.resumed_total += u64::from(resumed);
+        resumed
+    }
+
+    /// Moves every queued and blocked obligation of `class` to the
+    /// target lane — the INDEXED form of [`Self::reclassify_matching`]
+    /// with the predicate `|view| view.class == class` (CA-08).
+    /// Identity, lane routing, the blocked field change, and the
+    /// returned count are IDENTICAL to the predicate form's. The
+    /// source-lane partition is the same membership-keyed bulk shape
+    /// as [`Self::suspend_class`] (no canonical sort — no public
+    /// predicate runs; the same-lane skip and the empty-membership
+    /// early exit included).
+    pub fn reclassify_class(&mut self, class: EventClass, field: Field) -> u32 {
+        self.materialize_class_index();
+        let mut moved: Vec<Pending> = Vec::new();
+        for source in [Field::Near, Field::Far] {
+            if source == field {
+                continue;
+            }
+            let mut members = BTreeSet::new();
+            if let Some(membership) = self.class_index.as_mut().and_then(|i| i.get_mut(&class)) {
+                members = std::mem::take(match source {
+                    Field::Near => &mut membership.near,
+                    Field::Far => &mut membership.far,
+                });
+            }
+            if members.is_empty() {
+                continue;
+            }
+            let queue = match source {
+                Field::Near => &mut self.near_queue,
+                Field::Far => &mut self.far_queue,
+            };
+            let mut items = std::mem::take(queue).into_vec();
+            let extracted = items.extract_if(.., |Reverse(p)| members.contains(&(p.due, p.seq)));
+            for Reverse(pending) in extracted {
+                moved.push(pending);
+            }
+            *queue = BinaryHeap::from(items);
+        }
+        let mut reclassified = moved.len() as u32;
+        for mut pending in moved {
+            let source_field = pending.event.field;
+            let (due, seq, event_class) = (pending.due, pending.seq, pending.event.class);
+            pending.event.field = field;
+            match field {
+                Field::Near => self.near_queue.push(Reverse(pending)),
+                Field::Far => self.far_queue.push(Reverse(pending)),
+            }
+            if let Some(index) = self.class_index.as_mut() {
+                class_drop_queued(index, event_class, source_field, due, seq);
+                class_track_queued(index, event_class, field, due, seq);
+            }
+        }
+        // The blocked arm: the class's blocked members, ascending —
+        // the same selection and field change as the predicate form.
+        // The member set is taken and RESTORED (blocked membership
+        // is unchanged by a lane change), so the pass borrows nothing
+        // from the index while mutating `blocked`.
+        let mut blocked_members = BTreeSet::new();
+        if let Some(membership) = self.class_index.as_mut().and_then(|i| i.get_mut(&class)) {
+            blocked_members = std::mem::take(&mut membership.blocked);
+        }
+        for seq in blocked_members.iter() {
+            if let Some(event) = self.blocked.get_mut(seq)
+                && event.field != field
+            {
+                event.field = field;
+                reclassified += 1;
+            }
+        }
+        if let Some(membership) = self.class_index.as_mut().and_then(|i| i.get_mut(&class)) {
+            membership.blocked = blocked_members;
+        }
+        self.suspension.reclassified_total += u64::from(reclassified);
+        reclassified
+    }
+
+    /// Read-only held-obligation views of ONE class, in canonical seq
+    /// order — the indexed form of `held_view()` plus a class filter
+    /// (CA-08; the region director's deactivation gathering). FLAT in
+    /// the unrelated held population once the index is live: the
+    /// member seqs resolve through the held map's keyed lookup,
+    /// O(log + own) per member. Before materialization the scan form
+    /// runs — identical output by the same equivalence battery, so a
+    /// cold caller pays the scan exactly once (the deactivation
+    /// cadence suspends first, which materializes).
+    pub fn held_class_view(&self, class: EventClass) -> Vec<ObligationView<'_>> {
+        if let Some(membership) = self
+            .class_index
+            .as_ref()
+            .and_then(|index| index.get(&class))
+        {
+            return membership
+                .held
+                .iter()
+                .filter_map(|seq| self.held.get(seq))
+                .map(|pending| pending.view(ObligationLocation::Held))
+                .collect();
+        }
+        self.held_view()
+            .into_iter()
+            .filter(|view| view.class == class)
+            .collect()
     }
 
     // -------------------------------------------------------------- ticking
@@ -2810,6 +3382,13 @@ impl<W: World> Spine<W> {
                 Field::Far => self.far_queue.pop(),
             }
             .expect("queue head was just peeked");
+            // The class-locality index follows the pop (CA-08): the
+            // entry leaves this lane whichever arm takes it —
+            // execution (no membership anywhere) or a park (the
+            // blocked set re-registers it below).
+            if let Some(index) = self.class_index.as_mut() {
+                class_drop_queued(index, pending.event.class, field, pending.due, pending.seq);
+            }
             let event = pending.event;
             if !self.has_unmet_dependencies(&event) {
                 // The execution's synchronous waiter release is
@@ -2839,7 +3418,12 @@ impl<W: World> Spine<W> {
                 }
                 let remaining = self.register_waiters_for_unmet(event.id.seq, &event);
                 self.remaining_deps.insert(event.id.seq, remaining);
+                let (parked_class, parked_seq) = (event.class, event.id.seq);
                 self.blocked.insert(event.id.seq, event);
+                // The class-locality index follows the park (CA-08).
+                if let Some(index) = self.class_index.as_mut() {
+                    class_track_blocked(index, parked_class, parked_seq);
+                }
                 // One blocked park (the pop + unmet scan +
                 // registration): one housekeeping unit (B01). The
                 // registration fan-out the park performs beyond the
@@ -3100,6 +3684,13 @@ impl<W: World> Spine<W> {
             self.diag
                 .log(Level::Trace, format!("unblocked {} (due {due})", event.id));
         }
+        // The class-locality index follows the release (CA-08):
+        // blocked membership leaves, queued membership arrives under
+        // the event's own field (the queued-field==lane invariant).
+        if let Some(index) = self.class_index.as_mut() {
+            class_drop_blocked(index, event.class, seq);
+            class_track_queued(index, event.class, event.field, due, seq);
+        }
         match event.field {
             Field::Near => self.near_queue.push(Reverse(Pending::new(event))),
             Field::Far => self.far_queue.push(Reverse(Pending::new(event))),
@@ -3179,12 +3770,14 @@ fn fingerprint_deps(fp: &mut Fingerprinter, event: &Event) {
 // (execution order). Derived — `known` (dense allocation), `executed`
 // (the complement of unfinished), `waiting_on`, `held_index`,
 // `max_executed_index`, `remaining_deps` (B01's derived
-// remaining-dependency counts) — is rebuilt from those canonical sources
-// through the same code paths the live spine uses. Observational —
-// `LaneReport`, `LaneTotals`, `SuspensionStats`, `RetentionStats`,
-// `Diagnostics` — is not logical state: a restored spine resumes them at
-// defaults, they never affect scheduling, accounting, or fingerprints,
-// and the boundary is documented in the wire spec. The retention POLICY
+// remaining-dependency counts), `class_index` (CA-08's class-locality
+// membership, rebuilt on the first class-keyed call) — is rebuilt from
+// those canonical sources through the same code paths the live spine
+// uses. Observational — `LaneReport`, `LaneTotals`, `SuspensionStats`,
+// `RetentionStats`, `Diagnostics` — is not logical state: a restored
+// spine resumes them at defaults, they never affect scheduling,
+// accounting, or fingerprints, and the boundary is documented in the
+// wire spec. The retention POLICY
 // (A22-core) is driver configuration in the same never-serialized class:
 // a restored spine resumes with no policy until re-configured, while
 // compaction the policy already performed persists in the
@@ -3568,6 +4161,10 @@ impl<W: SaveWorld> Spine<W> {
             retention_stats: RetentionStats::default(),
             housekeeping_stats: HousekeepingStats::default(),
             scratch_follow_ups: Vec::new(),
+            // Wire-invisible (CA-08): the class-locality index never
+            // reaches the save — a restored spine reconstructs it on
+            // its first class-keyed call, from these canonical parts.
+            class_index: None,
         };
 
         // Queues: heap layout is rebuild-order-dependent and invisible —
@@ -6387,5 +6984,973 @@ mod tests {
                 assert_eq!(moves, vec![200, 200, 200]);
             }
         }
+    }
+
+    // -------------------------------------- CA-08 class-index tests (F08)
+
+    /// The fixture's target class — a foreign tag like any other
+    /// (the spine treats classes as opaque; the tests only need one
+    /// stable key the foreign population never uses).
+    const TARGET_CLASS: EventClass = EventClass::new(7);
+
+    /// The absent class every "materialize without moving anything"
+    /// call names (no fixture schedules class `u16::MAX`).
+    const ABSENT_CLASS: EventClass = EventClass::new(u16::MAX);
+
+    /// The equivalence battery's shared dependency anchors, so the
+    /// park/release shapes can reference them by identity.
+    struct ClassFixtureDeps {
+        /// Due at tick 2 — resolves inside the fixture's two driven
+        /// ticks (the partial-release and full-release groups key on
+        /// it).
+        resolves: EventId,
+        /// Due far in the future — never resolves inside any fixture
+        /// phase (the still-blocked groups key on it).
+        never: EventId,
+        /// Due at tick 2 in the near lane (the second resolver).
+        resolves_near: EventId,
+    }
+
+    /// Builds one CA-08 fixture twin. Deterministic seq allocation:
+    /// the three dependency anchors first, then the shape's entries —
+    /// identical on every call, so the three twins of one shape start
+    /// byte-identical. Shapes (the CA-03 lane's suspension templates):
+    ///
+    /// * 0 — the balanced mix: foreign queued in both lanes with
+    ///   interleaved dues, target queued in both lanes, target and
+    ///   foreign held, target blocked on the never-resolving anchor.
+    /// * 1 — high fan-in: sixteen target entries all blocked on the
+    ///   SAME never-resolving anchor (one waiter list, sixteen
+    ///   registrations), plus foreign queued.
+    /// * 2 — partial release: target groups with `[resolves, never]`
+    ///   (parks, then partially RELEASED through the release path —
+    ///   remaining 1, still blocked), `[resolves, resolves_near]`
+    ///   (parks, then fully released and re-queued), and
+    ///   `[never, resolves_near]` (parks, partially released).
+    /// * 3 — the empty class: the target has no member anywhere.
+    /// * 4 — all-held: the target lives only in the held set (the
+    ///   double-deactivation shape).
+    ///
+    /// Two ticks are driven so the parks and the partial/full
+    /// releases happen BEFORE the twins diverge in driving style.
+    fn build_class_shape(shape: usize) -> (Spine<SaveableNoopWorld>, ClassFixtureDeps) {
+        let mut spine = Spine::new(SaveableNoopWorld, 200);
+        let deps = ClassFixtureDeps {
+            resolves: spine
+                .schedule(spec(3, Field::Far, 2, 0))
+                .expect("anchor scheduling is valid"),
+            never: spine
+                .schedule(spec(4, Field::Far, 10_001, 0))
+                .expect("anchor scheduling is valid"),
+            resolves_near: spine
+                .schedule(spec(5, Field::Near, 2, 0))
+                .expect("anchor scheduling is valid"),
+        };
+        let target_at = |due: u64, payload: u64, field: Field, depends: Vec<EventId>| {
+            EventSpec::new(
+                TARGET_CLASS,
+                Schedule::AtLogicalTime { due: Tick(due) },
+                payload,
+            )
+            .in_field(field)
+            .with_dependencies(depends)
+        };
+        match shape {
+            0 => {
+                for i in 0..56u64 {
+                    let class = u16::try_from(i % 7).expect("class fits u16");
+                    let field = if i.is_multiple_of(2) {
+                        Field::Near
+                    } else {
+                        Field::Far
+                    };
+                    spine
+                        .schedule(spec(class, field, 100 + (i % 7) * 10, i))
+                        .expect("fixture scheduling is valid");
+                }
+                for i in 0..10u64 {
+                    let field = if i.is_multiple_of(2) {
+                        Field::Near
+                    } else {
+                        Field::Far
+                    };
+                    spine
+                        .schedule(spec(7, field, 100 + (i % 5) * 20, 1_000 + i))
+                        .expect("fixture scheduling is valid");
+                }
+                for i in 0..4u64 {
+                    spine
+                        .schedule_held(spec(7, Field::Near, 200 + i * 10, 2_000 + i))
+                        .expect("held scheduling is valid");
+                }
+                for i in 0..8u64 {
+                    spine
+                        .schedule_held(spec(
+                            u16::try_from(i % 6).expect("class fits u16"),
+                            Field::Far,
+                            210 + i * 10,
+                            3_000 + i,
+                        ))
+                        .expect("held scheduling is valid");
+                }
+                for i in 0..3u64 {
+                    spine
+                        .schedule(target_at(
+                            1,
+                            4_000 + i,
+                            Field::Near,
+                            vec![deps.resolves, deps.never],
+                        ))
+                        .expect("fixture scheduling is valid");
+                }
+            }
+            1 => {
+                for i in 0..16u64 {
+                    spine
+                        .schedule(target_at(
+                            1,
+                            5_000 + i,
+                            if i.is_multiple_of(2) {
+                                Field::Near
+                            } else {
+                                Field::Far
+                            },
+                            vec![deps.never, deps.never],
+                        ))
+                        .expect("fixture scheduling is valid");
+                }
+                for i in 0..24u64 {
+                    spine
+                        .schedule(spec(
+                            u16::try_from(i % 6).expect("class fits u16"),
+                            if i.is_multiple_of(3) {
+                                Field::Far
+                            } else {
+                                Field::Near
+                            },
+                            100 + (i % 5) * 10,
+                            6_000 + i,
+                        ))
+                        .expect("fixture scheduling is valid");
+                }
+            }
+            2 => {
+                for i in 0..4u64 {
+                    spine
+                        .schedule(target_at(
+                            1,
+                            7_000 + i,
+                            Field::Near,
+                            vec![deps.resolves, deps.never],
+                        ))
+                        .expect("fixture scheduling is valid");
+                }
+                for i in 0..4u64 {
+                    spine
+                        .schedule(target_at(
+                            1,
+                            7_100 + i,
+                            Field::Far,
+                            vec![deps.resolves, deps.resolves_near],
+                        ))
+                        .expect("fixture scheduling is valid");
+                }
+                for i in 0..4u64 {
+                    spine
+                        .schedule(target_at(
+                            1,
+                            7_200 + i,
+                            Field::Near,
+                            vec![deps.never, deps.resolves_near],
+                        ))
+                        .expect("fixture scheduling is valid");
+                }
+                for i in 0..20u64 {
+                    spine
+                        .schedule(spec(
+                            u16::try_from(i % 6).expect("class fits u16"),
+                            if i.is_multiple_of(4) {
+                                Field::Far
+                            } else {
+                                Field::Near
+                            },
+                            100 + (i % 6) * 10,
+                            7_300 + i,
+                        ))
+                        .expect("fixture scheduling is valid");
+                }
+            }
+            3 => {
+                for i in 0..40u64 {
+                    spine
+                        .schedule(spec(
+                            u16::try_from(i % 6).expect("class fits u16"),
+                            if i.is_multiple_of(2) {
+                                Field::Near
+                            } else {
+                                Field::Far
+                            },
+                            100 + (i % 8) * 10,
+                            8_000 + i,
+                        ))
+                        .expect("fixture scheduling is valid");
+                }
+            }
+            4 => {
+                for i in 0..8u64 {
+                    spine
+                        .schedule_held(spec(7, Field::Near, 150 + i * 10, 9_000 + i))
+                        .expect("held scheduling is valid");
+                }
+                for i in 0..30u64 {
+                    spine
+                        .schedule(spec(
+                            u16::try_from(i % 6).expect("class fits u16"),
+                            if i.is_multiple_of(2) {
+                                Field::Near
+                            } else {
+                                Field::Far
+                            },
+                            100 + (i % 7) * 10,
+                            9_100 + i,
+                        ))
+                        .expect("fixture scheduling is valid");
+                }
+            }
+            other => panic!("unknown CA-08 fixture shape {other}"),
+        }
+        spine.run_ticks(2);
+        (spine, deps)
+    }
+
+    /// The from-scratch recomputation of the class index from
+    /// canonical state — the test-local mirror of
+    /// `materialize_class_index` (the `rebuilt_witness_index`
+    /// precedent): the maintained index must equal it at every
+    /// compared boundary, on the indexed-driven lineage AND on the
+    /// generic-driven lineage with the index live.
+    fn rebuilt_class_index(spine: &Spine<SaveableNoopWorld>) -> ClassIndex {
+        let mut index: ClassIndex = BTreeMap::new();
+        for Reverse(pending) in spine.near_queue.iter() {
+            class_track_queued(
+                &mut index,
+                pending.event.class,
+                Field::Near,
+                pending.due,
+                pending.seq,
+            );
+        }
+        for Reverse(pending) in spine.far_queue.iter() {
+            class_track_queued(
+                &mut index,
+                pending.event.class,
+                Field::Far,
+                pending.due,
+                pending.seq,
+            );
+        }
+        for (seq, event) in &spine.blocked {
+            class_track_blocked(&mut index, event.class, *seq);
+        }
+        for (seq, pending) in &spine.held {
+            class_track_held(&mut index, pending.event.class, *seq);
+        }
+        index
+    }
+
+    /// The full observable comparison across the three twins: the
+    /// canonical save bytes (which cover clock, frontier, every Stats
+    /// counter, both lanes, the blocked and held sets, the ledger,
+    /// and the world), the lane/held/engine fingerprint domains, the
+    /// never-fingerprinted observational counters (suspension and
+    /// housekeeping — the CA-03 semantics must move identically),
+    /// and the coarse counts.
+    fn assert_class_twin_step(
+        generic: &Spine<SaveableNoopWorld>,
+        generic_live: &Spine<SaveableNoopWorld>,
+        indexed: &Spine<SaveableNoopWorld>,
+        shape: usize,
+        boundary: &str,
+    ) {
+        let bytes = generic.save_bytes();
+        assert_eq!(
+            generic_live.save_bytes(),
+            bytes,
+            "shape {shape} {boundary}: the generic path with a live index is byte-identical"
+        );
+        assert_eq!(
+            indexed.save_bytes(),
+            bytes,
+            "shape {shape} {boundary}: the indexed path is byte-identical"
+        );
+        for (label, spine) in [("generic-live", generic_live), ("indexed", indexed)] {
+            assert_eq!(
+                spine.lane_fingerprint(),
+                generic.lane_fingerprint(),
+                "shape {shape} {boundary}: {label} lane fingerprint"
+            );
+            assert_eq!(
+                spine.held_fingerprint(),
+                generic.held_fingerprint(),
+                "shape {shape} {boundary}: {label} held fingerprint"
+            );
+            assert_eq!(
+                spine.engine_fingerprint(),
+                generic.engine_fingerprint(),
+                "shape {shape} {boundary}: {label} engine fingerprint"
+            );
+            assert_eq!(
+                spine.suspension_stats(),
+                generic.suspension_stats(),
+                "shape {shape} {boundary}: {label} suspension stats"
+            );
+            assert_eq!(
+                spine.housekeeping_stats(),
+                generic.housekeeping_stats(),
+                "shape {shape} {boundary}: {label} housekeeping stats"
+            );
+            assert_eq!(
+                (
+                    spine.pending_count(),
+                    spine.blocked_count(),
+                    spine.held_count(),
+                    spine.clock()
+                ),
+                (
+                    generic.pending_count(),
+                    generic.blocked_count(),
+                    generic.held_count(),
+                    generic.clock()
+                ),
+                "shape {shape} {boundary}: {label} coarse counts"
+            );
+        }
+    }
+
+    /// The generic suspension predicate's visitation record:
+    /// `(phase, due, seq, class)` with phase 0 = queued-near,
+    /// 1 = queued-far, 2 = blocked, 3 = held.
+    type ClassVisit = (u8, u64, u64, u16);
+
+    fn visit_phase(view: &ObligationView) -> u8 {
+        match (view.location, view.field) {
+            (ObligationLocation::Queued, Field::Near) => 0,
+            (ObligationLocation::Queued, Field::Far) => 1,
+            (ObligationLocation::Blocked, _) => 2,
+            (ObligationLocation::Held, _) => 3,
+        }
+    }
+
+    /// IA-02's canonicity discipline, restated for the battery: the
+    /// generic predicate's visits arrive near-first then far, each
+    /// lane ascending `(due, seq)`, then the blocked set ascending
+    /// seq — the index's existence (and liveness) must never perturb
+    /// this order.
+    fn assert_canonical_class_visitation(visits: &[ClassVisit], context: &str) {
+        let mut phase = 0u8;
+        let mut last: Option<(u64, u64)> = None;
+        for &(visited_phase, due, seq, _) in visits {
+            assert!(
+                visited_phase >= phase,
+                "{context}: phase order near→far→blocked/held violated at ({visited_phase}, {due}, {seq})"
+            );
+            if visited_phase != phase {
+                phase = visited_phase;
+                last = None;
+            }
+            if let Some((last_due, last_seq)) = last {
+                let ascending = if phase <= 1 {
+                    (due, seq) > (last_due, last_seq)
+                } else {
+                    seq > last_seq
+                };
+                assert!(
+                    ascending,
+                    "{context}: phase {phase} visitation not canonical at ({due}, {seq}) after ({last_due}, {last_seq})"
+                );
+            }
+            last = Some((due, seq));
+        }
+    }
+
+    /// THE EQUIVALENCE PROOF (the lane's first mandatory test): one
+    /// logical transition sequence — suspend, save/restore boundary,
+    /// resume, reclassify, re-suspend, execution ticks — applied to
+    /// three byte-identical twins of every fixture shape: the
+    /// generic predicate APIs (index never materialized), the SAME
+    /// generic APIs with the index live (the coexistence proof — the
+    /// general path's own maintenance sites keep it exact), and the
+    /// indexed APIs. Every observable — canonical save bytes, all
+    /// three fingerprint domains, suspension AND housekeeping
+    /// counters, counts — is identical at every boundary; the
+    /// generic predicate's visitation is canonical and identical
+    /// whether or not the index is live; and both live lineages'
+    /// maintained indexes equal the from-scratch rebuild (the
+    /// rebuild-equals-maintained invariant).
+    #[test]
+    fn class_indexed_transitions_match_the_predicate_forms_bit_for_bit() {
+        for shape in 0..5usize {
+            let (mut generic, _) = build_class_shape(shape);
+            let (mut generic_live, _) = build_class_shape(shape);
+            let (mut indexed, _) = build_class_shape(shape);
+            assert!(
+                generic.class_index.is_none(),
+                "shape {shape}: the plain twin never materializes"
+            );
+            // Materialize the second generic twin WITHOUT moving
+            // anything (an absent class: build + early exit).
+            generic_live.suspend_class(ABSENT_CLASS);
+            assert!(generic_live.class_index.is_some());
+
+            // Phase 1 — suspend, with the visitation recorded on both
+            // generic twins.
+            let mut visits: Vec<ClassVisit> = Vec::new();
+            let mut visits_live: Vec<ClassVisit> = Vec::new();
+            let g_count = generic.suspend_matching(|view| {
+                visits.push((
+                    visit_phase(view),
+                    view.due.as_u64(),
+                    view.id.seq,
+                    view.class.0,
+                ));
+                view.class == TARGET_CLASS
+            });
+            let g2_count = generic_live.suspend_matching(|view| {
+                visits_live.push((
+                    visit_phase(view),
+                    view.due.as_u64(),
+                    view.id.seq,
+                    view.class.0,
+                ));
+                view.class == TARGET_CLASS
+            });
+            let i_count = indexed.suspend_class(TARGET_CLASS);
+            assert_eq!(
+                g2_count, g_count,
+                "shape {shape}: the live-index generic twin moves the same count"
+            );
+            assert_eq!(
+                i_count, g_count,
+                "shape {shape}: the indexed suspend returns the predicate form's count"
+            );
+            assert_eq!(
+                visits, visits_live,
+                "shape {shape}: the index's liveness never perturbs the generic visitation"
+            );
+            assert_canonical_class_visitation(&visits, &format!("shape {shape} suspend"));
+            assert_class_twin_step(&generic, &generic_live, &indexed, shape, "after suspend");
+            assert_eq!(
+                generic_live.class_index,
+                Some(rebuilt_class_index(&generic_live)),
+                "shape {shape}: the generic path's maintenance keeps the index exact"
+            );
+            assert_eq!(
+                indexed.class_index,
+                Some(rebuilt_class_index(&indexed)),
+                "shape {shape}: the indexed path's maintenance keeps the index exact"
+            );
+
+            // Phase 2 — the save/restore boundary: identical bytes
+            // across the wire, the restored indexed twin starting
+            // unmaterialized (wire-invisibility), then the same
+            // resume + reclassify on all three.
+            let bytes = generic.save_bytes();
+            let mut generic_r =
+                Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+            let mut generic_live_r =
+                Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+            let mut indexed_r =
+                Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+            assert_eq!(generic_r.save_bytes(), bytes);
+            assert_eq!(indexed_r.save_bytes(), bytes);
+            assert!(
+                indexed_r.class_index.is_none(),
+                "shape {shape}: the index never reaches the wire"
+            );
+            // Re-materialize the live-generic twin through the same
+            // absent-class call, so its post-restore generic driving
+            // again exercises the maintenance sites.
+            generic_live_r.suspend_class(ABSENT_CLASS);
+
+            let mut resume_visits: Vec<ClassVisit> = Vec::new();
+            let g_resume = generic_r.resume_matching(|view| {
+                resume_visits.push((
+                    visit_phase(view),
+                    view.due.as_u64(),
+                    view.id.seq,
+                    view.class.0,
+                ));
+                view.class == TARGET_CLASS
+            });
+            let g2_resume = generic_live_r.resume_matching(|view| view.class == TARGET_CLASS);
+            let i_resume = indexed_r.resume_class(TARGET_CLASS);
+            assert_eq!(g2_resume, g_resume);
+            assert_eq!(i_resume, g_resume, "shape {shape}: indexed resume count");
+            assert_canonical_class_visitation(&resume_visits, &format!("shape {shape} resume"));
+            assert_class_twin_step(
+                &generic_r,
+                &generic_live_r,
+                &indexed_r,
+                shape,
+                "after restore+resume",
+            );
+
+            let g_reclass =
+                generic_r.reclassify_matching(|view| view.class == TARGET_CLASS, Field::Near);
+            let g2_reclass =
+                generic_live_r.reclassify_matching(|view| view.class == TARGET_CLASS, Field::Near);
+            let i_reclass = indexed_r.reclassify_class(TARGET_CLASS, Field::Near);
+            assert_eq!(
+                g2_reclass, g_reclass,
+                "shape {shape}: the live-index reclassify count"
+            );
+            assert_eq!(
+                g_reclass, i_reclass,
+                "shape {shape}: indexed reclassify count"
+            );
+            assert_class_twin_step(
+                &generic_r,
+                &generic_live_r,
+                &indexed_r,
+                shape,
+                "after reclassify",
+            );
+            assert_eq!(
+                generic_live_r.class_index,
+                Some(rebuilt_class_index(&generic_live_r)),
+                "shape {shape}: reclassify maintenance exact (generic lineage)"
+            );
+            assert_eq!(
+                indexed_r.class_index,
+                Some(rebuilt_class_index(&indexed_r)),
+                "shape {shape}: reclassify maintenance exact (indexed lineage)"
+            );
+
+            // Phase 3 — the full cycle closed (re-suspend) and two
+            // execution ticks: the schedule/pop/park/release hooks
+            // run while the indexes are live on both lineages.
+            let g_again = generic_r.suspend_matching(|view| view.class == TARGET_CLASS);
+            let g2_again = generic_live_r.suspend_matching(|view| view.class == TARGET_CLASS);
+            let i_again = indexed_r.suspend_class(TARGET_CLASS);
+            assert_eq!(
+                g2_again, g_again,
+                "shape {shape}: the live-index re-suspend count"
+            );
+            assert_eq!(
+                i_again, g_again,
+                "shape {shape}: the cycle re-suspend count"
+            );
+            generic_r.run_ticks(2);
+            generic_live_r.run_ticks(2);
+            indexed_r.run_ticks(2);
+            assert_class_twin_step(
+                &generic_r,
+                &generic_live_r,
+                &indexed_r,
+                shape,
+                "after ticks",
+            );
+            assert_eq!(
+                generic_live_r.class_index,
+                Some(rebuilt_class_index(&generic_live_r)),
+                "shape {shape}: tick-path maintenance exact (generic lineage)"
+            );
+            assert_eq!(
+                indexed_r.class_index,
+                Some(rebuilt_class_index(&indexed_r)),
+                "shape {shape}: tick-path maintenance exact (indexed lineage)"
+            );
+        }
+
+        // The reclassify maintenance under the OTHER direction (the
+        // loop above drives Near only): fresh twins of the balanced
+        // shape, both with the index live, the far lane as the
+        // target on both forms — identical count, identical state,
+        // both lineages' indexes exact.
+        let (mut far_generic, _) = build_class_shape(0);
+        let (mut far_indexed, _) = build_class_shape(0);
+        far_generic.suspend_class(ABSENT_CLASS);
+        far_indexed.suspend_class(ABSENT_CLASS);
+        far_generic.suspend_matching(|view| view.class == TARGET_CLASS);
+        far_indexed.suspend_class(TARGET_CLASS);
+        far_generic.resume_matching(|view| view.class == TARGET_CLASS);
+        far_indexed.resume_class(TARGET_CLASS);
+        let g_far = far_generic.reclassify_matching(|view| view.class == TARGET_CLASS, Field::Far);
+        let i_far = far_indexed.reclassify_class(TARGET_CLASS, Field::Far);
+        assert_eq!(i_far, g_far, "the far-direction reclassify count matches");
+        assert_eq!(
+            far_indexed.save_bytes(),
+            far_generic.save_bytes(),
+            "the far-direction reclassify state matches"
+        );
+        assert_eq!(
+            far_generic.class_index,
+            Some(rebuilt_class_index(&far_generic)),
+            "the generic far-direction maintenance keeps the index exact"
+        );
+        assert_eq!(
+            far_indexed.class_index,
+            Some(rebuilt_class_index(&far_indexed)),
+            "the indexed far-direction maintenance keeps the index exact"
+        );
+    }
+
+    /// THE WIRE-INVISIBILITY PROOF (the derived-class discipline):
+    /// the index never reaches the save (a restored spine starts
+    /// `None`), the first class-keyed call rebuilds the IDENTICAL
+    /// index the live spine maintained (rebuild-equals-maintained),
+    /// the from-scratch recomputation agrees with both, and the
+    /// indexed and scan read forms emit the identical views.
+    #[test]
+    fn the_class_index_is_wire_invisible_and_rebuilds_identically() {
+        let (mut live, _) = build_class_shape(0);
+        live.suspend_class(TARGET_CLASS);
+        live.run_ticks(1);
+        live.resume_class(TARGET_CLASS);
+        live.suspend_class(TARGET_CLASS);
+        let maintained = live.class_index.clone().expect("the index is live");
+        assert_eq!(maintained, rebuilt_class_index(&live));
+
+        let bytes = live.save_bytes();
+        let mut restored: Spine<SaveableNoopWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off))
+                .expect("the fixture spine restores");
+        assert!(
+            restored.class_index.is_none(),
+            "the class index never reaches the wire"
+        );
+        assert_eq!(restored.save_bytes(), bytes);
+        // The read form falls back to the scan before materialization
+        // — identical output, so the comparison is meaningful.
+        let live_held: Vec<(u64, u16)> = live
+            .held_class_view(TARGET_CLASS)
+            .iter()
+            .map(|view| (view.id.seq, view.class.0))
+            .collect();
+        let restored_held: Vec<(u64, u16)> = restored
+            .held_class_view(TARGET_CLASS)
+            .iter()
+            .map(|view| (view.id.seq, view.class.0))
+            .collect();
+        assert_eq!(restored_held, live_held, "the scan fallback is identical");
+        // The first class-keyed mutating call rebuilds the exact map.
+        restored.suspend_class(ABSENT_CLASS);
+        assert_eq!(
+            restored.class_index,
+            Some(maintained),
+            "rebuild-equals-maintained across the wire"
+        );
+    }
+
+    /// Median-of-`reps` nanoseconds for `f` (the robust statistic
+    /// under the parallel test battery's noise — the witness-index
+    /// lane's helper shape).
+    fn class_median_ns(reps: usize, mut f: impl FnMut()) -> u64 {
+        let mut samples = Vec::with_capacity(reps);
+        for _ in 0..reps {
+            let started = std::time::Instant::now();
+            f();
+            samples.push(started.elapsed().as_nanos() as u64);
+        }
+        samples.sort_unstable();
+        samples[reps / 2]
+    }
+
+    /// The scaling fixture: the target owns EXACTLY `own` obligations
+    /// (40 at every size — the fixed affected work), the unrelated
+    /// population grows with `total` — foreign classes queued in both
+    /// lanes AND foreign entries seeded directly into the held set
+    /// (the scan form's cost is the WHOLE held map, so the unrelated
+    /// held population must grow too). The target is suspended, so
+    /// its members are the held set the queries walk.
+    fn build_class_scaling_fixture(total: usize, own: usize) -> Spine<SaveableNoopWorld> {
+        let mut spine = Spine::new(SaveableNoopWorld, 100_000);
+        let held_foreign = (total / 2).saturating_sub(own);
+        let queued_foreign = total - own - held_foreign;
+        for i in 0..own {
+            spine
+                .schedule(spec(
+                    7,
+                    if i.is_multiple_of(2) {
+                        Field::Near
+                    } else {
+                        Field::Far
+                    },
+                    500 + u64::try_from(i).expect("due fits u64") * 3,
+                    i as u64,
+                ))
+                .expect("fixture scheduling is valid");
+        }
+        for i in 0..queued_foreign {
+            spine
+                .schedule(spec(
+                    u16::try_from(i % 6).expect("class fits u16"),
+                    if i.is_multiple_of(2) {
+                        Field::Near
+                    } else {
+                        Field::Far
+                    },
+                    500 + u64::try_from(i % 97).expect("due fits u64") * 3,
+                    100_000 + i as u64,
+                ))
+                .expect("fixture scheduling is valid");
+        }
+        for i in 0..held_foreign {
+            spine
+                .schedule_held(spec(
+                    u16::try_from(i % 6).expect("class fits u16"),
+                    if i.is_multiple_of(2) {
+                        Field::Near
+                    } else {
+                        Field::Far
+                    },
+                    900 + u64::try_from(i % 89).expect("due fits u64") * 3,
+                    200_000 + i as u64,
+                ))
+                .expect("held scheduling is valid");
+        }
+        spine.suspend_class(TARGET_CLASS);
+        spine
+    }
+
+    /// THE SCALING EVIDENCE (the lane's second mandatory test): the
+    /// affected work fixed (the target owns 40 obligations at every
+    /// size) while the unrelated population grows 100×. The held-side
+    /// indexed queries — `held_class_view` and `resume_class` — are
+    /// FLAT in the unrelated population (the member set resolves
+    /// through the held map's keyed lookup; the scan forms walk the
+    /// whole map). The queue-side indexed suspend's EMPTY-membership
+    /// arm — the dormant-region common case — is flat through the
+    /// early exit while the generic empty-predicate suspend still
+    /// sorts both lanes. The queue-side partition WITH members is
+    /// measured and reported honestly: the `BinaryHeap` admits no
+    /// keyed removal, so the buffer partition remains O(lane) — the
+    /// canonical sort and the per-entry predicate calls are what the
+    /// indexed path removes (pod-observational numbers in the
+    /// unoptimized test profile; the assertions are the robust
+    /// invariants only, the witness-index lane's discipline).
+    #[test]
+    fn class_indexed_queries_are_flat_in_unrelated_population() {
+        let sizes = [1_000usize, 10_000, 100_000];
+        const OWN: usize = 40;
+        let mut held_scan = [0u64; 3];
+        let mut held_indexed = [0u64; 3];
+        let mut resume_scan = [0u64; 3];
+        let mut resume_indexed = [0u64; 3];
+        let mut empty_scan = [0u64; 3];
+        let mut empty_indexed = [0u64; 3];
+        let mut suspend_scan = [0u64; 3];
+        let mut suspend_indexed = [0u64; 3];
+        for (i, &total) in sizes.iter().enumerate() {
+            let mut scan_spine = build_class_scaling_fixture(total, OWN);
+            let mut indexed_spine = build_class_scaling_fixture(total, OWN);
+
+            held_scan[i] = class_median_ns(9, || {
+                let _ = scan_spine
+                    .held_view()
+                    .into_iter()
+                    .filter(|view| view.class == TARGET_CLASS)
+                    .count();
+            });
+            held_indexed[i] = class_median_ns(60, || {
+                let _ = indexed_spine.held_class_view(TARGET_CLASS).len();
+            });
+
+            // The transitions are state-mutating: the cycle
+            // held→queued→held repeats, each leg timed, so every
+            // repetition measures the identical state and BOTH timed
+            // legs move real members (the fixture enters held; the
+            // resume leg queues the target's forty; the suspend leg
+            // partitions them back out of the lanes).
+            let mut resume_samples = Vec::new();
+            let mut resume_indexed_samples = Vec::new();
+            let mut suspend_samples = Vec::new();
+            let mut suspend_indexed_samples = Vec::new();
+            for _ in 0..9 {
+                let started = std::time::Instant::now();
+                scan_spine.resume_matching(|view| view.class == TARGET_CLASS);
+                resume_samples.push(started.elapsed().as_nanos() as u64);
+                let started = std::time::Instant::now();
+                indexed_spine.resume_class(TARGET_CLASS);
+                resume_indexed_samples.push(started.elapsed().as_nanos() as u64);
+                let started = std::time::Instant::now();
+                scan_spine.suspend_matching(|view| view.class == TARGET_CLASS);
+                suspend_samples.push(started.elapsed().as_nanos() as u64);
+                let started = std::time::Instant::now();
+                indexed_spine.suspend_class(TARGET_CLASS);
+                suspend_indexed_samples.push(started.elapsed().as_nanos() as u64);
+            }
+            let median = |samples: &mut Vec<u64>| {
+                samples.sort_unstable();
+                samples[samples.len() / 2]
+            };
+            resume_scan[i] = median(&mut resume_samples);
+            resume_indexed[i] = median(&mut resume_indexed_samples);
+            suspend_scan[i] = median(&mut suspend_samples);
+            suspend_indexed[i] = median(&mut suspend_indexed_samples);
+
+            // The empty-class arms: state-neutral on both forms (the
+            // generic still drains, sorts, and re-heaps both lanes).
+            empty_scan[i] = class_median_ns(9, || {
+                scan_spine.suspend_matching(|view| view.class == ABSENT_CLASS);
+            });
+            empty_indexed[i] = class_median_ns(60, || {
+                indexed_spine.suspend_class(ABSENT_CLASS);
+            });
+
+            println!(
+                "ca08 scaling (population {total:6}, target owns {OWN}): held_view scan \
+                 {h_scan:9} ns vs indexed {h_idx:8} ns; resume scan {r_scan:9} ns vs indexed \
+                 {r_idx:8} ns; empty-class suspend scan {e_scan:9} ns vs indexed {e_idx:7} ns; \
+                 with-members suspend scan {s_scan:9} ns vs indexed {s_idx:8} ns \
+                 (pod-observational, test profile)",
+                h_scan = held_scan[i],
+                h_idx = held_indexed[i],
+                r_scan = resume_scan[i],
+                r_idx = resume_indexed[i],
+                e_scan = empty_scan[i],
+                e_idx = empty_indexed[i],
+                s_scan = suspend_scan[i],
+                s_idx = suspend_indexed[i],
+            );
+        }
+
+        // The scan forms grow linearly with the unrelated population
+        // (the 100× range must show at least 15× — expected ~50-100×;
+        // the with-members suspend's scan includes the O(N log N)
+        // sort, at least 10×).
+        for (label, series, factor) in [
+            ("held_view", &held_scan, 15u64),
+            ("resume", &resume_scan, 15),
+            ("empty-class suspend", &empty_scan, 10),
+            ("with-members suspend", &suspend_scan, 10),
+        ] {
+            assert!(
+                series[2] >= factor * series[0].max(1),
+                "{label}: the scan form grows with the unrelated population (measured {} → {} \
+                 ns across 1k → 100k)",
+                series[0],
+                series[2]
+            );
+        }
+        // The indexed walks are flat-to-logarithmic (the keyed
+        // lookups' depth grows with log of the population; a 100×
+        // range must stay within 3× plus the constant headroom).
+        for (label, series, headroom) in [
+            ("held_class_view", &held_indexed, 20_000u64),
+            ("resume_class", &resume_indexed, 40_000),
+            ("suspend_class (empty)", &empty_indexed, 20_000),
+        ] {
+            assert!(
+                series[2] <= 3 * series[0] + headroom,
+                "{label}: the indexed query is flat in the unrelated population (measured {} → \
+                 {} ns across 1k → 100k)",
+                series[0],
+                series[2]
+            );
+        }
+        // The with-members queue-side partition — the honest residual
+        // (O(lane buffer), no keyed heap removal): measured, reported,
+        // and pinned only to never regress against the scan form at
+        // the largest population.
+        assert!(
+            suspend_indexed[2] <= suspend_scan[2],
+            "the indexed with-members suspend never regresses against the predicate form \
+             (measured {} vs {} ns at 100k)",
+            suspend_indexed[2],
+            suspend_scan[2]
+        );
+    }
+
+    /// THE UPDATE COST (the lane's third mandatory test): the index
+    /// maintenance overhead on the generic main path — a
+    /// schedule/execute/park workload with the index live vs never
+    /// materialized. The live form pays one O(log) set insert per
+    /// schedule, one removal per execution, one move per park —
+    /// bounded by a small multiple of the plain path's per-op cost,
+    /// growing sub-linearly (log) in the population. The lazy gate
+    /// is pinned beside it: a spine whose driver never makes a
+    /// class-keyed call stays unmaterialized through the whole
+    /// workload — the property that keeps the `spine_allocations`
+    /// pins' scenario byte-identical.
+    fn run_class_workload(total: usize, materialize: bool) -> Spine<SaveableNoopWorld> {
+        let mut spine = Spine::new(SaveableNoopWorld, 10_000);
+        if materialize {
+            spine.suspend_class(ABSENT_CLASS);
+        }
+        // The never-resolving anchor: every tenth entry parks on it.
+        let anchor = spine
+            .schedule(spec(0, Field::Far, 100_000, 0))
+            .expect("anchor scheduling is valid");
+        for i in 0..total {
+            let spec = if i.is_multiple_of(10) {
+                EventSpec::new(
+                    EventClass::new(u16::try_from(i % 8).expect("class fits u16")),
+                    Schedule::AtLogicalTime {
+                        due: Tick(1 + u64::try_from(i % 50).expect("due fits u64")),
+                    },
+                    i as u64,
+                )
+                .in_field(if i.is_multiple_of(3) {
+                    Field::Far
+                } else {
+                    Field::Near
+                })
+                .with_dependencies(vec![anchor])
+            } else {
+                spec(
+                    u16::try_from(i % 8).expect("class fits u16"),
+                    if i.is_multiple_of(3) {
+                        Field::Far
+                    } else {
+                        Field::Near
+                    },
+                    1 + u64::try_from(i % 50).expect("due fits u64"),
+                    i as u64,
+                )
+            };
+            spine.schedule(spec).expect("workload scheduling is valid");
+        }
+        spine.run_ticks(60);
+        spine
+    }
+
+    #[test]
+    fn class_index_maintenance_overhead_is_bounded_and_the_index_stays_lazy() {
+        for &total in &[2_000usize, 20_000] {
+            let plain = class_median_ns(5, || {
+                let _ = run_class_workload(total, false);
+            });
+            let live = class_median_ns(5, || {
+                let _ = run_class_workload(total, true);
+            });
+            println!(
+                "ca08 update cost (population {total:6}): schedule+execute workload plain \
+                 {plain:11} ns vs index-live {live:11} ns ({:.2}×, pod-observational, test \
+                 profile)",
+                live as f64 / plain.max(1) as f64
+            );
+            assert!(
+                live <= 6 * plain + 20_000_000,
+                "population {total}: the index maintenance overhead is bounded (measured \
+                 {live} ns against {plain} ns plain)"
+            );
+        }
+        // The lazy gate — the allocation-pin scenario's guarantee,
+        // restated as its own pin: no class-keyed call, no index.
+        let plain_spine = run_class_workload(20_000, false);
+        assert!(
+            plain_spine.class_index.is_none(),
+            "a spine whose driver never makes a class-keyed call never materializes the index"
+        );
+        // And the live workload's maintained index is exact through
+        // the whole generic tick path (the coexistence proof at
+        // scale).
+        let live_spine = run_class_workload(20_000, true);
+        assert_eq!(
+            live_spine.class_index,
+            Some(rebuilt_class_index(&live_spine)),
+            "the generic tick path's maintenance keeps the index exact at scale"
+        );
     }
 }
