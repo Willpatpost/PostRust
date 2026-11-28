@@ -765,8 +765,8 @@ jobs:
           # result-lines and renderer-release literals — the passed
           # gate caught the omission (the system working as
           # designed); recorded honestly here.
-          expected=1673
-          if [ "$(uname -s)" != "Linux" ]; then expected=1622; fi
+          expected=1676
+          if [ "$(uname -s)" != "Linux" ]; then expected=1625; fi
           # T01 (2026-11-28): the main-shard pins centralized the same
           # way as the heavy shard's — the sibling defect here was the
           # echo printing a stale 33 while the gate enforced 34 (green
@@ -774,7 +774,7 @@ jobs:
           # printed expectation was wrong, the same duplicate-literal
           # drift class).
           expected_ignored=2
-          expected_results=37
+          expected_results=38
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
