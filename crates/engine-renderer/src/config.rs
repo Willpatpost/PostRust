@@ -222,6 +222,17 @@ pub enum LifecycleFaultSite {
     InstanceGrowthIdle,
     /// The pose carve's `device_idle` (same window).
     PoseGrowthIdle,
+    // ---- P5 R3 (A20, §4.5): the staging pool's in-flight safety ----
+    /// The staging batch's flush, armed to make the batch's fence
+    /// NEVER SIGNAL: the submission carries no fence (a structurally
+    /// real never-signaling fence — the device-level fault the
+    /// in-flight safety battery injects to prove the readiness
+    /// tracking never resets an unsignaled region). Unlike every
+    /// other site this one does NOT fail its step — the flush
+    /// succeeds and the wait/drain surfaces the stuck fence — so the
+    /// check is consumed as a behavior flag, not an error (the
+    /// one-shot plan/ordinal discipline is otherwise identical).
+    StagingFenceNeverSignals,
 }
 
 /// P5 §1.3 (A11/R1): the instance arena's configured HARD CAP — the

@@ -156,7 +156,11 @@ pub struct FrameResult {
 }
 
 /// Successful Vulkan allocation calls since renderer construction and the
-/// resident byte size of the texture allocations (including staging tails).
+/// resident byte size of the texture allocations. Since P5 R3 (A20) the
+/// texture allocations are IMAGE-ONLY on every pooled device (the staging
+/// tails retired); the combined-allocation form survives only on the
+/// pool-unavailable fallback, where the tail bytes remain in the totals and
+/// are attributed by `texture_staging_tail_bytes`.
 /// The additional fields count only the Era-1 target builders' Vulkan
 /// objects (image, memory, view, framebuffer — post chain, wet chain,
 /// shadow chain). Texture/corner/overlay allocations stay outside this
@@ -187,39 +191,68 @@ pub struct AllocationStats {
     /// Monotonic destruction count of Era-1 target builder memory allocations.
     pub target_memory_frees: u64,
     /// P5 R0 (§9.4, the attach/upload census): monotonic count of
-    /// one-shot staging submissions through the upload helper
-    /// (`with_upload_commands`) — each is a fresh command pool + one
-    /// command buffer + a fence, ONE queue submit, ONE blocking
-    /// `wait_for_fences`, then destruction of pool and fence. The
-    /// per-object machinery the A20/R3 staging pool replaces;
-    /// before-R3, every attach-time buffer and texture upload pays
-    /// exactly one of these. Read-only surface: recorded at the
-    /// helper's site, never changed by any frame-path code.
+    /// staging submissions — since P5 R3 (A20), one per POOLED batch
+    /// (the census's submits-per-batch row: a whole build's uploads
+    /// ride one submission) plus the retained per-object helper's
+    /// one-shot submits on pool-unavailable devices. The helper's
+    /// own whole lifetime (fresh pool, command buffer, fence, ONE
+    /// queue submit, ONE blocking `wait_for_fences`, destruction)
+    /// survives only on that fallback arm; the pooled batch is one
+    /// submit + one fence from the SHARED pool. Read-only surface:
+    /// recorded at the submit sites, never changed by any
+    /// frame-path code.
     pub upload_submits: u64,
     /// P5 R0 (§9.4): accumulated wall-clock nanoseconds blocked
-    /// inside those staging submissions' `wait_for_fences` calls —
-    /// the "blocking-wait total" row. Attach-time only (the frame
-    /// path's fence waits are outside this counter); the CPU/GPU
-    /// overlap the deferred-wait option would recover is exactly
-    /// this quantity.
+    /// inside the staging submissions' fence waits — the
+    /// "blocking-wait total" row. Attach-time only (the frame path's
+    /// fence waits are outside this counter). Since P5 R3 the wait
+    /// lands where the DEFERRED arm drains it (the attach's
+    /// batch-end drain) or at the inline flush — the CPU/GPU overlap
+    /// the deferral recovers is exactly this quantity.
     pub upload_blocking_wait_ns: u64,
     /// P5 R0 (§9.4): monotonic count of device-local buffer uploads
     /// staged through a throwaway HOST_VISIBLE pair
     /// (`create_device_local_buffer_with_data`) — each call creates
     /// AND destroys one staging buffer plus one staging memory. The
-    /// "staging object counts" row's buffer half (the texture half
-    /// is the permanent-tail counter below).
+    /// "staging object counts" row's buffer half. Since P5 R3 this
+    /// reads ZERO on every pooled device (the shared pool replaces
+    /// the pairs); the counter survives as the pool-unavailable
+    /// fallback's census (and the before/after row's evidence).
     pub staged_buffer_uploads: u64,
     /// P5 R0 (§9.4): the PERMANENT per-texture staging tails — for
     /// every uploaded texture, the bytes of its single
     /// device-local allocation beyond the image's own memory
     /// requirement (the staging buffer's bytes plus the alignment
     /// padding between the image and staging regions), resident for
-    /// the texture's whole lifetime. The dead VRAM A20/R3's pool
-    /// retires; `texture_bytes` above INCLUDES these same bytes in
-    /// its per-texture totals, so this field is the attribution
-    /// slice, not an additional sum.
+    /// the texture's whole lifetime. Since P5 R3 this reads ZERO on
+    /// every pooled device (the tails are RETIRED — each texture's
+    /// allocation is the image alone; the counter survives as the
+    /// pool-unavailable fallback's census). `texture_bytes` above
+    /// INCLUDES these same bytes in its per-texture totals on the
+    /// fallback arm, so this field is the attribution slice, not an
+    /// additional sum.
     pub texture_staging_tail_bytes: u64,
+    /// P5 R3 (A20, §4.5 — the attach census's AFTER row): the
+    /// staging pool's current backing capacity in bytes — ONE
+    /// shared, persistently mapped, power-of-two-grown backing for
+    /// every upload (0 before the first batch; the pool's existence
+    /// proof: "objects → 1 pool"). Grows only at a batch that does
+    /// not fit (see `staging_pool_growth_events`).
+    pub staging_pool_bytes: u64,
+    /// P5 R3: monotonic count of staging-pool GROWTH events — every
+    /// backing re-creation at a larger size (the demand's power-of-
+    /// two quantum, floored at 64 KiB, capped at 64 MiB; the old
+    /// backing retired only after the pool's own in-flight fences
+    /// drain). Attach-time only; the frame path never grows it.
+    pub staging_pool_growth_events: u64,
+    /// P5 R3: the bytes currently BOUND by the pool's readiness
+    /// tracking — every region staged or submitted past the retired
+    /// watermark (the in-flight batches plus any open batch's
+    /// staged bytes). Zero exactly when every region has been
+    /// retired on its OWN fence's signal; a never-signaling fence
+    /// keeps this nonzero forever (the in-flight safety battery's
+    /// observable).
+    pub staging_bound_region_bytes: u64,
     /// CA-01 (the attach-atomicity census): monotonic creation count
     /// of the corner pipeline group's Vulkan objects (the lit,
     /// proxy, and rain pipelines plus the lit and proxy layouts —
@@ -894,6 +927,27 @@ impl Renderer {
         // frames).
         let handle = attached.handle;
         self.scene = Some(attached);
+        // P5 R3 (A20): the attach's DEFERRED staging batch drains
+        // HERE — the batch-end wait the design's §4.3(c) names. The
+        // publication ORDER is deliberate: the scene and its
+        // pipelines are fully committed (releasing them now would
+        // orphan the committed pipeline group — the CA-01 discipline
+        // ends at the commit), and the drain's failure is DEVICE
+        // HEALTH, not attach atomicity — the error propagates with
+        // the scene functional, the stuck pool region the only cost
+        // (bounded by the pool's ceiling). The wait completes before
+        // any FIRST USE by construction: the first scene-backed
+        // frame cannot precede this call's return. The deferred
+        // submission overlapped the pipeline-group build above (the
+        // attach path's meaningful independent work — the honest
+        // deferral assessment; the resource-half tail between the
+        // flush and this drain is µs-scale).
+        if let Err(error) = self.ctx.drain_staging() {
+            // CA-13: the drain is device work — a device loss latches
+            // on its way out like every other device-touching step.
+            self.device_lost.observe(&error);
+            return Err(error);
+        }
         Ok(handle)
     }
 

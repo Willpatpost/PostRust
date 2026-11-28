@@ -19,9 +19,10 @@ use super::context::VulkanContext;
 use super::corner;
 use super::frame_plan::FramePlan;
 use super::resources::{
-    ScopedMappedBuffer, create_device_local_buffer_with_data, create_mapped_buffer,
-    create_shader_module,
+    ScopedMappedBuffer, create_device_local_buffer_staged, create_device_local_buffer_with_data,
+    create_mapped_buffer, create_shader_module,
 };
+use super::staging::FlushMode;
 use super::swapchain::SwapchainState;
 use super::{
     FramePolicy, post_draw, proxy_draw, reflection_draw, shadow_draw, skinned_draw, sky_draw,
@@ -316,20 +317,46 @@ impl PipelineState {
         if demo_scene == DemoScenePreference::Included {
             let (vertices, indices) = crate::scene::build_scene();
             self.scene_index_count = indices.len() as u32;
-            let (scene_vbo, scene_vbo_memory) = create_device_local_buffer_with_data(
-                ctx,
-                vk::BufferUsageFlags::VERTEX_BUFFER,
-                bytemuck::cast_slice(&vertices),
-            )?;
+            // P5 R3 (A20): the Included scene's VBO and IBO ride ONE
+            // pool batch, flushed INLINE — this build's remaining
+            // steps (the frames' sync objects) are µs-scale, so no
+            // meaningful independent work overlaps the copy; the
+            // inline wait is the honest first-milestone shape here.
+            // The pool-unavailable arm keeps the per-object helper.
+            let mut staging_batch = ctx.begin_staging_batch();
+            let vertex_bytes = bytemuck::cast_slice(&vertices);
+            let (scene_vbo, scene_vbo_memory) = match &mut staging_batch {
+                Some(batch) => create_device_local_buffer_staged(
+                    batch,
+                    vk::BufferUsageFlags::VERTEX_BUFFER,
+                    vertex_bytes,
+                ),
+                None => create_device_local_buffer_with_data(
+                    ctx,
+                    vk::BufferUsageFlags::VERTEX_BUFFER,
+                    vertex_bytes,
+                ),
+            }?;
             self.scene_vbo = scene_vbo;
             self.scene_vbo_memory = scene_vbo_memory;
-            let (scene_ibo, scene_ibo_memory) = create_device_local_buffer_with_data(
-                ctx,
-                vk::BufferUsageFlags::INDEX_BUFFER,
-                bytemuck::cast_slice(&indices),
-            )?;
+            let index_bytes = bytemuck::cast_slice(&indices);
+            let (scene_ibo, scene_ibo_memory) = match &mut staging_batch {
+                Some(batch) => create_device_local_buffer_staged(
+                    batch,
+                    vk::BufferUsageFlags::INDEX_BUFFER,
+                    index_bytes,
+                ),
+                None => create_device_local_buffer_with_data(
+                    ctx,
+                    vk::BufferUsageFlags::INDEX_BUFFER,
+                    index_bytes,
+                ),
+            }?;
             self.scene_ibo = scene_ibo;
             self.scene_ibo_memory = scene_ibo_memory;
+            if let Some(batch) = staging_batch.as_mut() {
+                batch.flush(FlushMode::InlineWait)?;
+            }
         }
 
         // Dynamic region-scene buffer (Stage 4 graphical integration):

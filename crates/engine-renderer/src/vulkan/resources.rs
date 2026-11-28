@@ -9,6 +9,14 @@
 //! so the movable half, the pure advance logic and its seam tests,
 //! lands in this module). Pure move from vulkan.rs (stage S4); no logic
 //! changed — only location and visibility.
+//!
+//! P5 R3 (A20): the per-object staging helpers are now the
+//! UNAVAILABLE-POOL fallback — every attach-time buffer upload stages
+//! through [`super::staging`]'s pool when a batch exists
+//! ([`create_device_local_buffer_staged`], the destination-creation
+//! half shared byte-for-byte with the retained helper); the throwaway
+//! HOST_VISIBLE pairs survive only for devices that cannot back the
+//! pool, keeping exactly the pre-R3 behavior there.
 
 use ash::vk;
 
@@ -226,6 +234,78 @@ pub(super) fn create_device_local_buffer_with_data(
                 if staging_memory != vk::DeviceMemory::null() {
                     ctx.device.free_memory(staging_memory, None);
                 }
+                if buffer != vk::Buffer::null() {
+                    ctx.device.destroy_buffer(buffer, None);
+                }
+                if memory != vk::DeviceMemory::null() {
+                    ctx.device.free_memory(memory, None);
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+/// P5 R3 (A20, design §4.3): the POOLED form of
+/// [`create_device_local_buffer_with_data`] — the destination's
+/// creation is the retained helper's own (byte-identical: the same
+/// buffer, memory-type, and binding steps, the same partial-failure
+/// discipline), while the staging rides the CALLER'S batch (one
+/// shared, persistently mapped pool region instead of a throwaway
+/// HOST_VISIBLE pair; the copy is recorded into the batch's replay
+/// log and executes at the batch's ONE submit). Callers with no
+/// batch (the pool unavailable on this device) keep the retained
+/// per-object helper — exactly the pre-R3 behavior.
+pub(super) fn create_device_local_buffer_staged(
+    batch: &mut super::staging::StagingBatch<'_>,
+    usage: vk::BufferUsageFlags,
+    data: &[u8],
+) -> Result<(vk::Buffer, vk::DeviceMemory), RendererError> {
+    let ctx = batch.ctx();
+    let size = data.len() as vk::DeviceSize;
+    // Partial-initialization cleanup (corrective finding G), the
+    // retained helper's own discipline: tracked handles are released
+    // when any step fails.
+    let mut buffer = vk::Buffer::null();
+    let mut memory = vk::DeviceMemory::null();
+    let result = (|| -> Result<(), RendererError> {
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(size)
+            // The staging copy's destination must allow transfers
+            // (VUID-vkCmdCopyBuffer-dstBuffer-00120 — surfaced by the
+            // CI validation-enabled smoke, invisible to the layer-less
+            // pod kit).
+            .usage(usage | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        buffer = unsafe { ctx.device.create_buffer(&buffer_info, None) }
+            .map_err(|error| RendererError::vk(error, "create_buffer"))?;
+        let requirements = unsafe { ctx.device.get_buffer_memory_requirements(buffer) };
+        let memory_index = find_memory_type(
+            ctx,
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .ok_or_else(|| RendererError::NoDevice("no DEVICE_LOCAL memory".into()))?;
+        let memory_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_index);
+        memory = unsafe { ctx.allocate_memory(&memory_info) }
+            .map_err(|error| RendererError::vk(error, "allocate_memory"))?;
+        unsafe { ctx.device.bind_buffer_memory(buffer, memory, 0) }
+            .map_err(|error| RendererError::vk(error, "bind_buffer_memory"))?;
+        // The pooled staging: one region in the shared backing, one
+        // recorded copy — the bytes and the destination semantics
+        // identical to the per-object path's pair-and-copy.
+        let region = batch.stage(data)?;
+        batch.record_buffer_copy(buffer, 0, region);
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok((buffer, memory)),
+        Err(error) => {
+            // SAFETY: exactly the handles created above, each exactly
+            // once (null until created).
+            unsafe {
                 if buffer != vk::Buffer::null() {
                     ctx.device.destroy_buffer(buffer, None);
                 }

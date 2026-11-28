@@ -7,9 +7,10 @@
 //! The name keeps its history (the corner was the first — and so
 //! far only — attached scene); the CONTENT is caller data now.
 use super::descriptors::create_sets_sized;
+use super::staging::FlushMode;
 use super::{
-    RendererError, SamplerPool, Texture, VulkanContext, create_device_local_buffer_with_data,
-    create_mapped_buffer, shader_layout_pins,
+    RendererError, SamplerPool, Texture, VulkanContext, create_device_local_buffer_staged,
+    create_device_local_buffer_with_data, create_mapped_buffer, shader_layout_pins,
 };
 use crate::config::FRAMES_IN_FLIGHT;
 use crate::lit_scene::{LightParams, Material};
@@ -138,11 +139,33 @@ impl CornerResources {
         // here keeps the RETAINED table typed by construction.
         self.draws = description.mesh.admit_draws(materials.len())?;
         self.ground = description.ground.clone();
-        (self.vertices, self.vertex_memory) = create_device_local_buffer_with_data(
-            ctx,
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-            bytemuck::cast_slice(&description.mesh.vertices),
-        )?;
+        // P5 R3 (A20, design §4.3): the attach's whole staging phase —
+        // the mesh VBO and EVERY albedo texture — rides ONE pool
+        // batch (one submit, one fence). The flush is DEFERRED and
+        // sits at the very END of this build: every fallible step
+        // above (and every CA-01 knob) fires with the batch still
+        // OPEN — an abort reclaims the staged regions with nothing
+        // submitted, so the partial-failure destroy below never races
+        // a pending copy — while the submission itself overlaps the
+        // pipeline-group build that follows this build in
+        // `Renderer::attach_scene` (the meaningful independent work:
+        // shader compilation), with the wait landing at the attach's
+        // drain, before any first use. `None` (the pool unavailable
+        // on this device) keeps the retained per-object path.
+        let mut staging_batch = ctx.begin_staging_batch();
+        let mesh_bytes = bytemuck::cast_slice(&description.mesh.vertices);
+        (self.vertices, self.vertex_memory) = match &mut staging_batch {
+            Some(batch) => create_device_local_buffer_staged(
+                batch,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                mesh_bytes,
+            ),
+            None => create_device_local_buffer_with_data(
+                ctx,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                mesh_bytes,
+            ),
+        }?;
         // CA-01 fault knob: the vertex pair exists — a plan armed
         // here fires with it created, exercising this build's own
         // partial-failure release below.
@@ -153,15 +176,28 @@ impl CornerResources {
         // generator's constants through `TextureExtent`).
         let extent = description.albedo_extent();
         for bytes in &description.textures.textures {
-            self.textures.push(Texture::upload(
-                ctx,
-                vk::Format::R8G8B8A8_UNORM,
-                vk::Extent2D {
-                    width: extent.width,
-                    height: extent.height,
-                },
-                bytes,
-            )?);
+            let texture = match &mut staging_batch {
+                Some(batch) => Texture::upload_in(
+                    batch,
+                    ctx,
+                    vk::Format::R8G8B8A8_UNORM,
+                    vk::Extent2D {
+                        width: extent.width,
+                        height: extent.height,
+                    },
+                    bytes,
+                ),
+                None => Texture::upload(
+                    ctx,
+                    vk::Format::R8G8B8A8_UNORM,
+                    vk::Extent2D {
+                        width: extent.width,
+                        height: extent.height,
+                    },
+                    bytes,
+                ),
+            }?;
+            self.textures.push(texture);
             // CA-01 fault knob: the just-pushed texture exists (the
             // ordinal selects which of the table's textures).
             ctx.check_lifecycle_fault(crate::LifecycleFaultSite::SceneTexture)?;
@@ -257,6 +293,15 @@ impl CornerResources {
                     &[],
                 );
             }
+        }
+        // THE BATCH'S ONE SUBMIT — deferred, and the build's LAST
+        // fallible-adjacent statement by design (see the batch's
+        // opening comment): everything above ran with the batch open
+        // (an abort reclaims the regions, nothing submitted), and
+        // from here the submission overlaps the caller's
+        // pipeline-group build until the attach's drain waits it.
+        if let Some(batch) = staging_batch.as_mut() {
+            batch.flush(FlushMode::Deferred)?;
         }
         Ok(())
     }
