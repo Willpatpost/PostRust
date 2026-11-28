@@ -221,20 +221,25 @@ pub enum CompactionError {
 }
 
 /// The execution-ledger retention policy (A22-core, P2 design §6.2 —
-/// the L7 lane): the configurable cadence that bounds the ledger's
-/// resident size by firing the EXISTING explicit compaction
+/// the L7 lane, extended by T07's two-class eligibility model): the
+/// configurable cadence that bounds the ledger's resident size by
+/// firing the EXISTING explicit compaction
 /// ([`Spine::compact`]) — no second compaction mechanism, no second
 /// summary domain. The policy is OPT-IN configuration with no
 /// default: a spine constructed without one never auto-compacts,
 /// keeping today's exact behavior (the no-silent-default rule — the
-/// application opts in explicitly through
-/// [`Spine::set_retention_policy`], and opting in now CARRIES the
+/// application opts in explicitly, and opting in now CARRIES the
 /// eligibility decision [`Spine::compact`]'s own doc delegates to
-/// the driver: the acknowledgment token [`ConsequenceEligibility`]
-/// is constructed only by a composition boundary that has proven
-/// every consequence consumer of the ledger prefix can relinquish
-/// it — the engine policy bounds RAM, the driver proves when
-/// consequence lanes tolerate a prefix cut, and the proof is
+/// the driver — the T07 two-class model: a world that is
+/// PERMANENTLY consequence-free (no application consumer of
+/// execution-history records exists or will ever exist) arms the
+/// cadence through [`Spine::set_retention_policy`] with the
+/// [`ConsequenceFreedom`] world-class capability, while a
+/// consequence-bearing world arms it through
+/// [`Spine::arm_retention_frontier`] and the cadence cuts only up
+/// to the minimum consumer acknowledgment, never on standing
+/// configuration — the engine policy bounds RAM, the driver proves
+/// when consequence lanes tolerate a prefix cut, and the proof is
 /// required at every reconfiguration, never standing configuration
 /// alone; a driver that wants the bound declared without the proof
 /// uses [`Spine::set_retention_bound`] and the checkpoint's
@@ -371,54 +376,232 @@ pub struct RetentionStats {
     /// The largest cut any single invocation has performed.
     pub max_chunk: u64,
     /// Ticks at which the checkpoint found the threshold exceeded
-    /// but declined to cut for want of consequence eligibility (a
-    /// bound declared through [`Spine::set_retention_bound`] without
-    /// the acknowledgment [`Spine::set_retention_policy`] requires)
-    /// — the refusal the lag observer
-    /// ([`Spine::retention_lag_records`]) makes visible as the
-    /// ledger's growth past the bound.
+    /// but declined to cut for want of firing eligibility — a bound
+    /// declared through [`Spine::set_retention_bound`] without an
+    /// arming (Class 1 or Class 2), OR a frontier armed with zero
+    /// registered consumers (the empty-frontier fail-closed rule:
+    /// `min(∅)` is a refusal, never a permission) — the refusal the
+    /// lag observer ([`Spine::retention_lag_records`]) makes visible
+    /// as the ledger's growth past the bound.
     pub refused_ticks: u64,
+    /// Ticks at which the threshold was exceeded with the frontier
+    /// (not the arming) the limiter: a registered consumer's
+    /// acknowledgment below the policy's cut — the cadence held,
+    /// counted, observable (T07's Class 2 backpressure signal; the
+    /// arming was present, the consumers had not released).
+    pub frontier_hold_ticks: u64,
+    /// The most recent threshold-exceeded evaluation's frontier
+    /// shortfall: how many records the policy could have cut
+    /// (`min(excess, chunk)`) but the consumers had not released —
+    /// `min(excess, chunk)` minus the clamped cut actually taken.
+    /// Zero when the consumers released everything the policy
+    /// wanted; the policy's full want when the frontier holds
+    /// everything. Updated only at threshold-exceeded frontier
+    /// evaluations (under the threshold the policy wants nothing,
+    /// so no frontier shortfall is defined); the value read is the
+    /// last such evaluation's.
+    pub retention_frontier_lag_records: u64,
 }
 
-/// The composition boundary's consequence-eligibility acknowledgment
-/// (CA-07/F07 — Q05's eligibility half): the token a driver can only
-/// construct by explicitly asserting the proof [`Spine::compact`]'s
-/// own doc delegates to it. Constructing this value through
-/// [`Self::acknowledged`] is the assertion that EVERY consequence
-/// consumer of the execution-ledger prefix — every application
-/// lane that reads history records (late accounting over the
-/// verbatim tail, the history APIs, audit consumers) — can
-/// relinquish those records, because the engine cannot know them:
-/// the ledger cut is structurally safe for every ENGINE invariant
-/// (the authority hangs off `next_seq`, the unfinished complement,
-/// `waiting_on`, and the max-due index — never the ledger), so the
-/// only eligibility that can be violated is the caller's own.
+/// The composition boundary's consequence-freedom capability (T07,
+/// CA-07/F07 — Q05's eligibility half, the design's Class 1):
+/// constructing this value asserts the WORLD CLASS — no application
+/// consumer of execution-history records exists or will ever exist
+/// in this composition (no late accounting over the verbatim tail,
+/// no audit consumer, no history API use — the world's handlers
+/// execute, the spine's own authority structures carry everything
+/// the engine needs, and history is diagnostic only). For such a
+/// world the eligible prefix is EVERYTHING EXECUTED — the frontier
+/// is the whole ledger — and [`RetentionPolicy`]'s `retain` window
+/// is a diagnostic-preference window, not a safety window.
 ///
-/// The acknowledgment is REQUIRED at every (re)configuration of the
-/// retention policy — the cadence never fires on standing
-/// configuration alone, and a restored spine (whose configuration
-/// restore clears, an intentional contract) must re-prove it before
-/// the next compact. A driver that wants the RAM bound declared
-/// without the proof uses [`Spine::set_retention_bound`]: the
+/// **The honest limit, stated in the type:** Rust cannot prove a
+/// negative about future callers; the capability is still an
+/// assertion. What the two-class model changes is that the
+/// assertion is now SCOPED to a world class with an unbounded
+/// frontier — it no longer impersonates evidence about consumer
+/// state. The register of evidence (which compositions asserted
+/// it) is the commit history and the audit trail, not the type
+/// system. Where the driver can discharge the proof structurally it
+/// should prefer the frontier class
+/// ([`Spine::arm_retention_frontier`]) even for consequence-free
+/// worlds; this class exists for the genuinely static case
+/// (deterministic simulations, benchmarks, the spine's own test
+/// fixtures).
+///
+/// The capability is REQUIRED at every (re)configuration of the
+/// retention policy through [`Spine::set_retention_policy`] — the
+/// cadence never fires on standing configuration alone, and a
+/// restored spine (whose configuration restore clears, an
+/// intentional contract) must re-assert it before the next compact.
+/// A driver that wants the RAM bound declared without the world
+/// class assertion uses [`Spine::set_retention_bound`]: the
 /// checkpoint then REFUSES to cut and the refusal and lag are
 /// observable ([`RetentionStats::refused_ticks`],
 /// [`Spine::retention_lag_records`]) — never a silent default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConsequenceEligibility {
+pub struct ConsequenceFreedom {
     /// Construction is the assertion; the field keeps the value
     /// opaque (there is nothing to read — the words are the proof).
     _asserted: (),
 }
 
-impl ConsequenceEligibility {
-    /// Constructs the acknowledgment. By constructing this value the
-    /// composition boundary asserts it has established that every
-    /// consequence consumer of the ledger prefix can relinquish it
-    /// — the eligibility proof is the CALLER's, made here, made
-    /// explicitly, and re-made at every reconfiguration.
-    pub const fn acknowledged() -> Self {
-        ConsequenceEligibility { _asserted: () }
+impl ConsequenceFreedom {
+    /// Constructs the world-class capability: by constructing this
+    /// value the composition boundary asserts its world is
+    /// PERMANENTLY consequence-free (see the type doc — the eligible
+    /// prefix is unbounded by construction of the application, not
+    /// by evidence gathered at runtime).
+    pub const fn permanently_free() -> Self {
+        ConsequenceFreedom { _asserted: () }
     }
+
+    /// The historical constructor name (CA-07's landing), kept for
+    /// one release so every existing call site compiles unchanged —
+    /// the token was never an "acknowledgment" of consumer state,
+    /// and the rename says so; use
+    /// [`ConsequenceFreedom::permanently_free`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "renamed: ConsequenceFreedom::permanently_free — the token asserts the \
+                consequence-free WORLD CLASS, not an acknowledgment of consumer state (T07)"
+    )]
+    pub const fn acknowledged() -> Self {
+        ConsequenceFreedom::permanently_free()
+    }
+}
+
+/// The CA-07 landing's name for [`ConsequenceFreedom`] (deprecated
+/// for one release per the T07 design's §6 migration): every
+/// external caller and test call site compiles unchanged through
+/// the alias while the docs stop calling the token an
+/// "acknowledgment."
+#[deprecated(
+    since = "0.1.0",
+    note = "renamed: ConsequenceFreedom — the two-class eligibility model (T07); construct \
+            through ConsequenceFreedom::permanently_free, or arm the per-consumer frontier \
+            through Spine::arm_retention_frontier"
+)]
+pub type ConsequenceEligibility = ConsequenceFreedom;
+
+/// A named retention consumer (T07's Class 2 — the consequence-bearing
+/// world's eligible-prefix frontier): a small stable identity the
+/// driver assigns to each application lane that reads execution
+/// history. The id keys the consumer's monotone acknowledgment in
+/// [`Spine::arm_retention_frontier`]'s registry; the frontier value
+/// the cadence consults is the MINIMUM over every registered
+/// consumer's acknowledgment, so a consumer is exactly as binding as
+/// its id being registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RetentionConsumerId(&'static str);
+
+impl RetentionConsumerId {
+    /// The consumer identity for a stable name (the driver's own
+    /// naming; two consumers are distinct iff their names are).
+    pub const fn new(name: &'static str) -> Self {
+        RetentionConsumerId(name)
+    }
+
+    /// The stable name the id was constructed from.
+    pub const fn as_str(&self) -> &'static str {
+        self.0
+    }
+}
+
+/// Typed refusals of [`Spine::acknowledge_retention_through`] (the
+/// frontier's monotonicity, enforced — never assumed): a consumer's
+/// acknowledgment only ever advances, and only consumers the driver
+/// registered exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionAckError {
+    /// No consumer is registered under this id — the acknowledgment
+    /// registry is explicit ([`Spine::register_retention_consumer`]),
+    /// and an ack for an unknown name is a driver wiring error, never
+    /// a silent registration.
+    UnknownConsumer { id: RetentionConsumerId },
+    /// The attempted acknowledgment REGRESSES below the consumer's
+    /// standing acknowledgment (monotonicity is a rule, not an
+    /// assumption: a consumer that re-derives its durable read point
+    /// must never move it backwards).
+    Regression {
+        id: RetentionConsumerId,
+        /// The consumer's standing acknowledgment (the high-water the
+        /// attempted value would have to reach).
+        acknowledged_through: u64,
+        /// The regressing value the call attempted.
+        attempted_through: u64,
+    },
+}
+
+/// Typed refusals of [`Spine::register_retention_consumer`] (the
+/// register rule, made mechanical — the join-time confrontation the
+/// T07 design's §8 honest limit requires): registering onto a
+/// compacted spine vouches for the STANDING cut, because the
+/// already-summarized prefix is unrecoverable by design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionRegisterError {
+    /// The consumer's durable read point (`vouches_through`) sits
+    /// below the standing summarized prefix: the records it still
+    /// needs were already summarized — unrecoverable, impossible to
+    /// serve (they were impossible to serve before the frontier
+    /// existed too; the register rule forces that impossibility to
+    /// be confronted at JOIN time, never discovered at read time).
+    /// The driver must handle this refusal; the engine cannot make
+    /// history reconstructible.
+    NeedsSummarizedRecords {
+        id: RetentionConsumerId,
+        /// The standing cut (records already summarized — the minimum
+        /// a joining consumer must be able to vouch for).
+        summarized_records: u64,
+        /// The joining consumer's offered durable read point.
+        consumer_read_point: u64,
+    },
+    /// A consumer is already registered under this id: registration
+    /// is a join, and silently overwriting a live consumer's
+    /// acknowledgment (or silently ignoring the re-registration) is
+    /// exactly the class of unnoticed driver bug the typed-refusal
+    /// discipline exists to surface. Advance an existing consumer
+    /// through [`Spine::acknowledge_retention_through`].
+    AlreadyRegistered {
+        id: RetentionConsumerId,
+        /// The registered consumer's standing acknowledgment.
+        acknowledged_through: u64,
+    },
+    /// No frontier is armed: the consumer registry belongs to
+    /// [`Spine::arm_retention_frontier`]'s mode, and registering
+    /// onto a spine armed with the Class-1 capability (or with only
+    /// a declared bound, or nothing) is a wiring mistake surfaced
+    /// typed — never a silent registry entry the checkpoint would
+    /// ignore.
+    FrontierNotArmed { id: RetentionConsumerId },
+}
+
+/// The retention cadence's eligibility mode (T07's two-class model —
+/// private configuration state, the same never-fingerprinted,
+/// never-serialized class as the [`RetentionPolicy`] field itself):
+/// the permanently-consequence-free capability (Class 1) or the
+/// per-consumer eligible-prefix frontier (Class 2). `None` is the
+/// refusal arm ([`Spine::set_retention_bound`]). The frontier never
+/// rides the wire: a restored spine arrives with no eligibility and
+/// no consumer registry, so a restored process can never resume
+/// cutting on a vouch a prior process made and this one did not
+/// re-make (the CA-07 hazard, closed at the representation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RetentionEligibility {
+    /// Class 1 — the permanently consequence-free world capability:
+    /// the eligible prefix is unbounded, the cadence cut consults no
+    /// consumer.
+    Freedom(ConsequenceFreedom),
+    /// Class 2 — the per-consumer monotone eligible-prefix frontier:
+    /// each registered consumer's acknowledgment (a global executed
+    /// ordinal — record *n* is the *n*-th execution of the spine's
+    /// lifetime, the ordinal space `summarized_records` already
+    /// counts on the wire), the cadence cut clamped to
+    /// `min(excess, chunk, eligible − summarized)`. `BTreeMap` for
+    /// deterministic iteration in the observability report.
+    Frontier {
+        consumers: BTreeMap<RetentionConsumerId, u64>,
+    },
 }
 
 /// Typed refusals of the held-reconstruction replacement set
@@ -798,14 +981,19 @@ pub struct Spine<W: World> {
     /// restored spine resumes with no policy until the driver
     /// re-configures.
     retention: Option<RetentionPolicy>,
-    /// The consequence-eligibility acknowledgment arming the
-    /// retention cadence (CA-07 — see [`ConsequenceEligibility`]):
-    /// a policy may be declared WITHOUT it (the refusal arm — the
-    /// checkpoint declines to cut, the lag exposed), and the
-    /// acknowledgment must accompany every (re)configuration that
-    /// wants firing. Same configuration class as `retention`:
-    /// never fingerprinted, never serialized, cleared at restore.
-    retention_eligibility: Option<ConsequenceEligibility>,
+    /// The eligibility arming the retention cadence (T07's two-class
+    /// model — see [`RetentionEligibility`]): the
+    /// permanently-consequence-free world capability (Class 1,
+    /// [`ConsequenceFreedom`]) or the per-consumer eligible-prefix
+    /// frontier (Class 2, [`Spine::arm_retention_frontier`]). A
+    /// policy may be declared WITHOUT it (the refusal arm — the
+    /// checkpoint declines to cut, the lag exposed), and the arming
+    /// must accompany every (re)configuration that wants firing.
+    /// Same configuration class as `retention`: never fingerprinted,
+    /// never serialized, cleared at restore — a restored spine
+    /// arrives with no eligibility AND no consumer registry, so it
+    /// can never resume cutting on a vouch a prior process made.
+    retention_eligibility: Option<RetentionEligibility>,
     /// Observational retention counters (the [`RetentionStats`] doc
     /// — the `LaneTotals`/`SuspensionStats` never-fingerprinted,
     /// never-serialized class).
@@ -2793,42 +2981,241 @@ impl<W: World> Spine<W> {
     // ---------------------------------------------------- retention policy
 
     /// Configures the execution-ledger retention policy (A22-core —
-    /// see [`RetentionPolicy`]) WITH the consequence-eligibility
-    /// acknowledgment (CA-07): the cadence this arms is the
-    /// ACKNOWLEDGED safe cut — the eligibility token is the
-    /// composition boundary's explicit proof that every consequence
-    /// consumer of the ledger prefix can relinquish it, required at
-    /// every (re)configuration (a restored spine re-proves before
-    /// its next compact; the cadence never fires on standing
-    /// configuration a prior process once vouched for). Setting a
-    /// policy never changes logical state — the fingerprint domains
-    /// and save bytes are untouched by configuration alone; only a
-    /// FIRING changes the history representation, through the same
-    /// authenticated cut the explicit [`Spine::compact`] performs.
+    /// see [`RetentionPolicy`]) with the PERMANENTLY
+    /// CONSEQUENCE-FREE world-class capability (T07's Class 1 —
+    /// CA-07): the cadence this arms is the consequence-free cut —
+    /// the capability is the composition boundary's explicit
+    /// assertion that NO application consumer of execution-history
+    /// records exists or will ever exist in this composition (the
+    /// eligible prefix unbounded by construction of the
+    /// application), required at every (re)configuration (a restored
+    /// spine re-asserts before its next compact; the cadence never
+    /// fires on standing configuration a prior process once vouched
+    /// for). Consequence-bearing worlds — any composition whose
+    /// lanes read history — arm through
+    /// [`Self::arm_retention_frontier`] instead, and the cadence
+    /// cuts only up to the minimum consumer acknowledgment. Setting
+    /// a policy never changes logical state — the fingerprint
+    /// domains and save bytes are untouched by configuration alone;
+    /// only a FIRING changes the history representation, through
+    /// the same authenticated cut the explicit [`Spine::compact`]
+    /// performs.
     pub fn set_retention_policy(
         &mut self,
         policy: RetentionPolicy,
-        eligibility: ConsequenceEligibility,
+        eligibility: ConsequenceFreedom,
     ) {
         self.retention = Some(policy);
-        self.retention_eligibility = Some(eligibility);
+        self.retention_eligibility = Some(RetentionEligibility::Freedom(eligibility));
     }
 
-    /// Declares the retention bound WITHOUT the eligibility
-    /// acknowledgment (CA-07's refusal arm): the checkpoint observes
-    /// the threshold but REFUSES to cut — the refusal counted in
+    /// Arms the consequence-bearing retention frontier (T07's
+    /// Class 2): the cadence fires only up to the MINIMUM consumer
+    /// acknowledgment, never on standing configuration. The
+    /// frontier is IN-MEMORY per-consumer monotone state — named
+    /// consumers acknowledge the prefix they can relinquish through
+    /// [`Self::register_retention_consumer`] and
+    /// [`Self::acknowledge_retention_through`], and the checkpoint's
+    /// cut is clamped to `min(excess, chunk, eligible −
+    /// summarized)` where `eligible` is the minimum acknowledgment.
+    ///
+    /// **THE EMPTY-FRONTIER RULE (fail-closed):** arming with ZERO
+    /// registered consumers NEVER cuts — `min(∅)` is undefined and
+    /// the design defines it as refusal, never as permission. A
+    /// driver that arms the frontier and forgets to register its
+    /// consumers sees [`RetentionStats::frontier_hold_ticks`] grow,
+    /// not cuts; this is deliberate, and the register calls belong
+    /// at the same configuration boundary as the arming. Arming is
+    /// fresh: any prior eligibility (Class 1 capability or an
+    /// earlier frontier's consumer registry) is replaced, and the
+    /// new registry starts empty.
+    ///
+    /// The frontier never rides the wire (the CA-07 why-not,
+    /// extended from the boolean token to every consumer ack): on
+    /// restore every consumer re-registers and re-establishes its
+    /// acknowledgment FROM ITS OWN DURABLE STATE — a restored
+    /// process can never resume cutting on a vouch a prior process
+    /// made and this one did not re-make. Setting the frontier
+    /// never changes logical state; only a FIRING does, through the
+    /// same authenticated cut the explicit [`Spine::compact`]
+    /// performs.
+    pub fn arm_retention_frontier(&mut self, policy: RetentionPolicy) {
+        self.retention = Some(policy);
+        self.retention_eligibility = Some(RetentionEligibility::Frontier {
+            consumers: BTreeMap::new(),
+        });
+    }
+
+    /// Registers a retention consumer onto the frontier (T07's
+    /// Class 2 — the register rule): the consumer joins with
+    /// `vouches_through`, its own durable read point in the GLOBAL
+    /// EXECUTED ORDINAL space (record *n* is the *n*-th execution of
+    /// the spine's lifetime — the same count space
+    /// `summarized_records` already rides on the wire, so
+    /// acknowledgments survive restore as ordinals even though the
+    /// registry itself does not). The register rule: a joining
+    /// consumer vouches for the STANDING cut — `vouches_through`
+    /// must be at or above the current `summarized_records`, because
+    /// the already-summarized prefix is unrecoverable and a consumer
+    /// that still needs those records cannot be served (a typed
+    /// [`RetentionRegisterError::NeedsSummarizedRecords`] refusal —
+    /// the join-time impossibility confronted, never discovered at
+    /// read time; the driver must handle it, the engine cannot make
+    /// history reconstructible). A fresh consumer on an uncut spine
+    /// registers at zero.
+    ///
+    /// The initial acknowledgment is the offered vouch (the §2.2
+    /// sketch's "the current summarized prefix" is the register
+    /// rule's FLOOR, not its ceiling: a consumer whose durable state
+    /// already absorbed past the standing cut joins at its true
+    /// point). An over-ack is the caller's trust boundary — the
+    /// engine cannot verify a consumer read what it vouches (the
+    /// design's honest limit); an under-ack merely holds the
+    /// frontier.
+    pub fn register_retention_consumer(
+        &mut self,
+        id: RetentionConsumerId,
+        vouches_through: u64,
+    ) -> Result<(), RetentionRegisterError> {
+        let summarized = self.standing_summarized_records();
+        if vouches_through < summarized {
+            return Err(RetentionRegisterError::NeedsSummarizedRecords {
+                id,
+                summarized_records: summarized,
+                consumer_read_point: vouches_through,
+            });
+        }
+        let Some(RetentionEligibility::Frontier { consumers }) = &mut self.retention_eligibility
+        else {
+            // The registry belongs to the frontier mode: registering
+            // onto a spine armed with the Class-1 capability (or
+            // with only a declared bound) is a wiring mistake
+            // surfaced typed — never a silent registry entry the
+            // checkpoint would ignore.
+            return Err(RetentionRegisterError::FrontierNotArmed { id });
+        };
+        if let Some(&acknowledged_through) = consumers.get(&id) {
+            return Err(RetentionRegisterError::AlreadyRegistered {
+                id,
+                acknowledged_through,
+            });
+        }
+        consumers.insert(id, vouches_through);
+        Ok(())
+    }
+
+    /// Advances a registered consumer's acknowledgment through
+    /// global executed ordinal `through` (the first `through`
+    /// execution records of the lifetime are releasable by this
+    /// consumer's vouch). MONOTONE and fail-closed: a regressing
+    /// value is a typed [`RetentionAckError::Regression`] refusal
+    /// (monotonicity is enforced, never assumed), an unknown
+    /// consumer a typed [`RetentionAckError::UnknownConsumer`]
+    /// refusal (the registry is explicit). A consumer acknowledging
+    /// only what it has DURABLY processed holds the frontier through
+    /// every unknown/indeterminate commit — the engine never
+    /// resolves an unknown into an ack (the persist side's
+    /// settled-transaction watermark rule).
+    ///
+    /// After an explicit [`Spine::compact`] cut PAST a consumer's
+    /// acknowledgment (the manual operator authority — the frontier
+    /// polices only the automatic path), the consumer's vouch sits
+    /// below the standing cut: the frontier accounting stays
+    /// coherent fail-closed (the clamp saturates at zero) until the
+    /// consumer's acknowledgment catches up past the new
+    /// `summarized_records`; an ack still below the standing cut is
+    /// accepted (progress toward catching up) as long as it does
+    /// not regress below the consumer's own prior value.
+    pub fn acknowledge_retention_through(
+        &mut self,
+        id: RetentionConsumerId,
+        through: u64,
+    ) -> Result<(), RetentionAckError> {
+        let Some(RetentionEligibility::Frontier { consumers }) = &mut self.retention_eligibility
+        else {
+            return Err(RetentionAckError::UnknownConsumer { id });
+        };
+        let Some(acknowledged) = consumers.get_mut(&id) else {
+            return Err(RetentionAckError::UnknownConsumer { id });
+        };
+        if through < *acknowledged {
+            return Err(RetentionAckError::Regression {
+                id,
+                acknowledged_through: *acknowledged,
+                attempted_through: through,
+            });
+        }
+        *acknowledged = through;
+        Ok(())
+    }
+
+    /// The per-consumer frontier lag (T07's observability surface):
+    /// the consumer's distance behind the LEADING registered
+    /// acknowledgment — which consumer is the gate, by name.
+    /// `None` when the id is not registered (or no frontier is
+    /// armed); zero when this consumer IS the leader. The lagging
+    /// consumer's owner sees the ledger's growth as its own
+    /// conscious decision ([`RetentionStats::refused_ticks`] and
+    /// [`RetentionStats::frontier_hold_ticks`] count the held
+    /// ticks; this accessor names the holder).
+    pub fn retention_consumer_lag(&self, id: RetentionConsumerId) -> Option<u64> {
+        let RetentionEligibility::Frontier { consumers } = self.retention_eligibility.as_ref()?
+        else {
+            return None;
+        };
+        let leading = consumers.values().copied().max()?;
+        let own = *consumers.get(&id)?;
+        Some(leading - own)
+    }
+
+    /// Converts an execution identity to its GLOBAL EXECUTED
+    /// ORDINAL (the acknowledgment space): `Some(n)` where the
+    /// record is the *n*-th execution of the spine's lifetime and
+    /// sits in the RETAINED tail; `None` when the identity is not
+    /// in the retained tail (not yet executed, or already
+    /// summarized — the summarized prefix cannot be mapped back,
+    /// by design). A driver-cadence convenience: O(live) scan of
+    /// the verbatim tail, never in the tick loop; consumers that
+    /// count what they read never need it.
+    pub fn retention_ordinal_of(&self, id: EventId) -> Option<u64> {
+        let summarized = self.standing_summarized_records();
+        let ordinal = self
+            .ledger
+            .iter()
+            .position(|record| record.id.seq == id.seq)? as u64;
+        Some(summarized + ordinal + 1)
+    }
+
+    /// The standing summarized prefix (the register rule's floor):
+    /// zero on a `Full` spine, the compacted history's cumulative
+    /// `summarized_records` otherwise.
+    fn standing_summarized_records(&self) -> u64 {
+        self.compacted
+            .as_ref()
+            .map(|compacted| compacted.summarized_records)
+            .unwrap_or(0)
+    }
+
+    /// Declares the retention bound WITHOUT any eligibility
+    /// (CA-07's refusal arm): the checkpoint observes the threshold
+    /// but REFUSES to cut — the refusal counted in
     /// [`RetentionStats::refused_ticks`], the ledger's growth past
     /// the bound exposed by [`Self::retention_lag_records`]. This is
     /// the state for a driver that knows its RAM bound but has not
-    /// (or no longer) proven consequence eligibility: never a silent
-    /// default, never a cut on unproven standing. Arming afterwards
-    /// is a fresh [`Self::set_retention_policy`] call — the bound
+    /// (or no longer) proven eligibility: never a silent default,
+    /// never a cut on unproven standing. Arming afterwards is a
+    /// fresh [`Self::set_retention_policy`] (Class 1) or
+    /// [`Self::arm_retention_frontier`] (Class 2) call — the bound
     /// and the proof together.
     pub fn set_retention_bound(&mut self, policy: RetentionPolicy) {
         self.retention = Some(policy);
         // A bound change re-opens the eligibility question: a prior
-        // acknowledgment vouched for cutting under the old bound's
-        // cadence, so it does not survive the reconfiguration.
+        // arming vouched for cutting under the old bound's cadence,
+        // so it does not survive the reconfiguration — the Class-1
+        // capability is dropped AND the frontier's consumer registry
+        // with it (a fresh arming re-registers; the register rule
+        // re-derives every vouch from the consumers' own durable
+        // state).
         self.retention_eligibility = None;
     }
 
@@ -2848,13 +3235,20 @@ impl<W: World> Spine<W> {
         self.retention
     }
 
-    /// Whether the configured policy's cadence is ARMED — the
-    /// consequence-eligibility acknowledgment is present, so the
-    /// checkpoint will fire when the threshold is exceeded. A
-    /// declared-but-unarmed policy (see [`Self::set_retention_bound`])
-    /// refuses instead, observably.
+    /// Whether the configured policy's cadence is ARMED — armed with
+    /// SOME eligibility (T07's two-class model): the Class-1
+    /// [`ConsequenceFreedom`] capability, OR a frontier with at
+    /// least one registered consumer (an armed-but-unregistered
+    /// frontier reports `false` — the empty-frontier fail-closed
+    /// rule; its threshold crossings are counted as refusals, never
+    /// cut). A declared-but-unarmed policy (see
+    /// [`Self::set_retention_bound`]) refuses instead, observably.
     pub fn retention_armed(&self) -> bool {
-        self.retention_eligibility.is_some()
+        match &self.retention_eligibility {
+            Some(RetentionEligibility::Freedom(_)) => true,
+            Some(RetentionEligibility::Frontier { consumers }) => !consumers.is_empty(),
+            None => false,
+        }
     }
 
     /// How far the retained ledger sits ABOVE the configured
@@ -2897,21 +3291,32 @@ impl<W: World> Spine<W> {
     /// at the gate exactly one chunk — and records the invocation in
     /// the observational counters. A no-op with no policy configured.
     ///
-    /// **THE ELIGIBILITY GATE (CA-07):** firing additionally requires
-    /// the consequence-eligibility acknowledgment
-    /// ([`Self::retention_armed`] — the acknowledged safe cut). A
-    /// declared-but-unarmed policy (see [`Self::set_retention_bound`])
-    /// REFUSES here when the threshold is exceeded: the refusal
-    /// counted in [`RetentionStats::refused_ticks`], the ledger's
-    /// growth past the bound exposed by [`Self::retention_lag_records`]
-    /// — the cut is never made on unproven standing, and the lag is
-    /// never silent.
+    /// **THE ELIGIBILITY GATE (CA-07, T07's two-class model):**
+    /// firing additionally requires an ARMED eligibility. The
+    /// Class-1 capability ([`Self::set_retention_policy`]) leaves the
+    /// cut at `min(excess, chunk)` — the world class asserts the
+    /// eligible prefix is unbounded. The frontier
+    /// ([`Self::arm_retention_frontier`]) CLAMPS the cut to
+    /// `min(excess, chunk, eligible − summarized)` where `eligible`
+    /// is the minimum registered consumer acknowledgment: a fully
+    /// held frontier (or an armed-but-empty one — the empty-frontier
+    /// fail-closed rule) refuses exactly like an unarmed policy —
+    /// counted in [`RetentionStats::refused_ticks`] AND
+    /// [`RetentionStats::frontier_hold_ticks`], the shortfall
+    /// exposed in [`RetentionStats::retention_frontier_lag_records`]
+    /// and per consumer in [`Self::retention_consumer_lag`] — never
+    /// a silent skip, never a discard to keep RAM under a target.
+    /// A declared-but-unarmed policy (see [`Self::set_retention_bound`])
+    /// REFUSES here when the threshold is exceeded: the cut is never
+    /// made on unproven standing, and the lag is never silent.
     ///
     /// The cut is a valid compaction window BY CONSTRUCTION: the gate
-    /// guarantees `excess ≥ chunk ≥ 1` and `cut ≥ 1`, so the window
-    /// retains ≥ `retain` ≥ 1 records and summarizes ≥ 1 — neither
-    /// typed refusal of [`Self::compact`] is reachable; the `expect`
-    /// documents the invariant, it never fires.
+    /// guarantees `excess ≥ chunk ≥ 1`, the frontier clamp only ever
+    /// lowers the cut, and the firing additionally requires
+    /// `cut ≥ 1`, so the window retains ≥ `retain` ≥ 1 records and
+    /// summarizes ≥ 1 — neither typed refusal of [`Self::compact`]
+    /// is reachable; the `expect` documents the invariant, it never
+    /// fires.
     fn apply_retention_policy(&mut self) {
         let Some(policy) = self.retention else {
             return;
@@ -2921,29 +3326,90 @@ impl<W: World> Spine<W> {
         if ledger_len <= threshold {
             return;
         }
-        if self.retention_eligibility.is_none() {
-            self.retention_stats.refused_ticks += 1;
-            if self.diag.would_log(Level::Info) {
-                self.diag.log(
-                    Level::Info,
-                    format!(
-                        "retention threshold exceeded at {} (retained {ledger_len} > bound \
-                         {threshold}) without consequence eligibility — refusing to cut; \
-                         lag {} records",
-                        self.clock,
-                        ledger_len - threshold
-                    ),
-                );
+        // The cut the POLICY would take at this tick, absent any
+        // consumer frontier (the excess above the verbatim window,
+        // chunk-bounded) — the frontier can only veto or clamp it,
+        // never widen it.
+        let policy_cut = (ledger_len - policy.retain.get()).min(policy.chunk.get());
+        match &self.retention_eligibility {
+            None => {
+                self.retention_stats.refused_ticks += 1;
+                if self.diag.would_log(Level::Info) {
+                    self.diag.log(
+                        Level::Info,
+                        format!(
+                            "retention threshold exceeded at {} (retained {ledger_len} > bound \
+                             {threshold}) without eligibility — refusing to cut; lag {} records",
+                            self.clock,
+                            ledger_len - threshold
+                        ),
+                    );
+                }
             }
-            return;
+            Some(RetentionEligibility::Freedom(_)) => {
+                self.fire_retention(ledger_len, policy_cut);
+            }
+            Some(RetentionEligibility::Frontier { consumers }) => {
+                // The frontier value: the minimum registered
+                // acknowledgment, in global executed ordinals; the
+                // releasable pool is what sits above the standing
+                // summarized prefix. An empty registry is the
+                // empty-frontier fail-closed rule (min(∅) is a
+                // refusal, never a permission).
+                let summarized = self.standing_summarized_records();
+                let eligible = consumers.values().copied().min();
+                let releasable = eligible.map_or(0, |ack| ack.saturating_sub(summarized));
+                // The frontier lag: how many records the policy
+                // could have cut but the consumers have not
+                // released (zero when the frontier released the
+                // policy's full want; the policy's full want when
+                // the frontier holds everything).
+                self.retention_stats.retention_frontier_lag_records =
+                    policy_cut.saturating_sub(releasable);
+                let cut = policy_cut.min(releasable);
+                if cut == 0 {
+                    self.retention_stats.refused_ticks += 1;
+                    self.retention_stats.frontier_hold_ticks += 1;
+                    if self.diag.would_log(Level::Info) {
+                        let held_by = match eligible {
+                            None => "no consumer registered".to_string(),
+                            Some(min_ack) => format!(
+                                "{} consumer(s) holding at eligible ordinal {min_ack}",
+                                consumers.len()
+                            ),
+                        };
+                        self.diag.log(
+                            Level::Info,
+                            format!(
+                                "retention threshold exceeded at {} (retained {ledger_len} > \
+                                 bound {threshold}) with the frontier held ({held_by}; \
+                                 summarized {summarized}, releasable {releasable}, policy want \
+                                 {policy_cut}) — refusing to cut; frontier lag {} records",
+                                self.clock, self.retention_stats.retention_frontier_lag_records
+                            ),
+                        );
+                    }
+                } else {
+                    self.fire_retention(ledger_len, cut);
+                }
+            }
         }
-        let excess = ledger_len - policy.retain.get();
-        let cut = excess.min(policy.chunk.get());
+    }
+
+    /// Fires one policy compaction of `cut` records (the invocation
+    /// the eligibility gate admitted — Class 1 unclamped, Class 2
+    /// clamped to the frontier): the shared firing tail of
+    /// [`Self::apply_retention_policy`]'s two armed arms. The cut is
+    /// a valid compaction window by the caller's construction
+    /// (`1 ≤ cut ≤ excess = ledger_len − retain`, so the window
+    /// retains ≥ `retain` ≥ 1 records and summarizes ≥ 1).
+    fn fire_retention(&mut self, ledger_len: u64, cut: u64) {
         let retained = ledger_len - cut;
         self.compact(retained).expect(
             "the retention policy's cut is a valid compaction window by construction: the \
-             threshold gate guarantees excess ≥ chunk ≥ 1 and cut ≥ 1, so the window retains \
-             ≥ retain ≥ 1 records and summarizes ≥ 1 — neither typed refusal is reachable",
+             threshold gate guarantees excess ≥ chunk ≥ 1, the frontier clamp only ever \
+             lowers it, and the firing requires cut ≥ 1, so the window retains ≥ retain ≥ 1 \
+             records and summarizes ≥ 1 — neither typed refusal is reachable",
         );
         self.retention_stats.compactions += 1;
         self.retention_stats.summarized_total += cut;
@@ -6151,12 +6617,14 @@ mod tests {
         )
     }
 
-    /// The consequence-eligibility acknowledgment (the fixtures'
-    /// shorthand — the test driver asserting the consequence
-    /// consumers it controls can relinquish the prefix; production
-    /// callers construct it at their own composition boundary, CA-07).
-    fn eligibility() -> ConsequenceEligibility {
-        ConsequenceEligibility::acknowledged()
+    /// The consequence-freedom world-class capability (the fixtures'
+    /// shorthand — the test driver asserting its world is
+    /// permanently consequence-free: `NoopWorld`, `SaveableNoopWorld`,
+    /// and `SustainedWorld` never read execution history, which is
+    /// exactly the Class-1 contract; production callers construct it
+    /// at their own composition boundary, T07/CA-07).
+    fn eligibility() -> ConsequenceFreedom {
+        ConsequenceFreedom::permanently_free()
     }
 
     /// THE OPT-OUT CONTRACT: no policy — the default — never
@@ -6984,6 +7452,947 @@ mod tests {
                 assert_eq!(moves, vec![200, 200, 200]);
             }
         }
+    }
+
+    // ------------------------------- T07 retention-frontier tests (Class 2)
+
+    /// A consumer identity for the frontier fixtures (the driver's
+    /// own naming — stable, small, opaque to the engine).
+    fn consumer(name: &'static str) -> RetentionConsumerId {
+        RetentionConsumerId::new(name)
+    }
+
+    /// THE MOVING CUT, HELD (T07's central case — the audit's first,
+    /// and the RED-FIRST witness this battery grew out of: written
+    /// first against the OLD api as
+    /// `red_witness_standing_token_cuts_past_a_would_be_consumers_need`,
+    /// run RED at the pre-fix tree — the standing-token cadence cut
+    /// exactly the 30 records a would-be consumer still needed,
+    /// `left: 0, right: 30` — then replaced by this frontier form):
+    /// the threshold is exceeded, a registered consumer's
+    /// acknowledgment sits below the policy's cut, and the checkpoint
+    /// REFUSES — counted in `refused_ticks` AND
+    /// `frontier_hold_ticks`, both lag metrics advanced, no cut,
+    /// `history_kind()` stays `Full`, the ledger grows past the bound
+    /// with conservation exact at every boundary (the no-discard
+    /// rule made mechanical: a held frontier costs one threshold
+    /// comparison, never a record). The consumer then reads its
+    /// history intact; when it acknowledges 15 ordinals, the next
+    /// firing cuts EXACTLY `min(excess, chunk, eligible −
+    /// summarized)` = 15 — the clamp, not the policy's 30.
+    #[test]
+    fn retention_frontier_holds_the_cut_below_a_registered_consumers_need() {
+        let mut spine = Spine::new(SustainedWorld, 10);
+        for i in 0..10u64 {
+            spine
+                .schedule(spec(5, Field::Near, 1, i))
+                .expect("schedule");
+        }
+        spine.arm_retention_frontier(policy(4, 30));
+        let accounting = consumer("accounting");
+        spine
+            .register_retention_consumer(accounting, 0)
+            .expect("a fresh consumer on an uncut spine registers at zero");
+        assert!(spine.retention_armed());
+        // Six ticks with the consumer holding at ack 0: ticks 4–6
+        // cross the bound (40/50/60 > 34) and every one refuses.
+        for tick in 1..=6u64 {
+            spine.run_tick();
+            let stats = spine.retention_stats();
+            assert_eq!(stats.compactions, 0, "tick {tick}: no cut while held");
+            let expected_holds = tick.saturating_sub(3);
+            assert_eq!(stats.frontier_hold_ticks, expected_holds);
+            assert_eq!(stats.refused_ticks, expected_holds);
+            // Conservation and the no-discard growth: every record
+            // the world executed is still in the verbatim tail.
+            assert_eq!(spine.stats().executed, tick * 10);
+            assert_eq!(spine.ledger_retained().len() as u64, tick * 10);
+            assert_eq!(
+                spine.retention_lag_records(),
+                (tick * 10).saturating_sub(34),
+                "tick {tick}: the growth past the bound is exposed"
+            );
+            let stats = spine.stats();
+            assert_eq!(
+                stats.scheduled,
+                stats.executed
+                    + spine.pending_count() as u64
+                    + spine.blocked_count() as u64
+                    + spine.held_count() as u64,
+                "tick {tick}: conservation"
+            );
+        }
+        // The would-be consumer's window — the first 30 records (the
+        // executions of ticks 1–3) — is INTACT (the red witness's
+        // assertion, now held by the frontier).
+        let retained = spine.ledger_retained();
+        assert_eq!(
+            retained
+                .iter()
+                .filter(|record| record.executed_tick.as_u64() <= 3)
+                .count(),
+            30,
+            "the consumer's un-released records survive the cadence"
+        );
+        assert_eq!(spine.retention_stats().retention_frontier_lag_records, 30);
+        assert!(matches!(spine.history_kind(), HistoryKind::Full));
+        // The consumer absorbs 15 ordinals (records 1–15); the next
+        // crossing cuts exactly the released prefix — the clamp.
+        spine
+            .acknowledge_retention_through(accounting, 15)
+            .expect("advancing ack");
+        spine.run_tick();
+        let stats = spine.retention_stats();
+        assert_eq!(stats.compactions, 1);
+        assert_eq!(stats.last_chunk, 15, "the cut is min(excess, chunk, 15)");
+        assert_eq!(stats.summarized_total, 15);
+        assert_eq!(spine.ledger_retained().len(), 70 - 15);
+        assert_eq!(stats.retention_frontier_lag_records, 30 - 15);
+        assert_eq!(
+            stats.frontier_hold_ticks, 3,
+            "the firing was clamped, not held"
+        );
+        // The count identity at the boundary.
+        let HistoryKind::Compacted {
+            summarized_records,
+            retained_records,
+            ..
+        } = spine.history_kind()
+        else {
+            panic!("the clamped firing compacted the spine");
+        };
+        assert_eq!(
+            summarized_records + retained_records,
+            spine.stats().executed
+        );
+        // Records 16–30 (the rest of the consumer's window) are
+        // still verbatim in the tail.
+        let retained = spine.ledger_retained();
+        assert_eq!(
+            retained
+                .iter()
+                .filter(|record| record.executed_tick.as_u64() <= 3)
+                .count(),
+            15,
+            "only the acknowledged 15 were cut; the rest of the window survives"
+        );
+    }
+
+    /// THE CLAMPED CADENCE IS THE EXPLICIT SEQUENCE (the :6487
+    /// discipline extended to the frontier mode): a consumer
+    /// acknowledging past the threshold in steps makes each firing
+    /// cut exactly `min(excess, chunk, eligible − summarized)`, and
+    /// the resulting save bytes are BYTE-IDENTICAL both to one
+    /// explicit compaction of the same total window and to the
+    /// interleaved explicit compaction sequence with the same cuts
+    /// at the same tick boundaries — the frontier only ever vetoes
+    /// or clamps a firing, so the wire stays a function of the cut
+    /// sequence alone (the count identity holds at every boundary).
+    #[test]
+    fn retention_frontier_advances_in_clamped_steps_matching_the_explicit_sequence() {
+        let build = || {
+            let mut spine = Spine::new(SaveableNoopWorld, 100);
+            for t in 1..=10u64 {
+                for i in 0..100u64 {
+                    spine
+                        .schedule(spec(0, Field::Near, t, t * 100 + i))
+                        .expect("schedule");
+                }
+            }
+            spine
+        };
+        // The frontier cadence: the consumer acknowledges BETWEEN
+        // ticks (its durable cadence — the value is visible to the
+        // next checkpoint), and the firings cut [150, 150, 300, 100]
+        // at ticks 4, 5, 7, 10 (700 summarized, 300 retained).
+        let mut frontier = build();
+        frontier.arm_retention_frontier(policy(10, 300));
+        let accounting = consumer("accounting");
+        frontier
+            .register_retention_consumer(accounting, 0)
+            .expect("register");
+        let schedule: [(u64, u64); 4] = [(4, 150), (5, 300), (7, 700), (10, 700)];
+        let mut acked = 0u64;
+        let mut cuts: Vec<(u64, u64)> = Vec::new(); // (tick, cut)
+        for tick in 1..=10u64 {
+            if let Some(&(_, ack_to)) = schedule.iter().find(|&&(at, _)| at == tick) {
+                frontier
+                    .acknowledge_retention_through(accounting, ack_to)
+                    .expect("the step schedule is monotone");
+                acked = ack_to;
+            }
+            // The oracle inputs, captured before the checkpoint runs.
+            let pre_summarized = match frontier.history_kind() {
+                HistoryKind::Compacted {
+                    summarized_records, ..
+                } => summarized_records,
+                HistoryKind::Full => 0,
+            };
+            frontier.run_tick();
+            let stats = frontier.retention_stats();
+            if stats.compactions > cuts.len() as u64 {
+                // The at-checkpoint length: the post-firing retained
+                // tail plus the cut (the tick's own arrivals
+                // included).
+                let at_len = frontier.ledger_retained().len() as u64 + stats.last_chunk;
+                let expected = (at_len - 10)
+                    .min(300)
+                    .min(acked.saturating_sub(pre_summarized));
+                assert_eq!(
+                    stats.last_chunk, expected,
+                    "tick {tick}: the cut is min(excess, chunk, eligible − summarized)"
+                );
+                cuts.push((tick, stats.last_chunk));
+                let HistoryKind::Compacted {
+                    summarized_records,
+                    retained_records,
+                    ..
+                } = frontier.history_kind()
+                else {
+                    panic!("tick {tick}: a firing compacted the spine");
+                };
+                assert_eq!(
+                    summarized_records + retained_records,
+                    frontier.stats().executed,
+                    "tick {tick}: count identity"
+                );
+            }
+        }
+        assert_eq!(
+            cuts,
+            vec![(4, 150), (5, 150), (7, 300), (10, 100)],
+            "the clamped cut sequence"
+        );
+        assert_eq!(frontier.ledger_retained().len(), 300);
+        // The explicit one-cut equivalent: the same ticks, one manual
+        // cut of the same total window (the prefix chain is
+        // invocation-boundary-independent — the :6487 pin).
+        let mut manual = build();
+        manual.run_ticks(10);
+        manual.compact(300).expect("the equivalent window compacts");
+        assert_eq!(
+            frontier.save_bytes(),
+            manual.save_bytes(),
+            "the clamped cadence and one explicit 700-record cut agree byte for byte"
+        );
+        // The interleaved explicit equivalent: the same cuts at the
+        // same tick boundaries, through the driver's own tool.
+        let mut stepped = build();
+        let mut total_cut = 0u64;
+        for tick in 1..=10u64 {
+            stepped.run_tick();
+            let firings_through: u64 = cuts
+                .iter()
+                .filter(|&&(at, _)| at <= tick)
+                .map(|&(_, cut)| cut)
+                .sum();
+            if firings_through > total_cut {
+                total_cut = firings_through;
+                let executed = stepped.stats().executed;
+                stepped
+                    .compact(executed - total_cut)
+                    .expect("the step window compacts");
+            }
+        }
+        assert_eq!(
+            frontier.save_bytes(),
+            stepped.save_bytes(),
+            "the clamped cadence and the interleaved explicit sequence agree byte for byte"
+        );
+    }
+
+    /// Every refusal is TYPED and every hold is COUNTED (the §5.3
+    /// matrix): an armed-but-empty frontier never cuts (the
+    /// empty-frontier fail-closed rule — `min(∅)` is a refusal,
+    /// never a permission, and `retention_armed` reports the truth);
+    /// an acknowledgment for an unknown consumer is a typed
+    /// `UnknownConsumer`; a regressing acknowledgment is a typed
+    /// `Regression` (monotonicity enforced, never assumed); a
+    /// registration whose vouch sits below the standing cut is the
+    /// typed join-time impossibility (`NeedsSummarizedRecords` — the
+    /// register rule); a duplicate registration and a registration
+    /// without a frontier armed are typed wiring refusals.
+    #[test]
+    fn retention_frontier_refusals_are_typed() {
+        let mut spine = Spine::new(SustainedWorld, 10);
+        for i in 0..10u64 {
+            spine
+                .schedule(spec(5, Field::Near, 1, i))
+                .expect("schedule");
+        }
+        // Registration without a frontier armed: a wiring mistake,
+        // surfaced typed — never a silent registry entry.
+        let audit = consumer("audit");
+        assert!(matches!(
+            spine.register_retention_consumer(audit, 0),
+            Err(RetentionRegisterError::FrontierNotArmed { id }) if id == audit
+        ));
+        spine.arm_retention_frontier(policy(4, 30));
+        assert!(
+            !spine.retention_armed(),
+            "an empty frontier is not an armed cadence"
+        );
+        spine.run_ticks(4);
+        // 40 records against the 34 bound: the empty frontier
+        // refuses exactly like an unarmed policy — counted, exposed,
+        // never a permission.
+        let stats = spine.retention_stats();
+        assert_eq!(stats.compactions, 0);
+        assert_eq!(stats.frontier_hold_ticks, 1);
+        assert_eq!(stats.refused_ticks, 1);
+        assert_eq!(stats.retention_frontier_lag_records, 30);
+        assert_eq!(spine.ledger_retained().len(), 40);
+        // An acknowledgment for a consumer that was never registered.
+        let unknown = consumer("never-registered");
+        assert!(matches!(
+            spine.acknowledge_retention_through(unknown, 10),
+            Err(RetentionAckError::UnknownConsumer { id }) if id == unknown
+        ));
+        // Registration and the monotone rule.
+        spine
+            .register_retention_consumer(audit, 20)
+            .expect("register at a durable read point");
+        spine
+            .acknowledge_retention_through(audit, 35)
+            .expect("advancing");
+        assert!(matches!(
+            spine.acknowledge_retention_through(audit, 34),
+            Err(RetentionAckError::Regression {
+                id,
+                acknowledged_through: 35,
+                attempted_through: 34,
+            }) if id == audit
+        ));
+        assert!(matches!(
+            spine.register_retention_consumer(audit, 40),
+            Err(RetentionRegisterError::AlreadyRegistered {
+                id,
+                acknowledged_through: 35,
+            }) if id == audit
+        ));
+        // The register rule: a consumer joining a COMPACTED spine
+        // vouches the standing cut or is refused typed.
+        let mut compacted = Spine::new(SaveableNoopWorld, 100);
+        for t in 1..=4u64 {
+            for i in 0..100u64 {
+                compacted
+                    .schedule(spec(0, Field::Near, t, t * 100 + i))
+                    .expect("schedule");
+            }
+        }
+        compacted.run_ticks(4);
+        compacted.compact(100).expect("an explicit 300-record cut");
+        compacted.arm_retention_frontier(policy(10, 300));
+        let late = consumer("late-joiner");
+        assert!(matches!(
+            compacted.register_retention_consumer(late, 299),
+            Err(RetentionRegisterError::NeedsSummarizedRecords {
+                id,
+                summarized_records: 300,
+                consumer_read_point: 299,
+            }) if id == late
+        ));
+        compacted
+            .register_retention_consumer(late, 300)
+            .expect("vouching the standing cut registers");
+        assert_eq!(
+            compacted.retention_consumer_lag(late),
+            Some(0),
+            "the sole consumer is the leader"
+        );
+    }
+
+    /// THE RESTORE→RE-REGISTER→CONTINUE PIN (the :6824 control shape
+    /// extended to the frontier): a mid-cadence save→restore arrives
+    /// with the frontier EMPTY and the policy cleared (no
+    /// acknowledgment, no consumer registry, no counter ever rides
+    /// the wire — a restored process can never resume cutting on a
+    /// vouch a prior process made); re-arming and re-registering
+    /// with the consumer's durably-derived ack reproduces the
+    /// uninterrupted control's save BYTE FOR BYTE under the same
+    /// acknowledgment schedule, and the restored process that fails
+    /// to re-register REFUSES instead of cutting.
+    #[test]
+    fn retention_frontier_restore_requires_fresh_registration() {
+        fn build() -> Spine<SustainedWorld> {
+            let mut spine = Spine::new(SustainedWorld, 10);
+            for i in 0..10u64 {
+                spine
+                    .schedule(spec(5, Field::Near, 1, i))
+                    .expect("schedule");
+            }
+            spine
+        }
+        let accounting = consumer("accounting");
+        // The acknowledgment schedule: the consumer absorbs each
+        // tick's ten records after the tick (its durable read point
+        // is the executed count).
+        let drive = |spine: &mut Spine<SustainedWorld>, ticks: u64, start_tick: u64| {
+            for t in start_tick..start_tick + ticks {
+                spine.run_tick();
+                spine
+                    .acknowledge_retention_through(accounting, t * 10)
+                    .expect("the schedule is monotone");
+            }
+        };
+        // The uninterrupted control: firings at ticks 4 and 7 (each
+        // cutting 30 — the consumer releases each tick's records, so
+        // the clamp never binds), 90 executed, 60 summarized, 30
+        // retained at the end.
+        let mut control = build();
+        control.arm_retention_frontier(policy(4, 30));
+        control
+            .register_retention_consumer(accounting, 0)
+            .expect("register");
+        drive(&mut control, 9, 1);
+        assert_eq!(control.retention_stats().compactions, 2);
+        assert_eq!(control.retention_stats().summarized_total, 60);
+        assert_eq!(control.ledger_retained().len(), 30);
+        // The split: five ticks (one firing in), save, restore.
+        let mut split = build();
+        split.arm_retention_frontier(policy(4, 30));
+        split
+            .register_retention_consumer(accounting, 0)
+            .expect("register");
+        drive(&mut split, 5, 1);
+        assert_eq!(split.retention_stats().compactions, 1);
+        let bytes = split.save_bytes();
+        // The pin: restore → re-arm → re-register at the DURABLE read
+        // point (50 — what the consumer had absorbed when the save
+        // happened) → continue the same schedule → byte-identical.
+        let mut restored: Spine<SustainedWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+        assert_eq!(restored.save_bytes(), bytes, "the round trip is stable");
+        assert_eq!(restored.retention_policy(), None);
+        assert!(!restored.retention_armed());
+        assert_eq!(restored.retention_stats(), RetentionStats::default());
+        restored.arm_retention_frontier(policy(4, 30));
+        restored
+            .register_retention_consumer(accounting, 50)
+            .expect("the durable point vouches the standing 30-record cut");
+        drive(&mut restored, 4, 6);
+        assert_eq!(restored.retention_stats().compactions, 1);
+        assert_eq!(restored.retention_stats().summarized_total, 30);
+        assert_eq!(
+            restored.save_bytes(),
+            control.save_bytes(),
+            "restore → re-register → continue is byte-identical to the control"
+        );
+        // The failure to re-register: the restored process re-arms
+        // but never registers — it REFUSES at every crossing, never
+        // cutting on the prior process's vouch.
+        let mut unregistered: Spine<SustainedWorld> =
+            Spine::restore(&bytes, Diagnostics::new(Level::Off)).expect("restore");
+        unregistered.arm_retention_frontier(policy(4, 30));
+        unregistered.run_ticks(4);
+        let stats = unregistered.retention_stats();
+        assert_eq!(stats.compactions, 0);
+        assert_eq!(
+            stats.frontier_hold_ticks, 3,
+            "ticks 7, 8, and 9 crossed and held"
+        );
+        assert!(
+            matches!(unregistered.history_kind(), HistoryKind::Compacted { .. }),
+            "the wire-carried cut persists; the cadence simply never adds to it"
+        );
+        assert_eq!(unregistered.ledger_retained().len(), 20 + 40);
+    }
+
+    /// THE TWIN DISCIPLINE THROUGH THE FRONTIER (the :6267 discipline
+    /// extended): a frontier-armed spine whose consumer releases
+    /// everything each tick (the clamp never binds) is
+    /// indistinguishable from the no-policy twin in every
+    /// authoritative observable at EVERY tick — stats, queues,
+    /// watermarks, the report — while the twin's FULL ledger is the
+    /// verbatim-suffix oracle at every cut: the frontier cadence
+    /// reproduces the classic sawtooth exactly.
+    #[test]
+    fn retention_frontier_cadence_matches_the_no_policy_twin_at_every_tick() {
+        let build = || {
+            let mut spine = Spine::new(SaveableNoopWorld, 100);
+            for t in 1..=10u64 {
+                for i in 0..100u64 {
+                    spine
+                        .schedule(spec(0, Field::Near, t, t * 100 + i))
+                        .expect("schedule");
+                }
+            }
+            spine
+        };
+        let mut spine = build();
+        spine.arm_retention_frontier(policy(10, 300));
+        let accounting = consumer("accounting");
+        spine
+            .register_retention_consumer(accounting, 0)
+            .expect("register");
+        let mut twin = build();
+        // The sawtooth: (retained length, cumulative firings) — the
+        // :6267 table, reproduced through the frontier.
+        let expected: [(u64, u64); 10] = [
+            (100, 0),
+            (200, 0),
+            (300, 0),
+            (100, 1),
+            (200, 1),
+            (300, 1),
+            (100, 2),
+            (200, 2),
+            (300, 2),
+            (100, 3),
+        ];
+        for (index, &(len, firings)) in expected.iter().enumerate() {
+            let tick = index + 1;
+            spine.run_tick();
+            twin.run_tick();
+            // The consumer absorbs the tick's records after the tick
+            // (its durable cadence) — the next checkpoint sees them.
+            spine
+                .acknowledge_retention_through(accounting, tick as u64 * 100)
+                .expect("monotone");
+            assert_eq!(spine.ledger_retained().len() as u64, len);
+            assert_eq!(spine.retention_stats().compactions, firings);
+            assert_eq!(spine.stats(), twin.stats(), "tick {tick}: stats");
+            assert_eq!(spine.pending_count(), twin.pending_count());
+            assert_eq!(spine.blocked_count(), twin.blocked_count());
+            assert_eq!(spine.held_count(), twin.held_count());
+            assert_eq!(spine.max_executed_due(), twin.max_executed_due());
+            assert_eq!(spine.processed_through(), twin.processed_through());
+            assert_eq!(spine.lane_report(), twin.lane_report());
+            if firings > 0 {
+                assert_eq!(spine.retention_stats().last_chunk, 300);
+                let HistoryKind::Compacted {
+                    summarized_records,
+                    retained_records,
+                    ..
+                } = spine.history_kind()
+                else {
+                    panic!("tick {tick}: a firing compacted the spine");
+                };
+                assert_eq!(
+                    summarized_records + retained_records,
+                    spine.stats().executed,
+                    "tick {tick}: count identity"
+                );
+                let twin_ledger = twin.ledger();
+                assert_eq!(
+                    spine.ledger_retained(),
+                    &twin_ledger[twin_ledger.len() - len as usize..],
+                    "tick {tick}: the tail is the control's verbatim suffix"
+                );
+            }
+        }
+        assert_eq!(spine.retention_stats().frontier_hold_ticks, 0);
+        assert_eq!(spine.retention_stats().retention_frontier_lag_records, 0);
+    }
+
+    /// THE RATE REGIMES (the §5.6 matrix): the consumer's
+    /// acknowledgment rate against the arrival rate governs the
+    /// ledger — a consumer slower than the arrivals nets the ledger
+    /// UPWARD (observable in the frontier lag, never resolved by
+    /// discarding a record); a consumer at the arrival rate under a
+    /// chunk that covers it holds the bound; a chunk below the
+    /// arrival rate nets upward through the frontier exactly as the
+    /// documented chunk misconfiguration rule does without it.
+    #[test]
+    fn retention_frontier_consumer_rate_governs_the_ledger_bound() {
+        // SLOWER THAN THE ARRIVALS (5 acked per tick against 10
+        // executed): clamped firings, the ledger nets upward ~5 per
+        // tick, the frontier lag exposes the shortfall, nothing is
+        // ever discarded.
+        let mut slow = Spine::new(SustainedWorld, 10);
+        for i in 0..10u64 {
+            slow.schedule(spec(5, Field::Near, 1, i)).expect("schedule");
+        }
+        slow.arm_retention_frontier(policy(4, 30));
+        let accounting = consumer("accounting");
+        slow.register_retention_consumer(accounting, 0)
+            .expect("register");
+        let mut acked = 0u64;
+        let mut last_len = 0u64;
+        for tick in 1..=8u64 {
+            slow.run_tick();
+            acked += 5;
+            slow.acknowledge_retention_through(accounting, acked)
+                .expect("monotone");
+            let len = slow.ledger_retained().len() as u64;
+            if tick >= 5 {
+                assert!(
+                    len > last_len,
+                    "tick {tick}: the consumer-limited ledger nets upward"
+                );
+            }
+            last_len = len;
+            let stats = slow.stats();
+            assert_eq!(
+                stats.scheduled,
+                stats.executed
+                    + slow.pending_count() as u64
+                    + slow.blocked_count() as u64
+                    + slow.held_count() as u64,
+                "tick {tick}: conservation — a held frontier never discards"
+            );
+            if let HistoryKind::Compacted {
+                summarized_records,
+                retained_records,
+                ..
+            } = slow.history_kind()
+            {
+                assert_eq!(
+                    summarized_records + retained_records,
+                    stats.executed,
+                    "tick {tick}: count identity"
+                );
+            }
+        }
+        assert_eq!(slow.stats().executed, 80);
+        assert_eq!(slow.ledger_retained().len(), 45);
+        assert_eq!(
+            slow.retention_stats().retention_frontier_lag_records,
+            25,
+            "the shortfall is exposed: the policy wants 30, the consumer releases 5"
+        );
+        // AT THE ARRIVAL RATE (10 per tick, chunk 30 covers it): the
+        // bound holds at every tick boundary.
+        let mut steady = Spine::new(SustainedWorld, 10);
+        for i in 0..10u64 {
+            steady
+                .schedule(spec(5, Field::Near, 1, i))
+                .expect("schedule");
+        }
+        steady.arm_retention_frontier(policy(4, 30));
+        steady
+            .register_retention_consumer(accounting, 0)
+            .expect("register");
+        for tick in 1..=9u64 {
+            steady.run_tick();
+            steady
+                .acknowledge_retention_through(accounting, tick * 10)
+                .expect("monotone");
+            assert!(
+                steady.ledger_retained().len() as u64 <= 34,
+                "tick {tick}: the bound holds"
+            );
+        }
+        // CHUNK BELOW THE ARRIVAL RATE (chunk 5 against 10 per
+        // tick): the ledger nets upward through the frontier exactly
+        // as the documented misconfiguration rule does — the
+        // consumer is not the limiter, and its lag is not blamed.
+        let mut choked = Spine::new(SustainedWorld, 10);
+        for i in 0..10u64 {
+            choked
+                .schedule(spec(5, Field::Near, 1, i))
+                .expect("schedule");
+        }
+        choked.arm_retention_frontier(policy(4, 5));
+        choked
+            .register_retention_consumer(accounting, 0)
+            .expect("register");
+        for tick in 1..=6u64 {
+            choked.run_tick();
+            choked
+                .acknowledge_retention_through(accounting, tick * 10)
+                .expect("monotone");
+        }
+        assert_eq!(choked.stats().executed, 60);
+        assert!(
+            choked.ledger_retained().len() as u64 > 34,
+            "the chunk-limited ledger nets upward (the configuration rule)"
+        );
+        assert_eq!(
+            choked.retention_stats().retention_frontier_lag_records,
+            0,
+            "the consumer released everything the policy wanted — the chunk is the limiter"
+        );
+    }
+
+    /// THE MULTI-CONSUMER MIN (the §5.6 closing case): with two
+    /// registered consumers the LAGGING one gates the cut — the
+    /// frontier is the minimum acknowledgment — and
+    /// `retention_consumer_lag` NAMES the gate (the leader reports
+    /// zero, the laggard reports its distance behind).
+    #[test]
+    fn retention_frontier_min_over_consumers_names_the_gate() {
+        let mut spine = Spine::new(SustainedWorld, 10);
+        for i in 0..10u64 {
+            spine
+                .schedule(spec(5, Field::Near, 1, i))
+                .expect("schedule");
+        }
+        spine.arm_retention_frontier(policy(4, 30));
+        let audit = consumer("audit");
+        let accounting = consumer("accounting");
+        spine
+            .register_retention_consumer(audit, 0)
+            .expect("register");
+        spine
+            .register_retention_consumer(accounting, 0)
+            .expect("register");
+        // The leader absorbs everything; the auditor lags at 5/tick.
+        for tick in 1..=6u64 {
+            spine.run_tick();
+            spine
+                .acknowledge_retention_through(accounting, tick * 10)
+                .expect("monotone");
+            spine
+                .acknowledge_retention_through(audit, tick * 5)
+                .expect("monotone");
+        }
+        // 60 executed; the auditor's acknowledgment gated every
+        // clamped firing (cuts 15 + 5 + 5 = 25 — exactly the
+        // auditor's released prefix at each crossing).
+        let HistoryKind::Compacted {
+            summarized_records, ..
+        } = spine.history_kind()
+        else {
+            panic!("the clamped cadence compacted the spine");
+        };
+        assert_eq!(summarized_records, 25);
+        assert_eq!(
+            spine.retention_stats().summarized_total,
+            25,
+            "the lagging consumer's ack is exactly what was cut"
+        );
+        assert_eq!(spine.ledger_retained().len(), 35);
+        // The named gate: the leader (accounting, acked 60) reports
+        // zero; the auditor (acked 30) reports its 30-ordinal
+        // distance behind the leader.
+        assert_eq!(spine.retention_consumer_lag(audit), Some(30));
+        assert_eq!(
+            spine.retention_consumer_lag(accounting),
+            Some(0),
+            "the leader reports zero — the auditor is the named gate"
+        );
+        // The tick-6 crossing: the policy wanted 30, the auditor had
+        // released 5 above the standing prefix — lag 25.
+        assert_eq!(spine.retention_stats().retention_frontier_lag_records, 25);
+    }
+
+    /// LATE JOIN (the §5.7 register rule, live): a consumer
+    /// registering after a firing vouches the standing cut (its
+    /// durable read point is at or above the summarized prefix) and
+    /// holds the NEXT firing at its own pace — the join is honest
+    /// about what is already unrecoverable, and the fresh consumer's
+    /// acknowledgment is exactly as binding as the veteran's.
+    /// Also pins `retention_ordinal_of` (the driver-cadence
+    /// convenience): a retained identity's global ordinal is
+    /// `summarized + tail position + 1`, and a summarized or
+    /// unexecuted identity reports `None` (the prefix cannot be
+    /// mapped back, by design).
+    #[test]
+    fn retention_frontier_late_join_vouches_the_standing_cut() {
+        let mut spine = Spine::new(SustainedWorld, 10);
+        for i in 0..10u64 {
+            spine
+                .schedule(spec(5, Field::Near, 1, i))
+                .expect("schedule");
+        }
+        spine.arm_retention_frontier(policy(4, 30));
+        let veteran = consumer("veteran");
+        spine
+            .register_retention_consumer(veteran, 0)
+            .expect("register");
+        for tick in 1..=4u64 {
+            spine.run_tick();
+            spine
+                .acknowledge_retention_through(veteran, tick * 10)
+                .expect("monotone");
+        }
+        // The tick-4 firing cut 30 (summarized 30, retained 10).
+        assert_eq!(spine.retention_stats().summarized_total, 30);
+        assert_eq!(spine.ledger_retained().len(), 10);
+        // The late joiner vouches the standing cut and registers at
+        // its own durable point above it.
+        let late = consumer("late-joiner");
+        spine
+            .register_retention_consumer(late, 30)
+            .expect("vouching the standing cut registers");
+        // Ticks 5–7 with the veteran releasing and the joiner
+        // holding: the tick-7 crossing (40 > 34) refuses — the
+        // joiner's ack is exactly as binding.
+        for tick in 5..=7u64 {
+            spine.run_tick();
+            spine
+                .acknowledge_retention_through(veteran, tick * 10)
+                .expect("monotone");
+        }
+        let stats = spine.retention_stats();
+        assert_eq!(
+            stats.compactions, 1,
+            "the tick-7 crossing held at the joiner"
+        );
+        assert_eq!(stats.frontier_hold_ticks, 1);
+        assert_eq!(spine.retention_consumer_lag(late), Some(70 - 30));
+        assert_eq!(spine.retention_consumer_lag(veteran), Some(0));
+        // The joiner releases: the next crossing fires, clamped from
+        // the new `summarized_records`.
+        spine
+            .acknowledge_retention_through(late, 50)
+            .expect("monotone");
+        spine.run_tick();
+        let stats = spine.retention_stats();
+        assert_eq!(stats.compactions, 2);
+        assert_eq!(
+            stats.last_chunk, 20,
+            "the clamp is min(excess, chunk, 50 − 30)"
+        );
+        assert_eq!(spine.ledger_retained().len(), 80 - 30 - 20);
+        // The ordinal convenience: the first retained record is
+        // ordinal 51 (summarized 50 + position 0 + 1); the
+        // summarized identity #1 and an unexecuted identity report
+        // None.
+        assert_eq!(
+            spine.retention_ordinal_of(spine.ledger_retained()[0].id),
+            Some(51)
+        );
+        assert_eq!(spine.retention_ordinal_of(EventId { seq: 0 }), None);
+        assert_eq!(spine.retention_ordinal_of(EventId { seq: 100_000 }), None);
+    }
+
+    /// CLASS-1 COMPAT (the §5.8 bar): every historical
+    /// `ConsequenceEligibility` call site compiles unchanged against
+    /// the deprecated alias, and a permanently-free-armed cadence —
+    /// through either constructor — reproduces the classic sawtooth
+    /// (the :6267 shape) with the frontier counters untouched: the
+    /// world-class capability leaves the cut at `min(excess,
+    /// chunk)`, unclamped, exactly the pre-T07 firing math.
+    #[test]
+    #[allow(deprecated)]
+    fn permanently_free_eligibility_and_the_alias_reproduce_the_classic_sawtooth() {
+        let build = || {
+            let mut spine = Spine::new(SaveableNoopWorld, 100);
+            for t in 1..=10u64 {
+                for i in 0..100u64 {
+                    spine
+                        .schedule(spec(0, Field::Near, t, t * 100 + i))
+                        .expect("schedule");
+                }
+            }
+            spine
+        };
+        // The deprecated alias path (the CA-07 call sites, unchanged).
+        let mut aliased = build();
+        aliased.set_retention_policy(policy(10, 300), ConsequenceEligibility::acknowledged());
+        assert!(aliased.retention_armed());
+        // The renamed Class-1 path.
+        let mut renamed = build();
+        renamed.set_retention_policy(policy(10, 300), ConsequenceFreedom::permanently_free());
+        assert!(renamed.retention_armed());
+        for spine in [&mut aliased, &mut renamed] {
+            spine.run_ticks(10);
+        }
+        for (name, spine) in [("alias", &aliased), ("renamed", &renamed)] {
+            let stats = spine.retention_stats();
+            assert_eq!(stats.compactions, 3, "{name}: firings at ticks 4/7/10");
+            assert_eq!(stats.summarized_total, 900);
+            assert_eq!(stats.last_chunk, 300);
+            assert_eq!(stats.frontier_hold_ticks, 0, "{name}: no frontier is armed");
+            assert_eq!(
+                stats.retention_frontier_lag_records, 0,
+                "{name}: no frontier is armed"
+            );
+            assert_eq!(spine.ledger_retained().len(), 100);
+        }
+        assert_eq!(
+            aliased.save_bytes(),
+            renamed.save_bytes(),
+            "the two Class-1 constructors agree byte for byte"
+        );
+    }
+
+    /// MANUAL AUTHORITY (the §5.10 bar, the audit's explicit clause):
+    /// an explicit [`Spine::compact`] between frontier-held firings
+    /// SUCCEEDS — the frontier polices only the automatic path, the
+    /// operator who explicitly cuts takes the responsibility
+    /// explicitly — and the frontier accounting stays COHERENT
+    /// fail-closed around it: a manual cut past a consumer's ack
+    /// leaves the clamp saturating at zero (the frontier holds until
+    /// the consumer's acknowledgment catches up past the new
+    /// `summarized_records`), and once it catches up the next firing
+    /// is measured from the new standing prefix.
+    #[test]
+    fn explicit_compact_between_frontier_holdings_keeps_the_frontier_coherent() {
+        let mut spine = Spine::new(SaveableNoopWorld, 100);
+        for t in 1..=10u64 {
+            for i in 0..100u64 {
+                spine
+                    .schedule(spec(0, Field::Near, t, t * 100 + i))
+                    .expect("schedule");
+            }
+        }
+        spine.run_ticks(6);
+        assert_eq!(spine.ledger_retained().len(), 600);
+        spine.arm_retention_frontier(policy(10, 300));
+        let accounting = consumer("accounting");
+        spine
+            .register_retention_consumer(accounting, 0)
+            .expect("register");
+        // The held crossing: the policy wants 300, the consumer has
+        // released nothing — the frontier refuses.
+        spine.run_tick();
+        let stats = spine.retention_stats();
+        assert_eq!(stats.compactions, 0);
+        assert_eq!(stats.frontier_hold_ticks, 1);
+        assert_eq!(stats.retention_frontier_lag_records, 300);
+        // The manual authority: the operator cuts 300 anyway —
+        // PAST the consumer's 0-ordinal ack. The explicit call
+        // succeeds (manual responsibility, never frontier-policed).
+        spine
+            .compact(300)
+            .expect("the manual cut is the operator's authority");
+        let HistoryKind::Compacted {
+            summarized_records, ..
+        } = spine.history_kind()
+        else {
+            panic!("the manual cut compacted the spine");
+        };
+        assert_eq!(summarized_records, 400);
+        // Coherent fail-closed accounting: the consumer's ack (0)
+        // now sits BELOW the standing cut, the clamp saturates at
+        // zero, and the frontier holds until the ack catches up —
+        // the ack may advance to a point still below the standing
+        // cut (progress toward catching up, monotone vs its own
+        // prior value only).
+        spine.run_tick();
+        assert_eq!(
+            spine.retention_stats().compactions,
+            0,
+            "the clamp saturates: releasable is ack 0 − summarized 400"
+        );
+        spine
+            .acknowledge_retention_through(accounting, 250)
+            .expect("monotone vs the consumer's own ack, though below the standing cut");
+        spine.run_tick();
+        assert_eq!(
+            spine.retention_stats().compactions,
+            0,
+            "still saturating: releasable is ack 250 − summarized 400"
+        );
+        // Catch-up: the ack passes the standing cut and the next
+        // crossing fires, measured from the NEW summarized_records.
+        spine
+            .acknowledge_retention_through(accounting, 500)
+            .expect("monotone");
+        spine.run_tick();
+        let stats = spine.retention_stats();
+        assert_eq!(stats.compactions, 1);
+        assert_eq!(
+            stats.last_chunk, 100,
+            "the clamp is min(excess, chunk, 500 − 400)"
+        );
+        assert_eq!(spine.ledger_retained().len(), 1000 - 400 - 100);
+        // The count identity survived the interleave.
+        let HistoryKind::Compacted {
+            summarized_records,
+            retained_records,
+            ..
+        } = spine.history_kind()
+        else {
+            panic!("the frontier firing compacted the spine");
+        };
+        assert_eq!(
+            summarized_records + retained_records,
+            spine.stats().executed
+        );
     }
 
     // -------------------------------------- CA-08 class-index tests (F08)
