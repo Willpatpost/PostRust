@@ -392,3 +392,6 @@ ratified (additive match arms, disclosed before the edit); the design's
 §7.1 example contradiction resolved to the mechanism. B01
 implemented-pending-measurement — the four obligations recorded. CI pins
 corrected (`c50a62c`: main 1673/1622). Confirming run `46147200290`.
+
+**T08 CI-verified green:** run `46147200290` at `c50a62c` — all five jobs
+success; the +12 pin arithmetic confirmed on both platforms.
