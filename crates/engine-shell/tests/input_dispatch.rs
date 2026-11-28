@@ -150,6 +150,15 @@ fn key_repeats_are_counted_not_repressed() {
     assert_eq!(snap.move_forward, 1, "the key remains held");
 }
 
+// CA-23's unmapped-repeat cases (keycode-less KeyDown events) live in
+// the library battery as inline `input` tests: the sdl3 wrapper's
+// queue conversion refuses `keycode: None` (`to_ll` returns None for
+// a keyboard event without a keycode), so those shapes cannot be
+// synthesized through SDL's event queue at all — the state machine is
+// driven directly through the identical production `process` branch
+// there, while this file keeps the full pump-path coverage for every
+// pushable shape.
+
 #[test]
 fn look_deltas_require_relative_capture_and_do_not_accumulate() {
     let _guard = lock();
