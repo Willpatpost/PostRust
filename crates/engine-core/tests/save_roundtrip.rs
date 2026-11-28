@@ -194,3 +194,117 @@ fn duplicate_dependencies_round_trip_faithfully() {
     assert_spines_equivalent(&spine, &restored, "duplicate deps");
     assert_eq!(bytes, restored.save_bytes());
 }
+
+#[test]
+fn npc_world_save_v2_round_trips_under_the_composition_budget() {
+    // T21 (the integration half of the decode-admission boundary):
+    // the composition caller's public shape — a v2 section encoded,
+    // then decoded under the EXACT budget its own arithmetic charges
+    // (`NpcWorldSectionV2::decode_reservation_bytes`, the same
+    // ledger the decoder runs) — round-trips byte-identically, and
+    // one byte under that budget refuses typed at the charge that
+    // crosses. The strict-audit-IV T21 contract: the caller's
+    // configured limit bounds the decode's TOTAL transients (the
+    // block vector, the columns at their actual requested capacity,
+    // the uniqueness-merge scratch), never the nominal columns
+    // alone.
+    use engine_core::lod::LodLevel;
+    use engine_core::npc_behavior::{NpcId, NpcIdentity};
+    use engine_core::npc_world_save::{NpcRegionBlock, NpcWorldSectionV2, SectionDecodeLimits};
+    use engine_core::world_config::WorldConfig;
+    use engine_core::{Decoder, Encoder, SaveError, Tick};
+
+    let identities = |region: u8, ids: &[u32]| -> Vec<NpcIdentity> {
+        ids.iter()
+            .map(|&id| NpcIdentity {
+                id: NpcId(id),
+                home_cell: ((id % 16) as u8, ((id / 16) % 16) as u8),
+                region,
+                appearance_seed: id.wrapping_mul(2_654_435_761),
+            })
+            .collect()
+    };
+    let block = |region: u8, ids: &[u32], dormant: bool| NpcRegionBlock {
+        near: region < 2,
+        lod: if dormant {
+            LodLevel::Dormant
+        } else {
+            LodLevel::Full
+        },
+        identities: identities(region, ids),
+        steps: ids.iter().map(|&id| u64::from(id) % 97).collect(),
+        milestones: ids.iter().map(|&id| u64::from(id) % 16).collect(),
+        credits: ids.iter().map(|&id| u64::from(id) % 5).collect(),
+        routine_cursor: if dormant {
+            Vec::new()
+        } else {
+            ids.iter().map(|&id| u64::from(id) / 2).collect()
+        },
+        positions: if dormant {
+            Vec::new()
+        } else {
+            ids.iter()
+                .map(|&id| ((id % 16) as u8, ((id / 7) % 16) as u8))
+                .collect()
+        },
+        represented_through: if dormant {
+            Vec::new()
+        } else {
+            ids.iter().map(|&id| Tick(u64::from(id) % 31)).collect()
+        },
+        pending_signals: if dormant {
+            Vec::new()
+        } else {
+            ids.iter().map(|&id| u64::from(id) % 3).collect()
+        },
+    };
+    let section = NpcWorldSectionV2 {
+        seed: 42,
+        activity_period: 5,
+        simplify_factor: 3,
+        commitment_window: 9,
+        region_lods_enabled: true,
+        config: WorldConfig {
+            region_count: 3,
+            npc_count: 9,
+            region_grid: 16,
+        },
+        regions: vec![
+            block(0, &[0, 3, 6], false),
+            block(1, &[1, 4, 7], true),
+            block(2, &[2, 5, 8], false),
+        ],
+    };
+    section
+        .validate()
+        .expect("the fixture section is consistent");
+    let mut enc = Encoder::new();
+    section.save(&mut enc);
+    let bytes = enc.into_bytes();
+    // The exact charge admits the section's own encoding, and the
+    // round trip is byte-identical under it.
+    let admitting = section
+        .decode_reservation_bytes()
+        .expect("the charge is representable");
+    let mut dec = Decoder::new(&bytes);
+    let restored =
+        NpcWorldSectionV2::restore_with_limits(&mut dec, &SectionDecodeLimits::new(9, admitting))
+            .expect("the exact charge admits the encoding");
+    assert!(dec.finish().is_ok());
+    assert_eq!(restored, section);
+    let mut re_enc = Encoder::new();
+    restored.save(&mut re_enc);
+    assert_eq!(
+        re_enc.into_bytes(),
+        bytes,
+        "the round trip is byte-identical under the composition budget"
+    );
+    // One byte below refuses typed, at the charge that crosses.
+    assert!(matches!(
+        NpcWorldSectionV2::restore_with_limits(
+            &mut Decoder::new(&bytes),
+            &SectionDecodeLimits::new(9, admitting - 1)
+        ),
+        Err(SaveError::Limit { .. })
+    ));
+}

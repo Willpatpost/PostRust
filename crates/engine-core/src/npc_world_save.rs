@@ -79,7 +79,8 @@
 //!   data) and P3 sign-off for the anchor/journal surface that also
 //!   reads world sections. Until then: load v1 as v1, v2 as v2.
 
-use std::collections::BTreeSet;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 
 use crate::clock::Tick;
 use crate::event::Event;
@@ -192,6 +193,17 @@ impl NpcWorldSection {
     /// the dormant-discard sentinel, the near-mask bound — consuming
     /// exactly the production encoding or returning the production
     /// typed error. Malformed input is never repaired.
+    ///
+    /// T21 (the transient arithmetic stated): the v1 workload is
+    /// FIXED — 1,000 identities, eight regions — so this walk's
+    /// total transient reservation is a constant (seven 1,000-element
+    /// columns, 8,000 bytes each: 56,000 nominal), reserved fallibly
+    /// (`try_reserve` — an allocation failure is the typed
+    /// [`SaveError::Overflow`] refusal, never an abort) and needing
+    /// no limits type (the documented CA-02 decision: affordability
+    /// is definitionally granted by the fixed v1 interpretation;
+    /// callers decoding less-trusted v1 bytes get their admission at
+    /// the byte framing the spine and the anchor own).
     pub fn restore(dec: &mut Decoder) -> Result<Self, SaveError> {
         const SECTION: &str = "npc-world-save";
         let seed = dec.read_u64()?;
@@ -218,11 +230,11 @@ impl NpcWorldSection {
         if npc_count != NPC_COUNT as u64 {
             return Err(SaveError::Integrity("npc-world-save/npc-count"));
         }
-        let mut steps = Vec::with_capacity(NPC_COUNT);
+        let mut steps = reserved_column(NPC_COUNT, SECTION)?;
         for _ in 0..NPC_COUNT {
             steps.push(dec.read_u64()?);
         }
-        let mut routine_cursor = Vec::with_capacity(NPC_COUNT);
+        let mut routine_cursor = reserved_column(NPC_COUNT, SECTION)?;
         for _ in 0..NPC_COUNT {
             routine_cursor.push(dec.read_u64()?);
         }
@@ -230,7 +242,7 @@ impl NpcWorldSection {
         // (`POSITION_DISCARDED` — the reconstructible representation
         // is GONE, not merely flagged); every other position must lie
         // on the region-local grid (the bounds invariant).
-        let mut positions = Vec::with_capacity(NPC_COUNT);
+        let mut positions = reserved_column(NPC_COUNT, SECTION)?;
         for _ in 0..NPC_COUNT {
             let x = dec.read_u8()?;
             let y = dec.read_u8()?;
@@ -239,19 +251,19 @@ impl NpcWorldSection {
             }
             positions.push((x, y));
         }
-        let mut represented_through = Vec::with_capacity(NPC_COUNT);
+        let mut represented_through = reserved_column(NPC_COUNT, SECTION)?;
         for _ in 0..NPC_COUNT {
             represented_through.push(dec.read_tick()?);
         }
-        let mut milestones = Vec::with_capacity(NPC_COUNT);
+        let mut milestones = reserved_column(NPC_COUNT, SECTION)?;
         for _ in 0..NPC_COUNT {
             milestones.push(dec.read_u64()?);
         }
-        let mut pending_signals = Vec::with_capacity(NPC_COUNT);
+        let mut pending_signals = reserved_column(NPC_COUNT, SECTION)?;
         for _ in 0..NPC_COUNT {
             pending_signals.push(dec.read_u64()?);
         }
-        let mut credits = Vec::with_capacity(NPC_COUNT);
+        let mut credits = reserved_column(NPC_COUNT, SECTION)?;
         for _ in 0..NPC_COUNT {
             credits.push(dec.read_u64()?);
         }
@@ -330,9 +342,9 @@ impl SaveWorld for NpcSaveWorld {
 pub const NPC_WORLD_SAVE_DOMAIN_V2: &str = "engine-slice/npc-world-save/2";
 
 /// Caller-configurable decode-admission limits for the v2 section
-/// (CA-02/F02, Q07 — the resource-admission half of the L8 boundary):
-/// what the DECODER may spend materializing a section, as a CALLER
-/// decision distinct from what the WIRE admits.
+/// (CA-02/F02, Q07, T21 — the resource-admission half of the L8
+/// boundary): what the DECODER may spend materializing a section, as
+/// a CALLER decision distinct from what the WIRE admits.
 ///
 /// **Why this type exists (the two-contracts finding):** the wire's
 /// own validity bounds (`MAX_REGION_COUNT`, `MAX_NPC_COUNT` — the
@@ -351,6 +363,42 @@ pub const NPC_WORLD_SAVE_DOMAIN_V2: &str = "engine-slice/npc-world-save/2";
 /// the second one, authored by the composition boundary that knows
 /// what it can afford.
 ///
+/// **What `max_reserve_bytes` bounds (T21 — the TOTAL, not the
+/// columns):** the ledger charges EVERY transient heap reservation
+/// the decode makes, each at its actual requested capacity rounded
+/// up to a documented allocation granularity
+/// ([`ALLOCATION_GRANULARITY`]):
+///
+/// * the per-block column vectors (`count × size_of::<T>()` — the
+///   exact capacity `try_reserve` requests, observable as
+///   `capacity() == len()` on every decoded column);
+/// * the regions vector itself (`region_count ×
+///   size_of::<NpcRegionBlock>()` — the block-vector transient
+///   CA-02 left as a plain reservation);
+/// * the cross-region uniqueness merge's cursor scratch (at most
+///   one twelve-byte cursor per region — the seen-id `BTreeSet`
+///   node stream CA-02 left unaccounted is gone entirely; see
+///   [`NpcWorldSectionV2::restore_with_limits`]).
+///
+/// A budget covering exactly the charge is computable WITHOUT
+/// decoding, from the section itself:
+/// [`NpcWorldSectionV2::decode_reservation_bytes`] is the same
+/// arithmetic the decoder's ledger runs, so a composition caller
+/// can configure the budget that admits precisely the section it
+/// authored — and one byte less refuses it, typed.
+///
+/// The granularity rounding is the documented conservative
+/// per-allocation overhead: std reserves "at least" the requested
+/// capacity, and the allocator may round a request into a larger
+/// size class — 64-byte granularity covers the common small-block
+/// classes (glibc's 16-byte-aligned chunks with header, jemalloc's
+/// 16-byte spacing, the Windows CRT's small-block heap) with
+/// margin. Allocators with coarser classes are honestly OUTSIDE
+/// this accounting: the budget is an admission contract over
+/// requested bytes plus this documented overhead, and
+/// allocator-level telemetry remains the counting-allocator census
+/// follow-up (the note below).
+///
 /// **The scoped/global identity policy is NOT this type's decision**
 /// (a separate owner question, deliberately out of scope): the v2
 /// format's identity table is globally scoped — ids unique across
@@ -366,6 +414,21 @@ pub const NPC_WORLD_SAVE_DOMAIN_V2: &str = "engine-slice/npc-world-save/2";
 /// over-budget input becomes a typed [`SaveError::Limit`] refusal
 /// BEFORE any reservation is made.
 ///
+/// **The default's transient arithmetic (T21, stated):** at
+/// [`Self::WIRE_MAXIMUM`] the byte budget is not enforced
+/// (`u64::MAX`), and the decode's transients are bounded by the
+/// whole-input minimum-size gate instead: a section payload of `S`
+/// bytes admits at most `(S − 10·R) / 35` identities (each
+/// identity's dormant wire minimum is 35 bytes, each block's
+/// framing 10), so the column reservations are at most
+/// `62/35 · S ≈ 1.8 × S` (the active in-memory stride over the
+/// dormant wire minimum) plus the fixed partition transients — the
+/// block vector at most `256 × size_of::<NpcRegionBlock>()`, the
+/// merge cursors at most `256 × 12` bytes, and the per-column
+/// granularity slack — roughly `1.8 ×` the input plus a ~54 KiB
+/// constant. CA-02's pre-gate shape reserved ~62 × the input; the
+/// whole-input gate is what the wire maximum now means.
+///
 /// **The allocation-census boundary (an honest note):** the
 /// thread-attributed counting-allocator census — the
 /// `tests/spine_allocations.rs` / `tests/spatial_query_allocations.rs`
@@ -374,7 +437,9 @@ pub const NPC_WORLD_SAVE_DOMAIN_V2: &str = "engine-slice/npc-world-save/2";
 /// which this codec's owning lanes did not add; the inline battery
 /// proves the same property structurally (the typed pre-reservation
 /// refusals plus the exact-capacity reservations — the reservation
-/// sizes are observable on every decoded section), and the census
+/// sizes are observable on every decoded section, and the ledger's
+/// charge is published by
+/// [`NpcWorldSectionV2::decode_reservation_bytes`]), and the census
 /// binary remains the natural follow-up if the composition boundary
 /// adopting `restore_with_limits` wants allocator-level telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,16 +451,23 @@ pub struct SectionDecodeLimits {
     /// larger declarations first).
     pub max_identities: u64,
     /// The maximum cumulative in-memory bytes the decode may reserve
-    /// across the section's per-block column vectors (the transient
-    /// reservation budget; the decoded section's own footprint is
-    /// bounded by it by construction).
+    /// across EVERY transient it allocates (T21's total budget: the
+    /// per-block column vectors, the regions vector, and the
+    /// uniqueness-merge scratch — each charged at its requested
+    /// capacity rounded up to the documented allocation granularity;
+    /// see the type doc for the full accounting and
+    /// [`NpcWorldSectionV2::decode_reservation_bytes`] for the exact
+    /// charge a given section will incur).
     pub max_reserve_bytes: u64,
 }
 
 impl SectionDecodeLimits {
     /// The wire-valid maximum: the identity codec's full domain and
-    /// an unbounded reservation budget — exactly the acceptance the
-    /// plain [`NpcWorldSectionV2::restore`] entry has always had.
+    /// an unenforced byte budget — exactly the acceptance the plain
+    /// [`NpcWorldSectionV2::restore`] entry has always had (the
+    /// default's transient arithmetic is stated in the type doc:
+    /// the whole-input minimum-size gate bounds the decode to
+    /// ~1.8× the input plus the fixed partition transients).
     pub const WIRE_MAXIMUM: SectionDecodeLimits = SectionDecodeLimits {
         max_identities: MAX_NPC_COUNT as u64,
         max_reserve_bytes: u64::MAX,
@@ -598,23 +670,42 @@ impl NpcWorldSectionV2 {
     /// ranges whose column reservations exceed the platform's
     /// willingness) becomes a typed refusal there, and remains —
     /// under the wire maximum — bounded by the input's own size (the
-    /// minimum-bytes gates below still apply, so no reservation ever
-    /// exceeds what the wire could actually supply for that count).
+    /// whole-input minimum-size gate and the minimum-bytes gates
+    /// below still apply, so no reservation ever exceeds what the
+    /// wire could actually supply for that count; see
+    /// [`SectionDecodeLimits`] for the default's transient
+    /// arithmetic).
     pub fn restore(dec: &mut Decoder) -> Result<Self, SaveError> {
         Self::restore_with_limits(dec, &SectionDecodeLimits::WIRE_MAXIMUM)
     }
 
     /// Restores the v2 section under CALLER-CONFIGURED admission
-    /// limits (CA-02/F02 — see [`SectionDecodeLimits`]): the same
-    /// fail-closed walk as [`Self::restore`], with the decoder's
+    /// limits (CA-02/F02, T21 — see [`SectionDecodeLimits`]): the
+    /// same fail-closed walk as [`Self::restore`], with the decoder's
     /// resource admission decided by the caller rather than the
-    /// wire's validity domain alone. Three gates close the
+    /// wire's validity domain alone. Five gates close the
     /// reservation-abort shape, each BEFORE the reservation it
     /// guards:
     ///
     /// * **The aggregate identity budget**: a declared population
     ///   above `limits.max_identities` is refused before any region
     ///   decodes (the over-budget workload refusal).
+    /// * **The whole-input minimum-size proof (T21)**: before ANY
+    ///   significant allocation, `region_count` blocks × 10 framing
+    ///   wire bytes + `npc_count` identities × 35 dormant-minimum
+    ///   wire bytes must fit in the bytes actually remaining — a
+    ///   truncated or huge-declaring input refuses here, typed,
+    ///   before the block vector or any column reserves. The gate
+    ///   never rejects a valid encoding (a complete section's
+    ///   payload is exactly its blocks' bytes, at least every
+    ///   block's dormant minimum). For a COMPLETE section it
+    ///   subsumes the per-column stride gate below — with the
+    ///   remaining-identity budget bounding every block count by
+    ///   the unclaimed population, each column's stride is payable
+    ///   from the dormant minima of the identities the section
+    ///   still owes; a TRUNCATED input whose active blocks sit
+    ///   above the dormant minimum is exactly what the stride gates
+    ///   (kept as defense in depth) still catch, column-named.
     /// * **The remaining identity budget**: each block's identity
     ///   count is bounded by the population REMAINING unclaimed by
     ///   earlier blocks (`npc_count − identities so far`), not the
@@ -633,17 +724,31 @@ impl NpcWorldSectionV2 {
     ///   encoding: a complete section's remaining bytes at each
     ///   column are exactly that column's bytes plus everything
     ///   after it.
+    /// * **The total reserve-bytes budget (T21)**: EVERY transient
+    ///   heap reservation — the regions vector, each column at its
+    ///   actual requested capacity, the uniqueness-merge scratch,
+    ///   each rounded up to the documented allocation granularity —
+    ///   is charged against `limits.max_reserve_bytes` before it is
+    ///   requested (the `regions-reserve`, `reserve-bytes`, and
+    ///   `uniqueness-scratch` refusals; the exact charge for a
+    ///   known section is published by
+    ///   [`Self::decode_reservation_bytes`]).
     ///
     /// All count arithmetic is checked, every reservation is
     /// fallible (`try_reserve` — an allocation failure is a typed
     /// [`SaveError::Overflow`] refusal, never an abort), and the
-    /// cumulative in-memory reservation is checked against
-    /// `limits.max_reserve_bytes` (the `reserve-bytes` refusal). The
-    /// per-region block vector itself stays a plain reservation:
-    /// `region_count` is bounded by the constant
-    /// [`MAX_REGION_COUNT`] (256 blocks × the block struct's size —
-    /// affordable by definition, like the v1 codec's fixed 1,000
-    /// identity set, which is why the v1 walk needs no limits type).
+    /// cross-region uniqueness proof is a bounded k-way merge over
+    /// the per-block identity tables (each already strictly
+    /// ascending, wire-enforced) instead of the per-ID `BTreeSet`
+    /// node stream CA-02 left unaccounted: at most one cursor per
+    /// region, charged and fallibly reserved before the merge runs,
+    /// never a dense bitset over the sparse u32 id universe. The
+    /// duplicate refusal stays the typed [`SaveError::Duplicate`]
+    /// naming the id, and still fires BEFORE the population-sum
+    /// integrity gate (the pre-T21 error preference); a
+    /// compound-malformed input may now name its other defect
+    /// first, since the merge runs after the walk (the variant and
+    /// the named id are unchanged).
     pub fn restore_with_limits(
         dec: &mut Decoder,
         limits: &SectionDecodeLimits,
@@ -690,13 +795,67 @@ impl NpcWorldSectionV2 {
                 max: limits.max_identities,
             });
         }
-        // The cumulative in-memory reservation across every block's
-        // columns (the `reserve-bytes` budget's ledger).
+        // THE WHOLE-INPUT MINIMUM-SIZE PROOF (T21): before ANY
+        // significant allocation, the declared partition and
+        // population must be payable at each identity's DORMANT
+        // minimum — region_count blocks of 10 framing wire bytes
+        // (near, lod, the fixed-width identity count) plus npc_count
+        // identities of 35 wire bytes (the 11-byte identity record
+        // and the three eight-byte record columns) must fit in the
+        // bytes actually remaining. A complete section's payload is
+        // exactly its blocks' bytes, at least every block's dormant
+        // minimum, so the gate never rejects a valid encoding; a
+        // truncated or huge-declaring input refuses HERE, typed,
+        // before the block vector or any column reserves. This
+        // subsumes the per-column wire-stride gates below (kept as
+        // defense in depth): the remaining-identity budget bounds
+        // every block count by the unclaimed population, so each
+        // column's stride is payable from the dormant minima of the
+        // identities the section still owes.
+        let framing_minimum = region_count
+            .checked_mul(BLOCK_FRAMING_WIRE_BYTES)
+            .ok_or(SaveError::Overflow { section: SECTION })?;
+        let identity_minimum = npc_count
+            .checked_mul(DORMANT_IDENTITY_WIRE_BYTES)
+            .ok_or(SaveError::Overflow { section: SECTION })?;
+        let section_minimum = framing_minimum
+            .checked_add(identity_minimum)
+            .ok_or(SaveError::Overflow { section: SECTION })?;
+        let remaining = dec.remaining() as u64;
+        if section_minimum > remaining {
+            return Err(SaveError::Limit {
+                section: SECTION,
+                kind: "section-minimum-bytes",
+                value: section_minimum,
+                max: remaining,
+            });
+        }
+        // The cumulative in-memory reservation across EVERY
+        // transient the decode allocates (T21's total budget: the
+        // block vector, the columns, the uniqueness scratch — each
+        // charged at the granularity-rounded request).
         let mut reserved: u64 = 0;
-        // The regions vector: bounded by the constant region-field
-        // width (256 blocks), affordable by definition.
-        let mut regions = Vec::with_capacity(region_count as usize);
-        let mut seen_ids: BTreeSet<u32> = BTreeSet::new();
+        // THE REGIONS VECTOR (T21): charged against the budget and
+        // reserved fallibly. The block vector is bounded by the
+        // constant region-field width (256 blocks), but under a
+        // caller's small budget it is transient heap the ledger must
+        // see BEFORE it is requested — the red witness's shape (a
+        // decode admitted at the nominal column budget while the
+        // block vector alone reserved ~5.6× it).
+        let region_slots =
+            usize::try_from(region_count).map_err(|_| SaveError::Overflow { section: SECTION })?;
+        charge_reserve(
+            region_count
+                .checked_mul(std::mem::size_of::<NpcRegionBlock>() as u64)
+                .ok_or(SaveError::Overflow { section: SECTION })?,
+            "regions-reserve",
+            limits,
+            &mut reserved,
+        )?;
+        let mut regions = Vec::new();
+        regions
+            .try_reserve(region_slots)
+            .map_err(|_| SaveError::Overflow { section: SECTION })?;
         let mut total_identities = 0u64;
         for region_index in 0..region_count {
             let near = read_flag(dec, SECTION)?;
@@ -744,20 +903,17 @@ impl NpcWorldSectionV2 {
                     return Err(SaveError::Integrity("npc-world-save-v2/identity-home-cell"));
                 }
                 // Canonical order: strictly ascending ids within the
-                // block, unique across the whole section — the dense
-                // positional discipline, made wire-checkable.
+                // block — the dense positional discipline, made
+                // wire-checkable, and the sortedness the post-walk
+                // cross-region uniqueness merge rides (T21: global
+                // uniqueness is proven by the bounded merge, not by
+                // per-ID index nodes).
                 if let Some(prior) = prev_id
                     && identity.id.0 <= prior
                 {
                     return Err(SaveError::Order { section: SECTION });
                 }
                 prev_id = Some(identity.id.0);
-                if !seen_ids.insert(identity.id.0) {
-                    return Err(SaveError::Duplicate {
-                        section: SECTION,
-                        seq: u64::from(identity.id.0),
-                    });
-                }
                 identities.push(identity);
             }
             total_identities = total_identities
@@ -915,6 +1071,33 @@ impl NpcWorldSectionV2 {
                 credits,
             });
         }
+        // THE CROSS-REGION UNIQUENESS MERGE (T21): the seen-id
+        // `BTreeSet` is gone — its per-ID tree nodes were transient
+        // index memory no budget saw (at least one fixed-layout
+        // allocation per eleven identities, unbounded by any caller
+        // limit). Every block's table is strictly ascending (the
+        // wire-enforced canonical order above), so a bounded k-way
+        // merge proves GLOBAL uniqueness: at most one cursor per
+        // region (never a dense bitset over the sparse u32 id
+        // universe), O(n log R), and the cursor scratch is charged
+        // and fallibly reserved before the merge runs. The duplicate
+        // refusal is still the typed `SaveError::Duplicate` naming
+        // the id, and still fires BEFORE the population-sum
+        // integrity gate (the pre-T21 error preference).
+        charge_reserve(
+            region_count
+                .checked_mul(std::mem::size_of::<UniquenessCursor>() as u64)
+                .ok_or(SaveError::Overflow { section: SECTION })?,
+            "uniqueness-scratch",
+            limits,
+            &mut reserved,
+        )?;
+        let mut cursors: Vec<Reverse<UniquenessCursor>> = Vec::new();
+        cursors
+            .try_reserve(region_slots)
+            .map_err(|_| SaveError::Overflow { section: SECTION })?;
+        let mut heap = BinaryHeap::from(cursors);
+        assert_cross_region_uniqueness(&regions, &mut heap)?;
         // The ONE identity count governs: the block counts must sum
         // to the configured population exactly — a different identity
         // set is an incompatible workload, never a resized restore.
@@ -930,6 +1113,71 @@ impl NpcWorldSectionV2 {
             config,
             regions,
         })
+    }
+
+    /// The exact total this section's encoding will charge against
+    /// [`SectionDecodeLimits::max_reserve_bytes`] at decode (T21 —
+    /// the composition caller's affordability arithmetic): the
+    /// regions vector, every column at its actual requested
+    /// capacity, and the uniqueness-merge scratch, each rounded up
+    /// to the documented allocation granularity — the SAME ledger
+    /// [`Self::restore_with_limits`] accumulates, computed without
+    /// decoding. A budget at or above this value admits the
+    /// section's own encoding; a budget one byte below refuses it,
+    /// typed, at the charge that crosses (the off-by-one admission
+    /// boundary, pinned by test). The charge follows the section's
+    /// SHAPE — the `lod`-selected dormant/active column set, exactly
+    /// as the wire walk reads it; `validate` the section first if
+    /// the caller wants the canonical shape.
+    pub fn decode_reservation_bytes(&self) -> Result<u64, SaveError> {
+        const SECTION: &str = "npc-world-save-v2";
+        let region_count = u64::from(self.config.region_count);
+        let block_bytes = region_count
+            .checked_mul(std::mem::size_of::<NpcRegionBlock>() as u64)
+            .ok_or(SaveError::Overflow { section: SECTION })?;
+        let mut total = allocation_charge(block_bytes)?;
+        for block in &self.regions {
+            let count = u64::try_from(block.identities.len())
+                .expect("the identity count is bounded by the configured population");
+            // The column strides the walk charges for this block's
+            // shape: the identity table, steps, milestones, and
+            // credits always; the four reconstructible columns only
+            // in the active shape (the structural dormant rule).
+            let strides: &[u64] = if block.lod == LodLevel::Dormant {
+                &[
+                    std::mem::size_of::<NpcIdentity>() as u64,
+                    std::mem::size_of::<u64>() as u64,
+                    std::mem::size_of::<u64>() as u64,
+                    std::mem::size_of::<u64>() as u64,
+                ]
+            } else {
+                &[
+                    std::mem::size_of::<NpcIdentity>() as u64,
+                    std::mem::size_of::<u64>() as u64,
+                    std::mem::size_of::<u64>() as u64,
+                    std::mem::size_of::<(u8, u8)>() as u64,
+                    std::mem::size_of::<Tick>() as u64,
+                    std::mem::size_of::<u64>() as u64,
+                    std::mem::size_of::<u64>() as u64,
+                    std::mem::size_of::<u64>() as u64,
+                ]
+            };
+            for stride in strides {
+                let nominal = count
+                    .checked_mul(*stride)
+                    .ok_or(SaveError::Overflow { section: SECTION })?;
+                let charge = allocation_charge(nominal)?;
+                total = total
+                    .checked_add(charge)
+                    .ok_or(SaveError::Overflow { section: SECTION })?;
+            }
+        }
+        let scratch = region_count
+            .checked_mul(std::mem::size_of::<UniquenessCursor>() as u64)
+            .ok_or(SaveError::Overflow { section: SECTION })?;
+        total
+            .checked_add(allocation_charge(scratch)?)
+            .ok_or(SaveError::Overflow { section: SECTION })
     }
 
     /// Validates an in-memory section before it is encoded (the
@@ -950,7 +1198,6 @@ impl NpcWorldSectionV2 {
         if self.regions.len() != self.config.region_count as usize {
             return Err(SaveError::Integrity("npc-world-save-v2/region-count"));
         }
-        let mut seen_ids: BTreeSet<u32> = BTreeSet::new();
         let mut total_identities = 0u64;
         for (region_index, block) in self.regions.iter().enumerate() {
             let count = block.identities.len();
@@ -1004,17 +1251,21 @@ impl NpcWorldSectionV2 {
                     return Err(SaveError::Order { section: SECTION });
                 }
                 prev_id = Some(identity.id.0);
-                if !seen_ids.insert(identity.id.0) {
-                    return Err(SaveError::Duplicate {
-                        section: SECTION,
-                        seq: u64::from(identity.id.0),
-                    });
-                }
             }
             total_identities = total_identities
                 .checked_add(u64::try_from(count).expect("counts are bounded by the identity set"))
                 .ok_or(SaveError::Overflow { section: SECTION })?;
         }
+        // THE CROSS-REGION UNIQUENESS MERGE (T21 — the same bounded
+        // merge the wire walk runs): the per-block ascending order
+        // was checked in the loop above, so the merge over the
+        // in-memory tables proves global uniqueness with at most one
+        // cursor per region (the scratch is bounded by the constant
+        // region-field width here — no budget applies to validate,
+        // and 256 twelve-byte cursors is affordable by definition).
+        let cursors: Vec<Reverse<UniquenessCursor>> = Vec::with_capacity(self.regions.len());
+        let mut heap = BinaryHeap::from(cursors);
+        assert_cross_region_uniqueness(&self.regions, &mut heap)?;
         if total_identities != u64::from(self.config.npc_count) {
             return Err(SaveError::Integrity("npc-world-save-v2/npc-count"));
         }
@@ -1093,6 +1344,153 @@ fn position_admitted(position: (u8, u8), region_grid: u8) -> bool {
     position == POSITION_DISCARDED || (position.0 < region_grid && position.1 < region_grid)
 }
 
+/// The documented conservative per-allocation overhead (T21): every
+/// decode reservation is charged at its requested byte count rounded
+/// UP to this granularity. `Vec::try_reserve` requests exactly the
+/// capacity it is asked for (observable on every decoded column:
+/// `capacity() == len()`), but std reserves "at least" the requested
+/// capacity and the allocator may round the request into a larger
+/// size class — 64-byte granularity covers the common small-block
+/// classes (glibc's 16-byte-aligned chunks with their header,
+/// jemalloc's 16-byte spacing, the Windows CRT's small-block heap)
+/// with margin. Allocators with coarser classes are honestly outside
+/// this accounting: the budget is an admission contract over
+/// requested bytes plus this documented overhead, and allocator-level
+/// telemetry remains the counting-allocator census follow-up (see
+/// [`SectionDecodeLimits`]'s census note).
+const ALLOCATION_GRANULARITY: u64 = 64;
+
+/// The wire bytes every region block costs before any identity
+/// (T21's whole-input minimum gate): the near flag, the LOD
+/// discriminant, and the identity count — a fixed-width u64 through
+/// `Encoder::write_count`.
+const BLOCK_FRAMING_WIRE_BYTES: u64 = 10;
+
+/// The minimum wire bytes ONE identity can occupy in a complete
+/// section (T21's whole-input minimum gate): the DORMANT record-only
+/// shape — the eleven-byte identity record plus the three record
+/// columns (steps, milestones, credits — eight wire bytes each). An
+/// active identity costs more (61); the dormant minimum is what the
+/// gate may assume.
+const DORMANT_IDENTITY_WIRE_BYTES: u64 = NpcIdentity::WIRE_STRIDE as u64 + 24;
+
+/// Rounds a nominal reservation up to the allocation granularity
+/// (checked; the T21 per-allocation overhead — see
+/// [`ALLOCATION_GRANULARITY`]).
+fn allocation_charge(nominal: u64) -> Result<u64, SaveError> {
+    const SECTION: &str = "npc-world-save-v2";
+    let padded = nominal
+        .checked_add(ALLOCATION_GRANULARITY - 1)
+        .ok_or(SaveError::Overflow { section: SECTION })?;
+    Ok(padded / ALLOCATION_GRANULARITY * ALLOCATION_GRANULARITY)
+}
+
+/// Charges one transient reservation (nominal bytes) against the
+/// caller's total budget, accumulating the section ledger (T21): the
+/// charge is the granularity-rounded request; the refusal is a typed
+/// `Limit` naming the caller's budget, BEFORE the reservation is
+/// made.
+fn charge_reserve(
+    nominal: u64,
+    kind: &'static str,
+    limits: &SectionDecodeLimits,
+    reserved: &mut u64,
+) -> Result<(), SaveError> {
+    const SECTION: &str = "npc-world-save-v2";
+    let charge = allocation_charge(nominal)?;
+    *reserved = reserved
+        .checked_add(charge)
+        .ok_or(SaveError::Overflow { section: SECTION })?;
+    if *reserved > limits.max_reserve_bytes {
+        return Err(SaveError::Limit {
+            section: SECTION,
+            kind,
+            value: *reserved,
+            max: limits.max_reserve_bytes,
+        });
+    }
+    Ok(())
+}
+
+/// One cursor in the cross-region uniqueness merge (T21): the next
+/// unconsumed identity of ONE region's table. `Ord` is by id first
+/// — the merge extracts the minimum — with region and index only as
+/// deterministic tie-breakers (a tie on id is exactly the duplicate
+/// the merge exists to catch).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct UniquenessCursor {
+    id: u32,
+    region: u8,
+    index: u32,
+}
+
+/// The cross-region uniqueness proof (T21): a bounded k-way merge
+/// over the per-block identity tables. Every block's table MUST
+/// already be strictly ascending (the wire-enforced canonical order;
+/// `validate` checks it in its own loop) — the merge pops the global
+/// minimum id repeatedly and refuses the first repeat with the typed
+/// `SaveError::Duplicate` naming it. The caller supplies the heap
+/// with capacity pre-reserved for one cursor per region (the merge
+/// never holds more), so no merge-step allocation occurs: std pushes
+/// allocate only at `len == capacity`.
+fn assert_cross_region_uniqueness(
+    regions: &[NpcRegionBlock],
+    heap: &mut BinaryHeap<Reverse<UniquenessCursor>>,
+) -> Result<(), SaveError> {
+    const SECTION: &str = "npc-world-save-v2";
+    for (region, block) in regions.iter().enumerate() {
+        if let Some(first) = block.identities.first() {
+            let region =
+                u8::try_from(region).expect("the region index is bounded by MAX_REGION_COUNT");
+            heap.push(Reverse(UniquenessCursor {
+                id: first.id.0,
+                region,
+                index: 0,
+            }));
+        }
+    }
+    let mut prev: Option<u32> = None;
+    while let Some(Reverse(cursor)) = heap.pop() {
+        // Each block is ascending and the heap yields the global
+        // minimum, so the merged sequence is nondecreasing and only
+        // a repeat can violate it (the `<=` is defensive).
+        if prev.is_some_and(|prior| cursor.id <= prior) {
+            return Err(SaveError::Duplicate {
+                section: SECTION,
+                seq: u64::from(cursor.id),
+            });
+        }
+        prev = Some(cursor.id);
+        let block = &regions[usize::from(cursor.region)];
+        let next = u64::from(cursor.index) + 1;
+        if next < block.identities.len() as u64 {
+            heap.push(Reverse(UniquenessCursor {
+                id: block.identities[usize::try_from(next).expect("bounded by the block length")]
+                    .id
+                    .0,
+                region: cursor.region,
+                index: u32::try_from(next).expect("bounded by the block length"),
+            }));
+        }
+    }
+    Ok(())
+}
+
+/// A fallibly reserved column (T21 — fallible allocation wherever
+/// practical): `try_reserve` makes a decode allocation failure a
+/// typed [`SaveError::Overflow`] refusal rather than a process
+/// abort. The v1 walk's columns are the fixed 1,000-identity
+/// workload's (affordable by definition — the documented CA-02
+/// decision that v1 needs no limits type); the v2 walk reserves the
+/// same way after its budget gates.
+fn reserved_column<T>(capacity: usize, section: &'static str) -> Result<Vec<T>, SaveError> {
+    let mut column = Vec::new();
+    column
+        .try_reserve(capacity)
+        .map_err(|_| SaveError::Overflow { section })?;
+    Ok(column)
+}
+
 /// The per-column admission gate (CA-02/F02): before a column's
 /// vector may reserve `count` elements, the count must be payable in
 /// WIRE bytes actually remaining (each element's minimum wire
@@ -1106,6 +1504,17 @@ fn position_admitted(position: (u8, u8), region_grid: u8) -> bool {
 /// supply for the count it declared. Never rejects a valid encoding:
 /// a complete section's remaining bytes at each column are exactly
 /// that column's bytes plus everything after it.
+///
+/// T21 note: for a COMPLETE section this stride gate is subsumed by
+/// the whole-input minimum-size proof (see
+/// [`NpcWorldSectionV2::restore_with_limits`]) — with every block
+/// count bounded by the unclaimed population, each column's stride
+/// is payable from the dormant minima of the identities still owed,
+/// so no valid encoding is refused here. It is kept as defense in
+/// depth, and it is LIVE for truncated inputs whose active blocks
+/// sit above the dormant minimum (the whole-input gate cannot see a
+/// section's actual shape, only its floor): the column-named
+/// refusal below is what catches them, before the reservation.
 fn admit_column(
     count: u64,
     wire_stride: u64,
@@ -1130,18 +1539,7 @@ fn admit_column(
     let mem_needed = count
         .checked_mul(mem_stride)
         .ok_or(SaveError::Overflow { section: SECTION })?;
-    *reserved = reserved
-        .checked_add(mem_needed)
-        .ok_or(SaveError::Overflow { section: SECTION })?;
-    if *reserved > limits.max_reserve_bytes {
-        return Err(SaveError::Limit {
-            section: SECTION,
-            kind: "reserve-bytes",
-            value: *reserved,
-            max: limits.max_reserve_bytes,
-        });
-    }
-    Ok(())
+    charge_reserve(mem_needed, "reserve-bytes", limits, reserved)
 }
 
 /// Reads a boolean flag (fail-closed on non-0/1 discriminants).
@@ -1905,15 +2303,20 @@ mod tests {
         ));
     }
 
-    /// THE MINIMUM-REMAINING-BYTES GATE (CA-02): a count within the
-    /// generic one-byte-per-element bound (8 identities, 20 bytes
-    /// remaining) but unpayable at the identity record's eleven-byte
-    /// wire stride (8 × 11 = 88 > 20) is refused BEFORE the
-    /// reservation — a typed `Limit` naming the stride-payable
-    /// maximum. Under the pre-CA-02 walk this input reserved eight
-    /// columns from the count and failed only inside the read loop.
+    /// THE WHOLE-INPUT MINIMUM-SIZE PROOF (T21): a declaration within
+    /// every per-field bound (1 region, 8 identities, a full block
+    /// header, 20 bytes of "records") is refused BEFORE any
+    /// reservation — the section's own minimum (1 × 10 framing +
+    /// 8 × 35 dormant-identity wire bytes = 290) exceeds the 30
+    /// bytes actually remaining, a typed `Limit` naming both. This
+    /// gate subsumes CA-02's per-column stride witness (the same
+    /// input, 8 identities × 11-byte stride vs 20 bytes, refused
+    /// pre-T21 at the identity column): the refusal now fires even
+    /// earlier — before the block vector, not just before the
+    /// columns. The stride gates remain in the walk as defense in
+    /// depth, unchanged in kind.
     #[test]
-    fn truncated_counts_fail_at_the_minimum_wire_bytes_gate() {
+    fn truncated_declarations_fail_at_the_whole_input_minimum_gate() {
         let mut enc = Encoder::new();
         enc.write_u64(1337); // seed
         enc.write_u64(6); // activity period
@@ -1930,52 +2333,335 @@ mod tests {
             enc.write_u8(0xAA); // twenty bytes actually present
         }
         let bytes = enc.into_bytes();
-        // The generic count bound passes (8 ≤ 20 remaining); the
-        // stride gate refuses: 20 / 11 = 1 identity payable.
+        // The whole-input proof: 10 + 8 × 35 = 290 wire bytes are the
+        // least a complete 1-region 8-identity section could occupy;
+        // 30 remain (the block header plus the twenty bytes).
         assert!(matches!(
             NpcWorldSectionV2::restore_with_limits(
                 &mut Decoder::new(&bytes),
                 &SectionDecodeLimits::WIRE_MAXIMUM
             ),
             Err(SaveError::Limit {
-                section: _,
-                kind: "identity-count",
-                value: 8,
-                max: 1
+                kind: "section-minimum-bytes",
+                value: 290,
+                max: 30,
+                ..
+            })
+        ));
+        // A huge declaration over a large-but-finite remainder
+        // refuses the same way, still before any reservation: 100
+        // declared identities with 100 bytes remaining (the generic
+        // one-byte-per-element count bound passes) against a
+        // minimum of 10 + 100 × 35 = 3,510.
+        let mut enc = Encoder::new();
+        enc.write_u64(1337);
+        enc.write_u64(6);
+        enc.write_u64(4);
+        enc.write_u64(12);
+        enc.write_u8(1);
+        enc.write_count(1); // region count
+        enc.write_count(100); // npc count: within the u32 domain
+        enc.write_u8(4); // region grid
+        for _ in 0..100 {
+            enc.write_u8(0xAA); // one hundred bytes actually present
+        }
+        let bytes = enc.into_bytes();
+        assert!(matches!(
+            NpcWorldSectionV2::restore_with_limits(
+                &mut Decoder::new(&bytes),
+                &SectionDecodeLimits::WIRE_MAXIMUM
+            ),
+            Err(SaveError::Limit {
+                kind: "section-minimum-bytes",
+                value: 3_510,
+                max: 100,
+                ..
+            })
+        ));
+        // And a truncation the minimum gate cannot see (an ACTIVE
+        // section sits above its all-dormant minimum, so the
+        // declaration's minimum fits while the input is 3 bytes
+        // short of the section's actual shape) still refuses typed —
+        // here at the stride gate, the defense-in-depth arm the
+        // whole-input minimum cannot subsume: region 1's credits
+        // column (2 identities x 8 wire bytes, 13 present) refuses
+        // with the column-naming Limit before its reservation.
+        let section = scaled_section(2, 4, 4, 1);
+        let mut bytes = encode_v2(&section);
+        bytes.truncate(bytes.len() - 3);
+        assert!(matches!(
+            NpcWorldSectionV2::restore(&mut Decoder::new(&bytes)),
+            Err(SaveError::Limit {
+                kind: "credits-count",
+                ..
             })
         ));
     }
 
-    /// THE RESERVE-BYTES BUDGET (CA-02): the cumulative in-memory
-    /// reservation across the section's columns is checked against
-    /// the caller's configured byte budget before each reservation —
-    /// the transient heap the decode may spend is a caller decision,
-    /// published as a typed refusal when the columns would exceed it.
+    /// THE TOTAL RESERVE-BYTES BUDGET (CA-02, re-derived under T21's
+    /// total accounting): every transient reservation — the block
+    /// vector, each column at its requested capacity, the uniqueness
+    /// scratch, each at the allocation granularity — is checked
+    /// against the caller's configured byte budget before it is
+    /// requested. The pre-T21 test pinned the nominal column sum
+    /// (48 identity bytes then 80 cumulative); the total ledger now
+    /// refuses earlier and larger, and the exact admitting charge is
+    /// [`NpcWorldSectionV2::decode_reservation_bytes`] — the
+    /// off-by-one boundary, both directions.
     #[test]
-    fn the_reserve_bytes_budget_bounds_the_transient_columns() {
+    fn the_reserve_bytes_budget_bounds_every_decode_transient() {
         let section = scaled_section(3, 12, 4, 1);
         let bytes = encode_v2(&section);
-        // Region 0 (Full, four identities): the identity table
-        // reserves 4 × 12 = 48 in-memory bytes; the steps column
-        // would push the cumulative reservation to 80.
+        // A budget below the block vector's own charge refuses at the
+        // FIRST reservation of the walk (the regions vector), the
+        // ledger reading the granularity-rounded 3 × block bytes.
+        let regions_charge = allocation_charge(3 * std::mem::size_of::<NpcRegionBlock>() as u64)
+            .expect("the block-vector charge is representable");
         let limits = SectionDecodeLimits::new(12, 50);
         assert!(matches!(
             NpcWorldSectionV2::restore_with_limits(&mut Decoder::new(&bytes), &limits),
             Err(SaveError::Limit {
-                section: _,
+                kind: "regions-reserve",
+                value,
+                max: 50,
+                ..
+            }) if value == regions_charge
+        ));
+        // A budget covering the block vector but not the first column
+        // (region 0's four-identity identity table: 4 × 12 = 48
+        // nominal, 64 charged at the granularity) refuses at the
+        // column, the cumulative ledger naming both charges.
+        let first_column_cumulative = regions_charge + allocation_charge(4 * 12).unwrap();
+        let limits = SectionDecodeLimits::new(12, first_column_cumulative - 1);
+        assert!(matches!(
+            NpcWorldSectionV2::restore_with_limits(&mut Decoder::new(&bytes), &limits),
+            Err(SaveError::Limit {
                 kind: "reserve-bytes",
-                value: 80,
-                max: 50
+                value,
+                max,
+                ..
+            }) if value == first_column_cumulative && max == first_column_cumulative - 1
+        ));
+        // The exact charge admits the section's own encoding, and
+        // one byte below refuses at the walk's last charge (the
+        // uniqueness scratch): the mirror and the ledger are the
+        // same arithmetic, pinned at the boundary.
+        let admitting = section
+            .decode_reservation_bytes()
+            .expect("the charge is representable");
+        let mut dec = Decoder::new(&bytes);
+        let restored = NpcWorldSectionV2::restore_with_limits(
+            &mut dec,
+            &SectionDecodeLimits::new(12, admitting),
+        )
+        .expect("the exact charge admits the section");
+        dec.finish().unwrap();
+        assert_eq!(restored, section);
+        assert!(matches!(
+            NpcWorldSectionV2::restore_with_limits(
+                &mut Decoder::new(&bytes),
+                &SectionDecodeLimits::new(12, admitting - 1)
+            ),
+            Err(SaveError::Limit {
+                kind: "uniqueness-scratch",
+                ..
             })
         ));
-        // A budget covering the section's whole transient reservation
-        // admits it (the 4-identity Full block at 62 bytes per
-        // identity + two 4-identity Dormant blocks at 36 per
-        // identity: 248 + 288 = 536 in-memory column bytes).
-        let admitting = SectionDecodeLimits::new(12, 536);
+    }
+
+    /// THE T21 WITNESS, POST-FIX (the pre-fix red run is recorded in
+    /// the lane's first commit `adaab2e`: the same input decoded Ok
+    /// at this budget while the block vector alone reserved
+    /// 256 × `size_of::<NpcRegionBlock>()` bytes against it — the
+    /// nominal column ledger admitted a decode whose transients
+    /// exceeded the caller's configured limit ~5.6×). The total
+    /// budget now charges the block vector first: the same input
+    /// under the same 9,216-byte budget refuses typed at the
+    /// regions-reserve gate BEFORE the reservation is made, and the
+    /// exact charge ([`NpcWorldSectionV2::decode_reservation_bytes`])
+    /// is the off-by-one admission boundary — the budget that admits
+    /// precisely this section, one byte less refusing typed at the
+    /// charge that crosses.
+    #[test]
+    fn small_configured_budgets_refuse_the_decode_transients_before_reserving() {
+        let section = scaled_section(256, 256, 16, 0);
+        let bytes = encode_v2(&section);
+        // The pre-fix nominal column arithmetic: 256 dormant
+        // identities × 36 in-memory bytes = 9,216 — the budget the
+        // pre-fix ledger stopped at.
+        let nominal_columns: u64 = 256 * 36;
+        assert_eq!(nominal_columns, 9_216);
+        let limits = SectionDecodeLimits::new(256, nominal_columns);
+        // The refusal fires at the block vector's charge, before the
+        // reservation: kind `regions-reserve`, the ledger's reading
+        // (the granularity-rounded 256 × block bytes), the caller's
+        // budget as the max.
+        let expected = allocation_charge(256 * std::mem::size_of::<NpcRegionBlock>() as u64)
+            .expect("the block-vector charge is representable");
+        assert!(
+            expected > nominal_columns,
+            "the block-vector charge ({expected}) must exceed the pre-fix nominal budget"
+        );
+        assert!(matches!(
+            NpcWorldSectionV2::restore_with_limits(&mut Decoder::new(&bytes), &limits),
+            Err(SaveError::Limit {
+                kind: "regions-reserve",
+                value,
+                max,
+                ..
+            }) if value == expected && max == nominal_columns
+        ));
+        // The off-by-one admission boundary: the exact charge admits
+        // the section's own encoding...
+        let admitting = section
+            .decode_reservation_bytes()
+            .expect("the charge is representable");
         let mut dec = Decoder::new(&bytes);
-        assert!(NpcWorldSectionV2::restore_with_limits(&mut dec, &admitting).is_ok());
+        let restored = NpcWorldSectionV2::restore_with_limits(
+            &mut dec,
+            &SectionDecodeLimits::new(256, admitting),
+        )
+        .expect("the exact charge admits the section");
         dec.finish().unwrap();
+        assert_eq!(restored, section);
+        // The transient is now BUDGETED, not banned: the block
+        // vector still reserves its 256 slots under the admitting
+        // budget, exactly as the charge said it would.
+        assert_eq!(restored.regions.capacity(), 256);
+        // ...and one byte below refuses, typed, at the charge that
+        // crosses — the uniqueness scratch is the walk's last charge
+        // for this shape, so that is the refusal that fires.
+        assert!(matches!(
+            NpcWorldSectionV2::restore_with_limits(
+                &mut Decoder::new(&bytes),
+                &SectionDecodeLimits::new(256, admitting - 1)
+            ),
+            Err(SaveError::Limit {
+                kind: "uniqueness-scratch",
+                max,
+                ..
+            }) if max == admitting - 1
+        ));
+    }
+
+    /// THE CROSS-REGION UNIQUENESS MERGE (T21): the per-ID
+    /// `BTreeSet` node stream is gone; global uniqueness is a
+    /// bounded k-way merge over the per-block ascending tables. The
+    /// battery: valid interleaved ids across regions restore (no
+    /// FALSE duplicate), an adversarial duplicate in NON-adjacent
+    /// regions with smaller ids merged first is refused naming the
+    /// id, a three-way duplicate refuses on the first repeat, a
+    /// duplicate spanning the first and last of many regions refuses
+    /// (the merge's long-range case), and the wire gate and the
+    /// in-memory `validate` gate agree on every case (the F06
+    /// discipline extended to the merge).
+    #[test]
+    fn cross_region_uniqueness_is_the_bounded_merge_on_every_shape() {
+        let base = scaled_section(1, 1, 16, 1);
+        let section_with = |regions: Vec<NpcRegionBlock>, npc_count: u32| NpcWorldSectionV2 {
+            regions,
+            config: WorldConfig {
+                region_count: 3,
+                npc_count,
+                region_grid: 16,
+            },
+            ..base.clone()
+        };
+        // Valid interleaved ids across three regions (ids 10..70
+        // spread so no two adjacent merge outputs share a block):
+        // restores, validates, and re-encodes byte-identically.
+        let interleaved = section_with(
+            vec![
+                region_block(0, 16, &[10, 30, 50], LodLevel::Full, true),
+                region_block(1, 16, &[20, 40, 60], LodLevel::Full, false),
+                region_block(2, 16, &[15, 25, 70], LodLevel::Dormant, false),
+            ],
+            9,
+        );
+        interleaved.validate().expect("interleaved ids are unique");
+        let bytes = encode_v2(&interleaved);
+        let mut dec = Decoder::new(&bytes);
+        let restored =
+            NpcWorldSectionV2::restore_with_limits(&mut dec, &SectionDecodeLimits::WIRE_MAXIMUM)
+                .expect("no false duplicate from interleaved ids");
+        dec.finish().unwrap();
+        assert_eq!(restored, interleaved);
+        assert_eq!(encode_v2(&restored), bytes);
+        // The adversarial shapes: a duplicate id in NON-adjacent
+        // regions with smaller ids merged before it (50 rides
+        // regions 0 and 2, ids 20/25/30/40 merged first).
+        let duplicate = section_with(
+            vec![
+                region_block(0, 16, &[10, 50], LodLevel::Full, true),
+                region_block(1, 16, &[20, 60], LodLevel::Full, false),
+                region_block(2, 16, &[50, 70], LodLevel::Dormant, false),
+            ],
+            6,
+        );
+        // Both gates refuse identically (the F06 discipline
+        // extended to the merge): the wire walk and the in-memory
+        // validator name the same duplicated id.
+        let wire_refusal = NpcWorldSectionV2::restore(&mut Decoder::new(&encode_v2(&duplicate)));
+        assert!(
+            matches!(wire_refusal, Err(SaveError::Duplicate { seq: 50, .. })),
+            "restore names the duplicated id"
+        );
+        assert!(
+            matches!(
+                duplicate.validate(),
+                Err(SaveError::Duplicate { seq: 50, .. })
+            ),
+            "validate names the duplicated id"
+        );
+        // A three-way duplicate (50 in every region): the first
+        // repeat refuses, naming the id.
+        let three_way = section_with(
+            vec![
+                region_block(0, 16, &[50], LodLevel::Full, true),
+                region_block(1, 16, &[50], LodLevel::Full, false),
+                region_block(2, 16, &[50], LodLevel::Dormant, false),
+            ],
+            3,
+        );
+        assert!(matches!(
+            NpcWorldSectionV2::restore(&mut Decoder::new(&encode_v2(&three_way))),
+            Err(SaveError::Duplicate { seq: 50, .. })
+        ));
+        assert!(matches!(
+            three_way.validate(),
+            Err(SaveError::Duplicate { .. })
+        ));
+        // The long-range case: a duplicate spanning the first and
+        // last of eight regions, six blocks of smaller ids between.
+        let mut regions = Vec::new();
+        regions.push(region_block(0, 16, &[100], LodLevel::Full, true));
+        for region in 1u32..7 {
+            regions.push(region_block(
+                region as u8,
+                16,
+                &[region],
+                LodLevel::Dormant,
+                false,
+            ));
+        }
+        regions.push(region_block(7, 16, &[100], LodLevel::Dormant, false));
+        let long_range = NpcWorldSectionV2 {
+            regions,
+            config: WorldConfig {
+                region_count: 8,
+                npc_count: 8,
+                region_grid: 16,
+            },
+            ..base.clone()
+        };
+        assert!(matches!(
+            NpcWorldSectionV2::restore(&mut Decoder::new(&encode_v2(&long_range))),
+            Err(SaveError::Duplicate { seq: 100, .. })
+        ));
+        assert!(matches!(
+            long_range.validate(),
+            Err(SaveError::Duplicate { .. })
+        ));
     }
 
     /// The multi-scale run fixture: a World whose authoritative state
