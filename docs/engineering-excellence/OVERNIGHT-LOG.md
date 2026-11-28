@@ -442,3 +442,11 @@ summary) PARKED as DECISION-T29-prefix-summary. The pre-existing no-default
 clippy error in recovery_classification.rs verified at base — the handoff's
 standing item, queued for its narrow follow-up. CI pins corrected
 (`aaf9c8e`: main 1684/1633). Run `46154762231` dispatched.
+
+**T29 verified green:** run `46158294657` at `52714d6` — all five jobs.
+The batch's full history: the exclusion-map pin (the gate firing correctly
+on the sqlite-gated +8), the T09 slope-threshold recalibration, and the
+Windows delete-semantics trap eliminated by construction (three iterations:
+the swallowed wipe → the loud wipe naming the lock → the fresh-root
+allocator). Every iteration root-caused from the run evidence before the
+next dispatch.
