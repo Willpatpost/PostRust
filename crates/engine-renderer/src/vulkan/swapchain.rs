@@ -430,6 +430,16 @@ pub(super) fn recreate_swapchain(
     // Keep the request pending across failures, including an error before
     // the replacement reaches vkCreateSwapchainKHR.
     frames.needs_recreate = true;
+    // P5 §3.3 (A18/R2) — RESOURCE-REPLACEMENT INVALIDATION, the
+    // recreation arm: the replacement pipeline state re-creates the
+    // instance carve and the 6-E2 indirect command buffer with NO
+    // content copy (the finding-A replication discipline — every
+    // frame that draws from a slot's region first wrote it), so no
+    // population stamp can vouch for any slot's content on the new
+    // generation. Clearing forces one rewrite per slot after the
+    // recreation — the stamp protocol's correctness rule, never a
+    // stale skip against uninitialized mapped memory.
+    frames.population_stamps.clear();
     unsafe { ctx.device.device_wait_idle() }
         .map_err(|error| RendererError::vk(error, "device_wait_idle"))?;
     let depth_format = swapchain.depth_format;

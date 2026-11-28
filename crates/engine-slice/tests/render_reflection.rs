@@ -914,6 +914,8 @@ fn wet_ground_gate_at(preference: DepthFormatPreference, label: &str) {
     // authored-silhouette equation).
     let npc_poses = vec![engine_renderer::animation::rest_pose_block(); npc.len()];
     let population = engine_renderer::ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: &npc,
         npc_poses: &npc_poses,
         npc_material: 1,
@@ -3140,6 +3142,8 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
         pose_index: 0,
     };
     let streak_population = ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: &[],
         npc_poses: &[],
         npc_material: 1,
@@ -3380,6 +3384,8 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
         pose_index: 0,
     };
     let behind_population = ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: &[],
         npc_poses: &[],
         npc_material: 1,
@@ -3433,6 +3439,8 @@ fn wet_ground_receiver_blends_under_translucent_rain() {
 /// The rainless empty population (the ordering gate's baseline).
 fn rainless_population() -> ProxyPopulation<'static> {
     ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: &[],
         npc_poses: &[],
         npc_material: 1,

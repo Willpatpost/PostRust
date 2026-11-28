@@ -992,6 +992,8 @@ fn populated_shadow_map_matches_the_raycaster() {
         .map(|_| engine_renderer::animation::rest_pose_block())
         .collect();
     let at_rest = ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: &npc,
         npc_poses: &rest_blocks,
         npc_material: 1,
@@ -1072,6 +1074,8 @@ fn populated_shadow_map_matches_the_raycaster() {
         "the frame-33 walkers are off the rest pose"
     );
     let walking = ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: &npc,
         npc_poses: &walked_blocks,
         npc_material: 1,

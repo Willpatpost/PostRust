@@ -140,6 +140,16 @@ pub(crate) struct ProxyFrameUpload<'a> {
     /// instanced, the per-object reference, or the 6-E2 indirect
     /// submission.
     pub mode: ProxyDrawMode,
+    /// P5 §3.3 (A18/R2): the caller's declared INSTANCE generation
+    /// (0 = always-dirty) — the frame flow's upload site gates this
+    /// slot's instance write AND its indirect command block on it
+    /// (the block's bytes are a pure function of the per-kind
+    /// counts, an instance-side fact).
+    pub instance_generation: u64,
+    /// P5 §3.3: the caller's declared POSE generation (0 =
+    /// always-dirty) — the upload site gates this slot's pose-block
+    /// write on it.
+    pub pose_generation: u64,
 }
 
 /// The per-kind pipelines one populated recording needs, for ONE

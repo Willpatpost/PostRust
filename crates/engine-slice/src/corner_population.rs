@@ -173,6 +173,52 @@ pub enum Phase {
     Walk(u16),
 }
 
+/// THE STANDER POSE-DEDUP (P5 §3.2(e), A18/R2 — the shared
+/// animation palette): the per-npc pose-block index over a palette
+/// of `[rest] ∪ {walker blocks}`. Standers all point at block 0 —
+/// ONE shared cached rest block instead of a per-stander COPY of
+/// the bit-exact identical bytes (the rest-identity proof makes the
+/// copies redundant by construction); walker j keeps its own
+/// evaluated block at `1 + j` (its ordinal among walkers). With NO
+/// stander the palette is the walkers alone and walker j sits at
+/// `j` — the all-walking population's submission is BYTE-IDENTICAL
+/// to the pre-dedup shape (no versioned claim where nothing is
+/// shared).
+///
+/// THE SKIN-MATRIX IDENTITY (the pixel-compatibility proof): each
+/// npc's EFFECTIVE skin matrices are unchanged — a stander selected
+/// a bit-exact rest copy before, it selects the one shared rest
+/// block now; a walker's own block is untouched. The submitted
+/// BYTES change (fewer blocks, remapped `pose_index` values) but
+/// every vertex's skinning arithmetic is bit-identical, so the
+/// rendered PIXELS are identical (the ink gates hold digit for
+/// digit). Pinned by `stander_dedup_preserves_every_npcs_skin_
+/// matrices` below.
+///
+/// Pure and shared: the phase-column path (this module), the
+/// locomotion path (corner_routes, over `speed == 0`), and the
+/// census's synthetic populations all reduce to the same stander
+/// flags and therefore the same mapping — ONE rule, never three.
+pub fn stander_dedup_block_indices(is_standing: &[bool]) -> Vec<u32> {
+    let any_stander = is_standing.iter().any(|&standing| standing);
+    let mut walker_ordinal = 0_u32;
+    is_standing
+        .iter()
+        .map(|&standing| {
+            if standing {
+                0
+            } else if any_stander {
+                walker_ordinal += 1;
+                walker_ordinal
+            } else {
+                let index = walker_ordinal;
+                walker_ordinal += 1;
+                index
+            }
+        })
+        .collect()
+}
+
 /// The 24 phase offsets, in NPC_TABLE order: the 8 waiters stand;
 /// the 2 crossers and 14 strollers walk at hand-spread phases (all
 /// distinct, deliberately not a gradient — pure data, pinned below).
@@ -199,9 +245,26 @@ const NPC_PHASE: [Phase; 24] = [
 /// entry order is part of the byte pin). Built ONCE per run (the
 /// demo holds it for the whole route); the per-frame
 /// zero-allocation discipline is the renderer's retained repack, not
-/// this table's construction.
+/// this table's construction. Since P5 §3.2(e) the returned npc
+/// instances carry the STANDER-DEDUP pose indices (see
+/// [`stander_dedup_block_indices`]) — the table's authored
+/// sequential values remapped mechanically at construction, a
+/// versioned claim on the params vec4's x exactly like the Era-2
+/// skinning claim (the packed-bytes pin below was repinned
+/// consciously; the pixels are identical by the skin-matrix
+/// identity proof).
 pub fn corner_population() -> (Vec<ProxyInstance>, Vec<ProxyInstance>) {
-    (NPC_TABLE.to_vec(), VEHICLE_TABLE.to_vec())
+    let mut npc = NPC_TABLE.to_vec();
+    let mapping = stander_dedup_block_indices(
+        &NPC_PHASE
+            .iter()
+            .map(|phase| matches!(phase, Phase::Stand))
+            .collect::<Vec<_>>(),
+    );
+    for (instance, &block) in npc.iter_mut().zip(mapping.iter()) {
+        instance.pose_index = block;
+    }
+    (npc, VEHICLE_TABLE.to_vec())
 }
 
 /// The placement table's phase column (the animated-population
@@ -228,16 +291,19 @@ pub fn corner_npc_tints() -> [[f32; 3]; 24] {
 /// counter at whatever rate it presents).
 pub const DEMO_CLOCK_HZ: f32 = 60.0;
 
-/// Evaluates the population's pose blocks for presented frame `k`
-/// (the deterministic clock: each walking NPC's clip time is
-/// `k / 60 + phase / 65536 · 1.1` modulo the stride; standing NPCs
-/// carry the bit-exact rest block). Writes into `out` IN PLACE (one
-/// block per table entry, pose-index order — entry i's block is
-/// block i, matching the table's sequential pose_index pin), reusing
-/// the buffer's capacity: the demo's per-frame walk evaluation
-/// allocates nothing after the first frame. Pure and deterministic:
-/// frame k always produces byte-identical blocks (the FNV pins
-/// below).
+/// Evaluates the population's pose PALETTE for presented frame `k`
+/// (P5 §3.2(e), the shared animation palette — was one block per
+/// table entry): the deterministic clock gives each walking NPC its
+/// clip time `k / 60 + phase / 65536 · 1.1` modulo the stride, and
+/// the emitted blocks are `[rest] ∪ {walker blocks}` in entry order
+/// — block 0 the shared cached rest (IFF at least one npc stands),
+/// walker j's own block at `1 + j` (see
+/// [`stander_dedup_block_indices`]). Writes into `out` IN PLACE,
+/// reusing the buffer's capacity: the demo's per-frame walk
+/// evaluation allocates nothing after the first frame. Pure and
+/// deterministic: frame k always produces byte-identical blocks
+/// (the FNV pins below). The per-npc skin matrices are IDENTICAL to
+/// the pre-dedup evaluation (the identity proof's test).
 pub fn evaluate_population_poses(k: u64, phases: &[Phase], out: &mut Vec<Block>) {
     use engine_renderer::animation::{
         SkinBind, compose_joint_matrices, humanoid_skeleton, rest_pose_block, sample_pose,
@@ -262,19 +328,22 @@ pub fn evaluate_population_poses(k: u64, phases: &[Phase], out: &mut Vec<Block>)
         "one stride is exactly 66 frames at 60 Hz"
     );
     let within_stride = (k % stride_frames) as f32 / DEMO_CLOCK_HZ;
+    let any_stander = phases.iter().any(|phase| matches!(phase, Phase::Stand));
     out.clear();
     out.reserve(phases.len());
+    // Block 0: the ONE shared rest block (the standers' own bytes,
+    // bit-exact by the rest-identity proof — deduplicated).
+    if any_stander {
+        out.push(rest_pose_block());
+    }
+    // The walkers' own blocks, in entry order (walker j at 1 + j).
     for phase in phases {
-        let block = match *phase {
-            Phase::Stand => rest_pose_block(),
-            Phase::Walk(offset) => {
-                let t = within_stride + offset as f32 / 65536.0 * WALK_STRIDE_SECONDS;
-                let pose = sample_pose(&clip, t);
-                let joint_worlds = compose_joint_matrices(&skeleton, &pose);
-                skin_matrices_bound(&joint_worlds, &bind)
-            }
-        };
-        out.push(block);
+        if let Phase::Walk(offset) = *phase {
+            let t = within_stride + offset as f32 / 65536.0 * WALK_STRIDE_SECONDS;
+            let pose = sample_pose(&clip, t);
+            let joint_worlds = compose_joint_matrices(&skeleton, &pose);
+            out.push(skin_matrices_bound(&joint_worlds, &bind));
+        }
     }
 }
 
@@ -329,16 +398,35 @@ mod tests {
             assert_eq!(instance.transform.turn % 16384, 0, "axis-aligned lanes");
             assert_eq!(instance.pose_index, 0, "vehicles never read the pose slot");
         }
-        // THE POSE-INDEX PIN: every npc's block index is its list
-        // position — the identity mapping the renderer's pose repack
-        // and the demo's walk evaluation both rely on (a later
-        // dedup remaps these values consciously, never silently).
-        for (index, instance) in npc.iter().enumerate() {
+        // THE POSE-INDEX PIN (P5 §3.2(e) — the stander-dedup's
+        // versioned claim): every STANDER shares block 0 (the one
+        // cached rest block — the authored table's sequential values
+        // remapped at construction); walker j carries `1 + j`, its
+        // ordinal among walkers; the 8 waiters stand and the 16
+        // crossers/strollers walk, so the palette is 17 blocks. The
+        // pre-dedup identity mapping this test used to pin is the
+        // documented history (the remap is conscious, never silent —
+        // the packed-bytes pin below fired on it exactly as
+        // designed).
+        let phases = corner_population_phases();
+        let mapping = stander_dedup_block_indices(
+            &phases
+                .iter()
+                .map(|phase| matches!(phase, Phase::Stand))
+                .collect::<Vec<_>>(),
+        );
+        for (index, (instance, &block)) in npc.iter().zip(mapping.iter()).enumerate() {
             assert_eq!(
-                instance.pose_index, index as u32,
-                "npc {index}'s pose block is its list position"
+                instance.pose_index, block,
+                "npc {index}'s pose block follows the dedup mapping"
             );
         }
+        assert_eq!(
+            mapping[0], 0,
+            "the first waiter stands at the shared block 0"
+        );
+        assert_eq!(mapping[8], 1, "the first walker (crosser 8) at block 1");
+        assert_eq!(mapping[23], 16, "the last walker at block 16");
     }
 
     /// Every pedestrian stands fully on the sidewalk ring (footprint
@@ -546,12 +634,15 @@ mod tests {
         );
     }
 
-    /// THE EVALUATION DETERMINISM PINS: the pose blocks at a fixed
-    /// frame are byte-identical across calls; the waiters' blocks
-    /// are bit-exact rest; ONE STRIDE = 66 frames at the 60 Hz
-    /// reference, so frame 66's blocks equal frame 0's EXACTLY (the
+    /// THE EVALUATION DETERMINISM PINS (the dedup palette's own):
+    /// the palette at a fixed frame is byte-identical across calls;
+    /// block 0 is the shared bit-exact rest (the waiters' own
+    /// bytes); the walker blocks are off rest at frame 0 (the phase
+    /// spread); ONE STRIDE = 66 frames at the 60 Hz reference, so
+    /// frame 66's palette equals frame 0's EXACTLY (the
     /// loop-closure pin); and the packed bytes' FNV at frames 0/33
-    /// are the cross-platform byte pins (measured below).
+    /// are the cross-platform byte pins (measured below, repinned
+    /// for the dedup palette).
     #[test]
     fn pose_evaluation_is_deterministic_and_periodic() {
         let phases = corner_population_phases();
@@ -560,29 +651,27 @@ mod tests {
         evaluate_population_poses(0, &phases, &mut a);
         evaluate_population_poses(0, &phases, &mut b);
         assert_eq!(a, b, "byte-identical across calls");
-        assert_eq!(a.len(), 24, "one block per npc");
+        assert_eq!(a.len(), 17, "the palette: one shared rest + 16 walkers");
 
-        // The waiters stand: bit-exact rest blocks.
+        // Block 0: the shared rest (the waiters' own bytes).
         let rest = engine_renderer::animation::rest_pose_block();
-        for (index, block) in a[..8].iter().enumerate() {
-            assert_eq!(*block, rest, "waiter {index} stands at the rest pose");
-        }
+        assert_eq!(a[0], rest, "block 0 is the shared cached rest");
 
         // The walkers move: at least one walker block differs from
         // rest at frame 0 (the phase spread means some walker is
         // mid-stride).
         assert!(
-            a[8..].iter().any(|block| *block != rest),
+            a[1..].iter().any(|block| *block != rest),
             "some walker is off rest at frame 0 (the phase spread)"
         );
 
         // THE PERIOD PIN: 66 frames = 1.1 s at 60 Hz — exactly one
-        // stride — so frame 66 reproduces frame 0's blocks EXACTLY.
+        // stride — so frame 66 reproduces frame 0's palette EXACTLY.
         let mut later = Vec::new();
         evaluate_population_poses(66, &phases, &mut later);
         assert_eq!(
             a, later,
-            "one stride later is the same pose (the loop closes)"
+            "one stride later is the same palette (the loop closes)"
         );
 
         // The retained buffer never grows across evaluations.
@@ -591,6 +680,91 @@ mod tests {
             evaluate_population_poses(k, &phases, &mut b);
             assert_eq!(b.capacity(), warmed, "no reallocation at frame {k}");
         }
+    }
+
+    /// P5 §3.2(e) — THE SKIN-MATRIX IDENTITY PROOF (the dedup's
+    /// pixel-compatibility witness): for EVERY npc and a spread of
+    /// frames, the palette block its dedup `pose_index` selects is
+    /// BIT-IDENTICAL to the block the pre-dedup per-npc evaluation
+    /// produced for that npc (the stander's own rest copy; the
+    /// walker's own sampled block). Same skin matrices per npc ⟹
+    /// same skinned vertices ⟹ same PIXELS — the submitted bytes
+    /// changed (fewer blocks, remapped indices), the ink gates
+    /// cannot.
+    #[test]
+    fn stander_dedup_preserves_every_npcs_skin_matrices() {
+        use engine_renderer::animation::{
+            SkinBind, compose_joint_matrices, humanoid_skeleton, rest_pose_block, sample_pose,
+            skin_matrices_bound, walk_clip,
+        };
+        let phases = corner_population_phases();
+        let (npc, _) = corner_population();
+        let mapping = stander_dedup_block_indices(
+            &phases
+                .iter()
+                .map(|phase| matches!(phase, Phase::Stand))
+                .collect::<Vec<_>>(),
+        );
+        let clip = walk_clip();
+        let skeleton = humanoid_skeleton();
+        let bind = SkinBind::from_skeleton(&skeleton);
+        let mut palette = Vec::new();
+        for k in [0_u64, 1, 17, 33, 47, 65] {
+            let within_stride = (k % 66) as f32 / DEMO_CLOCK_HZ;
+            evaluate_population_poses(k, &phases, &mut palette);
+            for (index, (phase, &block_index)) in phases.iter().zip(mapping.iter()).enumerate() {
+                // The pre-dedup per-npc evaluation (the reference
+                // oracle): the stander's rest copy, the walker's own
+                // sampled block.
+                let own = match *phase {
+                    Phase::Stand => rest_pose_block(),
+                    Phase::Walk(offset) => {
+                        let t = within_stride + offset as f32 / 65536.0 * WALK_STRIDE_SECONDS;
+                        let pose = sample_pose(&clip, t);
+                        let joint_worlds = compose_joint_matrices(&skeleton, &pose);
+                        skin_matrices_bound(&joint_worlds, &bind)
+                    }
+                };
+                assert_eq!(
+                    palette[block_index as usize], own,
+                    "frame {k}, npc {index}: the palette block is the npc's own \
+                     skin matrices (the dedup preserves the pixels)"
+                );
+                assert!(
+                    (block_index as usize) < palette.len(),
+                    "frame {k}, npc {index}: the index selects a supplied block"
+                );
+                assert_eq!(
+                    npc[index].pose_index, block_index,
+                    "frame {k}, npc {index}: the table's index agrees with the mapping"
+                );
+            }
+        }
+    }
+
+    /// P5 §3.2(e) — the mapping's own pins: the no-stander
+    /// population keeps the identity mapping (byte-identical
+    /// submission for all-walking populations — nothing is shared,
+    /// nothing is claimed); the all-stander population collapses to
+    /// one shared block; the mixed population is [standers → 0,
+    /// walker j → 1 + j].
+    #[test]
+    fn stander_dedup_mapping_pins() {
+        assert_eq!(
+            stander_dedup_block_indices(&[false, false, false]),
+            vec![0, 1, 2],
+            "no standers: the identity mapping (no versioned claim)"
+        );
+        assert_eq!(
+            stander_dedup_block_indices(&[true, true, true]),
+            vec![0, 0, 0],
+            "all standers: one shared block"
+        );
+        assert_eq!(
+            stander_dedup_block_indices(&[true, false, true, false, false]),
+            vec![0, 1, 0, 2, 3],
+            "the mixed palette: standers at 0, walker j at 1 + j"
+        );
     }
 
     /// The packed pose bytes' FNV at fixed frames (the deterministic
@@ -630,8 +804,15 @@ mod tests {
     /// The measured-actual FNV-1a digests of the demo's pose
     /// evaluation (the placeholder-pin discipline: measured at this
     /// tree by the first run of pose_bytes_fnv_pins, then frozen).
-    const PIN_FRAME_0: u64 = 5_757_258_358_703_043_002;
-    const PIN_FRAME_33: u64 = 12_735_933_771_296_667_791;
+    /// History: REPINNED in P5 R2 (A18, the §3.2(e) stander dedup) —
+    /// the palette is now `[rest] ∪ {16 walker blocks}` (17 blocks,
+    /// the standers' redundant rest copies removed) where the
+    /// pre-dedup digest hashed 24 blocks; the pin fired on the
+    /// change exactly as designed, the cause traced to the dedup
+    /// claim, and the per-npc skin matrices are proven identical by
+    /// `stander_dedup_preserves_every_npcs_skin_matrices`.
+    const PIN_FRAME_0: u64 = 14_796_718_041_729_273_370; // R2 MEASURED (the dedup palette), frozen.
+    const PIN_FRAME_33: u64 = 2_475_754_115_185_997_039; // R2 MEASURED (the dedup palette), frozen.
 
     /// THE PLACEMENT-TABLE BYTE PIN: the full population packs to a
     /// byte sequence whose FNV-1a hash is this pinned u64 (measured
@@ -673,7 +854,13 @@ mod tests {
     /// every table entry carries `alpha: 1.0`, which packs to the
     /// identical bits the former hard-coded 1.0 produced — the pin
     /// re-ran green, the opaque table's byte-compatibility proof.
-    const PINNED_FNV: u64 = 16_877_662_039_878_331_722;
+    /// REPINNED in P5 R2 (A18, the §3.2(e) stander dedup): the
+    /// constructor now remaps the authored sequential pose indices
+    /// onto the dedup palette mapping (standers → block 0, walker j
+    /// → 1 + j) — the params vec4's x claim moved with it, the pin
+    /// fired on the change exactly as designed, and the pixels are
+    /// identical by the skin-matrix identity proof.
+    const PINNED_FNV: u64 = 11_575_762_803_608_534_537; // R2 MEASURED (the dedup remap), frozen.
 
     // ------------------------------------------------------- helpers
     // (pure f32; the pins carry margins, so platform ulp differences

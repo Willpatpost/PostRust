@@ -205,6 +205,18 @@ pub struct RainLayer {
     /// expiry (the honest absence). The `died` census above counts
     /// BOTH; this counter separates the contacts.
     kill_deaths: u64,
+    /// P5 §3.3 (A18/R2) — the rain population's dirty generation
+    /// (the caller-owned half of the dirty-generation protocol):
+    /// bumped on every `update_and_build` (the instance pool is
+    /// rebuilt from the COMPLETED tick — a rebuild at an unchanged
+    /// camera and tick state produces byte-identical bytes, and one
+    /// redundant generation is never a stale one). Starts at 1: the
+    /// warm start's own build IS the first generation. The corner
+    /// crowd folds this layer's instances into ITS population and
+    /// bumps its own combined instance generation; standalone
+    /// submitters of [`RainLayer::population`] (the weather gates)
+    /// declare this counter directly.
+    instance_generation: u64,
 }
 
 impl RainLayer {
@@ -309,6 +321,7 @@ impl RainLayer {
             ripple_expired,
             ripple_refused: warm_refusals,
             kill_deaths: warm_kill_deaths,
+            instance_generation: 1,
         }
     }
 
@@ -443,6 +456,11 @@ impl RainLayer {
                 pose_index: 0,
             });
         }
+        // P5 §3.3: the instance pool was rebuilt from the completed
+        // tick — the rain population changed, bump its generation
+        // (conservative and honest: byte-identical rebuilds pay one
+        // redundant generation, never a stale one).
+        self.instance_generation += 1;
 
         report
     }
@@ -468,7 +486,11 @@ impl RainLayer {
         self.kill_deaths
     }
 
-    /// Returns the population for rendering.
+    /// Returns the population for rendering (P5 §3.3: the rain
+    /// population's dirty generation rides the instance half — the
+    /// layer bumps it on every `update_and_build` rebuild; the pose
+    /// half is always-dirty, vacuously — the rain kind never reads
+    /// pose blocks).
     pub fn population(&self) -> engine_renderer::ProxyPopulation<'_> {
         engine_renderer::ProxyPopulation {
             npc: &[],
@@ -478,6 +500,8 @@ impl RainLayer {
             vehicle_material: 0,
             rain: &self.instances,
             rain_material: RAIN_MATERIAL,
+            instance_generation: self.instance_generation,
+            pose_generation: 0,
         }
     }
 

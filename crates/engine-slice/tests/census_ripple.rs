@@ -75,6 +75,8 @@ fn render_wet_cell(
     let mut poses = Vec::new();
     evaluate_population_poses(0, &phases, &mut poses);
     let population = ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: &npc,
         npc_poses: &poses,
         npc_material: 1,

@@ -61,6 +61,7 @@ use super::uploads::{LayerPriority, upload_layers};
 use super::{corner, post_draw, proxy_draw, scene_record};
 use crate::config::{DemoScenePreference, DynamicClamp, FRAMES_IN_FLIGHT, PresentModePreference};
 use crate::overlay::OverlayVertex;
+use crate::proxy_instances::generation_write_needed;
 use crate::submission::FrameInputs;
 
 /// A single frame slot owns this mapping. The slot fence must have
@@ -116,6 +117,20 @@ impl OverlaySlot {
 /// flight slot, plus per-swapchain-image state.
 pub(crate) struct FrameState {
     overlay_slots: [OverlaySlot; FRAMES_IN_FLIGHT as usize],
+    /// P5 §3.3 (A18/R2): the per-slot dirty-generation stamps — the
+    /// write half of the dirty-generation protocol. Each stamp
+    /// records the population generation whose bytes that slot's
+    /// mapped region last consumed, written ONLY together with those
+    /// bytes (the upload site), so a matching nonzero generation
+    /// PROVES the region already holds byte-identical bytes — the
+    /// ping-pong correctness by construction (with
+    /// FRAMES_IN_FLIGHT = 2 a stable population pays one write per
+    /// slot per generation and then zero). 0 = unknown (the initial
+    /// state; what every always-dirty generation-0 write resets to;
+    /// and what every resource replacement clears — swapchain
+    /// recreation and arena growth both replace the mapped buffers
+    /// with no content copy).
+    pub population_stamps: PopulationStamps,
     /// Created with `RESET_COMMAND_BUFFER` (corrective finding D): the
     /// per-slot command buffers are re-recorded every frame, and the
     /// per-slot fence proves a buffer is no longer pending when its
@@ -158,6 +173,49 @@ pub(crate) struct FrameState {
     pub capture: CaptureState,
 }
 
+/// The per-slot population stamps (P5 §3.3, A18/R2): one generation
+/// record per frame slot per population region — the instance bytes,
+/// the pose blocks, and the 6-E2 indirect command block (which rides
+/// the INSTANCE generation; its bytes are a pure function of the
+/// per-kind counts). The gate itself is
+/// [`crate::proxy_instances::generation_write_needed`] — ONE pure
+/// decision function shared by this frame state, the upload site,
+/// and the census's write leg; the oracle harness at this module's
+/// bottom pins the whole protocol against the always-write path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PopulationStamps {
+    pub instance: [u64; FRAMES_IN_FLIGHT as usize],
+    pub pose: [u64; FRAMES_IN_FLIGHT as usize],
+    pub indirect: [u64; FRAMES_IN_FLIGHT as usize],
+}
+
+impl Default for PopulationStamps {
+    fn default() -> Self {
+        Self {
+            instance: [0; FRAMES_IN_FLIGHT as usize],
+            pose: [0; FRAMES_IN_FLIGHT as usize],
+            indirect: [0; FRAMES_IN_FLIGHT as usize],
+        }
+    }
+}
+
+impl PopulationStamps {
+    /// RESOURCE-REPLACEMENT INVALIDATION (P5 §3.3's mandated
+    /// correctness rule): clear every stamp to unknown. Called at
+    /// the two replacement sites — swapchain recreation (the
+    /// replacement pipeline state re-creates the instance and
+    /// indirect buffers with NO content copy) and arena growth (the
+    /// ensure ladder's `device_wait_idle` re-creation of a mapped
+    /// carve at a larger size, again with no content copy). After a
+    /// replacement, no stamp can vouch for any slot's content, so
+    /// every population write re-fires for one frame — correctness
+    /// first, the growth events' log-bounded frequency keeps the
+    /// cost negligible.
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 impl FrameState {
     pub(crate) fn new(
         ctx: &VulkanContext,
@@ -166,6 +224,7 @@ impl FrameState {
         // Partial-initialization cleanup (corrective finding G).
         let mut state = FrameState {
             overlay_slots: std::array::from_fn(|_| OverlaySlot::default()),
+            population_stamps: PopulationStamps::default(),
             command_pool: vk::CommandPool::null(),
             command_buffers: Vec::new(),
             image_available: Vec::new(),
@@ -369,6 +428,15 @@ pub(crate) struct FrameOutcome {
     /// lands on the NEXT frame's delta — no event is ever lost,
     /// at most attributed to the following frame.
     pub arena_growth_events: u32,
+    /// P5 §3.3 (A18/R2): population mapped-region writes the
+    /// dirty-generation protocol SKIPPED this frame (instance, pose,
+    /// and indirect blocks whose per-slot stamp already recorded the
+    /// submission's generation — the between-tick and
+    /// static-placement frames' whole saving). Zero on unpopulated,
+    /// deferred, and every generation-0 (un-opted) frame; at most 3
+    /// (one per region). The safe layer accumulates it into
+    /// `RenderStats::population_writes_skipped`.
+    pub population_writes_skipped: u32,
 }
 
 /// Construction-time frame policy (P4 D2 §3.4, stage A04): the
@@ -611,6 +679,25 @@ pub(crate) fn render_frame(
     };
     outcome.suboptimal = suboptimal;
     frames.image_index = image_index;
+
+    // P5 §3.3 (A18/R2) — RESOURCE-REPLACEMENT INVALIDATION, the
+    // growth arm: any arena growth THIS frame (the delta over the
+    // baseline taken at entry — the ensure ladder in either
+    // preparation path, or the out-of-date arm's re-run, all of
+    // which precede this point) re-created a mapped carve at a
+    // larger size under `device_wait_idle` with NO content copy, so
+    // no population stamp can vouch for any slot's content anymore.
+    // Clearing forces one rewrite per slot — correctness first; the
+    // pow2 growth quantum bounds the events (and therefore the
+    // forced rewrites) to `log2(cap / 64)` per session. Conservative
+    // by design: a REGION growth (not an instance/pose buffer) also
+    // clears the population stamps — one redundant rewrite, never a
+    // stale skip. The recreation arm of the invalidation lives in
+    // `recreate_swapchain` (the pipeline replacement re-creates the
+    // instance and indirect buffers there).
+    if ctx.arena_growth_events.get() != arena_growth_before {
+        frames.population_stamps.clear();
+    }
 
     // Phases 5-8 — `acquire_to_submit`: everything between the
     // acquisition and the submission. CA-10 (the stranded slot): the
@@ -1304,31 +1391,63 @@ fn upload_frame_data(
             .saturating_add(upload.vehicle_count)
             .saturating_add(upload.rain_count);
         outcome.instance_capacity = proxy_state.capacity();
-        // CA-12 (F12): the admitted-counts-vs-physical-carve check
-        // BEFORE the upload — the audit's backstop at the one place
-        // the repacked bytes meet the carve. Unreachable on the
-        // validated domain (the CPU repack and the carve share one
-        // cap, and the carve never sits below the frame's demand),
-        // but the pre-fix write carried only a `debug_assert` — in
-        // release a mismatch wrote past the mapped slot. Typed
-        // refusal instead.
-        admitted_bytes_fit(
-            upload.bytes.len(),
-            proxy_state.slot_bytes(),
-            "instance population",
-        )?;
-        unsafe { proxy_state.write_slot(slot, upload.bytes) };
+        // P5 §3.3 (A18/R2) — the per-frame-slot generation gate: the
+        // stamp records what THIS slot's region last consumed, so a
+        // matching nonzero generation proves the region already
+        // holds byte-identical bytes and the write is skipped (the
+        // safe layer's buffer records guarantee the retained bytes
+        // ARE the declared generation's — the two levels are
+        // independent by construction). Generation 0 (always-dirty)
+        // always writes and resets the stamp, so an opted-in
+        // generation can never skip against a slot holding some
+        // other caller's bytes.
+        if generation_write_needed(
+            frames.population_stamps.instance[slot],
+            upload.instance_generation,
+        ) {
+            // CA-12 (F12): the admitted-counts-vs-physical-carve check
+            // BEFORE the upload — the audit's backstop at the one place
+            // the repacked bytes meet the carve. Unreachable on the
+            // validated domain (the CPU repack and the carve share one
+            // cap, and the carve never sits below the frame's demand),
+            // but the pre-fix write carried only a `debug_assert` — in
+            // release a mismatch wrote past the mapped slot. Typed
+            // refusal instead.
+            admitted_bytes_fit(
+                upload.bytes.len(),
+                proxy_state.slot_bytes(),
+                "instance population",
+            )?;
+            unsafe { proxy_state.write_slot(slot, upload.bytes) };
+            frames.population_stamps.instance[slot] = upload.instance_generation;
+        } else {
+            outcome.population_writes_skipped += 1;
+        }
+        // The indirect command block rides the INSTANCE generation
+        // (NEW-REND-08's cached-indirect observation): its bytes are
+        // the pure proxy_indirect packing of the per-kind counts —
+        // an instance-side fact — so the same stamp decision gates
+        // it, tracked on its own stamp (the block is its own buffer,
+        // lazily created only in the indirect mode).
         if let Some(indirect) = proxy_state.indirect.as_ref()
             && matches!(upload.mode, crate::ProxyDrawMode::Indirect)
         {
-            unsafe {
-                indirect.write_slot(
-                    slot,
-                    upload.npc_count,
-                    upload.vehicle_count,
-                    upload.rain_count,
-                )
-            };
+            if generation_write_needed(
+                frames.population_stamps.indirect[slot],
+                upload.instance_generation,
+            ) {
+                unsafe {
+                    indirect.write_slot(
+                        slot,
+                        upload.npc_count,
+                        upload.vehicle_count,
+                        upload.rain_count,
+                    )
+                };
+                frames.population_stamps.indirect[slot] = upload.instance_generation;
+            } else {
+                outcome.population_writes_skipped += 1;
+            }
         }
         // The Era-2 pose bytes: this slot's region of the mapped pose
         // buffer, written under the SAME fence discipline as the
@@ -1336,20 +1455,29 @@ fn upload_frame_data(
         // exists whenever a populated frame runs — the ensure is
         // unconditional on proxy presence; the debug_assert co-pins
         // the structural invariant the way the indirect path does).
+        // The generation gate is the POSE generation — the garage's
+        // split: static instances skip their half while the advancing
+        // walk cycle keeps writing its own.
         if let Some(retained) = ctx.skinned_retained.as_ref() {
             outcome.pose_supplied = (upload.pose_bytes.len() / crate::animation::POSE_STRIDE)
                 .min(u32::MAX as usize) as u32;
             outcome.pose_capacity = retained.blocks_capacity();
-            // CA-12 (F12): the same admitted-vs-carve backstop on the
-            // pose path (the instance check's own discipline — the
-            // pre-fix `debug_assert` alone gated this write in
-            // release).
-            admitted_bytes_fit(
-                upload.pose_bytes.len(),
-                retained.slot_stride(),
-                "pose population",
-            )?;
-            unsafe { retained.write_slot(slot, upload.pose_bytes) };
+            if generation_write_needed(frames.population_stamps.pose[slot], upload.pose_generation)
+            {
+                // CA-12 (F12): the same admitted-vs-carve backstop on the
+                // pose path (the instance check's own discipline — the
+                // pre-fix `debug_assert` alone gated this write in
+                // release).
+                admitted_bytes_fit(
+                    upload.pose_bytes.len(),
+                    retained.slot_stride(),
+                    "pose population",
+                )?;
+                unsafe { retained.write_slot(slot, upload.pose_bytes) };
+                frames.population_stamps.pose[slot] = upload.pose_generation;
+            } else {
+                outcome.population_writes_skipped += 1;
+            }
         } else {
             debug_assert!(
                 false,
@@ -2146,6 +2274,287 @@ mod policy_tests {
                     && text.contains("refusing rather than writing past the mapping"),
                 "the refusal names the population and the carve: {text}"
             );
+        }
+    }
+
+    /// P5 §3.3 (A18/R2) — THE §3.5 ORACLE HARNESS, the write half
+    /// (the uploads policy_tests class, device-free): a fuzzed
+    /// (generation, population) sequence driven through BOTH
+    /// protocol levels — the gated repacks (the safe layer's CPU
+    /// half) and the per-slot stamp gates (this module's upload
+    /// half, modeled as slot-region byte stores exactly the mapped
+    /// writes perform) — asserting at EVERY frame that each slot's
+    /// regions hold EXACTLY the bytes the always-write path
+    /// produces (the oracle: fresh buffers, generation 0, every
+    /// region copied every frame). The slot index rotates the frame
+    /// flow's own ping-pong (frame_slot advancing modulo
+    /// FRAMES_IN_FLIGHT), so the between-generation slot-N-2 hazard
+    /// (the design's named risk) is exercised by construction: a
+    /// stable population pays one write per slot per generation and
+    /// then zero, and a bumped generation rewrites BOTH slots.
+    #[test]
+    fn population_generation_protocol_matches_the_always_write_oracle() {
+        use crate::animation::{
+            compose_joint_matrices, humanoid_skeleton, repack_poses_generation, rest_pose_block,
+            skin_matrices, walk_clip,
+        };
+        use crate::proxy_indirect::pack_indirect_block;
+        use crate::proxy_instances::{
+            InstanceTransform, ProxyInstance, repack_populations_generation,
+        };
+
+        let slots = FRAMES_IN_FLIGHT as usize;
+        let skeleton = humanoid_skeleton();
+        let clip = walk_clip();
+        let rest = rest_pose_block();
+        let walker_at = |t: f32| {
+            let pose = crate::animation::sample_pose(&clip, t);
+            let joint_worlds = compose_joint_matrices(&skeleton, &pose);
+            skin_matrices(&joint_worlds, &skeleton)
+        };
+        let instance = |x: f32, turn: u16, pose_index: u32| ProxyInstance {
+            transform: InstanceTransform {
+                pos: [x, 0.02, -2.0],
+                turn,
+                scale: 1.0,
+            },
+            tint: [0.8, 0.7, 0.6],
+            alpha: 1.0,
+            pose_index,
+        };
+        // The protocol side: the renderer's retained buffers + their
+        // generation records + the frame state's stamps + the slot
+        // regions (the mapped carves' model).
+        let mut gated_bytes = Vec::new();
+        let mut gated_poses = Vec::new();
+        let mut generations = crate::submission::PopulationGenerations::default();
+        let mut stamps = PopulationStamps::default();
+        let mut slot_instances = vec![Vec::<u8>::new(); slots];
+        let mut slot_poses = vec![Vec::<u8>::new(); slots];
+        let mut slot_indirect = vec![Vec::<u8>::new(); slots];
+        // The oracle side: always-write (generation 0, fresh records,
+        // every region copied every frame).
+        let mut oracle_bytes = Vec::new();
+        let mut oracle_poses = Vec::new();
+        let mut oracle_generations = crate::submission::PopulationGenerations::default();
+        let mut oracle_slot_instances = vec![Vec::<u8>::new(); slots];
+        let mut oracle_slot_poses = vec![Vec::<u8>::new(); slots];
+        let mut oracle_slot_indirect = vec![Vec::<u8>::new(); slots];
+        // The sequence state: a render-then-step crowd — instances
+        // move on ticks (every 3rd frame), poses advance on ticks
+        // (every 2nd frame), and between ticks the population is
+        // byte-identical (the submission the protocol must make
+        // free). An always-dirty caller interleaves on the frames
+        // congruent to 7 mod 11 (the un-opted route sharing the
+        // renderer).
+        let mut rng: u64 = 0x13198A2E03707344;
+        let mut instance_generation = 1_u64;
+        let mut pose_generation = 1_u64;
+        let mut x = 1.0_f32;
+        let mut pose_t = 0.0_f32;
+        let mut skipped = 0_usize;
+        let mut wrote = 0_usize;
+        for frame in 0..48_u64 {
+            let slot = (frame as usize) % slots;
+            rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let tick = frame % 3 == 0;
+            let pose_tick = frame % 2 == 0;
+            if tick {
+                instance_generation += 1;
+                x += (rng % 100) as f32 * 0.01;
+            }
+            if pose_tick {
+                pose_generation += 1;
+                pose_t = (pose_t + 0.017) % 1.1;
+            }
+            let instances = [instance(x, 1000, 0), instance(-3.0, 40000, 1)];
+            let poses = [rest, walker_at(pose_t)];
+            let un_opted = frame % 11 == 7;
+            let (declared_instance, declared_pose) = if un_opted {
+                (0, 0)
+            } else {
+                (instance_generation, pose_generation)
+            };
+            // ---- The gated path (both levels) ----
+            repack_populations_generation(
+                &mut gated_bytes,
+                &instances,
+                &[],
+                &[],
+                crate::proxy_instances::MAX_INSTANCES,
+                declared_instance,
+                &mut generations.instance,
+            )
+            .unwrap();
+            repack_poses_generation(
+                &mut gated_poses,
+                &poses[..],
+                crate::animation::MAX_POSE_BLOCKS,
+                declared_pose,
+                &mut generations.pose,
+            )
+            .unwrap();
+            if generation_write_needed(stamps.instance[slot], declared_instance) {
+                slot_instances[slot].clear();
+                slot_instances[slot].extend_from_slice(&gated_bytes);
+                stamps.instance[slot] = declared_instance;
+                wrote += 1;
+            } else {
+                skipped += 1;
+            }
+            let indirect_block = pack_indirect_block(396, 2, 552, 0, 6, 0);
+            if generation_write_needed(stamps.indirect[slot], declared_instance) {
+                slot_indirect[slot] = indirect_block.to_vec();
+                stamps.indirect[slot] = declared_instance;
+                wrote += 1;
+            } else {
+                skipped += 1;
+            }
+            if generation_write_needed(stamps.pose[slot], declared_pose) {
+                slot_poses[slot].clear();
+                slot_poses[slot].extend_from_slice(&gated_poses);
+                stamps.pose[slot] = declared_pose;
+                wrote += 1;
+            } else {
+                skipped += 1;
+            }
+            // ---- The oracle path (always-write) ----
+            repack_populations_generation(
+                &mut oracle_bytes,
+                &instances,
+                &[],
+                &[],
+                crate::proxy_instances::MAX_INSTANCES,
+                0,
+                &mut oracle_generations.instance,
+            )
+            .unwrap();
+            repack_poses_generation(
+                &mut oracle_poses,
+                &poses[..],
+                crate::animation::MAX_POSE_BLOCKS,
+                0,
+                &mut oracle_generations.pose,
+            )
+            .unwrap();
+            for (region, bytes) in [
+                (&mut oracle_slot_instances[slot], &oracle_bytes),
+                (&mut oracle_slot_poses[slot], &oracle_poses),
+            ] {
+                region.clear();
+                region.extend_from_slice(bytes);
+            }
+            oracle_slot_indirect[slot] = indirect_block.to_vec();
+            // ---- The equivalence: every region, every frame ----
+            assert_eq!(
+                slot_instances, oracle_slot_instances,
+                "frame {frame}: every slot's instance region is the always-write bytes"
+            );
+            assert_eq!(
+                slot_poses, oracle_slot_poses,
+                "frame {frame}: every slot's pose region is the always-write bytes"
+            );
+            assert_eq!(
+                slot_indirect, oracle_slot_indirect,
+                "frame {frame}: every slot's indirect block is the always-write bytes"
+            );
+        }
+        // The protocol actually did its job: skips occurred (the
+        // between-tick frames) AND writes occurred (the ticks, the
+        // always-dirty interleave, and the first pass over each
+        // slot) — a harness that skipped nothing or wrote nothing
+        // proves nothing.
+        assert!(skipped > 0, "the sequence exercised generation skips");
+        assert!(wrote > 0, "the sequence exercised real writes");
+        // The ping-pong shape's headline: after the LAST stable
+        // stretch (no tick on the trailing frames), every slot's
+        // stamp records the current generations — the stable
+        // population pays one write per slot per generation and then
+        // zero. The final two frames are tick-free by construction
+        // (47 % 3 != 0, 46 % 3 != 0), so both slots must be stamped
+        // at the final pose generation... asserted through the gate
+        // itself: no further write is needed on either slot.
+        for slot in 0..slots {
+            assert!(
+                !generation_write_needed(stamps.instance[slot], instance_generation)
+                    || stamps.instance[slot] == 0,
+                "slot {slot}: a stable population needs no further instance write"
+            );
+        }
+    }
+
+    /// P5 §3.3 — the ping-pong shape, directly: a STABLE opted-in
+    /// population over six frames on two slots writes each slot's
+    /// region exactly ONCE (its first frame) and skips every later
+    /// frame; a generation bump rewrites both slots exactly once
+    /// more. This is the design's §3.3(1) headline made assertable
+    /// at the stamp level.
+    #[test]
+    fn stable_population_writes_each_slot_once_per_generation() {
+        let slots = FRAMES_IN_FLIGHT as usize;
+        let mut stamps = PopulationStamps::default();
+        let mut writes = vec![0_usize; slots];
+        for frame in 0..6 {
+            let slot = frame % slots;
+            if generation_write_needed(stamps.instance[slot], 7) {
+                stamps.instance[slot] = 7;
+                writes[slot] += 1;
+            }
+        }
+        assert_eq!(writes, vec![1; slots], "one write per slot per generation");
+        // The bump: both slots rewrite once.
+        let mut bumped = vec![0_usize; slots];
+        for frame in 0..(2 * slots) {
+            let slot = frame % slots;
+            if generation_write_needed(stamps.instance[slot], 8) {
+                stamps.instance[slot] = 8;
+                bumped[slot] += 1;
+            }
+        }
+        assert_eq!(
+            bumped,
+            vec![1; slots],
+            "the bumped generation rewrites both slots"
+        );
+        // An interleaved always-dirty frame resets the stamp it
+        // writes, so the next opted-in frame cannot skip against it.
+        let slot = 0;
+        assert!(generation_write_needed(stamps.instance[slot], 0));
+        stamps.instance[slot] = 0;
+        assert!(
+            generation_write_needed(stamps.instance[slot], 8),
+            "a generation-0 write broke the stamp's vouching"
+        );
+    }
+
+    /// P5 §3.3 — THE RESOURCE-REPLACEMENT INVALIDATION semantics:
+    /// `clear()` returns every stamp to unknown, so a population
+    /// whose generation a slot ALREADY recorded writes again after
+    /// a replacement (a carve growth or a swapchain recreation
+    /// replaced the mapped buffer with no content copy — the new
+    /// region holds nothing the stamp can vouch for). The wiring
+    /// sites are `recreate_swapchain` (the recreation arm) and the
+    /// frame flow's arena-growth delta (the growth arm); this test
+    /// pins the state contract both sites rely on.
+    #[test]
+    fn stamp_clear_forces_rewrites_after_replacement() {
+        let mut stamps = PopulationStamps::default();
+        for slot in 0..FRAMES_IN_FLIGHT as usize {
+            stamps.instance[slot] = 5;
+            stamps.pose[slot] = 5;
+            stamps.indirect[slot] = 5;
+            assert!(!generation_write_needed(stamps.instance[slot], 5));
+            assert!(!generation_write_needed(stamps.pose[slot], 5));
+            assert!(!generation_write_needed(stamps.indirect[slot], 5));
+        }
+        stamps.clear();
+        for slot in 0..FRAMES_IN_FLIGHT as usize {
+            assert_eq!(stamps.instance[slot], 0, "slot {slot}: unknown again");
+            assert_eq!(stamps.pose[slot], 0);
+            assert_eq!(stamps.indirect[slot], 0);
+            assert!(generation_write_needed(stamps.instance[slot], 5));
+            assert!(generation_write_needed(stamps.pose[slot], 5));
+            assert!(generation_write_needed(stamps.indirect[slot], 5));
         }
     }
 }

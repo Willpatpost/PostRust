@@ -617,6 +617,8 @@ fn post_pixels_match_post_rs_and_the_disc_blooms() {
     // authored-silhouette equation).
     let npc_poses = vec![engine_renderer::animation::rest_pose_block(); npc.len()];
     let population = engine_renderer::ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: &npc,
         npc_poses: &npc_poses,
         npc_material: 1,
@@ -3032,6 +3034,8 @@ fn shadowed_populated_composes_through_the_hdr_chain() {
         .map(|_| engine_renderer::animation::rest_pose_block())
         .collect();
     let population = engine_renderer::ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: &npc,
         npc_poses: &rest_blocks,
         npc_material: 1,
@@ -3701,6 +3705,8 @@ fn check_torso_wall_through_the_chain(
     let single = [instance];
     let poses = [engine_renderer::animation::rest_pose_block()];
     let population = engine_renderer::ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: &single,
         npc_poses: &poses,
         npc_material: 1,

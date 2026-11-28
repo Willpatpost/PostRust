@@ -18,8 +18,11 @@
 //!   per-frame CPU cost of the three A18 operations (instance
 //!   repack, pose evaluation, slot write) at populations {6, 24,
 //!   1k, 4k} × dirty fraction {0%, the stander mix, 100%}. PURE
-//!   CPU — the BEFORE-R2 numbers run anywhere; the same harness
-//!   re-runs after R2 for the after. `tests/census_repack.rs`.
+//!   CPU — since P5 R2 (A18) each cell runs BOTH legs: the
+//!   before-R2 operations (the full-repack fallback) and the same
+//!   cell through the LANDED dirty-generation protocol (the
+//!   generation-gated repacks + the per-slot stamp-gated writes).
+//!   `tests/census_repack.rs`.
 //! - **§9.3 (arena residency)** — the BEFORE side IS [`carve`]'s
 //!   computed row (the carves are constant-sized today — the
 //!   finding itself); the battery prints it per population cell.

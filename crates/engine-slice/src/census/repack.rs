@@ -1,15 +1,17 @@
 //! §9.2's REPACK MATRIX (A18/R2's before/after row) — the per-frame
 //! CPU cost of the three operations `adapt_frame` runs on EVERY
-//! populated submission today (submission.rs's repack sequence):
+//! populated submission before R2 (submission.rs's repack sequence):
 //!
 //! - **instance repack** — [`engine_renderer::proxy_instances::
 //!   repack_populations`]: validate-all, clear, reserve, regenerate
 //!   every instance's 96 B (two fixed-order Taylor series per
 //!   instance plus the `to_bits` packing).
 //! - **pose evaluation** — [`crate::corner_population::
-//!   evaluate_population_poses`]: per NPC, `sample_pose` +
-//!   `compose_joint_matrices` + `skin_matrices_bound` (the walkers;
-//!   standers read the A17-landed cached rest block).
+//!   evaluate_population_poses`]: the §3.2(e) dedup PALETTE
+//!   (`[rest] ∪ {walker blocks}` — the standers' redundant rest
+//!   copies removed since R2); per WALKER, `sample_pose` +
+//!   `compose_joint_matrices` + `skin_matrices_bound` (the standers
+//!   read the A17-landed cached rest block ONCE, shared).
 //! - **slot write** — the per-frame mapped-region memcpy
 //!   `upload_frame_data` performs after the slot's fence wait
 //!   (frame.rs: the instance slice + the pose slice + the 48-B
@@ -19,17 +21,37 @@
 //!   real device path — the byte counts, not the destination, are
 //!   the row's variable).
 //!
+//! Since P5 R2 (A18) every cell runs BOTH legs (the §3.2
+//! before/after axis): the BEFORE leg is the R0 shape verbatim
+//! (always-repack, always-write — the full-repack fallback, the
+//! numbers comparable with E-12's archived row modulo the dedup
+//! palette's block counts); the AFTER leg drives the LANDED
+//! dirty-generation protocol — the generation-gated repacks
+//! ([`engine_renderer::proxy_instances::
+//! repack_populations_generation`] /
+//! [`engine_renderer::animation::repack_poses_generation`]) and the
+//! per-slot stamp-gated writes
+//! ([`engine_renderer::proxy_instances::generation_write_needed`],
+//! the frame flow's own ping-pong) — exactly the operations the
+//! adopted routes submit through. The 0% row's AFTER leg is the
+//! between-tick unchanged-population frame: nothing regenerated,
+//! nothing evaluated, nothing copied — the protocol's headline.
+//!
 //! The axes (§9.2): populations {6 (garage), 24 (corner), 1k, 4k
 //! (the cap)} × dirty fraction {0% (all standing), the stander mix
 //! (each table's OWN authored mix — the garage's 2 stand / 4 walk,
 //! the corner's 8 stand / 16 walk; the design's "~40%" label is a
 //! rounding of the stander share, the tables' actual counts are
-//! what run), 100% (all walking)}. BEFORE R2 the instance repack
-//! and the slot write are WHOLE-SET regardless of dirtiness — the
-//! flat columns across the dirty axis ARE the finding; the 0%
+//! what run), 100% (all walking)}. On the BEFORE leg the instance
+//! repack and the slot write are WHOLE-SET regardless of dirtiness
+//! — the flat columns across the dirty axis ARE the finding; the 0%
 //! instance-repack cell is also the RENDER-THEN-STEP between-tick
 //! frame's cost (an unchanged population still pays the full
-//! repack — §9.2's second half, measured).
+//! repack — §9.2's second half, measured). On the AFTER leg the
+//! instance generation is the static placement (never moves — the
+//! garage's own split and every between-tick frame), and the pose
+//! generation bumps exactly on the mix/full cells (the walkers
+//! advance per frame; the 0% pose set is static).
 //!
 //! §9.7's boundary leg lives here too: 4k is EXACTLY the cap
 //! (MAX_INSTANCES = MAX_POSE_BLOCKS = 4096); cap+1 must refuse with
@@ -101,7 +123,25 @@ impl DirtyFraction {
 }
 
 /// One matrix row: a (population × dirty fraction) cell's three
-/// measured operations plus its byte context.
+/// measured operations plus its byte context. Since P5 R2 each cell
+/// carries BOTH legs (§3.2's before/after axis):
+/// - the BEFORE leg — `instance_repack` / `pose_evaluation` /
+///   `slot_write` — the ALWAYS-REPACK, ALWAYS-WRITE operations
+///   exactly as `adapt_frame`/`upload_frame_data` ran them before
+///   the dirty-generation protocol (the full-repack fallback,
+///   unchanged; the numbers comparable with E-12's archived row
+///   modulo the §3.2(e) dedup palette's block counts);
+/// - the AFTER leg — `*_after` — the SAME cell through the R2
+///   protocol: the generation-gated repacks (validation always, the
+///   byte regeneration gated) and the per-slot stamp-gated writes
+///   (the frame flow's own ping-pong over FRAMES_IN_FLIGHT slots).
+///   The 0% row is the between-tick unchanged-population frame —
+///   its after-leg cost is the protocol's headline (~the gate
+///   checks; nothing regenerated, nothing copied).
+///
+/// `generation_skips` counts the gated-out operations in the after
+/// leg (repack reuses + write skips) — the protocol's observable
+/// saving, assertable by the tests.
 pub struct MatrixRow {
     pub population: &'static str,
     pub dirty: &'static str,
@@ -110,9 +150,15 @@ pub struct MatrixRow {
     pub instance_repack: TimingStats,
     pub pose_evaluation: TimingStats,
     pub slot_write: TimingStats,
+    pub instance_repack_after: TimingStats,
+    pub pose_evaluation_after: TimingStats,
+    pub slot_write_after: TimingStats,
+    pub generation_skips: usize,
     /// The frame's packed instance bytes (npc + vehicles).
     pub instance_bytes: usize,
-    /// The frame's packed pose bytes (one block per npc).
+    /// The frame's packed pose bytes (the §3.2(e) dedup palette —
+    /// `[rest] ∪ {walker blocks}`, one shared rest block instead of
+    /// a per-stander copy).
     pub pose_bytes: usize,
 }
 
@@ -207,13 +253,18 @@ pub fn census_populations() -> Vec<PopulationSpec> {
 /// cell; the §0.1 carve row printed once as the §9.3 context).
 /// `warmup` frames then `samples` measured frames per cell, the
 /// `benchmark::report` convention. Returns the rows for callers
-/// that assert over them (the lib tests' structure legs).
+/// that assert over them (the lib tests' structure legs). Since P5
+/// R2 each cell runs BOTH legs (see [`MatrixRow`]): the before-R2
+/// operations and the same cell through the dirty-generation
+/// protocol.
 pub fn run_repack_matrix(
     populations: &[PopulationSpec],
     warmup: usize,
     samples: usize,
 ) -> Vec<MatrixRow> {
-    println!("P5 R0 §9.2 — the repack matrix (BEFORE R2): CPU us/frame per operation");
+    println!(
+        "P5 §9.2 — the repack matrix (R2: BEFORE vs the dirty-generation AFTER): CPU us/frame per operation"
+    );
     println!(
         "  carve context (§9.3 BEFORE — demand-independent): instance {} B / pose {} B / region {} B = {} B total",
         crate::census::carve::mapped_carves().instance_bytes,
@@ -222,7 +273,8 @@ pub fn run_repack_matrix(
         crate::census::carve::mapped_carves().total_bytes,
     );
     println!(
-        "  per-cell: instance-repack / pose-evaluation / slot-write (sink copy of the frame's exact bytes) — {samples} samples after {warmup} warmup"
+        "  per-cell BEFORE: instance-repack / pose-eval / slot-write (the always-repack fallback); \
+         AFTER: the same operations through the P5 §3.3 generation gates — {samples} samples after {warmup} warmup"
     );
     let mut rows = Vec::new();
     for spec in populations {
@@ -244,9 +296,17 @@ pub fn run_repack_matrix(
     rows
 }
 
-/// One cell: the three operations measured over the advancing demo
-/// clock (frame k — the walkers' clip times advance exactly the way
-/// the composed route's do; standing NPCs read the cached block).
+/// One cell: both legs measured over the advancing demo clock
+/// (frame k — the walkers' clip times advance exactly the way the
+/// composed route's do; standing NPCs read the cached block).
+/// The BEFORE leg is the R0 shape verbatim (always-repack,
+/// always-write). The AFTER leg drives the P5 §3.3 protocol the
+/// adopted routes do: the matrix's instances are the fixed spec
+/// tables (the garage's static-placement / the between-tick corner
+/// shape — the instance generation never moves), and the pose
+/// generation bumps exactly on the dirty axis (0% = static pose set
+/// — the between-tick shape; mix/full = the walkers advance every
+/// frame).
 fn run_cell(
     spec: &PopulationSpec,
     fraction: DirtyFraction,
@@ -259,6 +319,11 @@ fn run_cell(
         .filter(|phase| matches!(phase, Phase::Walk(_)))
         .count();
     let standers = phases.len() - walkers;
+    // The after leg's dirty axis: the pose population changes per
+    // frame exactly on the mix/full cells (the walkers advance);
+    // the 0% cell is the static all-standing population (the
+    // between-tick unchanged-population shape).
+    let poses_dirty = fraction != DirtyFraction::Zero;
 
     // The retained buffers (the F-05 discipline the frame path
     // itself uses — clear + reserve + refill, capacity reused).
@@ -275,7 +340,26 @@ fn run_cell(
     let mut instance_times: Vec<Duration> = Vec::with_capacity(warmup + samples);
     let mut pose_times: Vec<Duration> = Vec::with_capacity(warmup + samples);
     let mut write_times: Vec<Duration> = Vec::with_capacity(warmup + samples);
+    // The after leg's own state: the buffers' generation records
+    // (the renderer's CPU half) and the per-slot stamps (the frame
+    // flow's write half, rotating the frame_slot ping-pong).
+    let mut instance_generation_record = 0_u64;
+    let mut pose_generation_record = 0_u64;
+    let mut stamp_instance = [0_u64; engine_renderer::config::FRAMES_IN_FLIGHT as usize];
+    let mut stamp_indirect = [0_u64; engine_renderer::config::FRAMES_IN_FLIGHT as usize];
+    let mut stamp_pose = [0_u64; engine_renderer::config::FRAMES_IN_FLIGHT as usize];
+    let mut instance_after_times: Vec<Duration> = Vec::with_capacity(warmup + samples);
+    let mut pose_after_times: Vec<Duration> = Vec::with_capacity(warmup + samples);
+    let mut write_after_times: Vec<Duration> = Vec::with_capacity(warmup + samples);
+    // The matrix's instances are the fixed spec tables — the static
+    // instance population every route with a placement table (and
+    // every between-tick frame) submits.
+    const STATIC_INSTANCE_GENERATION: u64 = 1;
+    let mut pose_generation = 1_u64;
+    let mut generation_skips = 0_usize;
+
     for frame in 0..warmup + samples {
+        // ---------------- BEFORE leg (the R0 operations) ----------------
         // Operation 1 — the instance repack (whole-set, always).
         let started = Instant::now();
         repack_populations(&mut instance_bytes, &spec.npc, &spec.vehicles, &[])
@@ -316,10 +400,101 @@ fn run_cell(
         );
         std::hint::black_box(indirect_sink.as_mut_slice()).copy_from_slice(&block);
         write_times.push(started.elapsed());
+
+        // ---------------- AFTER leg (the P5 §3.3 protocol) ----------------
+        // The instance half: the generation-gated repack (validation
+        // always; the regeneration gated on the static instance
+        // population's never-moving generation).
+        let started = Instant::now();
+        let decision = engine_renderer::proxy_instances::repack_populations_generation(
+            &mut instance_bytes,
+            &spec.npc,
+            &spec.vehicles,
+            &[],
+            MAX_INSTANCES,
+            STATIC_INSTANCE_GENERATION,
+            &mut instance_generation_record,
+        )
+        .expect("the census populations are valid by construction");
+        if decision == engine_renderer::proxy_instances::GenerationDecision::Reused {
+            generation_skips += 1;
+        }
+        instance_after_times.push(started.elapsed());
+        // The pose half: the composition re-evaluates exactly when
+        // the pose population is dirty (the render-then-step
+        // contract — between ticks nothing re-evaluates); the
+        // repack is generation-gated either way.
+        let started = Instant::now();
+        if poses_dirty {
+            evaluate_population_poses(frame as u64, &phases, &mut poses);
+            pose_generation += 1;
+        }
+        let decision = engine_renderer::animation::repack_poses_generation(
+            &mut pose_bytes,
+            &poses,
+            MAX_POSE_BLOCKS,
+            pose_generation,
+            &mut pose_generation_record,
+        )
+        .expect("the census populations are within the pose cap");
+        if decision == engine_renderer::proxy_instances::GenerationDecision::Reused {
+            generation_skips += 1;
+        }
+        pose_after_times.push(started.elapsed());
+        // The write half: the per-slot stamp gates over the frame
+        // flow's own ping-pong (the frame_slot rotation modulo
+        // FRAMES_IN_FLIGHT), using the protocol's ONE public
+        // decision function — the same `generation_write_needed`
+        // `upload_frame_data` consumes.
+        let started = Instant::now();
+        let slot = frame % engine_renderer::config::FRAMES_IN_FLIGHT as usize;
+        if engine_renderer::proxy_instances::generation_write_needed(
+            stamp_instance[slot],
+            STATIC_INSTANCE_GENERATION,
+        ) {
+            let instance_region =
+                std::hint::black_box(instance_sink.as_mut_slice())[..instance_bytes.len()].as_mut();
+            instance_region.copy_from_slice(&instance_bytes);
+            stamp_instance[slot] = STATIC_INSTANCE_GENERATION;
+        } else {
+            generation_skips += 1;
+        }
+        if engine_renderer::proxy_instances::generation_write_needed(
+            stamp_indirect[slot],
+            STATIC_INSTANCE_GENERATION,
+        ) {
+            let block = engine_renderer::proxy_indirect::pack_indirect_block(
+                npc_vertices,
+                spec.npc.len() as u32,
+                vehicle_vertices,
+                spec.vehicles.len() as u32,
+                rain_vertices,
+                0,
+            );
+            std::hint::black_box(indirect_sink.as_mut_slice()).copy_from_slice(&block);
+            stamp_indirect[slot] = STATIC_INSTANCE_GENERATION;
+        } else {
+            generation_skips += 1;
+        }
+        if engine_renderer::proxy_instances::generation_write_needed(
+            stamp_pose[slot],
+            pose_generation,
+        ) {
+            let pose_region =
+                std::hint::black_box(pose_sink.as_mut_slice())[..pose_bytes.len()].as_mut();
+            pose_region.copy_from_slice(&pose_bytes);
+            stamp_pose[slot] = pose_generation;
+        } else {
+            generation_skips += 1;
+        }
+        write_after_times.push(started.elapsed());
     }
     instance_times.drain(..warmup);
     pose_times.drain(..warmup);
     write_times.drain(..warmup);
+    instance_after_times.drain(..warmup);
+    pose_after_times.drain(..warmup);
+    write_after_times.drain(..warmup);
 
     let row = MatrixRow {
         population: spec.label,
@@ -329,12 +504,17 @@ fn run_cell(
         instance_repack: timing_stats(&mut instance_times),
         pose_evaluation: timing_stats(&mut pose_times),
         slot_write: timing_stats(&mut write_times),
+        instance_repack_after: timing_stats(&mut instance_after_times),
+        pose_evaluation_after: timing_stats(&mut pose_after_times),
+        slot_write_after: timing_stats(&mut write_after_times),
+        generation_skips,
         instance_bytes: instance_bytes.len(),
         pose_bytes: pose_bytes.len(),
     };
     println!(
-        "  {} x {}: {}/{} walk/stand — repack {:.2} / pose {:.2} / write {:.2} us \
-         (p99 {:.2}/{:.2}/{:.2}; inst {} B, pose {} B)",
+        "  {} x {}: {}/{} walk/stand — BEFORE repack {:.2} / pose {:.2} / write {:.2} us; \
+         AFTER repack {:.2} / pose {:.2} / write {:.2} us (skips {}) \
+         (inst {} B, pose {} B)",
         row.population,
         row.dirty,
         row.walkers,
@@ -342,9 +522,10 @@ fn run_cell(
         row.instance_repack.median_us,
         row.pose_evaluation.median_us,
         row.slot_write.median_us,
-        row.instance_repack.p99_us,
-        row.pose_evaluation.p99_us,
-        row.slot_write.p99_us,
+        row.instance_repack_after.median_us,
+        row.pose_evaluation_after.median_us,
+        row.slot_write_after.median_us,
+        row.generation_skips,
         row.instance_bytes,
         row.pose_bytes
     );
@@ -363,11 +544,14 @@ pub fn run_default_matrix() -> Vec<MatrixRow> {
 mod tests {
     use super::*;
 
-    /// The byte-count pins: every population's packed bytes are
-    /// exactly (npc + vehicles) × 96 instance bytes and npc × 704
-    /// pose bytes — the slot-write row's variables, and the §0.1
-    /// arithmetic's demand-side numbers (the corner's ~19 KB of
-    /// regenerated bytes vs the 6.7 MB carve).
+    /// The byte-count pins: every population's packed instance bytes
+    /// are exactly (npc + vehicles) × 96 instance bytes, and the
+    /// pose bytes are the §3.2(e) dedup PALETTE — `[rest] ∪ {walker
+    /// blocks}` — so the 0% cells carry ONE shared rest block (the
+    /// standers' redundant copies removed) and the mix cells carry
+    /// 1 + walkers (the corner's 17, the garage's 5). The
+    /// slot-write row's variables, and the §0.1 arithmetic's
+    /// demand-side numbers.
     #[test]
     fn cell_byte_counts_are_the_packed_strides() {
         let populations = census_populations();
@@ -375,17 +559,90 @@ mod tests {
         assert_eq!(row.len(), 4 * 3, "4 populations x 3 dirty fractions");
         let garage = &row[0];
         assert_eq!(garage.instance_bytes, 7 * INSTANCE_STRIDE, "6 npc + 1 van");
-        assert_eq!(garage.pose_bytes, 6 * POSE_STRIDE);
+        assert_eq!(
+            garage.pose_bytes, POSE_STRIDE,
+            "the garage 0% palette: the one shared rest block"
+        );
+        let garage_mix = &row[1];
+        assert_eq!(
+            garage_mix.pose_bytes,
+            5 * POSE_STRIDE,
+            "the garage mix palette: shared rest + 4 walkers"
+        );
         let corner = &row[3];
         assert_eq!(
             corner.instance_bytes,
             26 * INSTANCE_STRIDE,
             "24 npc + 2 vehicles"
         );
-        assert_eq!(corner.pose_bytes, 24 * POSE_STRIDE);
+        assert_eq!(
+            corner.pose_bytes, POSE_STRIDE,
+            "the corner 0% palette: the one shared rest block"
+        );
+        let corner_mix = &row[4];
+        assert_eq!(
+            corner_mix.pose_bytes,
+            17 * POSE_STRIDE,
+            "the corner mix palette: shared rest + 16 walkers"
+        );
         let four_k = &row[9];
         assert_eq!(four_k.instance_bytes, MAX_INSTANCES * INSTANCE_STRIDE);
-        assert_eq!(four_k.pose_bytes, MAX_POSE_BLOCKS * POSE_STRIDE);
+        assert_eq!(
+            four_k.pose_bytes, POSE_STRIDE,
+            "the 4k 0% palette: the one shared rest block"
+        );
+        let four_k_full = &row[11];
+        assert_eq!(
+            four_k_full.pose_bytes,
+            MAX_POSE_BLOCKS * POSE_STRIDE,
+            "the 4k 100% palette: no standers, the identity mapping"
+        );
+    }
+
+    /// P5 §3.3 (A18/R2) — the after leg's protocol columns: the 0%
+    /// cells (the between-tick unchanged-population shape) skip
+    /// EVERY gated operation after both frame slots are stamped —
+    /// the maximum 5 skips per frame (2 repack reuses + 3 write
+    /// skips); the 100% cells keep repacking and writing their POSE
+    /// half (the walkers advance — the dirty axis is honest) while
+    /// the instance half still skips (the static placement). This
+    /// is the census's own proof the protocol fires, assertable
+    /// wherever the lib tests run.
+    #[test]
+    fn after_leg_generation_skips_follow_the_dirty_axis() {
+        let populations = census_populations();
+        let rows = run_repack_matrix(&populations, 3, 4);
+        let frames = 3 + 4;
+        let corner_zero = &rows[3];
+        // 5 gated operations per frame; the first frame of each slot
+        // writes (2 slots), the rest skip — the warmup's first frame
+        // also pays the first repack. Assert the bulk: at least 5
+        // skips per measured frame on average over the window.
+        assert!(
+            corner_zero.generation_skips >= 5 * frames / 2,
+            "the 0% cell skips the gated operations ({} skips over {} frames)",
+            corner_zero.generation_skips,
+            frames
+        );
+        let corner_full = &rows[5];
+        // The 100% cell: the pose half never skips (the generation
+        // bumps every frame), the instance repack and the
+        // instance/indirect writes do — 3 gated operations per
+        // frame after the first.
+        assert!(
+            corner_full.generation_skips >= 3 * frames / 2
+                && corner_full.generation_skips < 5 * frames,
+            "the 100% cell skips the static halves but not the pose half ({} skips)",
+            corner_full.generation_skips
+        );
+        // Every after column measured real samples.
+        for row in &rows {
+            assert!(row.instance_repack_after.samples == 4);
+            assert!(row.pose_evaluation_after.samples == 4);
+            assert!(row.slot_write_after.samples == 4);
+            assert!(row.instance_repack_after.median_us > 0.0);
+            assert!(row.slot_write_after.median_us >= 0.0);
+        }
     }
 
     /// The dirty axis is honest: the stander-mix cells carry each

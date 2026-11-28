@@ -274,8 +274,25 @@ const VEHICLE_TABLE: [ProxyInstance; 1] = [
 /// The garage population: 6 NPCs then 1 vehicle, in the fixed
 /// buffer order (the repack's npc-then-vehicle order — the entry
 /// order is part of the byte pin, the corner table's discipline).
+/// Since P5 §3.2(e) the returned npc instances carry the
+/// STANDER-DEDUP pose indices (see
+/// [`crate::corner_population::stander_dedup_block_indices`]): the
+/// two workbench standers share palette block 0, the four walkers
+/// carry 1..4 — the authored sequential values remapped mechanically
+/// at construction (the corner table's own versioned claim; the
+/// pixels are identical by the skin-matrix identity proof).
 pub fn garage_population() -> (Vec<ProxyInstance>, Vec<ProxyInstance>) {
-    (NPC_TABLE.to_vec(), VEHICLE_TABLE.to_vec())
+    let mut npc = NPC_TABLE.to_vec();
+    let mapping = crate::corner_population::stander_dedup_block_indices(
+        &garage_phases()
+            .iter()
+            .map(|phase| matches!(phase, crate::corner_population::Phase::Stand))
+            .collect::<Vec<_>>(),
+    );
+    for (instance, &block) in npc.iter_mut().zip(mapping.iter()) {
+        instance.pose_index = block;
+    }
+    (npc, VEHICLE_TABLE.to_vec())
 }
 
 // ---- the scripted camera ----
@@ -378,10 +395,12 @@ mod tests {
     /// The population's pose contract (the
     /// [`engine_renderer::ProxyPopulation`] validation the
     /// submission performs): every npc's pose index selects a
-    /// supplied block under the garage's own phase column, and
-    /// the pose evaluation is deterministic in the frame counter
-    /// (the same pure machinery the corner crowd uses, over the
-    /// garage's authored table).
+    /// supplied block under the garage's own phase column — the
+    /// STANDER-DEDUP palette (P5 §3.2(e)): the two standers share
+    /// block 0, the four walkers carry 1..4, so the palette is 5
+    /// blocks for 6 npcs — and the pose evaluation is deterministic
+    /// in the frame counter (the same pure machinery the corner
+    /// crowd uses, over the garage's authored table).
     #[test]
     fn the_garage_population_satisfies_the_pose_contract() {
         let (npcs, vehicles) = garage_population();
@@ -389,13 +408,23 @@ mod tests {
         assert_eq!(npcs.len(), phases.len(), "one phase per npc entry");
         let mut poses = Vec::new();
         crate::corner_population::evaluate_population_poses(0, &phases, &mut poses);
-        assert_eq!(poses.len(), npcs.len(), "one block per npc entry");
+        // The dedup palette: [shared rest] ∪ {4 walker blocks}.
+        assert_eq!(
+            poses.len(),
+            5,
+            "the palette: one shared rest + four walkers"
+        );
         for (npc, block_count) in npcs.iter().zip(std::iter::repeat(poses.len())) {
             assert!(
                 (npc.pose_index as usize) < block_count,
                 "pose index {} selects a supplied block",
                 npc.pose_index
             );
+        }
+        // The dedup mapping's own pin: standers at 0, walker j at 1+j.
+        let expected = [0_u32, 0, 1, 2, 3, 4];
+        for (npc, &block) in npcs.iter().zip(expected.iter()) {
+            assert_eq!(npc.pose_index, block, "the garage table's dedup mapping");
         }
         // Determinism: frame k always produces byte-identical
         // blocks (the FNV-stable machinery the corner pins).
@@ -404,12 +433,12 @@ mod tests {
         crate::corner_population::evaluate_population_poses(37, &phases, &mut a);
         crate::corner_population::evaluate_population_poses(37, &phases, &mut b);
         assert_eq!(a, b, "frame 37's blocks are byte-identical");
-        // The frame advances the walkers' poses (the standers'
-        // rest blocks are frame-invariant).
+        // The frame advances the walkers' poses (the shared rest
+        // block is frame-invariant).
         let mut later = Vec::new();
         crate::corner_population::evaluate_population_poses(38, &phases, &mut later);
-        assert_ne!(a[2], later[2], "walker 2's pose advances with the clock");
-        assert_eq!(a[0], later[0], "stander 0's rest block is frame-invariant");
+        assert_ne!(a[2], later[2], "walker 1's pose advances with the clock");
+        assert_eq!(a[0], later[0], "the shared rest block is frame-invariant");
         // The vehicle kind is populated (the van rides the same
         // submission).
         assert_eq!(vehicles.len(), 1, "the parked van");

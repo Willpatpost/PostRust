@@ -209,6 +209,8 @@ fn submit_population(
     shadows: bool,
 ) -> engine_renderer::FrameResult {
     let population = ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: instances,
         npc_poses: blocks,
         npc_material: 1,
@@ -464,6 +466,8 @@ fn arena_growth_gate_boundary() {
         assert_eq!(renderer.stats().instance_capacity, 200);
         let over = synthetic_population(201);
         let population = ProxyPopulation {
+            instance_generation: 0,
+            pose_generation: 0,
             npc: &over,
             npc_poses: &poses,
             npc_material: 1,

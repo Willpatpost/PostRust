@@ -321,6 +321,8 @@ mod tests {
             vehicle_material: 0,
             rain: &[],
             rain_material: 0,
+            instance_generation: 0,
+            pose_generation: 0,
         };
         let shadows = ShadowFrame {
             bias: ShadowBias {
@@ -572,6 +574,8 @@ mod tests {
             vehicle_material: 0,
             rain: &[],
             rain_material: 0,
+            instance_generation: 0,
+            pose_generation: 0,
         };
         let submission = FrameSubmission {
             camera: FrameCamera {
@@ -630,6 +634,7 @@ mod tests {
     fn derive_plan(policy: SubmissionPolicy, submission: &FrameSubmission<'_>) -> FramePlan {
         let mut instance_bytes = Vec::new();
         let mut pose_bytes = Vec::new();
+        let mut generations = crate::submission::PopulationGenerations::default();
         let inputs = adapt_frame(
             policy,
             submission,
@@ -637,6 +642,7 @@ mod tests {
             &[],
             &mut instance_bytes,
             &mut pose_bytes,
+            &mut generations,
         )
         .expect("the test submissions validate");
         crate::vulkan::frame::InternalFrame::new(inputs).plan

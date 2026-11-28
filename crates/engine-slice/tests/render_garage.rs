@@ -140,6 +140,8 @@ fn the_garage_renders_through_the_public_api_with_its_own_known_answers() {
     let mut poses: Vec<Block> = Vec::new();
     engine_slice::corner_population::evaluate_population_poses(60, &phases, &mut poses);
     let population = ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: &npcs,
         npc_poses: &poses,
         npc_material: GARAGE_NPC_MATERIAL,

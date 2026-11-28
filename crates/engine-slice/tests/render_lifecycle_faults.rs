@@ -143,6 +143,8 @@ fn submit_population(
     size: (u32, u32),
 ) -> engine_renderer::FrameResult {
     let population = ProxyPopulation {
+        instance_generation: 0,
+        pose_generation: 0,
         npc: instances,
         npc_poses: blocks,
         npc_material: 1,
@@ -508,6 +510,8 @@ fn growth_idle_failures_release_the_staged_carve() {
             None,
             corner_bounds(),
             Some(ProxyPopulation {
+                instance_generation: 0,
+                pose_generation: 0,
                 npc: &grown,
                 npc_poses: &grown_poses,
                 npc_material: 1,
@@ -547,6 +551,8 @@ fn growth_idle_failures_release_the_staged_carve() {
             None,
             corner_bounds(),
             Some(ProxyPopulation {
+                instance_generation: 0,
+                pose_generation: 0,
                 npc: &grown,
                 npc_poses: &grown_poses,
                 npc_material: 1,
