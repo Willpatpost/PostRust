@@ -367,3 +367,14 @@ Verification run `46144553154` dispatched.
 **E-S3 verified green:** run `46144553154` at `fcecedd` — all five jobs
 success. The A06 extraction stands at E-S1+E-S2+E-S3 landed; E-S4 (the B15
 minimal-consumer re-measure) dispatched next.
+
+## E-S4 — the A06 migration COMPLETE (`915e09c`)
+
+The re-measure lane (`0ab767d`, FOOTPRINT.md only): the fresh-lock closure
+8 unique / 7 external — engine-animation + the 6-crate bytemuck chain, the
+ratified expectation confirmed exactly; 3.5 s cold, 493 KB release binary;
+the run-proof independently re-verified by the orchestrator (the digest pin
+reproduced standalone in release). The F-03 lever's animation slice realized
+(−46 crates vs the renderer pre-extraction); the types-only half explicitly
+open. **The owner-approved A06 extraction is fully executed: E-S1..E-S4,
+every stage with its equivalence bars and green runs.**
