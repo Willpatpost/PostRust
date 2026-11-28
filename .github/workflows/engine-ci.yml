@@ -744,8 +744,8 @@ jobs:
           # 31/31 at integration; Linux the platform-uniform
           # inference, to be confirmed by the candidate's
           # run).
-          expected=1524
-          if [ "$(uname -s)" != "Linux" ]; then expected=1473; fi
+          expected=1530
+          if [ "$(uname -s)" != "Linux" ]; then expected=1479; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
