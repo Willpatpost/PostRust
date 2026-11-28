@@ -213,6 +213,73 @@ pub(super) fn rollback_or_unknown(
 
 // ------------------------------------------------------------- the reads
 
+/// (T29) Reads a bounded prefix of an object row's bytes — the
+/// UNVERIFIED prefix op (the streaming verify's leading window; hash
+/// verification NOT implied, never a substitute for it). `substr` is
+/// 1-indexed over BLOB bytes and never reads past the row's end.
+pub(super) fn read_object_prefix(
+    conn: &Connection,
+    hash: &Hash,
+    len: usize,
+) -> Result<Vec<u8>, MediumError> {
+    let bytes: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT substr(bytes, 1, ?2) FROM objects WHERE hash = ?1",
+            params![hash.as_bytes(), len as i64],
+            |row| row.get(0),
+        )
+        .map(Some)
+        .or_else(no_rows_as_none)
+        .map_err(|e| sqlite_err("read object", e))?;
+    bytes.ok_or(MediumError::MissingObject { hash: *hash })
+}
+
+/// (T29) The row's total byte length (the streaming windows' bound —
+/// with the length known, no window ever reads past the row's end).
+pub(super) fn object_length(conn: &Connection, hash: &Hash) -> Result<u64, MediumError> {
+    let length: Option<i64> = conn
+        .query_row(
+            "SELECT length(bytes) FROM objects WHERE hash = ?1",
+            params![hash.as_bytes()],
+            |row| row.get(0),
+        )
+        .map(Some)
+        .or_else(no_rows_as_none)
+        .map_err(|e| sqlite_err("read object", e))?;
+    length
+        .map(|len| u64::try_from(len).unwrap_or(0))
+        .ok_or(MediumError::MissingObject { hash: *hash })
+}
+
+/// (T29) Reads the streaming continuation window at `offset`
+/// (0-based) into `buf` — the substr window (the pinned rusqlite's
+/// incremental blob I/O is feature-gated off; this is the design's
+/// sanctioned `substr` substrate — pure SQL, no new dependency, every
+/// window inside the caller's coordination scope exactly as the
+/// whole-row read always was).
+pub(super) fn read_object_window(
+    conn: &Connection,
+    hash: &Hash,
+    offset: u64,
+    buf: &mut [u8],
+) -> Result<usize, MediumError> {
+    let window: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT substr(bytes, ?2, ?3) FROM objects WHERE hash = ?1",
+            params![hash.as_bytes(), offset as i64 + 1, buf.len() as i64],
+            |row| row.get(0),
+        )
+        .map(Some)
+        .or_else(no_rows_as_none)
+        .map_err(|e| sqlite_err("read object", e))?;
+    let Some(window) = window else {
+        return Err(MediumError::MissingObject { hash: *hash });
+    };
+    let read = window.len().min(buf.len());
+    buf[..read].copy_from_slice(&window[..read]);
+    Ok(read)
+}
+
 /// Reads and verifies the `meta.head` row: the empty blob is the
 /// Loads a record row's canonical bytes, hash-verified.
 pub(super) fn load_record_verified(conn: &Connection, id: &Hash) -> Result<Vec<u8>, MediumError> {

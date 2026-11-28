@@ -214,6 +214,7 @@ fn composite_fixture(seed: u8) -> (StoredObject, Vec<StoredObject>) {
 
 /// One provider-neutral store mutation. The executors differ only in
 /// the physical seam; the bytes (hence every identity) are identical.
+#[derive(Clone)]
 enum Step {
     /// A content object at its own identity.
     Object(StoredObject),
@@ -246,6 +247,11 @@ enum Step {
     /// Replaces an object's stored bytes with hash-mismatching
     /// garbage (referenced corruption on load).
     CorruptObject(Hash),
+    /// (T29) Stores ARBITRARY bytes at a CHOSEN identity — the
+    /// streaming-discriminating corpus (a mid-object byte flip kept
+    /// under the original hash; truncations at the stream-window
+    /// boundaries under the original hash; hand-framed envelopes).
+    CorruptObjectAt(Hash, Vec<u8>),
     /// Replaces a record's stored bytes with hash-mismatching garbage
     /// (referenced corruption on load).
     CorruptRecord(Hash),
@@ -436,6 +442,9 @@ fn run_local_steps(medium: &LocalFileMedium, root: &Path, steps: &[Step]) {
             Step::CorruptObject(hash) | Step::CorruptRecord(hash) => {
                 fs::write(medium.object_path_pub(hash), b"wdiff-corrupt-garbage-bytes").unwrap();
             }
+            Step::CorruptObjectAt(hash, bytes) => {
+                fs::write(medium.object_path_pub(hash), bytes).unwrap();
+            }
         }
     }
 }
@@ -534,6 +543,13 @@ fn run_sqlite_steps(medium: &SqliteMedium, steps: &[Step]) {
                 conn.execute(
                     "UPDATE objects SET bytes = ?1 WHERE hash = ?2",
                     params![b"wdiff-corrupt-garbage-bytes".to_vec(), hash.as_bytes()],
+                )
+                .unwrap();
+            }
+            Step::CorruptObjectAt(hash, bytes) => {
+                conn.execute(
+                    "UPDATE objects SET bytes = ?1 WHERE hash = ?2",
+                    params![bytes.to_vec(), hash.as_bytes()],
                 )
                 .unwrap();
             }
@@ -1985,7 +2001,8 @@ fn suffix_composite_closure_corner_is_the_documented_divergence() {
 /// through the reader seam the walks already consume).
 #[derive(Debug, Default, Clone, Copy)]
 struct ReaderInstrumentation {
-    /// Whole content-object reads (the `read_object_bytes` calls).
+    /// Whole content-object reads (the `read_object_bytes` calls —
+    /// the legitimate whole holds only, after the streaming rewire).
     whole_object_reads: u64,
     /// Whole content-object BYTES returned (the volume row).
     whole_object_bytes: u64,
@@ -1993,6 +2010,16 @@ struct ReaderInstrumentation {
     record_reads: u64,
     /// The parent-present probes.
     presence_probes: u64,
+    /// (T29, commit 2) The unverified prefix reads (the streaming
+    /// verify's leading windows).
+    prefix_read_calls: u64,
+    /// (T29, commit 2) The streaming verified reads (the
+    /// `verify_object_streaming` calls — every content reference's
+    /// verification once the streaming rewire lands).
+    stream_verified_calls: u64,
+    /// (T29, commit 2) The total BYTES the streaming verifies folded
+    /// (the streamed volume row — the bytes READ, never held).
+    stream_verified_bytes: u64,
 }
 
 /// (T29) The local store's reader mirror — the layout's own
@@ -2057,6 +2084,92 @@ impl ChainReads for LocalStoreReader<'_> {
     fn record_present(&mut self, id: &Hash) -> Result<bool, MediumError> {
         self.instrumentation.presence_probes += 1;
         Ok(self.object_path(id).is_file())
+    }
+
+    // (T29, commit 2) The mirror of the local adapter's streaming
+    // pair: the unverified prefix read and the streaming verified
+    // read (the leading window + the positioned continuation through
+    // the core driver — the adapter's own shape).
+    fn read_object_prefix(&mut self, hash: &Hash, len: usize) -> Result<Vec<u8>, MediumError> {
+        self.instrumentation.prefix_read_calls += 1;
+        let path = self.object_path(hash);
+        let metadata = fs::metadata(&path).map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => MediumError::MissingObject { hash: *hash },
+            _ => MediumError::Io {
+                op: "stat object",
+                path: path.display().to_string(),
+                source: e,
+            },
+        })?;
+        if metadata.len() > MAX_OBJECT_BYTES {
+            return Err(MediumError::Format(engine_core::SaveError::Limit {
+                section: "object-store",
+                kind: "byte-length",
+                value: metadata.len(),
+                max: MAX_OBJECT_BYTES,
+            }));
+        }
+        let mut file = fs::File::open(&path).map_err(|e| MediumError::Io {
+            op: "read object",
+            path: path.display().to_string(),
+            source: e,
+        })?;
+        let want = len.min(usize::try_from(metadata.len()).unwrap_or(len));
+        let mut buffer = vec![0u8; want];
+        let mut read = 0usize;
+        while read < buffer.len() {
+            let n =
+                io::Read::read(&mut file, &mut buffer[read..]).map_err(|e| MediumError::Io {
+                    op: "read object",
+                    path: path.display().to_string(),
+                    source: e,
+                })?;
+            if n == 0 {
+                buffer.truncate(read);
+                break;
+            }
+            read += n;
+        }
+        Ok(buffer)
+    }
+
+    fn verify_object_streaming(
+        &mut self,
+        hash: &Hash,
+    ) -> Result<crate::chain_walk::VerifiedPrefix, MediumError> {
+        self.instrumentation.stream_verified_calls += 1;
+        let leading = self.read_object_prefix(hash, crate::chain_walk::STREAM_CHUNK_BYTES)?;
+        let path = self.object_path(hash);
+        let mut file = fs::File::open(&path).map_err(|e| MediumError::Io {
+            op: "read object",
+            path: path.display().to_string(),
+            source: e,
+        })?;
+        io::Seek::seek(&mut file, io::SeekFrom::Start(leading.len() as u64)).map_err(|e| {
+            MediumError::Io {
+                op: "seek object",
+                path: path.display().to_string(),
+                source: e,
+            }
+        })?;
+        let result = crate::chain_walk::verify_streamed_object(hash, leading, |buf| {
+            let mut read = 0usize;
+            while read < buf.len() {
+                let n =
+                    io::Read::read(&mut file, &mut buf[read..]).map_err(|e| MediumError::Io {
+                        op: "read object",
+                        path: path.display().to_string(),
+                        source: e,
+                    })?;
+                if n == 0 {
+                    break;
+                }
+                read += n;
+            }
+            Ok(read)
+        })?;
+        self.instrumentation.stream_verified_bytes += result.total_len;
+        Ok(result)
     }
 }
 
@@ -2133,18 +2246,96 @@ impl ChainReads for SqliteStoreReader<'_> {
             }),
         }
     }
+
+    // (T29, commit 2) The mirror of the sqlite adapter's streaming
+    // pair: the substr prefix read and the length-bounded window
+    // continuation through the core driver (the adapter's own shape —
+    // the pinned rusqlite's incremental blob I/O is feature-gated
+    // off; the substr substrate is the design's sanctioned fallback).
+    fn read_object_prefix(&mut self, hash: &Hash, len: usize) -> Result<Vec<u8>, MediumError> {
+        self.instrumentation.prefix_read_calls += 1;
+        let bytes: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT substr(bytes, 1, ?2) FROM objects WHERE hash = ?1",
+                params![hash.as_bytes(), len as i64],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(MediumError::Sqlite {
+                    op: "read object",
+                    detail: other.to_string(),
+                }),
+            })?;
+        bytes.ok_or(MediumError::MissingObject { hash: *hash })
+    }
+
+    fn verify_object_streaming(
+        &mut self,
+        hash: &Hash,
+    ) -> Result<crate::chain_walk::VerifiedPrefix, MediumError> {
+        self.instrumentation.stream_verified_calls += 1;
+        let leading = self.read_object_prefix(hash, crate::chain_walk::STREAM_CHUNK_BYTES)?;
+        let total: u64 = self
+            .conn
+            .query_row(
+                "SELECT length(bytes) FROM objects WHERE hash = ?1",
+                params![hash.as_bytes()],
+                |row| {
+                    let len: i64 = row.get(0)?;
+                    Ok(u64::try_from(len).unwrap_or(0))
+                },
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => MediumError::MissingObject { hash: *hash },
+                other => MediumError::Sqlite {
+                    op: "read object",
+                    detail: other.to_string(),
+                },
+            })?;
+        let mut offset = leading.len() as u64;
+        let conn = self.conn;
+        let result = crate::chain_walk::verify_streamed_object(hash, leading, |buf| {
+            if offset >= total {
+                return Ok(0);
+            }
+            let window: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT substr(bytes, ?2, ?3) FROM objects WHERE hash = ?1",
+                    params![hash.as_bytes(), offset as i64 + 1, buf.len() as i64],
+                    |row| row.get(0),
+                )
+                .map_err(|e| MediumError::Sqlite {
+                    op: "read object",
+                    detail: e.to_string(),
+                })?;
+            let Some(window) = window else {
+                return Ok(0);
+            };
+            let read = window.len().min(buf.len());
+            buf[..read].copy_from_slice(&window[..read]);
+            offset += read as u64;
+            Ok(read)
+        })?;
+        self.instrumentation.stream_verified_bytes += result.total_len;
+        Ok(result)
+    }
 }
 
 /// Runs the production cold walk over the local store's mirror
 /// reader and computes the census — with the mirror-vs-production
 /// summary equality asserted (the rows ride only if the mirror
 /// observes exactly what the provider's own walk observes).
+/// `largest_whole_read_object_bytes` is the caller-measured largest
+/// object the streaming walk holds WHOLE (roots/metadata only).
 fn census_over_local(
     label: &str,
     case: &Case,
     local: &LocalFileMedium,
     head: Hash,
-    largest_object_bytes: u64,
+    largest_whole_read_object_bytes: u64,
     dependency_edges: u64,
 ) -> chain_walk::walk_census::WalkCensus {
     let local_root = case.local_root();
@@ -2161,11 +2352,15 @@ fn census_over_local(
         "the {label} mirror walk must observe the production walk's summary"
     );
     let instrumentation = reader.instrumentation;
-    let census = chain_walk::walk_census::census(&walked, largest_object_bytes, dependency_edges);
+    let census =
+        chain_walk::walk_census::census(&walked, largest_whole_read_object_bytes, dependency_edges);
     println!(
-        "t29 census ({label}, local): {} whole object reads ({} B), {} record reads — {census:?}",
+        "t29 census ({label}, local): {} whole reads ({} B), {} streaming verifies \
+         ({} B), {} record reads — {census:?}",
         instrumentation.whole_object_reads,
         instrumentation.whole_object_bytes,
+        instrumentation.stream_verified_calls,
+        instrumentation.stream_verified_bytes,
         instrumentation.record_reads
     );
     census
@@ -2176,7 +2371,7 @@ fn census_over_sqlite(
     label: &str,
     sqlite: &SqliteMedium,
     head: Hash,
-    largest_object_bytes: u64,
+    largest_whole_read_object_bytes: u64,
     dependency_edges: u64,
 ) -> chain_walk::walk_census::WalkCensus {
     let mut reader = SqliteStoreReader {
@@ -2194,11 +2389,15 @@ fn census_over_sqlite(
         "the {label} mirror walk must observe the production walk's summary"
     );
     let instrumentation = reader.instrumentation;
-    let census = chain_walk::walk_census::census(&walked, largest_object_bytes, dependency_edges);
+    let census =
+        chain_walk::walk_census::census(&walked, largest_whole_read_object_bytes, dependency_edges);
     println!(
-        "t29 census ({label}, sqlite): {} whole object reads ({} B), {} record reads — {census:?}",
+        "t29 census ({label}, sqlite): {} whole reads ({} B), {} streaming verifies \
+         ({} B), {} record reads — {census:?}",
         instrumentation.whole_object_reads,
         instrumentation.whole_object_bytes,
+        instrumentation.stream_verified_calls,
+        instrumentation.stream_verified_bytes,
         instrumentation.record_reads
     );
     census
@@ -2338,7 +2537,10 @@ fn census_reclaim_chain(m: u64) -> (Chain, u64) {
 #[test]
 fn walker_residency_census_rows_at_the_r07_ladder() {
     let case = Case::new("t29-ladder");
-    let plain_largest = plain_object(b"t29-census-a").bytes().len() as u64;
+    // (T29, commit 2) The plain ladder holds NOTHING whole under the
+    // streaming mechanics — its objects are plain content references
+    // (no roots, no metadata): the largest whole-read input is zero.
+    let plain_largest_whole_read = 0u64;
     let mut plain_rows: Vec<(u64, u64, u64)> = Vec::new();
     for n in [512u64, 2048, 8192] {
         // Every scale builds from a wiped case root (the census
@@ -2369,9 +2571,21 @@ fn walker_residency_census_rows_at_the_r07_ladder() {
             .filter(|i| i % 2 == 1)
             .map(|i| 72 + format!("t29-pk{i}").len() as u64)
             .sum();
-        let local_census =
-            census_over_local("plain", &case, &local, chain.head, plain_largest, edges);
-        let sqlite_census = census_over_sqlite("plain", &sqlite, chain.head, plain_largest, edges);
+        let local_census = census_over_local(
+            "plain",
+            &case,
+            &local,
+            chain.head,
+            plain_largest_whole_read,
+            edges,
+        );
+        let sqlite_census = census_over_sqlite(
+            "plain",
+            &sqlite,
+            chain.head,
+            plain_largest_whole_read,
+            edges,
+        );
         for (label, census) in [("local", local_census), ("sqlite", sqlite_census)] {
             assert_eq!(census.records, n, "the {label} population at {n}");
             assert_eq!(census.content_objects, 2, "the {label} population at {n}");
@@ -2396,15 +2610,23 @@ fn walker_residency_census_rows_at_the_r07_ladder() {
                 census.seen_keys_bytes, expected_key_bytes,
                 "the {label} seen-keys row at {n}"
             );
+            // (T29, commit 2 — the movement's cause: the borrow fix)
+            // THE CHURN ROW PINS ZERO: the whole-read form's three
+            // cursor-set deep clones per divergent-head validation
+            // are deleted (the commit-1 rows were 80·N + the key
+            // bytes, linear in N: 61,641 / 247,253 / 990,677 B).
             assert_eq!(
-                census.validation_churn_bytes,
-                80 * n + expected_key_bytes,
-                "the {label} churn row at {n} (the three clones)"
+                census.validation_churn_bytes, 0,
+                "the {label} churn row at {n} (the clones deleted)"
             );
+            // (T29, commit 2 — the movement's cause: the streaming
+            // rewire) The object-peak row: ONE reused ~64 KiB stream
+            // window, no whole holds on the plain shape (the
+            // commit-1 row was 2·o_max).
             assert_eq!(
                 census.object_buffer_peak_bytes,
-                2 * plain_largest,
-                "the {label} object-peak row at {n}"
+                64 * 1024,
+                "the {label} object-peak row at {n} (the streaming window)"
             );
         }
         plain_rows.push((
@@ -2442,10 +2664,6 @@ fn walker_residency_census_rows_at_the_r07_ladder() {
         let (chain, reclaim_largest) = census_reclaim_chain(m);
         let (local, sqlite) = opened_pair(&case, &chain.steps);
         let keyed = (1..=m).filter(|i| i % 2 == 1).count() as u64;
-        let expected_key_bytes: u64 = (1..=m)
-            .filter(|i| i % 2 == 1)
-            .map(|i| 72 + format!("t29-rk{i}").len() as u64)
-            .sum();
         let local_census =
             census_over_local("reclaim", &case, &local, chain.head, reclaim_largest, 0);
         let sqlite_census = census_over_sqlite("reclaim", &sqlite, chain.head, reclaim_largest, 0);
@@ -2461,10 +2679,22 @@ fn walker_residency_census_rows_at_the_r07_ladder() {
                 88 * m,
                 "the reclaimed-index row at {m}"
             );
+            // (T29, commit 2 — the movement's cause: the borrow fix)
+            // THE CHURN ROW PINS ZERO on the reclaim shape too (the
+            // commit-1 rows carried the cloned reclaimed index:
+            // 65,897 / 263,797 / 1,056,373 B, linear in R).
             assert_eq!(
-                census.validation_churn_bytes,
-                160 + expected_key_bytes + 88 * m,
-                "the churn row carries the cloned reclaimed index at {m}"
+                census.validation_churn_bytes, 0,
+                "the reclaim churn row at {m} (the clones deleted)"
+            );
+            // (T29, commit 2 — the movement's cause: the streaming
+            // rewire) The object-peak row: the stream window PLUS the
+            // one legitimate whole hold (the checkpoint metadata
+            // object — the reclaim walk's only root-class read).
+            assert_eq!(
+                census.object_buffer_peak_bytes,
+                64 * 1024 + reclaim_largest,
+                "the reclaim object-peak row at {m}"
             );
         }
         reclaim_rows.push((m, local_census.cursor_resident_bytes));
@@ -2478,19 +2708,21 @@ fn walker_residency_census_rows_at_the_r07_ladder() {
     }
 }
 
-/// (T29, commit 1) THE OBJECT-PEAK ROW at the large-object shape —
-/// the design §2.2's dominant term MEASURED: with L5's derived frame
-/// maximum (~5.25 MiB) as the stand-in for a large session-snapshot
-/// content object, a record referencing TWO such objects holds the
-/// first whole across the second's whole read (peak ≈ 2·o_max) and
-/// every reference re-reads whole (the repeat-read volume row — the
-/// §4.3 memo's gate input). The whole-read volume and call rows are
-/// DIRECTLY measured through the instrumented readers over both
-/// providers' stores; the census's object-buffer peak row documents
-/// the current whole-read mechanics' 2·o_max. COMMIT 2'S MEASURED
-/// OBLIGATION: after the streaming rewire, the whole-read rows must
-/// show ZERO plain-object loads at this shape and the peak row the
-/// stream-chunk terms.
+/// (T29) THE OBJECT-PEAK ROW at the large-object shape — the design
+/// §2.2's dominant term, measured BEFORE and AFTER the streaming
+/// rewire: with L5's derived frame maximum (~5.25 MiB) as the
+/// stand-in for a large session-snapshot content object, a record
+/// referencing TWO such objects held the first whole across the
+/// second's whole read under the whole-read mechanics (the commit-1
+/// rows: whole-read volume 16,515,116 B, object-buffer peak
+/// 11,010,048 B = 2·o_max against a cursor-resident of 720 B — the
+/// transient exceeding the resident it builds). THE COMMIT-2
+/// MEASURED OBLIGATION, pinned here: ZERO plain-object whole loads
+/// at this shape (the whole-read rows empty; every content reference
+/// STREAMS — the streamed-volume row carrying the same bytes read,
+/// never held), and the object-buffer peak row showing the
+/// ~64 KiB stream window + root terms (no root at this shape: the
+/// plain window alone).
 #[test]
 fn walker_census_object_peak_at_the_large_object_shape() {
     let case = Case::new("t29-peak");
@@ -2527,7 +2759,7 @@ fn walker_census_object_peak_at_the_large_object_shape() {
     let observation = compare_cold("l5-max", &local, &sqlite, r2.id(), &no_exclusion());
     let summary = observation.summary.as_deref().unwrap();
     assert!(summary.contains("records: 3") && summary.contains("content_objects: 3"));
-    // The measured whole-read rows, both providers.
+    // The measured read rows, both providers.
     let local_root = case.local_root();
     let mut local_reader = LocalStoreReader {
         root: &local_root,
@@ -2547,33 +2779,57 @@ fn walker_census_object_peak_at_the_large_object_shape() {
         format!("{:?}", sqlite_walked.summary),
         "the two providers' mirror walks agree at the large-object shape"
     );
-    // EVERY content reference loads whole, twice over for the shared
-    // big object: founding's small + r1's two + r2's repeat of A.
+    // THE MEASURED OBLIGATION: every content reference STREAMS — ZERO
+    // plain-object whole loads (the commit-1 whole-read rows were 4
+    // calls / 16,515,116 B; the whole-read form now serves ONLY the
+    // root-class domains, absent at this shape), the streamed volume
+    // carrying the same four reference verifications (founding's
+    // small + r1's two + r2's repeat of A — the repeat-read row's
+    // I/O cost, its byte residency gone).
+    let small_len = plain_object(b"t29-peak-small").bytes().len() as u64;
     for (provider, instrumentation) in [
         ("local", local_instrumentation),
         ("sqlite", sqlite_reader.instrumentation),
     ] {
         assert_eq!(
-            instrumentation.whole_object_reads, 4,
-            "the {provider} whole-read calls at the large-object shape"
+            instrumentation.whole_object_reads, 0,
+            "the {provider} whole-read calls at the large-object shape (streaming)"
+        );
+        assert_eq!(
+            instrumentation.whole_object_bytes, 0,
+            "the {provider} whole-read volume at the large-object shape (streaming)"
+        );
+        assert_eq!(
+            instrumentation.stream_verified_calls, 4,
+            "the {provider} streaming verifications at the large-object shape"
         );
         assert!(
-            instrumentation.whole_object_bytes >= 3 * o_max,
-            "the {provider} whole-read volume {} B must carry the three large loads \
-             (the repeat-read row: 2·o_max concurrent + the shared repeat)",
-            instrumentation.whole_object_bytes
+            instrumentation.stream_verified_bytes >= 3 * o_max + small_len,
+            "the {provider} streamed volume {} B carries the same reference bytes, \
+             read never held",
+            instrumentation.stream_verified_bytes
         );
     }
-    // The census's peak row: 2·o_max under the whole-read mechanics.
-    let census = chain_walk::walk_census::census(&walked, o_max, 0);
-    assert_eq!(census.object_buffer_peak_bytes, 2 * o_max);
+    // The census's peak row: the ~64 KiB stream window, no whole hold
+    // at this shape (the commit-1 row was 11,010,048 B = 2·o_max).
+    let census = chain_walk::walk_census::census(&walked, 0, 0);
+    assert_eq!(census.object_buffer_peak_bytes, 64 * 1024);
+    assert!(
+        census.walk_transient_peak_bytes < 200 * 1024,
+        "the walk-transient peak {} B must be the stream terms, not the object \
+         bytes (the commit-1 row was {} B)",
+        census.walk_transient_peak_bytes,
+        2 * o_max + census.walked_bytes + census.positions_bytes
+    );
     println!(
-        "t29 census row: the large-object shape (o_max {o_max} B) — whole-read volume \
-         {} B local / {} B sqlite, object-buffer peak {} B (2·o_max), walk-transient \
-         peak {} B vs cursor-resident {} B",
-        local_instrumentation.whole_object_bytes,
-        sqlite_reader.instrumentation.whole_object_bytes,
+        "t29 census row: the large-object shape AFTER the streaming rewire (o_max \
+         {o_max} B) — whole-read volume 0 B, streamed volume {} B local / {} B \
+         sqlite, object-buffer peak {} B (the stream window; was 2·o_max = {} B), \
+         walk-transient peak {} B vs cursor-resident {} B",
+        local_instrumentation.stream_verified_bytes,
+        sqlite_reader.instrumentation.stream_verified_bytes,
         census.object_buffer_peak_bytes,
+        2 * o_max,
         census.walk_transient_peak_bytes,
         census.cursor_resident_bytes
     );
@@ -3324,9 +3580,9 @@ fn conflict_ordering_pins_the_cores_check_sequence() {
             late.id(),
             chain.head,
             trusted.cursor.epoch,
-            trusted.cursor.seen_keys,
-            trusted.cursor.record_ids,
-            trusted.cursor.reclaimed,
+            &trusted.cursor.seen_keys,
+            &trusted.cursor.record_ids,
+            &trusted.cursor.reclaimed,
         );
         let error = format!("{:?}", suffix.err().unwrap());
         assert!(
@@ -3348,9 +3604,9 @@ fn conflict_ordering_pins_the_cores_check_sequence() {
             late.id(),
             chain.head,
             trusted.cursor.epoch,
-            trusted.cursor.seen_keys,
-            trusted.cursor.record_ids,
-            trusted.cursor.reclaimed,
+            &trusted.cursor.seen_keys,
+            &trusted.cursor.record_ids,
+            &trusted.cursor.reclaimed,
         );
         let error = format!("{:?}", suffix.err().unwrap());
         assert!(
@@ -3594,5 +3850,766 @@ fn provider_read_failures_refuse_typed_fail_closed() {
             "the seam-independent classification compares byte-identically"
         );
         cold_refusal(&local_observation, "MissingObject");
+    }
+}
+
+// ============================================= (T29, commit 2) the equivalence
+//
+// THE L5 BAR (the `79b2fde` journal streaming differential's own
+// discipline): the production streaming walks asserted EQUAL to the
+// whole-read reference (`chain_walk::whole_read_reference`, the
+// pre-streaming forms preserved verbatim under cfg(test)) over the
+// full corpus — states by equality (the summary AND the cursor), the
+// errors by their complete Debug AND Display surfaces — with the
+// corpus gaining the streaming-discriminating shapes: a corrupt byte
+// in the MIDDLE of a large object (beyond the leading window), a
+// corrupt byte in the domain length prefix, an envelope whose
+// declared payload length disagrees with its stored size, and
+// truncations at the stream-window boundaries. Plus the sqlite
+// substrate's own preflight: the substr windows concatenate to
+// exactly the whole row (the pinned rusqlite's incremental blob I/O
+// is feature-gated off — the design's sanctioned fallback, verified
+// here at landing).
+
+/// One cold equivalence case: the store steps and the head to walk.
+struct EquivalenceCase {
+    label: &'static str,
+    steps: Vec<Step>,
+    head: Hash,
+}
+
+/// Runs the production streaming walk AND the whole-read reference
+/// walk over the SAME mirror reader, asserting full equality — the
+/// summary and the cursor on success, the complete error surfaces on
+/// refusal.
+fn assert_streaming_equals_reference<R: ChainReads>(
+    label: &str,
+    provider: &str,
+    open_reader: impl Fn() -> R,
+    head: Hash,
+) {
+    let mut production_reader = open_reader();
+    let production =
+        chain_walk::walk_chain_excluding(&mut production_reader, head, &no_exclusion());
+    let mut reference_reader = open_reader();
+    let reference = chain_walk::whole_read_reference::walk_chain_excluding_reference(
+        &mut reference_reader,
+        head,
+        &no_exclusion(),
+    );
+    match (production, reference) {
+        (Ok(production), Ok(reference)) => {
+            assert_eq!(
+                format!("{:?}", production.summary),
+                format!("{:?}", reference.summary),
+                "the {label} summaries differ ({provider})"
+            );
+            assert_eq!(
+                format!("{:?}", production.cursor),
+                format!("{:?}", reference.cursor),
+                "the {label} cursors differ ({provider})"
+            );
+        }
+        (Err(production), Err(reference)) => {
+            assert_eq!(
+                format!("{production:?}"),
+                format!("{reference:?}"),
+                "the {label} refusal Debug surfaces differ ({provider})"
+            );
+            assert_eq!(
+                format!("{production}"),
+                format!("{reference}"),
+                "the {label} refusal Display surfaces differ ({provider})"
+            );
+        }
+        (production, reference) => panic!(
+            "the {label} acceptance differs ({provider}): streaming accepted={} \
+             reference accepted={}",
+            production.is_ok(),
+            reference.is_ok()
+        ),
+    }
+}
+
+/// The suffix form: the production streaming suffix walk vs the
+/// whole-read reference suffix walk over the same reader, with the
+/// trusted sets a real dispatch would pass (established by the
+/// production cold walk over the base chain).
+fn assert_suffix_streaming_equals_reference<R: ChainReads>(
+    label: &str,
+    provider: &str,
+    open_reader: impl Fn() -> R,
+    base_head: Hash,
+    suffix_head: Hash,
+) {
+    let mut reader = open_reader();
+    let trusted = chain_walk::walk_chain_excluding(&mut reader, base_head, &no_exclusion())
+        .unwrap_or_else(|e| panic!("the {label} base walk must succeed ({provider}): {e:?}"));
+    let production = chain_walk::walk_suffix(
+        &mut reader,
+        suffix_head,
+        base_head,
+        trusted.cursor.epoch,
+        &trusted.cursor.seen_keys,
+        &trusted.cursor.record_ids,
+        &trusted.cursor.reclaimed,
+    );
+    let reference = chain_walk::whole_read_reference::walk_suffix_reference(
+        &mut reader,
+        suffix_head,
+        base_head,
+        trusted.cursor.epoch,
+        trusted.cursor.seen_keys.clone(),
+        trusted.cursor.record_ids.clone(),
+        trusted.cursor.reclaimed.clone(),
+    );
+    let fingerprint =
+        |suffix: &Result<Vec<chain_walk::VerifiedSuffixEntry>, MediumError>| match suffix {
+            Ok(entries) => format!(
+                "{:?}",
+                entries
+                    .iter()
+                    .map(|entry| (
+                        entry.id,
+                        format!("{:?}", entry.record),
+                        &entry.composite_closure
+                    ))
+                    .collect::<Vec<_>>()
+            ),
+            Err(error) => format!("{error:?} | {error}"),
+        };
+    assert_eq!(
+        fingerprint(&production),
+        fingerprint(&reference),
+        "the {label} suffix observations differ ({provider})"
+    );
+}
+
+/// (T29, commit 2) THE EQUIVALENCE PROOF — the streaming paths vs
+/// the whole-read reference over the full corpus, both providers:
+/// the valid families (founding-only, plain, the gapped reclaim
+/// chain, the composite chain), the refusal families the frozen
+/// rules define, and the streaming-discriminating shapes (the
+/// mid-object byte flip under the original identity, the domain
+/// length-prefix flip under the object's own identity, the
+/// declared-length disagreement, the window-boundary truncations).
+/// The suffix form runs the same proof over the dispatch's own
+/// trusted-set flow.
+#[test]
+fn streaming_paths_equal_the_whole_read_reference_over_the_corpus() {
+    let case = Case::new("t29-equivalence");
+    // The sqlite substrate preflight: the substr windows concatenate
+    // to exactly the whole row (the design's sanctioned fallback,
+    // verified at landing — the pinned rusqlite's incremental blob
+    // I/O is feature-gated off).
+    {
+        let (chain, _object) = plain_chain();
+        let (local, sqlite) = opened_pair(&case, &chain.steps);
+        drop(local);
+        let conn = sqlite.walk_differential_conn();
+        let object = plain_object(b"t29-substr-preflight-a-bit-longer");
+        conn.execute(
+            "INSERT OR REPLACE INTO objects (hash, domain, bytes) VALUES (?1, ?2, ?3)",
+            params![object.hash().as_bytes(), object.domain(), object.bytes()],
+        )
+        .unwrap();
+        let whole: Vec<u8> = conn
+            .query_row(
+                "SELECT bytes FROM objects WHERE hash = ?1",
+                params![object.hash().as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut windows: Vec<u8> = Vec::new();
+        let mut offset = 0i64;
+        loop {
+            let window: Vec<u8> = conn
+                .query_row(
+                    "SELECT substr(bytes, ?2, ?3) FROM objects WHERE hash = ?1",
+                    params![object.hash().as_bytes(), offset + 1, 8],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if window.is_empty() {
+                break;
+            }
+            windows.extend_from_slice(&window);
+            offset += window.len() as i64;
+        }
+        assert_eq!(
+            windows, whole,
+            "the substr windows must concatenate to the whole row (the substrate \
+             verification — an empty blob, never NULL, past the end)"
+        );
+    }
+    // The corpus.
+    let mut corpus: Vec<EquivalenceCase> = Vec::new();
+    {
+        // The valid families.
+        let object = plain_object(b"t29-eq-founding");
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "t29-ef", 0)
+            .with_content_refs(vec![object.hash()]);
+        corpus.push(EquivalenceCase {
+            label: "founding-only",
+            steps: vec![
+                Step::Object(object),
+                Step::Record(founding.clone()),
+                Step::Head(founding.id()),
+            ],
+            head: founding.id(),
+        });
+    }
+    {
+        let (chain, _object) = plain_chain();
+        corpus.push(EquivalenceCase {
+            label: "plain",
+            steps: chain.steps,
+            head: chain.head,
+        });
+    }
+    {
+        let chain = census_reclaim_chain(16).0;
+        corpus.push(EquivalenceCase {
+            label: "gapped-reclaim",
+            steps: chain.steps,
+            head: chain.head,
+        });
+    }
+    {
+        let (chain, _expected) = composite_chain(71);
+        corpus.push(EquivalenceCase {
+            label: "composite",
+            steps: chain.steps,
+            head: chain.head,
+        });
+    }
+    {
+        // The refusal families.
+        let (chain, object) = plain_chain();
+        let mut steps = chain.steps.clone();
+        steps.push(Step::CorruptObject(object.hash()));
+        corpus.push(EquivalenceCase {
+            label: "corrupt-object",
+            steps,
+            head: chain.head,
+        });
+    }
+    {
+        // The corrupt SECOND reference (the shared-first shape: the
+        // record's refs are [the shared object, the corrupt second] —
+        // a stale prefix cache serving the first ref's verdict for
+        // the second would accept the corruption, the seeded
+        // regression this shape exists to catch).
+        let (chain, _object) = plain_chain();
+        let second = plain_object(b"wdiff-second");
+        let mut steps = chain.steps.clone();
+        steps.push(Step::CorruptObject(second.hash()));
+        corpus.push(EquivalenceCase {
+            label: "corrupt-second-reference",
+            steps,
+            head: chain.head,
+        });
+    }
+    {
+        // A VALID large object (beyond the streaming window): an
+        // early-exiting stream that stops before the object's end
+        // would falsely refuse it, the seeded regression this shape
+        // exists to catch — both paths must ACCEPT.
+        const L5_MAX_BYTES: usize = 5 * 1024 * 1024 + 256 * 1024;
+        const FRAMING_BYTES: usize = 8 + "sektor7/save/1".len() + 8;
+        let big = plain_object(&vec![0x7e; L5_MAX_BYTES - FRAMING_BYTES]);
+        let small = plain_object(b"t29-eq-valid-big-small");
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "t29-evb", 0)
+            .with_content_refs(vec![small.hash()]);
+        let r1 = RevisionRecord::regular(founding.id(), 0, 1).with_content_refs(vec![big.hash()]);
+        let r2 = RevisionRecord::regular(r1.id(), 1, 2).with_content_refs(vec![big.hash()]);
+        corpus.push(EquivalenceCase {
+            label: "valid-large-object",
+            steps: vec![
+                Step::Object(small),
+                Step::Object(big),
+                Step::Record(founding),
+                Step::Record(r1),
+                Step::Record(r2.clone()),
+                Step::Head(r2.id()),
+            ],
+            head: r2.id(),
+        });
+    }
+    {
+        let (chain, _object) = plain_chain();
+        let mut steps = chain.steps.clone();
+        steps.push(Step::CorruptRecord(chain.ids[3]));
+        corpus.push(EquivalenceCase {
+            label: "corrupt-record",
+            steps,
+            head: chain.head,
+        });
+    }
+    {
+        let (chain, object) = plain_chain();
+        let mut steps = chain.steps.clone();
+        steps.push(Step::RemoveObject(object.hash()));
+        corpus.push(EquivalenceCase {
+            label: "missing-object",
+            steps,
+            head: chain.head,
+        });
+    }
+    {
+        let (chain, _object) = plain_chain();
+        let mut steps = chain.steps.clone();
+        steps.push(Step::RemoveRecord(chain.ids[2]));
+        corpus.push(EquivalenceCase {
+            label: "uncovered-gap",
+            steps,
+            head: chain.head,
+        });
+    }
+    {
+        let object = plain_object(b"t29-eq-epoch");
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "t29-ee", 0)
+            .with_content_refs(vec![object.hash()]);
+        let regressive =
+            RevisionRecord::regular(founding.id(), 2, 1).with_content_refs(vec![object.hash()]);
+        corpus.push(EquivalenceCase {
+            label: "epoch-regression",
+            steps: vec![
+                Step::Object(object),
+                Step::Record(founding),
+                Step::Record(regressive.clone()),
+                Step::Head(regressive.id()),
+            ],
+            head: regressive.id(),
+        });
+    }
+    {
+        let object = plain_object(b"t29-eq-dup");
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "t29-ed", 0)
+            .with_content_refs(vec![object.hash()]);
+        let first = RevisionRecord::regular(founding.id(), 0, 1)
+            .with_content_refs(vec![object.hash()])
+            .with_idempotency_key(b"t29-eq-key".to_vec());
+        let second = RevisionRecord::regular(first.id(), 1, 2)
+            .with_content_refs(vec![object.hash()])
+            .with_idempotency_key(b"t29-eq-key".to_vec());
+        corpus.push(EquivalenceCase {
+            label: "duplicate-key",
+            steps: vec![
+                Step::Object(object),
+                Step::Record(founding),
+                Step::RecordIdemSuppressed(first),
+                Step::RecordIdemSuppressed(second.clone()),
+                Step::Head(second.id()),
+            ],
+            head: second.id(),
+        });
+    }
+    {
+        let own = plain_object(b"t29-eq-dep");
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "t29-eq", 0)
+            .with_content_refs(vec![own.hash()]);
+        let record = RevisionRecord::regular(founding.id(), 0, 1)
+            .with_content_refs(vec![own.hash()])
+            .with_depends_on(vec![hash_object(b"t29-eq-nope")]);
+        let top = RevisionRecord::regular(record.id(), 1, 2).with_content_refs(vec![own.hash()]);
+        corpus.push(EquivalenceCase {
+            label: "depends-unresolvable",
+            steps: vec![
+                Step::Object(own),
+                Step::Record(founding),
+                Step::Record(record),
+                Step::Record(top.clone()),
+                Step::Head(top.id()),
+            ],
+            head: top.id(),
+        });
+    }
+    {
+        // The format families.
+        let garbage = [0xff_u8, 0xfe, 0xfd, 0xfc, 0xfb];
+        let garbage_id = hash_object(&garbage);
+        let (chain, _object) = plain_chain();
+        let record = RevisionRecord::regular(chain.head, 5, 9).with_content_refs(vec![garbage_id]);
+        let mut steps = chain.steps.clone();
+        steps.push(Step::RawObject(garbage.to_vec()));
+        steps.push(Step::Record(record.clone()));
+        steps.push(Step::Head(record.id()));
+        corpus.push(EquivalenceCase {
+            label: "format-domain",
+            steps,
+            head: record.id(),
+        });
+    }
+    {
+        let garbage = b"t29-eq-not-a-record";
+        let bogus = hash_object(garbage);
+        corpus.push(EquivalenceCase {
+            label: "format-record",
+            steps: vec![Step::RawRecord(garbage.to_vec()), Step::Head(bogus)],
+            head: bogus,
+        });
+    }
+    {
+        // THE STREAMING-DISCRIMINATING SHAPES. (a) A corrupt byte in
+        // the MIDDLE of a large object (beyond the leading window),
+        // stored under the ORIGINAL identity: the hash must catch it
+        // exactly as the whole read does (an early-exit stream that
+        // stops at the prefix would ACCEPT it — the seeded
+        // regression this shape exists to catch).
+        const L5_MAX_BYTES: usize = 5 * 1024 * 1024 + 256 * 1024;
+        const FRAMING_BYTES: usize = 8 + "sektor7/save/1".len() + 8;
+        let big = plain_object(&vec![0xc3; L5_MAX_BYTES - FRAMING_BYTES]);
+        let original_id = big.hash();
+        let mut flipped = big.bytes().to_vec();
+        let mid = flipped.len() / 2 + 12_345;
+        flipped[mid] ^= 0xff;
+        let small = plain_object(b"t29-eq-small");
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "t29-em", 0)
+            .with_content_refs(vec![small.hash()]);
+        let r1 = RevisionRecord::regular(founding.id(), 0, 1).with_content_refs(vec![original_id]);
+        corpus.push(EquivalenceCase {
+            label: "mid-object-byte-flip",
+            steps: vec![
+                Step::Object(small),
+                Step::Object(big),
+                Step::Record(founding),
+                Step::Record(r1.clone()),
+                Step::Head(r1.id()),
+                Step::CorruptObjectAt(original_id, flipped),
+            ],
+            head: r1.id(),
+        });
+        // (b) A corrupt byte in the domain LENGTH prefix, stored at
+        // the flipped bytes' OWN identity: the bounded domain read
+        // refuses identically (a prefix-cache serving stale bytes
+        // across references would diverge here — the second seeded
+        // regression's shape). Stored RAW (the flipped length prefix
+        // no longer frames as a `StoredObject`; the store is
+        // domain-agnostic and the identity is the bytes' own).
+        let mut prefix_flipped = plain_object(b"t29-eq-prefix").bytes().to_vec();
+        prefix_flipped[3] ^= 0xff;
+        let flipped_id = hash_object(&prefix_flipped);
+        let pf = plain_object(b"t29-eq-pf");
+        let founding_p = RevisionRecord::founding(AuthorityMode::Standalone, "t29-ep", 0)
+            .with_content_refs(vec![pf.hash()]);
+        let r_p =
+            RevisionRecord::regular(founding_p.id(), 0, 1).with_content_refs(vec![flipped_id]);
+        corpus.push(EquivalenceCase {
+            label: "domain-prefix-byte-flip",
+            steps: vec![
+                Step::Object(pf),
+                Step::RawObject(prefix_flipped),
+                Step::Record(founding_p),
+                Step::Record(r_p.clone()),
+                Step::Head(r_p.id()),
+            ],
+            head: r_p.id(),
+        });
+        // (c) Truncations at the stream-window boundaries, stored
+        // under the ORIGINAL identity (the hash catches each exactly
+        // as the whole read does — a short-read-as-EOF misreading
+        // would diverge here; the third seeded regression's shape).
+        for (label, cut) in [
+            (
+                "window-boundary-truncation",
+                crate::chain_walk::STREAM_CHUNK_BYTES,
+            ),
+            (
+                "window-boundary-truncation-plus-one",
+                crate::chain_walk::STREAM_CHUNK_BYTES + 1,
+            ),
+            (
+                "two-window-truncation",
+                2 * crate::chain_walk::STREAM_CHUNK_BYTES,
+            ),
+        ] {
+            let big_t = plain_object(&vec![0x3c; L5_MAX_BYTES - FRAMING_BYTES]);
+            let original = big_t.hash();
+            let truncated = big_t.bytes()[..cut.min(big_t.bytes().len())].to_vec();
+            let small_t = plain_object(b"t29-eq-trunc-small");
+            let founding_t = RevisionRecord::founding(AuthorityMode::Standalone, "t29-et", 0)
+                .with_content_refs(vec![small_t.hash()]);
+            let r_t =
+                RevisionRecord::regular(founding_t.id(), 0, 1).with_content_refs(vec![original]);
+            corpus.push(EquivalenceCase {
+                label,
+                steps: vec![
+                    Step::Object(small_t),
+                    Step::Object(big_t),
+                    Step::Record(founding_t),
+                    Step::Record(r_t.clone()),
+                    Step::Head(r_t.id()),
+                    Step::CorruptObjectAt(original, truncated),
+                ],
+                head: r_t.id(),
+            });
+        }
+    }
+    {
+        // (d) The declared-length disagreement: a hand-framed chunk
+        // envelope whose payload length prefix declares 1 MiB over an
+        // 18-byte payload — the whole form refuses at the payload
+        // read's truncation, the streaming form at the accounting;
+        // the ONE rule string both map to.
+        let mut envelope = Vec::new();
+        let mut enc = Encoder::new();
+        enc.write_str(composite_manifest::SESSION_CHUNK_DOMAIN);
+        enc.write_str(TAG_HEADER);
+        envelope.extend_from_slice(&enc.into_bytes());
+        envelope.extend_from_slice(&(1u64 << 20).to_le_bytes());
+        envelope.extend_from_slice(b"t29-short-payload");
+        let mismatched = StoredObject::new(envelope).unwrap();
+        let (reference_root, reference_chunks) = composite_fixture(81);
+        let reference = composite_manifest::decode(reference_root.bytes()).unwrap();
+        let mut entries = Vec::new();
+        for entry in &reference.entries {
+            if entry.tag == TAG_HEADER {
+                entries.push(ManifestEntry {
+                    tag: TAG_HEADER,
+                    identity: mismatched.hash(),
+                    payload_length: 1 << 20,
+                    kind: SectionKind::Singleton,
+                });
+            } else {
+                entries.push(entry.clone());
+            }
+        }
+        let manifest = CompositeManifest {
+            history_kind: HistoryKind::Full,
+            ledger_boundary: 4,
+            composed_length: entries.iter().map(|entry| entry.payload_length).sum(),
+            entries,
+        };
+        let root = StoredObject::new(composite_manifest::encode(&manifest)).unwrap();
+        let plain = plain_object(b"t29-eq-dl");
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "t29-eq-dl", 0)
+            .with_content_refs(vec![plain.hash()]);
+        let r1 = RevisionRecord::regular(founding.id(), 0, 1).with_content_refs(vec![plain.hash()]);
+        let snap = RevisionRecord::regular(r1.id(), 1, 2).with_content_refs(vec![root.hash()]);
+        let mut steps = vec![
+            Step::Object(plain),
+            Step::Object(mismatched),
+            Step::Object(root),
+            Step::Record(founding),
+            Step::Record(r1),
+        ];
+        for chunk in &reference_chunks {
+            steps.push(Step::Object(chunk.clone()));
+        }
+        steps.push(Step::Record(snap.clone()));
+        steps.push(Step::Head(snap.id()));
+        corpus.push(EquivalenceCase {
+            label: "declared-length-disagreement",
+            steps,
+            head: snap.id(),
+        });
+    }
+    // Every corpus case, both providers, production vs reference.
+    for equivalence in &corpus {
+        let (local, sqlite) = opened_pair(&case, &[]);
+        run_local_steps(&local, &case.local_root(), &equivalence.steps);
+        run_sqlite_steps(&sqlite, &equivalence.steps);
+        let local_root = case.local_root();
+        assert_streaming_equals_reference(
+            equivalence.label,
+            "local",
+            || LocalStoreReader {
+                root: &local_root,
+                instrumentation: ReaderInstrumentation::default(),
+            },
+            equivalence.head,
+        );
+        let conn = sqlite.walk_differential_conn();
+        assert_streaming_equals_reference(
+            equivalence.label,
+            "sqlite",
+            || SqliteStoreReader {
+                conn,
+                instrumentation: ReaderInstrumentation::default(),
+            },
+            equivalence.head,
+        );
+    }
+    // The suffix form: the same proof through the dispatch's own
+    // trusted-set flow — the valid absorption, the boundary
+    // violation, the duplicate key, the divergent rewrite, the valid
+    // composite closure, and the composite chunk corrupted mid-object
+    // (the streaming discriminator inside the suffix walk).
+    {
+        let (chain, object) = plain_chain();
+        let valid = chain.suffix_record(&object, 6);
+        let (local, sqlite) = opened_pair(&case, &[]);
+        let mut suffix_steps = chain.steps.clone();
+        suffix_steps.push(Step::Record(valid.clone()));
+        suffix_steps.push(Step::Head(valid.id()));
+        run_local_steps(&local, &case.local_root(), &suffix_steps);
+        run_sqlite_steps(&sqlite, &suffix_steps);
+        let local_root = case.local_root();
+        assert_suffix_streaming_equals_reference(
+            "suffix-valid",
+            "local",
+            || LocalStoreReader {
+                root: &local_root,
+                instrumentation: ReaderInstrumentation::default(),
+            },
+            chain.head,
+            valid.id(),
+        );
+        let conn = sqlite.walk_differential_conn();
+        assert_suffix_streaming_equals_reference(
+            "suffix-valid",
+            "sqlite",
+            || SqliteStoreReader {
+                conn,
+                instrumentation: ReaderInstrumentation::default(),
+            },
+            chain.head,
+            valid.id(),
+        );
+    }
+    {
+        let (chain, object) = plain_chain();
+        let late = RevisionRecord::regular(chain.head, 6, 7).with_content_refs(vec![object.hash()]);
+        let (local, sqlite) = opened_pair(&case, &[]);
+        let mut suffix_steps = chain.steps.clone();
+        suffix_steps.push(Step::Record(late.clone()));
+        suffix_steps.push(Step::Head(late.id()));
+        run_local_steps(&local, &case.local_root(), &suffix_steps);
+        run_sqlite_steps(&sqlite, &suffix_steps);
+        let local_root = case.local_root();
+        assert_suffix_streaming_equals_reference(
+            "suffix-boundary",
+            "local",
+            || LocalStoreReader {
+                root: &local_root,
+                instrumentation: ReaderInstrumentation::default(),
+            },
+            chain.head,
+            late.id(),
+        );
+    }
+    {
+        let (chain, object) = plain_chain();
+        let dup = RevisionRecord::regular(chain.head, 5, 6)
+            .with_content_refs(vec![object.hash()])
+            .with_idempotency_key(b"wdiff-k1".to_vec());
+        let (local, sqlite) = opened_pair(&case, &[]);
+        let mut suffix_steps = chain.steps.clone();
+        suffix_steps.push(Step::RecordIdemSuppressed(dup.clone()));
+        suffix_steps.push(Step::Head(dup.id()));
+        run_local_steps(&local, &case.local_root(), &suffix_steps);
+        run_sqlite_steps(&sqlite, &suffix_steps);
+        let local_root = case.local_root();
+        assert_suffix_streaming_equals_reference(
+            "suffix-duplicate-key",
+            "local",
+            || LocalStoreReader {
+                root: &local_root,
+                instrumentation: ReaderInstrumentation::default(),
+            },
+            chain.head,
+            dup.id(),
+        );
+    }
+    {
+        let (chain, object) = plain_chain();
+        let foreign = plain_object(b"t29-eq-divergent");
+        let foreign_founding = RevisionRecord::founding(AuthorityMode::Standalone, "t29-eqd", 0)
+            .with_content_refs(vec![foreign.hash()]);
+        let divergent = RevisionRecord::regular(foreign_founding.id(), 0, 7)
+            .with_content_refs(vec![object.hash()]);
+        let (local, sqlite) = opened_pair(&case, &[]);
+        let mut suffix_steps = chain.steps.clone();
+        suffix_steps.push(Step::Object(foreign));
+        suffix_steps.push(Step::Record(foreign_founding));
+        suffix_steps.push(Step::Record(divergent.clone()));
+        suffix_steps.push(Step::Head(divergent.id()));
+        run_local_steps(&local, &case.local_root(), &suffix_steps);
+        run_sqlite_steps(&sqlite, &suffix_steps);
+        let local_root = case.local_root();
+        assert_suffix_streaming_equals_reference(
+            "suffix-divergence",
+            "local",
+            || LocalStoreReader {
+                root: &local_root,
+                instrumentation: ReaderInstrumentation::default(),
+            },
+            chain.head,
+            divergent.id(),
+        );
+    }
+    {
+        // The valid composite suffix + the mid-chunk corruption.
+        let (chain, _object) = plain_chain();
+        let (root, chunks) = composite_fixture(91);
+        let record = RevisionRecord::regular(chain.head, 5, 6).with_content_refs(vec![root.hash()]);
+        let (local, sqlite) = opened_pair(&case, &[]);
+        let mut suffix_steps = chain.steps.clone();
+        suffix_steps.push(Step::Object(root));
+        suffix_steps.push(Step::Record(record.clone()));
+        for chunk in &chunks {
+            suffix_steps.push(Step::Object(chunk.clone()));
+        }
+        suffix_steps.push(Step::Head(record.id()));
+        run_local_steps(&local, &case.local_root(), &suffix_steps);
+        run_sqlite_steps(&sqlite, &suffix_steps);
+        let local_root = case.local_root();
+        assert_suffix_streaming_equals_reference(
+            "suffix-composite",
+            "local",
+            || LocalStoreReader {
+                root: &local_root,
+                instrumentation: ReaderInstrumentation::default(),
+            },
+            chain.head,
+            record.id(),
+        );
+        let conn = sqlite.walk_differential_conn();
+        assert_suffix_streaming_equals_reference(
+            "suffix-composite",
+            "sqlite",
+            || SqliteStoreReader {
+                conn,
+                instrumentation: ReaderInstrumentation::default(),
+            },
+            chain.head,
+            record.id(),
+        );
+        // The corrupted-chunk variant: a byte flipped in the middle
+        // of one chunk under its original identity — the suffix
+        // walk's closure verification must refuse identically on both
+        // paths.
+        let mut flipped = chunks[2].bytes().to_vec();
+        let mid = flipped.len() / 2 + 77;
+        flipped[mid] ^= 0xff;
+        let original = chunks[2].hash();
+        let (local, sqlite) = opened_pair(&case, &[]);
+        let mut corrupt_steps = suffix_steps.clone();
+        corrupt_steps.push(Step::CorruptObjectAt(original, flipped));
+        run_local_steps(&local, &case.local_root(), &corrupt_steps);
+        run_sqlite_steps(&sqlite, &corrupt_steps);
+        let local_root = case.local_root();
+        assert_suffix_streaming_equals_reference(
+            "suffix-composite-corrupt-chunk",
+            "local",
+            || LocalStoreReader {
+                root: &local_root,
+                instrumentation: ReaderInstrumentation::default(),
+            },
+            chain.head,
+            record.id(),
+        );
+        let conn = sqlite.walk_differential_conn();
+        assert_suffix_streaming_equals_reference(
+            "suffix-composite-corrupt-chunk",
+            "sqlite",
+            || SqliteStoreReader {
+                conn,
+                instrumentation: ReaderInstrumentation::default(),
+            },
+            chain.head,
+            record.id(),
+        );
     }
 }
