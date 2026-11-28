@@ -250,3 +250,15 @@ Confirming run `46133893849` dispatched.
 **T05 CI-verified green:** run `46133893849` at `121aa5d` — all five jobs
 success; the main 1650/1599/2/37 and renderer-release 220/3 pin arithmetic
 confirmed on all platforms.
+
+## The lifecycle cluster design landed (`d1ed4b2`)
+
+`designs/LIFECYCLE-T02-T03-T06-T16.md` (lane `1629d4d`): the four findings
+as one defect class — state vouching for device content advancing on call
+sequence rather than resource identity. T02 adjudicated
+confirmed-at-audit-SHA / refuted-at-head by the T05 mechanism (verified at
+the cited lines; the epoch binding lands anyway). New findings beyond the
+audit: the FSU release-half latch gap and the textures.rs InlineWait
+destination-destruction hazard (verified real). The serialized staged plan
+L1–L5 with the CPU/rig split named per stage. The implementation queues as
+ONE lane (the audit's one-team mandate) behind the memory ceiling.
