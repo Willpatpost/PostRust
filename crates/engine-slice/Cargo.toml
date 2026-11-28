@@ -7,6 +7,20 @@ license.workspace = true
 build = "build.rs"
 
 [features]
+# D-EE-10 item 4 (the owner APPROVED 2026-11-27): the SQLite
+# provider is threaded through engine-slice's own `sqlite` feature
+# — ENABLED BY DEFAULT, so the ordinary build retains the full
+# functionality (the Database store location, the backup capture,
+# the SQLite benchmark routes). A --no-default-features build is
+# LOCAL-ONLY: the engine-persist dependency resolves without
+# rusqlite, the `backup` module and the store union's SQLite arm
+# are compile-time absent, and every operation that REQUIRES the
+# provider (a StoreLocation::Database selection — the persist demo,
+# the recovery, the worker spawn) fails visibly with the typed
+# MediumError::SqliteNotBuilt refusal naming the missing feature —
+# NEVER a silent local downgrade.
+default = ["sqlite"]
+sqlite = ["engine-persist/sqlite"]
 # Test-only (the T2-B isolation corrective, extended by the RMD-03
 # corrective to forward into engine-persist): the crossing's
 # process-death crash-test seams — compile-time EXCLUDED from every
@@ -20,7 +34,14 @@ crash-test-seams = ["engine-persist/crash-test-seams"]
 
 [dependencies]
 engine-core = { path = "../engine-core" }
-engine-persist = { path = "../engine-persist" }
+# default-features = false + the `sqlite` forwarding feature above
+# (D-EE-10 item 4): the default build resolves exactly today's
+# feature set (engine-persist's `sqlite`), while a
+# --no-default-features engine-slice build is genuinely local-only
+# (engine-persist compiles without rusqlite — the F-02 footprint
+# saving is real at the integration tier, not just the library
+# tier).
+engine-persist = { path = "../engine-persist", default-features = false }
 engine-renderer = { path = "../engine-renderer" }
 engine-shell = { path = "../engine-shell" }
 

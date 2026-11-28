@@ -36,6 +36,28 @@
 //! from std** — the N−1-valid/N−lost scenario governs, and SQLite
 //! remains the identified production fallback (an evidence-based
 //! comparison is delivered at the Batch 2 review; the lead selects).
+//!
+//! **The `sqlite` Cargo feature (D-EE-10 item 4, owner APPROVED
+//! 2026-11-27):** the SQLite provider is an OPTIONAL dependency
+//! behind the `sqlite` feature — **ENABLED BY DEFAULT**, so ordinary
+//! consumers retain the full functionality unchanged (the
+//! `SqliteMedium` provider, the §6.1 migration, the backup capture).
+//! A `--no-default-features` build is **LOCAL-ONLY**: `rusqlite`
+//! and the bundled SQLite C compile (the F-02 measured cost) never
+//! resolve, and the type surface contracts to the local provider —
+//! the [`sqlite`] module (with [`SqliteMedium`],
+//! [`SqliteMediumConfig`], and the fault seam), the [`migrate`]
+//! module (with `migrate_local_to_sqlite` and its report types),
+//! and the [`MediumError::Sqlite`] / [`MediumError::MigrationPending`]
+//! variants are ABSENT from such a build (a compile-time fact, not
+//! a runtime fallback). Every operation whose REQUIREMENT is the
+//! SQLite provider — the store-location selection naming a
+//! database, the §6.1 migration, a stronger durability tier that
+//! only the transactional provider grants — fails visibly with the
+//! typed [`MediumError::SqliteNotBuilt`] refusal naming the missing
+//! feature: **NEVER a silent downgrade to the local file medium**
+//! (the weaker durability tier can never stand in for the stronger
+//! one the caller demanded).
 
 pub mod ancestry_accounting;
 pub mod ancestry_history;
@@ -55,6 +77,14 @@ pub mod hash;
 pub mod journal;
 pub mod local;
 pub mod medium;
+// (D-EE-10 item 4) The §6.1 legacy→SQLite migration: its target
+// side constructs the SQLite provider, so the whole module —
+// `migrate_local_to_sqlite`, `copy_legacy_chain`,
+// `cutover_seal_activate`, `archive_legacy`, and the report types —
+// exists only under the `sqlite` feature (DEFAULT ON; a
+// --no-default-features build is local-only and the migration is a
+// compile-time absence, never a runtime fallback).
+#[cfg(feature = "sqlite")]
 pub mod migrate;
 pub mod pipeline;
 pub mod range_completion;
@@ -67,16 +97,28 @@ pub mod recovery_discovery;
 pub mod residency;
 pub mod rotation;
 pub mod session_anchor;
+// D-EE-10 item 4: the sqlite provider and the §6.1 migration (its
+// target side IS a SqliteMedium) exist only under the `sqlite`
+// feature — DEFAULT ON; a --no-default-features build is local-only
+// (the absent-type surface is documented in the crate header, and
+// every sqlite-requiring operation fails visibly with the typed
+// MediumError::SqliteNotBuilt refusal, never a silent downgrade).
+#[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod worker_stats;
 
 #[cfg(test)]
-mod migrate_tests;
-#[cfg(test)]
-mod sqlite_tests;
-#[cfg(test)]
 mod tests;
-#[cfg(test)]
+// The sqlite-touching test batteries (D-EE-10 item 4): the sqlite
+// parity battery, the migration battery, and the local-vs-sqlite
+// walk differential all require the provider; the crate-root test
+// mod `tests` (the local medium's own battery) runs in BOTH
+// configurations.
+#[cfg(all(test, feature = "sqlite"))]
+mod migrate_tests;
+#[cfg(all(test, feature = "sqlite"))]
+mod sqlite_tests;
+#[cfg(all(test, feature = "sqlite"))]
 mod walk_differential;
 
 pub use ancestry_accounting::{
@@ -153,6 +195,7 @@ pub use medium::{
     AppendOutcome, CanonicalMedium, ChainSummary, MediumError, ObjectClass, Reconciliation,
     StoredObject, SyncTier, UnknownReason,
 };
+#[cfg(feature = "sqlite")]
 pub use migrate::{
     CopiedChain, MigrationError, MigrationReport, archive_legacy, copy_legacy_chain,
     cutover_seal_activate, migrate_local_to_sqlite,
@@ -214,6 +257,7 @@ pub use rotation::{
     PointerDurability, SessionRotationError, active_journal_path, read_journal_generations,
     reestablish_pointer_durability, retire_journal_generations, rotate_session_journal,
 };
+#[cfg(feature = "sqlite")]
 pub use sqlite::{
     SqliteFaultAction, SqliteFaultControl, SqliteFaultPoint, SqliteMedium, SqliteMediumConfig,
 };

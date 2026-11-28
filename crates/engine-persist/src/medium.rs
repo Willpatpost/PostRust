@@ -162,10 +162,26 @@ pub enum MediumError {
     /// storage, an API-level error) — fail-closed, never automatically
     /// repaired (PP-B1). The `detail` carries the engine's message;
     /// the engine never attempts `.recover` or any destructive repair.
+    /// (D-EE-10 item 4) Present only under the `sqlite` feature.
+    #[cfg(feature = "sqlite")]
     Sqlite {
         /// The operation that failed.
         op: &'static str,
         /// The database engine's message.
+        detail: String,
+    },
+    /// (D-EE-10 item 4, the owner's fail-visible rule) The operation
+    /// REQUIRES the SQLite provider and this build does not carry it
+    /// (engine-persist compiled without the `sqlite` Cargo feature —
+    /// the `--no-default-features` local-only configuration). The
+    /// requirement is refused typed and loud, naming the missing
+    /// feature: **NEVER a silent downgrade to the local file medium**
+    /// — a weaker durability tier can never stand in for the stronger
+    /// one the caller demanded (a database store location, the §6.1
+    /// migration, the transactional tier). The operator's fix is the
+    /// rebuild with the feature enabled (the default).
+    SqliteNotBuilt {
+        /// The refusing operation's context.
         detail: String,
     },
     /// The local store directory carries a `MIGRATED` tombstone (the
@@ -187,6 +203,8 @@ pub enum MediumError {
     /// (`SqliteMedium::open_migration_target`) may proceed, and the
     /// activation (`mark_migrated_from`) transitions it to a live
     /// campaign transactionally.
+    /// (D-EE-10 item 4) Present only under the `sqlite` feature.
+    #[cfg(feature = "sqlite")]
     MigrationPending {
         /// The refusing database's context.
         detail: String,
@@ -253,12 +271,22 @@ impl fmt::Display for MediumError {
             MediumError::Contention { detail } => {
                 write!(f, "storage write contention: {detail}")
             }
+            #[cfg(feature = "sqlite")]
             MediumError::Sqlite { op, detail } => {
                 write!(f, "sqlite operation {op} failed: {detail}")
+            }
+            MediumError::SqliteNotBuilt { detail } => {
+                write!(
+                    f,
+                    "the SQLite provider is required but not built \
+                     (engine-persist's `sqlite` feature is disabled — a \
+                     --no-default-features build is local-only): {detail}"
+                )
             }
             MediumError::Sealed { detail } => {
                 write!(f, "the store is sealed as migrated: {detail}")
             }
+            #[cfg(feature = "sqlite")]
             MediumError::MigrationPending { detail } => {
                 write!(
                     f,

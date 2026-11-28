@@ -591,6 +591,12 @@ pub fn member_preimage_object(entry: &crate::ancestry_witness::WitnessEntry) -> 
 
 #[cfg(all(test, feature = "composite-test-fixture"))]
 mod a2_tests {
+    // (D-EE-10 item 4) The fixture battery's helpers are carried on
+    // unix by the LocalFile twin regressions; on Windows the
+    // cross-platform tests are the SQLite twins (feature-gated) —
+    // the non-unix dormancy marker keeps a Windows local-only
+    // fixture build warning-clean without excluding any coverage.
+    #![cfg_attr(not(unix), allow(dead_code))]
     use super::*;
     use crate::medium::CanonicalMedium;
 
@@ -1299,6 +1305,8 @@ mod a2_tests {
     /// (A2-T9) The SQLite twin: the same complete traversal on the
     /// transactional provider (the Windows-compatible arm — the
     /// transactional begin admits on every platform).
+    /// (D-EE-10 item 4) Requires the SQLite provider — feature-gated.
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_sqlite_twin_walks_the_complete_history() {
         let path = temp_dir_path("sqlite", "t9");

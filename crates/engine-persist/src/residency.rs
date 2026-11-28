@@ -292,6 +292,7 @@ mod tests {
         CommitOutcome, CommitPipeline, PipelineError, SETTLED_COVERAGE_RETAINED,
     };
     use crate::record::{AuthorityMode, RevisionRecord};
+    #[cfg(feature = "sqlite")]
     use crate::sqlite::SqliteMedium;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -314,6 +315,9 @@ mod tests {
             self.0.join("store")
         }
 
+        /// (D-EE-10 item 4) The SQLite pipeline helper's path —
+        /// exists only under the `sqlite` feature.
+        #[cfg(feature = "sqlite")]
         fn db(&self) -> PathBuf {
             self.0.join("store.db")
         }
@@ -422,6 +426,7 @@ mod tests {
         CommitPipeline::open(LocalFileMedium::open(dir.store()).unwrap(), journal).unwrap()
     }
 
+    #[cfg(feature = "sqlite")]
     fn sqlite_pipeline(dir: &TestDir) -> CommitPipeline<SqliteMedium> {
         let mut medium = SqliteMedium::open(dir.db()).unwrap();
         if medium.head().unwrap().is_none() {
@@ -473,6 +478,11 @@ mod tests {
     /// commitment — and an absent identity answers None on both
     /// paths. The local file medium and the SQLite medium run the
     /// same battery (the "both providers" preservation duty).
+    /// (D-EE-10 item 4) The both-providers form requires the SQLite
+    /// provider — feature-gated; the local half of the battery is
+    /// covered by the provider-parameterized tests below, which run
+    /// in BOTH configurations.
+    #[cfg(feature = "sqlite")]
     #[test]
     fn cold_probe_agrees_with_the_hot_map_on_both_providers() {
         let dir = TestDir::new("equivalence-local");

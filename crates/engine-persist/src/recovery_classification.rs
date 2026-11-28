@@ -4464,11 +4464,15 @@ mod r1a2_production_tests {
     };
     use crate::medium::{AdmittedAppend, CanonicalMedium, StoredObject};
     use crate::reclaim::{
-        BeginPublicationOutcome, MediumReads, ReclaimUnit, ReclamationLedger,
-        create_campaign_bound_journal, find_installed_plan, find_installed_v2_audit,
-        journal_root_id, publish_journal_root_binding, publish_reclamation_ledger,
+        BeginPublicationOutcome, MediumReads, create_campaign_bound_journal, find_installed_plan,
+        find_installed_v2_audit, journal_root_id, publish_journal_root_binding,
         publish_reclamation_ledger_v2, publish_reclamation_plan,
     };
+    // (D-EE-10 item 4) The v1 legacy lane's ledger publisher and
+    // unit reader — the lane is sqlite-provider evidence, so the
+    // imports exist only under the feature.
+    #[cfg(feature = "sqlite")]
+    use crate::reclaim::{ReclaimUnit, ReclamationLedger, publish_reclamation_ledger};
     use crate::record::{AuthorityMode, RevisionRecord};
 
     // ------------------------------------------------------ the stores
@@ -4494,6 +4498,7 @@ mod r1a2_production_tests {
         .unwrap()
     }
 
+    #[cfg(feature = "sqlite")]
     fn sqlite_store(label: &str) -> (std::path::PathBuf, crate::SqliteMedium) {
         let path = temp_path("sqlite", label).with_extension("db");
         let medium = crate::SqliteMedium::open(&path).unwrap();
@@ -4541,12 +4546,18 @@ mod r1a2_production_tests {
         p1: Hash,
         members: Vec<Hash>,
         sk: Hash,
+        /// (D-EE-10 item 4) Read only by the staged ladder's
+        /// Windows-dormant tail (see [`staged_production_ladder`]).
+        #[cfg_attr(not(unix), allow(dead_code))]
         shared_object: Hash,
     }
 
     /// The staged V2 campaign's retained facts — every identity a
     /// later phase or assertion needs, all from genuine production
     /// returns.
+    /// (D-EE-10 item 4) Constructed only by the staged ladder's
+    /// Windows-dormant tail (see [`staged_production_ladder`]).
+    #[cfg_attr(not(unix), allow(dead_code))]
     struct StagedCampaign {
         members: Vec<Hash>,
         sk: Hash,
@@ -4558,6 +4569,9 @@ mod r1a2_production_tests {
         begin: Hash,
     }
 
+    /// (D-EE-10 item 4) Called only by the staged ladder's
+    /// Windows-dormant tail (see [`staged_production_ladder`]).
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn assemble_campaign(
         prefix: StagedPrefix,
         mk: Hash,
@@ -4729,6 +4743,10 @@ mod r1a2_production_tests {
     }
 
     /// (Phase E) The V2 begin — the plan-bound admission.
+    /// (D-EE-10 item 4) Windows-dormant without the SQLite lane
+    /// (the unix LocalFile regressions carry it; the A12IndexDoctor
+    /// precedent's marker).
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn stage_begin(medium: &mut dyn CanonicalMedium, mk: &Hash, tick: u64) -> Hash {
         let outcome = medium.begin_reclamation_v2(mk, tick).unwrap();
         let BeginPublicationOutcome::Accepted { id, .. } = outcome else {
@@ -4738,6 +4756,8 @@ mod r1a2_production_tests {
     }
 
     /// (Phase F) The B-P1 ancestry witness publication.
+    /// (D-EE-10 item 4) Windows-dormant without the SQLite lane.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn stage_witness(medium: &mut dyn CanonicalMedium, mk: &Hash, tick: u64) -> Hash {
         let publication = publish_ancestry_witness(medium, mk, tick).unwrap();
         assert!(
@@ -4753,6 +4773,9 @@ mod r1a2_production_tests {
     /// The C1 marker's classification entries — genuine campaign
     /// identities (SK and the keyed members as records, the
     /// founding's shared content as deferred storage).
+    /// (D-EE-10 item 4) Called only by the staged ladder's
+    /// Windows-dormant tail (see [`staged_production_ladder`]).
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn campaign_entries(campaign: &StagedCampaign) -> Vec<ClassificationEntry> {
         let mut entries = vec![
             ClassificationEntry {
@@ -4781,6 +4804,10 @@ mod r1a2_production_tests {
     /// publication rides): a regular revision under the supplied
     /// deterministic key, carrying the payload as its single
     /// content object, appended above the current head.
+    /// (D-EE-10 item 4) In this mod, called only by the staged
+    /// ladder's Windows-dormant tail (the r1a3/r1a4 copies live in
+    /// their own wholly-gated mods).
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn install_keyed_object_record(
         medium: &mut dyn CanonicalMedium,
         key: Vec<u8>,
@@ -4808,6 +4835,9 @@ mod r1a2_production_tests {
     /// (mk, key_batch) deterministic key while the payload commits
     /// the SUPPLIED context (the honest markers pass the matching
     /// context; the lying form binds a mutated one).
+    /// (D-EE-10 item 4) Called only by the staged ladder's
+    /// Windows-dormant tail and the SQLite-gated lanes.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn install_marker(
         medium: &mut dyn CanonicalMedium,
         campaign: &StagedCampaign,
@@ -4838,6 +4868,9 @@ mod r1a2_production_tests {
     /// entry set and installed through the in-crate admitted
     /// receipt (the only /2 installation route; no /2 publication
     /// route exists).
+    /// (D-EE-10 item 4) Called only by the staged ladder's
+    /// Windows-dormant tail (see [`staged_production_ladder`]).
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn stage_marker(
         medium: &mut dyn CanonicalMedium,
         campaign: &StagedCampaign,
@@ -4862,6 +4895,9 @@ mod r1a2_production_tests {
         classify_recovery_evidence(&mut reads, &head, &DiscoveryLimits::default_limits()).unwrap()
     }
 
+    /// (D-EE-10 item 4) Windows-dormant without the SQLite lane
+    /// (the unix LocalFile read-only proof carries it).
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn discover_via_medium(medium: &mut dyn CanonicalMedium) -> RecoveryEvidenceDiscovery {
         let head = medium.head().unwrap().unwrap();
         let mut reads = MediumReads::new(medium);
@@ -4879,6 +4915,14 @@ mod r1a2_production_tests {
     /// NoCoveringCheckpoint to AllBatchMarkersStructurallyMatched.
     /// Returns the campaign facts (the terminal state: every marker
     /// installed).
+    /// (D-EE-10 item 4) The ladder's tail (the marker installation
+    /// and the assembled campaign facts) is reached on Windows only
+    /// through the SQLite lane — feature-gated below — while the
+    /// unix LocalFile twin regressions carry it on every build; the
+    /// non-unix dormancy marker (the A12IndexDoctor precedent)
+    /// keeps a Windows local-only build warning-clean WITHOUT
+    /// excluding the unix coverage.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn staged_production_ladder(
         medium: &mut dyn CanonicalMedium,
         label: &str,
@@ -5027,6 +5071,7 @@ mod r1a2_production_tests {
 
     /// (B-R1a2 §1) The staged production publication classifies per
     /// phase under SQLite — the full ladder, every rung asserted.
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_sqlite_staged_production_publication_classifies_per_phase() {
         let (path, mut store) = sqlite_store("t1");
@@ -5054,6 +5099,7 @@ mod r1a2_production_tests {
     /// WITNESS-LESS terminal shape (the more common production
     /// form): Some → All across the ascending installations, the
     /// witness observation staying None throughout.
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_production_markers_classify_when_installed() {
         let (path, mut store) = sqlite_store("t3");
@@ -5100,6 +5146,7 @@ mod r1a2_production_tests {
     /// payload binding ANOTHER batch's audit) degrades the evidence
     /// with the C2 reader's typed context refusal — while the
     /// witness observation stays coherent (the orthogonality).
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_production_lying_marker_degrades() {
         let (path, mut store) = sqlite_store("t4");
@@ -5150,6 +5197,7 @@ mod r1a2_production_tests {
     /// checkpoint but carrying a GENUINE published shard payload
     /// (binding the covering MK) degrades the witness observation,
     /// while the retirement-evidence state is untouched.
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_foreign_keyed_covering_bound_shard_degrades_over_production_evidence() {
         let (path, mut store) = sqlite_store("t5");
@@ -5299,6 +5347,7 @@ mod r1a2_production_tests {
     /// (B-R1a2 §7) The interrupted pre-begin shape: the plan with a
     /// PARTIAL audit set (every batch except the last) stays
     /// PlanObservedWithoutBegin with the exact per-batch split.
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_interrupted_pre_begin_shape_classifies() {
         let (path, mut store) = sqlite_store("t7");
@@ -5339,6 +5388,7 @@ mod r1a2_production_tests {
     /// index, newest-first, with the read-back content references)
     /// plus the V1 begin (bound to the audit) classifies
     /// V1EvidenceObserved with the exact record identities.
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_v1_legacy_production_lane_classifies() {
         let (path, mut store) = sqlite_store("t8");
@@ -5394,6 +5444,10 @@ mod r1a2_production_tests {
 
     /// One V1 reclaim unit read back from the actual record (the
     /// genuine content references), with its keyed-ness.
+    /// (D-EE-10 item 4) The V1 legacy production lane is
+    /// SQLite-provider evidence — the helper exists only under the
+    /// feature.
+    #[cfg(feature = "sqlite")]
     fn v1_unit(medium: &mut dyn CanonicalMedium, id: &Hash) -> (ReclaimUnit, bool) {
         let record = medium.read_record(id).unwrap();
         let keyed = record.idempotency_key.is_some();
@@ -5455,7 +5509,7 @@ mod r1a2_production_tests {
     /// on Windows — the platform's positive evidence (the LocalFile
     /// positives cannot run there; SQLite is transactionally
     /// durable).
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "sqlite"))]
     #[test]
     fn the_sqlite_twin_carries_windows() {
         let (path, mut store) = sqlite_store("t10");
@@ -5495,6 +5549,7 @@ mod r1a2_production_tests {
     /// terminal state is TOTAL — every authority field destructured
     /// to NotEstablished, older_checkpoints unresolved below the
     /// boundary — over genuine production evidence.
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_production_unresolved_authority_is_total() {
         let (path, mut store) = sqlite_store("t12");
@@ -5526,6 +5581,7 @@ mod r1a2_production_tests {
     /// newest-first record order with every family present, the
     /// boundary below the covering checkpoint, and the complete
     /// structural-candidate set.
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_discovery_layer_production_observations() {
         let (path, mut store) = sqlite_store("t13");
@@ -5619,6 +5675,7 @@ mod r1a2_production_tests {
     /// (B-R1a2 §14) The discovery read-only proof: repeated
     /// head-relative discovery over the terminal campaign returns
     /// identical observations and never moves the head.
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_discovery_layer_read_only_proof() {
         let (path, mut store) = sqlite_store("t14");
@@ -5650,7 +5707,12 @@ mod r1a2_production_tests {
 // is a TEST-side construction over genuine campaign facts.
 // ===================================================================
 
-#[cfg(test)]
+// (D-EE-10 item 4) The degradation battery's staged evidence runs
+// on the transactional provider (the SQLite store fixtures below —
+// the genuine production-evidence shapes, not the local POSIX
+// twins): the whole mod requires the `sqlite` feature and is
+// compile-time excluded from a --no-default-features build.
+#[cfg(all(test, feature = "sqlite"))]
 mod r1a3_degradation_tests {
     use super::*;
     use crate::checkpoint::{SkipEntry, chain_range_digest_step, compute_digest_seed};
@@ -7103,7 +7165,11 @@ mod r1a3_degradation_tests {
 // honest boundaries.
 // ===================================================================
 
-#[cfg(test)]
+// (D-EE-10 item 4) The witness-degradation battery runs on the
+// transactional provider (the SQLite store fixtures below): the
+// whole mod requires the `sqlite` feature and is compile-time
+// excluded from a --no-default-features build.
+#[cfg(all(test, feature = "sqlite"))]
 mod r1a4_witness_tests {
     use super::*;
     use crate::checkpoint::{SkipEntry, chain_range_digest_step, compute_digest_seed};

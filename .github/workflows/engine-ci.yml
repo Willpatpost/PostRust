@@ -895,6 +895,59 @@ jobs:
         run: |
           cargo test -p engine-persist --lib bp1_production_tests
           cargo test -p engine-persist --lib r1a2_production_tests
+      # (D-EE-10 item 4, the owner APPROVED 2026-11-27/28) The
+      # LOCAL-ONLY configuration gate: engine-persist built
+      # --no-default-features excludes the SQLite provider entirely —
+      # rusqlite and its bundled C toolchain never resolve; the
+      # sqlite module, the §6.1 migration, and their public types
+      # are ABSENT from the crate (the documented no-default type
+      # surface). This step proves the authorization's clauses on
+      # every platform: the local-only battery is GREEN with the
+      # sqlite-gated tests excluded by the exact map (the exclusion
+      # COUNT pinned — 125 on Windows / 124 on Linux; the one
+      # platform-divergent exclusion is r1a2's
+      # the_sqlite_twin_carries_windows, cfg(windows), never
+      # executed on Linux), and the threading is compile-real
+      # through the integration tier: the engine-slice local-only
+      # CHECK (its own `sqlite` feature OFF — the store union
+      # reduced to the local medium, the backup module absent) and
+      # the FAIL-VISIBLE refusal test (the typed
+      # MediumError::SqliteNotBuilt naming the missing feature —
+      # NEVER a silent local downgrade; the store-selection seam
+      # refuses a StoreLocation::Database outright). The absolute
+      # default-configuration counts are NOT re-pinned here (the
+      # main Tests step's composite-test-fixture battery is a
+      # SUPERSET of this plain battery and governs them); this
+      # step's own invariant is the EXCLUSION MAP, measured as the
+      # same-step delta so a platform's absolute battery size can
+      # never mask a lost test. Windows MEASURED locally at this
+      # lane's tree (plain 745 / local-only 620, both exit 0, 11
+      # result lines each); Linux = the same 124 cross-platform
+      # exclusions (the platform-uniform inference — every excluded
+      # suite other than the named Windows twin carries no cfg
+      # gate — to be confirmed by this candidate's own run; a
+      # mismatch is corrected from actuals, never by weakening a
+      # test).
+      - name: Local-only battery (engine-persist --no-default-features — the D-EE-10 item 4 gate)
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p engine-persist 2>&1 | tee tests-plain.log
+          plain=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-plain.log)
+          cargo test -p engine-persist --no-default-features 2>&1 | tee tests-nodefault.log
+          nodefault=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-nodefault.log)
+          results=$(grep -c 'test result:' tests-nodefault.log || true)
+          excluded=$((plain - nodefault))
+          expected_excluded=124
+          if [ "$(uname -s)" != "Linux" ]; then expected_excluded=125; fi
+          echo "persist battery: plain $plain passed, local-only $nodefault passed, $results result lines, excluded $excluded (expected $expected_excluded)"
+          [ "$excluded" -eq "$expected_excluded" ] || { echo "LOCAL-ONLY EXCLUSION MAP MISMATCH: $excluded != $expected_excluded — the sqlite feature gate moved a test boundary"; exit 1; }
+          [ "$results" -eq 11 ] || { echo "LOCAL-ONLY RESULT-LINE MISMATCH: $results != 11 (the lib + the ten sqlite-free integration binaries + the doctest)"; exit 1; }
+          # The integration-tier threading: the local-only demo
+          # driver must COMPILE (its own sqlite feature OFF).
+          cargo check -p engine-slice --no-default-features
+          # The fail-visible refusal: the typed, loud NO.
+          cargo test -p engine-slice --no-default-features --lib store_selection_refuses_database_without_the_sqlite_feature
       - name: Fingerprint self-test double run
         shell: bash
         run: |
