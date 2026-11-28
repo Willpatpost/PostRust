@@ -1250,6 +1250,22 @@ impl EncounterDemo {
         // adversary boxes, skipping DEFEATED bodies.
         let mut targets = Vec::with_capacity(spine.world().count());
         encounter_targets(&mut targets, spine.world());
+        // F09 (Q04) — the indexed-query ADOPTION BOUNDARY at the
+        // encounter's volley: this revision's roster is 1–4 bodies
+        // (rebuilt every fire — the bodies move), carrying 1 ray
+        // (precision) or 5 (the spread volley). The ROSTER half of
+        // the composition gate declines at every roster that exists
+        // today (1–4, far below the gate), so the volley keeps
+        // `try_fire`'s exact linear per-ray resolves — the retained
+        // tiny-roster path, unchanged. The ENGINE-side half of the
+        // B06-recorded seam — `FireContext` carrying
+        // `Option<&CombatIndex>` so `try_fire`'s rays route through
+        // the composition's per-revision handle (the
+        // `combat_adoption::FireRoster` this composition would build
+        // right here, at the same scope) — is the recorded follow-up
+        // for a combat composition at/above the gate; the query half
+        // (a 5-ray volley vs the measured crossover) is measured and
+        // recorded in `combat_adoption`'s crossover table.
         // THE CONTEXT (the contract's §3 FireContext form): THIS
         // tick's eye + look direction (camera-agnostic — the same
         // request in both camera modes), the targets, the shared

@@ -77,7 +77,7 @@ use engine_core::adversary::{AdversaryConfig, AdversaryState, AdversaryWorld};
 use engine_core::{
     AttackProfile, AttackRequest, CameraMode, CollisionWorld, Combatant, DamageOutcome, Health,
     HitResolution, MissKind, MoveIntent, PlayerDriver, PlayerState, Spine, StaticCollider, Tick,
-    camera_pose_obstructed, health_full, look_direction, player_box, resolve_attack,
+    camera_pose_obstructed, health_full, look_direction, player_box,
 };
 use engine_renderer::scene::SceneVertex;
 use engine_renderer::{
@@ -89,6 +89,7 @@ use engine_shell::{
     ShellConfig,
 };
 
+use crate::combat_adoption::FireRoster;
 use crate::frame_timing::FrameTiming;
 use crate::math;
 use crate::playable_demo::{map_playable_input, playable_player_config};
@@ -963,7 +964,22 @@ impl CombatDemo {
         // perceives through and the player collides with — identical
         // boxes, built from the same literal; the split-borrow
         // composition's flagged copy).
-        let resolution = resolve_attack(fire_world, &request, &targets);
+        //
+        // F09 (Q04) — the indexed-query ADOPTION BOUNDARY at this
+        // composition: one stable roster revision per press (the
+        // roster is THIS press's — the body patrols between presses,
+        // so the revision changes every fire), carrying ONE trace
+        // (the press edge; the 18-tick cooldown bounds the rate).
+        // Both gate halves decline (roster 1 far below the
+        // composition's roster gate; queries 1 below its query
+        // gate), so the seam keeps the exact linear resolver — the
+        // audit's retained tiny-roster path, bit-identical by the
+        // same-call identity. A scaled composition (roster ≥ the
+        // gate AND queries ≥ the gate) adopts the CombatIndex
+        // through this same call — the equivalence, crossover, and
+        // fallback evidence lives in `combat_adoption`.
+        let roster = FireRoster::for_revision(&targets, 1);
+        let resolution = roster.resolve(fire_world, &request);
         match resolution {
             HitResolution::Hit { .. } => {
                 encounter.hits += 1;
