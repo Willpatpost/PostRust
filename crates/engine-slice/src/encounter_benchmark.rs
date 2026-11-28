@@ -84,7 +84,10 @@ impl Workload {
         let dwell = if self == Self::Stress { 2 } else { 37 };
         let index = (frame / dwell) % 5;
         let target = if index == 4 {
-            cover_slab().center
+            // CA-05 consumer adaptation: the geometry read goes through
+            // the accessor (the field is private since the
+            // stale-cached-bounds fix).
+            cover_slab().center()
         } else {
             let [x, y, z] = demo.spine.world().adversary(index).position;
             [x, y + ADVERSARY_HALF[1], z]

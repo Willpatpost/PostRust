@@ -1747,7 +1747,10 @@ fn cover_and_body_depth_faces_have_consistent_clockwise_winding() {
     let mut vertices = Vec::new();
     let slab = cover_slab();
     push_rotated_box(&mut vertices, &slab, [1.; 3]);
-    check(&vertices, slab.center);
+    // CA-05 consumer adaptation: the center read goes through the
+    // accessor (the field is private since the stale-cached-bounds
+    // fix).
+    check(&vertices, slab.center());
     build_encounter_vertices_into(&mut vertices, &EncounterDemo::new());
     let b = ENCOUNTER_BOXES[0];
     check(

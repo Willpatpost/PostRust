@@ -2159,7 +2159,11 @@ pub fn push_rotated_box(
     collider: &RotatedCollider,
     color: [f32; 3],
 ) {
-    let corners = box_corners(collider.half.map(|v| -v), collider.half);
+    // CA-05 consumer adaptation: the half-extents read goes through
+    // the accessor (the field is private since the
+    // stale-cached-bounds fix).
+    let half = collider.half();
+    let corners = box_corners(half.map(|v| -v), half);
     append_box(vertices, corners.map(|p| collider.to_world(p)), color);
 }
 

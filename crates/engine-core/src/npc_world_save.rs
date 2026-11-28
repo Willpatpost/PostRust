@@ -421,8 +421,13 @@ impl NpcWorldSectionV2 {
     /// selects — record-only for [`LodLevel::Dormant`]. Encoding an
     /// inconsistent section (a dormant block carrying non-empty
     /// reconstructible columns) writes the dormant shape: those
-    /// values are gone by the dormancy discipline; validate the
-    /// section first ([`Self::validate`]).
+    /// values are gone by the dormancy discipline. This raw codec is
+    /// TOTAL (the v1 mirror discipline — encoding is never repair):
+    /// a caller that encodes an unvalidated section can write bytes
+    /// [`Self::restore`] refuses; validate the section first
+    /// ([`Self::validate`]) — or encode through the fallible
+    /// validated path [`Self::save_validated`], which refuses before
+    /// any byte is written.
     pub fn save(&self, enc: &mut Encoder) {
         enc.write_u64(self.seed);
         enc.write_u64(self.activity_period);
@@ -468,6 +473,24 @@ impl NpcWorldSectionV2 {
                 enc.write_u64(*credit);
             }
         }
+    }
+
+    /// The fallible validated encoding path for public callers (F06's
+    /// wire half): validates the section — exactly
+    /// [`Self::validate`]'s gates, including the shared position
+    /// predicate — and only then encodes, so the bytes written
+    /// through this path are exactly bytes [`Self::restore`] accepts,
+    /// and a refusal happens before any byte is written. The raw
+    /// [`Self::save`] remains the total mirror codec (the v1
+    /// discipline: encoding is never repair, and the application's
+    /// own `NpcWorld::save` keeps its verbatim encoder — byte-ident,
+    /// pinned by the round-trip parity tests); a caller that saves an
+    /// unvalidated section through it can still write bytes restore
+    /// refuses. This path closes that hole for callers that opt in.
+    pub fn save_validated(&self, enc: &mut Encoder) -> Result<(), SaveError> {
+        self.validate()?;
+        self.save(enc);
+        Ok(())
     }
 
     /// Restores the v2 section (fail-closed): every count bounded
@@ -584,12 +607,14 @@ impl NpcWorldSectionV2 {
                     // Grid positions carry the dormant-discard
                     // sentinel (the reconstructible representation is
                     // GONE, not merely flagged); every other position
-                    // must lie on the region-local grid.
+                    // must lie on the region-local grid — through the
+                    // ONE shared predicate (F06: this gate and
+                    // `validate` answer identically by construction).
                     let mut positions = Vec::with_capacity(identity_count as usize);
                     for _ in 0..identity_count {
                         let x = dec.read_u8()?;
                         let y = dec.read_u8()?;
-                        if (x, y) != POSITION_DISCARDED && (x >= region_grid || y >= region_grid) {
+                        if !position_admitted((x, y), region_grid) {
                             return Err(SaveError::Integrity("npc-world-save-v2/position-bounds"));
                         }
                         positions.push((x, y));
@@ -652,8 +677,11 @@ impl NpcWorldSectionV2 {
     /// same gates inline as it reads): the configuration's domain,
     /// the block count agreement, the per-block column agreement with
     /// the structural dormant shape, the identity table's region,
-    /// home-cell, ordering, and global-uniqueness gates, and the
-    /// population sum.
+    /// home-cell, ordering, and global-uniqueness gates, the ACTIVE
+    /// blocks' grid positions through the ONE shared position
+    /// predicate (`position_admitted` — exactly restore's rule, so a
+    /// section that validates is exactly a section whose encoding
+    /// restores), and the population sum.
     pub fn validate(&self) -> Result<(), SaveError> {
         const SECTION: &str = "npc-world-save-v2";
         self.config
@@ -684,6 +712,20 @@ impl NpcWorldSectionV2 {
                 }
                 if !dormant && column_len != count {
                     return Err(SaveError::Integrity("npc-world-save-v2/column-counts"));
+                }
+            }
+            // THE SHARED POSITION GATE (F06): every active-block
+            // position faces exactly restore's predicate — the
+            // on-grid-or-sentinel rule through the ONE shared
+            // function — under the same production error name, so
+            // the in-memory gate and the wire gate refuse
+            // identically (the (4,0) witness case: previously
+            // admitted here, refused at restore).
+            if !dormant {
+                for position in &block.positions {
+                    if !position_admitted(*position, self.config.region_grid) {
+                        return Err(SaveError::Integrity("npc-world-save-v2/position-bounds"));
+                    }
                 }
             }
             let mut prev_id: Option<u32> = None;
@@ -759,6 +801,24 @@ fn lod_discriminant(lod: LodLevel) -> u8 {
         LodLevel::EventDriven => 2,
         LodLevel::Dormant => 3,
     }
+}
+
+/// The ONE grid-position predicate for the v2 section's ACTIVE
+/// blocks, shared by the in-memory validator and the decoder (F06:
+/// the two gates disagreed — `validate` checked column lengths and
+/// durable home cells but never inspected the active positions, so a
+/// section could pass validation and fail its own restore with
+/// `npc-world-save-v2/position-bounds`). A position is admitted
+/// exactly when it is the dormant-discard sentinel
+/// ([`POSITION_DISCARDED`]) or lies strictly on the region-local
+/// grid — the exact-tuple rule, so a PARTIAL sentinel (one sentinel
+/// coordinate, one off-grid) is an ordinary off-grid refusal, never
+/// an exemption. Both [`NpcWorldSectionV2::validate`] (before
+/// encoding) and [`NpcWorldSectionV2::restore`] (after) consult THIS
+/// function: a section that validates is exactly a section whose
+/// encoding restores.
+fn position_admitted(position: (u8, u8), region_grid: u8) -> bool {
+    position == POSITION_DISCARDED || (position.0 < region_grid && position.1 < region_grid)
 }
 
 /// Reads a boolean flag (fail-closed on non-0/1 discriminants).
@@ -1588,5 +1648,117 @@ mod tests {
             restored.world().total_steps()
         );
         assert!(restored.world().total_steps() > 4_000);
+    }
+
+    #[test]
+    fn active_positions_face_one_gate_in_memory_and_on_the_wire() {
+        // THE F06 WITNESS AS THE CRATE'S OWN BATTERY: pre-fix, an
+        // in-memory section with an off-grid active position (the
+        // audit's (4,0) on a 4-grid) PASSED validate() and FAILED its
+        // own restore with `npc-world-save-v2/position-bounds` — the
+        // two gates disagreed (the reproduced external witness, exit
+        // 101). Both gates now consult the ONE shared predicate
+        // (`position_admitted`), so they answer identically BY
+        // CONSTRUCTION for every position class: the ordinary cell,
+        // the exact edge (grid−1 on both axes), the dormant-discard
+        // sentinel, the PARTIAL sentinel (one sentinel coordinate —
+        // the exact-tuple rule makes it an ordinary off-grid
+        // refusal), and the witness's own (4,0) plus its mirrored
+        // axis — with the same production error name on refusal.
+        let mut section = scaled_section(1, 1, 4, 1);
+        for (position, admitted) in [
+            ((0, 0), true),                  // the ordinary cell
+            ((3, 3), true),                  // the exact edge: grid−1 on both axes
+            (POSITION_DISCARDED, true),      // the dormant-discard sentinel
+            ((u8::MAX, 0), false),           // partial sentinel: exact-tuple rule, no exemption
+            ((u8::MAX, u8::MAX - 1), false), // the mirrored partial sentinel
+            ((4, 0), false),                 // THE WITNESS CASE: off-grid, non-sentinel
+            ((0, 4), false),                 // the mirrored off-grid axis
+        ] {
+            section.regions[0].positions[0] = position;
+            let validated = section.validate();
+            let bytes = encode_v2(&section);
+            let restored = NpcWorldSectionV2::restore(&mut Decoder::new(&bytes));
+            // The witness's own assertion: the gates agree.
+            assert_eq!(
+                validated.is_ok(),
+                restored.is_ok(),
+                "position {position:?}: the in-memory and wire gates disagree"
+            );
+            assert_eq!(
+                validated.is_ok(),
+                admitted,
+                "position {position:?}: admitted iff on-grid-or-sentinel"
+            );
+            // Refusal identity: BOTH gates name the same production
+            // error (the witness's restore error, now validate's too).
+            if !admitted {
+                assert!(
+                    matches!(
+                        validated,
+                        Err(SaveError::Integrity("npc-world-save-v2/position-bounds"))
+                    ),
+                    "position {position:?}: validate names the position-bounds error"
+                );
+                assert!(
+                    matches!(
+                        restored,
+                        Err(SaveError::Integrity("npc-world-save-v2/position-bounds"))
+                    ),
+                    "position {position:?}: restore names the position-bounds error"
+                );
+            }
+        }
+        // The dormant shape is unaffected: a Dormant block's positions
+        // are empty (the structural rule), so the gate is the active
+        // blocks' alone.
+        let dormant = scaled_section(2, 6, 4, 0);
+        dormant.validate().expect("the dormant section validates");
+    }
+
+    #[test]
+    fn the_validated_encoding_path_refuses_what_restore_would() {
+        // F06's wire half: the raw `save` is total (the v1 mirror
+        // discipline), so a caller that saves an UNVALIDATED section
+        // can write bytes restore refuses — the same disagreement at
+        // the wire. `save_validated` closes it for public callers:
+        // the off-grid section is refused BEFORE any byte is written,
+        // and a valid section's bytes through the validated path are
+        // IDENTICAL to the raw path's (existing valid bytes
+        // preserved).
+        let mut off_grid = scaled_section(2, 6, 16, 2);
+        off_grid.regions[0].positions[0] = (16, 0); // off-grid, non-sentinel
+        let mut enc = Encoder::new();
+        let refused = off_grid.save_validated(&mut enc);
+        assert!(
+            matches!(
+                refused,
+                Err(SaveError::Integrity("npc-world-save-v2/position-bounds"))
+            ),
+            "the validated path names the shared gate's error"
+        );
+        assert!(
+            enc.as_bytes().is_empty(),
+            "the refusal happens before any byte is written"
+        );
+        // The raw codec remains total — and restore still refuses
+        // its bytes (the disagreement save_validated exists to close,
+        // pinned here as the discriminating pair).
+        let raw = encode_v2(&off_grid);
+        assert!(NpcWorldSectionV2::restore(&mut Decoder::new(&raw)).is_err());
+        // A valid section: byte-identical through both paths.
+        let valid = scaled_section(2, 6, 16, 2);
+        valid.validate().expect("the fixture section is consistent");
+        let mut enc = Encoder::new();
+        valid
+            .save_validated(&mut enc)
+            .expect("the valid section encodes");
+        assert_eq!(enc.into_bytes(), encode_v2(&valid));
+        // And those bytes restore (the round-trip the path promises).
+        let valid_bytes = encode_v2(&valid);
+        let mut dec = Decoder::new(&valid_bytes);
+        let restored = NpcWorldSectionV2::restore(&mut dec).unwrap();
+        dec.finish().unwrap();
+        assert_eq!(restored, valid);
     }
 }
