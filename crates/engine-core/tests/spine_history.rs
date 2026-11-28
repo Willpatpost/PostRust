@@ -698,3 +698,231 @@ fn e3_executed_membership_matches_the_ledger_ground_truth() {
     spine.run_ticks(5);
     check(&spine);
 }
+
+// ---------------------------------------- R2 frontier authority (D-EE-11)
+
+/// R2 arm 1 — acknowledgments beyond executed history: the register
+/// rule's FLOOR (the standing cut) was enforced, but neither the ack
+/// nor the join-time vouch had a CEILING — a consumer could ack
+/// ordinals that were never executed and the frontier would vouch
+/// for records that do not exist (the red witness at base `a3bd984`:
+/// `acknowledge_retention_through(executed + 1_000)` was ACCEPTED
+/// and made the consumer the frontier's leader). The fix: the
+/// executed-ordinal space's extent (`summarized + retained`, the
+/// count identity) is the ceiling, refused TYPED and fail-visible at
+/// both ack and register — never clamped (an ack for nonexistent
+/// records is a caller bug; the typed-refusal discipline —
+/// Regression/UnknownConsumer — is the precedent).
+#[test]
+fn r2_ack_beyond_executed_history_is_refused_typed() {
+    use engine_core::spine::{
+        RetentionAckError, RetentionConsumerId, RetentionPolicy, RetentionRegisterError,
+    };
+    use std::num::NonZeroU64;
+
+    let consumer = RetentionConsumerId::new("r2-ceiling");
+    let mut spine = scenario(4242, 6, 2);
+    let executed = spine.stats().executed;
+    assert!(executed > 0, "the scenario executed records");
+    assert_eq!(
+        spine.ledger_retained().len() as u64,
+        executed,
+        "an uncut spine's extent is the executed count"
+    );
+    spine.arm_retention_frontier(RetentionPolicy::new(
+        NonZeroU64::new(1).unwrap(),
+        NonZeroU64::new(30).unwrap(),
+    ));
+    spine
+        .register_retention_consumer(consumer, 0)
+        .expect("a fresh consumer registers at zero");
+
+    // The beyond-history ack: refused typed, with the extent named.
+    assert!(matches!(
+        spine.acknowledge_retention_through(consumer, executed + 1_000),
+        Err(RetentionAckError::BeyondExecutedHistory {
+            id,
+            executed_through: extent,
+            attempted_through,
+        }) if id == consumer && extent == executed && attempted_through == executed + 1_000
+    ));
+    // The refused ack mutated nothing: the consumer's standing ack is
+    // still zero (it is the holder, not the leader).
+    assert_eq!(spine.retention_consumer_lag(consumer), Some(0));
+
+    // The boundary is INCLUSIVE: the executed extent itself is the
+    // largest honest ack (a consumer that durably processed
+    // everything).
+    spine
+        .acknowledge_retention_through(consumer, executed)
+        .expect("acking exactly the executed extent is honest");
+    assert_eq!(spine.retention_consumer_lag(consumer), Some(0));
+
+    // The join-time vouch has the same ceiling (a late joiner cannot
+    // offer a read point past records that were never executed).
+    let late = RetentionConsumerId::new("r2-late-ceiling");
+    assert!(matches!(
+        spine.register_retention_consumer(late, executed + 1),
+        Err(RetentionRegisterError::BeyondExecutedHistory {
+            id,
+            executed_through: extent,
+            offered_read_point,
+        }) if id == late && extent == executed && offered_read_point == executed + 1
+    ));
+    spine
+        .register_retention_consumer(late, executed)
+        .expect("joining at exactly the executed extent is honest");
+}
+
+/// R2 arm 2 — ordinary explicit compaction vs the consumer frontier:
+/// at base `a3bd984` the explicit `Spine::compact` consulted only the
+/// window (the red witness: `compact(1)` on a frontier-armed spine
+/// with the consumer acked at 0 succeeded, summarizing records the
+/// consumer still needed). The fix (the reviewer's shape (a)): the
+/// ORDINARY compact is safe by default — it refuses, typed, any
+/// window whose post-cut `summarized_records` would pass the minimum
+/// registered acknowledgment (and an armed-but-EMPTY frontier holds
+/// everything, mirroring the cadence's `min(∅)`-is-refusal rule) —
+/// while the explicitly authorized administrative cut is its own
+/// loud, named call shape. The gate is vacuous with no frontier
+/// armed, and the authorized cut's wire bytes are the ordinary
+/// cut's (the gate decides, it never re-encodes).
+#[test]
+fn r2_ordinary_compact_respects_the_frontier_and_the_override_is_typed() {
+    use engine_core::spine::{
+        AdministrativeCompaction, CompactionError, RetentionConsumerId, RetentionPolicy,
+    };
+    use std::num::NonZeroU64;
+
+    let consumer = RetentionConsumerId::new("r2-gate");
+    let mut spine = scenario(4242, 6, 2);
+    let executed = spine.stats().executed;
+    let live = spine.ledger_retained().len() as u64;
+    assert_eq!(executed, live, "the scenario's spine is uncut");
+
+    // The armed-but-EMPTY frontier holds everything: min(∅) is a
+    // refusal, never a permission — the cadence's rule mirrored at
+    // the explicit path.
+    spine.arm_retention_frontier(RetentionPolicy::new(
+        NonZeroU64::new(1).unwrap(),
+        NonZeroU64::new(30).unwrap(),
+    ));
+    assert!(matches!(
+        spine.compact(live - 1),
+        Err(CompactionError::ConsumerFrontierHolds {
+            consumers: 0,
+            frontier_through: 0,
+            summarized_records: 0,
+            ..
+        })
+    ));
+    assert!(
+        matches!(spine.history_kind(), HistoryKind::Full),
+        "the refused ordinary compact mutated nothing"
+    );
+
+    // A registered consumer holding at ack 0: the ordinary compact
+    // refuses the cut past it, typed, with the frontier named.
+    spine
+        .register_retention_consumer(consumer, 0)
+        .expect("register");
+    assert!(matches!(
+        spine.compact(1),
+        Err(CompactionError::ConsumerFrontierHolds {
+            ledger_len,
+            retain: 1,
+            summarized_records: 0,
+            frontier_through: 0,
+            consumers: 1,
+        }) if ledger_len == live
+    ));
+    assert!(
+        matches!(spine.history_kind(), HistoryKind::Full),
+        "the refused ordinary compact mutated nothing"
+    );
+    assert_eq!(
+        spine.ledger_retained().len() as u64,
+        live,
+        "the refused ordinary compact discarded nothing"
+    );
+
+    // The safe window INSIDE the frontier: the consumer releases
+    // `released` ordinals and the ordinary compact of exactly that
+    // prefix succeeds (safe compaction is the default, not the
+    // exception).
+    let released = live / 2;
+    spine
+        .acknowledge_retention_through(consumer, released)
+        .expect("the consumer releases half the history");
+    spine
+        .compact(live - released)
+        .expect("the ordinary compact within the frontier is safe");
+    let HistoryKind::Compacted {
+        summarized_records, ..
+    } = spine.history_kind()
+    else {
+        panic!("the safe window compacted the spine");
+    };
+    assert_eq!(summarized_records, released);
+
+    // The authorized administrative cut past the frontier: the named,
+    // loud override performs what the ordinary path refuses, and its
+    // wire bytes are byte-identical to an unarmed spine's ordinary
+    // cut of the same window (the gate decides, it never re-encodes —
+    // the wire stays a function of the cut sequence alone).
+    let cut_more = spine.ledger_retained().len() as u64 / 2;
+    let mut unarmed = scenario(4242, 6, 2);
+    unarmed
+        .compact(live - released - cut_more)
+        .expect("the unarmed twin takes the same total window");
+    spine
+        .compact_authorized(
+            spine.ledger_retained().len() as u64 - cut_more,
+            AdministrativeCompaction::explicit_override(),
+        )
+        .expect("the authorized administrative cut past the frontier");
+    assert_eq!(
+        spine.save_bytes(),
+        unarmed.save_bytes(),
+        "the authorized cut and the unarmed ordinary cut agree byte for byte"
+    );
+    // The frontier accounting stays coherent fail-closed after the
+    // override: the consumer's ack (released) sits below the new
+    // standing cut, so the cadence's releasable clamp saturates at
+    // zero — no firing until the ack catches up.
+    spine.run_ticks(3);
+    assert_eq!(
+        spine.retention_stats().compactions,
+        0,
+        "the over-cut frontier holds: releasable saturates at zero"
+    );
+    let HistoryKind::Compacted {
+        summarized_records, ..
+    } = spine.history_kind()
+    else {
+        panic!("the spine stays compacted");
+    };
+    spine
+        .acknowledge_retention_through(consumer, summarized_records + 2)
+        .expect("the ack catches up past the new standing cut");
+    // Push the ledger past the policy's bound so the next checkpoint
+    // crossing is guaranteed (the firing assertion must not depend on
+    // the scenario's residual spawn budget).
+    let due = spine.clock().0 + 1;
+    for i in 0..40u64 {
+        spine
+            .schedule(common::at(due, 9_000 + i))
+            .expect("schedule");
+    }
+    spine.run_ticks(6);
+    assert_eq!(
+        spine.retention_stats().compactions,
+        1,
+        "the caught-up frontier fires again, measured from the new prefix"
+    );
+    assert_eq!(
+        spine.retention_stats().last_chunk,
+        2,
+        "the firing is clamped to the caught-up ack's releasable 2"
+    );
+}
