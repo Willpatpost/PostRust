@@ -308,3 +308,183 @@ fn npc_world_save_v2_round_trips_under_the_composition_budget() {
         Err(SaveError::Limit { .. })
     ));
 }
+
+#[test]
+fn npc_world_save_v2_restores_under_its_own_configuration_budget() {
+    // R5 (the production-entry boundary's config-class lever, the
+    // integration half): the budget a composition boundary restoring
+    // LESS-TRUSTED bytes configures — FINITE, derived from the
+    // caller's own authored `WorldConfig` through the public
+    // `SectionDecodeLimits::for_config` (re-exported at the crate
+    // root with the T21 surface) — admits the configuration's own
+    // section byte-identically (the safe upper bound covers every
+    // per-block split and lod shape), while a workload declaring
+    // beyond the authored configuration refuses typed BEFORE any
+    // reservation: one more identity at the aggregate identity
+    // gate, a wider partition at the reserve ledger's first charge.
+    // The wire maximum is the compatibility limit, never the
+    // affordability claim — the two contracts the R5 census keeps
+    // distinct.
+    use engine_core::lod::LodLevel;
+    use engine_core::npc_behavior::{NpcId, NpcIdentity};
+    use engine_core::npc_world_save::{NpcRegionBlock, NpcWorldSectionV2};
+    use engine_core::world_config::WorldConfig;
+    use engine_core::{Decoder, Encoder, SaveError, SectionDecodeLimits, Tick};
+
+    let identities = |region: u8, ids: &[u32]| -> Vec<NpcIdentity> {
+        ids.iter()
+            .map(|&id| NpcIdentity {
+                id: NpcId(id),
+                home_cell: ((id % 16) as u8, ((id / 16) % 16) as u8),
+                region,
+                appearance_seed: id.wrapping_mul(2_654_435_761),
+            })
+            .collect()
+    };
+    let block = |region: u8, ids: &[u32], dormant: bool| NpcRegionBlock {
+        near: region < 2,
+        lod: if dormant {
+            LodLevel::Dormant
+        } else {
+            LodLevel::Full
+        },
+        identities: identities(region, ids),
+        steps: ids.iter().map(|&id| u64::from(id) % 97).collect(),
+        milestones: ids.iter().map(|&id| u64::from(id) % 16).collect(),
+        credits: ids.iter().map(|&id| u64::from(id) % 5).collect(),
+        routine_cursor: if dormant {
+            Vec::new()
+        } else {
+            ids.iter().map(|&id| u64::from(id) / 2).collect()
+        },
+        positions: if dormant {
+            Vec::new()
+        } else {
+            ids.iter()
+                .map(|&id| ((id % 16) as u8, ((id / 7) % 16) as u8))
+                .collect()
+        },
+        represented_through: if dormant {
+            Vec::new()
+        } else {
+            ids.iter().map(|&id| Tick(u64::from(id) % 31)).collect()
+        },
+        pending_signals: if dormant {
+            Vec::new()
+        } else {
+            ids.iter().map(|&id| u64::from(id) % 3).collect()
+        },
+    };
+    // The concentrated split — every identity in region 0, the
+    // partition's nominal maximum — under a dormant tail.
+    let section = NpcWorldSectionV2 {
+        seed: 42,
+        activity_period: 5,
+        simplify_factor: 3,
+        commitment_window: 9,
+        region_lods_enabled: true,
+        config: WorldConfig {
+            region_count: 3,
+            npc_count: 9,
+            region_grid: 16,
+        },
+        regions: vec![
+            block(0, &[0, 1, 2, 3, 4, 5, 6, 7, 8], false),
+            block(1, &[], true),
+            block(2, &[], true),
+        ],
+    };
+    section
+        .validate()
+        .expect("the fixture section is consistent");
+    let mut enc = Encoder::new();
+    section.save(&mut enc);
+    let bytes = enc.into_bytes();
+    // The configuration's own budget admits it — the exact charge
+    // fits the safe upper bound, and the round trip is
+    // byte-identical.
+    let limits = SectionDecodeLimits::for_config(section.config)
+        .expect("the authored configuration is in the domain");
+    let exact = section
+        .decode_reservation_bytes()
+        .expect("the charge is representable");
+    assert!(
+        exact <= limits.max_reserve_bytes,
+        "the exact charge ({exact}) fits the config-derived budget ({})",
+        limits.max_reserve_bytes
+    );
+    let mut dec = Decoder::new(&bytes);
+    let restored = NpcWorldSectionV2::restore_with_limits(&mut dec, &limits)
+        .expect("the configuration's own budget admits its own section");
+    assert!(dec.finish().is_ok());
+    assert_eq!(restored, section);
+    let mut re_enc = Encoder::new();
+    restored.save(&mut re_enc);
+    assert_eq!(re_enc.into_bytes(), bytes);
+    // One identity beyond the authored population refuses typed at
+    // the aggregate identity gate, before any reservation.
+    let smaller = SectionDecodeLimits::for_config(WorldConfig {
+        region_count: 3,
+        npc_count: 8,
+        region_grid: 16,
+    })
+    .expect("the authored configuration is in the domain");
+    assert!(matches!(
+        NpcWorldSectionV2::restore_with_limits(&mut Decoder::new(&bytes), &smaller),
+        Err(SaveError::Limit {
+            kind: "npc-count",
+            value: 9,
+            max: 8,
+            ..
+        })
+    ));
+    // A narrower authored partition refuses the wide section at the
+    // reserve ledger's first charge (the block vector), before it
+    // reserves: a 12-region carrier of the same nine identities
+    // under a budget authored for one region.
+    let wide = NpcWorldSectionV2 {
+        config: WorldConfig {
+            region_count: 12,
+            npc_count: 9,
+            region_grid: 16,
+        },
+        regions: (0..12u8)
+            .map(|region| {
+                let ids: &[u32] = if region == 0 {
+                    &[0, 1, 2, 3, 4, 5, 6, 7, 8]
+                } else {
+                    &[]
+                };
+                block(region, ids, region > 0)
+            })
+            .collect(),
+        ..section.clone()
+    };
+    wide.validate().expect("the wide carrier is consistent");
+    let narrow = SectionDecodeLimits::for_config(WorldConfig {
+        region_count: 1,
+        npc_count: 9,
+        region_grid: 16,
+    })
+    .expect("the authored configuration is in the domain");
+    let block_vector = {
+        // The ledger's granularity-rounded block-vector charge
+        // (ceil to the documented 64-byte granularity).
+        let nominal = 12 * std::mem::size_of::<NpcRegionBlock>() as u64;
+        nominal.div_ceil(64) * 64
+    };
+    assert!(
+        block_vector > narrow.max_reserve_bytes,
+        "the wide carrier's block vector ({block_vector}) must exceed the narrow budget ({})",
+        narrow.max_reserve_bytes
+    );
+    let mut wide_enc = Encoder::new();
+    wide.save(&mut wide_enc);
+    assert!(matches!(
+        NpcWorldSectionV2::restore_with_limits(&mut Decoder::new(&wide_enc.into_bytes()), &narrow),
+        Err(SaveError::Limit {
+            kind: "regions-reserve",
+            ..
+        })
+    ));
+}

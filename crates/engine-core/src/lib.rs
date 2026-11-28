@@ -130,7 +130,7 @@ pub const POSITION_DISCARDED: (u8, u8) = (u8::MAX, u8::MAX);
 pub use lod::{LodConfig, LodConfigError, LodController, LodLevel, PresenceSample};
 pub use npc_world_save::{
     NPC_WORLD_SAVE_DOMAIN, NPC_WORLD_SAVE_DOMAIN_V2, NpcRegionBlock, NpcSaveWorld, NpcSaveWorldV2,
-    NpcWorldSection, NpcWorldSectionV2,
+    NpcWorldSection, NpcWorldSectionV2, SectionDecodeLimits,
 };
 pub use spine::{
     CompactionError, ExecCtx, FollowUpAdmission, HistoryKind, HousekeepingAdmission, LaneReport,

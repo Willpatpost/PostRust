@@ -406,6 +406,49 @@ pub const NPC_WORLD_SAVE_DOMAIN_V2: &str = "engine-slice/npc-world-save/2";
 /// whether a future format scopes identities per region is a
 /// format-versioning decision, never a decode-limit decision.
 ///
+/// **The production-entry boundary (the R5 census, 2026-11-28):**
+/// every PRODUCTION world-section decode entry in this tree flows
+/// TRUSTED-LOCAL saves, and none decodes v2 bytes at all yet:
+///
+/// * the application's [`crate::SaveWorld`] implementation for its
+///   `NpcWorld` (engine-slice's `npc` module) delegates to the V1
+///   [`NpcWorldSection::restore`] — reached only through
+///   `Spine::<NpcWorld>::restore` inside engine-slice's
+///   `restore_session`, whose bytes are the session snapshot the
+///   process itself serialized (the capture-validation round trip)
+///   or the persist medium's hash-verified, content-addressed,
+///   single-writer LOCAL storage (the recovery's HEAD-descent walk
+///   reads every object through `read_object`'s SHA-256
+///   verification against the requested identity);
+/// * the persist rotation anchor (`engine-persist`'s
+///   `session_anchor`) validates the newest snapshot through
+///   `Spine::<NpcSaveWorld>::restore` — the same fixed v1 walk,
+///   validation only;
+/// * the v2 codec has ZERO production consumers: `NpcSaveWorldV2`
+///   exists for the future authenticated v2 anchor (the P3
+///   coordination recorded at its doc), and
+///   [`NpcWorldSectionV2::restore_with_limits`] is called today
+///   only by tests.
+///
+/// The v1 walk needs no limits type (its identity set is the fixed
+/// 1,000-record v1 interpretation — transients a 56,000-byte-nominal
+/// constant, reserved fallibly; affordability is definitionally
+/// granted), and the [`crate::SaveWorld::restore`] trait signature
+/// carries no limits parameter BY the documented CA-02 owner
+/// decision — affordability belongs to the entry that owns the
+/// bytes, never to the generic codec. No network/co-op transport
+/// exists anywhere in the tree (networking is on the
+/// anti-abstraction ledger of both engine-core and engine-persist);
+/// the reviewer's "network/untrusted load" is the FIRST GAME's
+/// design goal, not landed code. WHEN such an entry lands — or any
+/// boundary restoring bytes it did not author — it must call
+/// [`NpcWorldSectionV2::restore_with_limits`] with a FINITE budget
+/// ([`Self::for_config`] derives one from the composition's own
+/// authored [`WorldConfig`]), never [`Self::WIRE_MAXIMUM`]: the wire
+/// maximum is a COMPATIBILITY limit (what a well-formed section may
+/// declare), never an affordability claim (what this decoder can
+/// spend materializing it).
+///
 /// The default ([`Self::WIRE_MAXIMUM`]) is exactly the wire's own
 /// validity domain, so the plain [`NpcWorldSectionV2::restore`]
 /// entry keeps today's acceptance byte for byte; composition
@@ -442,6 +485,23 @@ pub const NPC_WORLD_SAVE_DOMAIN_V2: &str = "engine-slice/npc-world-save/2";
 /// [`NpcWorldSectionV2::decode_reservation_bytes`]), and the census
 /// binary remains the natural follow-up if the composition boundary
 /// adopting `restore_with_limits` wants allocator-level telemetry.
+/// **What the census battery would carry (the designed shape, R5 —
+/// deliberately NOT implemented here):** `tests/npc_decode_allocations.rs`,
+/// one `#[global_allocator]` per binary, pinning for a fixed section
+/// under [`Self::WIRE_MAXIMUM`] and under [`Self::for_config`]
+/// budgets that the decode's allocation EVENT count equals the
+/// ledger's reservation count, that the allocation BYTES are at most
+/// the ledger's charge under the platform's real size classes (the
+/// 64-byte estimate's honesty made measurable, per-thread attributed
+/// the spine-allocation precedent's waker-registration lesson), and
+/// that every typed refusal path makes ZERO allocation events. It is
+/// not implemented on this lane by design: the counting allocator
+/// is engine-core's SECOND `unsafe` `GlobalAlloc` exception under
+/// the workspace's `unsafe_code = "deny"` (the first,
+/// `tests/spine_allocations.rs`, was admitted by an owner ruling
+/// with its own safety exception doc) — an unsafe-exception policy
+/// decision belonging to a lane brief carrying that authority, not
+/// to a docs-and-wiring lane under a no-unsafe invariant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SectionDecodeLimits {
     /// The maximum total identity records (the declared
@@ -481,6 +541,89 @@ impl SectionDecodeLimits {
             max_identities,
             max_reserve_bytes,
         }
+    }
+
+    /// The FINITE composition budget derived from the caller's own
+    /// authored configuration (R5 — the config-class affordability
+    /// decision, the budget a boundary restoring LESS-TRUSTED bytes
+    /// configures instead of [`Self::WIRE_MAXIMUM`]): `max_identities`
+    /// is exactly the authored population, and `max_reserve_bytes`
+    /// is the closed-form WORST-CASE charge any section carrying a
+    /// workload at or below that configuration can incur — the
+    /// partition transients (the block vector and the
+    /// uniqueness-merge scratch at the authored region count) plus
+    /// every column at the authored population in the ALL-ACTIVE
+    /// shape (the dormant shape is its subset), each column's
+    /// per-block charge sum bounded by `npc_count × stride +
+    /// (granularity − 1) × region_count` (the split's rounding
+    /// slack: a concentrated split pays the nominal, a
+    /// one-identity-per-region split pays the per-block rounding —
+    /// the bound covers both).
+    ///
+    /// The budget is a SAFE UPPER BOUND, never the minimal charge:
+    /// a known section's exact charge is
+    /// [`NpcWorldSectionV2::decode_reservation_bytes`], and this
+    /// budget is at or above it for every section whose declared
+    /// population is at most `config.npc_count` and whose partition
+    /// fits the authored region count — so restoring the
+    /// composition's own saves NEVER refuses (the gates never reject
+    /// a valid encoding), while a section declaring MORE than the
+    /// authored workload refuses TYPED ([`SaveError::Limit`]) — more
+    /// identities at the aggregate identity gate, a wider partition
+    /// at the reserve ledger — BEFORE the reservation it refuses.
+    /// The wire's own validity domain and this budget are the two
+    /// contracts the R5 census keeps distinct: the wire maximum is a
+    /// COMPATIBILITY limit (what a well-formed section may declare),
+    /// never an affordability claim (what this decoder can spend
+    /// materializing it).
+    ///
+    /// Fail-closed on a configuration outside [`WorldConfig`]'s
+    /// domain (exactly [`WorldConfig::validated`]'s gates), never
+    /// repaired.
+    pub fn for_config(config: WorldConfig) -> Result<Self, SaveError> {
+        const SECTION: &str = "section-decode-limits";
+        config
+            .validated()
+            .map_err(|_| SaveError::Integrity("section-decode-limits/world-config"))?;
+        let region_count = u64::from(config.region_count);
+        let npc_count = u64::from(config.npc_count);
+        // The partition transients at the authored region count: the
+        // block vector and the uniqueness-merge scratch.
+        let block_vector = region_count
+            .checked_mul(std::mem::size_of::<NpcRegionBlock>() as u64)
+            .ok_or(SaveError::Overflow { section: SECTION })?;
+        let mut total = allocation_charge(block_vector)?;
+        let scratch = region_count
+            .checked_mul(std::mem::size_of::<UniquenessCursor>() as u64)
+            .ok_or(SaveError::Overflow { section: SECTION })?;
+        total = total
+            .checked_add(allocation_charge(scratch)?)
+            .ok_or(SaveError::Overflow { section: SECTION })?;
+        // Every column at the authored population in the ALL-ACTIVE
+        // shape, with the per-block split's rounding slack bounded
+        // by one granularity per non-empty block: the sum over
+        // blocks of ceil64(count × stride) is at most
+        // npc_count × stride + (granularity − 1) × region_count
+        // (the one-count-governs rule makes the nominal terms
+        // split-independent).
+        let slack = (ALLOCATION_GRANULARITY - 1)
+            .checked_mul(region_count)
+            .ok_or(SaveError::Overflow { section: SECTION })?;
+        for stride in ACTIVE_COLUMN_STRIDES {
+            let nominal = npc_count
+                .checked_mul(stride)
+                .ok_or(SaveError::Overflow { section: SECTION })?;
+            let bound = nominal
+                .checked_add(slack)
+                .ok_or(SaveError::Overflow { section: SECTION })?;
+            total = total
+                .checked_add(bound)
+                .ok_or(SaveError::Overflow { section: SECTION })?;
+        }
+        Ok(SectionDecodeLimits {
+            max_identities: npc_count,
+            max_reserve_bytes: total,
+        })
     }
 }
 
@@ -1143,24 +1286,12 @@ impl NpcWorldSectionV2 {
             // shape: the identity table, steps, milestones, and
             // credits always; the four reconstructible columns only
             // in the active shape (the structural dormant rule).
+            // The SHARED stride tables — for_config's worst case
+            // derives from the same numbers, never a second copy.
             let strides: &[u64] = if block.lod == LodLevel::Dormant {
-                &[
-                    std::mem::size_of::<NpcIdentity>() as u64,
-                    std::mem::size_of::<u64>() as u64,
-                    std::mem::size_of::<u64>() as u64,
-                    std::mem::size_of::<u64>() as u64,
-                ]
+                &DORMANT_COLUMN_STRIDES
             } else {
-                &[
-                    std::mem::size_of::<NpcIdentity>() as u64,
-                    std::mem::size_of::<u64>() as u64,
-                    std::mem::size_of::<u64>() as u64,
-                    std::mem::size_of::<(u8, u8)>() as u64,
-                    std::mem::size_of::<Tick>() as u64,
-                    std::mem::size_of::<u64>() as u64,
-                    std::mem::size_of::<u64>() as u64,
-                    std::mem::size_of::<u64>() as u64,
-                ]
+                &ACTIVE_COLUMN_STRIDES
             };
             for stride in strides {
                 let nominal = count
@@ -1359,6 +1490,36 @@ fn position_admitted(position: (u8, u8), region_grid: u8) -> bool {
 /// telemetry remains the counting-allocator census follow-up (see
 /// [`SectionDecodeLimits`]'s census note).
 const ALLOCATION_GRANULARITY: u64 = 64;
+
+/// The per-identity IN-MEMORY column strides the v2 walk reserves
+/// for the DORMANT (record-only) block shape: the identity table,
+/// steps, milestones, and credits. THE ONE stride table shared by
+/// [`NpcWorldSectionV2::decode_reservation_bytes`] (the exact-charge
+/// mirror) and [`SectionDecodeLimits::for_config`] (the config-class
+/// budget's worst case) — never two tables that could drift.
+const DORMANT_COLUMN_STRIDES: [u64; 4] = [
+    std::mem::size_of::<NpcIdentity>() as u64,
+    std::mem::size_of::<u64>() as u64,
+    std::mem::size_of::<u64>() as u64,
+    std::mem::size_of::<u64>() as u64,
+];
+
+/// The per-identity IN-MEMORY column strides of the ACTIVE block
+/// shape: the dormant record columns PLUS the four reconstructible
+/// columns (routine cursor, positions, represented-through,
+/// pending signals). The active set is the SUPERSET — the worst
+/// case every aggregate budget must cover (see
+/// [`DORMANT_COLUMN_STRIDES`] for the one-table discipline).
+const ACTIVE_COLUMN_STRIDES: [u64; 8] = [
+    std::mem::size_of::<NpcIdentity>() as u64,
+    std::mem::size_of::<u64>() as u64,
+    std::mem::size_of::<u64>() as u64,
+    std::mem::size_of::<(u8, u8)>() as u64,
+    std::mem::size_of::<Tick>() as u64,
+    std::mem::size_of::<u64>() as u64,
+    std::mem::size_of::<u64>() as u64,
+    std::mem::size_of::<u64>() as u64,
+];
 
 /// The wire bytes every region block costs before any identity
 /// (T21's whole-input minimum gate): the near flag, the LOD
@@ -2542,6 +2703,220 @@ mod tests {
                 ..
             }) if max == admitting - 1
         ));
+    }
+
+    /// THE CONFIG-DERIVED ADMISSION BUDGET (R5 — the production-entry
+    /// boundary's config-class lever): `SectionDecodeLimits::for_config`
+    /// derives a FINITE budget from the composition's own authored
+    /// configuration, the budget a boundary restoring less-trusted
+    /// bytes configures instead of the wire maximum. The
+    /// never-refuses property on every shape a configuration can
+    /// carry: the concentrated split (every identity in one block —
+    /// the nominal maximum), the spread split (one identity per
+    /// block — the per-block rounding maximum), the round-robin
+    /// fixture partition, mixed dormant/active, all-dormant, the
+    /// minimal world, and the widest admitted partition — each
+    /// section's own bytes restore under its own configuration's
+    /// budget, and the exact charge
+    /// (`decode_reservation_bytes`) is at or below the budget (the
+    /// gates never reject a valid encoding; the bound covers both
+    /// split extremes).
+    #[test]
+    fn the_config_derived_budget_admits_every_section_its_config_carries() {
+        let base = scaled_section(1, 1, 16, 1);
+        let shaped = |splits: Vec<Vec<u32>>, grid: u8, dormant_from: usize| {
+            let regions = splits
+                .iter()
+                .enumerate()
+                .map(|(region, ids)| {
+                    region_block(
+                        region as u8,
+                        grid,
+                        ids,
+                        if region >= dormant_from {
+                            LodLevel::Dormant
+                        } else {
+                            LodLevel::Full
+                        },
+                        region < 2,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let npc_count: u32 = splits.iter().map(|ids| ids.len() as u32).sum();
+            NpcWorldSectionV2 {
+                regions,
+                config: WorldConfig {
+                    region_count: splits.len() as u32,
+                    npc_count,
+                    region_grid: grid,
+                },
+                ..base.clone()
+            }
+        };
+        // The concentrated split: all nine identities in region 0,
+        // two empty blocks after.
+        let concentrated = shaped(vec![vec![0, 1, 2, 3, 4, 5, 6, 7, 8], vec![], vec![]], 16, 9);
+        // The spread split: one identity per block across five
+        // regions (four identities ride the last block).
+        let spread = shaped(
+            vec![vec![0], vec![1], vec![2], vec![3], vec![4, 5, 6, 7]],
+            16,
+            3,
+        );
+        let mut battery: Vec<NpcWorldSectionV2> = vec![concentrated, spread];
+        // The fixture scales: the corner's configured values (both
+        // shapes), the memory-lane scale, the 10k fixture, the
+        // minimal world, the widest partition.
+        for (regions, npcs, grid, active) in [
+            (8, 24, 16, 8),
+            (8, 1000, 16, 8),
+            (8, 1000, 16, 3),
+            (64, 10_000, 16, 4),
+            (1, 1, 1, 1),
+            (256, 300, 255, 0),
+        ] {
+            battery.push(scaled_section(regions, npcs, grid, active));
+        }
+        for section in battery {
+            section
+                .validate()
+                .expect("the battery section is consistent");
+            let limits = SectionDecodeLimits::for_config(section.config)
+                .expect("the battery configuration is in the domain");
+            assert!(
+                limits.max_identities == u64::from(section.config.npc_count),
+                "the identity budget is exactly the authored population"
+            );
+            let exact = section
+                .decode_reservation_bytes()
+                .expect("the charge is representable");
+            assert!(
+                exact <= limits.max_reserve_bytes,
+                "the exact charge ({exact}) must fit the config-derived budget ({})",
+                limits.max_reserve_bytes
+            );
+            let bytes = encode_v2(&section);
+            let mut dec = Decoder::new(&bytes);
+            let restored = NpcWorldSectionV2::restore_with_limits(&mut dec, &limits)
+                .expect("the config-derived budget never refuses the config's own section");
+            dec.finish().unwrap();
+            assert_eq!(restored, section);
+            assert_eq!(encode_v2(&restored), bytes);
+        }
+    }
+
+    /// THE CONFIG-DERIVED ADMISSION BUDGET, refusal half (R5): a
+    /// section declaring MORE than the authored workload refuses
+    /// TYPED, before the reservation it refuses — more identities at
+    /// the aggregate identity gate (the over-budget workload
+    /// refusal), a wider partition at the reserve ledger's FIRST
+    /// charge (the block vector). The wire maximum keeps today's
+    /// acceptance of the same bytes: the limits change admission,
+    /// never the walk.
+    #[test]
+    fn the_config_derived_budget_refuses_declarations_beyond_the_authored_workload() {
+        // The identity axis: a 3-region/12-identity section under a
+        // budget authored for 11 identities — the aggregate gate
+        // fires before the whole-input proof or any reservation.
+        let section = scaled_section(3, 12, 4, 1);
+        let bytes = encode_v2(&section);
+        let limits = SectionDecodeLimits::for_config(WorldConfig {
+            region_count: 3,
+            npc_count: 11,
+            region_grid: 4,
+        })
+        .expect("the authored configuration is in the domain");
+        assert!(matches!(
+            NpcWorldSectionV2::restore_with_limits(&mut Decoder::new(&bytes), &limits),
+            Err(SaveError::Limit {
+                kind: "npc-count",
+                value: 12,
+                max: 11,
+                ..
+            })
+        ));
+        // The partition axis: a 256-region section under a budget
+        // authored for one region — the block vector's charge alone
+        // (256 x size_of::<NpcRegionBlock>(), granularity-rounded)
+        // exceeds the whole derived budget, so the refusal fires at
+        // the walk's FIRST charge, before the vector reserves.
+        let wide = scaled_section(256, 1, 16, 0);
+        let wide_bytes = encode_v2(&wide);
+        let narrow = SectionDecodeLimits::for_config(WorldConfig {
+            region_count: 1,
+            npc_count: 1,
+            region_grid: 16,
+        })
+        .expect("the authored configuration is in the domain");
+        let block_vector = allocation_charge(256 * std::mem::size_of::<NpcRegionBlock>() as u64)
+            .expect("the block-vector charge is representable");
+        assert!(
+            block_vector > narrow.max_reserve_bytes,
+            "the wide partition's block vector ({block_vector}) must exceed the narrow budget ({})",
+            narrow.max_reserve_bytes
+        );
+        assert!(matches!(
+            NpcWorldSectionV2::restore_with_limits(&mut Decoder::new(&wide_bytes), &narrow),
+            Err(SaveError::Limit {
+                kind: "regions-reserve",
+                value,
+                max,
+                ..
+            }) if value == block_vector && max == narrow.max_reserve_bytes
+        ));
+        // The wire maximum keeps today's acceptance of both inputs
+        // exactly (the compatibility limit, distinct from the
+        // affordability contract).
+        let mut dec = Decoder::new(&bytes);
+        assert!(
+            NpcWorldSectionV2::restore_with_limits(&mut dec, &SectionDecodeLimits::WIRE_MAXIMUM)
+                .is_ok()
+        );
+        let mut dec = Decoder::new(&wide_bytes);
+        assert!(
+            NpcWorldSectionV2::restore_with_limits(&mut dec, &SectionDecodeLimits::WIRE_MAXIMUM)
+                .is_ok()
+        );
+    }
+
+    /// The budget derivation is fail-closed on the configuration's
+    /// own domain (R5): a zero partition, a partition beyond the
+    /// identity codec's region field, a zero population, or a zero
+    /// grid side refuses at the derivation — never a repaired or
+    /// defaulted budget.
+    #[test]
+    fn an_invalid_configuration_is_refused_at_the_budget_derivation() {
+        let base = WorldConfig {
+            region_count: 3,
+            npc_count: 9,
+            region_grid: 16,
+        };
+        for invalid in [
+            WorldConfig {
+                region_count: 0,
+                ..base
+            },
+            WorldConfig {
+                region_count: MAX_REGION_COUNT + 1,
+                ..base
+            },
+            WorldConfig {
+                npc_count: 0,
+                ..base
+            },
+            WorldConfig {
+                region_grid: 0,
+                ..base
+            },
+        ] {
+            assert!(
+                matches!(
+                    SectionDecodeLimits::for_config(invalid),
+                    Err(SaveError::Integrity("section-decode-limits/world-config"))
+                ),
+                "the configuration {invalid:?} must refuse at the derivation"
+            );
+        }
     }
 
     /// THE CROSS-REGION UNIQUENESS MERGE (T21): the per-ID
