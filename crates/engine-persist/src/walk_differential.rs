@@ -612,17 +612,28 @@ impl Drop for Case {
 /// mutated stores (the prior sub-case's mediums are dropped at its
 /// block's end, before this runs).
 fn opened_pair(case: &Case, steps: &[Step]) -> (LocalFileMedium, SqliteMedium) {
-    // The wipe is LOUD on remnants (the Windows lesson, run
-    // 46155517625): a swallowed wipe failure surfaces later as a
-    // mystery unwrap in the clean open, far from its cause — fail
-    // HERE, naming the leftover, if anything survives removal.
-    if let Err(error) = fs::remove_dir_all(&case.root)
-        && case.root.exists()
-    {
-        panic!(
-            "the scratch wipe left remnants at {}: {error}",
-            case.root.display()
-        );
+    // The wipe is LOUD on remnants (the Windows lesson, runs
+    // 46155517625 + 46156442963): a swallowed wipe failure surfaces
+    // later as a mystery unwrap in the clean open, far from its
+    // cause. It first RETRIES with a bounded backoff — the transient
+    // lock class is real on Windows CI runners (the scanner holding
+    // a brief handle on a freshly-written db, os error 32) and
+    // releases on its own — then fails HERE, naming the leftover, if
+    // anything survives.
+    let mut wipe_attempts = 0;
+    while let Err(error) = fs::remove_dir_all(&case.root) {
+        if !case.root.exists() {
+            break;
+        }
+        wipe_attempts += 1;
+        if wipe_attempts >= 3 {
+            panic!(
+                "the scratch wipe left remnants at {} after {wipe_attempts} attempts: \
+                 {error}",
+                case.root.display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
     fs::create_dir_all(&case.root).unwrap();
     let local_root = case.local_root();
@@ -3768,17 +3779,18 @@ fn provider_read_failures_refuse_typed_fail_closed() {
         fs::create_dir(&path).unwrap();
         let local_observation =
             cold_outcome(local.walk_differential_cold(chain.head, &no_exclusion()));
-        // Windows delete semantics (2026-11-29, run 46155517625): the
-        // local medium's still-open handles let the scratch wipe
-        // (`let _ = remove_dir_all` in opened_pair) silently fail, so
-        // the injected object-directory survived into the SECOND
-        // opened_pair's clean open — the "read object"
-        // PermissionDenied surfacing as a mystery unwrap panic instead
-        // of the asserted typed refusal. Unix unlink semantics mask
-        // the divergence (handles never block removal). The medium is
-        // dropped BEFORE the scratch is reused; the observation was
-        // captured above (an owned outcome, not a borrow).
+        // Windows delete semantics (2026-11-29, runs 46155517625 +
+        // 46156442963): the local medium's still-open handles let the
+        // scratch wipe fail silently (the first run's swallowed
+        // failure surfacing as a mystery unwrap far from its cause),
+        // and the FIRST PAIR's sqlite medium holds the db-file lock
+        // at the second wipe — the loud wipe naming it "os error 32".
+        // Unix unlink semantics mask both (handles never block
+        // removal). BOTH first-pair mediums are dropped BEFORE the
+        // scratch is reused; the observations were captured above as
+        // owned outcomes, not borrows.
         drop(local);
+        drop(_sqlite);
         // Sqlite: the objects table is dropped under the same walk.
         let (chain2, _object2) = plain_chain();
         let (_local2, sqlite2) = opened_pair(&case, &chain2.steps);
