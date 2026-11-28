@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/engine-animation",
     "crates/engine-core",
     "crates/engine-persist",
     "crates/engine-renderer",

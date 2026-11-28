@@ -17,6 +17,11 @@ sdl3 = { version = "=0.20.0", default-features = false, features = ["build-from-
 # Validation-layer messages, swapchain events, and renderer diagnostics
 # flow through the shared engine-core logger (L0, TECH-ARCHITECTURE §2.12).
 engine-core = { path = "../engine-core" }
+# The deterministic animation core (A06 extraction, DECISION-A06 §4
+# E-S1, owner-approved per D-EE-10 §2): the pure pose/skeleton/
+# sampling machinery, re-exported through the animation
+# compatibility shim so every existing import path is stable.
+engine-animation = { path = "../engine-animation" }
 # Debug-overlay font: public-domain 8x8 bitmap data, no code (Stage 2
 # authorization item 4 — minimal overlay, no UI framework).
 font8x8 = "0.3.1"

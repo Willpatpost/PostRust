@@ -145,39 +145,17 @@ pub fn generation_write_needed(stamp: u64, generation: u64) -> bool {
     generation == 0 || stamp != generation
 }
 
-/// The fixed half-turn constant (the nearest f32 to π/2 — a fixed
-/// bit pattern, identical on every platform).
-const FRAC_PI_2: f32 = core::f32::consts::FRAC_PI_2;
-
-/// The deterministic sine/cosine of a turn fraction. Quadrant
-/// reduction plus fixed-order fixed-constant Taylor series (Horner
-/// evaluation, pure IEEE f32 arithmetic — no libm, no platform
-/// variation). Documented precision: absolute error ≤ 2e-6 over the
-/// full turn — ample for proxy orientation, where the contract is
-/// BIT-IDENTITY across platforms, not libm-grade accuracy.
-pub fn sin_cos_turn(turn: u16) -> (f32, f32) {
-    let quadrant = (turn >> 14) & 3;
-    // The within-quadrant angle: [0, π/2).
-    let x = (turn & 0x3FFF) as f32 * (FRAC_PI_2 / 16384.0);
-    let x2 = x * x;
-    // sin(x): x − x³/3! + x⁵/5! − x⁷/7! + x⁹/9! − x¹¹/11! (Horner).
-    let sin_x = x
-        * (1.0
-            + x2 * (-1.0 / 6.0
-                + x2 * (1.0 / 120.0
-                    + x2 * (-1.0 / 5040.0 + x2 * (1.0 / 362880.0 + x2 * (-1.0 / 39916800.0))))));
-    // cos(x): 1 − x²/2! + x⁴/4! − x⁶/6! + x⁸/8! − x¹⁰/10! (Horner).
-    let cos_x = 1.0
-        + x2 * (-1.0 / 2.0
-            + x2 * (1.0 / 24.0
-                + x2 * (-1.0 / 720.0 + x2 * (1.0 / 40320.0 + x2 * (-1.0 / 3628800.0)))));
-    match quadrant {
-        0 => (sin_x, cos_x),
-        1 => (cos_x, -sin_x),
-        2 => (-sin_x, -cos_x),
-        _ => (-cos_x, sin_x),
-    }
-}
+/// The deterministic sine/cosine of a turn fraction (the libm-free
+/// turn trigonometry — quadrant reduction plus fixed-order
+/// fixed-constant Taylor series, pure IEEE f32 arithmetic; the
+/// determinism contract in this module's header leans on it).
+/// MOVED to the engine-animation crate at E-S1 (the animation
+/// core's rotations and this module's instance packing share the
+/// ONE implementation — the convention exists exactly once; its
+/// known-answer tests moved with it) and re-exported here to hold
+/// the existing `engine_renderer::proxy_instances::sin_cos_turn`
+/// import path (the slice's test oracles among the consumers).
+pub use engine_animation::sin_cos_turn;
 
 /// The instance transform as four COLUMN-MAJOR matrix columns (the
 /// WGSL `mat4x4` constructor's order — the same convention the
@@ -453,45 +431,6 @@ pub fn verify_population_generation(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The known answers at the cardinal turns. Tolerance 1e-5
-    /// covers the documented Taylor truncation (≤ 2e-6) with margin.
-    #[test]
-    fn sin_cos_turn_known_answers() {
-        let (s, c) = sin_cos_turn(0);
-        assert!(
-            (s - 0.0).abs() < 1e-5 && (c - 1.0).abs() < 1e-5,
-            "zero turn: ({s}, {c})"
-        );
-        let (s, c) = sin_cos_turn(16384);
-        assert!(
-            (s - 1.0).abs() < 1e-5 && c.abs() < 1e-5,
-            "quarter: ({s}, {c})"
-        );
-        let (s, c) = sin_cos_turn(32768);
-        assert!(s.abs() < 1e-5 && (c + 1.0).abs() < 1e-5, "half: ({s}, {c})");
-        let (s, c) = sin_cos_turn(49152);
-        assert!(
-            (s + 1.0).abs() < 1e-5 && c.abs() < 1e-5,
-            "three-quarter: ({s}, {c})"
-        );
-    }
-
-    /// Opposite turns negate both components (the half-turn
-    /// symmetry), and every output stays within [-1, 1] + tolerance.
-    #[test]
-    fn sin_cos_turn_half_turn_symmetry_and_range() {
-        for turn in [
-            0u16, 1, 8191, 8192, 8193, 16383, 16384, 30000, 32767, 49151, 60000,
-        ] {
-            let (s, c) = sin_cos_turn(turn);
-            let (s_opp, c_opp) = sin_cos_turn(turn.wrapping_add(32768));
-            assert!((s + s_opp).abs() < 2e-5, "turn {turn}: {s} vs {s_opp}");
-            assert!((c + c_opp).abs() < 2e-5, "turn {turn}: {c} vs {c_opp}");
-            assert!((-1.0 - 1e-5..=1.0 + 1e-5).contains(&s));
-            assert!((-1.0 - 1e-5..=1.0 + 1e-5).contains(&c));
-        }
-    }
 
     /// The pinned matrix convention: identity at zero turn/scale 1;
     /// the quarter turn maps +X to −Z (the documented right-handed

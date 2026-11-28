@@ -12,8 +12,12 @@
 //! tile per 4 m), all six faces per box, origin at the feet/ground
 //! center. Counts are pinned by tests — structure, not coincidence.
 
-use crate::proxy_instances::sin_cos_turn;
 use crate::proxy_mesh::ProxyVertex;
+// E-S1 (DECISION-A06 §4): the libm-free turn trigonometry now lives
+// in the engine-animation crate (proxy_instances re-exports it);
+// SkinnedVertex and BOX_JOINT come with it for the skinned mesh
+// derivation below, which moved here from the animation module.
+use engine_animation::{BOX_JOINT, SkinnedVertex, sin_cos_turn};
 
 /// Emits one quad as six vertices (two CCW triangles — the
 /// proxy_mesh corner conventions).
@@ -194,6 +198,36 @@ pub fn humanoid_mesh() -> Vec<ProxyVertex> {
     v
 }
 
+/// Derives the skinned humanoid mesh from the unskinned one.
+/// The joints field is [BOX_JOINT[v/36] as u32, 0, 0, 0] (rigid binding).
+/// (E-S1, DECISION-A06 §4: moved here from the animation module —
+/// the derivation consumes THIS module's unskinned mesh, a renderer
+/// asset; `SkinnedVertex` and `BOX_JOINT` come from engine-animation.
+/// The animation compatibility shim re-exports this function so the
+/// `crate::animation::skinned_humanoid_mesh` and
+/// `engine_renderer::animation::skinned_humanoid_mesh` paths are
+/// stable.)
+pub fn skinned_humanoid_mesh() -> Vec<SkinnedVertex> {
+    let unskinned = humanoid_mesh();
+
+    let mut result = Vec::with_capacity(unskinned.len());
+
+    for (i, v) in unskinned.iter().enumerate() {
+        let box_idx = i / 36;
+        let joint_idx = BOX_JOINT[box_idx] as u32;
+
+        result.push(SkinnedVertex {
+            pos: v.pos,
+            normal: v.normal,
+            uv: v.uv,
+            joints: [joint_idx, 0, 0, 0],
+            weights: [1.0, 0.0, 0.0, 0.0],
+        });
+    }
+
+    result
+}
+
 /// The stylized sedan v2: body + cabin + four cylinder wheels
 /// (radius 0.35, width 0.25, at the standard sedan track). The
 /// wheels lift the body clear of the ground; origin at ground
@@ -285,6 +319,38 @@ mod tests {
                 .collect()
         };
         assert_eq!(bits(&a), bits(&b));
+    }
+
+    /// skinned_humanoid_mesh: 396 vertices; pos/normal/uv bits
+    /// byte-identical to humanoid_mesh() in the same order (the
+    /// derivation-is-faithful pin); rigid binding to the emission
+    /// box's joint; the 64-byte layout with joints at 32 and weights
+    /// at 48. (E-S1: moved here with `skinned_humanoid_mesh` from the
+    /// animation module — the 396-vertex mesh bit-identity gate.)
+    #[test]
+    fn skinned_humanoid_mesh_structure() {
+        let skinned = skinned_humanoid_mesh();
+        let unskinned = humanoid_mesh();
+
+        assert_eq!(skinned.len(), 396, "11 boxes x 36 vertices");
+        assert_eq!(skinned.len(), unskinned.len());
+        for (s, u) in skinned.iter().zip(unskinned.iter()) {
+            for i in 0..3 {
+                assert_eq!(s.pos[i].to_bits(), u.pos[i].to_bits(), "pos bits");
+                assert_eq!(s.normal[i].to_bits(), u.normal[i].to_bits(), "normal bits");
+            }
+            for i in 0..2 {
+                assert_eq!(s.uv[i].to_bits(), u.uv[i].to_bits(), "uv bits");
+            }
+        }
+        for (i, v) in skinned.iter().enumerate() {
+            let expected = BOX_JOINT[i / 36] as u32;
+            assert_eq!(v.joints, [expected, 0, 0, 0], "vertex {i} is rigid");
+            assert_eq!(v.weights, [1.0, 0.0, 0.0, 0.0]);
+        }
+        assert_eq!(std::mem::size_of::<SkinnedVertex>(), 64);
+        assert_eq!(std::mem::offset_of!(SkinnedVertex, joints), 32);
+        assert_eq!(std::mem::offset_of!(SkinnedVertex, weights), 48);
     }
 
     /// Validity: finite positions and UVs, unit normals everywhere
