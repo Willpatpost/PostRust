@@ -146,16 +146,31 @@ pub enum GenerationDecision {
 /// and its packed payload is zero bytes, so a reuse against it is
 /// vacuously correct.
 ///
-/// THE RESIDUAL HAZARD (documented, not hidden): allocator address
-/// recycling — source A dropped, source B's Vecs later allocated at
-/// A's exact addresses with the same counts and a colliding
-/// generation — can still present A's token. Content divergence
-/// there is caught by the missed-bump verify in debug/test; release
-/// keeps the renderer's pre-T05 behavior for that narrow case. The
-/// full hardening is the audit's revision-scoped population
-/// resource (a renderer-minted handle); this token is the cheap
-/// layer that closes the demonstrated LIVE-source collision without
-/// a single caller change.
+/// THE LIFETIME SCOPE BESIDE THE TOKEN (R1, D-EE-11 — the recycling
+/// residual CLOSED): allocator address recycling — source A dropped,
+/// source B's Vecs later allocated at A's exact addresses with the
+/// same counts and a colliding generation — can still present A's
+/// token; a pointer-derived token alone cannot see a lifetime end.
+/// The renderer's records therefore hold, beside each generation
+/// record, the population's CONTENT DIGEST
+/// ([`population_digest`] — FNV-1a over the same byte stream the
+/// packing writes), and a would-reuse at a matching token and
+/// generation must ALSO match the recorded digest, else the half's
+/// record resets to unknown and re-admits (fail-safe: one redundant
+/// repack, the safe direction, never a stale skip). A recycled
+/// address thus cannot inherit a prior source's VALIDATED GENERATION
+/// whenever the content differs — the only case that matters; a
+/// recycled source with byte-identical content reuses
+/// vacuously-correctly (the retained bytes ARE its bytes). This also
+/// closes the T05-documented missed-bump release trade (an in-place
+/// content change at a stable generation now re-admits instead of
+/// rendering stale). The remaining theoretical residual is a 64-bit
+/// FNV collision between different contents (~2⁻⁶⁴ per comparison;
+/// the debug/test missed-bump verify still byte-compares every reuse
+/// as the exact backstop); the audit's revision-scoped population
+/// handle (a renderer-minted, caller-held key) remains the future
+/// hardening for callers that want identity with no content scan at
+/// all.
 ///
 /// The token never enters packed bytes, digests, or pins — it is
 /// gate-only metadata (plain `usize` addresses, no pointers, no
@@ -302,17 +317,19 @@ impl ProxyInstance {
     }
 }
 
-/// Appends one instance's bytes in the fixed field order (the four
+/// Emits one instance's bytes in the fixed field order (the four
 /// matrix columns, tint rgb + the instance alpha, then the params
 /// vec4: the pose block index as an f32 bit pattern followed by
 /// three reserved zero f32s — the Era-2 claim on the former
 /// all-zero slot, a versioned layout change never a silent reuse).
-/// The single packing implementation both the allocating and the
-/// retained forms share — the byte layout exists exactly once.
-fn append_instance_bytes(bytes: &mut Vec<u8>, instance: &ProxyInstance) {
+/// THE ONE FIELD ORDER both the packing and the R1 content digest
+/// consume — written once here so [`population_digest`] can never
+/// drift from the packed bytes (a field the packing writes is a
+/// field the digest sees, by construction, not by duplication).
+fn emit_instance_bytes(mut write: impl FnMut(&[u8]), instance: &ProxyInstance) {
     for column in instance_columns(&instance.transform) {
         for value in column {
-            bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+            write(&value.to_bits().to_le_bytes());
         }
     }
     for value in [
@@ -321,13 +338,60 @@ fn append_instance_bytes(bytes: &mut Vec<u8>, instance: &ProxyInstance) {
         instance.tint[2],
         instance.alpha,
     ] {
-        bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+        write(&value.to_bits().to_le_bytes());
     }
     // The params vec4: x = the pose index (exact in f32 up to 2^24
     // blocks — far beyond MAX_INSTANCES), y/z/w reserved zeros.
     let pose_index = instance.pose_index as f32;
-    bytes.extend_from_slice(&pose_index.to_bits().to_le_bytes());
-    bytes.extend_from_slice(&[0u8; 12]);
+    write(&pose_index.to_bits().to_le_bytes());
+    write(&[0u8; 12]);
+}
+
+/// Appends one instance's bytes (the packing's sink — see
+/// [`emit_instance_bytes`] for the field order; the byte layout
+/// exists exactly once).
+fn append_instance_bytes(bytes: &mut Vec<u8>, instance: &ProxyInstance) {
+    emit_instance_bytes(|chunk| bytes.extend_from_slice(chunk), instance);
+}
+
+/// The FNV-1a 64-bit constants (the repo's standard — the packed-
+/// bytes pin below and the pose sequence digest use the same pair).
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// R1 (D-EE-11) — the INSTANCE population's content digest: FNV-1a
+/// over the SAME byte stream [`repack_populations`] writes (through
+/// [`emit_instance_bytes`]'s one field order — the digest equals the
+/// FNV of the population's packed bytes by construction). This is
+/// the lifetime-scoped half of the population identity: the renderer
+/// records it beside each generation record
+/// ([`crate::submission`]'s adapter) and re-admits on divergence, so
+/// a recycled address (or any missed bump) cannot inherit a prior
+/// source's validated generation — see
+/// [`InstanceSourceToken`]'s docs for the full contract. Pure,
+/// deterministic, platform-independent; gate-only metadata that
+/// never enters the packed bytes or the capture pins. Validation is
+/// NOT this function's business (the repack's own typed refusals
+/// own it) — a digest may be taken of a population that later
+/// refuses.
+pub fn population_digest(
+    npc: &[ProxyInstance],
+    vehicle: &[ProxyInstance],
+    rain: &[ProxyInstance],
+) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    for instance in npc.iter().chain(vehicle).chain(rain) {
+        emit_instance_bytes(
+            |chunk| {
+                for &byte in chunk {
+                    hash ^= byte as u64;
+                    hash = hash.wrapping_mul(FNV_PRIME);
+                }
+            },
+            instance,
+        );
+    }
+    hash
 }
 
 /// Packs `instances` into the instance-buffer bytes (little-endian

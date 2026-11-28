@@ -240,8 +240,21 @@ pub(crate) struct SubmissionPolicy {
 /// (the audit's demonstrated collision, made unrepresentable at the
 /// renderer's own seam, with no caller-side identity convention to
 /// follow). See [`crate::proxy_instances::InstanceSourceToken`]'s
-/// docs for the collision contract and the residual recycling
-/// hazard.
+/// docs for the collision contract.
+///
+/// **R1 (D-EE-11) — the lifetime scope beside the token:** a
+/// pointer-derived token cannot see a lifetime end — allocator
+/// address recycling can hand a dropped source's exact addresses
+/// (and thus its token) to a new source. `instance_digest` /
+/// `pose_digest` record the CONTENT digest of the population whose
+/// bytes each buffer holds (the FNV-1a over the same byte stream
+/// the packing writes, taken at every repack); the adapter resets
+/// the generation record to unknown whenever a would-reuse at a
+/// matching token and generation carries a DIFFERENT digest — so a
+/// recycled source (or any missed bump) re-admits instead of
+/// inheriting the prior source's validated generation. Fail-safe in
+/// both directions: a reset never vouches for anything, and a
+/// re-admission is one redundant repack, never a stale skip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct PopulationGenerations {
     /// The generation whose bytes the retained instance buffer
@@ -256,6 +269,48 @@ pub(crate) struct PopulationGenerations {
     pub instance_source: crate::proxy_instances::InstanceSourceToken,
     /// T05: the source whose bytes the retained pose buffer holds.
     pub pose_source: crate::animation::PoseSourceToken,
+    /// R1: the content digest of the instance population whose
+    /// bytes the retained instance buffer holds (the
+    /// [`crate::proxy_instances::population_digest`] of the admitted
+    /// submission, recorded at every repack). 0 = unknown — the
+    /// default record; a live population's digest is the FNV offset
+    /// basis at minimum, never 0.
+    pub instance_digest: u64,
+    /// R1: the pose half's mirror — the content digest of the pose
+    /// blocks whose bytes the retained pose buffer holds (this
+    /// module's `pose_blocks_digest` of the admitted submission).
+    pub pose_digest: u64,
+}
+
+/// R1 (D-EE-11) — the POSE population's content digest: FNV-1a over
+/// the pose blocks' f32 bit patterns in the exact stream
+/// `engine_animation::pack_pose_bytes` writes (joint-major,
+/// column-major, little-endian — the digest equals the FNV of the
+/// packed pose bytes by construction, not by duplication). The pose
+/// half's lifetime scope beside
+/// [`crate::animation::PoseSourceToken`]: recorded at every pose
+/// repack, consulted on every would-reuse, so a recycled pose source
+/// (or a missed pose bump) re-admits instead of inheriting a prior
+/// source's validated generation. Private here (the adapter is its
+/// only caller; the instance half's digest lives beside its packing
+/// in `proxy_instances.rs` as `population_digest`).
+fn pose_blocks_digest(blocks: &[[[[f32; 4]; 4]; crate::animation::HUMANOID_JOINTS]]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for block in blocks {
+        for matrix in block {
+            for column in matrix {
+                for value in column {
+                    for byte in value.to_bits().to_le_bytes() {
+                        hash ^= byte as u64;
+                        hash = hash.wrapping_mul(FNV_PRIME);
+                    }
+                }
+            }
+        }
+    }
+    hash
 }
 
 /// T05 (strict audit IV) — the population halves' regeneration
@@ -415,18 +470,23 @@ fn verify_population_reuse(
 /// independent reference path — a missed bump is loud; never a
 /// release production frame's cost).
 ///
-/// **T05 (strict audit IV) — the identity contract beside the
-/// generation:** `generations` also records each buffer's SOURCE
-/// token; a submission whose token differs (a second population
-/// source interleaving, the storage moved, or the per-kind
-/// partition changed at a stable total) resets that half's
+/// **T05 (strict audit IV) + R1 (D-EE-11) — the lifetime-scoped
+/// identity contract beside the generation:** `generations` also
+/// records each buffer's SOURCE token and CONTENT digest; a
+/// submission whose token differs (a second population source
+/// interleaving, the storage moved, or the per-kind partition
+/// changed at a stable total) OR whose content digest diverges at a
+/// would-be reuse (a recycled address presenting a dropped source's
+/// exact token, or any missed in-place bump) resets that half's
 /// generation record to unknown and re-admits — two live sources
-/// with colliding generation spaces cannot wrongly skip. The
-/// pose-index admission check rides the same evidence: it runs on
-/// every admitted/changed frame and skips only the fully-reused
-/// between-tick frame (change-proportional validation, the T18
-/// direction). The output carries the halves' regeneration report
-/// ([`PopulationRepacked`]) for the renderer's stamp invalidation.
+/// with colliding generation spaces cannot wrongly skip, and
+/// neither can a dead source's recycled addresses inherit its
+/// validated generation. The pose-index admission check rides the
+/// same evidence: it runs on every admitted/changed frame and skips
+/// only the fully-reused between-tick frame (change-proportional
+/// validation, the T18 direction). The output carries the halves'
+/// regeneration report ([`PopulationRepacked`]) for the renderer's
+/// stamp invalidation.
 ///
 /// `material_table` is the attached scene's material count — the
 /// population validation's bound. `0` on the layers-only shape
@@ -487,33 +547,64 @@ pub(crate) fn adapt_frame<'a, 'x>(
                     population.rain_material
                 )));
             }
-            // T05 (strict audit IV) — THE IDENTITY GATE BESIDE THE
-            // GENERATION: derive the submission's source tokens and
-            // compare them against the buffers' records. On a
+            // T05 (strict audit IV) + R1 (D-EE-11) — THE LIFETIME-
+            // SCOPED IDENTITY GATE BESIDE THE GENERATION: derive the
+            // submission's source tokens and content digests and
+            // compare them against the buffers' records. On a TOKEN
             // mismatch (a second source interleaving — the audit's
             // two populations beginning at generation 1 with
             // identical counts — or the same source after its
             // storage moved, or a per-kind repartition at a stable
             // total, which the byte-length guard alone cannot see)
-            // the generation record resets to UNKNOWN, so the
-            // repack below re-admits: the retained bytes become the
-            // NEW source's, never a stale skip. The records mutate
-            // fail-safe — a later refusal leaves them at unknown,
-            // vouching for nothing. The tokens are renderer-derived
-            // (no caller convention; see the token types' docs for
-            // the collision contract and the recycling residual).
+            // the generation record resets to UNKNOWN, so the repack
+            // below re-admits. On a DIGEST divergence at a would-be
+            // reuse — the token matched (same addresses, same
+            // counts) but the content is not what the record's
+            // generation was validated for: allocator address
+            // recycling handing a dropped source's exact addresses
+            // to a new source, or any missed in-place bump — the
+            // record ALSO resets to UNKNOWN and re-admits. The
+            // retained bytes become the NEW content's, never a
+            // stale skip; the records mutate fail-safe (a later
+            // refusal leaves them at unknown, vouching for nothing);
+            // a recycled source with byte-identical content reuses
+            // vacuously-correctly. The tokens and digests are
+            // renderer-derived (no caller convention; see the token
+            // types' docs for the composed collision contract).
             let instance_source = crate::proxy_instances::InstanceSourceToken::of(
                 population.npc,
                 population.vehicle,
                 population.rain,
             );
             let pose_source = crate::animation::PoseSourceToken::of(population.npc_poses);
+            let instance_digest = crate::proxy_instances::population_digest(
+                population.npc,
+                population.vehicle,
+                population.rain,
+            );
+            let pose_digest = pose_blocks_digest(population.npc_poses);
+            let total = population.npc.len() + population.vehicle.len() + population.rain.len();
             if generations.instance_source != instance_source {
                 generations.instance_source = instance_source;
+                generations.instance = 0;
+            } else if population.instance_generation != 0
+                && generations.instance == population.instance_generation
+                && instance_bytes.len() == total * crate::proxy_instances::INSTANCE_STRIDE
+                && generations.instance_digest != instance_digest
+            {
+                // R1: the would-reuse's content diverges from the
+                // recorded digest — the recycled-address collision
+                // or the missed bump. Re-admit (fail-safe repack).
                 generations.instance = 0;
             }
             if generations.pose_source != pose_source {
                 generations.pose_source = pose_source;
+                generations.pose = 0;
+            } else if population.pose_generation != 0
+                && generations.pose == population.pose_generation
+                && pose_bytes.len() == population.npc_poses.len() * crate::animation::POSE_STRIDE
+                && generations.pose_digest != pose_digest
+            {
                 generations.pose = 0;
             }
             // T18/T05 — THE POSE-INDEX ADMISSION PREDICATE: the
@@ -524,16 +615,14 @@ pub(crate) fn adapt_frame<'a, 'x>(
             // changed, not every unchanged frame"). The predicate is
             // exactly the conjunction of both repack gates' Reused
             // conditions as they stand AFTER the identity gate
-            // above (token match ⇒ the records were not reset), so
-            // it is true precisely when both halves will reuse —
-            // the frame whose bytes and whose pose-block count were
-            // both validated at admission. The debug_assert at the
+            // above (token match ⇒ the records were not reset; a
+            // digest divergence ⇒ they were), so it is true
+            // precisely when both halves will reuse — the frame
+            // whose bytes and whose pose-block count were both
+            // validated at admission. The debug_assert at the
             // arm's tail pins the equivalence to the actual
             // decisions (a drift tripwire, not a check of caller
-            // honesty: a missed bump inside a matching token is the
-            // protocol's documented release hazard, caught loudly
-            // by the verify below in debug/test).
-            let total = population.npc.len() + population.vehicle.len() + population.rain.len();
+            // honesty).
             let full_reuse = population.instance_generation != 0
                 && population.pose_generation != 0
                 && generations.instance == population.instance_generation
@@ -550,6 +639,15 @@ pub(crate) fn adapt_frame<'a, 'x>(
                 &mut generations.instance,
             )
             .map_err(RendererError::ProxyPack)?;
+            // R1: the record's digest follows the bytes — written
+            // ONLY together with a successful regeneration (the
+            // repack is atomic: a typed refusal above leaves the
+            // prior record intact, and it truthfully describes the
+            // untouched buffer; a reset record stays at unknown,
+            // vouching for nothing).
+            if instance_decision == crate::proxy_instances::GenerationDecision::Repacked {
+                generations.instance_digest = instance_digest;
+            }
             // The pose contract (the capture-refusal discipline):
             // every POPULATED npc's pose index must select a supplied
             // block; the block-count bound is the repack's own typed
@@ -587,6 +685,11 @@ pub(crate) fn adapt_frame<'a, 'x>(
                 &mut generations.pose,
             )
             .map_err(RendererError::PosePack)?;
+            // R1: the pose half's digest record, the same
+            // write-only-with-the-bytes discipline.
+            if pose_decision == crate::proxy_instances::GenerationDecision::Repacked {
+                generations.pose_digest = pose_digest;
+            }
             debug_assert!(
                 full_reuse
                     == (instance_decision == crate::proxy_instances::GenerationDecision::Reused
@@ -1402,5 +1505,438 @@ mod tests {
         )
         .expect("source B's stable resubmission validates");
         assert_eq!(instance_bytes, b_expected, "the reuse regenerated nothing");
+    }
+
+    /// R1 (D-EE-11, Arm A) — THE ADDRESS-RECYCLING WITNESS (the T05
+    /// token's documented residual): source A is admitted at
+    /// generation 5 and DROPPED; source B — a different population
+    /// whose Vec lands at A's EXACT recycled addresses (the
+    /// deterministic harness: two same-layout allocations with an
+    /// explicit drop between; the immediate same-size realloc is the
+    /// allocator's observed behavior on this platform) — submits at
+    /// its own colliding generation 5 with the same per-kind counts
+    /// and DIFFERENT content. The pointer-derived token alone cannot
+    /// distinguish the sources (that is the documented residual);
+    /// the lifetime-scoped identity beside it must: B RE-ADMITS and
+    /// the retained bytes become B's. Pre-fix this is the RED arm —
+    /// the recycled token matched, the raw gate reused A's bytes,
+    /// and the missed-bump verify panicked (the red run's captured
+    /// panic is itself the proof the recycling presented A's token);
+    /// in a release production frame the same state rendered A's
+    /// stale crowd silently.
+    #[test]
+    fn recycled_address_cannot_inherit_a_prior_sources_generation() {
+        use crate::animation::{HUMANOID_JOINTS, rest_pose_block};
+        use crate::proxy_instances::{
+            InstanceSourceToken, InstanceTransform, ProxyInstance, repack_populations,
+        };
+        let matrix = [
+            [0.9, 0.0, 0.0, 0.0],
+            [0.0, 0.9, 0.0, 0.0],
+            [0.0, 0.0, 0.9, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let light = crate::lit_scene::day_preset();
+        let policy = SubmissionPolicy {
+            proxy_draw_mode: ProxyDrawMode::default(),
+            ripple_debug: RippleDebugMode::default(),
+            instance_capacity: crate::proxy_instances::MAX_INSTANCES,
+            pose_capacity: crate::animation::MAX_POSE_BLOCKS,
+        };
+        let instance = |x: f32, y: f32, turn: u16, tint: [f32; 3]| ProxyInstance {
+            transform: InstanceTransform {
+                pos: [x, 0.02, y],
+                turn,
+                scale: 1.0,
+            },
+            tint,
+            alpha: 1.0,
+            pose_index: 0,
+        };
+        // The stable pose palette — this witness's subject is the
+        // instance half, so the pose source stays LIVE and unchanged
+        // (its own half keeps its honest reuse throughout).
+        let poses: Vec<[[[f32; 4]; 4]; HUMANOID_JOINTS]> =
+            vec![rest_pose_block(), rest_pose_block()];
+        fn build<'a>(
+            instances: &'a [ProxyInstance],
+            poses: &'a [[[[f32; 4]; 4]; HUMANOID_JOINTS]],
+            matrix: [[f32; 4]; 4],
+            light: crate::lit_scene::LightParams,
+        ) -> FrameSubmission<'a> {
+            FrameSubmission {
+                camera: FrameCamera {
+                    view_proj: matrix,
+                    eye: [4.0, 1.7, 12.0],
+                },
+                output: OutputTarget {
+                    window_size: (1280, 720),
+                },
+                layers: DynamicLayers::default(),
+                scene: Some(SceneFrame {
+                    light,
+                    shadows: None,
+                    population: Some(crate::renderer::ProxyPopulation {
+                        npc: &instances[..2],
+                        npc_poses: poses,
+                        npc_material: 0,
+                        vehicle: &instances[2..],
+                        vehicle_material: 0,
+                        rain: &[],
+                        rain_material: 0,
+                        instance_generation: 5,
+                        pose_generation: 5,
+                    }),
+                    sky: None,
+                    post: false,
+                    wet: None,
+                }),
+            }
+        }
+        let mut instance_bytes = Vec::new();
+        let mut pose_bytes = Vec::new();
+        let mut generations = PopulationGenerations::default();
+        let mut a_packed = Vec::new();
+        let a_token;
+        {
+            let source_a = vec![
+                instance(1.0, -2.0, 1000, [0.9, 0.9, 0.9]),
+                instance(-3.0, 4.0, 40000, [0.8, 0.6, 0.5]),
+                instance(7.0, 1.0, 8192, [0.2, 0.4, 0.9]),
+            ];
+            let submission_a = build(&source_a, &poses, matrix, light);
+            adapt_frame(
+                policy,
+                &submission_a,
+                3,
+                &[],
+                &mut instance_bytes,
+                &mut pose_bytes,
+                &mut generations,
+            )
+            .expect("source A validates and admits");
+            repack_populations(&mut a_packed, &source_a[..2], &source_a[2..], &[]).unwrap();
+            a_token = InstanceSourceToken::of(&source_a[..2], &source_a[2..], &[]);
+        }
+        // source_a is DROPPED here — its 3-instance heap block returns
+        // to the allocator, and the immediate same-layout allocation
+        // below lands at the exact same addresses on this platform's
+        // allocator (the recycling the token cannot see).
+        let source_b = vec![
+            instance(12.0, 5.0, 2000, [0.1, 0.9, 0.3]),
+            instance(-8.0, -6.0, 30000, [0.5, 0.5, 0.1]),
+            instance(9.0, 3.0, 4096, [0.3, 0.2, 0.7]),
+        ];
+        let b_token = InstanceSourceToken::of(&source_b[..2], &source_b[2..], &[]);
+        let recycled = a_token == b_token;
+        let submission_b = build(&source_b, &poses, matrix, light);
+        adapt_frame(
+            policy,
+            &submission_b,
+            3,
+            &[],
+            &mut instance_bytes,
+            &mut pose_bytes,
+            &mut generations,
+        )
+        .expect("source B re-admits through the lifetime-scoped identity");
+        let mut b_expected = Vec::new();
+        repack_populations(&mut b_expected, &source_b[..2], &source_b[2..], &[]).unwrap();
+        assert_eq!(
+            instance_bytes, b_expected,
+            "the retained bytes are source B's, never A's stale crowd \
+             (the allocator recycled A's exact addresses: {recycled})"
+        );
+        assert_ne!(instance_bytes, a_packed);
+        // B's between-tick frames keep the R2 reuse (the composed
+        // identity must not over-fire on the new source's stable
+        // frames).
+        let submission_b_again = build(&source_b, &poses, matrix, light);
+        adapt_frame(
+            policy,
+            &submission_b_again,
+            3,
+            &[],
+            &mut instance_bytes,
+            &mut pose_bytes,
+            &mut generations,
+        )
+        .expect("source B's stable resubmission validates");
+        assert_eq!(instance_bytes, b_expected, "the reuse regenerated nothing");
+    }
+
+    /// R1 — THE CONTENT-DIGEST ROAD, deterministic (no allocator
+    /// cooperation): the SAME source storage (the token matches),
+    /// the SAME generation, the content CHANGED in place — the
+    /// missed-bump shape, and exactly the state a recycled address
+    /// presents under a matching token. This is the release-side
+    /// hazard T05 documented as its narrow trade (risk 3: a missed
+    /// in-place bump renders stale in release; only the debug verify
+    /// panicked); the lifetime-scoped identity closes it: the
+    /// recorded content digest diverges, the half re-admits, and the
+    /// retained bytes are the CURRENT population's. Pre-fix RED: the
+    /// raw gate reused and the missed-bump verify panicked here.
+    #[test]
+    fn missed_bump_at_a_matching_token_re_admits_through_the_content_digest() {
+        use crate::animation::{HUMANOID_JOINTS, rest_pose_block};
+        use crate::proxy_instances::{InstanceTransform, ProxyInstance, repack_populations};
+        let matrix = [
+            [0.9, 0.0, 0.0, 0.0],
+            [0.0, 0.9, 0.0, 0.0],
+            [0.0, 0.0, 0.9, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let light = crate::lit_scene::day_preset();
+        let policy = SubmissionPolicy {
+            proxy_draw_mode: ProxyDrawMode::default(),
+            ripple_debug: RippleDebugMode::default(),
+            instance_capacity: crate::proxy_instances::MAX_INSTANCES,
+            pose_capacity: crate::animation::MAX_POSE_BLOCKS,
+        };
+        let instance = |x: f32, y: f32, turn: u16, tint: [f32; 3]| ProxyInstance {
+            transform: InstanceTransform {
+                pos: [x, 0.02, y],
+                turn,
+                scale: 1.0,
+            },
+            tint,
+            alpha: 1.0,
+            pose_index: 0,
+        };
+        let poses: Vec<[[[f32; 4]; 4]; HUMANOID_JOINTS]> =
+            vec![rest_pose_block(), rest_pose_block()];
+        fn build<'a>(
+            instances: &'a [ProxyInstance],
+            poses: &'a [[[[f32; 4]; 4]; HUMANOID_JOINTS]],
+            matrix: [[f32; 4]; 4],
+            light: crate::lit_scene::LightParams,
+        ) -> FrameSubmission<'a> {
+            FrameSubmission {
+                camera: FrameCamera {
+                    view_proj: matrix,
+                    eye: [4.0, 1.7, 12.0],
+                },
+                output: OutputTarget {
+                    window_size: (1280, 720),
+                },
+                layers: DynamicLayers::default(),
+                scene: Some(SceneFrame {
+                    light,
+                    shadows: None,
+                    population: Some(crate::renderer::ProxyPopulation {
+                        npc: &instances[..2],
+                        npc_poses: poses,
+                        npc_material: 0,
+                        vehicle: &instances[2..],
+                        vehicle_material: 0,
+                        rain: &[],
+                        rain_material: 0,
+                        instance_generation: 5,
+                        pose_generation: 5,
+                    }),
+                    sky: None,
+                    post: false,
+                    wet: None,
+                }),
+            }
+        }
+        let mut source = vec![
+            instance(1.0, -2.0, 1000, [0.9, 0.9, 0.9]),
+            instance(-3.0, 4.0, 40000, [0.8, 0.6, 0.5]),
+            instance(7.0, 1.0, 8192, [0.2, 0.4, 0.9]),
+        ];
+        let mut instance_bytes = Vec::new();
+        let mut pose_bytes = Vec::new();
+        let mut generations = PopulationGenerations::default();
+        let submission = build(&source, &poses, matrix, light);
+        adapt_frame(
+            policy,
+            &submission,
+            3,
+            &[],
+            &mut instance_bytes,
+            &mut pose_bytes,
+            &mut generations,
+        )
+        .expect("the population admits at generation 5");
+        let admitted = instance_bytes.clone();
+        // THE MISSED BUMP: the content changes in place, the declared
+        // generation does not — the token still matches (same
+        // storage, same counts), so only the content identity can
+        // catch it.
+        source[1].transform.pos[0] += 9.0;
+        source[1].tint = [0.3, 0.3, 0.3];
+        let submission = build(&source, &poses, matrix, light);
+        adapt_frame(
+            policy,
+            &submission,
+            3,
+            &[],
+            &mut instance_bytes,
+            &mut pose_bytes,
+            &mut generations,
+        )
+        .expect("the diverged content re-admits through the content digest");
+        let mut expected = Vec::new();
+        repack_populations(&mut expected, &source[..2], &source[2..], &[]).unwrap();
+        assert_eq!(
+            instance_bytes, expected,
+            "the retained bytes are the CURRENT population's, never the stale ones"
+        );
+        assert_ne!(instance_bytes, admitted);
+        // The now-honest between-tick frame keeps its R2 reuse.
+        let submission = build(&source, &poses, matrix, light);
+        adapt_frame(
+            policy,
+            &submission,
+            3,
+            &[],
+            &mut instance_bytes,
+            &mut pose_bytes,
+            &mut generations,
+        )
+        .expect("the stable resubmission validates");
+        assert_eq!(instance_bytes, expected, "the reuse regenerated nothing");
+    }
+
+    /// R1 — THE POSE HALF'S DIGEST ROAD: the same pose storage (the
+    /// pose token matches), the same pose generation, but the
+    /// evaluated blocks changed in place (the pose-side missed bump —
+    /// and the exact shape a recycled pose source presents). The
+    /// pose half's recorded content digest diverges → re-admit → the
+    /// retained pose bytes are the CURRENT blocks'; the instance
+    /// half (unchanged, honestly declared) keeps its reuse through
+    /// the same frames. Pre-fix RED: the raw pose gate reused and
+    /// the pose missed-bump verify panicked here.
+    #[test]
+    fn pose_missed_bump_at_a_matching_token_re_admits() {
+        use crate::animation::{
+            HUMANOID_JOINTS, JointPose, compose_joint_matrices, humanoid_skeleton, rest_pose_block,
+            skin_matrices,
+        };
+        use crate::proxy_instances::{InstanceTransform, ProxyInstance};
+        let matrix = [
+            [0.9, 0.0, 0.0, 0.0],
+            [0.0, 0.9, 0.0, 0.0],
+            [0.0, 0.0, 0.9, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let light = crate::lit_scene::day_preset();
+        let policy = SubmissionPolicy {
+            proxy_draw_mode: ProxyDrawMode::default(),
+            ripple_debug: RippleDebugMode::default(),
+            instance_capacity: crate::proxy_instances::MAX_INSTANCES,
+            pose_capacity: crate::animation::MAX_POSE_BLOCKS,
+        };
+        let skeleton = humanoid_skeleton();
+        let walker_at = |turn: i16| {
+            let mut pose = [JointPose {
+                delta_pos: [0.0; 3],
+                delta_turns: [0; 3],
+            }; HUMANOID_JOINTS];
+            pose[7].delta_turns = [turn, 0, 0];
+            let joint_worlds = compose_joint_matrices(&skeleton, &pose);
+            skin_matrices(&joint_worlds, &skeleton)
+        };
+        let instance = |x: f32, y: f32, turn: u16, pose_index: u32| ProxyInstance {
+            transform: InstanceTransform {
+                pos: [x, 0.02, y],
+                turn,
+                scale: 1.0,
+            },
+            tint: [0.8, 0.7, 0.6],
+            alpha: 1.0,
+            pose_index,
+        };
+        let instances = vec![
+            instance(1.0, -2.0, 1000, 0),
+            instance(-3.0, 4.0, 40000, 1),
+            instance(7.0, 1.0, 8192, 0),
+        ];
+        fn build<'a>(
+            instances: &'a [ProxyInstance],
+            poses: &'a [[[[f32; 4]; 4]; HUMANOID_JOINTS]],
+            matrix: [[f32; 4]; 4],
+            light: crate::lit_scene::LightParams,
+        ) -> FrameSubmission<'a> {
+            FrameSubmission {
+                camera: FrameCamera {
+                    view_proj: matrix,
+                    eye: [4.0, 1.7, 12.0],
+                },
+                output: OutputTarget {
+                    window_size: (1280, 720),
+                },
+                layers: DynamicLayers::default(),
+                scene: Some(SceneFrame {
+                    light,
+                    shadows: None,
+                    population: Some(crate::renderer::ProxyPopulation {
+                        npc: &instances[..2],
+                        npc_poses: poses,
+                        npc_material: 0,
+                        vehicle: &instances[2..],
+                        vehicle_material: 0,
+                        rain: &[],
+                        rain_material: 0,
+                        instance_generation: 5,
+                        pose_generation: 5,
+                    }),
+                    sky: None,
+                    post: false,
+                    wet: None,
+                }),
+            }
+        }
+        let mut poses = vec![rest_pose_block(), walker_at(9000)];
+        let mut instance_bytes = Vec::new();
+        let mut pose_bytes = Vec::new();
+        let mut generations = PopulationGenerations::default();
+        let submission = build(&instances, &poses, matrix, light);
+        adapt_frame(
+            policy,
+            &submission,
+            3,
+            &[],
+            &mut instance_bytes,
+            &mut pose_bytes,
+            &mut generations,
+        )
+        .expect("the population admits at generation 5");
+        let admitted = pose_bytes.clone();
+        // THE POSE-SIDE MISSED BUMP: the evaluated blocks change in
+        // place, the declared pose generation does not.
+        poses[1] = walker_at(-9000);
+        let submission = build(&instances, &poses, matrix, light);
+        adapt_frame(
+            policy,
+            &submission,
+            3,
+            &[],
+            &mut instance_bytes,
+            &mut pose_bytes,
+            &mut generations,
+        )
+        .expect("the diverged pose content re-admits through the content digest");
+        let mut expected = Vec::new();
+        crate::animation::repack_poses(&mut expected, &poses).unwrap();
+        assert_eq!(
+            pose_bytes, expected,
+            "the retained pose bytes are the CURRENT blocks', never the stale ones"
+        );
+        assert_ne!(pose_bytes, admitted);
+        // The now-honest between-tick frame keeps its R2 reuse.
+        let submission = build(&instances, &poses, matrix, light);
+        adapt_frame(
+            policy,
+            &submission,
+            3,
+            &[],
+            &mut instance_bytes,
+            &mut pose_bytes,
+            &mut generations,
+        )
+        .expect("the stable resubmission validates");
+        assert_eq!(pose_bytes, expected, "the reuse regenerated nothing");
     }
 }
