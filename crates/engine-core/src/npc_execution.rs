@@ -135,7 +135,7 @@ pub struct WakeOutcome {
 ///
 /// Returns None (fail closed) iff `commitment` ≥ schedule.entries.len()
 /// — the corrupted-input refusal — or the rule table fails
-/// [`validate_rule_table`] (finding 6's admission refusal: a
+/// [`validate_rule_table`] (the admission refusal: a
 /// policy-authored out-of-range need index never reaches the
 /// selector's both passes).
 ///
@@ -158,7 +158,7 @@ pub fn evaluate_wake(
     if commitment as usize >= schedule.entries.len() {
         return None;
     }
-    // Fail closed on an inadmissible rule table (finding 6's
+    // Fail closed on an inadmissible rule table (the
     // admission refusal — an out-of-range need index is refused
     // here, typed, before the selector can ever index with it).
     if validate_rule_table(rules).is_err() {
@@ -218,9 +218,9 @@ pub struct WitnessOutcome {
 /// Evaluates a witness wake: lazy decay (as above), then the view
 /// carrying the FIRED perceptions — the NEWEST ≤ MAX_PERCEPTIONS
 /// entries of the witness's memory (the LAST bounded entries of the
-/// supplied slice, in the slice's own fixed order — finding 6's
-/// suffix correction: the implementation once took the FIRST
-/// entries, silently dropping the newest) — and NO due commitment
+/// supplied slice, in the slice's own fixed order — the suffix,
+/// never the head: taking the FIRST entries would silently drop the
+/// newest) — and NO due commitment
 /// (a witness wake is not a calendar event). The selector offers
 /// the perceptions to the rule table like any other input (the
 /// engine imposes no fear semantics — §4.1); a rule with a witness
@@ -228,9 +228,8 @@ pub struct WitnessOutcome {
 /// (npc_behavior's matcher contract).
 ///
 /// Returns `None` (fail closed) iff the rule table fails
-/// [`validate_rule_table`] (finding 6's admission refusal) — the
-/// typed refusal the wake path has always had, on the witness path
-/// too.
+/// [`validate_rule_table`] (the admission refusal) — the same
+/// typed refusal the wake path takes, on the witness path too.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_witness(
     routine: &NpcRoutine,

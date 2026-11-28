@@ -46,10 +46,10 @@
 //! `activate` rebuild, and `witness_classifications` through the
 //! lane's own analogous derived index) is a per-witness key-set walk
 //! in the CANONICAL order fused with the two-phase precedence at
-//! read time — byte-identical to the old scan+sort forms (the
+//! read time — byte-identical to the scan+sort oracles (the
 //! equivalence battery pins it across fixture shapes, the recovery
 //! shape included) at O(log L + the witness's OWN records), flat in
-//! the foreign history the old forms scanned per call. The indexes
+//! the foreign history a full scan walks per call. The indexes
 //! are DERIVED in the spine's class sense: wire-invisible (never
 //! serialized — the durable form is the journal's records and
 //! decisions, and a recovered lane REPLAYS through the public
@@ -644,10 +644,11 @@ pub struct MemoryLedger {
     /// FACT that forces a derived index (and forbids the tempting
     /// range query): `MemoryKey` orders EVENT-FIRST — (event,
     /// witness, kind) — so the canonical maps iterate in EVENT order
-    /// and one witness's records are SCATTERED; `witness_records`'s
-    /// pre-index form full-scanned both maps, filtered, and sorted —
-    /// O(ledger) + O(result · log result) per call, paid per witness
-    /// activation, per journal flush claim, per conservation check.
+    /// and one witness's records are SCATTERED; without the index,
+    /// every witness-oriented read must full-scan both maps,
+    /// filter, and sort — O(ledger) + O(result · log result) per
+    /// call, paid per witness activation, per journal flush claim,
+    /// per conservation check.
     ///
     /// MAINTENANCE (the ONE key-set mutation site): [`Self::capture`]
     /// inserts, exactly on `Captured`. `confirm` moves a record
@@ -660,7 +661,7 @@ pub struct MemoryLedger {
     ///
     /// DETERMINISM: a `BTreeSet<MemoryKey>` iterates in canonical
     /// MemoryKey order — for a FIXED witness that is (event, kind),
-    /// exactly the order the pre-index sort produced — so every
+    /// exactly the order a scan+sort of the maps produces — so every
     /// query the index serves is byte-identical to the scan form
     /// (pinned by the equivalence battery). The outer map is
     /// keyed-lookup only in production code (never iterated), so it
@@ -761,11 +762,11 @@ impl MemoryLedger {
     /// THE INDEXED PHASE MERGE (A09): the derived witness→keys
     /// index's per-witness key set already iterates in canonical
     /// `MemoryKey` order — (event, kind) for a fixed witness, exactly
-    /// the order the pre-index scan+sort produced — and each key
+    /// the order a scan+sort of the maps produces — and each key
     /// resolves through the same two-phase precedence
     /// [`Self::record`] exposes (pending first, then confirmed).
     /// Cost O(log L + the witness's OWN records) with zero sorting —
-    /// FLAT in the foreign history the scan form walked whole, per
+    /// FLAT in the foreign history a full scan walks whole, per
     /// call. Output: the identical `Vec<&MemoryRecord>` in the
     /// identical order (the equivalence battery pins the
     /// byte-identity across fixture shapes, the recovery replay
@@ -787,8 +788,8 @@ impl MemoryLedger {
     /// order — the pipeline ride's episode material (which keys a
     /// commit claims). Served by the same index walk: canonical key
     /// order with the pending-phase filter — O(log L + the witness's
-    /// OWN records), never the pre-index form's full scan and re-sort
-    /// through [`Self::witness_records`].
+    /// OWN records), never a full scan and re-sort through
+    /// [`Self::witness_records`].
     #[must_use]
     pub fn pending_keys(&self, witness: u32) -> Vec<MemoryKey> {
         let Some(keys) = self.witness_index.get(&witness) else {
@@ -883,8 +884,8 @@ pub struct MemoryLane {
     /// lane): `witness → the set of decided keys`. The same
     /// structural fact as the ledger's — `classifications` is keyed
     /// by the event-first `MemoryKey`, so one witness's decisions
-    /// scatter and `witness_classifications`' pre-index form
-    /// full-scanned the map — and the same consumers pay it: the
+    /// scatter and, without the index, `witness_classifications`
+    /// must full-scan the map — and the same consumers pay it: the
     /// journal bridge reads the witness's sync PER COMMIT CALL
     /// (commit staging, the classification flush, the recovery
     /// comparison), so the scan is linear in the GLOBAL decision
@@ -1058,7 +1059,7 @@ impl MemoryLane {
     /// order the decisions map's own iteration restricted to the
     /// witness produces — each key resolved through the decisions
     /// map. Cost O(log C + the witness's OWN decisions), flat in the
-    /// global decision history the pre-index form scanned per call.
+    /// global decision history a full scan walks per call.
     #[must_use]
     pub fn witness_classifications(&self, witness: u32) -> Vec<(MemoryKey, bool)> {
         let Some(keys) = self.classification_index.get(&witness) else {
@@ -1210,7 +1211,7 @@ impl MemoryLane {
         hasher.finish()
     }
 
-    /// THE VERSIONED DIAGNOSTIC DIGEST (finding 7's correction — a
+    /// THE VERSIONED DIAGNOSTIC DIGEST (a
     /// diagnostic BESIDE the compatibility `digest` above, never a
     /// replacement for it; versioned like R1's journal, so a future
     /// field list is a new version tag, never a silent move of this

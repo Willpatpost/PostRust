@@ -24,11 +24,13 @@
 //! event's commit step enumerates its witness set — the NPCs within
 //! the event's perception radius — so cost is O(active NPCs in
 //! radius) per significant event, zero for the population at large
-//! (never N NPCs × M events). This module's census is the LINEAR,
-//! exact form (no spatial partition exists in the simulation
-//! substrate — §10.2's verified list; the measured-trigger rule
-//! holds: any future index must preserve BOTH the inversion and the
-//! fixed order, or determinism breaks). Tier gating is the caller's
+//! (never N NPCs × M events). The canonical census primitive is the
+//! LINEAR, exact form — [`perceive`] — and the simulation substrate
+//! holds no persistent spatial partition (the §10.2 verified list;
+//! the D-family index below is per-batch composition scratch, never
+//! substrate state). The measured-trigger rule holds: any index must
+//! preserve BOTH the inversion and the fixed order, or determinism
+//! breaks. Tier gating is the caller's
 //! composition: a dormant/far NPC is not in any active region's
 //! census, so it witnesses nothing (§5.1 — the census this module
 //! walks already excludes it).
@@ -56,7 +58,7 @@
 //! order. Because the candidate set is a conservative SUPERSET of
 //! the disc's members evaluated in the linear walk's own order,
 //! every yield is bit-identical to [`perceive`]'s — the same trick
-//! the P2-L5 static broad phase landed in `player.rs`. The
+//! `player.rs`'s P2-L5 static broad phase uses. The
 //! composition adopts the index only above the measured gate
 //! ([`CENSUS_INDEX_POPULATION_GATE`] population AND
 //! [`CENSUS_INDEX_QUERIES_GATE`] census queries per tick — the
@@ -277,8 +279,8 @@ pub const CENSUS_CELL_SIZE: f32 = 4.0;
 pub const CENSUS_CELL_LIMIT: i32 = 1 << 21;
 
 /// The cell-walk crossover factor (the design's §2.6 waste trigger,
-/// the same number and argument the L5 static broad phase landed):
-/// when a query's conservative extent spans more than this many
+/// the same number and argument `player.rs`'s L5 static broad phase
+/// carries): when a query's conservative extent spans more than this many
 /// cells PER RECORD in the population, the cell walk alone
 /// outcosts the linear walk's per-record evaluations, so the query
 /// takes the exact linear path. This guard is ALSO what makes the
@@ -331,8 +333,8 @@ fn census_cell_of(coordinate: f32) -> Option<i32> {
 }
 
 /// A trivially-cheap deterministic hasher for cell keys (FNV-1a
-/// over the key bytes — the same hasher choice the L5 static broad
-/// phase landed in `player.rs`). The index is lookup-only — never
+/// over the key bytes — the same hasher choice `player.rs`'s L5
+/// static broad phase carries). The index is lookup-only — never
 /// iterated — so the hash choice is behavior-invisible by
 /// construction; it exists purely to keep per-cell lookups cheap.
 #[derive(Clone, Default)]

@@ -352,11 +352,12 @@ pub struct RetentionStats {
 /// removed, the given events installed as held under their own
 /// identities — so a refusal is always about the replacement set's
 /// identities, and it is always fail-closed and PRE-MUTATION: the
-/// spine is left exactly as the call found it (independent audit
-/// IA-06 at `be910bf`: the pre-fix insertion half installed a
-/// conflicting identity without checking the surviving structures,
-/// and the save then failed restore with
-/// `Duplicate { section: "spine-save/identities", seq: 0 }`).
+/// spine is left exactly as the call found it. The divergence class
+/// a refusal closes (IA-06): an unchecked install of a conflicting
+/// identity gives one identity two simultaneous obligations and
+/// manufactures a save the restore gates refuse as
+/// `Duplicate { section: "spine-save/identities", .. }` — the audit
+/// record lives in the commit that landed the validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconstructionError {
     /// The replacement set repeats an identity: the second install
@@ -462,11 +463,10 @@ pub enum ObligationLocation {
 pub struct ObligationView<'a> {
     pub id: EventId,
     pub due: Tick,
-    /// The obligation's FULL schedule form (Batch 5's lifecycle
-    /// corrective: the collected obligation's exact semantics —
-    /// logical-time or execution-relative — must survive the plan's
-    /// owned form, so a recovered chain resumes with its original
-    /// anchoring, never a flattened due).
+    /// The obligation's FULL schedule form: the collected obligation's
+    /// exact semantics — logical-time or execution-relative — must
+    /// survive the plan's owned form, so a recovered chain resumes
+    /// with its original anchoring, never a flattened due.
     pub schedule: Schedule,
     pub class: EventClass,
     pub payload: u64,
@@ -1275,8 +1275,8 @@ impl<W: World> Spine<W> {
     ///
     /// The predicate observes candidates in **canonical `(due, seq)`
     /// order** within each lane (near first, then far), then the
-    /// blocked set in ascending-seq order — the contract the
-    /// pre-bulk-partition pop loop established (IA-02): a stateful
+    /// blocked set in ascending-seq order — the canonical-visitation
+    /// contract (IA-02): a stateful
     /// `FnMut` closure sees the identical visitation sequence on a
     /// live spine and on a save→restored copy of the same spine, so
     /// its selection can never depend on heap-rebuild layout.
@@ -1295,19 +1295,18 @@ impl<W: World> Spine<W> {
             &mut matches,
         );
         // The blocked arm of the same bulk-partition shape (A08a): one
-        // allocation-free in-place pass — `extract_if` is the
-        // retain-style compaction that yields the removed entries by
-        // value in canonical seq order, so the old
-        // collect-seqs-then-remove temp Vec disappears. The split
-        // field borrows are what make the in-place pass possible: the
-        // dependency check runs through the free-function helpers
-        // (never a whole-spine `&self` method call) while the map
-        // iterator holds `blocked`, and the borrow checker proves
-        // every touched field disjoint. Processing order (ascending
-        // seq) and every per-entry decision — registration cleanup,
-        // `held_index`/`held` insertion — are identical to the
-        // two-phase form; `unfinished` and `next_seq` are read-only
-        // here, so each entry is judged against the same fixed view.
+        // allocation-free in-place pass — `extract_if` yields the
+        // removed entries by value in canonical seq order, with no
+        // collect-seqs-then-remove temp Vec. The split field borrows
+        // are what make the in-place pass possible: the dependency
+        // check runs through the free-function helpers (never a
+        // whole-spine `&self` method call) while the map iterator
+        // holds `blocked`, and the borrow checker proves every
+        // touched field disjoint. `unfinished` and `next_seq` are
+        // read-only here, so each entry is judged in ascending-seq
+        // order against the same fixed view, and every per-entry
+        // decision — registration cleanup, `held_index`/`held`
+        // insertion — matches the two-phase form.
         let unfinished = &self.unfinished;
         let next_seq = self.next_seq;
         let extracted = self.blocked.extract_if(.., |_, event| {
@@ -1405,11 +1404,11 @@ impl<W: World> Spine<W> {
     /// observationally exact (the lanes re-heap from the decision
     /// snapshot's own multiset; `unfinished`, `blocked`, `held`, and
     /// every statistic are untouched) and the spine still saves and
-    /// restores cleanly. This is the load-path form the audit's IA-06
-    /// witness exercises: the pre-fix insertion half installed a
-    /// replacement carrying a SURVIVING identity without checking the
-    /// surviving structures, and the save then failed restore with
-    /// `Duplicate { section: "spine-save/identities", seq: 0 }`.
+    /// restores cleanly. The failure class a refusal closes (IA-06,
+    /// see [`ReconstructionError`]): an unchecked install of a
+    /// SURVIVING identity gives one identity two simultaneous
+    /// obligations — a save the restore gates must refuse as
+    /// `Duplicate`.
     ///
     /// Replacement identities MAY reuse identities the removal just
     /// freed (the crossing's recovery re-installs the journaled
@@ -1574,11 +1573,10 @@ impl<W: World> Spine<W> {
     }
 
     /// Partitions one lane into the reconstruction's decision
-    /// snapshot (the validation's read-only source — the pre-mutation
-    /// form of the old drop-from-queue drain): `into_vec` consumes
-    /// the heap's buffer, the sort exits it into canonical
-    /// `(due, seq)` order — the order the old pop drain visited (a
-    /// min-heap over unique keys pops ascending; the IA-02
+    /// snapshot (the validation's read-only source): `into_vec`
+    /// consumes the heap's buffer, the sort exits it into canonical
+    /// `(due, seq)` order — the order a min-heap over unique keys
+    /// pops ascending (the IA-02
     /// canonical-visitation discipline) — and `extract_if` is the
     /// retain-style compaction yielding the matching half by value.
     /// Returns `(retained, dropped)`; NO other structure is touched
@@ -1634,20 +1632,19 @@ impl<W: World> Spine<W> {
     /// an erasure of historical due times (reviewer clarification C).
     pub fn resume_matching(&mut self, mut matches: impl FnMut(&ObligationView) -> bool) -> u32 {
         // The A08a bulk-partition shape: one allocation-free in-place
-        // pass over the held map — `extract_if` is the retain-style
-        // compaction that yields the removed entries by value in
-        // canonical seq order, so the old collect-seqs-then-remove
-        // temp Vec disappears. The split field borrows
+        // pass over the held map — `extract_if` yields the removed
+        // entries by value in canonical seq order, with no
+        // collect-seqs-then-remove temp Vec. The split field borrows
         // (the `register_waiters_for_unmet_into` precedent: the
         // free-function dependency helpers plus direct per-field
         // access, never a whole-spine method call) let the pass
         // update `held_index`, route entries to their lanes, and
         // re-register blocked waiters while the map iterator holds
         // `held` — the borrow checker proves every touched field
-        // disjoint. Per-entry decisions run in the same
-        // ascending-seq order against the same fixed `unfinished`
-        // view (resume never mutates it), so revalidation,
-        // registration, and lane routing are identical to the
+        // disjoint. `unfinished` is read-only here (resume never
+        // mutates it), so entries are judged in the same
+        // ascending-seq order against the same fixed view, and
+        // revalidation, registration, and lane routing match the
         // two-phase form.
         let unfinished = &self.unfinished;
         let next_seq = self.next_seq;
@@ -1684,22 +1681,18 @@ impl<W: World> Spine<W> {
     }
 
     /// Bulk-partitions one lane, holding matching entries and
-    /// heapifying the rest back into the same buffer — the A08a
-    /// linear shape (P2 design §4.2 step 1) replacing the old
-    /// pop-everything/re-push drain: `into_vec` consumes the heap in
-    /// O(1) reusing its buffer, `extract_if` is the retain-style
-    /// stable compaction that yields the removed entries by value (no
-    /// temp Vec — the held inserts receive them directly), and
-    /// `BinaryHeap::from` heapifies in O(N) with no allocation (the
-    /// buffer transfers). Net O(N log N) — the sort below dominates,
-    /// the same class as the old pop drain — with zero scratch
-    /// allocations, versus O(N log N) + one temp Vec per lane per
-    /// call for the pop loop.
+    /// heapifying the rest back into the same buffer (the A08a
+    /// linear shape, P2 design §4.2 step 1): `into_vec` consumes the
+    /// heap in O(1) reusing its buffer, `extract_if` is the
+    /// retain-style compaction that yields the removed entries by
+    /// value (no temp Vec — the held inserts receive them directly),
+    /// and `BinaryHeap::from` heapifies in O(N) with no allocation
+    /// (the buffer transfers). Net O(N log N) — the sort below
+    /// dominates — with zero scratch allocations per call.
     ///
     /// The taken buffer is **sorted into canonical `(due, seq)` order
     /// before the partition** (IA-02): the public `FnMut` predicate
-    /// must observe candidates exactly where the old pop loop
-    /// observed them — canonical order, never the heap's
+    /// must observe candidates in canonical order — never the heap's
     /// rebuild-dependent buffer order, which a save→restore rebuilds
     /// differently from live scheduling (a stateful predicate's
     /// selection would otherwise change across restore). The sort is
@@ -1802,8 +1795,8 @@ impl<W: World> Spine<W> {
     /// sort plus O(N) partition and heapify, with zero scratch
     /// allocations (the caller's `moved` Vec is the operation's
     /// output, not scratch). The sort gives the public predicate the
-    /// same canonical `(due, seq)` visitation the old pop loop had
-    /// (IA-02 — see [`Self::suspend_from_queue`]); every other
+    /// canonical `(due, seq)` visitation (IA-02 — see
+    /// [`Self::suspend_from_queue`]); every other
     /// observable derives from the canonical keys, so the retained
     /// multiset's rebuild stays invisible.
     fn reclassify_queue(
@@ -2601,9 +2594,9 @@ impl<W: World> Spine<W> {
         });
         // The event leaves the unfinished index BEFORE the handler
         // runs, so follow-ups may declare dependencies on the event
-        // currently executing (the complement representation's form
-        // of the old executed-set insert — same sequencing, same
-        // semantics).
+        // currently executing (the complement representation's
+        // equivalent of the executed-set insert — same sequencing,
+        // same semantics).
         self.unfinished.remove(&event.id.seq);
         self.stats.executed += 1;
         if executed_tick > due {
@@ -2678,10 +2671,9 @@ impl<W: World> Spine<W> {
 
     /// Whether `event` still has unexecuted dependencies — the hot-path
     /// emptiness question the drain and unblock paths ask. No
-    /// allocation: the Vec form this replaces allocated once per
-    /// blocked transition and once per unblock re-validation, while
-    /// both callers only ever needed this boolean (and, for suppressed
-    /// diagnostics, a count). Delegates to the free-function form over
+    /// allocation: both callers need only this boolean (plus, for
+    /// suppressed diagnostics, a count) — never a collected Vec.
+    /// Delegates to the free-function form over
     /// split borrows (the A08a in-place passes share it).
     fn has_unmet_dependencies(&self, event: &Event) -> bool {
         has_unmet_dependencies_with(&self.unfinished, self.next_seq, event)
@@ -2701,8 +2693,7 @@ impl<W: World> Spine<W> {
     /// Registers `dependent` on every currently-unexecuted dependency
     /// of a newly blocked `event` (deduplicated) — the fused unmet filter + waiter
     /// registration the drain, resume, and restore paths
-    /// share. Identical per-dependency iteration order and dedup to
-    /// the slice form it replaces; allocation-free. Delegates to the
+    /// share. Allocation-free. Delegates to the
     /// free-function form over split borrows, and returns the
     /// registration count that seeds the derived remaining-dependency
     /// counter (B01 — see [`register_waiters_for_unmet_into`]).
@@ -2721,16 +2712,16 @@ impl<W: World> Spine<W> {
     /// healthy-ratio derivation dictates). O(1) through the derived
     /// remaining-dependency count: the count of UNIQUE unmet
     /// dependencies at park time, decremented once per executed
-    /// prerequisite, is zero exactly when the old full-list
-    /// revalidation would pass — equivalent by the registration
-    /// dedup (repeated dependency ids register, and count, once) and
+    /// prerequisite, is zero exactly when a full-list revalidation
+    /// of the unmet dependencies would pass — equivalent by the
+    /// registration dedup (repeated dependency ids register, and
+    /// count, once) and
     /// by the lifecycle rule that a waiter's registrations exist
     /// only while it is blocked and the prerequisite unexecuted.
     fn try_unblock(&mut self, seq: u64) -> u64 {
         let Some(remaining) = self.remaining_deps.get_mut(&seq) else {
-            // Not currently blocked — the defensive no-op the
-            // full-list revalidation had (the lifecycle keeps waiter
-            // lists inside the blocked set).
+            // Not currently blocked — a defensive no-op (the
+            // lifecycle keeps waiter lists inside the blocked set).
             return 0;
         };
         if *remaining > 1 {

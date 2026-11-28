@@ -28,7 +28,7 @@
 //! subtracting 1.0 rounds back to the same float; a valid authored
 //! stride of 2^-30 against a distance of 1.0 puts the phase at 2^30).
 //! The reduction is exact everywhere exactness is possible and
-//! byte-identical to the repeated subtraction it replaces (the
+//! byte-identical to the repeated-subtraction reduction (the
 //! arithmetic proof lives at step 9 below); a non-finite phase
 //! (distance/stride overflowing f32 on valid authored inputs) is
 //! clamped to 0.0 and counted fail-visibly. The crossing loop is
@@ -715,11 +715,11 @@ pub fn advance_batch(
         // and the state settles at the last admitted crossing: the
         // NPC stands at the waypoint it reached (leg_distance 0 on
         // the leg it entered — an on-route position), and the next
-        // tick resumes the walk. The pre-corrective defect kept the
-        // unconsumed distance in the state, so step 5 extrapolated
+        // tick resumes the walk. The settlement is what protects the
+        // `leg_distance < leg_length` walking invariant: carrying
+        // the unconsumed distance would let step 5 extrapolate
         // `leg_from + leg_distance · unit` past the leg's end by
-        // that whole distance — a walker off its route with the
-        // `leg_distance < leg_length` invariant broken. Ordinary
+        // that whole distance — a walker off its route. Ordinary
         // trajectories never fire this (the loop breaks with
         // `leg_distance < length`); the guard's counter reports it
         // fail-visibly. The `speed > 0` guard is the same one step 5
@@ -820,8 +820,8 @@ pub fn advance_batch(
             // authored stride of 2^-30 against a distance of 1.0
             // puts the phase at 2^30, and the tick never returned).
             // The reduction is EXACT everywhere exactness is
-            // possible, and byte-identical to the repeated
-            // subtraction it replaces: for a phase in [1, 2^24)
+            // possible, and byte-identical to the repeated-
+            // subtraction reduction: for a phase in [1, 2^24)
             // every integer up to the phase and every multiple of
             // the phase's own ulp in [0, 1) are representable, so
             // both `floor` and the subtraction are exact — the

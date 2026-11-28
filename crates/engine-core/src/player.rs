@@ -38,7 +38,7 @@
 //! prototype scope). The third-person camera has no collision of its
 //! own (documented limitation).
 //!
-//! C2-P1 (the playable-world interaction loop) adds: the grounded
+//! C2-P1 (the playable-world interaction loop): the grounded
 //! step-up probe ([`PlayerConfig::step_height`], default 0 =
 //! DISABLED, preserving the Cycle-1 clamp behavior bit-exactly — the
 //! frozen trace's guarantee); the exact segment intersection query
@@ -59,7 +59,7 @@
 //! reporting `refused_invalid_inputs`: a valid player state can
 //! never be silently turned non-finite by invalid inputs (a
 //! non-finite incoming STATE is refused separately,
-//! `refused_nonfinite_state`). R4b adds the semantic minimums
+//! `refused_nonfinite_state`). The R4b semantic minimums
 //! (positive `pitch_limit` — a negative one inverts the pitch clamp
 //! and panics — and positive `height`/`radius` extents) and exact
 //! u64 tick accounting across the whole tick-rate range: a 2³²-tick
@@ -121,7 +121,7 @@ pub const MAX_TICK_HZ: u32 = 1_000_000_000;
 /// conceivable session). Within the domain the tick accounting is
 /// exact in u64 for every representable input (`due == executed +
 /// outstanding`, including a 2³²-tick obligation at the 1 GHz tick
-/// bound, which the old u32 narrowing wrapped to zero); an advance
+/// bound — u32 arithmetic would wrap it to zero); an advance
 /// that would exceed the remaining domain is clamped to the boundary
 /// and REPORTED via [`DriveStep::domain_clamped`] — never silently
 /// discarded.
@@ -1617,9 +1617,9 @@ pub struct DriveStep {
     pub executed_ticks: u32,
     /// Due ticks retained (not yet executed) — a reported obligation,
     /// never silently discarded; drains when catch-up capacity
-    /// allows. u64 (R4b): a 2³²-tick obligation at the 1 GHz tick
-    /// bound accounts exactly — the old u32 narrowing wrapped it to
-    /// zero.
+    /// allows. u64 (R4b): exact across the whole tick-rate range —
+    /// a 2³²-tick obligation at the 1 GHz tick bound accounts
+    /// exactly (u32 accounting would wrap it to zero).
     pub outstanding_ticks: u64,
     /// The advance was clamped to the remaining
     /// [`MAX_TOTAL_ADVANCE_NS`] domain — reported, never silent.
@@ -1743,8 +1743,8 @@ impl PlayerDriver {
     /// Advances by elapsed monotonic time (frame-sampled live
     /// intent). R4b: the due-tick arithmetic is u128-wide with u64
     /// public accounting — exact across the whole tick-rate range
-    /// (the 2³²-tick counterexample at the 1 GHz bound included; the
-    /// old `as u32` narrowing wrapped it to zero) — and an advance
+    /// (the 2³²-tick counterexample at the 1 GHz bound included;
+    /// u32 narrowing would wrap it to zero) — and an advance
     /// beyond the remaining [`MAX_TOTAL_ADVANCE_NS`] domain is
     /// clamped to the boundary and REPORTED via `domain_clamped`.
     pub fn advance(&mut self, elapsed: Duration, intent: MoveIntent) -> DriveStep {
