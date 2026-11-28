@@ -1978,6 +1978,68 @@ mod tests {
         dec.finish().unwrap();
     }
 
+    /// THE RED WITNESS (T21, recorded pre-fix — the assertion is
+    /// inverted by the fix commit): the reserve-bytes ledger counts
+    /// only the nominal COLUMN bytes, so a decode under a small
+    /// configured budget allocates transients far beyond it. A
+    /// 256-region, one-identity-per-region all-dormant section's
+    /// nominal column sum is 256 × 36 = 9,216 in-memory bytes
+    /// (identity 12 + steps 8 + milestones 8 + credits 8 per
+    /// identity), and a budget of exactly 9,216 admits the decode
+    /// today. But the walk ALSO transiently reserves, never charging
+    /// the budget:
+    ///
+    /// * the regions vector — `Vec::with_capacity(256)` reserves
+    ///   exactly 256 × `size_of::<NpcRegionBlock>()` allocator-request
+    ///   bytes (measured at runtime below; the exact request size,
+    ///   not an estimate), observable as `regions.capacity() == 256`
+    ///   on the restored section — on this toolchain ~5.6× the whole
+    ///   configured budget by itself;
+    /// * the seen-id index — std's `BTreeSet<u32>` nodes hold at
+    ///   most 11 entries each, so 256 identities allocate at least
+    ///   ⌈256/11⌉ = 24 fixed-layout node allocations (the node
+    ///   layout is std-implementation-defined, roughly 160 bytes on
+    ///   this toolchain — the counting-allocator census remains the
+    ///   follow-up that would measure it; the node COUNT is the
+    ///   derived lower bound).
+    ///
+    /// The caller configured 9,216; the decode spent 9,216 + ~51,200
+    /// + ≥ 24 nodes. Post-fix, this same input under the same budget
+    /// refuses typed at the regions-reserve gate BEFORE the
+    /// reservation is made.
+    #[test]
+    fn small_configured_budgets_do_not_bound_the_decode_transients_red_witness() {
+        let section = scaled_section(256, 256, 16, 0);
+        let bytes = encode_v2(&section);
+        // The nominal column arithmetic: 256 dormant identities × 36
+        // in-memory bytes = 9,216 — the ledger's exact final reading.
+        let nominal_columns: u64 = 256 * 36;
+        assert_eq!(nominal_columns, 9_216);
+        let limits = SectionDecodeLimits::new(256, nominal_columns);
+        let mut dec = Decoder::new(&bytes);
+        let restored = NpcWorldSectionV2::restore_with_limits(&mut dec, &limits)
+            .expect("RED: today the decode is admitted at the nominal column budget");
+        dec.finish().unwrap();
+        assert_eq!(restored, section);
+        // The transient the budget never saw, part 1 (the exact
+        // allocator request): the block vector reserved 256 slots.
+        assert_eq!(restored.regions.capacity(), 256);
+        let regions_reservation = 256 * std::mem::size_of::<NpcRegionBlock>() as u64;
+        assert!(
+            regions_reservation > nominal_columns,
+            "the regions vector alone ({regions_reservation} bytes) exceeds the whole \
+             configured budget ({nominal_columns} bytes)"
+        );
+        // Part 2 (the derived lower bound): the seen-id index's node
+        // count — at least one fixed-layout allocation per eleven
+        // identities, never charged against any budget.
+        assert_eq!(256u64.div_ceil(11), 24);
+        // RED: the caller's configured limit was exceeded by
+        // transients the ledger never charged. (Post-fix: this exact
+        // call refuses with `SaveError::Limit` at the regions-reserve
+        // gate, before any reservation is made.)
+    }
+
     /// The multi-scale run fixture: a World whose authoritative state
     /// IS the v2 section (per-region steps columns), executing by the
     /// payload's (region, column) pair and chaining itself — the
