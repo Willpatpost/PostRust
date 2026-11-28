@@ -592,3 +592,15 @@ spine_queued_transition_allocations 1, suspension 20, doc-tests 0);
 `cargo check --workspace --all-targets` exit 0, zero warnings (the legacy
 emission API's `()` returns preserved — no engine-slice caller moved). CI pin
 movement for the orchestrator's batch: the main shard's engine-core lib +3.
+
+## R3 + R4 landed (`d1a2d92`) — four of six review findings resolved
+
+R3: the typed follow-up admission contract (refusing beyond K at emission,
+synchronously in-hand; the budget admission-time-known; the legacy forms
+byte-identical) with deterministic deferral parked as the owner decision;
+the ceiling claims corrected admission-epoch-scoped; the runtime-bound
+behavior documented-as-designed. R4: the caller census proving no production
+caller splittable mid-object at real capacities; the boundary strengthened
+with the lattice theorem and the unit-aligned-budget lever; the engine-owned
+units designed and parked; the census's latent rig red corrected (114).
+Pins: main 1698/1647, renderer-release 236. Run `46168694243` dispatched.
