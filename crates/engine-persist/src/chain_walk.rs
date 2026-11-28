@@ -823,3 +823,147 @@ pub(crate) fn advance_cursor(
         }
     }
 }
+
+// ============================================================== the census
+// (T29, commit 1) The walker residency census — the R07-§7-shape
+// read-only ESTIMATOR over a walked chain (the design §2's three
+// lifetime classes as documented fields over MEASURED populations),
+// test-only: never serialized, never a fingerprint input, never a
+// production surface. The populations are the walked chain's own
+// (records, content objects, key lengths, reclaimed entries) plus
+// two caller-measured inputs (the store's largest content object;
+// the walked records' total depends_on edges) — the estimator never
+// guesses a population. The per-element constants are the R07 §2 /
+// CA-17 conventions the design inherits and labels as estimates:
+// std's exact B-tree node occupancy is its own business, so the node
+// share is taken at ≈48 B amortized per element; `Hash` is a fixed
+// 32 B; the Vec header at 24 B; Vec capacity slack up to 2× length
+// is a documented upper bound the rows report WITHOUT (the rows are
+// the convention-constant term, never the slack).
+//
+// Gated with the differential battery that consumes it (the
+// both-providers census requires the sqlite twin; a local-only test
+// build compiles neither).
+#[cfg(all(test, feature = "sqlite"))]
+pub(crate) mod walk_census {
+    use super::WalkedChain;
+
+    /// 32 B hash + the ≈48 B amortized B-tree node share per element.
+    pub(crate) const HASH_SET_ELEMENT_BYTES: u64 = 32 + 48;
+    /// The per-key overhead: 24 B Vec header + the node share; the
+    /// key's own bytes are measured per key.
+    pub(crate) const KEY_OVERHEAD_BYTES: u64 = 24 + 48;
+    /// 32 B hash + 8 B epoch + the node share per reclaimed entry.
+    pub(crate) const RECLAIMED_ELEMENT_BYTES: u64 = 32 + 8 + 48;
+    /// The walked triple `(Hash, u64, Vec<Hash>)`: 40 B tuple + 24 B
+    /// Vec header, plus 32 B per depends_on edge (measured).
+    pub(crate) const WALKED_TUPLE_BYTES: u64 = 40 + 24;
+    /// The deferred ancestry index entry: 32 B hash + 8 B position +
+    /// the node share.
+    pub(crate) const POSITIONS_ELEMENT_BYTES: u64 = 32 + 8 + 48;
+    /// The object-buffer holds the CURRENT whole-read walks keep
+    /// concurrently: the first reference's whole bytes held across
+    /// the remaining references' whole reads — peak ≈ 2·o_max (the
+    /// design §2.2's dominant term; the composite chunk's
+    /// whole-load-plus-`to_vec()` copy is the same 2× shape when the
+    /// largest object is a chunk). `o_max` is the MEASURED largest
+    /// content object the caller supplies.
+    pub(crate) const OBJECT_HOLDS_PER_MAX: u64 = 2;
+
+    /// One census row set. Every byte field is an estimator row over
+    /// measured populations (labeled conventions, never byte-level
+    /// measurements); every population field is measured.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct WalkCensus {
+        // measured populations
+        /// Retained records walked (the summary's own count).
+        pub(crate) records: u64,
+        /// Distinct reachable content objects (the summary's own).
+        pub(crate) content_objects: u64,
+        /// Distinct idempotency keys seen (on-chain plus the
+        /// reclaimed-index merge).
+        pub(crate) keys: u64,
+        /// The reclaimed-index entries merged into the universe.
+        pub(crate) reclaimed_entries: u64,
+        /// The caller-measured total depends_on edges walked.
+        pub(crate) dependency_edges: u64,
+        // class 1 — cursor-resident (session lifetime; O(chain) BY
+        // DESIGN and load-bearing: the substrate of the O(1)
+        // per-commit key/dependency membership checks — never shrunk)
+        /// `reachable` (record ids + content hashes).
+        pub(crate) reachable_bytes: u64,
+        /// `record_ids` (the revision-id subset).
+        pub(crate) record_ids_bytes: u64,
+        /// `seen_keys` (per-key measured lengths).
+        pub(crate) seen_keys_bytes: u64,
+        /// `reclaimed` (identity → epoch).
+        pub(crate) reclaimed_index_bytes: u64,
+        /// The four fields' total (the O(100) fixed fields omitted as
+        /// noise, per the design §2.1).
+        pub(crate) cursor_resident_bytes: u64,
+        // class 2 — walk-transient (peak concurrent with the cursor
+        // being built)
+        /// The `walked` triples.
+        pub(crate) walked_bytes: u64,
+        /// The deferred ancestry `positions` map.
+        pub(crate) positions_bytes: u64,
+        /// The object-buffer term under the CURRENT whole-read
+        /// mechanics: 2·o_max.
+        pub(crate) object_buffer_peak_bytes: u64,
+        /// The walk-transient total (walked + positions + the object
+        /// buffers; the staged MK indexes join the reclaimed row at
+        /// the merge, per the design §2.2's accounting).
+        pub(crate) walk_transient_peak_bytes: u64,
+        // class 3 — the per-validation churn
+        /// The three cursor-set deep clones `validate_observed`
+        /// performs before EVERY divergent-head suffix walk
+        /// (`seen_keys` + `record_ids` + `reclaimed`, allocated AND
+        /// freed per external append observed — pure churn, no
+        /// residency, no proof value). THE COMMIT-2 TEETH ROW: it
+        /// must pin to ZERO after the borrow fix.
+        pub(crate) validation_churn_bytes: u64,
+    }
+
+    /// Computes the census over one walked chain.
+    pub(crate) fn census(
+        walked: &WalkedChain,
+        largest_object_bytes: u64,
+        dependency_edges: u64,
+    ) -> WalkCensus {
+        let cursor = &walked.cursor;
+        let records = walked.summary.records;
+        let content_objects = walked.summary.content_objects;
+        let keys = cursor.seen_keys.len() as u64;
+        let reclaimed_entries = cursor.reclaimed.len() as u64;
+        let reachable_bytes = HASH_SET_ELEMENT_BYTES * cursor.reachable.len() as u64;
+        let record_ids_bytes = HASH_SET_ELEMENT_BYTES * cursor.record_ids.len() as u64;
+        let seen_keys_bytes = cursor
+            .seen_keys
+            .iter()
+            .map(|key| KEY_OVERHEAD_BYTES + key.len() as u64)
+            .sum();
+        let reclaimed_index_bytes = RECLAIMED_ELEMENT_BYTES * reclaimed_entries;
+        let walked_bytes = WALKED_TUPLE_BYTES * records + 32 * dependency_edges;
+        let positions_bytes = POSITIONS_ELEMENT_BYTES * records;
+        let object_buffer_peak_bytes = OBJECT_HOLDS_PER_MAX.saturating_mul(largest_object_bytes);
+        let cursor_resident_bytes =
+            reachable_bytes + record_ids_bytes + seen_keys_bytes + reclaimed_index_bytes;
+        WalkCensus {
+            records,
+            content_objects,
+            keys,
+            reclaimed_entries,
+            dependency_edges,
+            reachable_bytes,
+            record_ids_bytes,
+            seen_keys_bytes,
+            reclaimed_index_bytes,
+            cursor_resident_bytes,
+            walked_bytes,
+            positions_bytes,
+            object_buffer_peak_bytes,
+            walk_transient_peak_bytes: walked_bytes + positions_bytes + object_buffer_peak_bytes,
+            validation_churn_bytes: record_ids_bytes + seen_keys_bytes + reclaimed_index_bytes,
+        }
+    }
+}
