@@ -23,7 +23,7 @@ use super::corner;
 use super::descriptors::DescriptorFoundation;
 use super::resources::advance_target_fault_plan;
 use super::skinned_draw;
-use super::staging::StagingPool;
+use super::staging::{StagingPool, UploadTicket};
 use super::textures::{SamplerPool, Texture};
 use crate::config::{DepthFormatPreference, RenderConfig, TargetFaultSite, TargetFaultStage};
 use std::cell::RefCell;
@@ -112,6 +112,17 @@ pub(crate) struct VulkanContext {
     /// indirect-issuance observation's exact shape) into
     /// `FrameOutcome::arena_growth_events` → `RenderStats`.
     pub(super) arena_growth_events: Cell<u64>,
+    /// T02 (strict audit IV, §2.3 of the lifecycle design): the
+    /// RESOURCE EPOCH source — a context-monotonic counter minted
+    /// once per PUBLICATION of a resource identity (a mapped carve's
+    /// creation or growth-commit replacement). The population
+    /// stamps carry the epoch of the carve they vouch for, so a
+    /// replaced carve (a fresh epoch — the counter never repeats)
+    /// can never inherit a previous identity's stamps: resource
+    /// creation, replacement, and reset cannot collide with a
+    /// surviving stamp. Composes with T05's submission-time clears
+    /// (the identity window) — the epoch closes the RESOURCE window.
+    pub(super) resource_epochs: Cell<u64>,
     /// Diagnostic fault-injection seam: arms a one-shot plan for the
     /// corrective finding 3+8 verification. The `u32` ordinal is
     /// 1-based and decrements per MATCHING check across the renderer's
@@ -194,6 +205,59 @@ pub(crate) struct VulkanContext {
     /// owning thread (the mapped pointer makes it `!Send`/`!Sync`).
     /// See [`super::staging`] — the module doc is the design.
     pub(super) staging: RefCell<StagingPool>,
+    /// T03 (strict audit IV, §3.2): the QUARANTINED attaches — staged
+    /// scene resources retained under their ticket after a
+    /// drain-failure (never destroyed on that arm; never published).
+    /// Normally empty; at most one live entry (the one-scene budget's
+    /// shadow — a second attach is refused while any quarantine
+    /// exists). See [`QuarantinedScene`].
+    pub(super) quarantined_scenes: Vec<QuarantinedScene>,
+    /// T03 §3.4: the rollback's classified idle/drain failure — the
+    /// typed diagnostic recorded when the release path's fallback
+    /// could not PROVE the device idle (the rollback stays
+    /// infallible by contract; the original error propagates, this
+    /// record surfaces the residual risk through
+    /// [`crate::Renderer::last_release_idle_failure`]).
+    pub(super) last_release_idle_failure: Option<RendererError>,
+}
+
+/// T03 (strict audit IV, §3.2 of the lifecycle design): one
+/// QUARANTINED attach — the staged scene resources whose deferred
+/// upload's drain FAILED (a stuck fence or another non-loss drain
+/// error) retained UNDER THEIR TICKET instead of destroyed or
+/// published. A timeout is not completion: the in-flight copies may
+/// still reference these resources, so they are NEVER destroyed on
+/// the quarantine arm — the NEXT attach attempt reconciles the
+/// ticket (the T16 typed poll: completed → released, pending → the
+/// attach refuses typed, retry later), and the teardown's classified
+/// idle makes the destroys legal if the fence never signals. At most
+/// one live quarantined attach per renderer (a second attach is
+/// refused while any quarantine exists — the one-scene budget's
+/// shadow).
+pub(crate) struct QuarantinedScene {
+    pub(crate) resources: corner::CornerResources,
+    /// The deferred batch's identity — `None` on the pool-unavailable
+    /// fallback arm (reconciled by a bounded drain attempt instead
+    /// of the non-blocking poll).
+    pub(crate) ticket: Option<UploadTicket>,
+}
+
+/// T03 §3.2: the quarantine reconciliation's decision — the attach
+/// retry's step 0 (the device work lives in
+/// [`VulkanContext::probe_quarantined_scene`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum QuarantineReconciliation {
+    /// No quarantine exists — the attach proceeds.
+    None,
+    /// The ticket completed — release the quarantine (the pipeline
+    /// group FIRST, then the resources) and proceed with the attach.
+    Released,
+    /// The ticket is still in flight — the attach refuses typed;
+    /// retry after the upload completes (outcome (b)).
+    StillInFlight,
+    /// The reconciliation observed a device loss — the lifecycle
+    /// latch takes it (outcome (c)).
+    Failed(RendererError),
 }
 
 impl VulkanContext {
@@ -530,6 +594,7 @@ impl VulkanContext {
             sampler_creations: Cell::new(0),
             indirect_draws_issued: Cell::new(0),
             arena_growth_events: Cell::new(0),
+            resource_epochs: Cell::new(0),
             target_fault: Cell::new(None),
             lifecycle_fault: Cell::new(None),
             corner_pipeline_objects: Cell::new(0),
@@ -551,6 +616,8 @@ impl VulkanContext {
             staged_buffer_uploads: Cell::new(0),
             texture_staging_tail_bytes: Cell::new(0),
             staging: RefCell::new(StagingPool::new()),
+            quarantined_scenes: Vec::new(),
+            last_release_idle_failure: None,
         };
         if let Err(e) = context.init_atlas(atlas) {
             context.destroy();
@@ -586,7 +653,7 @@ impl VulkanContext {
     pub(crate) fn attach_scene_resources(
         &mut self,
         description: &crate::scene_description::SceneDescription,
-    ) -> Result<(), RendererError> {
+    ) -> Result<Option<super::staging::UploadTicket>, RendererError> {
         if self.corner.is_some() {
             return Err(RendererError::Vulkan(
                 "a scene is already attached (one scene per renderer — \
@@ -594,9 +661,74 @@ impl VulkanContext {
                     .into(),
             ));
         }
-        let resources = corner::CornerResources::new(self, description)?;
+        let (resources, ticket) = corner::CornerResources::new(self, description)?;
         self.corner = Some(resources);
-        Ok(())
+        Ok(ticket)
+    }
+
+    /// T03 (strict audit IV, §3.2 step 5): QUARANTINES the staged
+    /// scene resources under their ticket — the drain-failure arm of
+    /// the attach transaction. The one-scene budget frees (`corner`
+    /// is `None` again, so a retry builds fresh resources); the
+    /// scene handle was never published; the RESOURCES survive (a
+    /// timeout is not completion: the in-flight copies may still
+    /// reference them — never destroyed on this arm). The next
+    /// attach attempt reconciles the ticket
+    /// ([`Self::probe_quarantined_scene`]); the teardown's classified
+    /// idle releases them if the fence never signals.
+    pub(crate) fn quarantine_staged_scene(&mut self, ticket: Option<super::staging::UploadTicket>) {
+        if let Some(resources) = self.corner.take() {
+            self.quarantined_scenes
+                .push(QuarantinedScene { resources, ticket });
+        }
+    }
+
+    /// T03 §3.2 (the retry's step 0): the quarantine's reconciliation
+    /// DECISION — non-destructive (the caller releases the dependent
+    /// corner pipeline group FIRST, then
+    /// [`Self::release_quarantined_scene`]). The ticket's completion
+    /// is the T16 typed poll: completed → `Released` (the fence
+    /// signaled — or the entry already retired); pending →
+    /// `StillInFlight` (the attach refuses typed, retry later — the
+    /// outcome-(b) contract); a loss at the poll → `Failed` (the
+    /// lifecycle latch takes it — outcome (c)). The fallback-arm
+    /// quarantine (no ticket of its own) reconciles by a bounded
+    /// drain attempt.
+    pub(crate) fn probe_quarantined_scene(&self) -> QuarantineReconciliation {
+        let Some(quarantined) = self.quarantined_scenes.first() else {
+            return QuarantineReconciliation::None;
+        };
+        match quarantined.ticket {
+            Some(ticket) => match self.staging_ticket_completed(ticket) {
+                Ok(true) => QuarantineReconciliation::Released,
+                Ok(false) => QuarantineReconciliation::StillInFlight,
+                Err(error) => QuarantineReconciliation::Failed(error),
+            },
+            None => match self.drain_staging() {
+                Ok(()) => QuarantineReconciliation::Released,
+                Err(RendererError::DeviceLost { .. }) => {
+                    QuarantineReconciliation::Failed(RendererError::DeviceLost {
+                        operation: "staging drain (quarantine reconciliation)".into(),
+                    })
+                }
+                Err(_) => QuarantineReconciliation::StillInFlight,
+            },
+        }
+    }
+
+    /// T03 §3.2: releases the FIRST quarantined scene — called only
+    /// after [`Self::probe_quarantined_scene`] reported `Released`
+    /// (the ticket completed) or from the teardown (after the
+    /// staging pool's classified idle made every destroy legal).
+    /// SAFETY/legality: the quarantined ticket's fence signaled, or
+    /// the teardown's idle completed/was loss-abandoned — no pending
+    /// submission reads these resources.
+    pub(crate) fn release_quarantined_scene(&mut self) {
+        if let Some(quarantined) = self.quarantined_scenes.first_mut() {
+            let resources = std::mem::take(&mut quarantined.resources);
+            resources.destroy(self);
+            self.quarantined_scenes.remove(0);
+        }
     }
 
     /// CA-01 (attach atomicity): releases the STAGED scene resources
@@ -616,24 +748,76 @@ impl VulkanContext {
     /// (the build's deferred flush; the pipeline-group failure this
     /// rollback serves happens after it) — the batch's copies write
     /// the very images and buffers being released, so the pool
-    /// drains FIRST (the actual resource dependency). A drain that
-    /// times out (a stuck submission) falls back to
-    /// `device_wait_idle` before the destroys — the releases must
-    /// proceed (the rollback is infallible by contract; the ORIGINAL
-    /// error propagates, never this best-effort cleanup's).
+    /// drains FIRST (the actual resource dependency).
+    ///
+    /// T03 §3.4 — THE IDLE AUDIT: the rollback stays infallible by
+    /// contract (the ORIGINAL error propagates, never this cleanup's)
+    /// but every device call's error here is now CLASSIFIED or
+    /// RECORDED, never silently discarded: a drain failure that is a
+    /// device loss skips the idle entirely (a lost device fails the
+    /// idle with the same loss — no information gained) and proceeds
+    /// with the destroys on the loss-abandon semantics (the spec's
+    /// supported teardown path after `ERROR_DEVICE_LOST`), the loss
+    /// recorded on [`Self::last_release_idle_failure`] for the
+    /// renderer's observe; a stuck drain falls back to
+    /// `device_wait_idle` (the stuck-fence protocol — teardown's own
+    /// shape) with the idle's result classified the same way (a loss
+    /// records and proceeds on loss-abandon; any other idle failure
+    /// records and proceeds — the residual risk that pending copies
+    /// race the destroys is documented here rather than converted
+    /// into an unrecoverable renderer, which propagating would make
+    /// of a CA-01 rollback — the audit's outcome (b) forbids that
+    /// for a CLEANUP failure).
     pub(crate) fn release_staged_scene_resources(&mut self) {
         // P5 R3: the in-flight check first (the Ref borrow must end
         // before the drain's mutable borrow begins).
         let staging_in_flight = self.staging.borrow().has_in_flight();
-        if staging_in_flight && self.drain_staging().is_err() {
-            // SAFETY: the rollback's last resort — the stuck fence
-            // cannot be waited, so the whole device idles before any
-            // destroy (teardown's own protocol).
-            unsafe { self.device.device_wait_idle() }.ok();
+        if staging_in_flight {
+            match self.drain_staging() {
+                Ok(()) => {} // drained: the destroys below are legal
+                Err(drain_error) => {
+                    if matches!(drain_error, RendererError::DeviceLost { .. }) {
+                        // §3.4: a lost device gains nothing from the
+                        // idle (it fails with the same loss) — skip it,
+                        // proceed on the loss-abandon semantics, record.
+                        self.last_release_idle_failure = Some(drain_error);
+                    } else {
+                        // SAFETY: the rollback's last resort — the
+                        // stuck fence cannot be waited, so the whole
+                        // device idles before any destroy (teardown's
+                        // own protocol); the result is classified
+                        // below, never discarded.
+                        match unsafe { self.device.device_wait_idle() } {
+                            Ok(()) => {}
+                            Err(idle_result) => {
+                                self.last_release_idle_failure = Some(RendererError::vk(
+                                    idle_result,
+                                    "device_wait_idle (release staged scene resources)",
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
         }
         if let Some(resources) = self.corner.take() {
             resources.destroy(self);
         }
+    }
+
+    /// T03 §3.4: takes the recorded release-idle failure — the
+    /// renderer's attach-rollback arm observes it into the lifecycle
+    /// (the disposal observing); the public
+    /// [`crate::Renderer::last_release_idle_failure`] surface reads
+    /// it non-destructively before that.
+    pub(crate) fn take_release_idle_failure(&mut self) -> Option<RendererError> {
+        self.last_release_idle_failure.take()
+    }
+
+    /// T03 §3.4: the recorded release-idle failure, if any (the
+    /// observability read — `None` in the ordinary rollback).
+    pub(crate) fn release_idle_failure(&self) -> Option<&RendererError> {
+        self.last_release_idle_failure.as_ref()
     }
 
     fn init_atlas(&mut self, atlas: &crate::glyph_atlas::GlyphAtlas) -> Result<(), RendererError> {
@@ -1076,6 +1260,19 @@ impl VulkanContext {
             .set(self.arena_growth_events.get() + 1);
     }
 
+    /// T02 §2.3: mints the next resource epoch — called at exactly
+    /// the sites that publish a mapped carve's IDENTITY (the carve's
+    /// initial creation and each growth-commit replacement; the
+    /// pipeline-replacement path assigns fresh epochs because the
+    /// replacement carves are fresh publications). The first minted
+    /// epoch is 1: the stamps' 0 means UNKNOWN and can never equal a
+    /// minted epoch, so a fresh carve can never inherit a stamp.
+    pub(crate) fn mint_resource_epoch(&self) -> u64 {
+        let next = self.resource_epochs.get() + 1;
+        self.resource_epochs.set(next);
+        next
+    }
+
     /// Full teardown in manifest order (assumes swapchain/pipelines/frames
     /// were already destroyed by the owning Renderer).
     pub(crate) fn destroy(&mut self) {
@@ -1105,6 +1302,14 @@ impl VulkanContext {
         // the context's `&` never alias.
         let mut staging = std::mem::take(&mut self.staging);
         staging.get_mut().destroy(self);
+        // T03 §3.2: the quarantined scenes release AFTER the staging
+        // pool's teardown — its classified idle (which ran above if
+        // anything was in flight) or the completed retirements prove
+        // no pending submission reads these resources; the corner
+        // they bound was already released above if it was live.
+        while !self.quarantined_scenes.is_empty() {
+            self.release_quarantined_scene();
+        }
         unsafe {
             if self.messenger != vk::DebugUtilsMessengerEXT::null() {
                 self.debug_utils

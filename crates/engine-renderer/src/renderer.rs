@@ -503,13 +503,15 @@ pub struct Renderer {
     /// calls, losslessly), so the CPU typed-refusal boundary and
     /// the device carve ceiling are the same number by construction.
     arena_budgets: ArenaBudgets,
-    /// CA-13 (F13/A14): the device-loss latch. `None` until the
-    /// first [`crate::RendererError::DeviceLost`] leaves a
-    /// device-touching entry; from then on every public
-    /// frame/attach/capture entry refuses with the typed variant
-    /// WITHOUT touching the dead device (repeated submissions on a
-    /// lost device are prevented, not retried).
-    device_lost: vulkan::DeviceLossLatch,
+    /// T06 (strict audit IV, §4.1): the renderer's LIFECYCLE state —
+    /// CA-13's device-loss latch absorbed as the `DeviceLost` state
+    /// (first observation wins, stable operation context, `refusal`
+    /// delegating — the landed behavior preserved exactly) plus the
+    /// NEW terminality: ANY `FrameSlotUnrecoverable` (ordinary
+    /// source included) and the §4.3 stuck-fence class POISON, every
+    /// device-touching entry refusing with the typed reason. See
+    /// [`vulkan::RendererLifecycle`].
+    lifecycle: vulkan::RendererLifecycle,
 }
 
 /// The Era-1 sky layer's frame description (the per-frame
@@ -624,16 +626,56 @@ struct AttachedScene {
 /// otherwise (CA-01 — see the public method's doc). ONE scene per
 /// renderer lifetime (the context's attach refuses a second; the
 /// device-lifetime pass families bind the attached buffers).
+///
+/// T03 (the transaction): the retained facts travel WITH the build's
+/// deferred-batch [`UploadTicket`] — the identity the transaction
+/// tracks until the drain proves readiness (`None` on the
+/// pool-unavailable fallback arm).
 fn attach_description(
     ctx: &mut VulkanContext,
     description: SceneDescription,
-) -> Result<AttachedScene, RendererError> {
+) -> Result<(AttachedScene, Option<vulkan::UploadTicket>), RendererError> {
     description.validate()?;
     let material_count = description.materials.len() as u32;
-    ctx.attach_scene_resources(&description)?;
-    Ok(AttachedScene {
-        handle: SceneHandle { material_count },
-    })
+    let ticket = ctx.attach_scene_resources(&description)?;
+    Ok((
+        AttachedScene {
+            handle: SceneHandle { material_count },
+        },
+        ticket,
+    ))
+}
+
+/// T03 (strict audit IV, §3.1's contract, the pure half): the
+/// transaction's outcome state machine — what a DRAIN failure at the
+/// commit point becomes. `(a)` is the success arm (no error); a
+/// device loss is `(c)` (the lifecycle latch takes it — every later
+/// device-touching entry refused, the quarantine becomes the
+/// device-loss teardown); EVERYTHING else is `(b)` (the quarantine:
+/// the staged resources retained under their ticket, the budget
+/// freed, the handle never published, retry supported). Pure —
+/// unit-pinned; the transaction runs THIS function over the real
+/// drain error.
+fn classify_attach_drain_failure(error: &RendererError) -> AttachDrainOutcome {
+    if matches!(error, RendererError::DeviceLost { .. }) {
+        AttachDrainOutcome::TerminalLoss
+    } else {
+        AttachDrainOutcome::QuarantineAndRetry
+    }
+}
+
+/// T03 §3.1: the transaction's outcome for a drain failure (see
+/// [`classify_attach_drain_failure`]).
+enum AttachDrainOutcome {
+    /// Outcome (b): quarantine the staged resources under the
+    /// ticket; the budget frees; the handle never publishes; the
+    /// retry is supported.
+    QuarantineAndRetry,
+    /// Outcome (c): the device-loss latch — every later
+    /// device-touching entry refused; the staged resources stay for
+    /// the device-loss teardown (destroys proceed on the
+    /// loss-abandon semantics).
+    TerminalLoss,
 }
 
 impl Renderer {
@@ -778,7 +820,7 @@ impl Renderer {
             proxy_draw_mode: ProxyDrawMode::default(),
             ripple_debug: RippleDebugMode::Off,
             arena_budgets,
-            device_lost: vulkan::DeviceLossLatch::default(),
+            lifecycle: vulkan::RendererLifecycle::new(),
         })
     }
 
@@ -830,7 +872,7 @@ impl Renderer {
         // loss refuses without touching the dead device
         // (`render_frame` delegates here, so this gate covers both
         // entries).
-        if let Some(refusal) = self.device_lost.refusal() {
+        if let Some(refusal) = self.lifecycle.refusal() {
             return Err(refusal);
         }
         // The F-05 overlay-vertex reuse (the audit's measured
@@ -885,14 +927,21 @@ impl Renderer {
             &frame,
         ) {
             Ok(outcome) => outcome,
-            // CA-13 (F13/A14): the error passes the latch on its way
-            // out — a device loss (or a terminal slot failure whose
-            // SOURCE is one) latches for every later entry.
+            // CA-13 (F13/A14) + T06: the error passes the lifecycle
+            // on its way out — a device loss latches for every later
+            // entry, and a terminal slot failure or a §4.3 stuck
+            // fence POISONS it (every later device-touching entry
+            // refused with the typed reason).
             Err(error) => {
-                self.device_lost.observe(&error);
+                self.lifecycle.note_recreate(self.frames.needs_recreate);
+                self.lifecycle.observe(&error);
                 return Err(error);
             }
         };
+        // T06 §4.1: the deferred-recreation intent mirrored into the
+        // lifecycle (internal-only, NOT an error state — the next
+        // proceeding frame's recreation block consumes it).
+        self.lifecycle.note_recreate(self.frames.needs_recreate);
         Ok(self.finish_frame(outcome))
     }
 
@@ -928,11 +977,42 @@ impl Renderer {
     /// their own description through this call, and the second
     /// scene (engine-slice's garage) proves the boundary.
     pub fn attach_scene(&mut self, scene: SceneDescription) -> Result<SceneHandle, RendererError> {
-        // CA-13 (F13/A14): the device-loss entry gate — attach is a
-        // device-touching entry (uploads, pipeline creation); a
-        // latched loss refuses without touching the dead device.
-        if let Some(refusal) = self.device_lost.refusal() {
+        // CA-13 (F13/A14) + T06: the lifecycle entry gate — attach is
+        // a device-touching entry (uploads, pipeline creation); a
+        // latched loss or a poison refuses without touching the
+        // dead device.
+        if let Some(refusal) = self.lifecycle.refusal() {
             return Err(refusal);
+        }
+        // T03 (the transaction) — STEP 0, THE QUARANTINE
+        // RECONCILIATION: a previous attach's deferred upload may
+        // still be in flight under its ticket. The ticket's
+        // completion is the T16 typed poll: completed → release the
+        // quarantine (the committed corner pipeline group FIRST —
+        // its pipelines were built against the quarantined
+        // resources' descriptor layout, and the fresh attach below
+        // rebuilds it against the fresh layout — then the resources
+        // themselves) and proceed; pending → the attach refuses
+        // typed, retry after the upload completes (outcome (b));
+        // a loss at the poll → outcome (c).
+        match self.ctx.probe_quarantined_scene() {
+            vulkan::QuarantineReconciliation::None => {}
+            vulkan::QuarantineReconciliation::Released => {
+                self.pipes.release_corner_group(&self.ctx);
+                self.ctx.release_quarantined_scene();
+            }
+            vulkan::QuarantineReconciliation::StillInFlight => {
+                return Err(RendererError::Vulkan(
+                    "a previous attach's upload is still in flight (quarantined \
+                     under its ticket — a timeout is not completion); retry \
+                     after it completes"
+                        .into(),
+                ));
+            }
+            vulkan::QuarantineReconciliation::Failed(error) => {
+                self.lifecycle.observe(&error);
+                return Err(error);
+            }
         }
         // CA-01 (attach atomicity): the attach is a STAGED
         // transaction. The resources install FIRST (the pipeline
@@ -949,12 +1029,12 @@ impl Renderer {
         // refused ("a scene is already attached") and the renderer
         // was unusable for scene-backed frames — the stranded
         // no-scene state the audit's CA-01 named.
-        let attached = match attach_description(&mut self.ctx, scene) {
+        let (attached, ticket) = match attach_description(&mut self.ctx, scene) {
             Ok(attached) => attached,
-            // CA-13: the loss latches on its way out (the uploads
-            // inside the attach are device work).
+            // CA-13 + T06: the loss latches on its way out (the
+            // uploads inside the attach are device work).
             Err(error) => {
-                self.device_lost.observe(&error);
+                self.lifecycle.observe(&error);
                 return Err(error);
             }
         };
@@ -976,37 +1056,65 @@ impl Renderer {
             // and the error propagates — the retry re-runs the whole
             // attach from a clean context.
             self.ctx.release_staged_scene_resources();
+            // T06 §3.4/§4.2: a loss observed INSIDE the rollback's
+            // disposal (the classified idle/drain record) surfaces to
+            // the lifecycle — the disposal observing.
+            if let Some(disposal) = self.ctx.take_release_idle_failure() {
+                self.lifecycle.observe(&disposal);
+            }
             // CA-13: the pipeline creation is device work — the loss
             // latches here too.
-            self.device_lost.observe(&error);
+            self.lifecycle.observe(&error);
             return Err(error);
+        }
+        // T03 (the transaction) — STEP 4, THE DRAIN MOVED BEFORE THE
+        // PUBLISH: the scene and its handle become frame-visible
+        // only on PROVEN upload readiness. The pre-fix order
+        // published first and drained later (renderer.rs:988→1004 at
+        // the design's SHA) — a drain failure then returned `Err`
+        // with the scene already live and the committed pipeline
+        // group un-releasable (the CA-01 discipline ends at the
+        // commit). The deferral's PERFORMANCE value is preserved:
+        // the pipeline-group build above still overlaps the copies;
+        // only the publication moves behind the drain (the µ-scale
+        // tail the R3 lane's own honest assessment named).
+        if let Err(error) = self.ctx.drain_staging() {
+            // CA-13 + T06: the drain is device work — the loss
+            // latches/poisons on its way out like every other
+            // device-touching step.
+            self.lifecycle.observe(&error);
+            match classify_attach_drain_failure(&error) {
+                // Outcome (c): every later device-touching entry
+                // refused; the staged resources stay installed for
+                // the DEVICE-LOSS TEARDOWN (destroys proceed on the
+                // loss-abandon semantics — the spec's supported path
+                // after ERROR_DEVICE_LOST).
+                AttachDrainOutcome::TerminalLoss => return Err(error),
+                // Outcome (b): QUARANTINE, do not destroy — the
+                // staged resources move under their ticket (the
+                // in-flight copies may still reference them; a
+                // timeout is not completion), the one-scene budget
+                // frees (`ctx.corner` is `None` again), and the
+                // handle was never published: the renderer is
+                // exactly as it was, and the RETRY is supported (the
+                // reconciliation above re-drains the ticket — the
+                // fence may have signaled in the meantime — and
+                // releases on completion). The committed pipeline
+                // group stays alive with the quarantined resources
+                // (releasing them now would orphan it — the CA-01
+                // discipline); the reconciliation releases the pair
+                // together at the next attach attempt.
+                AttachDrainOutcome::QuarantineAndRetry => {
+                    self.ctx.quarantine_staged_scene(ticket);
+                    return Err(error);
+                }
+            }
         }
         // Full success — publish the retained facts and the handle
         // together (the one place the attach becomes visible to
-        // frames).
+        // frames; T03's single visibility point).
         let handle = attached.handle;
         self.scene = Some(attached);
-        // P5 R3 (A20): the attach's DEFERRED staging batch drains
-        // HERE — the batch-end wait the design's §4.3(c) names. The
-        // publication ORDER is deliberate: the scene and its
-        // pipelines are fully committed (releasing them now would
-        // orphan the committed pipeline group — the CA-01 discipline
-        // ends at the commit), and the drain's failure is DEVICE
-        // HEALTH, not attach atomicity — the error propagates with
-        // the scene functional, the stuck pool region the only cost
-        // (bounded by the pool's ceiling). The wait completes before
-        // any FIRST USE by construction: the first scene-backed
-        // frame cannot precede this call's return. The deferred
-        // submission overlapped the pipeline-group build above (the
-        // attach path's meaningful independent work — the honest
-        // deferral assessment; the resource-half tail between the
-        // flush and this drain is µs-scale).
-        if let Err(error) = self.ctx.drain_staging() {
-            // CA-13: the drain is device work — a device loss latches
-            // on its way out like every other device-touching step.
-            self.device_lost.observe(&error);
-            return Err(error);
-        }
         Ok(handle)
     }
 
@@ -1047,7 +1155,7 @@ impl Renderer {
         // CA-13 (F13/A14): the device-loss entry gate — a latched
         // loss refuses without touching the dead device (repeated
         // submissions on a lost device are prevented, not retried).
-        if let Some(refusal) = self.device_lost.refusal() {
+        if let Some(refusal) = self.lifecycle.refusal() {
             return Err(refusal);
         }
         // Scene/attach coherence (the design's §3.3 order step 1):
@@ -1153,14 +1261,21 @@ impl Renderer {
             &frame,
         ) {
             Ok(outcome) => outcome,
-            // CA-13 (F13/A14): the error passes the latch on its way
-            // out — a device loss (or a terminal slot failure whose
-            // SOURCE is one) latches for every later entry.
+            // CA-13 (F13/A14) + T06: the error passes the lifecycle
+            // on its way out — a device loss latches for every later
+            // entry, and a terminal slot failure or a §4.3 stuck
+            // fence POISONS it (every later device-touching entry
+            // refused with the typed reason).
             Err(error) => {
-                self.device_lost.observe(&error);
+                self.lifecycle.note_recreate(self.frames.needs_recreate);
+                self.lifecycle.observe(&error);
                 return Err(error);
             }
         };
+        // T06 §4.1: the deferred-recreation intent mirrored into the
+        // lifecycle (internal-only, NOT an error state — the next
+        // proceeding frame's recreation block consumes it).
+        self.lifecycle.note_recreate(self.frames.needs_recreate);
         Ok(self.finish_frame(outcome))
     }
 
@@ -1199,7 +1314,7 @@ impl Renderer {
     pub fn request_shadow_map_capture(&mut self) -> Result<(), RendererError> {
         // CA-13 (F13/A14): the device-loss entry gate — the shadow
         // state's lazy ensure is device work.
-        if let Some(refusal) = self.device_lost.refusal() {
+        if let Some(refusal) = self.lifecycle.refusal() {
             return Err(refusal);
         }
         if self.pipes.shadows.is_none() {
@@ -1211,7 +1326,7 @@ impl Renderer {
                 ));
             }
             if let Err(error) = self.pipes.ensure_shadow_resources(&self.ctx) {
-                self.device_lost.observe(&error);
+                self.lifecycle.observe(&error);
                 return Err(error);
             }
         }
@@ -1228,14 +1343,14 @@ impl Renderer {
     pub fn take_shadow_map_capture(&mut self) -> Result<Option<ShadowMapReadback>, RendererError> {
         // CA-13 (F13/A14): the device-loss entry gate — the readback
         // fence wait is device work.
-        if let Some(refusal) = self.device_lost.refusal() {
+        if let Some(refusal) = self.lifecycle.refusal() {
             return Err(refusal);
         }
         let depths =
             match vulkan::take_shadow_readback(&self.ctx, &mut self.pipes, &mut self.frames) {
                 Ok(depths) => depths,
                 Err(error) => {
-                    self.device_lost.observe(&error);
+                    self.lifecycle.observe(&error);
                     return Err(error);
                 }
             };
@@ -1455,7 +1570,7 @@ impl Renderer {
         // CA-13 (F13/A14): the device-loss entry gate — a capture on
         // a latched-dead renderer can never complete; refuse without
         // touching the device.
-        if let Some(refusal) = self.device_lost.refusal() {
+        if let Some(refusal) = self.lifecycle.refusal() {
             return Err(refusal);
         }
         vulkan::request_capture(&mut self.frames)
@@ -1469,13 +1584,13 @@ impl Renderer {
     pub fn take_frame_capture(&mut self) -> Result<Option<CapturedFrame>, RendererError> {
         // CA-13 (F13/A14): the device-loss entry gate — the fence
         // wait is device work on a dead device.
-        if let Some(refusal) = self.device_lost.refusal() {
+        if let Some(refusal) = self.lifecycle.refusal() {
             return Err(refusal);
         }
         match vulkan::take_capture(&self.ctx, &mut self.frames) {
             Ok(capture) => Ok(capture),
             Err(error) => {
-                self.device_lost.observe(&error);
+                self.lifecycle.observe(&error);
                 Err(error)
             }
         }
@@ -1489,6 +1604,19 @@ impl Renderer {
         vulkan::last_capture_refusal(&self.frames)
     }
 
+    /// T03 (strict audit IV, §3.4): the rollback's recorded
+    /// release-idle failure, if any — the TYPED diagnostic left when
+    /// the attach-rollback's fallback could not PROVE the device
+    /// idle before releasing the staged resources (the rollback is
+    /// infallible by contract: the ORIGINAL error propagated; this
+    /// record is the residual risk made observable, the
+    /// `last_capture_refusal`-style surface the design named).
+    /// `None` in the ordinary rollback (the drain or the idle
+    /// proved the device idle).
+    pub fn last_release_idle_failure(&self) -> Option<&RendererError> {
+        self.ctx.release_idle_failure()
+    }
+
     fn push_validation_message(&mut self, message: String) {
         self.stats.recent_validation.push(message);
         let len = self.stats.recent_validation.len();
@@ -1500,7 +1628,19 @@ impl Renderer {
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        vulkan::device_idle(&self.ctx).ok();
+        // T06 §4.2 — observe-on-every-exit, DISPOSALS INCLUDED: the
+        // pre-teardown idle's result is no longer discarded
+        // (`.ok()`): the lifecycle enters `Destroying` and a loss
+        // observed at the idle is recorded through the same
+        // classification (nothing further is refused — drop must
+        // complete — and the destroy sequence below proceeds on the
+        // loss-abandon semantics: after `ERROR_DEVICE_LOST` the
+        // `vkDestroy*`/`vkFree*` calls remain the spec's supported
+        // teardown path).
+        self.lifecycle.begin_destroy();
+        if let Err(error) = vulkan::device_idle(&self.ctx) {
+            self.lifecycle.observe(&error);
+        }
         self.frames.destroy(&self.ctx);
         // Framebuffers before the render pass they reference.
         self.swapchain.destroy(&self.ctx);
@@ -1583,6 +1723,61 @@ pub(crate) fn pack_ripple_field(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T03 (strict audit IV, §3.1's contract — the transaction's
+    /// outcome state machine, the PURE half): the table mapping a
+    /// drain failure at the commit point to its outcome. A device
+    /// loss is (c) — the lifecycle latch (every later entry refused;
+    /// the staged resources stay for the device-loss teardown).
+    /// EVERYTHING else is (b) — the quarantine (the staged resources
+    /// retained under their ticket, the budget freed, the handle
+    /// never published, retry supported): the typed staging-timeout
+    /// string, an ordinary Vulkan error, and the injected
+    /// StagingDrainTimeout fault the rig witness drives all take the
+    /// same arm. The success arm (a) is the absence of an error —
+    /// the publish path.
+    #[test]
+    fn the_attach_drain_failure_outcome_table() {
+        // (c): the loss class.
+        assert!(matches!(
+            classify_attach_drain_failure(&RendererError::DeviceLost {
+                operation: "staging drain".into()
+            }),
+            AttachDrainOutcome::TerminalLoss
+        ));
+        // (b): the stuck-fence drain timeout (the typed
+        // staging-timeout shape — a Vulkan string carrying the
+        // bound-bytes context).
+        assert!(matches!(
+            classify_attach_drain_failure(&RendererError::Vulkan(
+                "staging drain: fence wait timed out after 2000000000 ns".into()
+            )),
+            AttachDrainOutcome::QuarantineAndRetry
+        ));
+        // (b): an ordinary Vulkan drain error.
+        assert!(matches!(
+            classify_attach_drain_failure(&RendererError::Vulkan(
+                "staging drain: ERROR_OUT_OF_DEVICE_MEMORY".into()
+            )),
+            AttachDrainOutcome::QuarantineAndRetry
+        ));
+        // (b): the injected drivable timeout (the rig witness's
+        // knob — a healthy device, the retry reconciles).
+        assert!(matches!(
+            classify_attach_drain_failure(&RendererError::InjectedFault(
+                "StagingDrainTimeout LifecycleFaultSite".into()
+            )),
+            AttachDrainOutcome::QuarantineAndRetry
+        ));
+        // (b): a stuck-fence classification surfacing at the drain
+        // (the frame-slot class propagated through a nested path).
+        assert!(matches!(
+            classify_attach_drain_failure(&RendererError::StuckFence {
+                site: "wait_slot_fence (the slot's previous submission)"
+            }),
+            AttachDrainOutcome::QuarantineAndRetry
+        ));
+    }
 
     /// The test-authored ripple policy (the demo's
     /// corner_weather::RIPPLE_POLICY numbers, verbatim): lifetime

@@ -147,6 +147,14 @@ pub(crate) struct SkinnedRetained {
     /// demand-sized carve `slot_stride` derives from —
     /// `blocks_capacity * POSE_STRIDE == slot_stride`).
     blocks_capacity: u32,
+    /// T02 (strict audit IV, §2.3): the pose carve's ALLOCATION
+    /// EPOCH — minted at this carve's publication (the creation
+    /// here, or the growth commit below; the retained state survives
+    /// pipeline replacements, so a replacement does NOT re-mint —
+    /// the pose carve's identity is unchanged by it). The population
+    /// stamps' pose half carries the epoch of the carve it vouches
+    /// for, so a grown carve can never inherit a surviving stamp.
+    allocation_epoch: u64,
     set_layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
     sets: [vk::DescriptorSet; MATERIAL_COUNT],
@@ -203,6 +211,8 @@ impl SkinnedRetained {
             mapped: core::ptr::null_mut(),
             slot_stride,
             blocks_capacity: blocks,
+            // T02 §2.3: this carve's publication mints its epoch.
+            allocation_epoch: ctx.mint_resource_epoch(),
             set_layout: vk::DescriptorSetLayout::null(),
             pool: vk::DescriptorPool::null(),
             sets: [vk::DescriptorSet::null(); MATERIAL_COUNT],
@@ -314,6 +324,12 @@ impl SkinnedRetained {
         self.mapped = mapped;
         self.slot_stride = slot_stride;
         self.blocks_capacity = target;
+        // T02 §2.3: the growth COMMIT publishes a new carve identity
+        // — mint the fresh epoch HERE (the stamps' epoch comparison
+        // at the upload site then forces one rewrite per slot, the
+        // correctness bearer; the frame flow's growth-delta clear is
+        // the belt beside it).
+        self.allocation_epoch = ctx.mint_resource_epoch();
         ctx.record_arena_growth();
         Ok(())
     }
@@ -322,6 +338,12 @@ impl SkinnedRetained {
     /// observability read and the growth logic's current value.
     pub(super) fn blocks_capacity(&self) -> u32 {
         self.blocks_capacity
+    }
+
+    /// T02 §2.3: the pose carve's allocation epoch — the upload
+    /// site's stamp gate compares it.
+    pub(super) fn allocation_epoch(&self) -> u64 {
+        self.allocation_epoch
     }
 
     /// The pose carve's per-slot byte stride

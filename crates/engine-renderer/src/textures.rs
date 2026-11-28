@@ -4,7 +4,7 @@
 //! ride the shared staging pool (the per-texture combined allocation
 //! survives only as the pool-unavailable fallback, verbatim).
 
-use super::staging::{FlushMode, StagingBatch};
+use super::staging::{FlushDisposition, FlushMode, StagingBatch};
 use super::{RendererError, VulkanContext, find_memory_type, with_upload_commands};
 use ash::vk;
 
@@ -34,19 +34,49 @@ impl Texture {
         extent: vk::Extent2D,
         texels: &[u8],
     ) -> Result<Self, RendererError> {
-        let mut batch = ctx.begin_staging_batch();
+        // T16 §5.1: the typed begin — `Ok(None)` is the per-object
+        // fallback (sticky unsupported-memory, or a TRANSIENT
+        // pressure failure that retries the backing next call); a
+        // device error at the pool propagates (never masked).
+        let mut batch = ctx.begin_staging_batch()?;
         match &mut batch {
             Some(batch) => {
                 let texture = Self::upload_pooled(batch, ctx, format, extent, texels)?;
-                if let Err(error) = batch.flush(FlushMode::InlineWait) {
-                    // The flush failed (submit or wait): the partial
-                    // texture must not survive its never-submitted or
-                    // stuck upload.
-                    let mut texture = texture;
-                    texture.destroy(ctx);
-                    return Err(error);
+                // T16/T03: the flush's TYPED disposition — the
+                // cleanup decision depends on whether the batch is
+                // PENDING.
+                match batch.flush(FlushMode::InlineWait) {
+                    FlushDisposition::Completed => Ok(texture),
+                    // Nothing pending references the destination (the
+                    // submit failed, or the wait proved completion
+                    // before a poll surfaced device health): today's
+                    // destroy is correct.
+                    FlushDisposition::NotSubmitted(error) => {
+                        // The partial texture must not survive its
+                        // never-submitted upload.
+                        let mut texture = texture;
+                        texture.destroy(ctx);
+                        Err(error)
+                    }
+                    // T03 §3.3 — THE IN-FLIGHT-DESTINATION RULE (the
+                    // textures.rs:41–48 hazard, the audit's cleanest
+                    // existing form): the batch IS in flight and the
+                    // destination is registered with the ticket's
+                    // QUARANTINE (the flush moved it) — a submitted
+                    // copy may still reference the image. Do NOT
+                    // destroy; the quarantine releases the handles
+                    // when the ticket completes (the drain sweep) or
+                    // at the teardown's classified idle. The error
+                    // propagates; the abandoned `texture` value
+                    // carries no destructor, so the handles live on
+                    // under the quarantine's ownership exactly once.
+                    FlushDisposition::SubmittedUnwaited { error, .. } => Err(error),
+                    // Structurally impossible: only the Deferred arm
+                    // constructs this variant, and no wait runs here.
+                    FlushDisposition::Deferred { .. } => {
+                        unreachable!("an InlineWait flush never defers")
+                    }
                 }
-                Ok(texture)
             }
             None => Self::upload_unpooled(ctx, format, extent, texels),
         }
@@ -193,6 +223,17 @@ impl Texture {
                 .device
                 .create_image_view(&view_info, None)
                 .map_err(|e| RendererError::vk(e, "create texture view"))?;
+            // T03 §3.3: the destination registers with the open
+            // batch — on a `SubmittedUnwaited` flush the registration
+            // moves to the ticket's quarantine (the caller is then
+            // forbidden to destroy the texture: a submitted copy may
+            // still reference the image); on every other disposition
+            // the registration is discarded (the caller owns it).
+            batch.register_destination(super::staging::StagingDestination::Image {
+                image: texture.image,
+                memory: texture.memory,
+                view: texture.view,
+            });
             Ok(())
         })();
         if let Err(e) = result {

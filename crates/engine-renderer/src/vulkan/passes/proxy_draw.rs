@@ -71,7 +71,7 @@
 //! of pipeline assembly with the SAME descriptor set layout as the
 //! lit pipeline (the 6-B foundation; no new bindings).
 
-use super::staging::FlushMode;
+use super::staging::{FlushDisposition, FlushMode};
 use super::{
     RendererError, ScopedMappedBuffer, VulkanContext, create_device_local_buffer_staged,
     create_device_local_buffer_with_data, create_mapped_buffer,
@@ -391,6 +391,16 @@ pub(crate) struct ProxyResources {
     /// The 6-E2 indirect command state — lazily created at the
     /// first INDIRECT-mode populated frame (see [`IndirectResources`]).
     pub(super) indirect: Option<IndirectResources>,
+    /// T02 (strict audit IV, §2.3): the instance carve's ALLOCATION
+    /// EPOCH — minted at this carve's publication (the creation
+    /// here, or the growth commit below; a pipeline replacement
+    /// publishes a fresh `ProxyResources` and therefore a fresh
+    /// epoch). The population stamps' instance/indirect halves carry
+    /// the epoch of the carve they vouch for, so a replaced carve
+    /// can never inherit a surviving stamp — the fragile
+    /// delayed-invalidation invariant the audit named, eliminated at
+    /// the resource side.
+    allocation_epoch: u64,
 }
 
 impl ProxyResources {
@@ -434,6 +444,8 @@ impl ProxyResources {
             capacity,
             slot_bytes: (capacity as usize * INSTANCE_STRIDE) as u64,
             indirect: None,
+            // T02 §2.3: this carve's publication mints its epoch.
+            allocation_epoch: ctx.mint_resource_epoch(),
         };
         if let Err(error) = partial.build(ctx, &npc, &vehicle, &rain) {
             partial.release(ctx);
@@ -458,7 +470,7 @@ impl ProxyResources {
         // pool is groundwork for, not this milestone's claim). The
         // census: 3 per-object submits → 1. The pool-unavailable arm
         // keeps the per-object helper.
-        let mut staging_batch = ctx.begin_staging_batch();
+        let mut staging_batch = ctx.begin_staging_batch()?;
         let npc_bytes = bytemuck::cast_slice(npc);
         (self.npc_vbo, self.npc_memory) = match &mut staging_batch {
             Some(batch) => create_device_local_buffer_staged(
@@ -499,7 +511,27 @@ impl ProxyResources {
             ),
         }?;
         if let Some(batch) = staging_batch.as_mut() {
-            batch.flush(FlushMode::InlineWait)?;
+            // T16/T03: the flush's TYPED disposition. On
+            // `SubmittedUnwaited` the three mesh-VBO destinations are
+            // IN FLIGHT under the ticket (registered with the batch
+            // at their creation; the flush moved the registrations to
+            // the ticket's quarantine) — this partial state must NOT
+            // destroy them: the handles detach here so `release`'s
+            // null destroys are no-ops, and the quarantine releases
+            // them when the ticket completes.
+            match batch.flush(FlushMode::InlineWait) {
+                FlushDisposition::Completed | FlushDisposition::Deferred { .. } => {}
+                FlushDisposition::NotSubmitted(error) => return Err(error),
+                FlushDisposition::SubmittedUnwaited { error, .. } => {
+                    self.npc_vbo = vk::Buffer::null();
+                    self.npc_memory = vk::DeviceMemory::null();
+                    self.vehicle_vbo = vk::Buffer::null();
+                    self.vehicle_memory = vk::DeviceMemory::null();
+                    self.rain_vbo = vk::Buffer::null();
+                    self.rain_memory = vk::DeviceMemory::null();
+                    return Err(error);
+                }
+            }
         }
         (self.instances, self.instances_memory, self.instances_mapped) = create_mapped_buffer(
             ctx,
@@ -517,6 +549,15 @@ impl ProxyResources {
     /// `FrameOutcome`) and the growth target's current value.
     pub(super) fn capacity(&self) -> u32 {
         self.capacity
+    }
+
+    /// T02 §2.3: the instance carve's allocation epoch — the upload
+    /// site's stamp gate compares it (the indirect block rides this
+    /// epoch: its buffer is published only beside this carve, at the
+    /// carve's creation or a pipeline replacement that re-publishes
+    /// both).
+    pub(super) fn allocation_epoch(&self) -> u64 {
+        self.allocation_epoch
     }
 
     /// P5 §1.3 (A11/R1): grows the instance carve to `target`
@@ -592,6 +633,12 @@ impl ProxyResources {
         self.instances_mapped = instances_mapped;
         self.capacity = target;
         self.slot_bytes = slot_bytes;
+        // T02 §2.3: the growth COMMIT publishes a new carve identity
+        // — mint the fresh epoch HERE (the stamps' epoch comparison
+        // at the upload site then forces one rewrite per slot, the
+        // correctness bearer; the frame flow's growth-delta clear is
+        // the belt beside it).
+        self.allocation_epoch = ctx.mint_resource_epoch();
         ctx.record_arena_growth();
         Ok(())
     }

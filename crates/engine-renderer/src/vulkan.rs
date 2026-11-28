@@ -120,6 +120,10 @@ mod staging;
 mod swapchain;
 mod uploads;
 
+// The T03/T16 transaction surface (renderer.rs consumes these
+// through the `vulkan::` path the S4 split froze).
+pub(crate) use staging::UploadTicket;
+
 // The pass-resource family modules (design §5.1's passes row): the
 // files live under `vulkan/passes/` but stay declared HERE — not under
 // a `passes` parent module — so their module paths
@@ -174,7 +178,9 @@ pub(crate) use capture::{
     drain_validation_messages, environment_pending, last_capture_refusal, request_capture,
     request_shadow_readback, take_capture, take_shadow_readback,
 };
-pub(crate) use context::{VulkanContext, device_idle, pick_depth_format, pick_surface_format};
+pub(crate) use context::{
+    QuarantineReconciliation, VulkanContext, device_idle, pick_depth_format, pick_surface_format,
+};
 pub(crate) use frame::{FrameOutcome, FramePolicy, FrameState, InternalFrame, render_frame};
 pub(crate) use pipelines::PipelineState;
 pub(crate) use swapchain::{
@@ -296,6 +302,23 @@ pub enum RendererError {
         /// The operation that observed the loss (the error context).
         operation: String,
     },
+    /// T06 (strict audit IV, §4.3 of the lifecycle design): a
+    /// bounded fence wait timed out and the ONE `get_fence_status`
+    /// poll that followed found the fence genuinely unsignaled
+    /// (`NOT_READY`) — a stuck submission, classified through the
+    /// device BEFORE being called stuck (the audit's
+    /// "stuck-fence timeout that's device-loss masquerading as
+    /// timeout" corrected: a loss at the poll surfaces as
+    /// [`Self::DeviceLost`] instead). The renderer POISONS on this
+    /// error (see [`RendererLifecycle`]): the frame slot's
+    /// synchronization can no longer be trusted, every later
+    /// device-touching entry refuses with the typed reason, and
+    /// constructing a fresh renderer is the supported path — never
+    /// a silent 2-second wait discovered on the next frame.
+    StuckFence {
+        /// The wait that timed out (the classification's site).
+        site: &'static str,
+    },
 }
 
 impl RendererError {
@@ -349,24 +372,281 @@ impl DeviceLossLatch {
     }
 
     /// Observes an error on its way OUT of a device-touching entry:
-    /// the first device loss latches — top-level, or the SOURCE of a
-    /// terminal [`RendererError::FrameSlotUnrecoverable`] (a lost
-    /// device also fails the CA-10 release ladder's own submits and
-    /// waits; the loss is the reason the slot could not be released,
-    /// so the terminal wrap still latches). Later observations never
-    /// overwrite the first context. Pure.
+    /// the first device loss latches — top-level, the SOURCE of a
+    /// terminal [`RendererError::FrameSlotUnrecoverable`], or (T06,
+    /// the FSU release-half gap the lifecycle design's §4.2 named)
+    /// the RELEASE half of one: a heal submit that fails lossy
+    /// while the source is ordinary is the exact composition
+    /// `dispose_failed_acquisition` can produce (the fence
+    /// discriminator takes the heal arm on a status *error*, the
+    /// heal submit then fails `ERROR_DEVICE_LOST`), and the loss
+    /// first APPEARING there latches with the release's operation
+    /// context. The source keeps priority (a loss on both halves
+    /// reports the source's context — the frame's original error is
+    /// the reason the release ladder ran at all). Later
+    /// observations never overwrite the first context. Pure.
     pub(crate) fn observe(&mut self, error: &RendererError) {
         let operation = match error {
             RendererError::DeviceLost { operation } => Some(operation.clone()),
-            RendererError::FrameSlotUnrecoverable { source, .. } => match source.as_ref() {
+            RendererError::FrameSlotUnrecoverable { source, release } => match source.as_ref() {
                 RendererError::DeviceLost { operation } => Some(operation.clone()),
-                _ => None,
+                ordinary_source => match release.as_ref() {
+                    RendererError::DeviceLost { operation } => Some(operation.clone()),
+                    _ => {
+                        let _ = ordinary_source;
+                        None
+                    }
+                },
             },
             _ => None,
         };
         if self.operation.is_none() {
             self.operation = operation;
         }
+    }
+}
+
+/// T06 (strict audit IV, §4.1 of the lifecycle design): the
+/// renderer's LIFECYCLE state machine — the terminal-state
+/// discipline around CA-13's latch. `Ready` is the ordinary state;
+/// `RecreateRequired` is the frame flow's own deferred-recreation
+/// intent (internal-only, NOT an error state — frames still run,
+/// the recreation block consumes it; [`Self::note_recreate`] mirrors
+/// the frame state's `needs_recreate` flag into it for
+/// observability); `DeviceLost` IS CA-13's latch (the struct remains
+/// the implementation — first observation wins, stable operation
+/// context, [`Self::refusal`] delegates — the landed behavior
+/// preserved exactly); `Poisoned` is the NEW terminality: ANY
+/// [`RendererError::FrameSlotUnrecoverable`] (ordinary source
+/// included — the audit's "non-device-loss terminal slot error is
+/// not evidently permanently latched") and the stuck-fence class
+/// (§4.3) poison, every device-touching entry refusing with the
+/// typed reason; `Destroying` is the drop observability state
+/// (§4.2's disposal observations — nothing further is refused, drop
+/// must complete, but a loss observed at the disposal is recorded
+/// through the same classification).
+///
+/// Pure state (one enum word plus the latch it wraps) so the whole
+/// discipline is unit-testable without a GPU (the mock-free seam
+/// discipline); the REAL-loss path is the classification in
+/// [`RendererError::vk`] plus the injected-loss battery run on a
+/// live device (the rig leg in engine-slice's
+/// `render_lifecycle_faults`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RendererLifecycle {
+    Ready,
+    /// The frame flow latched `needs_recreate` — the deferred
+    /// recreation arm's own state, consumed by the next proceeding
+    /// frame's recreation block (unchanged behavior; carried here
+    /// so the lifecycle can name it).
+    RecreateRequired,
+    /// CA-13's latch, absorbed: the field stays, the enum wraps it.
+    DeviceLost {
+        latch: DeviceLossLatch,
+    },
+    /// Terminal, non-loss: every device-touching entry refused with
+    /// the typed reason.
+    Poisoned {
+        reason: PoisonReason,
+    },
+    /// Drop entered — the disposal observations' state.
+    Destroying,
+}
+
+/// The typed reason a [`RendererLifecycle`] poisoned (T06 §4.1):
+/// the original error is RETAINED (the refusal reconstructs it, so
+/// a refused entry reports the terminal failure that caused the
+/// poison, never a generic message).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PoisonReason {
+    /// A post-acquire release could not complete (CA-10's terminal
+    /// wrap) with NO device loss on either half — the slot is
+    /// stranded, the device is not gone.
+    FrameSlotUnrecoverable {
+        source: Box<RendererError>,
+        release: Box<RendererError>,
+    },
+    /// A bounded fence wait timed out and the §4.3 classification
+    /// found the fence genuinely unsignaled.
+    StuckFence {
+        site: &'static str,
+        error: Box<RendererError>,
+    },
+    /// §3.4's non-loss release-idle failure, IF ever escalated to
+    /// terminal. The design's §3.4 ruled the opposite for today —
+    /// the rollback stays infallible by contract and the idle
+    /// failure is RECORDED as a typed diagnostic on the context
+    /// (`last_release_idle_failure`) instead — so this arm is
+    /// RESERVED: never constructed by the landed code, kept because
+    /// the design's enum names it as the escalation path a future
+    /// owner decision could take.
+    #[allow(dead_code)]
+    ReleaseFailed(Box<RendererError>),
+}
+
+impl PoisonReason {
+    /// The poison classes of §4.1 — consulted only AFTER the loss
+    /// latch found no device loss on the error (a loss-carrying FSU
+    /// latches instead; see [`RendererLifecycle::observe`]). Pure.
+    fn from_error(error: &RendererError) -> Option<Self> {
+        match error {
+            RendererError::FrameSlotUnrecoverable { source, release } => {
+                Some(Self::FrameSlotUnrecoverable {
+                    source: source.clone(),
+                    release: release.clone(),
+                })
+            }
+            RendererError::StuckFence { site } => Some(Self::StuckFence {
+                site,
+                error: Box::new(error.clone()),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The typed refusal a poisoned renderer returns: the ORIGINAL
+    /// terminal error, reconstructed (never a generic message).
+    fn refusal(&self) -> RendererError {
+        match self {
+            Self::FrameSlotUnrecoverable { source, release } => {
+                RendererError::FrameSlotUnrecoverable {
+                    source: source.clone(),
+                    release: release.clone(),
+                }
+            }
+            Self::StuckFence { error, .. } => (**error).clone(),
+            Self::ReleaseFailed(error) => (**error).clone(),
+        }
+    }
+}
+
+impl RendererLifecycle {
+    pub(crate) const fn new() -> Self {
+        Self::Ready
+    }
+
+    /// The entry gate every device-touching public entry consults
+    /// FIRST (§4.1): `Some` once terminal — the latched loss
+    /// (CA-13's refusal, delegated) or the poison's typed reason.
+    /// `Ready`, `RecreateRequired` (not an error state), and
+    /// `Destroying` (drop must complete; nothing further is
+    /// refused) refuse nothing.
+    pub(crate) fn refusal(&self) -> Option<RendererError> {
+        match self {
+            Self::Ready | Self::RecreateRequired | Self::Destroying => None,
+            Self::DeviceLost { latch } => latch.refusal(),
+            Self::Poisoned { reason } => Some(reason.refusal()),
+        }
+    }
+
+    /// §4.2 — OBSERVE ON EVERY EXIT, disposals included: an error
+    /// leaving a device-touching entry (or a disposal's device call)
+    /// passes here. In the latched state the latch keeps CA-13's
+    /// first-observation-wins discipline; in the poisoned state the
+    /// first poison is terminal; otherwise the error is classified:
+    /// a device loss (top-level, or an FSU's source — priority — or
+    /// its release half, the §4.2 gap) latches; an FSU with no loss
+    /// on either half POISONS (the audit's stranded-slot terminal
+    /// class); a §4.3 stuck fence poisons. In `Destroying` the same
+    /// classification runs — the record — while nothing further is
+    /// refused (drop does not consult the gate).
+    pub(crate) fn observe(&mut self, error: &RendererError) {
+        match self {
+            Self::DeviceLost { latch } => latch.observe(error),
+            Self::Poisoned { .. } => {}
+            Self::Ready | Self::RecreateRequired | Self::Destroying => {
+                // The loss decision first, through CA-13's own latch
+                // (its observe now inspects the FSU's release half
+                // too — one classification, both consumers).
+                let mut latch = DeviceLossLatch::default();
+                latch.observe(error);
+                if latch.refusal().is_some() {
+                    *self = Self::DeviceLost { latch };
+                    return;
+                }
+                // No loss: the poison classes.
+                if let Some(reason) = PoisonReason::from_error(error) {
+                    *self = Self::Poisoned { reason };
+                }
+            }
+        }
+    }
+
+    /// Mirrors the frame flow's `needs_recreate` flag (§4.1's
+    /// internal-only state: NOT an error — frames still run, the
+    /// recreation block consumes the intent; carried for lifecycle
+    /// observability, never consulted by the entry gate).
+    pub(crate) fn note_recreate(&mut self, pending: bool) {
+        if pending {
+            if matches!(self, Self::Ready) {
+                *self = Self::RecreateRequired;
+            }
+        } else if matches!(self, Self::RecreateRequired) {
+            *self = Self::Ready;
+        }
+    }
+
+    /// §4.2: drop entered — the disposal observations' state. Only
+    /// the non-terminal states transition (a latched loss or a
+    /// poison stays recorded through the teardown); nothing further
+    /// is refused either way.
+    pub(crate) fn begin_destroy(&mut self) {
+        if matches!(self, Self::Ready | Self::RecreateRequired) {
+            *self = Self::Destroying;
+        }
+    }
+}
+
+impl Default for RendererLifecycle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// T06 §4.3: the classification of the ONE `get_fence_status` poll
+/// issued after a bounded fence wait timed out — the device is
+/// consulted BEFORE the fence is called stuck. `Signaled` means the
+/// fence signaled between the wait and the poll (proceed); `Stuck`
+/// is the poll's `NOT_READY` (genuinely unsignaled — the stuck-fence
+/// class; ash surfaces it as `Ok(false)`); `DeviceLost` is the loss surfacing through the poll (the
+/// masquerading-timeout case the audit named); `PollError` is any
+/// other poll failure (propagate typed at the call site). Pure —
+/// unit-pinned CPU-side; the real-loss arms are rig-only.
+pub(crate) enum FenceTimeoutClass {
+    Signaled,
+    Stuck,
+    DeviceLost,
+    PollError(vk::Result),
+}
+
+pub(crate) fn classify_fence_timeout(poll: Result<bool, vk::Result>) -> FenceTimeoutClass {
+    match poll {
+        Ok(signaled) if signaled => FenceTimeoutClass::Signaled,
+        Ok(_) => FenceTimeoutClass::Stuck,
+        Err(vk::Result::ERROR_DEVICE_LOST) => FenceTimeoutClass::DeviceLost,
+        Err(error) => FenceTimeoutClass::PollError(error),
+    }
+}
+
+/// T16 §5.2: the classified poll feeding the staging pool's
+/// ordered-prefix retirement — `Signaled` retires the entry,
+/// `Pending` stops the prefix, `DeviceLost` returns the typed loss
+/// (propagates to the caller's observe/latch — T06's composition),
+/// `Failed` propagates typed. The twin of [`classify_fence_timeout`]
+/// for the non-blocking poll path. Pure — unit-pinned.
+pub(crate) enum FencePoll {
+    Signaled,
+    Pending,
+    DeviceLost,
+    Failed(vk::Result),
+}
+
+pub(crate) fn classify_fence_status(poll: Result<bool, vk::Result>) -> FencePoll {
+    match poll {
+        Ok(signaled) if signaled => FencePoll::Signaled,
+        Ok(_) => FencePoll::Pending,
+        Err(vk::Result::ERROR_DEVICE_LOST) => FencePoll::DeviceLost,
+        Err(error) => FencePoll::Failed(error),
     }
 }
 
@@ -432,6 +712,13 @@ impl std::fmt::Display for RendererError {
                 f,
                 "the Vulkan device was lost ({operation}); the renderer refuses further \
                  device work on it — construct a fresh renderer"
+            ),
+            RendererError::StuckFence { site } => write!(
+                f,
+                "a stuck fence at {site}: the bounded wait timed out and the device \
+                 reports the fence genuinely unsignaled (a submission that never \
+                 completed); this renderer's frame-slot synchronization can no longer \
+                 be trusted — construct a fresh renderer"
             ),
         }
     }
@@ -652,6 +939,273 @@ mod policy_tests {
             None,
             "an ordinary terminal wrap is not a device loss"
         );
+        // T06 §4.2 — THE RELEASE HALF (the FSU release-half gap): a
+        // loss that first appears in the RELEASE ladder latches with
+        // the release's operation context. This is the exact
+        // composition `dispose_failed_acquisition` can produce: the
+        // fence-state discriminator takes the heal arm on a status
+        // *error*, the heal submit then fails `ERROR_DEVICE_LOST`
+        // while the frame's original error was ordinary.
+        let mut release_loss = DeviceLossLatch::default();
+        release_loss.observe(&RendererError::FrameSlotUnrecoverable {
+            source: Box::new(RendererError::InjectedFault("FrameSubmit".into())),
+            release: Box::new(RendererError::DeviceLost {
+                operation: "release submit (fence heal)".into(),
+            }),
+        });
+        match release_loss.refusal() {
+            Some(RendererError::DeviceLost { operation }) => {
+                assert_eq!(
+                    operation, "release submit (fence heal)",
+                    "the RELEASE half's loss latches with its own operation context"
+                )
+            }
+            other => panic!("the release-half loss latches: {other:?}"),
+        }
+        // The SOURCE keeps priority when both halves are losses (the
+        // frame's original error is the reason the release ran).
+        let mut both_loss = DeviceLossLatch::default();
+        both_loss.observe(&RendererError::FrameSlotUnrecoverable {
+            source: Box::new(RendererError::DeviceLost {
+                operation: "queue_submit".into(),
+            }),
+            release: Box::new(RendererError::DeviceLost {
+                operation: "release submit (fence heal)".into(),
+            }),
+        });
+        match both_loss.refusal() {
+            Some(RendererError::DeviceLost { operation }) => {
+                assert_eq!(operation, "queue_submit", "the source's context wins")
+            }
+            other => panic!("the both-loss wrap latches: {other:?}"),
+        }
+    }
+
+    /// T06 (§4.1): the LIFECYCLE state machine — the terminal-state
+    /// discipline around the latch. Pure, device-free: the CA-13
+    /// semantics preserved (a loss latches, first context stable),
+    /// the NEW poison classes landing (ANY FrameSlotUnrecoverable —
+    /// ordinary source included — and the §4.3 stuck fence), the
+    /// first poison terminal, and the internal-only states
+    /// (RecreateRequired, Destroying) refusing nothing.
+    #[test]
+    fn the_renderer_lifecycle_poisons_terminal_slot_and_stuck_fence_errors() {
+        use super::{PoisonReason, RendererLifecycle};
+
+        // A fresh lifecycle refuses nothing; ordinary errors observe
+        // nothing (the pre-fix behavior for non-terminal errors).
+        let mut lifecycle = RendererLifecycle::new();
+        assert_eq!(
+            lifecycle.refusal(),
+            None,
+            "a fresh lifecycle refuses nothing"
+        );
+        lifecycle.observe(&RendererError::Vulkan("queue_present: ...".into()));
+        lifecycle.observe(&RendererError::InjectedFault("FrameSubmit".into()));
+        assert_eq!(
+            lifecycle.refusal(),
+            None,
+            "ordinary errors never terminalize"
+        );
+
+        // CA-13 PRESERVED: a device loss latches with its operation,
+        // and a later loss at another operation never overwrites.
+        lifecycle.observe(&RendererError::DeviceLost {
+            operation: "acquire_next_image".into(),
+        });
+        match lifecycle.refusal() {
+            Some(RendererError::DeviceLost { operation }) => {
+                assert_eq!(operation, "acquire_next_image")
+            }
+            other => panic!("the loss latches as before: {other:?}"),
+        }
+        lifecycle.observe(&RendererError::DeviceLost {
+            operation: "queue_submit".into(),
+        });
+        match lifecycle.refusal() {
+            Some(RendererError::DeviceLost { operation }) => {
+                assert_eq!(operation, "acquire_next_image", "first context stable")
+            }
+            other => panic!("the latch keeps first-wins: {other:?}"),
+        }
+
+        // The FSU whose SOURCE is a loss latches (CA-13's wrap arm —
+        // the source's context, NOT a poison).
+        let mut wrap_lifecycle = RendererLifecycle::new();
+        wrap_lifecycle.observe(&RendererError::FrameSlotUnrecoverable {
+            source: Box::new(RendererError::DeviceLost {
+                operation: "queue_submit".into(),
+            }),
+            release: Box::new(RendererError::Vulkan("release failed".into())),
+        });
+        assert!(matches!(
+            wrap_lifecycle.refusal(),
+            Some(RendererError::DeviceLost { .. })
+        ));
+
+        // T06's FSU release-half arm: an ordinary source with a LOSS
+        // release latches with the release's context (no poison —
+        // the loss is the terminal class).
+        let mut release_lifecycle = RendererLifecycle::new();
+        release_lifecycle.observe(&RendererError::FrameSlotUnrecoverable {
+            source: Box::new(RendererError::InjectedFault("FrameSubmit".into())),
+            release: Box::new(RendererError::DeviceLost {
+                operation: "release submit (fence heal)".into(),
+            }),
+        });
+        match release_lifecycle.refusal() {
+            Some(RendererError::DeviceLost { operation }) => {
+                assert_eq!(operation, "release submit (fence heal)")
+            }
+            other => panic!("the release-half loss latches: {other:?}"),
+        }
+
+        // THE NEW POISON: an FSU with NO loss on either half — the
+        // audit's stranded-slot terminal class — poisons, and the
+        // refusal RECONSTRUCTS the original terminal error (the
+        // typed reason, never a generic message).
+        let mut poisoned = RendererLifecycle::new();
+        let stranded = RendererError::FrameSlotUnrecoverable {
+            source: Box::new(RendererError::InjectedFault("FrameRecord".into())),
+            release: Box::new(RendererError::Vulkan("release failed".into())),
+        };
+        poisoned.observe(&stranded);
+        assert_eq!(
+            poisoned.refusal(),
+            Some(stranded.clone()),
+            "an ordinary-source FSU poisons with the original error as the refusal"
+        );
+        // The first poison is terminal: a later loss does not
+        // overwrite the poison class.
+        poisoned.observe(&RendererError::DeviceLost {
+            operation: "queue_submit".into(),
+        });
+        assert_eq!(
+            poisoned.refusal(),
+            Some(stranded),
+            "the poison is terminal — a later loss does not replace it"
+        );
+
+        // The §4.3 stuck-fence class poisons the same way.
+        let mut stuck = RendererLifecycle::new();
+        let stuck_error = RendererError::StuckFence {
+            site: "wait_slot_fence (the slot's previous submission)",
+        };
+        stuck.observe(&stuck_error);
+        assert_eq!(
+            stuck.refusal(),
+            Some(stuck_error),
+            "a stuck fence poisons with the typed error as the refusal"
+        );
+        assert!(matches!(
+            stuck,
+            RendererLifecycle::Poisoned {
+                reason: PoisonReason::StuckFence { .. }
+            }
+        ));
+
+        // The internal-only states refuse nothing (§4.1):
+        // RecreateRequired is the deferred-recreation intent, NOT an
+        // error state, and note_recreate's mirror is reversible.
+        let mut recreating = RendererLifecycle::new();
+        recreating.note_recreate(true);
+        assert!(matches!(recreating, RendererLifecycle::RecreateRequired));
+        assert_eq!(
+            recreating.refusal(),
+            None,
+            "RecreateRequired refuses nothing (frames still run)"
+        );
+        recreating.note_recreate(false);
+        assert!(matches!(recreating, RendererLifecycle::Ready));
+        // A terminal state ignores the recreate mirror.
+        let mut terminal = RendererLifecycle::new();
+        terminal.observe(&RendererError::StuckFence { site: "x" });
+        terminal.note_recreate(true);
+        assert!(matches!(terminal, RendererLifecycle::Poisoned { .. }));
+
+        // Destroying (§4.2): drop's observability state — refuses
+        // nothing, and a loss observed at the disposal records
+        // through the normal classification (nothing consults the
+        // gate afterward; drop must complete).
+        let mut destroying = RendererLifecycle::new();
+        destroying.begin_destroy();
+        assert!(matches!(destroying, RendererLifecycle::Destroying));
+        assert_eq!(destroying.refusal(), None);
+        destroying.observe(&RendererError::DeviceLost {
+            operation: "device_wait_idle".into(),
+        });
+        assert!(matches!(destroying, RendererLifecycle::DeviceLost { .. }));
+        // A terminal state does not un-terminalize at destroy.
+        let mut poisoned_to_destroy = RendererLifecycle::new();
+        poisoned_to_destroy.observe(&RendererError::StuckFence { site: "x" });
+        poisoned_to_destroy.begin_destroy();
+        assert!(matches!(
+            poisoned_to_destroy,
+            RendererLifecycle::Poisoned { .. }
+        ));
+    }
+
+    /// T06 §4.3 / T16 §5.2: the pure fence-poll classification
+    /// tables — the device consulted BEFORE a timed-out fence is
+    /// called stuck. `vkGetFenceStatus` returns `SUCCESS` /
+    /// `NOT_READY` / `ERROR_DEVICE_LOST` / other errors; the tables
+    /// pin every arm of both consumers (the post-timeout
+    /// classification and the ordered-prefix retirement poll). The
+    /// real-loss arms are rig-only; the TABLES are CPU-pinned.
+    #[test]
+    fn the_fence_poll_classifications_table_every_arm() {
+        use super::{FencePoll, FenceTimeoutClass, classify_fence_status, classify_fence_timeout};
+
+        // The post-timeout classification (§4.3): the frame-slot class.
+        // ash surfaces vkGetFenceStatus's SUCCESS as Ok(true) and its
+        // NOT_READY as Ok(false) — the poll's own results, never a
+        // wait-timeout result.
+        assert!(matches!(
+            classify_fence_timeout(Ok(true)),
+            FenceTimeoutClass::Signaled
+        ));
+        assert!(matches!(
+            classify_fence_timeout(Ok(false)),
+            FenceTimeoutClass::Stuck
+        ));
+        assert!(matches!(
+            classify_fence_timeout(Err(vk::Result::ERROR_DEVICE_LOST)),
+            FenceTimeoutClass::DeviceLost
+        ));
+        for other in [
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            vk::Result::ERROR_INITIALIZATION_FAILED,
+            vk::Result::ERROR_SURFACE_LOST_KHR,
+        ] {
+            assert!(matches!(
+                classify_fence_timeout(Err(other)),
+                FenceTimeoutClass::PollError(result) if result == other
+            ));
+        }
+        // The fence signaled between the wait and the poll is NOT a
+        // timeout class at all — the poll's SUCCESS means proceed.
+        assert!(!matches!(
+            classify_fence_timeout(Ok(true)),
+            FenceTimeoutClass::Stuck
+        ));
+
+        // The ordered-prefix poll (§5.2): the staging pool's twin.
+        assert!(matches!(
+            classify_fence_status(Ok(true)),
+            FencePoll::Signaled
+        ));
+        assert!(matches!(
+            classify_fence_status(Ok(false)),
+            FencePoll::Pending
+        ));
+        assert!(matches!(
+            classify_fence_status(Err(vk::Result::ERROR_DEVICE_LOST)),
+            FencePoll::DeviceLost
+        ));
+        assert!(matches!(
+            classify_fence_status(Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)),
+            FencePoll::Failed(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+        ));
     }
 }
 

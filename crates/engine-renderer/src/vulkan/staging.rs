@@ -49,11 +49,16 @@
 //! (same bytes, same copies: the device-local contents are
 //! byte-identical, §4.4).
 //!
-//! The pool is created lazily with the first batch and is
-//! UNAVAILABLE (sticky) if the backing cannot be created — the
-//! callers then fall back to the retained per-object paths
-//! (resources.rs's helpers and the texture fallback arm), so a
-//! no-HOST_VISIBLE device keeps exactly its pre-R3 behavior.
+//! The pool is created lazily with the first batch and is UNAVAILABLE
+//! (sticky, TYPED — T16's `StagingAvailability`) only when the device
+//! exposes no HOST_VISIBLE|HOST_COHERENT backing memory — the callers
+//! then fall back to the retained per-object paths (resources.rs's
+//! helpers and the texture fallback arm), so a no-HOST_VISIBLE device
+//! keeps exactly its pre-R3 behavior. Every OTHER backing failure
+//! (OOM-class, or a device loss) is RETRYABLE or TERMINAL — never a
+//! permanent silent disable: a transient allocation failure degrades
+//! ONE call to the fallback and the next begin retries the backing;
+//! a loss propagates typed (T16: never masked into a fallback).
 
 use ash::vk;
 use std::collections::VecDeque;
@@ -61,6 +66,7 @@ use std::collections::VecDeque;
 use super::RendererError;
 use super::context::VulkanContext;
 use super::resources::create_mapped_buffer;
+use super::{FencePoll, FenceTimeoutClass, classify_fence_status, classify_fence_timeout};
 
 /// The backing's minimum size (bytes) — the overlay/arena floor
 /// discipline: the first demand rounds up to the power-of-two
@@ -169,6 +175,42 @@ pub(crate) enum FlushMode {
     Deferred,
 }
 
+/// T16 (strict audit IV, §5.1 of the lifecycle design): the pool's
+/// TYPED availability — the sticky `bool` corrected. Only
+/// [`Self::UnsupportedMemory`] is sticky (no HOST_VISIBLE|HOST_COHERENT
+/// type exists — permanent on this device, the pre-R3 fallback
+/// contract); [`Self::Pressure`] is RETRYABLE (a transient allocation
+/// failure degrades one call to the per-object fallback and the next
+/// `begin_staging_batch` retries the backing — the pool is never
+/// permanently disabled by an OOM); [`Self::Terminal`] is a device
+/// loss observed at the pool (propagates, never masked into a
+/// fallback — the T06 latch takes it at the renderer's entry).
+/// [`Self::Available`] is the ordinary state (including "not yet
+/// created" — the lazy first-batch discipline).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StagingAvailability {
+    Available,
+    UnsupportedMemory { detail: String },
+    Pressure(RendererError),
+    Terminal(RendererError),
+}
+
+/// T16 §5.1: the pure classification of a backing-creation failure
+/// into the availability states — `NoDevice` (no suitable memory
+/// TYPE on this device) is the sticky unsupported-memory arm, a
+/// typed device loss is terminal, everything else (allocation/map
+/// failures — the OOM class) is retryable pressure. Unit-pinned;
+/// the begin path runs THIS function over the real creation error.
+pub(crate) fn classify_backing_failure(error: &RendererError) -> StagingAvailability {
+    match error {
+        RendererError::NoDevice(detail) => StagingAvailability::UnsupportedMemory {
+            detail: detail.clone(),
+        },
+        RendererError::DeviceLost { .. } => StagingAvailability::Terminal(error.clone()),
+        other => StagingAvailability::Pressure(other.clone()),
+    }
+}
+
 /// The pool's current backing. Created lazily with the first batch;
 /// replaced (grown) only after the in-flight list drains.
 struct Backing {
@@ -179,13 +221,125 @@ struct Backing {
 }
 
 /// One flushed-not-yet-retired batch: its fence, its command buffer
-/// (freed at retire), and its bump range. In SUBMISSION order.
+/// (freed at retire), its bump range, and its POOL-MINTED batch id
+/// (the [`UploadTicket`] identity — T16 §5.3). In SUBMISSION order.
 #[derive(Clone, Copy)]
 struct InFlight {
     fence: vk::Fence,
     command: vk::CommandBuffer,
     start: vk::DeviceSize,
     end: vk::DeviceSize,
+    /// The pool-minted monotonic batch id — the ticket's identity
+    /// half (unique per flush, never reused: the id, not the fence
+    /// handle, is what a quarantined upload tracks).
+    batch: u64,
+}
+
+/// T16 §5.3 / T03 §3.3: the IDENTITY of one flushed batch — the
+/// pool-minted monotonic batch id plus the batch's fence (the
+/// completion signal the ticket tracks). Returned by
+/// [`StagingBatch::flush`] so a caller whose upload failed MID-FLIGHT
+/// (the `SubmittedUnwaited` disposition) can hand its destinations to
+/// the ticket's quarantine instead of destroying them — and so a
+/// DEFERRED batch's caller (the attach transaction) can track
+/// readiness before publishing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UploadTicket {
+    /// The pool-minted monotonic batch id.
+    pub(crate) batch: u64,
+    /// The batch's fence handle.
+    pub(crate) fence: vk::Fence,
+}
+
+/// T03 §3.3 / T16 §5.3: the TYPED outcome of a flush — the caller's
+/// cleanup decision depends on whether the batch is PENDING:
+///
+/// - [`Self::Completed`] — nothing pending (an empty batch, or the
+///   inline wait succeeded): the caller owns its destinations.
+/// - [`Self::Deferred`] — submitted, the wait lands at the caller's
+///   drain; `ticket` is the batch's identity for readiness tracking.
+/// - [`Self::NotSubmitted`] — nothing PENDING references the batch's
+///   destinations (the begin/end/fence/submit steps failed — a failed
+///   `queue_submit` attaches nothing; or the wait proved completion
+///   and a later poll surfaced device health): the caller's own
+///   partial-failure destroy is legal.
+/// - [`Self::SubmittedUnwaited`] — the batch IS in flight under
+///   `ticket`: a timeout is NOT completion; the caller must NOT
+///   destroy destinations created beside the batch (T03's
+///   in-flight-destination rule — the quarantine owns them).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FlushDisposition {
+    Completed,
+    Deferred {
+        ticket: UploadTicket,
+    },
+    NotSubmitted(RendererError),
+    SubmittedUnwaited {
+        error: RendererError,
+        ticket: UploadTicket,
+    },
+}
+
+/// T03 §3.3 / T16 §5.3: one DESTINATION handed to the ticket's
+/// quarantine — the raw handles of a resource whose upload is IN
+/// FLIGHT under the ticket (a submitted copy may still reference
+/// it). Created beside an open batch through
+/// [`StagingBatch::register_destination`]; moved to the pool's
+/// quarantine by the flush's `SubmittedUnwaited` arm (the caller is
+/// then FORBIDDEN to destroy it — the textures.rs:41–48 hazard's
+/// rule); released when the ticket completes (the drain's sweep) or
+/// at the teardown's classified idle.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StagingDestination {
+    Buffer {
+        buffer: vk::Buffer,
+        memory: vk::DeviceMemory,
+    },
+    Image {
+        image: vk::Image,
+        memory: vk::DeviceMemory,
+        view: vk::ImageView,
+    },
+}
+
+impl StagingDestination {
+    /// Releases the destination's handles. SAFETY/legality: the
+    /// owning ticket's fence signaled (the drain sweep proved it) or
+    /// the teardown's classified idle completed (or was
+    /// loss-abandoned) — no pending submission reads these handles.
+    /// Null handles (a caller's partial state) are no-ops per the
+    /// spec's destroy semantics.
+    fn release(self, ctx: &VulkanContext) {
+        unsafe {
+            match self {
+                Self::Buffer { buffer, memory } => {
+                    ctx.device.destroy_buffer(buffer, None);
+                    ctx.device.free_memory(memory, None);
+                }
+                Self::Image {
+                    image,
+                    memory,
+                    view,
+                } => {
+                    ctx.device.destroy_image_view(view, None);
+                    ctx.device.destroy_image(image, None);
+                    ctx.device.free_memory(memory, None);
+                }
+            }
+        }
+    }
+}
+
+/// One quarantined upload: the destinations abandoned to a ticket
+/// whose inline wait failed (T03 §3.3) — retained until the ticket
+/// completes, never destroyed by the abandoning caller.
+struct QuarantinedUpload {
+    /// The upload's identity (diagnostic: the landed sweep releases
+    /// at FULL drain/teardown, where every ticket completed — a
+    /// future per-ticket streaming sweep reads this).
+    #[allow(dead_code)]
+    ticket: UploadTicket,
+    destinations: Vec<StagingDestination>,
 }
 
 /// The device-lifetime staging pool, owned by the
@@ -196,10 +350,12 @@ struct InFlight {
 /// silently cross threads).
 pub(crate) struct StagingPool {
     backing: Option<Backing>,
-    /// Sticky: the first backing creation failed — every later batch
-    /// falls back to the retained per-object paths (the caller's
-    /// `begin_staging_batch` returns `None`).
-    unavailable: bool,
+    /// T16 §5.1: the TYPED availability — only `UnsupportedMemory`
+    /// (and a latched `Terminal` loss) is sticky; a transient
+    /// `Pressure` failure never permanently disables the pool (the
+    /// next begin retries the backing). The pre-fix sticky `bool`
+    /// disabled the pool after ANY first-backing failure.
+    availability: StagingAvailability,
     command_pool: vk::CommandPool,
     /// The bump frontier: regions [watermark, committed) are bound
     /// (staged and/or submitted, not yet retired).
@@ -207,24 +363,43 @@ pub(crate) struct StagingPool {
     /// The retirement frontier: bytes before it are free for reuse.
     watermark: vk::DeviceSize,
     in_flight: VecDeque<InFlight>,
+    /// The pool-minted monotonic batch id source (the
+    /// [`UploadTicket`] identity).
+    batch_ids: u64,
     /// One open batch at a time (the single-threaded frame flow's
     /// discipline; a nested begin is a programming error and panics
     /// loudly).
     batch_open: bool,
     growth_events: u64,
+    /// T03 §3.3 / T16 §5.3: the destination QUARANTINE — uploads
+    /// whose inline wait failed (the `SubmittedUnwaited` arm), their
+    /// destinations retained under the ticket until it completes
+    /// (the drain sweep) or the teardown's classified idle releases
+    /// them. Normally empty; bounded by the flush-failure rate.
+    quarantine: Vec<QuarantinedUpload>,
+    /// §5.4: the teardown idle's classification, recorded — the
+    /// destroy path cannot propagate, but the audit's "don't assert
+    /// device_idle succeeded when result was ignored" is answered
+    /// with a typed record instead of a discarded `.ok()`. Readable
+    /// through [`VulkanContext::staging_destroy_idle_failure`] for
+    /// diagnosis (the teardown-diagnostics surface).
+    last_destroy_idle: std::cell::Cell<Option<RendererError>>,
 }
 
 impl StagingPool {
     pub(crate) const fn new() -> Self {
         Self {
             backing: None,
-            unavailable: false,
+            availability: StagingAvailability::Available,
             command_pool: vk::CommandPool::null(),
             committed: 0,
             watermark: 0,
             in_flight: VecDeque::new(),
+            batch_ids: 0,
             batch_open: false,
             growth_events: 0,
+            quarantine: Vec::new(),
+            last_destroy_idle: std::cell::Cell::new(None),
         }
     }
 
@@ -253,22 +428,51 @@ impl StagingPool {
     }
 
     /// Retires the LEADING signaled in-flight entries (the pure
-    /// advance over the real fence statuses). Non-blocking: a zero
-    /// timeout `wait_for_fences` is the status poll. An entry's
-    /// region is released only here — on its OWN fence signal, in
-    /// order (the module's readiness discipline).
-    fn retire_signaled(&mut self, ctx: &VulkanContext) {
+    /// advance over the classified fence statuses). T16 §5.2: the
+    /// ordered-prefix poll — ONE `get_fence_status` per entry IN
+    /// SUBMISSION ORDER, STOPPING at the first pending entry (no
+    /// all-fence allocation; the prefix-bounded statuses are the
+    /// only poll work), every status CLASSIFIED through
+    /// [`super::classify_fence_status`] (no `.is_ok()` masking: a
+    /// device loss at any polled fence returns the typed loss — the
+    /// T06 composition — and any other poll error propagates typed).
+    /// An entry's region is released only here — on its OWN fence
+    /// signal, in order (the module's readiness discipline).
+    fn retire_signaled(&mut self, ctx: &VulkanContext) -> Result<(), RendererError> {
         if self.in_flight.is_empty() {
-            return;
+            return Ok(());
         }
-        // SAFETY: the fences are owned by the in-flight entries; a
-        // zero-timeout wait is a status query.
-        let statuses: Vec<bool> = self
-            .in_flight
-            .iter()
-            .map(|entry| unsafe { ctx.device.wait_for_fences(&[entry.fence], true, 0).is_ok() })
-            .collect();
-        let retire = retire_leading_signaled(&statuses);
+        // The classified statuses of the ORDERED PREFIX through the
+        // first pending entry — the bools
+        // [`retire_leading_signaled`] consumes, now fed by the
+        // classification (never by a raw `.is_ok()`).
+        let mut signaled: Vec<bool> = Vec::new();
+        for entry in &self.in_flight {
+            // SAFETY: the fence is owned by the in-flight entry; the
+            // status poll is non-blocking.
+            let status = unsafe { ctx.device.get_fence_status(entry.fence) };
+            match classify_fence_status(status) {
+                FencePoll::Signaled => signaled.push(true),
+                FencePoll::Pending => {
+                    // The prefix property: stop at the first pending
+                    // entry — no later fence is polled at all.
+                    signaled.push(false);
+                    break;
+                }
+                FencePoll::DeviceLost => {
+                    return Err(RendererError::DeviceLost {
+                        operation: "get_fence_status (staging retire poll)".into(),
+                    });
+                }
+                FencePoll::Failed(error) => {
+                    return Err(RendererError::vk(
+                        error,
+                        "get_fence_status (staging retire poll)",
+                    ));
+                }
+            }
+        }
+        let retire = retire_leading_signaled(&signaled);
         for _ in 0..retire {
             if let Some(entry) = self.in_flight.pop_front() {
                 // The watermark invariant: the entries retire in
@@ -289,6 +493,7 @@ impl StagingPool {
                 self.watermark = entry.end;
             }
         }
+        Ok(())
     }
 
     /// Waits EVERY in-flight fence (in order, each with the frame
@@ -299,6 +504,13 @@ impl StagingPool {
     /// stay bound — the honest state: an unsignaled fence means the
     /// bytes are not provably free) and the error propagates.
     fn drain(&mut self, ctx: &VulkanContext) -> Result<(), RendererError> {
+        // T03's drivable fault knob (the design's §6 L3 row): fires
+        // BEFORE the wait, with the batch already submitted and in
+        // flight under its ticket — the exact state the attach
+        // transaction must QUARANTINE rather than roll back over.
+        // One-shot like every lifecycle site; a healthy device's
+        // retry then reconciles the ticket as completed.
+        ctx.check_lifecycle_fault(crate::LifecycleFaultSite::StagingDrainTimeout)?;
         while let Some(entry) = self.in_flight.front().cloned() {
             let wait_started = std::time::Instant::now();
             // SAFETY: the fence is owned by the in-flight entry.
@@ -324,16 +536,70 @@ impl StagingPool {
                     self.watermark = entry.end;
                 }
                 Err(vk::Result::TIMEOUT) => {
-                    return Err(RendererError::Vulkan(format!(
-                        "staging drain: fence wait timed out after {} ns \
-                         (a stuck upload submission — {} bound bytes stay \
-                         unretired; constructing a fresh renderer is the \
-                         supported path)",
-                        super::WAIT_TIMEOUT_NS,
-                        self.bound_region_bytes()
-                    )));
+                    // T06 §4.3 (the pool class): the timeout is
+                    // classified through ONE `get_fence_status`
+                    // before the submission is called stuck — a loss
+                    // masquerading as a timeout surfaces as the
+                    // TYPED loss (the audit's T16 demand), and a
+                    // fence that signaled between the wait and the
+                    // poll retires normally (never a false stuck
+                    // report). The genuinely-stuck arm keeps the
+                    // typed staging-timeout shape (§5.4: the honest
+                    // state — the regions stay bound), unchanged.
+                    // SAFETY: the fence is owned by the entry.
+                    let polled = unsafe { ctx.device.get_fence_status(entry.fence) };
+                    match classify_fence_timeout(polled) {
+                        FenceTimeoutClass::Signaled => {
+                            ctx.record_upload_wait(wait_started.elapsed());
+                            self.in_flight.pop_front();
+                            debug_assert_eq!(
+                                entry.start, self.watermark,
+                                "the drain retires in bump order"
+                            );
+                            // SAFETY: the poll proved the fence
+                            // signaled — the command buffer is not
+                            // pending; each handle owned exactly once.
+                            unsafe {
+                                ctx.device.destroy_fence(entry.fence, None);
+                                ctx.device
+                                    .free_command_buffers(self.command_pool, &[entry.command]);
+                            }
+                            self.watermark = entry.end;
+                        }
+                        FenceTimeoutClass::Stuck => {
+                            return Err(RendererError::Vulkan(format!(
+                                "staging drain: fence wait timed out after {} ns \
+                                 (a stuck upload submission — {} bound bytes stay \
+                                 unretired; constructing a fresh renderer is the \
+                                 supported path)",
+                                super::WAIT_TIMEOUT_NS,
+                                self.bound_region_bytes()
+                            )));
+                        }
+                        FenceTimeoutClass::DeviceLost => {
+                            return Err(RendererError::DeviceLost {
+                                operation: "get_fence_status (staging drain, after wait timeout)"
+                                    .into(),
+                            });
+                        }
+                        FenceTimeoutClass::PollError(error) => {
+                            return Err(RendererError::vk(
+                                error,
+                                "get_fence_status (staging drain)",
+                            ));
+                        }
+                    };
                 }
                 Err(error) => return Err(RendererError::vk(error, "staging drain")),
+            }
+        }
+        // T03 §3.3: the drain completed EVERY in-flight ticket — the
+        // destination quarantine's retained uploads are all complete
+        // now, so their handles release (the abandoning callers
+        // never destroyed them; this is their single release).
+        for quarantined in self.quarantine.drain(..) {
+            for destination in quarantined.destinations {
+                destination.release(ctx);
             }
         }
         Ok(())
@@ -412,14 +678,31 @@ impl StagingPool {
     /// Full teardown (the context's destroy): if anything is still
     /// in flight the device is idled FIRST (the stuck-fence protocol
     /// — a never-signaling fence must not wedge the teardown), then
-    /// every entry and the backing are released. Best-effort by
-    /// contract (the callers are drop paths); errors cannot propagate
-    /// here, and the device-idle makes every destroy legal.
+    /// every entry and the backing are released. T16 §5.4: the
+    /// idle's result is CLASSIFIED, never discarded (the audit's
+    /// "don't assert device_idle succeeded when result was ignored")
+    /// — `Ok` makes the destroys below legal; `ERROR_DEVICE_LOST`
+    /// lets them proceed on the loss-abandon semantics (after a loss
+    /// the `vkDestroy*`/`vkFree*` calls remain the spec's supported
+    /// teardown path) with the classification recorded on
+    /// [`Self::last_destroy_idle`]; any other error also proceeds
+    /// (teardown must complete) with the failure recorded the same
+    /// way. Best-effort by contract (the callers are drop paths);
+    /// errors cannot propagate here, and the classification makes
+    /// every destroy legal.
     pub(crate) fn destroy(&mut self, ctx: &VulkanContext) {
         if !self.in_flight.is_empty() {
             // SAFETY: the renderer's owning drop path — the device is
             // live and every other owner is already released.
-            unsafe { ctx.device.device_wait_idle() }.ok();
+            match unsafe { ctx.device.device_wait_idle() } {
+                Ok(()) => {}
+                Err(error) => {
+                    self.last_destroy_idle.set(Some(RendererError::vk(
+                        error,
+                        "device_wait_idle (staging teardown)",
+                    )));
+                }
+            }
         }
         for entry in self.in_flight.drain(..) {
             // SAFETY: the idle wait above completed every submission;
@@ -428,6 +711,14 @@ impl StagingPool {
                 ctx.device.destroy_fence(entry.fence, None);
                 ctx.device
                     .free_command_buffers(self.command_pool, &[entry.command]);
+            }
+        }
+        // T03 §3.3: the quarantined destinations release under the
+        // same legality proof (the idle above completed every
+        // submission, or was loss-abandoned).
+        for quarantined in self.quarantine.drain(..) {
+            for destination in quarantined.destinations {
+                destination.release(ctx);
             }
         }
         if let Some(backing) = self.backing.take() {
@@ -473,6 +764,11 @@ pub(crate) struct StagingBatch<'a> {
     /// The bump frontier at begin — the abort rollback point.
     start: vk::DeviceSize,
     records: Vec<StagingRecord>,
+    /// T03 §3.3: the destinations created beside this batch (the
+    /// pooled helpers register them as they create) — moved to the
+    /// ticket's quarantine by the flush's `SubmittedUnwaited` arm;
+    /// discarded on every other disposition (the caller owns them).
+    destinations: Vec<StagingDestination>,
     closed: bool,
 }
 
@@ -506,7 +802,10 @@ impl<'a> StagingBatch<'a> {
     pub(crate) fn stage(&mut self, bytes: &[u8]) -> Result<StagedRegion, RendererError> {
         let len = bytes.len() as vk::DeviceSize;
         let mut pool = self.ctx.staging.borrow_mut();
-        if pool.unavailable {
+        if matches!(
+            pool.availability,
+            StagingAvailability::UnsupportedMemory { .. }
+        ) {
             return Err(RendererError::Vulkan(
                 "the staging pool is unavailable on this device".into(),
             ));
@@ -531,6 +830,17 @@ impl<'a> StagingBatch<'a> {
         }
         pool.committed = needed_end;
         Ok(StagedRegion { offset, len })
+    }
+
+    /// T03 §3.3: registers a DESTINATION created beside this batch —
+    /// the raw handles of a resource the batch's copies write. On
+    /// the flush's `SubmittedUnwaited` arm the registration moves to
+    /// the ticket's quarantine (the caller is then forbidden to
+    /// destroy the handles: a submitted copy may still reference
+    /// them); on every other disposition the registration is
+    /// discarded (the caller owns the destination).
+    pub(crate) fn register_destination(&mut self, destination: StagingDestination) {
+        self.destinations.push(destination);
     }
 
     /// Records one whole-region buffer copy (the per-object helper's
@@ -571,14 +881,21 @@ impl<'a> StagingBatch<'a> {
     /// milestone) or defers (the wait lands at the caller's drain).
     /// A batch with no recorded copies is a no-op (no empty submits —
     /// the census counts real submissions only).
-    pub(crate) fn flush(&mut self, mode: FlushMode) -> Result<(), RendererError> {
+    ///
+    /// T16/T03: the outcome is the TYPED [`FlushDisposition`] — the
+    /// caller's cleanup decision depends on whether the batch is
+    /// PENDING (a timeout is NOT completion: the `SubmittedUnwaited`
+    /// arm's batch is in flight under its [`UploadTicket`], and the
+    /// destinations created beside it must not be destroyed by the
+    /// caller on that arm).
+    pub(crate) fn flush(&mut self, mode: FlushMode) -> FlushDisposition {
         if self.records.is_empty() {
             // Nothing to submit: reclaim the staged regions and close.
             let mut pool = self.ctx.staging.borrow_mut();
             pool.batch_open = false;
             pool.committed = self.start;
             self.closed = true;
-            return Ok(());
+            return FlushDisposition::Completed;
         }
         let mut pool = self.ctx.staging.borrow_mut();
         // The command pool is created with the first real flush.
@@ -586,8 +903,20 @@ impl<'a> StagingBatch<'a> {
             let info =
                 vk::CommandPoolCreateInfo::default().queue_family_index(self.ctx.graphics_family);
             // SAFETY: fresh object; the pool owns it until teardown.
-            pool.command_pool = unsafe { self.ctx.device.create_command_pool(&info, None) }
-                .map_err(|error| RendererError::vk(error, "staging command pool"))?;
+            // T16 §5.3: the flush's PRE-SUBMIT allocations are the
+            // queue-entry publications — on their failure nothing is
+            // pending, so the disposition is `NotSubmitted` (today's
+            // caller cleanup is correct; the batch's Drop aborts the
+            // staged regions).
+            pool.command_pool = match unsafe { self.ctx.device.create_command_pool(&info, None) } {
+                Ok(created) => created,
+                Err(error) => {
+                    return FlushDisposition::NotSubmitted(RendererError::vk(
+                        error,
+                        "staging command pool",
+                    ));
+                }
+            };
         }
         let allocate = vk::CommandBufferAllocateInfo::default()
             .command_pool(pool.command_pool)
@@ -596,8 +925,15 @@ impl<'a> StagingBatch<'a> {
         // SAFETY: the pool owns the command pool; the buffer is freed
         // at retire, at teardown, or on every error path below
         // (nothing pending can exist before a successful submit).
-        let command = unsafe { self.ctx.device.allocate_command_buffers(&allocate) }
-            .map_err(|error| RendererError::vk(error, "staging command buffer"))?[0];
+        let command = match unsafe { self.ctx.device.allocate_command_buffers(&allocate) } {
+            Ok(buffers) => buffers[0],
+            Err(error) => {
+                return FlushDisposition::NotSubmitted(RendererError::vk(
+                    error,
+                    "staging command buffer",
+                ));
+            }
+        };
         let src = pool
             .backing
             .as_ref()
@@ -669,15 +1005,24 @@ impl<'a> StagingBatch<'a> {
                     .device
                     .free_command_buffers(pool.command_pool, &[command]);
             }
-            return Err(error);
+            return FlushDisposition::NotSubmitted(error);
         }
         let start = self.start;
         let end = pool.committed;
+        // T16 §5.3: the pool-minted monotonic batch id — the
+        // ticket's identity half (the fence handle alone could be
+        // recycled by the driver after a retire; the id never is).
+        pool.batch_ids += 1;
+        let ticket = UploadTicket {
+            batch: pool.batch_ids,
+            fence,
+        };
         pool.in_flight.push_back(InFlight {
             fence,
             command,
             start,
             end,
+            batch: ticket.batch,
         });
         pool.batch_open = false;
         self.closed = true;
@@ -696,24 +1041,100 @@ impl<'a> StagingBatch<'a> {
                         // The signaled entry retires if it is at the
                         // head (earlier deferred entries correctly
                         // block the watermark behind their own
-                        // fences).
-                        pool.retire_signaled(self.ctx);
-                        Ok(())
+                        // fences). T16 §5.2: the retire poll is now
+                        // CLASSIFIED — a loss or poll error at an
+                        // EARLIER entry's fence surfaces typed (never
+                        // masked); THIS batch's wait already proved
+                        // its own completion, so nothing pending
+                        // references the caller's destinations and
+                        // the error rides the NotSubmitted contract.
+                        match pool.retire_signaled(self.ctx) {
+                            Ok(()) => FlushDisposition::Completed,
+                            Err(error) => FlushDisposition::NotSubmitted(error),
+                        }
                     }
-                    Err(vk::Result::TIMEOUT) => Err(RendererError::Vulkan(format!(
-                        "staging upload: fence wait timed out after {} ns \
-                         (a stuck upload submission; constructing a fresh \
-                         renderer is the supported path)",
-                        super::WAIT_TIMEOUT_NS
-                    ))),
-                    Err(error) => Err(RendererError::vk(error, "staging upload wait")),
+                    Err(vk::Result::TIMEOUT) => {
+                        // T06 §4.3 (the pool class, the InlineWait
+                        // site): ONE `get_fence_status` classifies
+                        // the timeout before the submission is
+                        // called stuck — a loss surfacing typed, a
+                        // fence that signaled in between retiring
+                        // normally. THE STUCK ARM'S CONTRACT (T03's
+                        // in-flight-destination rule): the entry IS
+                        // in flight (pushed above BEFORE this wait)
+                        // and its destinations must NOT be destroyed
+                        // by the caller on this error — a timeout is
+                        // not completion. The typed staging-timeout
+                        // shape is unchanged (§5.4).
+                        // SAFETY: the fence is owned by the entry.
+                        let polled = unsafe { self.ctx.device.get_fence_status(fence) };
+                        match classify_fence_timeout(polled) {
+                            FenceTimeoutClass::Signaled => {
+                                self.ctx.record_upload_submit(wait_started.elapsed());
+                                match pool.retire_signaled(self.ctx) {
+                                    Ok(()) => FlushDisposition::Completed,
+                                    Err(error) => FlushDisposition::NotSubmitted(error),
+                                }
+                            }
+                            FenceTimeoutClass::Stuck => {
+                                // T03 §3.3: the destinations created
+                                // beside this batch move to the
+                                // ticket's QUARANTINE — the caller is
+                                // forbidden to destroy them (a
+                                // submitted copy may still reference
+                                // them; a timeout is not completion).
+                                let destinations = std::mem::take(&mut self.destinations);
+                                if !destinations.is_empty() {
+                                    pool.quarantine.push(QuarantinedUpload {
+                                        ticket,
+                                        destinations,
+                                    });
+                                }
+                                FlushDisposition::SubmittedUnwaited {
+                                    error: RendererError::Vulkan(format!(
+                                        "staging upload: fence wait timed out after {} ns \
+                                         (a stuck upload submission; constructing a fresh \
+                                         renderer is the supported path)",
+                                        super::WAIT_TIMEOUT_NS
+                                    )),
+                                    ticket,
+                                }
+                            }
+                            FenceTimeoutClass::DeviceLost => {
+                                let destinations = std::mem::take(&mut self.destinations);
+                                if !destinations.is_empty() {
+                                    pool.quarantine.push(QuarantinedUpload {
+                                        ticket,
+                                        destinations,
+                                    });
+                                }
+                                FlushDisposition::SubmittedUnwaited {
+                                    error: RendererError::DeviceLost {
+                                        operation:
+                                            "get_fence_status (staging inline wait, after timeout)"
+                                                .into(),
+                                    },
+                                    ticket,
+                                }
+                            }
+                            FenceTimeoutClass::PollError(error) => FlushDisposition::NotSubmitted(
+                                RendererError::vk(error, "get_fence_status (staging inline wait)"),
+                            ),
+                        }
+                    }
+                    Err(error) => FlushDisposition::NotSubmitted(RendererError::vk(
+                        error,
+                        "staging upload wait",
+                    )),
                 }
             }
             FlushMode::Deferred => {
                 // The submit is counted now; the blocking time lands
-                // on the census at the DRAIN that waits it.
+                // on the census at the DRAIN that waits it. The
+                // ticket is the caller's readiness-tracking identity
+                // (T03's transaction holds it until the drain).
                 self.ctx.record_upload_submit(std::time::Duration::ZERO);
-                Ok(())
+                FlushDisposition::Deferred { ticket }
             }
         }
     }
@@ -832,16 +1253,29 @@ unsafe fn execute_records(
 impl VulkanContext {
     /// Opens ONE staging batch (the single-batch discipline — a
     /// nested open panics: the renderer's single-threaded flow never
-    /// nests). `None` when the pool is UNAVAILABLE on this device
-    /// (the sticky first-backing-creation failure): the caller falls
-    /// back to the retained per-object upload paths, keeping exactly
-    /// the pre-R3 behavior on a no-HOST_VISIBLE device. Retires the
-    /// leading signaled batches first (the readiness recycling), and
-    /// wraps the bump around to zero when nothing is bound.
-    pub(crate) fn begin_staging_batch(&self) -> Option<StagingBatch<'_>> {
+    /// nests). T16 §5.1: `Ok(None)` is the per-object FALLBACK for
+    /// this call — the sticky `UnsupportedMemory` (no
+    /// HOST_VISIBLE|HOST_COHERENT backing type on this device, the
+    /// pre-R3 contract) or a TRANSIENT `Pressure` failure (the next
+    /// begin retries the backing; the pool is never permanently
+    /// disabled by an OOM — the pre-fix sticky `bool` did exactly
+    /// that). `Err` is a device error observed at the pool — a typed
+    /// loss (sticky `Terminal`: every later begin fails fast without
+    /// touching the dead device) or a classified poll failure —
+    /// propagated, never masked into a fallback. Retires the leading
+    /// signaled batches first (the readiness recycling, CLASSIFIED —
+    /// a loss at the retire poll propagates), and wraps the bump
+    /// around to zero when nothing is bound.
+    pub(crate) fn begin_staging_batch(&self) -> Result<Option<StagingBatch<'_>>, RendererError> {
         let mut pool = self.staging.borrow_mut();
-        if pool.unavailable {
-            return None;
+        match &pool.availability {
+            // Sticky: this device cannot back the pool — the
+            // callers' fallback arms keep the pre-R3 path.
+            StagingAvailability::UnsupportedMemory { .. } => return Ok(None),
+            // Sticky (latched): the pool observed a device loss;
+            // fail fast without touching the dead device.
+            StagingAvailability::Terminal(error) => return Err(error.clone()),
+            StagingAvailability::Available | StagingAvailability::Pressure(_) => {}
         }
         if pool.backing.is_none() {
             // The lazy first backing (the overlay/region lazy
@@ -854,14 +1288,28 @@ impl VulkanContext {
                 STAGING_POOL_FLOOR_BYTES,
             ) {
                 Ok(created) => created,
-                Err(_) => {
-                    // Sticky: this device cannot back the pool (no
-                    // HOST_VISIBLE|HOST_COHERENT staging memory — the
-                    // same class of failure the per-object helper's
-                    // staging half raises at its own allocation). The
-                    // callers' fallback arms keep the pre-R3 path.
-                    pool.unavailable = true;
-                    return None;
+                Err(error) => {
+                    // T16 §5.1: the failure is CLASSIFIED, not
+                    // flattened into the old sticky bool — only the
+                    // no-memory-type arm is permanent; a transient
+                    // allocation failure degrades THIS call to the
+                    // fallback (the availability stays retryable);
+                    // a typed loss is terminal and sticky.
+                    match classify_backing_failure(&error) {
+                        StagingAvailability::UnsupportedMemory { .. } => {
+                            pool.availability = classify_backing_failure(&error);
+                            return Ok(None);
+                        }
+                        StagingAvailability::Terminal(_) => {
+                            pool.availability = classify_backing_failure(&error);
+                            return Err(error);
+                        }
+                        // Pressure: retryable — NOT stored (the next
+                        // begin retries the backing).
+                        StagingAvailability::Pressure(_) | StagingAvailability::Available => {
+                            return Ok(None);
+                        }
+                    }
                 }
             };
             pool.backing = Some(Backing {
@@ -875,7 +1323,16 @@ impl VulkanContext {
             !pool.batch_open,
             "one staging batch at a time (the single-threaded flow's discipline)"
         );
-        pool.retire_signaled(self);
+        // T16 §5.2: the classified ordered-prefix retirement — a
+        // loss or poll error at a signaled-prefix fence propagates
+        // typed (the availability latches Terminal on a loss so the
+        // next begin fails fast).
+        if let Err(error) = pool.retire_signaled(self) {
+            if matches!(error, RendererError::DeviceLost { .. }) {
+                pool.availability = StagingAvailability::Terminal(error.clone());
+            }
+            return Err(error);
+        }
         if pool.watermark == pool.committed {
             // Nothing bound: the bump wraps to zero (the ordinary
             // recycling — a fresh batch reuses the retired space).
@@ -884,12 +1341,61 @@ impl VulkanContext {
         }
         pool.batch_open = true;
         let start = pool.committed;
-        Some(StagingBatch {
+        Ok(Some(StagingBatch {
             ctx: self,
             start,
             records: Vec::new(),
+            destinations: Vec::new(),
             closed: false,
-        })
+        }))
+    }
+
+    /// T16 §5.1: the pool's typed availability (the observability
+    /// read — `Pressure` appears here only transiently between the
+    /// failed begin and the retry; the stored states are `Available`,
+    /// the sticky `UnsupportedMemory`, and the latched `Terminal`).
+    /// T16 §5.3 / T03 §3.3: the ticket's completion check — the T16
+    /// typed poll over the ticket's own fence. `Ok(true)` when the
+    /// batch completed (the fence signaled, or the entry already
+    /// RETIRED — a retired entry's fence signaled by definition);
+    /// `Ok(false)` when it is still in flight; `Err` is the
+    /// classified poll failure (a typed loss propagates — the T06
+    /// composition). The quarantine's re-drain and the teardown
+    /// release both consume THIS check.
+    pub(crate) fn staging_ticket_completed(
+        &self,
+        ticket: UploadTicket,
+    ) -> Result<bool, RendererError> {
+        let pool = self.staging.borrow();
+        // A retired entry completed (its fence signaled before the
+        // retire); a ticket beyond the minted range is a caller bug,
+        // refused loudly rather than vouched.
+        let Some(entry) = pool
+            .in_flight
+            .iter()
+            .find(|entry| entry.batch == ticket.batch)
+        else {
+            if ticket.batch == 0 || ticket.batch > pool.batch_ids {
+                return Err(RendererError::Vulkan(format!(
+                    "the upload ticket {} was never minted by this pool",
+                    ticket.batch
+                )));
+            }
+            return Ok(true);
+        };
+        // SAFETY: the fence is owned by the in-flight entry.
+        let status = unsafe { self.device.get_fence_status(entry.fence) };
+        match classify_fence_status(status) {
+            FencePoll::Signaled => Ok(true),
+            FencePoll::Pending => Ok(false),
+            FencePoll::DeviceLost => Err(RendererError::DeviceLost {
+                operation: "get_fence_status (upload ticket completion check)".into(),
+            }),
+            FencePoll::Failed(error) => Err(RendererError::vk(
+                error,
+                "get_fence_status (upload ticket completion check)",
+            )),
+        }
     }
 
     /// Waits every in-flight staging batch (the DEFERRED flushes'
@@ -1004,6 +1510,57 @@ mod staging_pool_seam_tests {
                 assert!(!statuses[retired]);
             }
         }
+    }
+
+    /// T16 §5.1: the backing-failure classification table — the
+    /// pre-fix sticky `bool` permanently disabled the pool after ANY
+    /// first-backing failure; the typed states correct it: only the
+    /// no-memory-TYPE arm (`NoDevice`) is the sticky
+    /// unsupported-memory state, a typed device loss is terminal,
+    /// and EVERYTHING else (the OOM class — allocation and map
+    /// failures) is retryable pressure. Pure — the begin path runs
+    /// THIS function over the real creation error.
+    #[test]
+    fn the_backing_failure_classification_tables_the_availability_states() {
+        use super::{StagingAvailability, classify_backing_failure};
+        use crate::vulkan::RendererError;
+
+        // No HOST_VISIBLE|HOST_COHERENT type on this device — the
+        // sticky unsupported-memory arm (the pre-R3 fallback
+        // contract, unchanged for the devices that need it).
+        assert!(matches!(
+            classify_backing_failure(&RendererError::NoDevice("no HOST_VISIBLE memory".into())),
+            StagingAvailability::UnsupportedMemory { .. }
+        ));
+        // A typed device loss at the backing — terminal (propagates;
+        // the pool latches it and fails fast without touching the
+        // dead device).
+        assert!(matches!(
+            classify_backing_failure(&RendererError::DeviceLost {
+                operation: "allocate overlay memory".into()
+            }),
+            StagingAvailability::Terminal(_)
+        ));
+        // The OOM class and every ordinary Vulkan failure —
+        // RETRYABLE pressure (the next begin retries the backing;
+        // the pool is never permanently disabled by a transient
+        // condition — the audit's exact demand).
+        assert!(matches!(
+            classify_backing_failure(&RendererError::Vulkan(
+                "allocate overlay memory: ERROR_OUT_OF_DEVICE_MEMORY".into()
+            )),
+            StagingAvailability::Pressure(_)
+        ));
+        assert!(matches!(
+            classify_backing_failure(&RendererError::Vulkan(
+                "map overlay: ERROR_MEMORY_MAP_FAILED".into()
+            )),
+            StagingAvailability::Pressure(_)
+        ));
+        assert!(matches!(
+            classify_backing_failure(&RendererError::InjectedFault("StagingBacking".into())),
+            StagingAvailability::Pressure(_)
+        ));
     }
 }
 

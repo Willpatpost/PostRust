@@ -233,6 +233,18 @@ pub enum LifecycleFaultSite {
     /// check is consumed as a behavior flag, not an error (the
     /// one-shot plan/ordinal discipline is otherwise identical).
     StagingFenceNeverSignals,
+    // ---- T03 (the attach transaction's drivable timeout) ----
+    /// The staging DRAIN, armed to fail BEFORE the wait: the
+    /// one-shot timeout that makes the T03 transaction's quarantine
+    /// arm drivable without `StagingFenceNeverSignals`' permanent
+    /// stick (a real stuck fence never recovers; this knob's
+    /// "timeout" leaves a HEALTHY device, so the retry's
+    /// reconciliation finds the ticket completed and the attach
+    /// proceeds — the outcome-(b) retry-supported witness). Fires at
+    /// the drain's top, with the batch already submitted and in
+    /// flight under its ticket (the exact state the transaction must
+    /// quarantine rather than roll back over).
+    StagingDrainTimeout,
 }
 
 /// P5 §1.3 (A11/R1): the instance arena's configured HARD CAP — the

@@ -58,10 +58,11 @@ use super::pipelines::PipelineState;
 use super::resources::create_mapped_buffer;
 use super::swapchain::{SwapchainState, mark_suboptimal};
 use super::uploads::{LayerPriority, upload_layers};
+use super::{FenceTimeoutClass, classify_fence_timeout};
 use super::{corner, post_draw, proxy_draw, scene_record};
 use crate::config::{DemoScenePreference, DynamicClamp, FRAMES_IN_FLIGHT, PresentModePreference};
 use crate::overlay::OverlayVertex;
-use crate::proxy_instances::generation_write_needed;
+use crate::proxy_instances::population_write_needed;
 use crate::submission::FrameInputs;
 
 /// A single frame slot owns this mapping. The slot fence must have
@@ -157,6 +158,18 @@ pub(crate) struct FrameState {
     pub timestamps_written: [bool; FRAMES_IN_FLIGHT as usize],
     /// A present reported suboptimal — recreate before the next frame.
     pub needs_recreate: bool,
+    /// T06 (strict audit IV, §4.4): the FIRST-USE tracking — per
+    /// swapchain image, whether that image has EVER been presented
+    /// or render-submitted (a rendered image ends the frame in
+    /// `PRESENT_SRC` via the render pass's final layout). The
+    /// release-present of a NEVER-presented image would present it
+    /// in its initial `UNDEFINED` layout — the WSI premise the
+    /// audit refuses to trust — so the acquisition disposition's
+    /// first-use arm submits the minimal `UNDEFINED→PRESENT_SRC`
+    /// transition first (see [`dispose_failed_acquisition`]). Reset
+    /// at every swapchain recreation (the new chain's images are
+    /// fresh); grown with the per-image tables.
+    pub image_ever_presented: Vec<bool>,
     /// The 6-F shadow-map readback handshake (single-flight, like
     /// the color capture; survives pipeline replacements).
     pub(crate) shadow_readback: ShadowReadbackState,
@@ -200,6 +213,20 @@ pub(crate) struct PopulationStamps {
     /// written with ([npc, vehicle, rain]) — the indirect-count
     /// identity beside the generation.
     pub indirect_counts: [[u32; 3]; FRAMES_IN_FLIGHT as usize],
+    /// T02 (strict audit IV, §2.3): the per-slot EPOCH halves — the
+    /// allocation epoch of the carve each stamp's bytes were written
+    /// INTO, recorded together with those bytes at the upload site.
+    /// 0 = unknown (never equal to a minted epoch, which start at 1):
+    /// a REPLACED carve (a growth commit's or a pipeline
+    /// replacement's fresh publication) can never inherit a previous
+    /// identity's stamp — the resource-window half of the gate
+    /// [`crate::proxy_instances::population_write_needed`], the
+    /// correctness bearer the audit's delayed-invalidation finding
+    /// demanded (T05's submission-time clears close the identity
+    /// window; the two compose).
+    pub instance_epochs: [u64; FRAMES_IN_FLIGHT as usize],
+    pub pose_epochs: [u64; FRAMES_IN_FLIGHT as usize],
+    pub indirect_epochs: [u64; FRAMES_IN_FLIGHT as usize],
 }
 
 impl Default for PopulationStamps {
@@ -209,6 +236,9 @@ impl Default for PopulationStamps {
             pose: [0; FRAMES_IN_FLIGHT as usize],
             indirect: [0; FRAMES_IN_FLIGHT as usize],
             indirect_counts: [[0; 3]; FRAMES_IN_FLIGHT as usize],
+            instance_epochs: [0; FRAMES_IN_FLIGHT as usize],
+            pose_epochs: [0; FRAMES_IN_FLIGHT as usize],
+            indirect_epochs: [0; FRAMES_IN_FLIGHT as usize],
         }
     }
 }
@@ -250,6 +280,8 @@ impl PopulationStamps {
         self.instance = [0; FRAMES_IN_FLIGHT as usize];
         self.indirect = [0; FRAMES_IN_FLIGHT as usize];
         self.indirect_counts = [[0; 3]; FRAMES_IN_FLIGHT as usize];
+        self.instance_epochs = [0; FRAMES_IN_FLIGHT as usize];
+        self.indirect_epochs = [0; FRAMES_IN_FLIGHT as usize];
     }
 
     /// T05 — the POSE half's repack invalidation (the instance
@@ -258,6 +290,7 @@ impl PopulationStamps {
     /// the advancing pose half rewrites).
     pub(crate) fn clear_pose(&mut self) {
         self.pose = [0; FRAMES_IN_FLIGHT as usize];
+        self.pose_epochs = [0; FRAMES_IN_FLIGHT as usize];
     }
 }
 
@@ -280,6 +313,7 @@ impl FrameState {
             timestamps_supported: ctx.timestamp_valid_bits > 0,
             timestamps_written: [false; FRAMES_IN_FLIGHT as usize],
             needs_recreate: false,
+            image_ever_presented: Vec::new(),
             surface_probe_pending: false,
             shadow_readback: ShadowReadbackState::default(),
             frame_slot: 0,
@@ -355,6 +389,11 @@ impl FrameState {
             .map_err(|error| RendererError::vk(error, "create present semaphore"))?;
             self.present_semaphores.push(semaphore);
         }
+        // T06 §4.4: the first-use table grows with the per-image
+        // tables (the grown entries are fresh — never presented).
+        while self.image_ever_presented.len() < needed {
+            self.image_ever_presented.push(false);
+        }
         Ok(())
     }
 
@@ -383,6 +422,9 @@ impl FrameState {
         swapchain_image_count: u32,
     ) -> Result<(), RendererError> {
         self.images_in_flight = vec![vk::Fence::null(); swapchain_image_count as usize];
+        // T06 §4.4: the new chain's images are FRESH (initial layout
+        // UNDEFINED, never presented) — the first-use table resets.
+        self.image_ever_presented = vec![false; swapchain_image_count as usize];
         self.sync_present_semaphores(ctx, swapchain_image_count)
     }
 
@@ -726,20 +768,22 @@ pub(crate) fn render_frame(
     frames.image_index = image_index;
 
     // P5 §3.3 (A18/R2) — RESOURCE-REPLACEMENT INVALIDATION, the
-    // growth arm: any arena growth THIS frame (the delta over the
-    // baseline taken at entry — the ensure ladder in either
-    // preparation path, or the out-of-date arm's re-run, all of
-    // which precede this point) re-created a mapped carve at a
-    // larger size under `device_wait_idle` with NO content copy, so
-    // no population stamp can vouch for any slot's content anymore.
-    // Clearing forces one rewrite per slot — correctness first; the
-    // pow2 growth quantum bounds the events (and therefore the
-    // forced rewrites) to `log2(cap / 64)` per session. Conservative
-    // by design: a REGION growth (not an instance/pose buffer) also
-    // clears the population stamps — one redundant rewrite, never a
-    // stale skip. The recreation arm of the invalidation lives in
-    // `recreate_swapchain` (the pipeline replacement re-creates the
-    // instance and indirect buffers there).
+    // growth arm — DEMOTED TO A BELT by T02 (strict audit IV, §2.3):
+    // the epoch gate at the upload site
+    // ([`crate::proxy_instances::population_write_needed`], the
+    // carve's minted allocation epoch beside the generation) is the
+    // CORRECTNESS BEARER — a replaced carve's fresh epoch can never
+    // equal a surviving stamp's, so the delayed-invariant hazard the
+    // audit sketched (a growth event swallowed by a later error
+    // before this clear runs, the next frame's baseline absorbing
+    // the counter) is closed at the RESOURCE side, not by the call
+    // sequence. The clear is KEPT as defense-in-depth (one redundant
+    // rewrite per growth event — the growth events are log-bounded,
+    // and the belt also covers the conservative region-growth arm
+    // below); the recreation arm of the invalidation lives in
+    // `recreate_swapchain` (the pipeline replacement re-publishes
+    // the instance and indirect carves with FRESH EPOCHS there —
+    // the same rule at the replacement site).
     if ctx.arena_growth_events.get() != arena_growth_before {
         frames.population_stamps.clear();
     }
@@ -927,10 +971,44 @@ fn wait_slot_fence(
     // resetting first would leave that guard waiting on a fence only
     // THIS frame's submission will signal — the 240-pacing-against-FIFO
     // wedge (rig finding, 2026-10-20: "wait image fence timed out").
-    unsafe {
+    //
+    // T06 §4.3: a TIMEOUT is classified through ONE `get_fence_status`
+    // before the fence is called stuck — the wait's bounded timeout
+    // surfaces as the TYPED stuck-fence refusal only when the device
+    // itself reports the fence unsignaled (a loss at the poll surfaces
+    // as the typed loss instead; a fence that signaled between the
+    // wait and the poll proceeds — never a false stuck report).
+    let waited = unsafe {
         ctx.device
             .wait_for_fences(&[frames.in_flight[slot]], true, WAIT_TIMEOUT_NS)
-            .map_err(|error| RendererError::vk(error, "wait_for_fences (slot fence timed out — a submission never completed; presenting faster than the present mode drains?)"))?;
+    };
+    match waited {
+        Ok(()) => {}
+        Err(vk::Result::TIMEOUT) => match classify_fence_timeout(unsafe {
+            ctx.device.get_fence_status(frames.in_flight[slot])
+        }) {
+            FenceTimeoutClass::Signaled => {}
+            FenceTimeoutClass::Stuck => {
+                return Err(RendererError::StuckFence {
+                    site: "wait_slot_fence (the slot's previous submission)",
+                });
+            }
+            FenceTimeoutClass::DeviceLost => {
+                return Err(RendererError::DeviceLost {
+                    operation: "get_fence_status (slot fence, after wait timeout)".into(),
+                });
+            }
+            FenceTimeoutClass::PollError(error) => {
+                return Err(RendererError::vk(error, "get_fence_status (slot fence)"));
+            }
+        },
+        Err(error) => {
+            return Err(RendererError::vk(
+                error,
+                "wait_for_fences (slot fence timed out — a submission never completed; \
+                 presenting faster than the present mode drains?)",
+            ));
+        }
     }
 
     // Allocation can fail. Grow only the fenced slot, before acquire, so
@@ -1068,15 +1146,41 @@ fn guard_image_and_read_timestamps(
 ) -> Result<Option<f64>, RendererError> {
     if let Some(image_fence) = mut_at(&mut frames.images_in_flight, image_index as usize) {
         if *image_fence != vk::Fence::null() {
-            unsafe {
+            let waited = unsafe {
                 ctx.device
                     .wait_for_fences(&[*image_fence], true, WAIT_TIMEOUT_NS)
-                    .map_err(|error| {
-                        RendererError::vk(
-                            error,
-                            "wait image fence (timed out — a submission never completed)",
-                        )
-                    })?;
+            };
+            match waited {
+                Ok(()) => {}
+                // T06 §4.3: the same one-poll classification as the
+                // slot wait — a timeout is stuck only when the device
+                // says so, and a loss at the poll surfaces typed.
+                Err(vk::Result::TIMEOUT) => {
+                    let polled = unsafe { ctx.device.get_fence_status(*image_fence) };
+                    match classify_fence_timeout(polled) {
+                        FenceTimeoutClass::Signaled => {}
+                        FenceTimeoutClass::Stuck => {
+                            return Err(RendererError::StuckFence {
+                                site: "guard_image (the image's previous submission)",
+                            });
+                        }
+                        FenceTimeoutClass::DeviceLost => {
+                            return Err(RendererError::DeviceLost {
+                                operation: "get_fence_status (image fence, after wait timeout)"
+                                    .into(),
+                            });
+                        }
+                        FenceTimeoutClass::PollError(error) => {
+                            return Err(RendererError::vk(error, "get_fence_status (image fence)"));
+                        }
+                    }
+                }
+                Err(error) => {
+                    return Err(RendererError::vk(
+                        error,
+                        "wait image fence (timed out — a submission never completed)",
+                    ));
+                }
             }
         }
         // The per-image ownership STAGING (CA-10): the slot fence is
@@ -1144,22 +1248,34 @@ fn commit_slot_fence(
 /// release defines the disposition for each piece:
 ///
 /// **The acquired image + the acquire semaphore** — RETURNED
-/// together: the WSI-canonical release presents the image WAITING
-/// `image_available[slot]`, so the presentation is ordered against
-/// the acquire's implicit layout transition (the sync-validation
-/// WRITE_AFTER_READ the rig caught when an earlier draft presented
-/// with no waits) and the wait consumes the signal at the
-/// presentation — one operation returning the image to the pool and
-/// retiring the semaphore's signal. The content is whatever the
-/// image last held (the failed frame drew nothing into it — a
-/// visible one-frame staleness on an already-reported error path).
-/// An out-of-date refusal is the normal path's own deferred-
-/// recreation arm (latch the intent, probe next frame); because a
-/// REJECTED present may not have consumed the wait, the semaphore
-/// is then REPLACED (below) rather than trusted. A HARD present
-/// failure holds the image (the pool shrinks by one, fail-visible
-/// as the typed acquire timeout once failures exhaust it) and the
-/// semaphore is replaced the same way.
+/// together through the T06 §4.4 first-use disposition: a
+/// PREVIOUSLY-PRESENTED image (the presentation engine hands it
+/// back effectively in `PRESENT_SRC`) takes the WSI-canonical
+/// release — presenting it WAITING `image_available[slot]` (the
+/// sync-validation WRITE_AFTER_READ the rig caught when an earlier
+/// draft presented with no waits, the wait consuming the signal at
+/// the presentation — one operation returning the image to the pool
+/// and retiring the semaphore's signal; the content is whatever the
+/// image last held, a visible one-frame staleness on an
+/// already-reported error path). A NEVER-presented image (the first
+/// acquisition on a fresh swapchain, the frame failing before
+/// recording) is in its initial `UNDEFINED` layout, and presenting
+/// it in that state is the WSI premise the audit refuses to trust —
+/// that arm submits the MINIMAL `UNDEFINED → PRESENT_SRC_KHR`
+/// transition first (one barrier, no accesses, `TOP_OF_PIPE →
+/// BOTTOM_OF_PIPE`), the submit waiting `image_available[slot]` at
+/// `COLOR_ATTACHMENT_OUTPUT` and signaling the image's present
+/// semaphore, then presents waiting THAT semaphore: the release is
+/// layout-legal BY CONSTRUCTION, premise-independent (the rig's
+/// core validation remains the arbiter of the premise itself). An
+/// out-of-date refusal is the normal path's own deferred-recreation
+/// arm (latch the intent, probe next frame); because a REJECTED
+/// present may not have consumed its wait, the direct arm REPLACES
+/// the acquire semaphore (below) and the transition arm REPLACES
+/// the present semaphore (the transition submit already consumed
+/// the acquire wait). A HARD present failure holds the image (the
+/// pool shrinks by one, fail-visible as the typed acquire timeout
+/// once failures exhaust it) and replaces the same semaphore.
 ///
 /// **The slot fence** — healed when the fence-state discriminator
 /// (`get_fence_status`) finds it unsignaled: the fence is SIGNALED
@@ -1232,41 +1348,199 @@ fn dispose_failed_acquisition(
             *image_fence = vk::Fence::null();
         }
     }
-    // The image return + the acquire semaphore's consume: the
-    // WSI-canonical release present (see the doc above).
-    let present_wait_semaphores = [frames.image_available[slot]];
-    let present_swapchains = [swapchain.swapchain];
-    let present_image_indices = [image_index];
-    let present_info = vk::PresentInfoKHR::default()
-        .wait_semaphores(&present_wait_semaphores)
-        .swapchains(&present_swapchains)
-        .image_indices(&present_image_indices);
-    let semaphore_trusted = match unsafe {
-        ctx.swapchain_ext
-            .queue_present(ctx.graphics_queue, &present_info)
-    } {
-        Ok(suboptimal) => {
-            if suboptimal {
-                mark_suboptimal(&mut frames.needs_recreate);
+    // The image return + the acquire semaphore's consume. T06 §4.4 —
+    // THE FIRST-USE DISPOSITION: a previously-presented (or
+    // render-submitted) image is effectively in `PRESENT_SRC` when
+    // the presentation engine hands it back, and the WSI-canonical
+    // release presents it WAITING `image_available[slot]` (today's
+    // behavior, unchanged — the sync-validation WRITE_AFTER_READ the
+    // rig caught when an earlier draft presented with no waits, the
+    // wait consuming the signal at the presentation). A
+    // NEVER-presented image (the first acquisition on a fresh
+    // swapchain, the frame failing before recording) is in its
+    // initial `UNDEFINED` layout — presenting it in that state is
+    // the WSI premise the audit refuses to trust, so that arm
+    // submits the MINIMAL transition instead: one-barrier command
+    // buffer (`UNDEFINED → PRESENT_SRC_KHR`, `srcAccessMask = 0`,
+    // `dstAccessMask = 0` — the WSI-acquire idiom; general queue
+    // families in scope since the barrier's stages are
+    // `TOP_OF_PIPE → BOTTOM_OF_PIPE`), submitted waiting
+    // `image_available[slot]` at `COLOR_ATTACHMENT_OUTPUT` and
+    // signaling the image's present semaphore, then the present
+    // waits THAT semaphore. The transition submit carries no fence
+    // (the slot fence's heal is the separate empty-submit idiom
+    // below, and signaling an already-signaled fence is invalid) —
+    // the DRAIN PROOF below completes it before this function
+    // returns, so nothing pending survives the disposition.
+    let ever_presented = frames
+        .image_ever_presented
+        .get(image_index as usize)
+        .copied()
+        .unwrap_or(false);
+    // Which semaphore may hold an unconsumed signal when the
+    // release present was rejected or failed (the replacement arm
+    // below): the direct arm's acquire semaphore, the transition
+    // arm's present semaphore (the transition submit consumed the
+    // acquire wait itself).
+    let mut replace_present_semaphore = false;
+    let semaphore_trusted = if !first_use_release_needs_transition(ever_presented) {
+        // THE PREVIOUSLY-PRESENTED ARM — today's direct release.
+        let present_wait_semaphores = [frames.image_available[slot]];
+        let present_swapchains = [swapchain.swapchain];
+        let present_image_indices = [image_index];
+        let present_info = vk::PresentInfoKHR::default()
+            .wait_semaphores(&present_wait_semaphores)
+            .swapchains(&present_swapchains)
+            .image_indices(&present_image_indices);
+        match unsafe {
+            ctx.swapchain_ext
+                .queue_present(ctx.graphics_queue, &present_info)
+        } {
+            Ok(suboptimal) => {
+                if suboptimal {
+                    mark_suboptimal(&mut frames.needs_recreate);
+                }
+                // A processed present consumed the wait: the
+                // semaphore is trusted idle once the drain below
+                // completes. The image is now in the presentation
+                // engine's hands in PRESENT_SRC — the first-use
+                // tracking marks it.
+                if let Some(ever) = frames.image_ever_presented.get_mut(image_index as usize) {
+                    *ever = true;
+                }
+                true
             }
-            // A processed present consumed the wait: the semaphore
-            // is trusted idle once the drain below completes.
-            true
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                // The normal present path's own deferred arm: the
+                // presentation is gone, the recreation intent and the
+                // deferral hint latch. A rejected present may not have
+                // consumed the wait — the semaphore is replaced below.
+                mark_suboptimal(&mut frames.needs_recreate);
+                frames.surface_probe_pending = true;
+                false
+            }
+            Err(_present_error) => {
+                // The image stays held (pool shrinkage, fail-visible as
+                // the typed acquire timeout once failures exhaust it);
+                // the semaphore may hold its signal — replaced below.
+                false
+            }
         }
-        Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-            // The normal present path's own deferred arm: the
-            // presentation is gone, the recreation intent and the
-            // deferral hint latch. A rejected present may not have
-            // consumed the wait — the semaphore is replaced below.
-            mark_suboptimal(&mut frames.needs_recreate);
-            frames.surface_probe_pending = true;
-            false
+    } else {
+        // THE FIRST-USE ARM — the minimal transition submit, then
+        // the present waiting the PRESENT semaphore.
+        let present_semaphore = match frames.present_semaphore_for(ctx, image_index) {
+            Ok(semaphore) => semaphore,
+            Err(release_error) => {
+                return RendererError::FrameSlotUnrecoverable {
+                    source: Box::new(error),
+                    release: Box::new(release_error),
+                };
+            }
+        };
+        let command = frames.command_buffers[slot];
+        let image = swapchain.images[image_index as usize];
+        let transition = (|| unsafe {
+            ctx.device
+                .begin_command_buffer(
+                    command,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(|error| RendererError::vk(error, "release transition begin"))?;
+            // SAFETY: the command buffer is recording; the image is
+            // the acquired swapchain image (the reset at the top of
+            // this disposal discarded any partial recording — the
+            // frame's commands never executed, so the image's layout
+            // is its initial UNDEFINED); the barrier is the WSI
+            // first-use idiom (no accesses, top-of-pipe to
+            // bottom-of-pipe).
+            ctx.device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[vk::ImageMemoryBarrier::default()
+                    .image(image)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                    )
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::empty())
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)],
+            );
+            ctx.device
+                .end_command_buffer(command)
+                .map_err(|error| RendererError::vk(error, "release transition end"))?;
+            let wait_semaphores = [frames.image_available[slot]];
+            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let signal_semaphores = [present_semaphore];
+            let commands = [command];
+            let submits = [vk::SubmitInfo::default()
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&commands)
+                .signal_semaphores(&signal_semaphores)];
+            // SAFETY: the command buffer was just recorded and ended;
+            // no fence (the drain proof below completes the
+            // submission before this disposal returns).
+            ctx.device
+                .queue_submit(ctx.graphics_queue, &submits, vk::Fence::null())
+                .map_err(|error| RendererError::vk(error, "release transition submit"))
+        })();
+        if let Err(release_error) = transition {
+            return RendererError::FrameSlotUnrecoverable {
+                source: Box::new(error),
+                release: Box::new(release_error),
+            };
         }
-        Err(_present_error) => {
-            // The image stays held (pool shrinkage, fail-visible as
-            // the typed acquire timeout once failures exhaust it);
-            // the semaphore may hold its signal — replaced below.
-            false
+        // The transition submit consumed the acquire wait: the
+        // ACQUIRE semaphore is trusted (the drain below completes
+        // the submission). The present now waits the PRESENT
+        // semaphore the transition signaled.
+        let present_wait_semaphores = [present_semaphore];
+        let present_swapchains = [swapchain.swapchain];
+        let present_image_indices = [image_index];
+        let present_info = vk::PresentInfoKHR::default()
+            .wait_semaphores(&present_wait_semaphores)
+            .swapchains(&present_swapchains)
+            .image_indices(&present_image_indices);
+        match unsafe {
+            ctx.swapchain_ext
+                .queue_present(ctx.graphics_queue, &present_info)
+        } {
+            Ok(suboptimal) => {
+                if suboptimal {
+                    mark_suboptimal(&mut frames.needs_recreate);
+                }
+                if let Some(ever) = frames.image_ever_presented.get_mut(image_index as usize) {
+                    *ever = true;
+                }
+                true
+            }
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                mark_suboptimal(&mut frames.needs_recreate);
+                frames.surface_probe_pending = true;
+                // The acquire semaphore was consumed by the
+                // transition submit; the PRESENT semaphore may hold
+                // its signal (a rejected present may not have
+                // consumed the wait) — the replacement arm below
+                // replaces it.
+                replace_present_semaphore = true;
+                true
+            }
+            Err(_present_error) => {
+                replace_present_semaphore = true;
+                true
+            }
         }
     };
     // The fence heal (see the doc above): one empty submission
@@ -1324,6 +1598,42 @@ fn dispose_failed_acquisition(
             }
         };
         frames.image_available[slot] = fresh;
+    }
+    if replace_present_semaphore {
+        // T06 §4.4 (the first-use arm's rejected-present shape): the
+        // transition submit consumed the acquire wait, but the
+        // PRESENT semaphore it signaled may hold an unconsumed
+        // signal (the rejected present may not have waited it) — a
+        // future submission signaling it again would signal an
+        // already-signaled binary semaphore. REPLACE it under the
+        // same drain proof (no queued operation refers to it), and
+        // do NOT mark the image ever-presented (the presentation was
+        // rejected — the image's layout is the transition's
+        // PRESENT_SRC, tracked at the successful arms only).
+        if let Some(&stale) = frames.present_semaphores.get(image_index as usize)
+            && stale != vk::Semaphore::null()
+        {
+            unsafe {
+                ctx.device.destroy_semaphore(stale, None);
+            }
+        }
+        let fresh = match unsafe {
+            ctx.device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+        }
+        .map_err(|error| RendererError::vk(error, "release (present semaphore replacement)"))
+        {
+            Ok(fresh) => fresh,
+            Err(release_error) => {
+                return RendererError::FrameSlotUnrecoverable {
+                    source: Box::new(error),
+                    release: Box::new(release_error),
+                };
+            }
+        };
+        if (image_index as usize) < frames.present_semaphores.len() {
+            frames.present_semaphores[image_index as usize] = fresh;
+        }
     }
     error
 }
@@ -1446,8 +1756,20 @@ fn upload_frame_data(
         // always writes and resets the stamp, so an opted-in
         // generation can never skip against a slot holding some
         // other caller's bytes.
-        if generation_write_needed(
+        // T02 §2.3: the EXTENDED gate — the carve's allocation epoch
+        // beside the generation. A REPLACED carve (a growth commit
+        // or a pipeline replacement published a fresh epoch) can
+        // never inherit a surviving stamp, so the interrupted-growth
+        // hazard the audit sketched (growth commits, then a
+        // downstream failure swallows the delta clear, then a retry
+        // at the surviving generation) rewrites through the epoch
+        // mismatch — the correctness bearer; the frame flow's
+        // growth-delta clear below is the belt.
+        let instance_carve_epoch = proxy_state.allocation_epoch();
+        if population_write_needed(
+            frames.population_stamps.instance_epochs[slot],
             frames.population_stamps.instance[slot],
+            instance_carve_epoch,
             upload.instance_generation,
         ) {
             // CA-12 (F12): the admitted-counts-vs-physical-carve check
@@ -1465,6 +1787,7 @@ fn upload_frame_data(
             )?;
             unsafe { proxy_state.write_slot(slot, upload.bytes) };
             frames.population_stamps.instance[slot] = upload.instance_generation;
+            frames.population_stamps.instance_epochs[slot] = instance_carve_epoch;
         } else {
             outcome.population_writes_skipped += 1;
         }
@@ -1484,8 +1807,12 @@ fn upload_frame_data(
             && matches!(upload.mode, crate::ProxyDrawMode::Indirect)
         {
             let submitted_counts = [upload.npc_count, upload.vehicle_count, upload.rain_count];
-            if generation_write_needed(
+            // T02: the indirect block rides the INSTANCE carve's
+            // epoch (its buffer is published only beside that carve).
+            if population_write_needed(
+                frames.population_stamps.indirect_epochs[slot],
                 frames.population_stamps.indirect[slot],
+                instance_carve_epoch,
                 upload.instance_generation,
             ) || frames.population_stamps.indirect_counts[slot] != submitted_counts
             {
@@ -1498,6 +1825,7 @@ fn upload_frame_data(
                     )
                 };
                 frames.population_stamps.indirect[slot] = upload.instance_generation;
+                frames.population_stamps.indirect_epochs[slot] = instance_carve_epoch;
                 frames.population_stamps.indirect_counts[slot] = submitted_counts;
             } else {
                 outcome.population_writes_skipped += 1;
@@ -1516,8 +1844,17 @@ fn upload_frame_data(
             outcome.pose_supplied = (upload.pose_bytes.len() / crate::animation::POSE_STRIDE)
                 .min(u32::MAX as usize) as u32;
             outcome.pose_capacity = retained.blocks_capacity();
-            if generation_write_needed(frames.population_stamps.pose[slot], upload.pose_generation)
-            {
+            // T02 §2.3: the pose carve's epoch beside the pose
+            // generation — the same extended gate (the pose carve's
+            // growth commits mint fresh epochs; the retained state
+            // survives pipeline replacements, which do NOT re-mint).
+            let pose_carve_epoch = retained.allocation_epoch();
+            if population_write_needed(
+                frames.population_stamps.pose_epochs[slot],
+                frames.population_stamps.pose[slot],
+                pose_carve_epoch,
+                upload.pose_generation,
+            ) {
                 // CA-12 (F12): the same admitted-vs-carve backstop on the
                 // pose path (the instance check's own discipline — the
                 // pre-fix `debug_assert` alone gated this write in
@@ -1529,6 +1866,7 @@ fn upload_frame_data(
                 )?;
                 unsafe { retained.write_slot(slot, upload.pose_bytes) };
                 frames.population_stamps.pose[slot] = upload.pose_generation;
+                frames.population_stamps.pose_epochs[slot] = pose_carve_epoch;
             } else {
                 outcome.population_writes_skipped += 1;
             }
@@ -2153,6 +2491,17 @@ fn submit_command_buffer(
             .queue_submit(ctx.graphics_queue, &[submit_info], frames.in_flight[slot])
             .map_err(|error| RendererError::vk(error, "queue_submit"))?;
     }
+    // T06 §4.4: a COMPLETED render submission leaves the acquired
+    // image in `PRESENT_SRC` (the render pass's final layout) — the
+    // first-use tracking marks it, so a later failed frame's
+    // release-present takes the previously-presented arm (the
+    // direct release idiom) rather than the transition submit.
+    if let Some(ever) = frames
+        .image_ever_presented
+        .get_mut(frames.image_index as usize)
+    {
+        *ever = true;
+    }
     if frames.timestamps_supported {
         frames.timestamps_written[slot] = true;
     }
@@ -2187,6 +2536,13 @@ fn present_image(
     } {
         Ok(present_suboptimal) => {
             outcome.presented = true;
+            // T06 §4.4: a successful present hands the image to the
+            // presentation engine in `PRESENT_SRC` — the first-use
+            // tracking marks it (a later release-present of this
+            // image is the previously-presented arm).
+            if let Some(ever) = frames.image_ever_presented.get_mut(image_index as usize) {
+                *ever = true;
+            }
             if present_suboptimal || outcome.suboptimal {
                 outcome.suboptimal = true;
                 mark_suboptimal(&mut frames.needs_recreate);
@@ -2246,6 +2602,19 @@ pub(crate) fn timestamp_sample_ready(supported: bool, written: bool) -> bool {
     supported && written
 }
 
+/// T06 (strict audit IV, §4.4): the release-present's ARM SELECTION —
+/// the previously-presented arm keeps the direct release (the
+/// WSI-canonical idiom); a NEVER-presented image (never presented and
+/// never render-submitted — initial layout `UNDEFINED`) takes the
+/// minimal transition submit, making the release layout-legal BY
+/// CONSTRUCTION. Pure — the arm-selection half only; the WSI premise
+/// itself (whether a direct present of an UNDEFINED image would be
+/// accepted) is the rig's core-validation question, deliberately NOT
+/// relied upon.
+pub(crate) fn first_use_release_needs_transition(ever_presented: bool) -> bool {
+    !ever_presented
+}
+
 /// Presentation-wait semaphore table growth (corrective finding C): the
 /// table only ever grows to cover the required length — entries are never
 /// invalidated, because recreation idles the device first.
@@ -2256,6 +2625,7 @@ pub(crate) fn present_semaphore_len_for(current_len: usize, required: usize) -> 
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+    use crate::proxy_instances::generation_write_needed;
 
     /// THE A04 ZERO-COST STATEMENT (design §3.4, the type-level
     /// half): the collapsed parameter set is plain stack data —
@@ -2273,6 +2643,23 @@ mod policy_tests {
         assert_copy::<InternalFrame<'static>>();
         assert_copy::<FramePlan>();
         assert_copy::<FrameOutcome>();
+    }
+
+    /// T06 §4.4: the first-use arm selection — a never-presented
+    /// image takes the transition submit; a presented or
+    /// render-submitted image (either marks it) keeps the direct
+    /// release. The WSI premise itself is rig territory (the design's
+    /// honest limit); the arm SELECTION is this pure half.
+    #[test]
+    fn the_first_use_release_selects_the_transition_only_for_never_presented_images() {
+        assert!(
+            first_use_release_needs_transition(false),
+            "a never-presented image (initial UNDEFINED) takes the transition submit"
+        );
+        assert!(
+            !first_use_release_needs_transition(true),
+            "a presented or render-submitted image (PRESENT_SRC) keeps the direct release"
+        );
     }
 
     #[test]
@@ -2406,6 +2793,16 @@ mod policy_tests {
         let mut slot_instances = vec![Vec::<u8>::new(); slots];
         let mut slot_poses = vec![Vec::<u8>::new(); slots];
         let mut slot_indirect = vec![Vec::<u8>::new(); slots];
+        // T02 §2.3: the modeled carve epochs (the minted identities
+        // the extended gate compares). The growth events below
+        // replace a carve WITHOUT any stamp clear — the belt-missing
+        // shape the audit's delayed-invalidation finding sketched —
+        // so the ORACLE equality holds only if the epoch alone
+        // forces the rewrite (the red witness of the bare-generation
+        // gate: it would skip and keep the replaced carve's
+        // uninitialized bytes).
+        let mut instance_carve_epoch = 1_u64;
+        let mut pose_carve_epoch = 1_u64;
         // The oracle side: always-write (generation 0, fresh records,
         // every region copied every frame).
         let mut oracle_bytes = Vec::new();
@@ -2449,6 +2846,17 @@ mod policy_tests {
             } else {
                 (instance_generation, pose_generation)
             };
+            // T02: the modeled carve replacements — growth commits
+            // (or pipeline replacements) publishing FRESH epochs with
+            // no content copy and NO stamp clear (the belt's absence
+            // isolates the epoch gate: the oracle below still must
+            // match).
+            if frame % 17 == 5 {
+                instance_carve_epoch += 1;
+            }
+            if frame % 13 == 9 {
+                pose_carve_epoch += 1;
+            }
             // ---- The gated path (both levels) ----
             let instance_decision = repack_populations_generation(
                 &mut gated_bytes,
@@ -2484,26 +2892,44 @@ mod policy_tests {
             if pose_decision == crate::proxy_instances::GenerationDecision::Repacked {
                 stamps.clear_pose();
             }
-            if generation_write_needed(stamps.instance[slot], declared_instance) {
+            if population_write_needed(
+                stamps.instance_epochs[slot],
+                stamps.instance[slot],
+                instance_carve_epoch,
+                declared_instance,
+            ) {
                 slot_instances[slot].clear();
                 slot_instances[slot].extend_from_slice(&gated_bytes);
                 stamps.instance[slot] = declared_instance;
+                stamps.instance_epochs[slot] = instance_carve_epoch;
                 wrote += 1;
             } else {
                 skipped += 1;
             }
             let indirect_block = pack_indirect_block(396, 2, 552, 0, 6, 0);
-            if generation_write_needed(stamps.indirect[slot], declared_instance) {
+            if population_write_needed(
+                stamps.indirect_epochs[slot],
+                stamps.indirect[slot],
+                instance_carve_epoch,
+                declared_instance,
+            ) {
                 slot_indirect[slot] = indirect_block.to_vec();
                 stamps.indirect[slot] = declared_instance;
+                stamps.indirect_epochs[slot] = instance_carve_epoch;
                 wrote += 1;
             } else {
                 skipped += 1;
             }
-            if generation_write_needed(stamps.pose[slot], declared_pose) {
+            if population_write_needed(
+                stamps.pose_epochs[slot],
+                stamps.pose[slot],
+                pose_carve_epoch,
+                declared_pose,
+            ) {
                 slot_poses[slot].clear();
                 slot_poses[slot].extend_from_slice(&gated_poses);
                 stamps.pose[slot] = declared_pose;
+                stamps.pose_epochs[slot] = pose_carve_epoch;
                 wrote += 1;
             } else {
                 skipped += 1;
@@ -2566,10 +2992,143 @@ mod policy_tests {
         // itself: no further write is needed on either slot.
         for slot in 0..slots {
             assert!(
-                !generation_write_needed(stamps.instance[slot], instance_generation)
-                    || stamps.instance[slot] == 0,
-                "slot {slot}: a stable population needs no further instance write"
+                !population_write_needed(
+                    stamps.instance_epochs[slot],
+                    stamps.instance[slot],
+                    instance_carve_epoch,
+                    instance_generation
+                ) || stamps.instance[slot] == 0,
+                "slot {slot}: a stable population on a stable carve needs no further write"
             );
+        }
+    }
+
+    /// T02 (strict audit IV, §2.3) — THE EPOCH GATE'S DECISION TABLE,
+    /// isolated (the resource window alone, no repack clear, no
+    /// growth-delta belt): a REPLACED carve (a fresh minted epoch)
+    /// rewrites at EVERY generation — even the surviving one —
+    /// because the bytes vouched for the OLD identity; the unknown
+    /// stamp (epoch 0, never minted) writes; the stable
+    /// epoch+generation pair skips (the R2 reuse preserved exactly);
+    /// the generation-0 always-dirty rule is unchanged. This is the
+    /// CPU half of the interrupted-growth witness (the rig leg
+    /// drives the end-to-end property; the epoch arm is isolated
+    /// HERE because on a live head the T05 clears fire beside it).
+    #[test]
+    fn the_epoch_gate_decision_table_pins_the_resource_window() {
+        use crate::proxy_instances::population_write_needed;
+        // The stable pair skips (the R2 win, unchanged).
+        assert!(!population_write_needed(1, 7, 1, 7));
+        // A generation change at the same epoch writes.
+        assert!(population_write_needed(1, 7, 1, 8));
+        // Generation 0 is always-dirty.
+        assert!(population_write_needed(1, 7, 1, 0));
+        // THE EPOCH ARM: the carve was replaced (a fresh minted
+        // epoch) — the rewrite fires at EVERY generation, including
+        // the one the stamp already records (the delayed-
+        // invalidation hazard's exact shape: the growth committed,
+        // the frame failed before the delta clear, the retry
+        // presents the surviving generation).
+        assert!(population_write_needed(1, 7, 2, 7));
+        assert!(
+            population_write_needed(1, 0, 2, 0),
+            "generation 0 stays always-dirty"
+        );
+        assert!(population_write_needed(1, 7, 2, 8));
+        // The unknown stamp (epoch 0 — the initial state and what
+        // every clear resets to) can never equal a minted epoch
+        // (they start at 1): a fresh carve never inherits a stamp.
+        assert!(population_write_needed(0, 7, 1, 7));
+        assert!(population_write_needed(0, 0, 1, 0));
+        // A stamp written into an OLDER epoch of the SAME carve
+        // identity cannot occur (epochs are minted per publication);
+        // the table's symmetry is checked anyway — any mismatch
+        // writes.
+        assert!(population_write_needed(2, 7, 1, 7));
+    }
+
+    /// T02 §2.3 — THE BELT-MISSING WITNESS, slot-level: both slots
+    /// stamped at (epoch E, generation g); the carve's growth commit
+    /// publishes epoch E+1 with NO stamp clear (the frame flow's
+    /// delta-clear belt absent — the interrupted-growth shape); the
+    /// extended gate rewrites BOTH slots at the SAME generation g
+    /// (the bare-generation gate — the pre-fix rule — returns FALSE
+    /// and would keep vouching the replaced carve's uninitialized
+    /// bytes: the RED witness, constructible at the audit's SHA
+    /// where no T05 clear fired either). After the rewrite the
+    /// stable skip returns (the R2 win preserved).
+    #[test]
+    fn an_epoch_bump_rewrites_both_slots_without_any_clear() {
+        use crate::proxy_instances::{generation_write_needed, population_write_needed};
+        let slots = FRAMES_IN_FLIGHT as usize;
+        let mut stamps = PopulationStamps {
+            instance: [5; FRAMES_IN_FLIGHT as usize],
+            indirect: [5; FRAMES_IN_FLIGHT as usize],
+            pose: [5; FRAMES_IN_FLIGHT as usize],
+            instance_epochs: [1; FRAMES_IN_FLIGHT as usize],
+            indirect_epochs: [1; FRAMES_IN_FLIGHT as usize],
+            pose_epochs: [1; FRAMES_IN_FLIGHT as usize],
+            ..Default::default()
+        };
+        // The stable pair skips under BOTH gates (the pre-fix
+        // behavior at a stable carve).
+        for slot in 0..slots {
+            assert!(!generation_write_needed(stamps.instance[slot], 5));
+            assert!(!population_write_needed(
+                stamps.instance_epochs[slot],
+                stamps.instance[slot],
+                1,
+                5
+            ));
+        }
+        // THE CARVE REPLACEMENT (the growth commit's fresh epoch),
+        // with NO clear of any kind:
+        let replaced_epoch = 2;
+        for slot in 0..slots {
+            // The RED half: the bare-generation gate alone returns
+            // FALSE (it cannot see the carve's identity).
+            assert!(
+                !generation_write_needed(stamps.instance[slot], 5),
+                "the bare gate is exactly the delayed-invariant hazard"
+            );
+            // The GREEN half: the extended gate forces the rewrite.
+            assert!(
+                population_write_needed(
+                    stamps.instance_epochs[slot],
+                    stamps.instance[slot],
+                    replaced_epoch,
+                    5
+                ),
+                "slot {slot}: a replaced carve rewrites at the surviving generation"
+            );
+            // The write records the NEW epoch beside the generation.
+            stamps.instance_epochs[slot] = replaced_epoch;
+        }
+        // The stable skip returns on the new carve (the R2 win).
+        for slot in 0..slots {
+            assert!(!population_write_needed(
+                stamps.instance_epochs[slot],
+                stamps.instance[slot],
+                replaced_epoch,
+                5
+            ));
+        }
+        // T05's clears still reset the epoch halves (the identity
+        // window composing with the resource window).
+        stamps.clear_instance();
+        for slot in 0..slots {
+            assert_eq!(stamps.instance_epochs[slot], 0);
+            assert_eq!(stamps.indirect_epochs[slot], 0);
+            assert!(population_write_needed(
+                stamps.instance_epochs[slot],
+                stamps.instance[slot],
+                replaced_epoch,
+                5
+            ));
+        }
+        stamps.clear_pose();
+        for slot in 0..slots {
+            assert_eq!(stamps.pose_epochs[slot], 0);
         }
     }
 

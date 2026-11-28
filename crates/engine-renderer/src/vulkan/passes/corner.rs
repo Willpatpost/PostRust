@@ -7,7 +7,7 @@
 //! The name keeps its history (the corner was the first — and so
 //! far only — attached scene); the CONTENT is caller data now.
 use super::descriptors::create_sets_sized;
-use super::staging::FlushMode;
+use super::staging::{FlushDisposition, FlushMode, UploadTicket};
 use super::{
     RendererError, SamplerPool, Texture, VulkanContext, create_device_local_buffer_staged,
     create_device_local_buffer_with_data, create_mapped_buffer, shader_layout_pins,
@@ -115,20 +115,32 @@ impl CornerResources {
     /// first; a refusal here never happens for a validated
     /// description, and a construction failure releases exactly
     /// what exists). Partial-failure safe, as ever.
-    pub fn new(ctx: &VulkanContext, description: &SceneDescription) -> Result<Self, RendererError> {
+    ///
+    /// T03 (the transaction): returns the build's DEFERRED batch's
+    /// [`UploadTicket`] too — the identity the attach transaction
+    /// tracks until the drain proves readiness (`None` on the
+    /// pool-unavailable fallback arm, whose per-object uploads
+    /// complete inline).
+    pub fn new(
+        ctx: &VulkanContext,
+        description: &SceneDescription,
+    ) -> Result<(Self, Option<UploadTicket>), RendererError> {
         let mut state = Self::default();
-        if let Err(e) = state.build(ctx, description) {
-            state.destroy(ctx);
-            return Err(e);
-        }
-        Ok(state)
+        let ticket = match state.build(ctx, description) {
+            Ok(ticket) => ticket,
+            Err(e) => {
+                state.destroy(ctx);
+                return Err(e);
+            }
+        };
+        Ok((state, ticket))
     }
 
     fn build(
         &mut self,
         ctx: &VulkanContext,
         description: &SceneDescription,
-    ) -> Result<(), RendererError> {
+    ) -> Result<Option<UploadTicket>, RendererError> {
         let materials = &description.materials;
         self.materials = materials.clone();
         // CA-14/CA-15: the TYPED admission — the same whole
@@ -152,7 +164,11 @@ impl CornerResources {
         // shader compilation), with the wait landing at the attach's
         // drain, before any first use. `None` (the pool unavailable
         // on this device) keeps the retained per-object path.
-        let mut staging_batch = ctx.begin_staging_batch();
+        // T16 §5.1: the typed begin — `Ok(None)` is the per-object
+        // fallback (the sticky unsupported-memory arm, or a TRANSIENT
+        // pressure failure that retries the backing next call); a
+        // device error at the pool propagates (never masked).
+        let mut staging_batch = ctx.begin_staging_batch()?;
         let mesh_bytes = bytemuck::cast_slice(&description.mesh.vertices);
         (self.vertices, self.vertex_memory) = match &mut staging_batch {
             Some(batch) => create_device_local_buffer_staged(
@@ -300,10 +316,23 @@ impl CornerResources {
         // (an abort reclaims the regions, nothing submitted), and
         // from here the submission overlaps the caller's
         // pipeline-group build until the attach's drain waits it.
+        // T16/T03: the flush's TYPED disposition — the Deferred
+        // success carries the batch's [`UploadTicket`] (the identity
+        // the attach transaction tracks to readiness), and a
+        // `NotSubmitted` failure (nothing pending — the submit
+        // failed) propagates as before.
+        let mut ticket = None;
         if let Some(batch) = staging_batch.as_mut() {
-            batch.flush(FlushMode::Deferred)?;
+            match batch.flush(FlushMode::Deferred) {
+                FlushDisposition::Completed => {}
+                FlushDisposition::Deferred { ticket: flushed } => ticket = Some(flushed),
+                FlushDisposition::NotSubmitted(error) => return Err(error),
+                // Structurally impossible in Deferred mode (no wait
+                // runs); defended anyway — propagate, never swallow.
+                FlushDisposition::SubmittedUnwaited { error, .. } => return Err(error),
+            }
         }
-        Ok(())
+        Ok(ticket)
     }
 
     pub fn texture_bytes(&self) -> u64 {

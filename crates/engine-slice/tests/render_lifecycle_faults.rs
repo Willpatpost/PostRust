@@ -721,3 +721,606 @@ fn device_loss_is_typed_and_latched() {
     drop(app);
     println!("CA-13 device loss: typed at the boundary, latched across every entry");
 }
+
+/// T16/L2 (the staging typing's rig leg — the design's §6 L2 row:
+/// "the fault battery on a live queue (never-signaling fence, poll-
+/// error arms)"): the CLASSIFIED ordered-prefix poll on a real queue
+/// — a never-signaling fence (the `StagingFenceNeverSignals` seam,
+/// one-shot) stuck at the in-flight HEAD keeps its region bound
+/// (R3's in-flight safety, re-proven under the classified poll: the
+/// old `Vec<bool>` + `.is_ok()` masking collected every fence's
+/// status and treated every ERROR as unsignaled; the new poll
+/// classifies each status and STOPS at the first pending entry),
+/// and a RETRY batch behind the stuck head stages and completes
+/// cleanly without retiring past it — the prefix property on a live
+/// queue. The drain's typed staging-timeout shape is preserved
+/// (§5.4: unchanged), and the teardown's CLASSIFIED idle (§5.4)
+/// releases the stuck entries (the drop completes — the audit's
+/// "don't assert device_idle succeeded when result was ignored"
+/// answered with the classification). The poll-ERROR arms (a loss
+/// at the poll) are owner-validation territory per the design's
+/// §7.2 — pinned by the CPU classification tables until a real loss
+/// is observed on the rig.
+#[test]
+#[ignore = "requires a real Vulkan device and windows (the rig run: release, serial, archived per E-8)"]
+fn classified_ordered_prefix_poll_keeps_the_stuck_head_bound() {
+    let _guard = sdl_lock();
+    let (mut app, mut renderer) = lifecycle_renderer("T16 L2 classified prefix poll");
+    let _ = app.frame();
+    // THE STUCK HEAD: the attach's deferred batch flushes with NO
+    // fence signal (the seam's structurally real never-signaling
+    // fence), so the attach's batch-end drain times out.
+    renderer.inject_lifecycle_fault(LifecycleFaultSite::StagingFenceNeverSignals, 1);
+    match attach_corner_scene(&mut renderer) {
+        Err(engine_renderer::RendererError::Vulkan(message)) => assert!(
+            message.contains("staging drain"),
+            "the typed drain timeout, preserved (§5.4): {message}"
+        ),
+        other => panic!("the never-signaling fence fails the attach's drain, got {other:?}"),
+    }
+    let stuck = renderer.allocations();
+    assert_eq!(
+        stuck.upload_submits, 2,
+        "the batch WAS submitted (the census counts it; the atlas batch retired)"
+    );
+    assert!(
+        stuck.staging_bound_region_bytes > 0,
+        "the never-signaling region stays bound under the classified poll"
+    );
+    // THE RETRY BEHIND THE STUCK HEAD: the seam is one-shot (the
+    // retry's flush carries a real fence), so the retry's batch
+    // stages at fresh offsets past the stuck region, its fence
+    // SIGNALS — and the ordered prefix still refuses to retire past
+    // the stuck head (the prefix property; the bound bytes now cover
+    // both regions). The retry's own drain times out on the head, so
+    // the attach fails again — the pool state, not a masking
+    // regression, is the witness.
+    match attach_corner_scene(&mut renderer) {
+        Err(engine_renderer::RendererError::Vulkan(message)) => assert!(
+            message.contains("staging drain"),
+            "the retry's drain still waits the stuck HEAD first: {message}"
+        ),
+        other => panic!("the retry fails at the stuck head's drain, got {other:?}"),
+    }
+    let after_retry = renderer.allocations();
+    assert_eq!(
+        after_retry.upload_submits,
+        stuck.upload_submits + 1,
+        "the retry's batch submitted once more (its own fence is real)"
+    );
+    assert!(
+        after_retry.staging_bound_region_bytes > stuck.staging_bound_region_bytes,
+        "the retry's region joins the bound set behind the stuck head \
+         (bound {} -> {} — the prefix never retires past a pending entry)",
+        stuck.staging_bound_region_bytes,
+        after_retry.staging_bound_region_bytes
+    );
+    let stats = renderer.stats();
+    assert_eq!(stats.validation_errors, 0, "{:?}", stats.recent_validation);
+    // THE §5.4 TEARDOWN: the classified idle makes the stuck entries'
+    // release legal — the drop completes (a wedged teardown fails
+    // right here).
+    drop(renderer);
+    drop(app);
+    println!(
+        "T16 L2: the classified prefix keeps the stuck head bound ({} bytes), the retry \
+         stages behind it, the teardown releases",
+        after_retry.staging_bound_region_bytes
+    );
+}
+
+/// T03/L3 (the transaction's rig leg — the design's §6 L3 row: "the
+/// new `StagingDrainTimeout` witness: attach fails, `scene()` is
+/// `None`, submit with scene refuses typed, retry succeeds on a
+/// healthy device"): the commit-on-readiness order. The knob fires
+/// at the attach's drain — AFTER the deferred batch submitted, WITH
+/// the pipeline group committed — the exact state the pre-fix order
+/// published first (the scene went live behind the `Err`; the CA-01
+/// rollback could not reach it). The transaction instead
+/// QUARANTINES the staged resources under their ticket: no handle
+/// published (`scene()` is `None`), a scene-backed submit refuses
+/// typed, and the RETRY on the healthy device reconciles the
+/// ticket (the fence signaled in the meantime — the T16 typed poll
+/// reports completed), releases the quarantine (the pipeline group
+/// first, then the resources — the census pair equal), and the
+/// attach succeeds and renders validation-clean.
+#[test]
+#[ignore = "requires a real Vulkan device and windows (the rig run: release, serial, archived per E-8)"]
+fn staging_drain_timeout_quarantines_and_the_retry_succeeds() {
+    let _guard = sdl_lock();
+    let (mut app, mut renderer) = lifecycle_renderer("T03 L3 drain timeout transaction");
+    let _ = app.frame();
+    let size = app.window().size_in_pixels();
+    let matrix = lifecycle_matrix(size);
+    // THE FAILED ATTACH: the drain's one-shot timeout, with the
+    // batch already submitted under its ticket.
+    renderer.inject_lifecycle_fault(LifecycleFaultSite::StagingDrainTimeout, 1);
+    match attach_corner_scene(&mut renderer) {
+        Err(engine_renderer::RendererError::InjectedFault(message)) => assert!(
+            message.contains("StagingDrainTimeout"),
+            "the drivable drain timeout: {message}"
+        ),
+        other => panic!("the transaction fails at the drain, got {other:?}"),
+    }
+    // THE PUBLISH-ORDER FIX (the red witness of the pre-fix tree,
+    // which published the scene BEFORE the drain): no handle.
+    assert!(
+        renderer.scene().is_none(),
+        "the drain-failed attach published no handle — the transaction \
+         quarantined instead"
+    );
+    // A scene-backed submit refuses typed (the layers-only shape
+    // still renders — the renderer is usable, outcome (b)).
+    let refused = renderer.submit_frame(corner_submission(
+        &matrix,
+        [0.0, 1.7, 15.0],
+        day_preset(),
+        None,
+        corner_bounds(),
+        None,
+        None,
+        false,
+        None,
+        size,
+    ));
+    match refused {
+        Err(engine_renderer::RendererError::Vulkan(message)) => assert!(
+            message.contains("requires an attached scene"),
+            "the scene-less refusal is typed: {message}"
+        ),
+        other => panic!("the scene-backed submit refuses typed, got {other:?}"),
+    }
+    // The quarantined first attach's census: its group committed
+    // (creations counted, nothing staged-released yet — the
+    // quarantine retains it).
+    let after_failure = renderer.allocations();
+    assert_eq!(
+        after_failure.corner_pipeline_objects, 5,
+        "the first attach's group committed (five objects created)"
+    );
+    assert_eq!(
+        after_failure.corner_pipeline_object_frees, 0,
+        "nothing staged-released yet — the quarantine retains the group"
+    );
+    // THE RETRY (the reconciliation): the knob is one-shot and the
+    // device healthy, so the ticket's fence signaled — the probe
+    // reports completed, the quarantine releases (the group first:
+    // its five objects staged-released), and the SAME description
+    // attaches cleanly on the SAME renderer.
+    let handle = attach_corner_scene(&mut renderer)
+        .unwrap_or_else(|error| panic!("the retry attach must succeed: {error:?}"));
+    assert!(renderer.scene().is_some(), "the handle is live");
+    assert_eq!(
+        handle.material_count as usize,
+        engine_renderer::lit_scene::materials().len(),
+        "the retried attach's handle"
+    );
+    let allocations = renderer.allocations();
+    assert_eq!(
+        allocations.corner_pipeline_object_frees, 5,
+        "the reconciliation released the FIRST group's five objects \
+         (the quarantined resources' dependent pipelines die before the \
+         resources themselves)"
+    );
+    assert_eq!(
+        allocations.corner_pipeline_objects - allocations.corner_pipeline_object_frees,
+        5,
+        "exactly the SECOND group's five objects remain live (committed, \
+         released at end of life outside the census pair)"
+    );
+    // The retried renderer RENDERS: three scene-backed frames (past
+    // both frame slots), validation-clean — the rebuilt group is
+    // complete.
+    for _ in 0..3 {
+        let outcome = submit_plain_scene_frame(&mut renderer, &matrix, size);
+        assert!(outcome.presented, "the retried frame presents");
+    }
+    let stats = renderer.stats();
+    assert_eq!(stats.validation_errors, 0, "{:?}", stats.recent_validation);
+    drop(renderer);
+    drop(app);
+    println!("T03 L3: drain timeout → quarantined (no handle), retry reconciled and attached");
+}
+
+/// T03/L3 (the transaction's NEVER-SIGNALING leg — the design's
+/// rig-deferred row: "`StagingFenceNeverSignals` during attach →
+/// scene never published, quarantine survives, teardown releases"):
+/// the stuck-fence quarantine. The deferred batch's fence never
+/// signals, so the attach's drain times out with the batch IN
+/// FLIGHT — the transaction quarantines (a timeout is not
+/// completion: the in-flight destinations are never destroyed), the
+/// handle is never published, and the RETRY refuses typed at the
+/// reconciliation (the ticket is still pending — outcome (b)'s
+/// retry-supported contract, refused while the upload is genuinely
+/// stuck). The teardown then releases the quarantined resources
+/// under the classified idle's legality proof (the drop completes).
+#[test]
+#[ignore = "requires a real Vulkan device and windows (the rig run: release, serial, archived per E-8)"]
+fn never_signaling_attach_quarantine_survives_and_teardown_releases() {
+    let _guard = sdl_lock();
+    let (mut app, mut renderer) = lifecycle_renderer("T03 L3 never-signaling quarantine");
+    let _ = app.frame();
+    renderer.inject_lifecycle_fault(LifecycleFaultSite::StagingFenceNeverSignals, 1);
+    match attach_corner_scene(&mut renderer) {
+        Err(engine_renderer::RendererError::Vulkan(message)) => assert!(
+            message.contains("staging drain"),
+            "the stuck-fence drain timeout: {message}"
+        ),
+        other => panic!("the never-signaling fence fails the attach's drain, got {other:?}"),
+    }
+    assert!(
+        renderer.scene().is_none(),
+        "the stuck-drain attach published no handle"
+    );
+    // The quarantine survives: the retry REFUSES typed at the
+    // reconciliation (the ticket is still in flight — never
+    // destroyed, never published).
+    match attach_corner_scene(&mut renderer) {
+        Err(engine_renderer::RendererError::Vulkan(message)) => assert!(
+            message.contains("still in flight"),
+            "the reconciliation refuses while the ticket is pending: {message}"
+        ),
+        other => panic!("the retry refuses at the pending quarantine, got {other:?}"),
+    }
+    // The stuck batch's region stays bound (the honest state) and
+    // the quarantined resources survive with it (never destroyed on
+    // the quarantine arm — the in-flight-destination rule at scene
+    // scale).
+    let allocations = renderer.allocations();
+    assert!(
+        allocations.staging_bound_region_bytes > 0,
+        "the never-signaling region stays bound (the quarantine's \
+         resources survive with it)"
+    );
+    let stats = renderer.stats();
+    assert_eq!(stats.validation_errors, 0, "{:?}", stats.recent_validation);
+    // THE TEARDOWN: the classified idle makes the quarantined
+    // resources' and the stuck entries' release legal — the drop
+    // completes (a wedged teardown fails right here).
+    drop(renderer);
+    drop(app);
+    println!(
+        "T03 L3: the never-signaling quarantine survives the retry refusal, teardown releases"
+    );
+}
+
+/// T02/L4 (the epoch gate's rig leg — the design's §6 L4 row: "the
+/// interrupted-growth red/green pair (fault-arm the ladder after a
+/// growth, retry, `population_writes_skipped == 0`)"): the
+/// end-to-end interrupted-growth property, driven with the design's
+/// own arm — `PoseGrowthIdle` on a frame whose demand grows the
+/// INSTANCE carve first (the ladder's order: region → instance →
+/// pose): the instance growth COMMITS (a fresh carve epoch
+/// published), then the pose growth's idle window fails the frame —
+/// the audit's primary arm, and exactly the shape whose delta-clear
+/// belt a downstream failure swallows. The RETRY then grows the pose
+/// carve (its own fresh epoch) and re-submits the population:
+/// `population_writes_skipped` must be FROZEN across the retry
+/// frames — every slot's region rewrites through the epoch
+/// mismatches (and on a live head the T05 repack clear beside them —
+/// the identity and resource windows composing), never a stale skip
+/// against the replaced carves' uninitialized bytes. The RED half of
+/// the pair is historical (constructible at the audit's SHA
+/// `096f8d9`, where neither the T05 clears nor the epochs existed);
+/// at the current head the green property is what the rig can prove,
+/// and the epoch arm in isolation is pinned CPU-side
+/// (`an_epoch_bump_rewrites_both_slots_without_any_clear` — the
+/// belt-missing shape with the bare gate's red witness shown
+/// directly). The submission adapter's debug byte-verify (the
+/// always-upload oracle's CPU-side twin) stays green throughout in
+/// debug builds.
+#[test]
+#[ignore = "requires a real Vulkan device and windows (the rig run: release, serial, archived per E-8)"]
+fn interrupted_growth_retry_rewrites_every_slot() {
+    let _guard = sdl_lock();
+    let (mut app, mut renderer) = lifecycle_renderer("T02 L4 interrupted growth");
+    let _ = app.frame();
+    let size = app.window().size_in_pixels();
+    let matrix = lifecycle_matrix(size);
+    attach_corner_scene(&mut renderer).expect("the scene attaches");
+    // A generation-carrying submit (the battery's own helper submits
+    // at generation 0 — always-dirty, no skips to observe; the epoch
+    // witness needs the opted-in protocol).
+    type PoseBlock = [[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS];
+    let submit_at = |renderer: &mut Renderer,
+                     instances: &[engine_renderer::proxy_instances::ProxyInstance],
+                     blocks: &[PoseBlock],
+                     generation: u64|
+     -> engine_renderer::FrameResult {
+        renderer
+            .submit_frame(corner_submission(
+                &matrix,
+                [0.0, 1.7, 15.0],
+                day_preset(),
+                None,
+                corner_bounds(),
+                Some(ProxyPopulation {
+                    instance_generation: generation,
+                    pose_generation: generation,
+                    npc: instances,
+                    npc_poses: blocks,
+                    npc_material: 1,
+                    vehicle: &[],
+                    vehicle_material: 2,
+                    rain: &[],
+                    rain_material: 0,
+                }),
+                None,
+                false,
+                None,
+                size,
+            ))
+            .expect("the populated frame renders")
+    };
+    // THE WARM POPULATION: two npcs at generation 5, four frames —
+    // both slots stamped, the between-tick skips observed (the R2
+    // win the epoch gate must preserve).
+    let small = engine_slice::census::repack::synthetic_population(2);
+    let small_poses: Vec<[[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS]> =
+        vec![engine_renderer::animation::rest_pose_block(); 2];
+    for _ in 0..4 {
+        submit_at(&mut renderer, &small, &small_poses, 5);
+    }
+    let warm_skips = renderer.stats().population_writes_skipped;
+    let warm_growth = renderer.stats().arena_growth_events;
+    assert!(
+        warm_skips > 0,
+        "the warm population observed the between-tick skips (the R2 win)"
+    );
+    // THE INTERRUPTED GROWTH: 200 instances/pose blocks (far past the
+    // carves' 64 floor) at generation 6. The ladder grows the
+    // INSTANCE carve (committed — a fresh epoch published) and then
+    // fails at the POSE growth's idle window: the frame dies after
+    // one growth committed and before any upload ran (the prepare
+    // phase precedes the acquire), the delta-clear belt exactly
+    // what this failure swallows.
+    let large = engine_slice::census::repack::synthetic_population(200);
+    let large_poses: Vec<[[[f32; 4]; 4]; engine_renderer::animation::HUMANOID_JOINTS]> =
+        vec![engine_renderer::animation::rest_pose_block(); 200];
+    renderer.inject_lifecycle_fault(LifecycleFaultSite::PoseGrowthIdle, 1);
+    let failed = renderer.submit_frame(corner_submission(
+        &matrix,
+        [0.0, 1.7, 15.0],
+        day_preset(),
+        None,
+        corner_bounds(),
+        Some(ProxyPopulation {
+            instance_generation: 6,
+            pose_generation: 6,
+            npc: &large,
+            npc_poses: &large_poses,
+            npc_material: 1,
+            vehicle: &[],
+            vehicle_material: 2,
+            rain: &[],
+            rain_material: 0,
+        }),
+        None,
+        false,
+        None,
+        size,
+    ));
+    match failed {
+        Err(engine_renderer::RendererError::InjectedFault(_)) => {}
+        other => panic!("the growing frame fails at the pose growth's idle, got {other:?}"),
+    }
+    let after_failure_growth = renderer.stats().arena_growth_events;
+    assert!(
+        after_failure_growth > warm_growth,
+        "the INSTANCE growth committed before the pose idle failed the frame ({} -> {})",
+        warm_growth,
+        after_failure_growth
+    );
+    // THE RETRY: the same growing population at the same generation.
+    // The pose growth now commits (its own fresh epoch); every
+    // slot's region must rewrite — population_writes_skipped FROZEN
+    // across the retry frames (a stale skip against the replaced
+    // carves is exactly the hazard).
+    let skipped_before_retry = renderer.stats().population_writes_skipped;
+    for _ in 0..4 {
+        let outcome = submit_at(&mut renderer, &large, &large_poses, 6);
+        assert!(outcome.presented, "the retry frame presents");
+    }
+    assert_eq!(
+        renderer.stats().population_writes_skipped,
+        skipped_before_retry,
+        "the interrupted-growth retry rewrote every region (no stale skip \
+         against the replaced carves)"
+    );
+    // The stable population then skips again (the R2 win preserved
+    // on the NEW carve epochs).
+    let before_stable = renderer.stats().population_writes_skipped;
+    for _ in 0..4 {
+        let outcome = submit_at(&mut renderer, &large, &large_poses, 6);
+        assert!(outcome.presented);
+    }
+    assert!(
+        renderer.stats().population_writes_skipped > before_stable,
+        "the stable population on the new carve skips again (the R2 win)"
+    );
+    let stats = renderer.stats();
+    assert_eq!(stats.validation_errors, 0, "{:?}", stats.recent_validation);
+    drop(renderer);
+    drop(app);
+    println!(
+        "T02 L4: the interrupted-growth retry rewrote every slot (skips frozen), \
+              the stable population skipped again on the new epochs"
+    );
+}
+
+/// T06/L5 (the first-use disposition's DECIDING rig run — the
+/// design's §6 L5 row: "fresh swapchain → first-acquire fault →
+/// validation clean on the transition submit (or the fallback arm
+/// taken and documented); the WSI spec premise settled with the
+/// layer's actual verdict recorded"): a NEVER-presented image (the
+/// fresh renderer's first acquisition — no frame has presented or
+/// render-submitted any image yet) failing at a post-acquire
+/// boundary BEFORE recording takes the release's TRANSITION arm:
+/// the minimal `UNDEFINED → PRESENT_SRC_KHR` barrier submit waiting
+/// the acquire semaphore and signaling the present semaphore, then
+/// the present waiting THAT semaphore. THE CORE VALIDATION VERDICT
+/// over this disposition is the deciding evidence (the audit
+/// refused to trust the old comment's "acquire performs an implicit
+/// transition" premise; the transition makes the release
+/// layout-legal BY CONSTRUCTION, premise-independent). The
+/// previously-presented arm (the direct release-present, the
+/// pre-L5 behavior) is exercised beside it — after successful
+/// frames, the same fault's release stays validation-clean.
+#[test]
+#[ignore = "requires a real Vulkan device and windows (the rig run: release, serial, archived per E-8)"]
+fn first_use_release_presents_through_the_transition_validation_clean() {
+    let _guard = sdl_lock();
+    let (mut app, mut renderer) = lifecycle_renderer("T06 L5 first-use disposition");
+    let _ = app.frame();
+    let size = app.window().size_in_pixels();
+    let matrix = lifecycle_matrix(size);
+    attach_corner_scene(&mut renderer).expect("the scene attaches");
+    // ---- THE FIRST-USE ARM: the renderer has presented NOTHING —
+    // the first acquired image is never-presented (initial layout
+    // UNDEFINED). The upload boundary fails the frame before any
+    // recording; the release must take the TRANSITION submit.
+    renderer.inject_lifecycle_fault(LifecycleFaultSite::FrameUpload, 1);
+    match renderer.submit_frame(corner_submission(
+        &matrix,
+        [0.0, 1.7, 15.0],
+        day_preset(),
+        None,
+        corner_bounds(),
+        None,
+        None,
+        false,
+        None,
+        size,
+    )) {
+        Err(engine_renderer::RendererError::InjectedFault(_)) => {}
+        other => panic!("the first frame fails at the upload boundary, got {other:?}"),
+    }
+    // THE DECIDING ASSERTION: the transition submit + the
+    // semaphore-waited present are validation-clean (sync
+    // validation ON — a layout-illegal present of an UNDEFINED
+    // image is exactly what the layer would flag).
+    let mut stats = renderer.stats();
+    assert_eq!(
+        stats.validation_errors, 0,
+        "the first-use transition release is validation-clean: {:?}",
+        stats.recent_validation
+    );
+    // ---- THE PREVIOUSLY-PRESENTED ARM: successful frames present
+    // (every image the swapchain hands back is now
+    // ever-presented); the same fault's release takes the DIRECT
+    // arm — the pre-L5 behavior, still validation-clean.
+    for _ in 0..4 {
+        let outcome = submit_plain_scene_frame(&mut renderer, &matrix, size);
+        assert!(outcome.presented, "the warm frame presents");
+    }
+    renderer.inject_lifecycle_fault(LifecycleFaultSite::FrameUpload, 1);
+    match renderer.submit_frame(corner_submission(
+        &matrix,
+        [0.0, 1.7, 15.0],
+        day_preset(),
+        None,
+        corner_bounds(),
+        None,
+        None,
+        false,
+        None,
+        size,
+    )) {
+        Err(engine_renderer::RendererError::InjectedFault(_)) => {}
+        other => panic!("the later frame fails at the upload boundary, got {other:?}"),
+    }
+    stats = renderer.stats();
+    assert_eq!(
+        stats.validation_errors, 0,
+        "the previously-presented direct release is validation-clean: {:?}",
+        stats.recent_validation
+    );
+    // The renderer remains fully usable (the slot was released on
+    // both arms — the CA-10 discipline unchanged).
+    for _ in 0..3 {
+        let outcome = submit_plain_scene_frame(&mut renderer, &matrix, size);
+        assert!(outcome.presented, "the post-failure frame presents");
+    }
+    stats = renderer.stats();
+    assert_eq!(stats.validation_errors, 0, "{:?}", stats.recent_validation);
+    drop(renderer);
+    drop(app);
+    println!("T06 L5: the first-use transition release and the direct arm both validation-clean");
+}
+
+/// T06/L1 (the lifecycle substrate's rig leg — the design's
+/// LIFECYCLE-T02-T03-T06-T16 §6 L1 row): the CA-13 latch absorbed
+/// into the `RendererLifecycle` state machine keeps every refusal
+/// surface — including `render_layers`, the frame entry the CA-13
+/// battery's submit-only leg did not exercise — AND the renderer
+/// with a latched loss DROPS cleanly (the §4.2 disposal discipline:
+/// the lifecycle enters `Destroying`, the idle's error is observed
+/// rather than discarded, and the destroy sequence proceeds on the
+/// loss-abandon semantics — `vkDestroy*`/`vkFree*` remain the
+/// supported teardown path after `ERROR_DEVICE_LOST`). The
+/// loss-from-`get_fence_status` arms (§4.3's poll classification on
+/// a REAL loss) are owner-validation territory per the design's own
+/// honest limit §7.2: `inject_device_loss` models only the acquire
+/// site, so those arms are pinned by the CPU classification tables
+/// (`the_fence_poll_classifications_table_every_arm`) until a real
+/// loss is observed on the rig.
+#[test]
+#[ignore = "requires a real Vulkan device and windows (the rig run: release, serial, archived per E-8)"]
+fn lifecycle_latch_covers_render_layers_and_the_loss_renderer_drops_cleanly() {
+    let _guard = sdl_lock();
+    let (mut app, mut renderer) = lifecycle_renderer("T06 L1 lifecycle substrate");
+    let _ = app.frame();
+    let size = app.window().size_in_pixels();
+    attach_corner_scene(&mut renderer).expect("the scene attaches");
+    for _ in 0..3 {
+        let outcome = submit_plain_scene_frame(&mut renderer, &lifecycle_matrix(size), size);
+        assert!(outcome.presented, "the warm frame presents");
+    }
+    // The injected loss at the acquire site (the one seam that
+    // models the terminal outcome faithfully).
+    renderer.inject_device_loss();
+    match renderer.submit_frame(corner_submission(
+        &lifecycle_matrix(size),
+        [0.0, 1.7, 15.0],
+        day_preset(),
+        None,
+        corner_bounds(),
+        None,
+        None,
+        false,
+        None,
+        size,
+    )) {
+        Err(engine_renderer::RendererError::DeviceLost { operation }) => assert_eq!(
+            operation, "acquire_next_image",
+            "the lifecycle's DeviceLost state carries CA-13's first context"
+        ),
+        other => panic!("the typed loss refusal, got {other:?}"),
+    }
+    // THE RENDER_LAYERS GATE (the frame entry the CA-13 battery did
+    // not exercise): refused with the same first observation's
+    // context, without touching the dead device (an unarmed call
+    // that reached the device would present a real frame).
+    let refused =
+        renderer.render_layers(&engine_slice::math::identity(), &[], None, &[], None, size);
+    match refused {
+        Err(engine_renderer::RendererError::DeviceLost { operation }) => assert_eq!(
+            operation, "acquire_next_image",
+            "render_layers refuses through the same lifecycle gate"
+        ),
+        other => panic!("the render_layers latched refusal, got {other:?}"),
+    }
+    // Validation clean before the drop (the losses are the
+    // injection's, not a real driver error).
+    let stats = renderer.stats();
+    assert_eq!(stats.validation_errors, 0, "{:?}", stats.recent_validation);
+    // THE §4.2 DISPOSAL: the latched renderer drops cleanly — the
+    // lifecycle's Destroying observability state records the idle's
+    // result instead of discarding it, and the ordered teardown
+    // (frames → swapchain → pipes → context) completes on the
+    // loss-abandon semantics. A panic or a wedged drop fails the
+    // test right here.
+    drop(renderer);
+    drop(app);
+    println!("T06 L1: the lifecycle latch covers render_layers; the loss renderer drops cleanly");
+}
