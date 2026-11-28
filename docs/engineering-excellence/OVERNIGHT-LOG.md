@@ -144,3 +144,23 @@ discrepancy noted (41-vs-20 `self.ledger` census — pattern scope; the
 implementation re-derives the inventory fresh). Implementation queued behind the
 running build lanes, staged per the design (commit 1 the frontier, commit 2 the
 logical head), with the four measurement obligations named.
+
+## T19 — the A06 E-S1 extraction landed (`f4ce19b` + the guard companion `d9c3f24`)
+
+The lane (`ee/overnight-t19-animation`, commit `c9700eb`, base `9690284`) delivered
+stage E-S1: the new `engine-animation` crate (bytemuck only, `#![deny(unsafe_code)]`)
+owning the pure pose/skeleton/sampling core; the GPU packing layer staying
+renderer-side; every existing import path stable through the shim (zero consumer
+edits; the lib.rs root re-export block byte-stable). Orchestrator verification:
+diff scope exact (8 files, no slice/core/shadows/lib.rs edits); the minimal
+Cargo.lock delta ratified; gates re-run independently (renderer 211/0/0 measured;
+test conservation exact 211+21=232); all four equivalence bars reproduced (pose
+digest, instance FNV, rest-identity, mesh bit-identity). One deviation ratified:
+SkinnedVertex moved (not kept) — matching the owner-ratified DECISION-A06 §4
+verbatim ("SkinnedVertex stays in engine-animation"; the brief had drifted).
+The workspace inventory guard corrected 5→6 members (`d9c3f24`, its designed
+refusal honored). The CI measurement run `46129087795` dispatched at `d9c3f24`
+to measure the pin movements (renderer-release 232→211, main result lines +2
+expected); pins will be corrected ONLY from its measured actuals. E-S2 (slice
+rewire to `engine_animation::`), E-S3 (shim deletion decision), E-S4 (B15
+re-measure) queued.
