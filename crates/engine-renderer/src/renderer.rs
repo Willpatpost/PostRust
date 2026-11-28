@@ -184,6 +184,40 @@ pub struct AllocationStats {
     pub target_framebuffer_frees: u64,
     /// Monotonic destruction count of Era-1 target builder memory allocations.
     pub target_memory_frees: u64,
+    /// P5 R0 (§9.4, the attach/upload census): monotonic count of
+    /// one-shot staging submissions through the upload helper
+    /// (`with_upload_commands`) — each is a fresh command pool + one
+    /// command buffer + a fence, ONE queue submit, ONE blocking
+    /// `wait_for_fences`, then destruction of pool and fence. The
+    /// per-object machinery the A20/R3 staging pool replaces;
+    /// before-R3, every attach-time buffer and texture upload pays
+    /// exactly one of these. Read-only surface: recorded at the
+    /// helper's site, never changed by any frame-path code.
+    pub upload_submits: u64,
+    /// P5 R0 (§9.4): accumulated wall-clock nanoseconds blocked
+    /// inside those staging submissions' `wait_for_fences` calls —
+    /// the "blocking-wait total" row. Attach-time only (the frame
+    /// path's fence waits are outside this counter); the CPU/GPU
+    /// overlap the deferred-wait option would recover is exactly
+    /// this quantity.
+    pub upload_blocking_wait_ns: u64,
+    /// P5 R0 (§9.4): monotonic count of device-local buffer uploads
+    /// staged through a throwaway HOST_VISIBLE pair
+    /// (`create_device_local_buffer_with_data`) — each call creates
+    /// AND destroys one staging buffer plus one staging memory. The
+    /// "staging object counts" row's buffer half (the texture half
+    /// is the permanent-tail counter below).
+    pub staged_buffer_uploads: u64,
+    /// P5 R0 (§9.4): the PERMANENT per-texture staging tails — for
+    /// every uploaded texture, the bytes of its single
+    /// device-local allocation beyond the image's own memory
+    /// requirement (the staging buffer's bytes plus the alignment
+    /// padding between the image and staging regions), resident for
+    /// the texture's whole lifetime. The dead VRAM A20/R3's pool
+    /// retires; `texture_bytes` above INCLUDES these same bytes in
+    /// its per-texture totals, so this field is the attribution
+    /// slice, not an additional sum.
+    pub texture_staging_tail_bytes: u64,
 }
 
 /// Long-lived renderer statistics (Stage 2 authorization, item 4).

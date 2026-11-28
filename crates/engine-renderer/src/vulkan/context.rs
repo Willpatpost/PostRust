@@ -132,6 +132,20 @@ pub(crate) struct VulkanContext {
     target_view_frees: Cell<u64>,
     target_framebuffer_frees: Cell<u64>,
     target_memory_frees: Cell<u64>,
+    /// P5 R0 (§9.4, the attach/upload census): the one-shot staging
+    /// submission count and its accumulated blocking-wait time (see
+    /// `crate::AllocationStats::upload_submits` /
+    /// `upload_blocking_wait_ns` — the field docs are the contract).
+    /// Interior-mutable like every counter here: the upload helpers
+    /// take `&VulkanContext`.
+    upload_submits: Cell<u64>,
+    upload_blocking_wait_ns: Cell<u64>,
+    /// P5 R0 (§9.4): the throwaway staging-pair count
+    /// (`staged_buffer_uploads`).
+    staged_buffer_uploads: Cell<u64>,
+    /// P5 R0 (§9.4): the permanent per-texture staging tail bytes
+    /// (`texture_staging_tail_bytes`).
+    texture_staging_tail_bytes: Cell<u64>,
 }
 
 impl VulkanContext {
@@ -477,6 +491,10 @@ impl VulkanContext {
             target_view_frees: Cell::new(0),
             target_framebuffer_frees: Cell::new(0),
             target_memory_frees: Cell::new(0),
+            upload_submits: Cell::new(0),
+            upload_blocking_wait_ns: Cell::new(0),
+            staged_buffer_uploads: Cell::new(0),
+            texture_staging_tail_bytes: Cell::new(0),
         };
         if let Err(e) = context.init_atlas(atlas) {
             context.destroy();
@@ -564,7 +582,48 @@ impl VulkanContext {
             target_view_frees: self.target_view_frees.get(),
             target_framebuffer_frees: self.target_framebuffer_frees.get(),
             target_memory_frees: self.target_memory_frees.get(),
+            upload_submits: self.upload_submits.get(),
+            upload_blocking_wait_ns: self.upload_blocking_wait_ns.get(),
+            staged_buffer_uploads: self.staged_buffer_uploads.get(),
+            texture_staging_tail_bytes: self.texture_staging_tail_bytes.get(),
         }
+    }
+
+    /// P5 R0 (§9.4): records one COMPLETED one-shot staging
+    /// submission (the `with_upload_commands` helper's whole
+    /// lifetime — pool, buffer, fence, submit, blocking wait,
+    /// destruction) together with the wall time spent blocked in its
+    /// `wait_for_fences`. Called only after the wait succeeded, so a
+    /// failed upload counts neither the submit nor its partial wait
+    /// (fail-visible, never overcounted).
+    pub(super) fn record_upload_submit(&self, blocking_wait: std::time::Duration) {
+        self.upload_submits.set(self.upload_submits.get() + 1);
+        let ns = u64::try_from(blocking_wait.as_nanos()).unwrap_or(u64::MAX);
+        self.upload_blocking_wait_ns
+            .set(self.upload_blocking_wait_ns.get().saturating_add(ns));
+    }
+
+    /// P5 R0 (§9.4): records one device-local buffer upload staged
+    /// through a throwaway HOST_VISIBLE pair (the
+    /// `create_device_local_buffer_with_data` helper — one staging
+    /// buffer plus one staging memory created and destroyed per
+    /// call). Called only after the upload succeeded.
+    pub(super) fn record_staged_buffer_upload(&self) {
+        self.staged_buffer_uploads
+            .set(self.staged_buffer_uploads.get() + 1);
+    }
+
+    /// P5 R0 (§9.4): records one texture's PERMANENT staging tail —
+    /// the bytes of the texture's single device-local allocation
+    /// beyond the image's own memory requirement (staging buffer +
+    /// alignment padding), resident for the texture's lifetime.
+    /// Called only after the allocation succeeded.
+    pub(super) fn record_texture_staging_tail(&self, tail_bytes: u64) {
+        self.texture_staging_tail_bytes.set(
+            self.texture_staging_tail_bytes
+                .get()
+                .saturating_add(tail_bytes),
+        );
     }
 
     /// Arms a one-shot target-construction fault plan. The `ordinal`

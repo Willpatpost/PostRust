@@ -132,6 +132,17 @@ impl Texture {
                 .map_err(|e| RendererError::vk(e, "allocate texture image and staging memory"))?;
             ctx.texture_allocations
                 .set(ctx.texture_allocations.get() + 1);
+            // P5 R0 (§9.4, the attach/upload census): the PERMANENT
+            // staging tail — this texture's single device-local
+            // allocation carries the staging buffer's bytes (plus
+            // the alignment padding before it) forever, dead VRAM
+            // after the one copy. Recorded for the census row; the
+            // subtraction is total-ordered by construction
+            // (`allocation_bytes` = the image requirement rounded up
+            // to the staging alignment, plus the staging size).
+            ctx.record_texture_staging_tail(
+                texture.allocation_bytes.saturating_sub(image_req.size),
+            );
             ctx.device
                 .bind_image_memory(texture.image, texture.memory, 0)
                 .map_err(|e| RendererError::vk(e, "bind texture image"))?;
